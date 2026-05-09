@@ -12,6 +12,7 @@ import subprocess
 import numpy as np
 import torch
 
+from models.utils.compression.gpcc_tmc3 import GPCCGeometryEncoder
 from models.utils.compression.proxy_octree import ProxyOctreeConfig, SoftOctreeRateProxy
 
 
@@ -615,192 +616,26 @@ class _SparsePCGCActualEncoder:
 
 
 class _GPCCActualEncoder:
-    """Run MPEG G-PCC/tmc3 geometry coding as an actual-bit teacher."""
+    """Thin loss-side wrapper around the myNet_new G-PCC geometry encoder."""
 
     codec_name = "gpcc"
 
     def __init__(self, args, writer=None):
-        self.args = args
-        self.writer = writer
-        self.tmp_root = getattr(args, "gpcc_tmp_dir", "")
-        self.timeout = float(getattr(args, "gpcc_timeout", 120.0))
-        self.effective_qs = max(float(getattr(args, "gpcc_effective_qs", getattr(args, "qs", 1.0))), 1e-12)
-        self.prequantize = bool(getattr(args, "gpcc_prequantize", True))
-        self.disable_attribute_coding = bool(getattr(args, "gpcc_disable_attribute_coding", True))
-        self.merge_duplicated_points = bool(getattr(args, "gpcc_merge_duplicated_points", True))
-        self._loaded = False
-        self._encoder_path = None
-        self._cfg_path = None
-        self._request_id = 0
-
-    def _repo_root(self):
-        return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
-
-    def _resolve_path(self, raw_path, base_dir):
-        raw = os.path.expanduser(str(raw_path))
-        if os.path.isabs(raw):
-            return os.path.abspath(raw)
-        candidates = [
-            os.path.abspath(os.path.join(os.getcwd(), raw)),
-            os.path.abspath(os.path.join(base_dir, raw)),
-            os.path.abspath(os.path.join(self._repo_root(), raw)),
-        ]
-        for candidate in candidates:
-            if os.path.exists(candidate):
-                return candidate
-        return candidates[1]
-
-    def _gpcc_root(self):
-        root = getattr(self.args, "gpcc_root", "")
-        if not root:
-            root = os.path.join(self._repo_root(), "compress", "octree", "G-PCC")
-        return self._resolve_path(root, self._repo_root())
-
-    def _lazy_init(self):
-        if self._loaded:
-            return
-        root = self._gpcc_root()
-        encoder_path = getattr(self.args, "gpcc_encoder_path", "")
-        if not encoder_path:
-            encoder_path = os.path.join(root, "build", "tmc3", "tmc3")
-        encoder_path = self._resolve_path(encoder_path, root)
-        cfg_dir = getattr(self.args, "gpcc_cfg_dir", "")
-        if not cfg_dir:
-            cfg_dir = os.path.join(root, "cfg", "octree-predlift", "lossless-geom-lossless-attrs", "longdress_vox10_1300")
-        cfg_path = self._resolve_path(cfg_dir, root)
-        if os.path.isdir(cfg_path):
-            cfg_path = os.path.join(cfg_path, "encoder.cfg")
-        if not os.path.isfile(encoder_path):
-            raise FileNotFoundError(f"G-PCC tmc3 encoder not found: {encoder_path}")
-        if not os.path.isfile(cfg_path):
-            raise FileNotFoundError(f"G-PCC encoder.cfg not found: {cfg_path}")
-        self._encoder_path = encoder_path
-        self._cfg_path = cfg_path
-        self._loaded = True
-        if self.writer is not None and hasattr(self.writer, "write"):
-            self.writer.write(
-                "G-PCC actual encoder loaded: "
-                f"encoder={encoder_path}, cfg={cfg_path}, prequantize={self.prequantize}, "
-                f"effective_qs={self.effective_qs}, geometry_only={self.disable_attribute_coding}"
-            )
-
-    def _make_tmp_dir(self):
-        root = self.tmp_root
-        if not root:
-            root = "/dev/shm/mynet_gpcc_teacher" if os.path.isdir("/dev/shm") else None
-        if root:
-            os.makedirs(root, exist_ok=True)
-            return tempfile.mkdtemp(prefix="gpcc_actual_", dir=root)
-        return tempfile.mkdtemp(prefix="gpcc_actual_")
-
-    def _quantized_coords(self, pts_3n):
-        pts = (
-            pts_3n.detach()
-            .transpose(0, 1)
-            .contiguous()
-            .to(device="cpu", dtype=torch.float32)
+        self.encoder = GPCCGeometryEncoder(
+            root=getattr(args, "gpcc_root", ""),
+            encoder_path=getattr(args, "gpcc_encoder_path", ""),
+            cfg_dir=getattr(args, "gpcc_cfg_dir", ""),
+            tmp_root=getattr(args, "gpcc_tmp_dir", ""),
+            timeout=float(getattr(args, "gpcc_timeout", 120.0)),
+            effective_qs=float(getattr(args, "gpcc_effective_qs", getattr(args, "qs", 1.0))),
+            prequantize=bool(getattr(args, "gpcc_prequantize", True)),
+            disable_attribute_coding=bool(getattr(args, "gpcc_disable_attribute_coding", True)),
+            merge_duplicated_points=bool(getattr(args, "gpcc_merge_duplicated_points", True)),
+            writer=writer,
         )
-        finite = torch.isfinite(pts).all(dim=1)
-        pts = pts[finite]
-        if pts.numel() == 0:
-            return np.zeros((0, 3), dtype=np.int32)
-        if self.prequantize:
-            coords = torch.round(pts / float(self.effective_qs)).to(torch.long)
-        else:
-            coords = torch.round(pts).to(torch.long)
-        coords = coords - coords.amin(dim=0, keepdim=True)
-        coords = torch.unique(coords, dim=0)
-        if coords.shape[0] == 0:
-            return np.zeros((0, 3), dtype=np.int32)
-        span = coords.amax(dim=0) + 1
-        key = coords[:, 0] + span[0] * (coords[:, 1] + span[1] * coords[:, 2])
-        order = torch.argsort(key)
-        return coords[order].to(torch.int32).numpy()
-
-    @staticmethod
-    def _write_ascii_ply(path, coords):
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="ascii") as file:
-            file.write("ply\n")
-            file.write("format ascii 1.0\n")
-            file.write(f"element vertex {int(coords.shape[0])}\n")
-            file.write("property float x\n")
-            file.write("property float y\n")
-            file.write("property float z\n")
-            file.write("end_header\n")
-            for x, y, z in coords:
-                file.write(f"{int(x)} {int(y)} {int(z)}\n")
-
-    def _command(self, ply_path, bin_path, rec_path):
-        cmd = [
-            self._encoder_path,
-            "-c",
-            self._cfg_path,
-            f"--uncompressedDataPath={ply_path}",
-            f"--reconstructedDataPath={rec_path}",
-            f"--compressedStreamPath={bin_path}",
-            "--mode=0",
-            "--autoSeqBbox=1",
-            "--positionQuantizationScale=1",
-            "--trisoupNodeSizeLog2=0",
-            f"--mergeDuplicatedPoints={1 if self.merge_duplicated_points else 0}",
-        ]
-        if self.disable_attribute_coding:
-            cmd.append("--disableAttributeCoding=1")
-        return cmd
 
     def encode_bits(self, pts_3n):
-        self._lazy_init()
-        coords = self._quantized_coords(pts_3n)
-        point_count = int(coords.shape[0])
-        if point_count <= 0:
-            return {
-                "bit": 0.0,
-                "bpp": 0.0,
-                "bpn": 0.0,
-                "single": 0.0,
-                "node": 0.0,
-                "point_count": 0,
-                "codec": self.codec_name,
-            }
-
-        tmp_dir = self._make_tmp_dir()
-        try:
-            self._request_id += 1
-            ply_path = os.path.join(tmp_dir, f"input_{self._request_id}.ply")
-            bin_path = os.path.join(tmp_dir, f"encoded_{self._request_id}.bin")
-            rec_path = os.path.join(tmp_dir, f"recon_{self._request_id}.ply")
-            self._write_ascii_ply(ply_path, coords)
-            cmd = self._command(ply_path, bin_path, rec_path)
-            result = subprocess.run(
-                cmd,
-                text=True,
-                capture_output=True,
-                check=False,
-                timeout=self.timeout,
-                cwd=self._gpcc_root(),
-            )
-            if result.returncode != 0:
-                stdout_tail = (result.stdout or "")[-1200:]
-                stderr_tail = (result.stderr or "")[-1200:]
-                raise RuntimeError(
-                    "G-PCC teacher encode failed "
-                    f"(returncode={result.returncode}, cmd={' '.join(cmd)}).\n"
-                    f"stdout_tail={stdout_tail}\nstderr_tail={stderr_tail}"
-                )
-            bit = float(os.path.getsize(bin_path) * 8) if os.path.isfile(bin_path) else 0.0
-            return {
-                "bit": bit,
-                "bpp": bit / max(float(point_count), 1.0),
-                "bpn": bit,
-                "single": 0.0,
-                "node": 0.0,
-                "point_count": point_count,
-                "codec": self.codec_name,
-                "mode": "tmc3_geometry_octree",
-            }
-        finally:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+        return self.encoder.encode_tensor(pts_3n)
 
 
 def _actual_codec_key(args):

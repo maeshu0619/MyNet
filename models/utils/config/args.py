@@ -69,6 +69,7 @@ def _cli_option_was_provided(option_name: str) -> bool:
 
 def _discover_latest_pretrained_checkpoint(model_stem: str = model_name) -> str:
     candidates = []
+    candidates.extend(_LOG_ROOT.glob(f"*/MyNetwork_train/pretrained/*/{model_stem}.pth"))
     candidates.extend(_LOG_ROOT.glob(f"*/MyNetwork_train/checkpoints/*/{model_stem}.pth"))
     candidates.extend(_PRETRAINED_ROOT.glob(f"*/*/{model_stem}.pth"))
     candidates.extend(_LEGACY_PRETRAINED_ROOT.glob(f"*/*/{model_stem}.pth"))
@@ -241,6 +242,9 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--max_drop_ratio', default=0.03, type=float, help='点削除ゲートの上限割合')
     parser.add_argument('--repair_drop_ratio_weight', default=4.0, type=float, help='点削除割合制御損失の重み')
     parser.add_argument('--repair_drop_shape_guard_weight', default=1.0, type=float, help='形状保持点を削除しすぎない正則化')
+    parser.add_argument('--repair_add_ratio_weight', default=4.0, type=float, help='点追加割合制御損失の重み')
+    parser.add_argument('--repair_add_shape_guard_weight', default=0.5, type=float, help='形状保持点の近傍に追加しすぎない正則化')
+    parser.add_argument('--repair_add_offset_weight', default=0.25, type=float, help='追加点オフセットの正則化')
     parser.add_argument('--repair_priority_gate', default=True, type=str2bool, help='高コスト領域だけを修復対象にする優先度ゲートを使うか')
     parser.add_argument('--repair_priority_gate_tau', default=0.08, type=float, help='修復優先度ゲートの温度')
     parser.add_argument('--repair_gate_mean_cap', default=True, type=str2bool, help='修復対象割合の平均がtarget_repair_ratioを超えないように再スケールするか')
@@ -278,14 +282,14 @@ def parse_pugan_args(parser, file_day, file_time):
     """Train"""
     parser.add_argument('--save_dir', default=str((_DATA_ROOT / 'trained_model').resolve()), type=str, help='モデル保存ディレクトリ')
     parser.add_argument('--ckpt', default=_default_checkpoint_path(), type=str, help='チェックポイントのパス')
-    parser.add_argument('--out_path', default=str((_LOG_ROOT / file_day / "MyNetwork_train" / "checkpoints" / file_time).resolve()), type=str, help='チェックポイント保存先')
+    parser.add_argument('--out_path', default=str((_LOG_ROOT / file_day / "MyNetwork_train" / "pretrained" / file_time).resolve()), type=str, help='チェックポイント保存先')
     parser.add_argument('--log_root', default=str(_LOG_ROOT), type=str, help='学習・推論ログ保存ルート')
     parser.add_argument('--optim', default='adam', type=str, help='最適化手法（adamまたはsgd）')
     parser.add_argument('--expansion', action='store_true', help='拡張データを使用するか')
     parser.add_argument('--gamma', default=0.5, type=float, help='学習率減衰の係数')
     parser.add_argument('--lr_decay_step', default=24, type=int, help='学習率を減衰させるステップ間隔')
     parser.add_argument('--max_files', default=30, type=int, help='読み込む最大ファイル数')
-    parser.add_argument('--episodes', default=64, type=int, help='学習エピソード数')
+    parser.add_argument('--episodes', default=128, type=int, help='学習エピソード数')
     parser.add_argument('--lr', default=1e-3, type=float, help='学習率')
     parser.add_argument('--save_eval', default='loss', type=str, help='評価指標（lossまたはpsnr）')
     parser.add_argument('--deform', default=False, type=str2bool, help='変形モジュールをゆっくり学習するか')
@@ -310,7 +314,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--add_rep',    default=1*100, type=float, help='Addの分散抑制損失')
     parser.add_argument('--disp_cnt',    default=5, type=float, help='Displacementの個数制御損失')
     parser.add_argument('--disp_fit',    default=4*100, type=float, help='Displacementのフィッティング損失')
-    parser.add_argument('--w_geom',     default=10**7, type=float, help='幾何損失ブロック全体の重み')
+    parser.add_argument('--w_geom',     default=10**6, type=float, help='幾何損失ブロック全体の重み')
     parser.add_argument('--w_com',      default=10, type=float, help='最終圧縮損失ブロック全体の重み（各com_*項をまとめて掛ける）')
     parser.add_argument('--w_prun',     default=1, type=float, help='原因分解損失ブロック全体の重み（旧Pruning枠）')
     parser.add_argument('--w_add',      default=1, type=float, help='構造修復ポリシー損失ブロック全体の重み（旧Add枠）')
@@ -582,7 +586,7 @@ def parse_pugan_args(parser, file_day, file_time):
     if not args.run_name:
         args.run_name = f"{args.time}_{args.surrogate_name}"
     if not _cli_option_was_provided("--out_path"):
-        args.out_path = str((_LOG_ROOT / args.date / "MyNetwork_train" / "checkpoints" / args.run_name).resolve())
+        args.out_path = str((_LOG_ROOT / args.date / "MyNetwork_train" / "pretrained" / args.run_name).resolve())
     actual_bit_backends = {
         "octattention_actual",
         "octattention_actual_ste",

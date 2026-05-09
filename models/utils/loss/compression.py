@@ -82,12 +82,54 @@ class CompressionLossMixin:
                 self.last_surrogate_target_entry = None
         return self.actual_encoder
 
-    def _encode_actual_batch(self, args, xyz):
+    @staticmethod
+    def _effective_keep_mask_from_weights(weights, args):
+        weights = torch.nan_to_num(weights.detach(), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+        point_count = int(weights.numel())
+        if point_count <= 0:
+            return weights.new_zeros((0,), dtype=torch.bool)
+        threshold = float(
+            getattr(args, "operation_count_drop_threshold", getattr(args, "test_drop_threshold", 0.5))
+        )
+        keep_mask = weights >= threshold
+        keep_count = int(keep_mask.sum().item())
+        if keep_count <= 0 or keep_count >= point_count:
+            expected_keep = int(round(float(weights.sum().item())))
+            expected_keep = min(max(expected_keep, 1), point_count)
+            if 0 < expected_keep < point_count:
+                topk_idx = torch.topk(weights, k=expected_keep, largest=True, sorted=False).indices
+                keep_mask = torch.zeros_like(weights, dtype=torch.bool)
+                keep_mask.scatter_(0, topk_idx, True)
+        if not bool(keep_mask.any().item()):
+            keep_mask[torch.argmax(weights)] = True
+        return keep_mask
+
+    def _select_actual_points(self, xyz_3n, final_w, args, batch_idx):
+        if final_w is None:
+            return xyz_3n
+        if final_w.ndim == 3:
+            weights = final_w[batch_idx].squeeze(0)
+        elif final_w.ndim == 2:
+            weights = final_w[batch_idx]
+        else:
+            weights = final_w.reshape(-1)
+        point_count = int(xyz_3n.shape[-1])
+        weights = weights.to(device=xyz_3n.device, dtype=torch.float32).reshape(-1)
+        if weights.numel() > point_count:
+            weights = weights[:point_count]
+        elif weights.numel() < point_count:
+            pad = weights.new_ones((point_count - int(weights.numel()),))
+            weights = torch.cat([weights, pad], dim=0)
+        keep_mask = self._effective_keep_mask_from_weights(weights, args)
+        return xyz_3n[:, keep_mask]
+
+    def _encode_actual_batch(self, args, xyz, final_w=None):
         encoder = self._get_actual_encoder(args)
         stats_list = []
         for b in range(xyz.shape[0]):
-            stats = dict(encoder.encode_bits(xyz[b].to(torch.float32)))
-            stats = self._attach_octree_aux_stats(args, xyz[b], stats)
+            pts_b = self._select_actual_points(xyz[b].to(torch.float32), final_w, args, b)
+            stats = dict(encoder.encode_bits(pts_b))
+            stats = self._attach_octree_aux_stats(args, pts_b, stats)
             stats_list.append(stats)
         total_bit = sum(s["bit"] for s in stats_list)
         total_single = sum(s["single"] for s in stats_list)
@@ -203,7 +245,7 @@ class CompressionLossMixin:
             cached_gt = self._encode_actual_batch(args, gt_xyz)
             self._store_cached_actual_gt(cache_key, cached_gt)
 
-        stats_gen = self._encode_actual_batch(args, gen_xyz)
+        stats_gen = self._encode_actual_batch(args, gen_xyz, final_w=final_w)
         codec_name = str(stats_gen.get("codec", cached_gt.get("codec", "octattention"))).strip().lower()
         backend_label = f"{codec_name}_actual_ste" if use_proxy_surrogate else f"{codec_name}_actual"
         gt_bit = float(cached_gt["bit"])

@@ -47,7 +47,7 @@ class PlotMaker():
             log_root = os.path.join(base_dir, "log")
         else:
             log_root = os.path.abspath(os.path.expanduser(str(log_root)))
-        self.save_dir = os.path.join(log_root, self.args.date, "MyNetwork_train")
+        self.save_dir = os.path.join(log_root, self.args.date, f"MyNetwork_train/{args.compress}")
         self.num_loss = 14
         self.x_len = 10
         self.y_len = 4
@@ -587,11 +587,21 @@ class PlotMaker():
 
         save_path = os.path.join(self.save_dir, f"{filename_front}_point_edits.png")
         edit_titles = {
-            "added_points": "Added Points",
-            "deleted_points": "Deleted Points",
-            "adjusted_points": "Adjusted Points",
+            "added_points": "Add",
+            "deleted_points": "Prun",
+            "adjusted_points": "Adjust",
         }
-        fig, axes = plot_mod.subplots(len(self.edit_keys), 1, figsize=(self.x_len, self.y_len * len(self.edit_keys)))
+        edit_colors = {
+            "added_points": "#2ca02c",
+            "deleted_points": "#d62728",
+            "adjusted_points": "#1f77b4",
+        }
+        fig, axes = plot_mod.subplots(
+            len(self.edit_keys),
+            1,
+            figsize=(self.x_len, self.y_len * len(self.edit_keys)),
+            sharex=False,
+        )
         if len(self.edit_keys) == 1:
             axes = [axes]
         x_values = list(x_history)
@@ -600,12 +610,19 @@ class PlotMaker():
             if values:
                 epochs, plot_values = self._downsample_series(x_values, [int(value) for value in values])
                 if plot_values:
-                    ax.plot(epochs, plot_values, marker="o", linewidth=2, markersize=3)
+                    ax.plot(
+                        epochs,
+                        plot_values,
+                        marker="o",
+                        linewidth=2,
+                        markersize=3,
+                        color=edit_colors.get(key),
+                    )
                     plotted = True
             if not plotted:
                 ax.text(0.5, 0.5, "no point edit data", ha="center", va="center", transform=ax.transAxes, alpha=0.7)
             ax.set_xlabel(xl)
-            ax.set_ylabel("Point Count")
+            ax.set_ylabel(f"{edit_titles.get(key, key)} Count")
             ax.set_title(edit_titles.get(key, key))
             ax.grid(True, alpha=0.35)
             if len(x_history) >= 2:
@@ -615,7 +632,7 @@ class PlotMaker():
                     ax.xaxis.set_major_locator(MaxNLocator(integer=True))
                 except Exception:
                     pass
-        plot_mod.tight_layout()
+        fig.tight_layout(h_pad=2.0)
         plot_mod.savefig(save_path, dpi=140)
         plot_mod.close(fig)
 

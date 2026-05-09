@@ -702,6 +702,8 @@ class Network(nn.Module):
                     "loss_policy": float(loss_policy.detach().cpu()),
                     "loss_repair": float(loss_repair.detach().cpu()),
                     "repair_ratio": float(repair_gate.mean().detach().cpu()),
+                    "add_ratio": float(actuator_stats.get("add_ratio", pts_xyz.new_zeros(())).detach().cpu()),
+                    "add_count": int(actuator_stats.get("add_count", 0)),
                     "drop_ratio": float(actuator_stats["drop_prob"].mean().detach().cpu()),
                     "keep_ratio": float(actuator_stats["keep_prob"].mean().detach().cpu()),
                     "delta_norm": float(actuator_stats["delta"].norm(dim=1).mean().detach().cpu()),

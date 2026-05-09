@@ -187,7 +187,7 @@ class SurrogateCompressionLossMixin:
             if weights_all.shape[-1] > N:
                 weights_all = weights_all[..., :N]
             elif weights_all.shape[-1] < N:
-                pad = weights_all.new_zeros(*weights_all.shape[:-1], N - weights_all.shape[-1])
+                pad = weights_all.new_ones(*weights_all.shape[:-1], N - weights_all.shape[-1])
                 weights_all = torch.cat([weights_all, pad], dim=-1)
             weights_all = torch.nan_to_num(weights_all, nan=0.0, posinf=1.0, neginf=0.0)
             weights_all = weights_all.clamp(0.0, 1.0)
@@ -508,7 +508,7 @@ class SurrogateCompressionLossMixin:
             if cached_gt is None:
                 cached_gt = self._encode_actual_batch(args, gt_xyz)
                 self._store_cached_actual_gt(cache_key, cached_gt)
-            stats_gen = self._encode_actual_batch(args, gen_xyz)
+            stats_gen = self._encode_actual_batch(args, gen_xyz, final_w=final_w)
             teacher_codec = str(stats_gen.get("codec", cached_gt.get("codec", "octattention"))).strip().lower()
             actual_bit_percent = self._relative_percent(float(stats_gen["bit"]), float(cached_gt["bit"]))
             actual_bpp_percent = self._relative_percent(float(stats_gen["bpp"]), float(cached_gt["bpp"]))

@@ -14,7 +14,7 @@ class OctreeStructureAnalysis(nn.Module):
         self.writer = writer
         self.ctx_level = int(getattr(args, "octree_ctx_level", 5))
         self.ctx_dim = max(int(getattr(args, "octree_ctx_dim", 8)), 8)
-        self.qs = float(getattr(args, "qs", 2.0))
+        self.qs = self._effective_qs(args)
         self.k_geo = max(int(getattr(args, "structure_geo_k", 8)), 3)
         self.geo_max_points = max(int(getattr(args, "structure_geo_max_points", 4096)), 0)
         self.feature_dim = 35
@@ -29,6 +29,26 @@ class OctreeStructureAnalysis(nn.Module):
             ctx_dim=self.ctx_dim,
         )
         self.proxy_octree_ctx = SoftOctreeRateProxy(proxy_cfg)
+
+    @staticmethod
+    def _effective_qs(args):
+        compress_key = (
+            str(getattr(args, "compress", ""))
+            .strip()
+            .lower()
+            .replace("-", "")
+            .replace("_", "")
+            .replace(" ", "")
+        )
+        if compress_key == "sparsepcgc":
+            return max(
+                float(getattr(args, "sparsepcgc_effective_qs", 0.0))
+                or float(getattr(args, "sparsepcgc_voxel_size", 1.0)) * float(getattr(args, "sparsepcgc_pos_quantscale", 1)),
+                1e-9,
+            )
+        if compress_key in {"gpcc", "gpcctmc3"}:
+            return max(float(getattr(args, "gpcc_effective_qs", getattr(args, "qs", 2.0))), 1e-9)
+        return max(float(getattr(args, "qs", 2.0)), 1e-9)
 
     def _parse_diag_levels(self, raw_levels):
         if isinstance(raw_levels, (list, tuple)):

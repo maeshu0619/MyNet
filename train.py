@@ -100,6 +100,7 @@ def _write_structure_decision_debug(writer, prefix, structure_debug):
         f"top_cause={top_cause}, top_policy={top_policy}, "
         f"policy_entropy={float(structure_debug.get('policy_entropy', 0.0)):.6f}, "
         f"policy_diversity={int(structure_debug.get('policy_diversity', 0))}, "
+        f"add_ratio={float(structure_debug.get('add_ratio', 0.0)):.6f}, "
         f"cause_mean=[{_format_named_float_map(cause_mean)}], "
         f"policy_mean=[{_format_named_float_map(policy_mean)}]"
     )
@@ -1004,6 +1005,8 @@ def train(model, args, loss, writer, plot, notifier=None):
                         writer.write(
                             f"StructureStats step={step + 1}/{num_steps}: "
                             f"repair_ratio={float(structure_debug.get('repair_ratio', 0.0)):.6f}, "
+                            f"add_ratio={float(structure_debug.get('add_ratio', 0.0)):.6f}, "
+                            f"add_count={int(structure_debug.get('add_count', 0))}, "
                             f"drop_ratio={float(structure_debug.get('drop_ratio', 0.0)):.6f}, "
                             f"keep_ratio={float(structure_debug.get('keep_ratio', 0.0)):.6f}, "
                             f"delta_norm={float(structure_debug.get('delta_norm', 0.0)):.6f}"
@@ -1284,6 +1287,7 @@ if __name__ == '__main__':
     
     # ログのセットアップ
     writer = Writing(
+        args, 
         file_day,
         file_time,
         filename="MyNetwork_train",

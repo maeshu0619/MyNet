@@ -1456,6 +1456,7 @@ if __name__ == '__main__':
     
     # ログのセットアップ
     writer = Writing(
+        args, 
         file_day,
         file_time,
         filename="MyNetwork_test",

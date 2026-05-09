@@ -2,8 +2,7 @@ import datetime
 import os
 
 class Writing:
-    # 
-    def __init__(self, file_day, file_time, filename, flush_every=32, sync_every=0, log_root=None):
+    def __init__(self, args, file_day, file_time, filename, flush_every=32, sync_every=0, log_root=None):
         if log_root is None:
             # 現在のファイル（write.py）基準でルートを決定
             base_dir = os.path.abspath(
@@ -15,7 +14,7 @@ class Writing:
 
         # ディレクトリパス
         record_dir = os.path.join(
-            log_root, file_day, filename
+            log_root, file_day, filename, f"{args.compress}"
         )
 
         # ディレクトリ作成
