@@ -1,0 +1,285 @@
+import math
+import hashlib
+from typing import Dict, Optional
+
+import torch
+
+
+def resolve_subtree_level(args, default: Optional[int] = None) -> int:
+    level = int(getattr(args, "train_subtree_level", 0))
+    if level <= 0:
+        if default is None:
+            default = int(getattr(args, "repair_unit_level", max(1, int(getattr(args, "octree_ctx_level", 5)))))
+        level = int(default)
+    return max(level, 1)
+
+
+def resolve_subtree_level_range(args, default: Optional[int] = None):
+    base_level = resolve_subtree_level(args, default=default)
+    jitter = max(int(getattr(args, "train_subtree_level_jitter", 0)), 0)
+    min_level = int(getattr(args, "train_subtree_level_min", 0))
+    max_level = int(getattr(args, "train_subtree_level_max", 0))
+    if min_level <= 0:
+        min_level = max(1, base_level - jitter)
+    if max_level <= 0:
+        max_level = base_level + jitter
+    if min_level > max_level:
+        min_level, max_level = max_level, min_level
+    return {
+        "base": int(base_level),
+        "min": max(int(min_level), 1),
+        "max": max(int(max_level), 1),
+    }
+
+
+def _estimate_subtree_max_level_single(valid_pts: torch.Tensor, qs: float) -> int:
+    offset = valid_pts.amin(dim=1)
+    qpts = torch.round((valid_pts - offset.unsqueeze(1)) / qs).to(torch.long)
+    max_coord = int(qpts.max().detach().cpu()) if qpts.numel() > 0 else 0
+    return max(int(math.ceil(math.log2(max(max_coord + 1, 1)))), 1)
+
+
+def sample_train_subtree_depth(pts_xyz: torch.Tensor, args, global_step: int = 0, cache_key: Optional[str] = None):
+    if pts_xyz.ndim != 3 or pts_xyz.shape[1] != 3:
+        raise ValueError(f"pts_xyz must have shape [B, 3, N], got {tuple(pts_xyz.shape)}")
+
+    qs = max(float(getattr(args, "qs", 2.0)), 1e-9)
+    level_range = resolve_subtree_level_range(args)
+    data_max_level = None
+    for b in range(pts_xyz.shape[0]):
+        pts_b = pts_xyz[b].to(torch.float32)
+        finite_mask = torch.isfinite(pts_b).all(dim=0)
+        if finite_mask.any():
+            valid_pts = torch.nan_to_num(pts_b[:, finite_mask], nan=0.0, posinf=0.0, neginf=0.0)
+        else:
+            valid_pts = pts_b.new_zeros((3, 1))
+        max_level_b = _estimate_subtree_max_level_single(valid_pts, qs)
+        data_max_level = max_level_b if data_max_level is None else min(data_max_level, max_level_b)
+
+    if data_max_level is None:
+        data_max_level = level_range["base"]
+    explicit_range = int(getattr(args, "train_subtree_level_min", 0)) > 0 or int(getattr(args, "train_subtree_level_max", 0)) > 0
+    use_full_random_range = (
+        bool(getattr(args, "train_subtree_randomize_level", False))
+        and bool(getattr(args, "train_subtree_random_full_range", True))
+        and not explicit_range
+    )
+    if use_full_random_range:
+        min_level = 1
+        max_level = max(1, int(data_max_level))
+    else:
+        min_level = max(1, min(level_range["min"], data_max_level))
+        max_level = max(min_level, min(level_range["max"], data_max_level))
+    chosen = max(min(level_range["base"], max_level), min_level)
+
+    if bool(getattr(args, "train_subtree_randomize_level", False)) and max_level > min_level:
+        mode = str(getattr(args, "train_subtree_level_sampling", "uniform_random")).strip().lower()
+        span = max_level - min_level + 1
+        if mode == "coverage_cycle":
+            chosen = min_level + (int(global_step) % span)
+        elif mode == "uniform_random":
+            seed_text = f"{cache_key or ''}|step={int(global_step)}|seed={int(getattr(args, 'seed', 0))}"
+            seed_value = int(hashlib.sha1(seed_text.encode("utf-8")).hexdigest()[:16], 16)
+            chosen = min_level + (seed_value % span)
+        else:
+            raise ValueError(
+                "--train_subtree_level_sampling must be one of: uniform_random, coverage_cycle "
+                f"(got {mode})"
+            )
+
+    return {
+        "depth": int(chosen),
+        "base_depth": int(level_range["base"]),
+        "min_depth": int(min_level),
+        "max_depth": int(max_level),
+        "data_max_depth": int(data_max_level),
+    }
+
+
+def should_use_full_cloud_anchor(args, global_step: int = 0, cache_key: Optional[str] = None):
+    """Return whether this step should train on the full cloud instead of one subtree."""
+    step = int(global_step)
+    interval = max(int(getattr(args, "train_patch_subset_anchor_interval", 0)), 0)
+    if interval > 0 and ((step + 1) % interval) == 0:
+        return True, "interval"
+
+    prob = float(getattr(args, "train_subtree_full_cloud_prob", 0.0))
+    if prob <= 0.0:
+        return False, "subtree"
+    if prob >= 1.0:
+        return True, "probability"
+
+    seed_text = f"{cache_key or ''}|anchor_step={step}|seed={int(getattr(args, 'seed', 0))}"
+    seed_value = int(hashlib.sha1(seed_text.encode("utf-8")).hexdigest()[:16], 16)
+    threshold = seed_value / float(16 ** 16)
+    if threshold < prob:
+        return True, "probability"
+    return False, "subtree"
+
+
+def build_octree_subtree_reference(pts_xyz: torch.Tensor, args, depth: Optional[int] = None) -> Dict[str, torch.Tensor]:
+    if pts_xyz.ndim != 3 or pts_xyz.shape[1] != 3:
+        raise ValueError(f"pts_xyz must have shape [B, 3, N], got {tuple(pts_xyz.shape)}")
+
+    qs = max(float(getattr(args, "qs", 2.0)), 1e-9)
+    base_depth = resolve_subtree_level(args, default=depth)
+
+    offsets = []
+    max_levels = []
+    depths = []
+    for b in range(pts_xyz.shape[0]):
+        pts_b = pts_xyz[b].to(torch.float32)
+        finite_mask = torch.isfinite(pts_b).all(dim=0)
+        if finite_mask.any():
+            valid_pts = torch.nan_to_num(pts_b[:, finite_mask], nan=0.0, posinf=0.0, neginf=0.0)
+        else:
+            valid_pts = pts_b.new_zeros((3, 1))
+
+        offset_b = valid_pts.amin(dim=1)
+        qpts = torch.round((valid_pts - offset_b.unsqueeze(1)) / qs).to(torch.long)
+        max_level = _estimate_subtree_max_level_single(valid_pts, qs)
+        depth_b = max(1, min(base_depth, max_level))
+
+        offsets.append(offset_b.to(device=pts_xyz.device, dtype=pts_xyz.dtype))
+        max_levels.append(max_level)
+        depths.append(depth_b)
+
+    return {
+        "offset": torch.stack(offsets, dim=0),
+        "max_level": torch.tensor(max_levels, device=pts_xyz.device, dtype=torch.long),
+        "depth": torch.tensor(depths, device=pts_xyz.device, dtype=torch.long),
+        "qs": float(qs),
+    }
+
+
+def assign_octree_subtree_keys(pts_xyz: torch.Tensor, subtree_ref: Dict[str, torch.Tensor]) -> torch.Tensor:
+    if pts_xyz.ndim != 3 or pts_xyz.shape[1] != 3:
+        raise ValueError(f"pts_xyz must have shape [B, 3, N], got {tuple(pts_xyz.shape)}")
+    if subtree_ref is None:
+        raise ValueError("subtree_ref must not be None.")
+
+    offsets = subtree_ref["offset"].to(device=pts_xyz.device, dtype=torch.float32)
+    max_levels = subtree_ref["max_level"].to(device=pts_xyz.device, dtype=torch.long)
+    depths = subtree_ref["depth"].to(device=pts_xyz.device, dtype=torch.long)
+    qs = max(float(subtree_ref.get("qs", 1.0)), 1e-9)
+
+    if offsets.shape[0] != pts_xyz.shape[0]:
+        if offsets.shape[0] == 1 and pts_xyz.shape[0] > 1:
+            offsets = offsets.expand(pts_xyz.shape[0], -1)
+            max_levels = max_levels.expand(pts_xyz.shape[0])
+            depths = depths.expand(pts_xyz.shape[0])
+        else:
+            raise ValueError(
+                f"subtree_ref batch size {offsets.shape[0]} does not match pts batch size {pts_xyz.shape[0]}"
+            )
+
+    keys = []
+    for b in range(pts_xyz.shape[0]):
+        pts_b = pts_xyz[b].to(torch.float32)
+        safe_pts = torch.nan_to_num(pts_b, nan=0.0, posinf=0.0, neginf=0.0)
+        qpts = torch.round((safe_pts - offsets[b].unsqueeze(1)) / qs).to(torch.long).clamp_min_(0)
+        max_level = int(max_levels[b].item())
+        depth = int(depths[b].item())
+        shift = max(max_level - depth, 0)
+        if shift > 0:
+            qpts = torch.bitwise_right_shift(qpts, shift)
+        grid = 1 << depth
+        qpts = qpts.clamp_(0, grid - 1)
+        key_b = qpts[0] + grid * (qpts[1] + grid * qpts[2])
+        invalid_mask = ~torch.isfinite(pts_xyz[b]).all(dim=0)
+        if invalid_mask.any():
+            key_b = key_b.masked_fill(invalid_mask, -1)
+        keys.append(key_b)
+    return torch.stack(keys, dim=0)
+
+
+def subtree_membership_mask(unit_keys: torch.Tensor, selected_keys: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    if unit_keys is None or selected_keys is None:
+        return None
+    selected_keys = selected_keys.to(device=unit_keys.device, dtype=unit_keys.dtype).reshape(-1)
+    if selected_keys.numel() == 0:
+        return torch.zeros_like(unit_keys, dtype=torch.bool)
+    return unit_keys.unsqueeze(-1).eq(selected_keys.view(1, 1, -1)).any(dim=-1)
+
+
+def sorted_unique_subtree_keys(unit_keys: torch.Tensor) -> torch.Tensor:
+    if unit_keys.ndim == 2:
+        if unit_keys.shape[0] != 1:
+            raise ValueError("sorted_unique_subtree_keys currently expects batch size 1.")
+        unit_keys = unit_keys[0]
+    valid = unit_keys[unit_keys >= 0]
+    if valid.numel() == 0:
+        return unit_keys.new_empty((0,), dtype=unit_keys.dtype)
+    return torch.unique(valid, sorted=True)
+
+
+def build_subtree_index_map(unit_keys: torch.Tensor):
+    if unit_keys.ndim == 2:
+        if unit_keys.shape[0] != 1:
+            raise ValueError("build_subtree_index_map currently expects batch size 1.")
+        unit_keys = unit_keys[0]
+    if unit_keys.ndim != 1:
+        raise ValueError(f"unit_keys must be 1D or [1, N], got {tuple(unit_keys.shape)}")
+
+    valid_mask = unit_keys >= 0
+    valid_keys = unit_keys[valid_mask]
+    valid_idx = torch.nonzero(valid_mask, as_tuple=False).flatten()
+    if valid_keys.numel() == 0:
+        return unit_keys.new_empty((0,), dtype=unit_keys.dtype), []
+
+    sorted_keys, order = torch.sort(valid_keys)
+    sorted_idx = valid_idx.index_select(0, order)
+    unique_keys, counts = torch.unique_consecutive(sorted_keys, return_counts=True)
+
+    index_lists = []
+    start = 0
+    for count in counts.detach().cpu().tolist():
+        end = start + int(count)
+        index_lists.append(sorted_idx[start:end])
+        start = end
+    return unique_keys, index_lists
+
+
+def select_octree_subtree_keys(sorted_keys: torch.Tensor, global_step: int, args) -> torch.Tensor:
+    if sorted_keys.ndim != 1:
+        raise ValueError(f"sorted_keys must be 1D, got {tuple(sorted_keys.shape)}")
+    total = int(sorted_keys.numel())
+    if total <= 0:
+        raise ValueError("Subtree subset selection received zero subtrees.")
+
+    sampling = str(getattr(args, "train_patch_subset_sampling", "coverage_cycle")).strip().lower()
+    if sampling != "coverage_cycle":
+        raise ValueError(f"Unsupported train subtree subset sampling mode: {sampling}")
+
+    per_step = int(getattr(args, "train_patch_subset_patches_per_step", total))
+    if per_step < 1:
+        raise ValueError("train_patch_subset_patches_per_step must be >= 1")
+    if per_step >= total:
+        return sorted_keys
+
+    stride = max(int(math.ceil(total / float(per_step))), 1)
+    offset = int(global_step) % stride
+    selected_positions = []
+    seen = set()
+    for class_shift in range(stride):
+        start = (offset + class_shift) % stride
+        for idx in range(start, total, stride):
+            if idx in seen:
+                continue
+            selected_positions.append(idx)
+            seen.add(idx)
+            if len(selected_positions) >= per_step:
+                break
+        if len(selected_positions) >= per_step:
+            break
+
+    if len(selected_positions) < per_step:
+        for idx in range(total):
+            if idx in seen:
+                continue
+            selected_positions.append(idx)
+            if len(selected_positions) >= per_step:
+                break
+
+    selected_idx = torch.tensor(selected_positions, device=sorted_keys.device, dtype=torch.long)
+    return sorted_keys.index_select(0, selected_idx)

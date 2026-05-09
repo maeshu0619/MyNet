@@ -1,0 +1,231 @@
+import math
+
+import torch
+import torch.nn as nn
+
+
+class StructureRepairActuator(nn.Module):
+    """Apply small geometry-preserving movements that realize repair policies.
+
+    The actuator predicts both a small displacement and a point-wise keep/drop
+    gate.  This lets the downstream compression loss reach actual deletion
+    decisions instead of only moving every point.
+    """
+
+    def __init__(self, in_channels, hidden_dim=64, args=None):
+        super().__init__()
+        self.args = args
+        self.offset_head = nn.Sequential(
+            nn.Conv1d(in_channels, hidden_dim, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(hidden_dim, hidden_dim, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(hidden_dim, 3, 1),
+        )
+        self.drop_head = nn.Sequential(
+            nn.Conv1d(in_channels, hidden_dim, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(hidden_dim, hidden_dim, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(hidden_dim, 1, 1),
+        )
+        nn.init.zeros_(self.offset_head[-1].weight)
+        nn.init.zeros_(self.offset_head[-1].bias)
+        nn.init.zeros_(self.drop_head[-1].weight)
+        target_repair_ratio = float(
+            getattr(self.args, "target_repair_ratio", getattr(self.args, "target_disp_ratio", 0.20))
+        )
+        target_drop_ratio = float(getattr(self.args, "target_drop_ratio", 0.01))
+        init_drop = target_drop_ratio / max(target_repair_ratio, 1e-6)
+        init_drop = min(max(init_drop, 1e-4), 0.95)
+        init_drop_bias = math.log(init_drop / max(1.0 - init_drop, 1e-6))
+        nn.init.constant_(self.drop_head[-1].bias, init_drop_bias)
+        self.debug_tensors = {}
+
+    def _max_offset(self, pts_xyz, coord_scale):
+        raw_max = float(getattr(self.args, "max_repair_offset", getattr(self.args, "max_disp_offset", 0.002)))
+        qstep_max = float(getattr(self.args, "max_repair_qstep", 0.25)) * float(getattr(self.args, "qs", 2.0))
+        raw_max = max(raw_max, qstep_max)
+        if coord_scale is None:
+            return pts_xyz.new_full((pts_xyz.shape[0], 1, 1), raw_max)
+        if torch.is_tensor(coord_scale):
+            scale = coord_scale.to(device=pts_xyz.device, dtype=pts_xyz.dtype).reshape(-1, 1, 1)
+            if scale.shape[0] == 1 and pts_xyz.shape[0] > 1:
+                scale = scale.expand(pts_xyz.shape[0], -1, -1)
+            return raw_max / scale.clamp_min(1e-9)
+        return pts_xyz.new_full((pts_xyz.shape[0], 1, 1), raw_max / max(float(coord_scale), 1e-9))
+
+    @staticmethod
+    def _clip_vector(delta, max_norm):
+        norm = torch.linalg.norm(delta, dim=1, keepdim=True).clamp_min(1e-12)
+        scale = (max_norm / norm).clamp_max(1.0)
+        return delta * scale
+
+    @staticmethod
+    def _priority_topk_gate(priority, target_ratio, tau):
+        B, _, N = priority.shape
+        if N <= 0:
+            return priority
+        keep = max(1, min(int(round(float(target_ratio) * float(N))), N))
+        flat = priority.detach().reshape(B, N)
+        threshold = torch.topk(flat, k=keep, dim=1, largest=True).values[:, -1].view(B, 1, 1)
+        return torch.sigmoid((priority - threshold) / max(float(tau), 1e-6))
+
+    @staticmethod
+    def _masked_mean(values, point_mask):
+        if point_mask is None:
+            return values.mean()
+        if point_mask.ndim == 2:
+            point_mask = point_mask.unsqueeze(1)
+        if point_mask.ndim != 3 or point_mask.shape[0] != values.shape[0] or point_mask.shape[2] != values.shape[2]:
+            raise ValueError("point_mask must broadcast to [B, 1, N].")
+        mask = point_mask.to(device=values.device, dtype=values.dtype)
+        denom = mask.sum().clamp_min(1.0)
+        return (values * mask).sum() / denom
+
+    def forward(
+        self,
+        pts_xyz,
+        structure,
+        cause_scores,
+        policy_probs,
+        actuator_features,
+        repair_priority=None,
+        coord_scale=None,
+        selection_mask=None,
+    ):
+        snap_strength = float(getattr(self.args, "repair_snap_strength", getattr(self.args, "disp_snap_strength", 0.35)))
+        max_offset = self._max_offset(pts_xyz, coord_scale)
+        stage = str(getattr(self.args, "training_stage", "joint")).strip().lower()
+        if stage == "diagnosis":
+            actuator_strength = float(getattr(self.args, "diagnosis_actuator_strength", 0.1))
+        else:
+            actuator_strength = float(getattr(self.args, "repair_actuator_strength", 1.0))
+
+        preserve = policy_probs[:, 0:1, :]
+        p_chain = policy_probs[:, 1:2, :]
+        p_sibling = policy_probs[:, 2:3, :]
+        p_parent = policy_probs[:, 3:4, :]
+        p_context = policy_probs[:, 4:5, :]
+        p_comp = policy_probs[:, 5:6, :]
+        p_outlier = policy_probs[:, 6:7, :] if policy_probs.shape[1] > 6 else policy_probs.new_zeros(preserve.shape)
+        base_repair_gate = (1.0 - preserve).clamp(0.0, 1.0)
+        if selection_mask is not None:
+            if selection_mask.ndim == 2:
+                selection_mask = selection_mask.unsqueeze(1)
+            if selection_mask.ndim != 3 or selection_mask.shape[0] != pts_xyz.shape[0] or selection_mask.shape[2] != pts_xyz.shape[2]:
+                raise ValueError("selection_mask must broadcast to [B, 1, N].")
+            selection_mask = selection_mask.to(device=pts_xyz.device, dtype=pts_xyz.dtype)
+            base_repair_gate = base_repair_gate * selection_mask
+        target_ratio = float(getattr(self.args, "target_repair_ratio", getattr(self.args, "target_disp_ratio", 0.20)))
+        if bool(getattr(self.args, "repair_priority_gate", True)) and repair_priority is not None:
+            priority = repair_priority.to(device=pts_xyz.device, dtype=pts_xyz.dtype).clamp(0.0, 1.0)
+            priority_gate = self._priority_topk_gate(
+                priority,
+                target_ratio=max(target_ratio, 1e-4),
+                tau=float(getattr(self.args, "repair_priority_gate_tau", 0.08)),
+            )
+            repair_gate = base_repair_gate * priority_gate
+        else:
+            repair_gate = base_repair_gate
+        if bool(getattr(self.args, "repair_gate_mean_cap", True)):
+            gate_mean = self._masked_mean(repair_gate, selection_mask).detach().clamp_min(1e-6)
+            gate_scale = (target_ratio / gate_mean).clamp_max(1.0)
+            repair_gate = repair_gate * gate_scale
+
+        node_score = cause_scores[:, 0:1, :]
+        single_score = cause_scores[:, 1:2, :]
+        lowprob_score = cause_scores[:, 2:3, :] if cause_scores.shape[1] > 2 else preserve.new_zeros(preserve.shape)
+        shape_idx = 6 if cause_scores.shape[1] > 6 else 5
+        shape_score = cause_scores[:, shape_idx:shape_idx+1, :]
+
+        delete_prior = (
+            0.95 * p_outlier
+            + 0.75 * p_chain
+            + 0.55 * p_sibling
+            + 0.45 * p_parent
+            + 0.20 * p_context
+            + 0.25 * node_score
+            + 0.25 * single_score
+            + 0.15 * lowprob_score
+            - 0.85 * preserve
+            - 0.75 * shape_score
+        )
+        delete_prior = torch.sigmoid(delete_prior.clamp(-8.0, 8.0))
+        learned_drop = torch.sigmoid(self.drop_head(actuator_features))
+        drop_prob = (repair_gate * delete_prior * learned_drop).clamp(0.0, 1.0)
+        keep_prob = (1.0 - drop_prob).clamp(1e-4, 1.0)
+
+        snap_delta = structure["snap_delta"].to(device=pts_xyz.device, dtype=pts_xyz.dtype)
+        learned_delta = torch.tanh(self.offset_head(actuator_features)) * max_offset
+        motion_gate = repair_gate * keep_prob
+
+        # Give each named policy a genuinely different geometric primitive so
+        # the diagnosis/policy path is not only cosmetic.  All paths remain
+        # small and geometry-preserving, but they bias edits differently.
+        delta_chain = snap_strength * 1.20 * snap_delta
+        delta_sibling = snap_strength * 0.60 * snap_delta + 0.40 * learned_delta
+        delta_parent = snap_strength * 0.90 * snap_delta + 0.20 * learned_delta
+        delta_context = 0.85 * learned_delta
+        delta_comp = 0.55 * learned_delta - 0.20 * snap_strength * snap_delta
+        delta_outlier = 0.15 * learned_delta
+
+        primitive_delta = (
+            p_chain * delta_chain
+            + p_sibling * delta_sibling
+            + p_parent * delta_parent
+            + p_context * delta_context
+            + p_comp * delta_comp
+            + p_outlier * delta_outlier
+        )
+        raw_delta = actuator_strength * motion_gate * primitive_delta
+        delta = self._clip_vector(raw_delta, max_offset)
+        pts_out = pts_xyz + delta
+
+        final_w = keep_prob
+        delta_norm = torch.linalg.norm(delta, dim=1, keepdim=True)
+        normalized_delta = delta_norm / max_offset.clamp_min(1e-12)
+        edit_reg = self._masked_mean(normalized_delta.pow(2) * motion_gate.detach(), selection_mask)
+
+        ratio_loss = (self._masked_mean(repair_gate, selection_mask) - target_ratio) ** 2
+        shape_guard = self._masked_mean(repair_gate * cause_scores[:, shape_idx:shape_idx+1, :], selection_mask)
+        target_drop_ratio = float(getattr(self.args, "target_drop_ratio", 0.01))
+        max_drop_ratio = max(float(getattr(self.args, "max_drop_ratio", max(target_drop_ratio, 0.01))), target_drop_ratio)
+        drop_ratio = self._masked_mean(drop_prob, selection_mask)
+        drop_ratio_loss = (drop_ratio - target_drop_ratio) ** 2
+        drop_cap_loss = torch.relu(drop_ratio - max_drop_ratio) ** 2
+        drop_shape_guard = self._masked_mean(drop_prob * shape_score, selection_mask)
+        loss = (
+            edit_reg
+            + float(getattr(self.args, "repair_ratio_weight", 0.1)) * ratio_loss
+            + float(getattr(self.args, "repair_shape_guard_weight", 0.05)) * shape_guard
+            + float(getattr(self.args, "repair_drop_ratio_weight", 1.0)) * (drop_ratio_loss + drop_cap_loss)
+            + float(getattr(self.args, "repair_drop_shape_guard_weight", 0.5)) * drop_shape_guard
+        )
+
+        self.debug_tensors = {
+            "repair_gate": repair_gate.mean().detach(),
+            "delta_norm": delta_norm.mean().detach(),
+            "edit_reg": edit_reg.detach(),
+            "drop_ratio": drop_ratio.detach(),
+            "keep_ratio": keep_prob.mean().detach(),
+            "policy_chain_mean": p_chain.mean().detach(),
+            "policy_sibling_mean": p_sibling.mean().detach(),
+            "policy_parent_mean": p_parent.mean().detach(),
+            "policy_context_mean": p_context.mean().detach(),
+            "policy_comp_mean": p_comp.mean().detach(),
+            "policy_outlier_mean": p_outlier.mean().detach(),
+        }
+        return pts_out, final_w, loss, {
+            "repair_gate": repair_gate,
+            "drop_prob": drop_prob,
+            "keep_prob": keep_prob,
+            "delta": delta,
+            "primitive_delta": primitive_delta,
+            "edit_reg": edit_reg,
+            "ratio_loss": ratio_loss,
+            "shape_guard": shape_guard,
+            "drop_ratio_loss": drop_ratio_loss,
+            "drop_cap_loss": drop_cap_loss,
+            "drop_shape_guard": drop_shape_guard,
+        }
