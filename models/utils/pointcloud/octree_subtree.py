@@ -32,6 +32,26 @@ def resolve_subtree_level_range(args, default: Optional[int] = None):
     }
 
 
+def _effective_subtree_qs(args) -> float:
+    compress_key = (
+        str(getattr(args, "compress", ""))
+        .strip()
+        .lower()
+        .replace("-", "")
+        .replace("_", "")
+        .replace(" ", "")
+    )
+    if compress_key == "sparsepcgc":
+        return max(
+            float(getattr(args, "sparsepcgc_effective_qs", 0.0))
+            or float(getattr(args, "sparsepcgc_voxel_size", 1.0)) * float(getattr(args, "sparsepcgc_pos_quantscale", 1)),
+            1e-9,
+        )
+    if compress_key in {"gpcc", "gpcctmc3"}:
+        return max(float(getattr(args, "gpcc_effective_qs", getattr(args, "qs", 2.0))), 1e-9)
+    return max(float(getattr(args, "qs", 2.0)), 1e-9)
+
+
 def _estimate_subtree_max_level_single(valid_pts: torch.Tensor, qs: float) -> int:
     offset = valid_pts.amin(dim=1)
     qpts = torch.round((valid_pts - offset.unsqueeze(1)) / qs).to(torch.long)
@@ -43,7 +63,7 @@ def sample_train_subtree_depth(pts_xyz: torch.Tensor, args, global_step: int = 0
     if pts_xyz.ndim != 3 or pts_xyz.shape[1] != 3:
         raise ValueError(f"pts_xyz must have shape [B, 3, N], got {tuple(pts_xyz.shape)}")
 
-    qs = max(float(getattr(args, "qs", 2.0)), 1e-9)
+    qs = _effective_subtree_qs(args)
     level_range = resolve_subtree_level_range(args)
     data_max_level = None
     for b in range(pts_xyz.shape[0]):
@@ -70,6 +90,19 @@ def sample_train_subtree_depth(pts_xyz: torch.Tensor, args, global_step: int = 0
     else:
         min_level = max(1, min(level_range["min"], data_max_level))
         max_level = max(min_level, min(level_range["max"], data_max_level))
+    uncapped_min_level = int(min_level)
+    uncapped_max_level = int(max_level)
+    curriculum_phase = 1.0
+    curriculum_steps = 0
+    if bool(getattr(args, "train_subtree_level_curriculum", True)) and max_level > min_level:
+        total_steps = max(int(getattr(args, "_total_train_steps_estimate", 0)), 0)
+        curriculum_fraction = min(max(float(getattr(args, "train_subtree_curriculum_fraction", 0.5)), 0.0), 1.0)
+        curriculum_steps = int(round(float(total_steps) * curriculum_fraction)) if total_steps > 0 else 0
+        if curriculum_steps > 0:
+            curriculum_phase = min(max(float(global_step) / float(curriculum_steps), 0.0), 1.0)
+            depth_span = uncapped_max_level - uncapped_min_level
+            curriculum_max = uncapped_min_level + int(math.floor(float(depth_span) * curriculum_phase + 1e-9))
+            max_level = max(min_level, min(max_level, curriculum_max))
     chosen = max(min(level_range["base"], max_level), min_level)
 
     if bool(getattr(args, "train_subtree_randomize_level", False)) and max_level > min_level:
@@ -92,6 +125,10 @@ def sample_train_subtree_depth(pts_xyz: torch.Tensor, args, global_step: int = 0
         "base_depth": int(level_range["base"]),
         "min_depth": int(min_level),
         "max_depth": int(max_level),
+        "uncapped_min_depth": int(uncapped_min_level),
+        "uncapped_max_depth": int(uncapped_max_level),
+        "curriculum_phase": float(curriculum_phase),
+        "curriculum_steps": int(curriculum_steps),
         "data_max_depth": int(data_max_level),
     }
 
@@ -121,8 +158,8 @@ def build_octree_subtree_reference(pts_xyz: torch.Tensor, args, depth: Optional[
     if pts_xyz.ndim != 3 or pts_xyz.shape[1] != 3:
         raise ValueError(f"pts_xyz must have shape [B, 3, N], got {tuple(pts_xyz.shape)}")
 
-    qs = max(float(getattr(args, "qs", 2.0)), 1e-9)
-    base_depth = resolve_subtree_level(args, default=depth)
+    qs = _effective_subtree_qs(args)
+    base_depth = max(int(depth), 1) if depth is not None else resolve_subtree_level(args)
 
     offsets = []
     max_levels = []

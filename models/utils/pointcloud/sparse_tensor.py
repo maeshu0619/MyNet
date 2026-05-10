@@ -26,14 +26,29 @@ def _voxelize_once(pts_xyz: torch.Tensor, voxel_size: float):
 def _full_sparse_tensor_points(
     pts_xyz: torch.Tensor,
     coord_scale,
-    qs: int,
+    qs: float,
     voxel_scale: float = 1.0,
+    quant_mode: str = "floor_relative",
+    pos_quantscale: int = 1,
 ):
     scale = _normalize_coord_scale_like(pts_xyz, coord_scale)
     voxel_size = max(float(voxel_scale) * float(qs) / max(float(scale.item()), 1e-9), 1e-9)
-    mins = pts_xyz.amin(dim=1, keepdim=True)
-    discrete = torch.floor((pts_xyz - mins) / voxel_size).long()
-    coords_xyz = mins + (discrete.to(dtype=pts_xyz.dtype) + 0.5) * voxel_size
+    quant_mode = str(quant_mode).strip().lower()
+    if quant_mode in {"sparsepcgc_twostep"}:
+        pos_q = max(int(pos_quantscale), 1)
+        first = torch.round(pts_xyz / voxel_size)
+        discrete = torch.round(first / float(pos_q)).long()
+        coords_xyz = discrete.to(dtype=pts_xyz.dtype) * voxel_size * float(pos_q)
+    elif quant_mode in {"round_absolute", "sparsepcgc"}:
+        discrete = torch.round(pts_xyz / voxel_size).long()
+        coords_xyz = discrete.to(dtype=pts_xyz.dtype) * voxel_size
+    elif quant_mode in {"floor_absolute"}:
+        discrete = torch.floor(pts_xyz / voxel_size).long()
+        coords_xyz = (discrete.to(dtype=pts_xyz.dtype) + 0.5) * voxel_size
+    else:
+        mins = pts_xyz.amin(dim=1, keepdim=True)
+        discrete = torch.floor((pts_xyz - mins) / voxel_size).long()
+        coords_xyz = mins + (discrete.to(dtype=pts_xyz.dtype) + 0.5) * voxel_size
     feat = pts_xyz.new_ones((1, int(coords_xyz.shape[-1])))
     return coords_xyz, feat, float(voxel_size)
 
@@ -80,11 +95,13 @@ def build_sparse_point_tensor_single(
     pts_xyz: torch.Tensor,
     coord_scale,
     max_points: int,
-    qs: int,
+    qs: float,
     raw_downsample_factor: float = 1.0,
     voxel_scale: float = 1.0,
     growth: float = 1.5,
     max_iters: int = 8,
+    quant_mode: str = "floor_relative",
+    pos_quantscale: int = 1,
 ) -> Dict[str, torch.Tensor]:
     """
     Build a sparse-tensor-like representation in two stages.
@@ -111,6 +128,8 @@ def build_sparse_point_tensor_single(
         coord_scale=coord_scale,
         qs=qs,
         voxel_scale=voxel_scale,
+        quant_mode=quant_mode,
+        pos_quantscale=pos_quantscale,
     )
     num_points = int(sparse_xyz.shape[-1])
     max_points = max(int(max_points), 0)

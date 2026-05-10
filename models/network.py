@@ -205,6 +205,23 @@ class Network(nn.Module):
             propagated.append(self._propagate_encoder_features(full_xyz_b, coarse_xyz_b, coarse_feat_b))
         return torch.cat(propagated, dim=0)
 
+    def _encoder_sparse_qs_mode_and_pos(self):
+        compress_key = (
+            str(getattr(self.args, "compress", ""))
+            .strip()
+            .lower()
+            .replace("-", "")
+            .replace("_", "")
+            .replace(" ", "")
+        )
+        if compress_key == "sparsepcgc":
+            voxel_size = max(float(getattr(self.args, "sparsepcgc_voxel_size", 1.0)), 1e-9)
+            pos_q = max(int(getattr(self.args, "sparsepcgc_pos_quantscale", 1)), 1)
+            return voxel_size, "sparsepcgc_twostep", pos_q
+        if compress_key in {"gpcc", "gpcctmc3"}:
+            return max(float(getattr(self.args, "gpcc_effective_qs", getattr(self.args, "qs", 2.0))), 1e-9), "floor_relative", 1
+        return max(float(getattr(self.args, "qs", 2.0)), 1e-9), "floor_relative", 1
+
     def _encode(self, pts_xyz, coord_scale=None):
         encoder_input = pts_xyz
         encoder_feat = None
@@ -220,16 +237,19 @@ class Network(nn.Module):
             sparse_full_xyz_list = []
             sparse_feat_list = []
             scale = self._normalize_coord_scale(pts_xyz, coord_scale)
+            sparse_qs, sparse_quant_mode, sparse_pos_q = self._encoder_sparse_qs_mode_and_pos()
             for b in range(pts_xyz.shape[0]):
                 sparse_tensor = build_sparse_point_tensor_single(
                     pts_xyz[b],
                     scale[b:b + 1],
                     max_points=int(getattr(self.args, "encoder_pre_downsample_max_points", 0)),
-                    qs=int(getattr(self.args, "qs", 2)),
+                    qs=sparse_qs,
                     raw_downsample_factor=float(getattr(self.args, "encoder_raw_downsample_factor", 1.0)),
                     voxel_scale=float(getattr(self.args, "encoder_pre_downsample_voxel_scale", 1.0)),
                     growth=float(getattr(self.args, "encoder_pre_downsample_growth", 1.5)),
                     max_iters=int(getattr(self.args, "encoder_pre_downsample_max_iters", 8)),
+                    quant_mode=sparse_quant_mode,
+                    pos_quantscale=sparse_pos_q,
                 )
                 sparse_full_xyz_b = sparse_tensor["sparse_xyz"]
                 sparse_xyz_b = sparse_tensor["coords_xyz"]
@@ -342,6 +362,7 @@ class Network(nn.Module):
                 "feature_dim": int(getattr(self.args, "encoder_input_dim", 3)),
                 "kept_sparse_after_encoder": keep_sparse_path,
                 "raw_downsample_factor": float(getattr(self.args, "encoder_raw_downsample_factor", 1.0)),
+                "sparse_quant_mode": self._encoder_sparse_qs_mode_and_pos()[1],
             }
         return {
             "local_feat": local_feat,
@@ -704,6 +725,15 @@ class Network(nn.Module):
                     "repair_ratio": float(repair_gate.mean().detach().cpu()),
                     "add_ratio": float(actuator_stats.get("add_ratio", pts_xyz.new_zeros(())).detach().cpu()),
                     "add_count": int(actuator_stats.get("add_count", 0)),
+                    "add_effective_count": int(actuator_stats.get("add_effective_count", 0)),
+                    "add_candidate_ratio": float(actuator_stats.get("add_candidate_ratio", 0.0)),
+                    "add_score_noise": float(actuator_stats.get("add_score_noise", 0.0)),
+                    "add_weight_random_mix": float(actuator_stats.get("add_weight_random_mix", 0.0)),
+                    "drop_score_noise": float(actuator_stats.get("drop_score_noise", 0.0)),
+                    "drop_random_mix": float(actuator_stats.get("drop_random_mix", 0.0)),
+                    "add_drop_conflict_loss": float(actuator_stats.get("add_drop_conflict_loss", pts_xyz.new_zeros(())).detach().cpu()),
+                    "added_keep_loss": float(actuator_stats.get("added_keep_loss", pts_xyz.new_zeros(())).detach().cpu()),
+                    "add_min_offset_loss": float(actuator_stats.get("add_min_offset_loss", pts_xyz.new_zeros(())).detach().cpu()),
                     "drop_ratio": float(actuator_stats["drop_prob"].mean().detach().cpu()),
                     "keep_ratio": float(actuator_stats["keep_prob"].mean().detach().cpu()),
                     "delta_norm": float(actuator_stats["delta"].norm(dim=1).mean().detach().cpu()),

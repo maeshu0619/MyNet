@@ -157,11 +157,7 @@ class CompressionLossMixin:
     def _actual_octree_stat_qs(self, args, codec_name):
         codec_key = str(codec_name).strip().lower()
         if codec_key == "sparsepcgc":
-            return max(
-                float(getattr(args, "sparsepcgc_effective_qs", 0.0))
-                or float(getattr(args, "sparsepcgc_voxel_size", 1.0)) * float(getattr(args, "sparsepcgc_pos_quantscale", 1)),
-                1e-9,
-            )
+            return max(float(getattr(args, "sparsepcgc_voxel_size", 1.0)), 1e-9)
         if codec_key == "gpcc":
             return max(float(getattr(args, "gpcc_effective_qs", getattr(args, "qs", 1.0))), 1e-9)
         return max(float(getattr(args, "qs", 1.0)), 1e-9)
@@ -184,6 +180,8 @@ class CompressionLossMixin:
             pts_3n,
             qs=self._actual_octree_stat_qs(args, codec_name),
             max_depth=int(getattr(args, "compression_octree_stat_depth", 0)),
+            quant_mode="sparsepcgc" if codec_name == "sparsepcgc" else "round",
+            pos_quantscale=int(getattr(args, "sparsepcgc_pos_quantscale", 1)) if codec_name == "sparsepcgc" else 1,
         )
         aux_node = float(aux["node_count"])
         aux_single = float(aux["single_child_count"])

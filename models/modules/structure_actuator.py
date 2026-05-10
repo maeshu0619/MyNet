@@ -122,23 +122,74 @@ class StructureRepairActuator(nn.Module):
         denom = mask.sum().clamp_min(1.0)
         return (values * mask).sum() / denom
 
+    def _exploration_phase(self):
+        if not self.training:
+            return 1.0
+        fraction = min(max(float(getattr(self.args, "repair_exploration_fraction", 0.0)), 0.0), 1.0)
+        if fraction <= 0.0:
+            return 1.0
+        total_steps = max(int(getattr(self.args, "_total_train_steps_estimate", 0)), 1)
+        step = min(max(int(getattr(self.args, "_global_train_step", 0)), 0), total_steps)
+        progress = min(float(step) / float(max(total_steps, 1)), 1.0)
+        return min(progress / fraction, 1.0)
+
+    def _annealed_value(self, start_name, end_name, default_start=0.0, default_end=0.0):
+        start = float(getattr(self.args, start_name, default_start))
+        end = float(getattr(self.args, end_name, default_end))
+        phase = self._exploration_phase()
+        return start + (end - start) * phase
+
+    def _max_add_ratio(self):
+        target_ratio = max(float(getattr(self.args, "target_add_ratio", 0.01)), 0.0)
+        max_ratio = max(float(getattr(self.args, "max_add_ratio", max(target_ratio, 0.0))), target_ratio)
+        return max(max_ratio, 0.0)
+
     def _target_add_count(self, point_count):
         if point_count <= 0 or not bool(getattr(self.args, "add", True)):
-            return 0
-        target_ratio = max(float(getattr(self.args, "target_add_ratio", 0.01)), 0.0)
-        max_ratio = max(float(getattr(self.args, "max_add_ratio", max(target_ratio, 0.0))), 0.0)
-        if target_ratio <= 0.0 or max_ratio <= 0.0:
-            return 0
-        max_add_points = max(1, int(max_ratio * float(point_count)))
-        add_points = max(1, int(target_ratio * float(point_count)))
-        return min(add_points, max_add_points, point_count)
+            return 0, 0.0
+        max_ratio = self._max_add_ratio()
+        if max_ratio <= 0.0:
+            return 0, 0.0
+        start = float(getattr(self.args, "repair_add_candidate_ratio_start", 0.0)) or max_ratio
+        end = float(getattr(self.args, "repair_add_candidate_ratio_end", 0.0)) or max_ratio
+        phase = self._exploration_phase()
+        candidate_ratio = start + (end - start) * phase
+        candidate_ratio = min(max(candidate_ratio, 0.0), max_ratio)
+        max_add_points = max(1, int(round(max_ratio * float(point_count))))
+        add_points = int(round(candidate_ratio * float(point_count)))
+        if candidate_ratio > 0.0:
+            add_points = max(add_points, 1)
+        return min(add_points, max_add_points, point_count), float(candidate_ratio)
 
     @staticmethod
-    def _mask_add_scores(add_scores, selection_mask):
+    def _gumbel_like(values):
+        eps = torch.finfo(values.dtype).eps
+        uniform = torch.rand_like(values).clamp(eps, 1.0 - eps)
+        return -torch.log(-torch.log(uniform))
+
+    @staticmethod
+    def _random_ratio_mask_like(values, max_ratio, point_mask=None):
+        max_ratio = max(float(max_ratio), 0.0)
+        if max_ratio <= 0.0:
+            return torch.zeros_like(values)
+        B = values.shape[0]
+        ratios = torch.rand((B, 1, 1), device=values.device, dtype=values.dtype) * min(max_ratio, 1.0)
+        mask = (torch.rand_like(values) < ratios).to(dtype=values.dtype)
+        if point_mask is not None:
+            mask = mask * point_mask.to(device=values.device, dtype=values.dtype)
+        return mask
+
+    @staticmethod
+    def _mask_add_scores(add_scores, selection_mask, keep_prob=None, keep_threshold=0.0):
         if selection_mask is None:
-            return add_scores
-        valid = selection_mask.squeeze(1) if selection_mask.ndim == 3 else selection_mask
-        valid = valid.to(device=add_scores.device, dtype=torch.bool)
+            valid = torch.ones_like(add_scores, dtype=torch.bool)
+        else:
+            valid = selection_mask.squeeze(1) if selection_mask.ndim == 3 else selection_mask
+            valid = valid.to(device=add_scores.device, dtype=torch.bool)
+        if keep_prob is not None and float(keep_threshold) > 0.0:
+            keep = keep_prob.squeeze(1) if keep_prob.ndim == 3 else keep_prob
+            keep = keep.to(device=add_scores.device, dtype=add_scores.dtype)
+            valid = valid & (keep.detach() >= float(keep_threshold))
         masked = add_scores.masked_fill(~valid, -1.0e6)
         all_invalid = ~valid.any(dim=1)
         if bool(all_invalid.any().item()):
@@ -213,9 +264,25 @@ class StructureRepairActuator(nn.Module):
             - 0.85 * preserve
             - 0.75 * shape_score
         )
+        target_drop_ratio = float(getattr(self.args, "target_drop_ratio", 0.01))
+        max_drop_ratio = max(float(getattr(self.args, "max_drop_ratio", max(target_drop_ratio, 0.01))), target_drop_ratio)
         delete_prior = torch.sigmoid(delete_prior.clamp(-8.0, 8.0))
-        learned_drop = torch.sigmoid(self.drop_head(actuator_features))
+        drop_score_noise = max(
+            self._annealed_value("repair_drop_score_noise_start", "repair_drop_score_noise_end"),
+            0.0,
+        )
+        learned_drop_logit = self.drop_head(actuator_features)
+        if self.training and drop_score_noise > 0.0:
+            learned_drop_logit = learned_drop_logit + torch.randn_like(learned_drop_logit) * drop_score_noise
+        learned_drop = torch.sigmoid(learned_drop_logit)
         drop_prob = (repair_gate * delete_prior * learned_drop).clamp(0.0, 1.0)
+        drop_random_mix = min(
+            max(self._annealed_value("repair_drop_random_mix_start", "repair_drop_random_mix_end"), 0.0),
+            1.0,
+        )
+        if self.training and drop_random_mix > 0.0:
+            random_drop = self._random_ratio_mask_like(drop_prob, max_drop_ratio, selection_mask)
+            drop_prob = ((1.0 - drop_random_mix) * drop_prob + drop_random_mix * random_drop).clamp(0.0, 1.0)
         keep_prob = (1.0 - drop_prob).clamp(1e-4, 1.0)
 
         snap_delta = structure["snap_delta"].to(device=pts_xyz.device, dtype=pts_xyz.dtype)
@@ -246,14 +313,26 @@ class StructureRepairActuator(nn.Module):
 
         final_w = keep_prob
         B, _, N = pts_xyz.shape
-        add_k = self._target_add_count(N)
+        add_k, add_candidate_ratio = self._target_add_count(N)
         add_ratio = pts_xyz.new_zeros(())
         add_ratio_loss = pts_xyz.new_zeros(())
         add_shape_guard = pts_xyz.new_zeros(())
         add_offset_reg = pts_xyz.new_zeros(())
+        add_drop_conflict_loss = pts_xyz.new_zeros(())
+        added_keep_loss = pts_xyz.new_zeros(())
+        add_min_offset_loss = pts_xyz.new_zeros(())
         add_prob = pts_xyz.new_zeros((B, 1, N))
         add_priority = add_prob
         add_count_value = 0
+        add_effective_count_value = 0
+        add_score_noise = max(
+            self._annealed_value("repair_add_score_noise_start", "repair_add_score_noise_end"),
+            0.0,
+        )
+        add_weight_random_mix = min(
+            max(self._annealed_value("repair_add_weight_random_mix_start", "repair_add_weight_random_mix_end"), 0.0),
+            1.0,
+        )
         if add_k > 0:
             learned_add_logit = self.add_head(actuator_features)
             add_prior = (
@@ -268,8 +347,16 @@ class StructureRepairActuator(nn.Module):
                 - 0.60 * p_outlier
                 - 0.65 * shape_score
             )
-            add_priority = torch.sigmoid((learned_add_logit + add_prior).clamp(-8.0, 8.0))
-            add_scores = self._mask_add_scores((learned_add_logit + add_prior).squeeze(1), selection_mask)
+            add_logit = learned_add_logit + add_prior
+            if self.training and add_score_noise > 0.0:
+                add_logit = add_logit + self._gumbel_like(add_logit) * add_score_noise
+            add_priority = torch.sigmoid(add_logit.clamp(-8.0, 8.0))
+            add_scores = self._mask_add_scores(
+                add_logit.squeeze(1),
+                selection_mask,
+                keep_prob=keep_prob,
+                keep_threshold=float(getattr(self.args, "add_noop_keep_threshold", 0.5)),
+            )
             add_idx = torch.topk(add_scores.detach(), k=add_k, dim=1, largest=True, sorted=False).indices
             add_idx = torch.sort(add_idx, dim=1).values
             hard_add_mask = torch.zeros_like(add_scores)
@@ -282,7 +369,11 @@ class StructureRepairActuator(nn.Module):
             soft_mean = soft_add_mask.mean(dim=1, keepdim=True).detach().clamp_min(1e-12)
             soft_add_mask = (soft_add_mask * (hard_ratio / soft_mean)).clamp(0.0, 1.0)
             add_mask_st = hard_add_mask - soft_add_mask.detach() + soft_add_mask
-            add_prob = add_mask_st.unsqueeze(1)
+            add_weight_mode = str(getattr(self.args, "repair_add_weight_mode", "hard")).strip().lower()
+            if add_weight_mode == "soft":
+                add_prob = add_mask_st.unsqueeze(1) * add_priority
+            else:
+                add_prob = add_mask_st.unsqueeze(1)
 
             learned_add_delta = torch.tanh(self.add_dir_head(actuator_features)) * max_offset
             center_dir = pts_out - pts_out.mean(dim=2, keepdim=True)
@@ -300,18 +391,41 @@ class StructureRepairActuator(nn.Module):
             added_base = torch.gather(pts_out, 2, idx_expand_xyz)
             added_delta = torch.gather(add_delta_all, 2, idx_expand_xyz)
             added_pts = added_base + added_delta
+            selected_add_strength = torch.gather(add_priority, 2, idx_expand_w)
             added_w = torch.gather(add_prob, 2, idx_expand_w)
+            if add_weight_mode == "soft":
+                added_w = selected_add_strength
+            if self.training and add_weight_random_mix > 0.0:
+                random_w = torch.rand_like(added_w)
+                added_w = ((1.0 - add_weight_random_mix) * added_w + add_weight_random_mix * random_w).clamp(0.0, 1.0)
 
             pts_out = torch.cat([pts_out, added_pts], dim=2)
             final_w = torch.cat([final_w, added_w], dim=2)
 
-            add_ratio = add_prob.mean()
+            add_ratio = added_w.sum() / max(float(B * N), 1.0)
             target_add_ratio = pts_xyz.new_tensor(float(getattr(self.args, "target_add_ratio", 0.01)))
-            add_ratio_loss = (add_prob.mean(dim=2).squeeze(1) - target_add_ratio).pow(2).mean()
+            add_ratio_loss = (add_ratio - target_add_ratio).pow(2)
             add_shape_guard = self._masked_mean(add_prob * shape_score, selection_mask)
+            add_drop_conflict_loss = self._masked_mean(add_prob * drop_prob.detach(), selection_mask)
+            if str(getattr(self.args, "repair_add_weight_mode", "hard")).strip().lower() == "soft":
+                added_keep_loss = (added_w * (1.0 - added_w)).mean()
+            else:
+                added_keep_loss = (1.0 - selected_add_strength).pow(2).mean()
             added_delta_norm = torch.linalg.norm(added_delta, dim=1, keepdim=True) / max_offset.clamp_min(1e-12)
             add_offset_reg = (added_delta_norm.pow(2) * added_w.detach()).sum() / added_w.detach().sum().clamp_min(1.0)
+            min_offset_qstep = max(float(getattr(self.args, "repair_add_min_offset_qstep", 0.20)), 0.0)
+            max_offset_qstep = max(float(getattr(self.args, "max_repair_qstep", 0.25)), min_offset_qstep, 1e-6)
+            min_offset_norm = min(min_offset_qstep / max_offset_qstep, 1.0)
+            if min_offset_norm > 0.0:
+                min_offset_shortfall = torch.relu(added_delta_norm.new_tensor(min_offset_norm) - added_delta_norm).pow(2)
+                add_min_offset_loss = (
+                    min_offset_shortfall * selected_add_strength.detach()
+                ).sum() / selected_add_strength.detach().sum().clamp_min(1.0)
             add_count_value = int(add_k)
+            hardening_threshold = float(
+                getattr(self.args, "operation_count_drop_threshold", getattr(self.args, "test_drop_threshold", 0.5))
+            )
+            add_effective_count_value = int((added_w.detach() >= hardening_threshold).sum().item())
 
         delta_norm = torch.linalg.norm(delta, dim=1, keepdim=True)
         normalized_delta = delta_norm / max_offset.clamp_min(1e-12)
@@ -319,8 +433,6 @@ class StructureRepairActuator(nn.Module):
 
         ratio_loss = (self._masked_mean(repair_gate, selection_mask) - target_ratio) ** 2
         shape_guard = self._masked_mean(repair_gate * cause_scores[:, shape_idx:shape_idx+1, :], selection_mask)
-        target_drop_ratio = float(getattr(self.args, "target_drop_ratio", 0.01))
-        max_drop_ratio = max(float(getattr(self.args, "max_drop_ratio", max(target_drop_ratio, 0.01))), target_drop_ratio)
         drop_ratio = self._masked_mean(drop_prob, selection_mask)
         drop_ratio_loss = (drop_ratio - target_drop_ratio) ** 2
         drop_cap_loss = torch.relu(drop_ratio - max_drop_ratio) ** 2
@@ -334,11 +446,22 @@ class StructureRepairActuator(nn.Module):
             + float(getattr(self.args, "repair_add_ratio_weight", 4.0)) * add_ratio_loss
             + float(getattr(self.args, "repair_add_shape_guard_weight", 0.5)) * add_shape_guard
             + float(getattr(self.args, "repair_add_offset_weight", 0.25)) * add_offset_reg
+            + float(getattr(self.args, "repair_add_drop_conflict_weight", 2.0)) * add_drop_conflict_loss
+            + float(getattr(self.args, "repair_add_keep_weight", 1.0)) * added_keep_loss
+            + float(getattr(self.args, "repair_add_min_offset_weight", 0.5)) * add_min_offset_loss
         )
 
         self.debug_tensors = {
             "repair_gate": repair_gate.mean().detach(),
             "add_ratio": add_ratio.detach(),
+            "add_candidate_ratio": pts_xyz.new_tensor(float(add_candidate_ratio)).detach(),
+            "add_score_noise": pts_xyz.new_tensor(float(add_score_noise)).detach(),
+            "add_weight_random_mix": pts_xyz.new_tensor(float(add_weight_random_mix)).detach(),
+            "drop_score_noise": pts_xyz.new_tensor(float(drop_score_noise)).detach(),
+            "drop_random_mix": pts_xyz.new_tensor(float(drop_random_mix)).detach(),
+            "add_drop_conflict_loss": add_drop_conflict_loss.detach(),
+            "added_keep_loss": added_keep_loss.detach(),
+            "add_min_offset_loss": add_min_offset_loss.detach(),
             "delta_norm": delta_norm.mean().detach(),
             "edit_reg": edit_reg.detach(),
             "drop_ratio": drop_ratio.detach(),
@@ -358,6 +481,12 @@ class StructureRepairActuator(nn.Module):
             "add_priority": add_priority,
             "add_ratio": add_ratio,
             "add_count": add_count_value,
+            "add_effective_count": add_effective_count_value,
+            "add_candidate_ratio": float(add_candidate_ratio),
+            "add_score_noise": float(add_score_noise),
+            "add_weight_random_mix": float(add_weight_random_mix),
+            "drop_score_noise": float(drop_score_noise),
+            "drop_random_mix": float(drop_random_mix),
             "delta": delta,
             "primitive_delta": primitive_delta,
             "edit_reg": edit_reg,
@@ -369,4 +498,7 @@ class StructureRepairActuator(nn.Module):
             "add_ratio_loss": add_ratio_loss,
             "add_shape_guard": add_shape_guard,
             "add_offset_reg": add_offset_reg,
+            "add_drop_conflict_loss": add_drop_conflict_loss,
+            "added_keep_loss": added_keep_loss,
+            "add_min_offset_loss": add_min_offset_loss,
         }

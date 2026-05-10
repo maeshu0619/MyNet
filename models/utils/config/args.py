@@ -4,17 +4,19 @@ import sys
 from pathlib import Path
 from cfgs.utils import str2bool
 
-pretrained_date = "20260508"
-pretrained_time = "190424"
-method_loss = "cd"
+pretrained_date = "20260509"
+pretrained_time = "102820"
+method_com = "OctAttention"
+# method_com = "SparsePCGC"
+# method_com = "G-PCC"
 method_name = "Mine"
 model_name = "best"
 
-# dataname = "8i"
+dataname = "8i"
 # dataname = "MVUB"
-dataname = "UVG"
+# dataname = "UVG"
 
-# dataset_name = "longdress"
+dataset_name = "longdress"
 # dataset_name = "loot"
 # dataset_name = "redandblack"
 # dataset_name = "soldier"
@@ -25,7 +27,7 @@ dataname = "UVG"
 # dataset_name = "ricardo"
 # dataset_name = "sarah"
 
-dataset_name = "BlueBackpack"
+# dataset_name = "BlueBackpack"
 # dataset_name = "CasualSquat"
 # dataset_name = "ElegantDance"
 # dataset_name = "Gymnast"
@@ -77,18 +79,18 @@ def _discover_latest_pretrained_checkpoint(model_stem: str = model_name) -> str:
     if existing:
         latest = max(existing, key=lambda path: path.stat().st_mtime)
         return str(latest.resolve())
-    fallback = _PRETRAINED_ROOT / pretrained_date / f"{pretrained_time}_{method_loss}" / f"{model_stem}.pth"
+    fallback = _PRETRAINED_ROOT / pretrained_date / f"{pretrained_time}_{method_com}" / f"{model_stem}.pth"
     return str(fallback.resolve())
 
 
 def _default_checkpoint_path() -> str:
-    preferred = _PRETRAINED_ROOT / pretrained_date / f"{pretrained_time}_{method_loss}" / f"{model_name}.pth"
+    preferred = _PRETRAINED_ROOT / pretrained_date / f"{pretrained_time}_{method_com}" / f"{model_name}.pth"
     if preferred.is_file():
         return str(preferred.resolve())
     data_root_candidates = sorted(_PRETRAINED_ROOT.glob(f"*/*/{model_name}.pth"))
     if data_root_candidates:
         return str(data_root_candidates[-1].resolve())
-    legacy_preferred = _LEGACY_PRETRAINED_ROOT / pretrained_date / f"{pretrained_time}_{method_loss}" / f"{model_name}.pth"
+    legacy_preferred = _LEGACY_PRETRAINED_ROOT / pretrained_date / f"{pretrained_time}_{method_com}" / f"{model_name}.pth"
     if legacy_preferred.is_file():
         return str(legacy_preferred.resolve())
     return _discover_latest_pretrained_checkpoint(model_stem=model_name)
@@ -245,6 +247,23 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--repair_add_ratio_weight', default=4.0, type=float, help='点追加割合制御損失の重み')
     parser.add_argument('--repair_add_shape_guard_weight', default=0.5, type=float, help='形状保持点の近傍に追加しすぎない正則化')
     parser.add_argument('--repair_add_offset_weight', default=0.25, type=float, help='追加点オフセットの正則化')
+    parser.add_argument('--repair_add_drop_conflict_weight', default=2.0, type=float, help='削除される点を基点に追加する無駄操作へのペナルティ')
+    parser.add_argument('--repair_add_keep_weight', default=1.0, type=float, help='追加した点が推論時hardeningで消えないようにする損失重み')
+    parser.add_argument('--repair_add_min_offset_qstep', default=0.20, type=float, help='追加点が基点と重複しないための最小オフセット(量子化step比)')
+    parser.add_argument('--repair_add_min_offset_weight', default=0.5, type=float, help='追加点オフセットが小さすぎる時のペナルティ重み')
+    parser.add_argument('--add_noop_keep_threshold', default=0.5, type=float, help='このkeep確率未満の点は追加基点から除外する')
+    parser.add_argument('--repair_add_weight_mode', default='hard', type=str, help='追加点のfinal_wをhard/softのどちらで作るか')
+    parser.add_argument('--repair_exploration_fraction', default=0.0, type=float, help='全学習stepのうちadd/drop探索ノイズを残す割合')
+    parser.add_argument('--repair_add_candidate_ratio_start', default=0.0, type=float, help='探索初期の追加候補割合(0ならmax_add_ratio)')
+    parser.add_argument('--repair_add_candidate_ratio_end', default=0.0, type=float, help='探索終了後の追加候補割合(0ならmax_add_ratio)')
+    parser.add_argument('--repair_add_score_noise_start', default=0.0, type=float, help='探索初期に追加位置logitへ入れるGumbelノイズ量')
+    parser.add_argument('--repair_add_score_noise_end', default=0.0, type=float, help='探索終了後に追加位置logitへ入れるGumbelノイズ量')
+    parser.add_argument('--repair_add_weight_random_mix_start', default=0.0, type=float, help='探索初期に追加点final_wへ混ぜるランダム重み割合')
+    parser.add_argument('--repair_add_weight_random_mix_end', default=0.0, type=float, help='探索終了後に追加点final_wへ混ぜるランダム重み割合')
+    parser.add_argument('--repair_drop_score_noise_start', default=0.0, type=float, help='探索初期に削除logitへ入れる正規ノイズ量')
+    parser.add_argument('--repair_drop_score_noise_end', default=0.0, type=float, help='探索終了後に削除logitへ入れる正規ノイズ量')
+    parser.add_argument('--repair_drop_random_mix_start', default=0.0, type=float, help='探索初期に削除確率へ混ぜるランダム削除マスク割合')
+    parser.add_argument('--repair_drop_random_mix_end', default=0.0, type=float, help='探索終了後に削除確率へ混ぜるランダム削除マスク割合')
     parser.add_argument('--repair_priority_gate', default=True, type=str2bool, help='高コスト領域だけを修復対象にする優先度ゲートを使うか')
     parser.add_argument('--repair_priority_gate_tau', default=0.08, type=float, help='修復優先度ゲートの温度')
     parser.add_argument('--repair_gate_mean_cap', default=True, type=str2bool, help='修復対象割合の平均がtarget_repair_ratioを超えないように再スケールするか')
@@ -357,7 +376,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--sparsepcgc_ckptdir_high', default=str(_DEFAULT_SPARSEPCGC_CKPT_SPARSE_HIGH), type=str, help='SparsePCGC sparse high checkpoint')
     parser.add_argument('--sparsepcgc_ckptdir_offset', default=str(_DEFAULT_SPARSEPCGC_CKPT_SPARSE_OFFSET), type=str, help='SparsePCGC offset checkpoint')
     parser.add_argument('--sparsepcgc_offset', default=False, type=str2bool, help='SparsePCGC sparse_lossy_gpccでoffset modelを使うか')
-    parser.add_argument('--sparsepcgc_match_qs', default=True, type=str2bool, help='SparsePCGCの有効量子化幅を--qsに合わせる（明示指定が無い場合）')
+    parser.add_argument('--sparsepcgc_match_qs', default=False, type=str2bool, help='SparsePCGCの有効量子化幅を--qsに合わせる（SparsePCGC本体条件を優先するならFalse）')
     parser.add_argument('--sparsepcgc_voxel_size', default=1.0, type=float, help='SparsePCGC load_sparse_tensorのvoxel_size')
     parser.add_argument('--sparsepcgc_pos_quantscale', default=1, type=int, help='SparsePCGC posQuantscale')
     parser.add_argument('--sparsepcgc_psnr_resolution', default=1023, type=int, help='SparsePCGC lossy評価用PSNR resolution')
@@ -460,6 +479,8 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--train_subtree_level_max', default=0, type=int, help='train時subtree深さの最大値(0ならbase+jitter)')
     parser.add_argument('--train_subtree_random_full_range', default=True, type=str2bool, help='min/max未指定時はデータから推定した全Octree深さ範囲からランダムに選ぶ')
     parser.add_argument('--train_subtree_level_sampling', default='uniform_random', type=str, help='subtree深さサンプリング方法(uniform_random/coverage_cycle)')
+    parser.add_argument('--train_subtree_level_curriculum', default=True, type=str2bool, help='学習前半は浅いsubtree深さから始めて徐々に深くする')
+    parser.add_argument('--train_subtree_curriculum_fraction', default=0.5, type=float, help='全学習stepのうちsubtree深さcurriculumに使う割合')
     parser.add_argument('--train_subtree_min_points', default=4, type=int, help='train時に優先的に選ぶsubtreeの最小点数（満たす候補が無ければフォールバック）')
     parser.add_argument('--train_patch_subset_patches_per_step', default=1, type=int, help='1 stepで処理するsubtree数')
     parser.add_argument('--train_patch_subset_anchor_interval', default=32, type=int, help='subtree subset学習時に何stepごとにfull-cloud anchor学習を挟むか(0なら間隔指定なし)')
@@ -722,6 +743,90 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     args.compression_octree_stat_depth = max(int(getattr(args, "compression_octree_stat_depth", 0)), 0)
     args.compression_octree_stat_force = bool(getattr(args, "compression_octree_stat_force", True))
+    sparsepcgc_backend = compress_key == "sparsepcgc" or args.compression_loss_backend.startswith("sparsepcgc_")
+    if sparsepcgc_backend:
+        if not _cli_option_was_provided("--compression_surrogate_forward_mode"):
+            args.compression_surrogate_forward_mode = "teacher_ste"
+        if not _cli_option_was_provided("--compression_surrogate_refresh_interval"):
+            args.compression_surrogate_refresh_interval = 1
+        if not _cli_option_was_provided("--compression_surrogate_reuse_last_target"):
+            args.compression_surrogate_reuse_last_target = False
+        if not _cli_option_was_provided("--compression_surrogate_train_steps"):
+            args.compression_surrogate_train_steps = max(args.compression_surrogate_train_steps, 4)
+        if not _cli_option_was_provided("--compression_surrogate_warmup_steps"):
+            args.compression_surrogate_warmup_steps = max(args.compression_surrogate_warmup_steps, 4)
+        if not _cli_option_was_provided("--compression_surrogate_aux_node_weight"):
+            args.compression_surrogate_aux_node_weight = max(args.compression_surrogate_aux_node_weight, 0.20)
+        if not _cli_option_was_provided("--compression_surrogate_aux_single_weight"):
+            args.compression_surrogate_aux_single_weight = max(args.compression_surrogate_aux_single_weight, 0.10)
+        if not _cli_option_was_provided("--compression_surrogate_levels"):
+            args.compression_surrogate_levels = "2,4,6,8,10"
+        if not _cli_option_was_provided("--octree_diag_levels"):
+            args.octree_diag_levels = "2,4,6,8,10,12"
+        if not _cli_option_was_provided("--target_add_ratio"):
+            args.target_add_ratio = max(float(getattr(args, "target_add_ratio", 0.0)), 0.015)
+        if not _cli_option_was_provided("--max_add_ratio"):
+            args.max_add_ratio = max(float(getattr(args, "max_add_ratio", 0.0)), 0.06)
+        if not _cli_option_was_provided("--target_drop_ratio"):
+            args.target_drop_ratio = max(float(getattr(args, "target_drop_ratio", 0.0)), 0.03)
+        if not _cli_option_was_provided("--max_drop_ratio"):
+            args.max_drop_ratio = max(float(getattr(args, "max_drop_ratio", 0.0)), 0.08)
+        if not _cli_option_was_provided("--repair_add_ratio_weight"):
+            args.repair_add_ratio_weight = min(float(getattr(args, "repair_add_ratio_weight", 4.0)), 1.0)
+        if not _cli_option_was_provided("--repair_add_keep_weight"):
+            args.repair_add_keep_weight = 0.10
+        if not _cli_option_was_provided("--repair_add_weight_mode"):
+            args.repair_add_weight_mode = "soft"
+        if not _cli_option_was_provided("--repair_exploration_fraction"):
+            args.repair_exploration_fraction = 0.50
+        if not _cli_option_was_provided("--repair_add_candidate_ratio_start"):
+            args.repair_add_candidate_ratio_start = 0.06
+        if not _cli_option_was_provided("--repair_add_candidate_ratio_end"):
+            args.repair_add_candidate_ratio_end = 0.06
+        if not _cli_option_was_provided("--repair_add_score_noise_start"):
+            args.repair_add_score_noise_start = 2.0
+        if not _cli_option_was_provided("--repair_add_score_noise_end"):
+            args.repair_add_score_noise_end = 0.0
+        if not _cli_option_was_provided("--repair_add_weight_random_mix_start"):
+            args.repair_add_weight_random_mix_start = 0.85
+        if not _cli_option_was_provided("--repair_add_weight_random_mix_end"):
+            args.repair_add_weight_random_mix_end = 0.0
+        if not _cli_option_was_provided("--repair_drop_score_noise_start"):
+            args.repair_drop_score_noise_start = 1.0
+        if not _cli_option_was_provided("--repair_drop_score_noise_end"):
+            args.repair_drop_score_noise_end = 0.0
+        if not _cli_option_was_provided("--repair_drop_random_mix_start"):
+            args.repair_drop_random_mix_start = 0.65
+        if not _cli_option_was_provided("--repair_drop_random_mix_end"):
+            args.repair_drop_random_mix_end = 0.0
+        if not _cli_option_was_provided("--max_repair_qstep"):
+            args.max_repair_qstep = max(float(getattr(args, "max_repair_qstep", 0.0)), 0.55)
+        if not _cli_option_was_provided("--train_subtree_level"):
+            args.train_subtree_level = 3
+        if not _cli_option_was_provided("--train_subtree_level_jitter"):
+            args.train_subtree_level_jitter = 1
+        if not _cli_option_was_provided("--train_subtree_random_full_range"):
+            args.train_subtree_random_full_range = False
+        if not _cli_option_was_provided("--train_subtree_level_sampling"):
+            args.train_subtree_level_sampling = "coverage_cycle"
+        if not _cli_option_was_provided("--train_subtree_level_curriculum"):
+            args.train_subtree_level_curriculum = True
+        if not _cli_option_was_provided("--train_subtree_curriculum_fraction"):
+            args.train_subtree_curriculum_fraction = 0.50
+        if not _cli_option_was_provided("--train_subtree_min_points"):
+            args.train_subtree_min_points = max(int(getattr(args, "train_subtree_min_points", 1)), 128)
+        if not _cli_option_was_provided("--train_patch_subset_anchor_interval"):
+            args.train_patch_subset_anchor_interval = 8
+        if not _cli_option_was_provided("--train_subtree_full_cloud_prob"):
+            args.train_subtree_full_cloud_prob = max(float(getattr(args, "train_subtree_full_cloud_prob", 0.0)), 0.10)
+        if not _cli_option_was_provided("--compression_grad_probe"):
+            args.compression_grad_probe = True
+        if not _cli_option_was_provided("--compression_grad_probe_every"):
+            args.compression_grad_probe_every = min(max(int(getattr(args, "compression_grad_probe_every", 10)), 1), 8)
+        if not _cli_option_was_provided("--debug_grad_flow"):
+            args.debug_grad_flow = True
+        if not _cli_option_was_provided("--debug_grad_flow_rate"):
+            args.debug_grad_flow_rate = 8
 
     args.encoder_pre_downsample_mode = str(args.encoder_pre_downsample_mode).strip().lower()
     if args.encoder_pre_downsample_mode not in {"voxel"}:
@@ -792,9 +897,33 @@ def parse_pugan_args(parser, file_day, file_time):
             "--train_subtree_level_sampling must be one of: uniform_random, coverage_cycle "
             f"(got {args.train_subtree_level_sampling})"
         )
+    args.train_subtree_level_curriculum = bool(getattr(args, "train_subtree_level_curriculum", True))
+    args.train_subtree_curriculum_fraction = min(
+        max(float(getattr(args, "train_subtree_curriculum_fraction", 0.5)), 0.0),
+        1.0,
+    )
     args.train_subtree_random_full_range = bool(getattr(args, "train_subtree_random_full_range", True))
     args.train_subtree_min_points = max(int(getattr(args, "train_subtree_min_points", 1)), 1)
     args.train_subtree_stat_log_limit = max(int(getattr(args, "train_subtree_stat_log_limit", 16)), 0)
+    args.add_noop_keep_threshold = min(max(float(getattr(args, "add_noop_keep_threshold", 0.5)), 0.0), 1.0)
+    args.repair_add_drop_conflict_weight = max(float(getattr(args, "repair_add_drop_conflict_weight", 0.0)), 0.0)
+    args.repair_add_keep_weight = max(float(getattr(args, "repair_add_keep_weight", 0.0)), 0.0)
+    args.repair_add_min_offset_qstep = max(float(getattr(args, "repair_add_min_offset_qstep", 0.0)), 0.0)
+    args.repair_add_min_offset_weight = max(float(getattr(args, "repair_add_min_offset_weight", 0.0)), 0.0)
+    args.repair_add_weight_mode = str(getattr(args, "repair_add_weight_mode", "hard")).strip().lower()
+    if args.repair_add_weight_mode not in {"hard", "soft"}:
+        raise ValueError("--repair_add_weight_mode must be hard or soft")
+    args.repair_exploration_fraction = min(max(float(getattr(args, "repair_exploration_fraction", 0.0)), 0.0), 1.0)
+    args.repair_add_candidate_ratio_start = max(float(getattr(args, "repair_add_candidate_ratio_start", 0.0)), 0.0)
+    args.repair_add_candidate_ratio_end = max(float(getattr(args, "repair_add_candidate_ratio_end", 0.0)), 0.0)
+    args.repair_add_score_noise_start = max(float(getattr(args, "repair_add_score_noise_start", 0.0)), 0.0)
+    args.repair_add_score_noise_end = max(float(getattr(args, "repair_add_score_noise_end", 0.0)), 0.0)
+    args.repair_add_weight_random_mix_start = min(max(float(getattr(args, "repair_add_weight_random_mix_start", 0.0)), 0.0), 1.0)
+    args.repair_add_weight_random_mix_end = min(max(float(getattr(args, "repair_add_weight_random_mix_end", 0.0)), 0.0), 1.0)
+    args.repair_drop_score_noise_start = max(float(getattr(args, "repair_drop_score_noise_start", 0.0)), 0.0)
+    args.repair_drop_score_noise_end = max(float(getattr(args, "repair_drop_score_noise_end", 0.0)), 0.0)
+    args.repair_drop_random_mix_start = min(max(float(getattr(args, "repair_drop_random_mix_start", 0.0)), 0.0), 1.0)
+    args.repair_drop_random_mix_end = min(max(float(getattr(args, "repair_drop_random_mix_end", 0.0)), 0.0), 1.0)
     args.ckpt = _resolve_repo_or_cwd_path(args.ckpt)
     args.octattention_ckpt = _resolve_repo_or_cwd_path(args.octattention_ckpt)
     args.sparsepcgc_root = _resolve_repo_or_cwd_path(args.sparsepcgc_root)

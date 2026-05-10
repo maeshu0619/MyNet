@@ -3,7 +3,7 @@ import math
 import torch
 
 
-def hard_octree_occupancy_stats(pts_3n, qs=1.0, max_depth=0):
+def hard_octree_occupancy_stats(pts_3n, qs=1.0, max_depth=0, quant_mode="round", pos_quantscale=1):
     if pts_3n.ndim != 2 or pts_3n.shape[0] != 3:
         raise ValueError(f"pts_3n must have shape [3, N], got {tuple(pts_3n.shape)}")
 
@@ -23,7 +23,15 @@ def hard_octree_occupancy_stats(pts_3n, qs=1.0, max_depth=0):
         }
 
     qs = max(float(qs), 1e-9)
-    q = torch.round(pts / qs).to(torch.long)
+    quant_mode = str(quant_mode).strip().lower()
+    if quant_mode == "sparsepcgc":
+        pos_q = max(int(pos_quantscale), 1)
+        q = torch.round(pts / qs)
+        if pos_q != 1:
+            q = torch.round(q / float(pos_q))
+        q = q.to(torch.long)
+    else:
+        q = torch.round(pts / qs).to(torch.long)
     q = q - q.amin(dim=1, keepdim=True)
     coords = torch.unique(q.transpose(0, 1).contiguous(), dim=0, sorted=False)
     if coords.numel() == 0:

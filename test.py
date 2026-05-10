@@ -374,6 +374,10 @@ def _aggregate_structure_debug_chunks(chunks):
     merged["operation_by_cause"] = _merge_operation_by_cause(chunks)
     merged["policy_entropy"] = float(np.mean([float(chunk.get("policy_entropy", 0.0)) for chunk in chunks]))
     merged["policy_diversity"] = max(int(chunk.get("policy_diversity", 0)) for chunk in chunks)
+    for key in ("add_ratio", "drop_ratio", "keep_ratio", "add_candidate_ratio"):
+        merged[key] = float(np.mean([float(chunk.get(key, 0.0)) for chunk in chunks]))
+    for key in ("add_count", "add_effective_count"):
+        merged[key] = int(sum(int(chunk.get(key, 0)) for chunk in chunks))
     merged["octree_level_debug"] = _merge_octree_level_debug(chunks)
     merged["chunk_count"] = len(chunks)
     return merged
@@ -392,6 +396,9 @@ def _write_structure_decision_debug(writer, prefix, structure_debug):
         f"policy_entropy={float(structure_debug.get('policy_entropy', 0.0)):.6f}, "
         f"policy_diversity={int(structure_debug.get('policy_diversity', 0))}, "
         f"chunks={int(structure_debug.get('chunk_count', 1))}, "
+        f"add_ratio={float(structure_debug.get('add_ratio', 0.0)):.6f}, "
+        f"add_count={int(structure_debug.get('add_count', 0))}, "
+        f"add_effective_count={int(structure_debug.get('add_effective_count', 0))}, "
         f"cause_mean=[{_format_named_float_map(cause_mean)}], "
         f"policy_mean=[{_format_named_float_map(policy_mean)}]"
     )
@@ -521,6 +528,7 @@ def _compute_drop_hardening(final_w, args):
     total_count = int(flat_w.numel())
     keep_mask = flat_w >= drop_th
     keep_count = int(keep_mask.sum().item())
+    expected_keep = None
     hardening_mode = "threshold"
 
     if total_count > 0 and (keep_count <= 0 or keep_count >= total_count):
@@ -538,7 +546,44 @@ def _compute_drop_hardening(final_w, args):
         "threshold": drop_th,
         "keep_count": keep_count,
         "total_count": total_count,
+        "expected_keep": expected_keep,
+        "above_threshold": int((flat_w >= drop_th).sum().item()),
+        "weight_min": float(flat_w.min().detach().cpu()) if total_count > 0 else None,
+        "weight_mean": float(flat_w.mean().detach().cpu()) if total_count > 0 else None,
+        "weight_max": float(flat_w.max().detach().cpu()) if total_count > 0 else None,
     }
+
+
+def _summarize_hardening_counts(input_points, pre_output_points, keep_mask):
+    input_points = int(input_points)
+    pre_output_points = int(pre_output_points)
+    candidate_added = max(pre_output_points - input_points, 0)
+    if keep_mask is None or int(keep_mask.numel()) == 0:
+        kept_original = min(input_points, pre_output_points)
+        kept_added = candidate_added
+    else:
+        flat_keep = keep_mask.reshape(-1)
+        original_end = min(input_points, int(flat_keep.numel()), pre_output_points)
+        added_start = min(input_points, int(flat_keep.numel()), pre_output_points)
+        added_end = min(input_points + candidate_added, int(flat_keep.numel()), pre_output_points)
+        kept_original = int(flat_keep[:original_end].sum().item()) if original_end > 0 else 0
+        kept_added = int(flat_keep[added_start:added_end].sum().item()) if added_end > added_start else 0
+    deleted_original = max(input_points - kept_original, 0)
+    deleted_added = max(candidate_added - kept_added, 0)
+    return {
+        "candidate_added": int(candidate_added),
+        "kept_original": int(kept_original),
+        "deleted_original": int(deleted_original),
+        "kept_added": int(kept_added),
+        "deleted_added": int(deleted_added),
+        "net_change_after_hardening": int(kept_added - deleted_original),
+    }
+
+
+def _format_optional_float(value, digits=6):
+    if value is None:
+        return "None"
+    return f"{float(value):.{digits}f}"
 
 
 def _summarize_point_edits(input_xyz, pre_harden_gen_pts, final_gen_pts, edit_ref_xyz, keep_mask, args):
@@ -995,6 +1040,14 @@ def test(model, loss, args, writer):
             f"device={getattr(args, 'sparsepcgc_device', 'auto')}, "
             f"skip_decode={bool(getattr(args, 'sparsepcgc_skip_decode', True))}"
         )
+        writer.write(
+            "SparsePCGC Quantization Alignment: "
+            "teacher=round(x/voxel_size)->unique->round(coord/posQuantscale)->unique, "
+            "network_sparse_quant=sparsepcgc_twostep, "
+            f"voxel_size={float(getattr(args, 'sparsepcgc_voxel_size', 1.0))}, "
+            f"pos_quantscale={int(getattr(args, 'sparsepcgc_pos_quantscale', 1))}, "
+            f"effective_qs={float(getattr(args, 'sparsepcgc_effective_qs', 0.0))}"
+        )
     if str(getattr(args, "compression_loss_backend", "proxy")).strip().lower().startswith("gpcc"):
         writer.write(
             "G-PCC Teacher: "
@@ -1024,6 +1077,13 @@ def test(model, loss, args, writer):
         f"patch_budget_test={int(getattr(args, 'patch_parallel_points_budget_test', 0))}"
     )
     writer.write(f"Requested Inference Mode: {args.test_inference_mode}")
+    writer.write(
+        "Repair Inference: "
+        f"add_weight_mode={getattr(args, 'repair_add_weight_mode', 'hard')}, "
+        f"target_add_ratio={float(getattr(args, 'target_add_ratio', 0.0))}, "
+        f"max_add_ratio={float(getattr(args, 'max_add_ratio', 0.0))}, "
+        f"drop_threshold={float(getattr(args, 'test_drop_threshold', 0.5))}"
+    )
     writer.write(
         "Quality Metrics: "
         f"max_points={int(getattr(args, 'test_metric_max_points', 8192))}, "
@@ -1214,6 +1274,31 @@ def test(model, loss, args, writer):
             )
             print(point_msg)
             writer.write(point_msg)
+            hardening_counts = _summarize_hardening_counts(
+                input_points=input_points,
+                pre_output_points=int(pre_harden_gen_pts.shape[-1]),
+                keep_mask=keep_mask,
+            )
+            hardening_msg = (
+                "HardeningStats: "
+                f"mode={hardening_info.get('mode', 'none')}, "
+                f"threshold={float(hardening_info.get('threshold', 0.5)):.4f}, "
+                f"keep={hardening_info.get('keep_count')}/{hardening_info.get('total_count')}, "
+                f"above_threshold={hardening_info.get('above_threshold')}, "
+                f"expected_keep={hardening_info.get('expected_keep')}, "
+                f"w[min/mean/max]="
+                f"{_format_optional_float(hardening_info.get('weight_min'))}/"
+                f"{_format_optional_float(hardening_info.get('weight_mean'))}/"
+                f"{_format_optional_float(hardening_info.get('weight_max'))}, "
+                f"candidate_added={hardening_counts['candidate_added']}, "
+                f"kept_original={hardening_counts['kept_original']}, "
+                f"deleted_original={hardening_counts['deleted_original']}, "
+                f"kept_added={hardening_counts['kept_added']}, "
+                f"deleted_added={hardening_counts['deleted_added']}, "
+                f"net_change_after_hardening={hardening_counts['net_change_after_hardening']}"
+            )
+            print(hardening_msg)
+            writer.write(hardening_msg)
 
             base_model = model.module if hasattr(model, "module") else model
             encoder_debug = {}
@@ -1456,7 +1541,7 @@ if __name__ == '__main__':
     
     # ログのセットアップ
     writer = Writing(
-        args, 
+        args,
         file_day,
         file_time,
         filename="MyNetwork_test",

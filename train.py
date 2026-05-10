@@ -129,11 +129,7 @@ def _write_structure_decision_debug(writer, prefix, structure_debug):
 def _compression_stat_qs(args):
     codec = str(getattr(args, "compress", "OctAttention")).strip().lower().replace("_", "").replace("-", "")
     if codec == "sparsepcgc":
-        return max(
-            float(getattr(args, "sparsepcgc_effective_qs", 0.0))
-            or float(getattr(args, "sparsepcgc_voxel_size", 1.0)) * float(getattr(args, "sparsepcgc_pos_quantscale", 1)),
-            1e-9,
-        )
+        return max(float(getattr(args, "sparsepcgc_voxel_size", 1.0)), 1e-9)
     if codec == "gpcc":
         return max(float(getattr(args, "gpcc_effective_qs", getattr(args, "qs", 1.0))), 1e-9)
     return max(float(getattr(args, "qs", 1.0)), 1e-9)
@@ -160,6 +156,10 @@ def _summarize_subtree_octree_stats(input_xyz, groups, args):
             pts,
             qs=qs,
             max_depth=int(getattr(args, "compression_octree_stat_depth", 0)),
+            quant_mode="sparsepcgc"
+            if str(getattr(args, "compress", "")).strip().lower().replace("-", "").replace("_", "") == "sparsepcgc"
+            else "round",
+            pos_quantscale=int(getattr(args, "sparsepcgc_pos_quantscale", 1)),
         )
         nodes.append(float(stats["node_count"]))
         singles.append(float(stats["single_child_count"]))
@@ -186,6 +186,7 @@ def train(model, args, loss, writer, plot, notifier=None):
     writer.write(f"Total seq directories: {num_seq}")
     seq_datasets = [(seq_dir, PlyDirDataset(args, seq_dir)) for seq_dir in seq_dirs]
     total_train_files = sum(len(dataset) for _, dataset in seq_datasets)
+    args._total_train_steps_estimate = max(int(getattr(args, "episodes", 1)), 1) * max(int(total_train_files), 1)
     set_cache_expected = getattr(model, "set_expected_input_cache_entries", None)
     if callable(set_cache_expected):
         set_cache_expected(total_train_files)
@@ -412,6 +413,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                             f"depth={int(subtree_depth_meta['depth'])} "
                             f"(base={int(subtree_depth_meta['base_depth'])}, "
                             f"range={int(subtree_depth_meta['min_depth'])}-{int(subtree_depth_meta['max_depth'])}, "
+                            f"uncapped_range={int(subtree_depth_meta.get('uncapped_min_depth', subtree_depth_meta['min_depth']))}-"
+                            f"{int(subtree_depth_meta.get('uncapped_max_depth', subtree_depth_meta['max_depth']))}, "
+                            f"curriculum_phase={float(subtree_depth_meta.get('curriculum_phase', 1.0)):.3f}, "
                             f"data_max={int(subtree_depth_meta['data_max_depth'])}), "
                             f"selected={selected_subtree_count}/{eligible_subtree_count} eligible "
                             f"(total={total_subtree_count}, min_points={min_subtree_points}), "
@@ -459,13 +463,13 @@ def train(model, args, loss, writer, plot, notifier=None):
                                     subtree_ref=subtree_ref,
                                     selected_subtree_keys=None,
                                 )
-                            if final_w_sub is not None and not torch.isfinite(final_w_sub).all():
+                            if final_w is not None and not torch.isfinite(final_w).all():
                                 writer.write(
-                                    "Warning: final_w_sub contains NaN/Inf. "
-                                    "It will be sanitized before point-edit summary."
+                                    "Warning: final_w contains NaN/Inf. "
+                                    "It will be sanitized before point-edit summary and losses."
                                 )
-                                final_w_sub = torch.nan_to_num(final_w_sub, nan=0.0, posinf=1.0, neginf=0.0)
-                                final_w_sub = final_w_sub.clamp(0.0, 1.0)
+                                final_w = torch.nan_to_num(final_w, nan=0.0, posinf=1.0, neginf=0.0)
+                                final_w = final_w.clamp(0.0, 1.0)
                             if detail_log_this_step:
                                 base_model = model.module if hasattr(model, "module") else model
                                 encoder_debug_chunks.append(dict(getattr(base_model, "last_encoder_debug", {}) or {}))
@@ -990,7 +994,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                         f"actual_bit_percent={float(comp_debug.get('actual_total_bit_percent', comp_debug.get('total_bit', 0.0))):.6f}, "
                         f"objective={float(comp_debug.get('compression_objective', comp_debug.get('total_bit', 0.0))):.6f}, "
                         f"surrogate_bit_percent={float(comp_debug.get('surrogate_pred_bit', 0.0)):.6f}, "
+                        f"surrogate_target_bit={float(comp_debug.get('surrogate_target_bit', 0.0)):.6f}, "
                         f"surrogate_abs_bit_error={float(comp_debug.get('surrogate_abs_bit_error', 0.0)):.6f}, "
+                        f"surrogate_train_loss={float(comp_debug.get('surrogate_train_loss', 0.0)):.6f}, "
                         f"soft_node={float(comp_debug.get('soft_node_percent', 0.0)):.6f}, "
                         f"soft_single={float(comp_debug.get('soft_single_percent', 0.0)):.6f}, "
                         f"octree_node:{float(comp_debug.get('gt_octree_node', 0.0)):.1f}->{float(comp_debug.get('gen_octree_node', 0.0)):.1f}, "
@@ -1007,6 +1013,15 @@ def train(model, args, loss, writer, plot, notifier=None):
                             f"repair_ratio={float(structure_debug.get('repair_ratio', 0.0)):.6f}, "
                             f"add_ratio={float(structure_debug.get('add_ratio', 0.0)):.6f}, "
                             f"add_count={int(structure_debug.get('add_count', 0))}, "
+                            f"add_effective_count={int(structure_debug.get('add_effective_count', 0))}, "
+                            f"add_candidate_ratio={float(structure_debug.get('add_candidate_ratio', 0.0)):.6f}, "
+                            f"add_noise={float(structure_debug.get('add_score_noise', 0.0)):.4f}, "
+                            f"add_weight_mix={float(structure_debug.get('add_weight_random_mix', 0.0)):.4f}, "
+                            f"drop_noise={float(structure_debug.get('drop_score_noise', 0.0)):.4f}, "
+                            f"drop_mix={float(structure_debug.get('drop_random_mix', 0.0)):.4f}, "
+                            f"add_drop_conflict={float(structure_debug.get('add_drop_conflict_loss', 0.0)):.6f}, "
+                            f"added_keep_loss={float(structure_debug.get('added_keep_loss', 0.0)):.6f}, "
+                            f"add_min_offset_loss={float(structure_debug.get('add_min_offset_loss', 0.0)):.6f}, "
                             f"drop_ratio={float(structure_debug.get('drop_ratio', 0.0)):.6f}, "
                             f"keep_ratio={float(structure_debug.get('keep_ratio', 0.0)):.6f}, "
                             f"delta_norm={float(structure_debug.get('delta_norm', 0.0)):.6f}"
@@ -1287,7 +1302,7 @@ if __name__ == '__main__':
     
     # ログのセットアップ
     writer = Writing(
-        args, 
+        args,
         file_day,
         file_time,
         filename="MyNetwork_train",
@@ -1310,6 +1325,13 @@ if __name__ == '__main__':
         "Optimization Modes: "
         f"geometry={'ste_hard' if args.discrete_loss_mode == 'ste_hard' else ('weighted_soft' if args.discrete_loss_mode == 'weighted_soft' else 'hard')}, "
         f"compression={args.compression_loss_backend}"
+    )
+    writer.write(
+        "Gradient Diagnostics: "
+        f"compression_grad_probe={bool(getattr(args, 'compression_grad_probe', False))}"
+        f"(every={int(getattr(args, 'compression_grad_probe_every', 1))}), "
+        f"debug_grad_flow={bool(getattr(args, 'debug_grad_flow', False))}"
+        f"(rate={int(getattr(args, 'debug_grad_flow_rate', 1))})"
     )
     compression_backend = str(getattr(args, "compression_loss_backend", "proxy")).strip().lower()
     actual_total_bit_backend = compression_backend in {
@@ -1402,6 +1424,8 @@ if __name__ == '__main__':
         f"train_subtree_level_max={int(getattr(args, 'train_subtree_level_max', 0))}, "
         f"train_subtree_random_full_range={bool(getattr(args, 'train_subtree_random_full_range', False))}, "
         f"train_subtree_level_sampling={getattr(args, 'train_subtree_level_sampling', 'uniform_random')}, "
+        f"train_subtree_level_curriculum={bool(getattr(args, 'train_subtree_level_curriculum', True))}, "
+        f"train_subtree_curriculum_fraction={float(getattr(args, 'train_subtree_curriculum_fraction', 0.5))}, "
         f"train_patch_subset_patches_per_step={int(getattr(args, 'train_patch_subset_patches_per_step', 0))}, "
         f"train_patch_subset_anchor_interval={int(getattr(args, 'train_patch_subset_anchor_interval', 0))}, "
         f"train_subtree_full_cloud_prob={float(getattr(args, 'train_subtree_full_cloud_prob', 0.0))}, "
@@ -1417,6 +1441,23 @@ if __name__ == '__main__':
         "Point Edit Count Thresholds: "
         f"drop_keep_threshold={float(getattr(args, 'operation_count_drop_threshold', 0.5))}, "
         f"adjust_threshold={float(getattr(args, 'operation_count_adjust_threshold', 1e-6))}"
+    )
+    writer.write(
+        "Repair Exploration: "
+        f"add_weight_mode={getattr(args, 'repair_add_weight_mode', 'hard')}, "
+        f"target_add_ratio={float(getattr(args, 'target_add_ratio', 0.0))}, "
+        f"max_add_ratio={float(getattr(args, 'max_add_ratio', 0.0))}, "
+        f"explore_fraction={float(getattr(args, 'repair_exploration_fraction', 0.0))}, "
+        f"add_candidate_ratio={float(getattr(args, 'repair_add_candidate_ratio_start', 0.0))}"
+        f"->{float(getattr(args, 'repair_add_candidate_ratio_end', 0.0))}, "
+        f"add_score_noise={float(getattr(args, 'repair_add_score_noise_start', 0.0))}"
+        f"->{float(getattr(args, 'repair_add_score_noise_end', 0.0))}, "
+        f"add_weight_mix={float(getattr(args, 'repair_add_weight_random_mix_start', 0.0))}"
+        f"->{float(getattr(args, 'repair_add_weight_random_mix_end', 0.0))}, "
+        f"drop_score_noise={float(getattr(args, 'repair_drop_score_noise_start', 0.0))}"
+        f"->{float(getattr(args, 'repair_drop_score_noise_end', 0.0))}, "
+        f"drop_mix={float(getattr(args, 'repair_drop_random_mix_start', 0.0))}"
+        f"->{float(getattr(args, 'repair_drop_random_mix_end', 0.0))}"
     )
     writer.write(f"Octree Diagnostic Levels: {getattr(args, 'octree_diag_levels', '4,6,8,10,12')}")
     writer.write(f"Step Log Frequency: print_rate={args.print_rate}")
@@ -1436,6 +1477,13 @@ if __name__ == '__main__':
             f"effective_qs={float(getattr(args, 'sparsepcgc_effective_qs', 0.0))}, "
             f"root={getattr(args, 'sparsepcgc_root', '')}, "
             f"skip_decode={bool(getattr(args, 'sparsepcgc_skip_decode', True))}"
+        )
+        writer.write(
+            "SparsePCGC Quantization Alignment: "
+            "teacher=round(x/voxel_size)->unique->round(coord/posQuantscale)->unique, "
+            f"network_sparse_quant=sparsepcgc_twostep, "
+            f"surrogate_effective_qs={float(getattr(args, 'sparsepcgc_effective_qs', 0.0))}, "
+            f"surrogate_levels={getattr(args, 'compression_surrogate_levels', '4,6,8')}"
         )
     if compression_backend.startswith("gpcc"):
         writer.write(
