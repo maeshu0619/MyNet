@@ -57,7 +57,7 @@ class PlotMaker():
         self.step_x_his = []
         self.epo_x_his = []
         self.epi_x_his = []
-        self.edit_keys = ["added_points", "deleted_points", "adjusted_points"]
+        self.edit_keys = ["added_ratio_percent", "deleted_ratio_percent", "adjusted_ratio_percent"]
         self.step_edit_his = [[] for _ in self.edit_keys]
         self.epo_edit_his = [[] for _ in self.edit_keys]
         self.epi_edit_his = [[] for _ in self.edit_keys]
@@ -150,19 +150,21 @@ class PlotMaker():
 
     def _reset_edit_running(self, mode):
         if mode == "epo":
-            self._edit_epo_sums = [0 for _ in self.edit_keys]
+            self._edit_epo_sums = [0.0 for _ in self.edit_keys]
+            self._edit_epo_counts = [0 for _ in self.edit_keys]
             self._edit_epo_steps = 0
         elif mode == "epi":
-            self._edit_epi_sums = [0 for _ in self.edit_keys]
+            self._edit_epi_sums = [0.0 for _ in self.edit_keys]
+            self._edit_epi_counts = [0 for _ in self.edit_keys]
             self._edit_epi_steps = 0
         else:
             raise ValueError(f"Unknown edit running mode: {mode}")
 
     def _edit_running_state(self, mode):
         if mode == "epo":
-            return self._edit_epo_sums, self._edit_epo_steps
+            return self._edit_epo_sums, self._edit_epo_counts, self._edit_epo_steps
         if mode == "epi":
-            return self._edit_epi_sums, self._edit_epi_steps
+            return self._edit_epi_sums, self._edit_epi_counts, self._edit_epi_steps
         raise ValueError(f"Unknown edit running mode: {mode}")
 
     def _set_edit_running_step_count(self, mode, value):
@@ -376,22 +378,25 @@ class PlotMaker():
         edit_stats = edit_stats or {}
         values = []
         for key in self.edit_keys:
-            try:
-                values.append(int(round(float(edit_stats.get(key, 0)))))
-            except (TypeError, ValueError):
-                values.append(0)
+            values.append(self._metric_float(edit_stats.get(key)))
         return values
 
     def _append_edit_history_entry(self, x_history, edit_history, x_value, values):
         x_history.append(int(x_value))
         for idx, value in enumerate(values):
-            edit_history[idx].append(int(value))
+            edit_history[idx].append(self._metric_float(value))
 
     def _accumulate_edit_running(self, mode, values):
-        sums, step_count = self._edit_running_state(mode)
+        sums, counts, step_count = self._edit_running_state(mode)
+        has_any_value = False
         for idx, value in enumerate(values):
-            sums[idx] += int(value)
-        self._set_edit_running_step_count(mode, step_count + 1)
+            if value is None:
+                continue
+            sums[idx] += float(value)
+            counts[idx] += 1
+            has_any_value = True
+        if has_any_value:
+            self._set_edit_running_step_count(mode, step_count + 1)
 
     def record_point_edits(self, mode, x_value, edit_stats=None):
         info = {
@@ -409,8 +414,11 @@ class PlotMaker():
             self._accumulate_edit_running("epi", values)
             return info
         if mode == "epo":
-            values, accepted_steps = self._edit_running_state("epo")
-            values = [int(value) for value in values]
+            sums, counts, accepted_steps = self._edit_running_state("epo")
+            values = [
+                (sum_value / float(count_value)) if count_value > 0 else None
+                for sum_value, count_value in zip(sums, counts)
+            ]
             self._reset_edit_running("epo")
             info["plot_values"] = values
             info["accepted_steps"] = accepted_steps
@@ -420,8 +428,11 @@ class PlotMaker():
             self._append_edit_history_entry(self.epo_edit_x_his, self.epo_edit_his, x_value, values)
             return info
         if mode == "epi":
-            values, accepted_steps = self._edit_running_state("epi")
-            values = [int(value) for value in values]
+            sums, counts, accepted_steps = self._edit_running_state("epi")
+            values = [
+                (sum_value / float(count_value)) if count_value > 0 else None
+                for sum_value, count_value in zip(sums, counts)
+            ]
             self._reset_edit_running("epi")
             info["plot_values"] = values
             info["accepted_steps"] = accepted_steps
@@ -490,7 +501,11 @@ class PlotMaker():
             for step in range(len(x_history)):
                 row = [str(int(x_history[step]))]
                 for metric in edit_history:
-                    row.append(str(int(metric[step])) if step < len(metric) else "")
+                    if step < len(metric):
+                        value = self._metric_float(metric[step])
+                        row.append("" if value is None else f"{value:.10g}")
+                    else:
+                        row.append("")
                 f.write(",".join(row) + "\n")
 
     def _plot_single_axis(self, ax, epochs, values, loss_idx, xl):
@@ -587,14 +602,14 @@ class PlotMaker():
 
         save_path = os.path.join(self.save_dir, f"{filename_front}_point_edits.png")
         edit_titles = {
-            "added_points": "Add",
-            "deleted_points": "Prun",
-            "adjusted_points": "Adjust",
+            "added_ratio_percent": "Add",
+            "deleted_ratio_percent": "Prun",
+            "adjusted_ratio_percent": "Adjust",
         }
         edit_colors = {
-            "added_points": "#2ca02c",
-            "deleted_points": "#d62728",
-            "adjusted_points": "#1f77b4",
+            "added_ratio_percent": "#2ca02c",
+            "deleted_ratio_percent": "#d62728",
+            "adjusted_ratio_percent": "#1f77b4",
         }
         fig, axes = plot_mod.subplots(
             len(self.edit_keys),
@@ -608,8 +623,9 @@ class PlotMaker():
         for ax, key, values in zip(axes, self.edit_keys, edit_history):
             plotted = False
             if values:
-                epochs, plot_values = self._downsample_series(x_values, [int(value) for value in values])
-                if plot_values:
+                plot_values = self._plot_values(values)
+                epochs, plot_values = self._downsample_series(x_values, plot_values)
+                if any(math.isfinite(value) for value in plot_values):
                     ax.plot(
                         epochs,
                         plot_values,
@@ -622,8 +638,9 @@ class PlotMaker():
             if not plotted:
                 ax.text(0.5, 0.5, "no point edit data", ha="center", va="center", transform=ax.transAxes, alpha=0.7)
             ax.set_xlabel(xl)
-            ax.set_ylabel(f"{edit_titles.get(key, key)} Count")
-            ax.set_title(edit_titles.get(key, key))
+            ax.set_ylabel(f"{edit_titles.get(key, key)} Ratio [%]")
+            ax.set_title(f"{edit_titles.get(key, key)} Ratio")
+            ax.axhline(0.0, color="black", linewidth=0.7, alpha=0.4)
             ax.grid(True, alpha=0.35)
             if len(x_history) >= 2:
                 ax.set_xlim(min(x_history), max(x_history))

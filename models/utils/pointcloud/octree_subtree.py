@@ -52,6 +52,42 @@ def _effective_subtree_qs(args) -> float:
     return max(float(getattr(args, "qs", 2.0)), 1e-9)
 
 
+def _percent_range(values, fallback):
+    if isinstance(values, (list, tuple)) and len(values) >= 2:
+        lo, hi = float(values[0]), float(values[1])
+    else:
+        parts = [item.strip() for item in str(values).split(",") if item.strip()]
+        if len(parts) >= 2:
+            lo, hi = float(parts[0]), float(parts[1])
+        else:
+            lo, hi = fallback
+    lo, hi = sorted((lo, hi))
+    lo = min(max(lo, 0.0), 1.0)
+    hi = min(max(hi, 0.0), 1.0)
+    if hi <= 0.0:
+        hi = max(float(fallback[1]), 1e-6)
+    return lo, hi
+
+
+def _sample_depth_from_range(min_level, max_level, args, global_step, cache_key):
+    min_level = int(min_level)
+    max_level = int(max_level)
+    if max_level <= min_level:
+        return max(min_level, 1)
+    mode = str(getattr(args, "train_subtree_level_sampling", "uniform_random")).strip().lower()
+    span = max_level - min_level + 1
+    if mode == "coverage_cycle":
+        return min_level + (int(global_step) % span)
+    if mode == "uniform_random":
+        seed_text = f"{cache_key or ''}|step={int(global_step)}|seed={int(getattr(args, 'seed', 0))}"
+        seed_value = int(hashlib.sha1(seed_text.encode("utf-8")).hexdigest()[:16], 16)
+        return min_level + (seed_value % span)
+    raise ValueError(
+        "--train_subtree_level_sampling must be one of: uniform_random, coverage_cycle "
+        f"(got {mode})"
+    )
+
+
 def _estimate_subtree_max_level_single(valid_pts: torch.Tensor, qs: float) -> int:
     offset = valid_pts.amin(dim=1)
     qpts = torch.round((valid_pts - offset.unsqueeze(1)) / qs).to(torch.long)
@@ -78,6 +114,48 @@ def sample_train_subtree_depth(pts_xyz: torch.Tensor, args, global_step: int = 0
 
     if data_max_level is None:
         data_max_level = level_range["base"]
+    percent_curriculum = (
+        bool(getattr(args, "train_subtree_depth_percent_curriculum", False))
+        and not bool(getattr(args, "_train_subtree_depth_cli_override", False))
+    )
+    if percent_curriculum:
+        total_steps = max(int(getattr(args, "_total_train_steps_estimate", 0)), 0)
+        curriculum_fraction = min(max(float(getattr(args, "train_subtree_curriculum_fraction", 1.0)), 0.0), 1.0)
+        curriculum_steps = int(round(float(total_steps) * curriculum_fraction)) if total_steps > 0 else 0
+        if curriculum_steps > 0:
+            phase_denom = max(curriculum_steps - 1, 1)
+            curriculum_phase = min(max(float(global_step) / float(phase_denom), 0.0), 1.0)
+        else:
+            curriculum_phase = 0.0
+        start_lo, start_hi = _percent_range(
+            getattr(args, "train_subtree_depth_percent_start", "0.70,0.90"),
+            (0.70, 0.90),
+        )
+        end_lo, end_hi = _percent_range(
+            getattr(args, "train_subtree_depth_percent_end", "0.10,0.60"),
+            (0.10, 0.60),
+        )
+        pct_lo = start_lo + (end_lo - start_lo) * curriculum_phase
+        pct_hi = start_hi + (end_hi - start_hi) * curriculum_phase
+        pct_lo, pct_hi = sorted((pct_lo, pct_hi))
+        min_level = max(1, min(int(math.ceil(float(data_max_level) * pct_lo)), int(data_max_level)))
+        max_level = max(1, min(int(math.floor(float(data_max_level) * pct_hi)), int(data_max_level)))
+        if min_level > max_level:
+            min_level, max_level = max_level, min_level
+        chosen = _sample_depth_from_range(min_level, max_level, args, global_step, cache_key)
+        return {
+            "depth": int(chosen),
+            "base_depth": int(level_range["base"]),
+            "min_depth": int(min_level),
+            "max_depth": int(max_level),
+            "uncapped_min_depth": int(min_level),
+            "uncapped_max_depth": int(max_level),
+            "curriculum_phase": float(curriculum_phase),
+            "curriculum_steps": int(curriculum_steps),
+            "data_max_depth": int(data_max_level),
+            "depth_percent_curriculum": True,
+            "depth_percent_range": (float(pct_lo), float(pct_hi)),
+        }
     explicit_range = int(getattr(args, "train_subtree_level_min", 0)) > 0 or int(getattr(args, "train_subtree_level_max", 0)) > 0
     use_full_random_range = (
         bool(getattr(args, "train_subtree_randomize_level", False))
@@ -96,29 +174,23 @@ def sample_train_subtree_depth(pts_xyz: torch.Tensor, args, global_step: int = 0
     curriculum_steps = 0
     if bool(getattr(args, "train_subtree_level_curriculum", True)) and max_level > min_level:
         total_steps = max(int(getattr(args, "_total_train_steps_estimate", 0)), 0)
-        curriculum_fraction = min(max(float(getattr(args, "train_subtree_curriculum_fraction", 0.5)), 0.0), 1.0)
+        curriculum_fraction = min(max(float(getattr(args, "train_subtree_curriculum_fraction", 1.0)), 0.0), 1.0)
         curriculum_steps = int(round(float(total_steps) * curriculum_fraction)) if total_steps > 0 else 0
         if curriculum_steps > 0:
-            curriculum_phase = min(max(float(global_step) / float(curriculum_steps), 0.0), 1.0)
+            phase_denom = max(curriculum_steps - 1, 1)
+            curriculum_phase = min(max(float(global_step) / float(phase_denom), 0.0), 1.0)
             depth_span = uncapped_max_level - uncapped_min_level
-            curriculum_max = uncapped_min_level + int(math.floor(float(depth_span) * curriculum_phase + 1e-9))
-            max_level = max(min_level, min(max_level, curriculum_max))
+            direction = str(getattr(args, "train_subtree_curriculum_direction", "deep_to_shallow")).strip().lower()
+            if direction == "shallow_to_deep":
+                curriculum_max = uncapped_min_level + int(math.floor(float(depth_span) * curriculum_phase + 1e-9))
+                max_level = max(min_level, min(max_level, curriculum_max))
+            else:
+                curriculum_min = uncapped_max_level - int(math.floor(float(depth_span) * curriculum_phase + 1e-9))
+                min_level = min(max_level, max(min_level, curriculum_min))
     chosen = max(min(level_range["base"], max_level), min_level)
 
     if bool(getattr(args, "train_subtree_randomize_level", False)) and max_level > min_level:
-        mode = str(getattr(args, "train_subtree_level_sampling", "uniform_random")).strip().lower()
-        span = max_level - min_level + 1
-        if mode == "coverage_cycle":
-            chosen = min_level + (int(global_step) % span)
-        elif mode == "uniform_random":
-            seed_text = f"{cache_key or ''}|step={int(global_step)}|seed={int(getattr(args, 'seed', 0))}"
-            seed_value = int(hashlib.sha1(seed_text.encode("utf-8")).hexdigest()[:16], 16)
-            chosen = min_level + (seed_value % span)
-        else:
-            raise ValueError(
-                "--train_subtree_level_sampling must be one of: uniform_random, coverage_cycle "
-                f"(got {mode})"
-            )
+        chosen = _sample_depth_from_range(min_level, max_level, args, global_step, cache_key)
 
     return {
         "depth": int(chosen),
@@ -130,6 +202,7 @@ def sample_train_subtree_depth(pts_xyz: torch.Tensor, args, global_step: int = 0
         "curriculum_phase": float(curriculum_phase),
         "curriculum_steps": int(curriculum_steps),
         "data_max_depth": int(data_max_level),
+        "depth_percent_curriculum": False,
     }
 
 

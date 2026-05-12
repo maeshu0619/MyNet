@@ -57,7 +57,7 @@ class Loss(
         self.actual_encoder = None
         self.actual_encoder_codec_key = None
         self.surrogate_levels = self._parse_surrogate_levels(args)
-        self.surrogate_feature_dim = 21 + 5 * len(self.surrogate_levels)
+        self.surrogate_feature_dim = 22 + 5 * len(self.surrogate_levels)
         self.compression_surrogate = _CompressionSurrogateNet(
             in_dim=self.surrogate_feature_dim,
             hidden_dim=int(getattr(args, "compression_surrogate_hidden_dim", 128)),

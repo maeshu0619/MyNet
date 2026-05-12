@@ -48,33 +48,33 @@ from models.utils.config.args import parse_pugan_args
 
 import multiprocessing as mp
 
-from models.utils.training.utils import (_adapt_encoder_state_dict_for_sparse_input, 
-                                         _resolve_amp_dtype, 
-                                         _warmup_whole_cloud_caches, 
-                                         _use_memory_safe_loader_workers, 
-                                         _resolve_training_stage_for_episode, 
-                                         _stage_loss_factors, 
-                                         _make_step_cache_key, 
-                                         _should_log_step, 
-                                         _downsample_input_batch, 
-                                         _get_patch_info, 
-                                         _effective_patch_batch_size, 
+from models.utils.training.utils import (_adapt_encoder_state_dict_for_sparse_input,
+                                         _resolve_amp_dtype,
+                                         _warmup_whole_cloud_caches,
+                                         _use_memory_safe_loader_workers,
+                                         _resolve_training_stage_for_episode,
+                                         _stage_loss_factors,
+                                         _make_step_cache_key,
+                                         _should_log_step,
+                                         _downsample_input_batch,
+                                         _get_patch_info,
+                                         _effective_patch_batch_size,
                                          select_patch_subset_ids,
                                          make_patch_subset_cache_key,
-                                         _accumulate_grouped_patch_geometry, 
-                                         _run_geometry_audit, 
-                                         _new_metric_sums, 
-                                         _add_metric_sums, 
-                                         _surrogate_plot_metrics, 
-                                         _sync_for_timing, 
-                                         _prepare_whole_cloud_inputs, 
-                                         _metric_avgs_to_floats, 
-                                         _format_metric_summary, 
+                                         _accumulate_grouped_patch_geometry,
+                                         _run_geometry_audit,
+                                         _new_metric_sums,
+                                         _add_metric_sums,
+                                         _surrogate_plot_metrics,
+                                         _sync_for_timing,
+                                         _prepare_whole_cloud_inputs,
+                                         _metric_avgs_to_floats,
+                                         _format_metric_summary,
                                          _new_point_edit_sums,
                                          _add_point_edit_sums,
                                          _finalize_point_edit_sums,
                                          _summarize_point_edits,
-                                         _cuda_bf16_ops_safe, 
+                                         _cuda_bf16_ops_safe,
                                          _log_grad_flow)
 from models.utils.training.utils import *
 
@@ -86,6 +86,24 @@ def _format_named_float_map(values, max_items=None):
     if max_items is not None:
         items = items[:max_items]
     return ", ".join(f"{key}={float(value):.4f}" for key, value in items)
+
+
+def _uses_actual_total_bit_objective(args):
+    backend_name = str(getattr(args, "compression_loss_backend", "proxy")).strip().lower()
+    return backend_name in {
+        "octattention_actual",
+        "octattention_actual_ste",
+        "octattention_surrogate",
+        "sparsepcgc_actual",
+        "sparsepcgc_actual_ste",
+        "sparsepcgc_surrogate",
+        "gpcc_actual",
+        "gpcc_actual_ste",
+        "gpcc_surrogate",
+        "draco_actual",
+        "draco_actual_ste",
+        "draco_surrogate",
+    }
 
 
 def _write_structure_decision_debug(writer, prefix, structure_debug):
@@ -292,7 +310,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                 # pts: [1, N, 3]
                 if timing_enabled:
                     _sync_for_timing(use_cuda)
-                    timing_model_start = time.time()
+                    timing_data_start = time.time()
                 subtree_mode = bool(getattr(args, "train_patch_subset_enable", False))
                 if subtree_mode:
                     input_pcd = pts if pts.dim() == 3 else pts.unsqueeze(0)
@@ -313,6 +331,10 @@ def train(model, args, loss, writer, plot, notifier=None):
                     input_pcd = input_xyz
 
                 pcd_pts_num = input_xyz.shape[-1]
+                if timing_enabled:
+                    _sync_for_timing(use_cuda)
+                    timing_data_end = time.time()
+                    timing_model_start = timing_data_end
 
                 clear_policy_terms = getattr(model, "clear_discrete_policy_terms", None)
                 if callable(clear_policy_terms):
@@ -416,7 +438,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                             f"uncapped_range={int(subtree_depth_meta.get('uncapped_min_depth', subtree_depth_meta['min_depth']))}-"
                             f"{int(subtree_depth_meta.get('uncapped_max_depth', subtree_depth_meta['max_depth']))}, "
                             f"curriculum_phase={float(subtree_depth_meta.get('curriculum_phase', 1.0)):.3f}, "
-                            f"data_max={int(subtree_depth_meta['data_max_depth'])}), "
+                            f"data_max={int(subtree_depth_meta['data_max_depth'])}, "
+                            f"percent_mode={bool(subtree_depth_meta.get('depth_percent_curriculum', False))}, "
+                            f"percent_range={subtree_depth_meta.get('depth_percent_range', 'n/a')}), "
                             f"selected={selected_subtree_count}/{eligible_subtree_count} eligible "
                             f"(total={total_subtree_count}, min_points={min_subtree_points}), "
                             f"points[min/mean/max]={min(point_counts)}/{mean_points:.1f}/{max(point_counts)}, "
@@ -921,18 +945,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                             loss.last_compression_debug = {}
                             loss.last_compression_terms = {}
 
-                backend_name = str(getattr(args, "compression_loss_backend", "proxy")).strip().lower()
-                actual_total_bit_backend = backend_name in {
-                    "octattention_actual",
-                    "octattention_actual_ste",
-                    "octattention_surrogate",
-                    "sparsepcgc_actual",
-                    "sparsepcgc_actual_ste",
-                    "sparsepcgc_surrogate",
-                    "gpcc_actual",
-                    "gpcc_actual_ste",
-                    "gpcc_surrogate",
-                }
+                actual_total_bit_backend = _uses_actual_total_bit_objective(args)
                 if actual_total_bit_backend:
                     L_com_objective = float(getattr(args, "w_com", 1.0)) * L_com
                 else:
@@ -992,6 +1005,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                         f"actual_bit:{float(comp_debug.get('gt_actual_bit', float('nan'))):.6f}"
                         f"->{float(comp_debug.get('gen_actual_bit', float('nan'))):.6f}, "
                         f"actual_bit_percent={float(comp_debug.get('actual_total_bit_percent', comp_debug.get('total_bit', 0.0))):.6f}, "
+                        f"codec_points={int(comp_debug.get('gt_points', 0))}->{int(comp_debug.get('gen_points', 0))}, "
                         f"objective={float(comp_debug.get('compression_objective', comp_debug.get('total_bit', 0.0))):.6f}, "
                         f"surrogate_bit_percent={float(comp_debug.get('surrogate_pred_bit', 0.0)):.6f}, "
                         f"surrogate_target_bit={float(comp_debug.get('surrogate_target_bit', 0.0)):.6f}, "
@@ -1169,17 +1183,50 @@ def train(model, args, loss, writer, plot, notifier=None):
                         f"threshold={threshold_text}"
                         f"{baseline_text}"
                     )
-                en_step = time.time()
+                if timing_enabled:
+                    _sync_for_timing(use_cuda)
+                    en_step = time.time()
+                    base_model = model.module if hasattr(model, "module") else model
+                    comp_debug = getattr(loss, "last_compression_debug", {}) or {}
+                    comp_timing = comp_debug.get("timing", {}) or {}
+                    runtime_timing = getattr(base_model, "last_runtime_timing", {}) or {}
+                    encoder_debug = getattr(base_model, "last_encoder_debug", {}) or {}
+                    cuda_peak_mb = 0.0
+                    if use_cuda and torch.cuda.is_available():
+                        cuda_peak_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
+                    writer.write(
+                        "StepTiming "
+                        f"step={step + 1}/{num_steps}: "
+                        f"data={timing_data_end - timing_data_start:.4f}s, "
+                        f"model={timing_model_end - timing_model_start:.4f}s, "
+                        f"loss={timing_loss_end - timing_loss_start:.4f}s, "
+                        f"backward_opt={timing_step_end - timing_loss_end:.4f}s, "
+                        f"metrics_log={en_step - timing_step_end:.4f}s, "
+                        f"total={en_step - st_step:.4f}s, "
+                        f"cuda_peak_mb={cuda_peak_mb:.1f}, "
+                        f"knn_backend={KNN_BACKEND}, "
+                        f"encoder_raw={encoder_debug.get('raw_points', 'n/a')}, "
+                        f"encoder_coarse={encoder_debug.get('coarse_points', 'n/a')}, "
+                        f"runtime={runtime_timing}, "
+                        f"compression_timing={comp_timing}"
+                    )
+                else:
+                    en_step = time.time()
                 if log_this_step:
+                    input_avg = float(train_edit_stats.get("input_points_avg", train_edit_stats.get("input_points", 0)))
+                    pre_output_avg = float(
+                        train_edit_stats.get("pre_output_points_avg", train_edit_stats.get("pre_output_points", 0))
+                    )
+                    output_avg = float(train_edit_stats.get("output_points_avg", train_edit_stats.get("output_points", 0)))
                     writer.write(
                         "PointEditStats "
                         f"step={step + 1}/{num_steps}: "
-                        f"input={int(train_edit_stats.get('input_points', 0))}, "
-                        f"pre_output={int(train_edit_stats.get('pre_output_points', 0))}, "
-                        f"output={int(train_edit_stats.get('output_points', 0))}, "
-                        f"added={int(train_edit_stats.get('added_points', 0))}, "
-                        f"deleted={int(train_edit_stats.get('deleted_points', 0))}, "
-                        f"adjusted={int(train_edit_stats.get('adjusted_points', 0))}, "
+                        f"input_mean={input_avg:.3f}, "
+                        f"pre_output_mean={pre_output_avg:.3f}, "
+                        f"output_mean={output_avg:.3f}, "
+                        f"added_ratio={float(train_edit_stats.get('added_ratio_percent', 0.0)):.4f}%, "
+                        f"deleted_ratio={float(train_edit_stats.get('deleted_ratio_percent', 0.0)):.4f}%, "
+                        f"adjusted_ratio={float(train_edit_stats.get('adjusted_ratio_percent', 0.0)):.4f}%, "
                         f"adjust_mean={float(train_edit_stats.get('adjust_mean', 0.0)):.6g}, "
                         f"adjust_max={float(train_edit_stats.get('adjust_max', 0.0)):.6g}, "
                         f"keep_mode={train_edit_stats.get('keep_mode', 'none')}"
@@ -1211,11 +1258,13 @@ def train(model, args, loss, writer, plot, notifier=None):
                 writer.write(_format_metric_summary("EpochAvg", plot.metric_keys, epoch_avgs))
             epoch_edit_info = plot.record_point_edits("epo", global_epoch + 1)
             if not epoch_edit_info.get("skipped", False):
-                added, deleted, adjusted = epoch_edit_info.get("plot_values", [0, 0, 0])
+                added, deleted, adjusted = epoch_edit_info.get("plot_values", [None, None, None])
                 writer.write(
-                    "EpochPointEditTotal: "
+                    "EpochPointEditAverage: "
                     f"epoch={global_epoch + 1}, "
-                    f"added={int(added)}, deleted={int(deleted)}, adjusted={int(adjusted)}, "
+                    f"added_ratio={0.0 if added is None else float(added):.4f}%, "
+                    f"deleted_ratio={0.0 if deleted is None else float(deleted):.4f}%, "
+                    f"adjusted_ratio={0.0 if adjusted is None else float(adjusted):.4f}%, "
                     f"steps={int(epoch_edit_info.get('accepted_steps', 0))}"
                 )
             global_epoch += 1
@@ -1239,11 +1288,13 @@ def train(model, args, loss, writer, plot, notifier=None):
         writer.write(_format_metric_summary("EpisodeAvg", plot.metric_keys, plot.epi_avg))
         episode_edit_info = plot.record_point_edits("epi", episode + 1)
         if not episode_edit_info.get("skipped", False):
-            added, deleted, adjusted = episode_edit_info.get("plot_values", [0, 0, 0])
+            added, deleted, adjusted = episode_edit_info.get("plot_values", [None, None, None])
             writer.write(
-                "EpisodePointEditTotal: "
+                "EpisodePointEditAverage: "
                 f"episode={episode + 1}, "
-                f"added={int(added)}, deleted={int(deleted)}, adjusted={int(adjusted)}, "
+                f"added_ratio={0.0 if added is None else float(added):.4f}%, "
+                f"deleted_ratio={0.0 if deleted is None else float(deleted):.4f}%, "
+                f"adjusted_ratio={0.0 if adjusted is None else float(adjusted):.4f}%, "
                 f"steps={int(episode_edit_info.get('accepted_steps', 0))}"
             )
         plot.plot_loss_curve("epi")
@@ -1334,17 +1385,7 @@ if __name__ == '__main__':
         f"(rate={int(getattr(args, 'debug_grad_flow_rate', 1))})"
     )
     compression_backend = str(getattr(args, "compression_loss_backend", "proxy")).strip().lower()
-    actual_total_bit_backend = compression_backend in {
-        "octattention_actual",
-        "octattention_actual_ste",
-        "octattention_surrogate",
-        "sparsepcgc_actual",
-        "sparsepcgc_actual_ste",
-        "sparsepcgc_surrogate",
-        "gpcc_actual",
-        "gpcc_actual_ste",
-        "gpcc_surrogate",
-    }
+    actual_total_bit_backend = _uses_actual_total_bit_objective(args)
     surrogate_backend = compression_backend.endswith("_surrogate")
     if surrogate_backend:
         writer.write(
@@ -1391,8 +1432,16 @@ if __name__ == '__main__':
 
     if bool(getattr(args, "train_patch_subset_enable", False)):
         writer.write("Model Input is Whole Point Cloud (Octree Subtree Mode)")
+        writer.write(
+            "Compression Teacher Scope: actual_bit_percent is measured on the current subtree/full-cloud training sample, "
+            "not on the offline multi-frame evaluation set."
+        )
     elif args.split2patch:
         writer.write(f"Model Input is Patch")
+        writer.write(
+            "Compression Teacher Scope: actual_bit_percent is measured on the current training patch, "
+            "not on the offline full-cloud evaluation set."
+        )
     else:
         writer.write(f"Model Input is Whole Point Cloud")
     writer.write(
@@ -1405,6 +1454,7 @@ if __name__ == '__main__':
         f"encoder_pre_downsample={bool(getattr(args, 'encoder_pre_downsample', False))}, "
         f"encoder_pre_downsample_mode={getattr(args, 'encoder_pre_downsample_mode', 'voxel')}, "
         f"encoder_pre_downsample_max_points={int(getattr(args, 'encoder_pre_downsample_max_points', 0))}, "
+        f"encoder_cdist_max_points={int(getattr(args, 'encoder_cdist_max_points', 0))}, "
         f"encoder_feature_propagation={getattr(args, 'encoder_feature_propagation', 'knn_inverse_distance')}, "
         f"encoder_feature_propagation_k={int(getattr(args, 'encoder_feature_propagation_k', 3))}, "
         f"input_sampling={args.input_sampling}, split2patch={args.split2patch}, "
@@ -1425,7 +1475,11 @@ if __name__ == '__main__':
         f"train_subtree_random_full_range={bool(getattr(args, 'train_subtree_random_full_range', False))}, "
         f"train_subtree_level_sampling={getattr(args, 'train_subtree_level_sampling', 'uniform_random')}, "
         f"train_subtree_level_curriculum={bool(getattr(args, 'train_subtree_level_curriculum', True))}, "
-        f"train_subtree_curriculum_fraction={float(getattr(args, 'train_subtree_curriculum_fraction', 0.5))}, "
+        f"train_subtree_curriculum_direction={getattr(args, 'train_subtree_curriculum_direction', 'deep_to_shallow')}, "
+        f"train_subtree_curriculum_fraction={float(getattr(args, 'train_subtree_curriculum_fraction', 1.0))}, "
+        f"train_subtree_depth_percent_curriculum={bool(getattr(args, 'train_subtree_depth_percent_curriculum', False))}, "
+        f"train_subtree_depth_percent_start={getattr(args, 'train_subtree_depth_percent_start', [])}, "
+        f"train_subtree_depth_percent_end={getattr(args, 'train_subtree_depth_percent_end', [])}, "
         f"train_patch_subset_patches_per_step={int(getattr(args, 'train_patch_subset_patches_per_step', 0))}, "
         f"train_patch_subset_anchor_interval={int(getattr(args, 'train_patch_subset_anchor_interval', 0))}, "
         f"train_subtree_full_cloud_prob={float(getattr(args, 'train_subtree_full_cloud_prob', 0.0))}, "
@@ -1495,6 +1549,20 @@ if __name__ == '__main__':
             f"effective_qs={float(getattr(args, 'gpcc_effective_qs', 0.0))}, "
             f"geometry_only={bool(getattr(args, 'gpcc_disable_attribute_coding', True))}, "
             f"merge_duplicates={bool(getattr(args, 'gpcc_merge_duplicated_points', True))}"
+        )
+    if compression_backend.startswith("draco"):
+        writer.write(
+            "Draco Teacher: "
+            f"encoder={getattr(args, 'draco_encoder_path', '')}, "
+            f"decoder={getattr(args, 'draco_decoder_path', '')}, "
+            f"match_qs={bool(getattr(args, 'draco_match_qs', True))}, "
+            f"prequantize={bool(getattr(args, 'draco_prequantize', True))}, "
+            f"effective_qs={float(getattr(args, 'draco_effective_qs', 0.0))}, "
+            f"qp={int(getattr(args, 'draco_position_quantization_bits', 0))}, "
+            f"cl={int(getattr(args, 'draco_compression_level', 7))}, "
+            f"point_cloud={bool(getattr(args, 'draco_force_point_cloud', True))}, "
+            f"merge_duplicates={bool(getattr(args, 'draco_merge_duplicated_points', True))}, "
+            f"skip_decode={bool(getattr(args, 'draco_skip_decode', True))}"
         )
     writer.write(f"Compression Rate Metric: {args.compression_rate_metric}")
     writer.write(f"Compression Loss Backend: {args.compression_loss_backend}")

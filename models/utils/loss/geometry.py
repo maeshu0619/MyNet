@@ -130,7 +130,7 @@ class GeometryLossMixin:
                 else:
                     L_d2 = L_d2_hard
 
-            L_geom += L_cd + 0.2 * L_d2
+            L_geom += L_cd + float(getattr(args, "geom_d2_weight", 0.2)) * L_d2
             self._set_geometry_debug(
                 mode="cd+d2",
                 value=float(L_geom.detach()),

@@ -241,9 +241,43 @@ def _sample_geometry_audit_tensors(gen_pts, gt_pts, final_w, out_label, args, ca
 
 def _resolved_test_save_paths(args, step_idx):
     base_dir = Path(os.path.abspath(os.path.expanduser(args.save_ply_dir)))
+    codec_eval_dir = Path(
+        os.path.abspath(
+            os.path.expanduser(getattr(args, "codec_eval_dir", args.save_ply_dir))
+        )
+    )
     run_dir = base_dir / "runs" / f"{args.date}_{args.time}_{Path(args.ckpt).stem}"
     filename = f"{step_idx:04d}_{getattr(args, 'method_name', 'Mine')}.ply"
-    return base_dir, base_dir / filename, run_dir, run_dir / filename
+    return {
+        "primary_dir": base_dir,
+        "primary_path": base_dir / filename,
+        "run_dir": run_dir,
+        "run_path": run_dir / filename,
+        "codec_eval_dir": codec_eval_dir,
+        "codec_eval_path": codec_eval_dir / filename,
+    }
+
+
+def _copy_file_if_needed(src_path, dst_path):
+    src = Path(src_path)
+    dst = Path(dst_path)
+    if src.resolve() == dst.resolve():
+        return dst
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst)
+    return dst
+
+
+def _cleanup_codec_eval_slot(codec_eval_dir, step_idx, keep_path):
+    keep = Path(keep_path).resolve()
+    slot_prefix = f"{int(step_idx):04d}_"
+    for path in Path(codec_eval_dir).glob(f"{slot_prefix}*.ply"):
+        if path.resolve() == keep:
+            continue
+        try:
+            path.unlink()
+        except OSError:
+            pass
 
 
 def _format_log_value(value, kind="float"):
@@ -431,6 +465,7 @@ def _emit_step_result_table(step_idx, step_record, writer):
         [
             ("input_path", step_record["input_path"]),
             ("output_path", step_record["output_path"]),
+            ("codec_eval_path", step_record["codec_eval_path"]),
             ("deleted_points", _format_log_value(step_record["deleted_points"], "int")),
             ("added_points", _format_log_value(step_record["added_points"], "int")),
             ("adjusted_points", _format_log_value(step_record["adjusted_points"], "int")),
@@ -641,6 +676,15 @@ def _compression_efficiency_value(comp_debug, fallback=None):
     if torch.is_tensor(fallback):
         return float(fallback.detach().cpu())
     return float(fallback)
+
+
+def _should_force_actual_codec_eval(args):
+    backend = str(getattr(args, "compression_loss_backend", "proxy")).strip().lower()
+    return backend.endswith("_surrogate")
+
+
+def _compression_eval_refresh_mode(args):
+    return "always" if _should_force_actual_codec_eval(args) else True
 
 
 def _build_inference_subtree_ref(input_xyz, args):
@@ -1023,12 +1067,17 @@ def test(model, loss, args, writer):
     writer.write(f"model: {args.ckpt}")
     writer.write(f"input dir: {args.input_dir_test}")
     writer.write(f"output ply dir: {args.save_ply_dir}")
+    writer.write(f"codec eval dir: {args.codec_eval_dir}")
     writer.write(f"Method Name: {getattr(args, 'method_name', 'Mine')}")
     writer.write(f"Surrogate Name: {getattr(args, 'surrogate_name', getattr(args, 'compress', 'OctAttention'))}")
     writer.write(
         "Optimization Modes: "
         f"geometry={'ste_hard' if args.discrete_loss_mode == 'ste_hard' else ('weighted_soft' if args.discrete_loss_mode == 'weighted_soft' else 'hard')}, "
         f"compression={args.compression_loss_backend}"
+    )
+    writer.write(
+        "Compression Eval Mode: "
+        f"refresh_actual_gen={_compression_eval_refresh_mode(args)}"
     )
     writer.write(f"Compression Codec: {getattr(args, 'compress', 'OctAttention')}")
     if str(getattr(args, "compression_loss_backend", "proxy")).strip().lower().startswith("sparsepcgc"):
@@ -1116,6 +1165,7 @@ def test(model, loss, args, writer):
         L_nodes_his = []
         L_single_his = []
         compression_efficiency_his = []
+        compression_efficiency_metric = None
         step_result_records = []
         selected_inference_mode = None
         for step, pts in enumerate(loader):
@@ -1338,13 +1388,14 @@ def test(model, loss, args, writer):
             )
 
             if bool(getattr(args, "test_compute_loss", True)):
+                compression_eval_refresh = _compression_eval_refresh_mode(args)
                 L_com, loss_bit, loss_single, loss_nodes, _, _ = loss.get_compression_loss(
                     args,
                     gen_xyz=gen_pts[:, :3, :],
                     gt_xyz=input_pcd[:, :3, :],
                     final_w=None,
                     cache_key=cache_key,
-                    refresh_actual_gen=False,
+                    refresh_actual_gen=compression_eval_refresh,
                 )
                 gen_a, gt_a, w_a, label_a = _sample_geometry_audit_tensors(
                     gen_pts,
@@ -1376,11 +1427,19 @@ def test(model, loss, args, writer):
                 compression_efficiency = _compression_efficiency_value(comp_debug, fallback=loss_bit)
                 if compression_efficiency is not None:
                     compression_efficiency_his.append(compression_efficiency)
+                    compression_efficiency_metric = str(
+                        comp_debug.get("metric", compression_efficiency_metric or "total_bit_diff_percent")
+                    )
                     writer.write(
                         "CompressionEfficiency: "
-                        f"total_bit_diff_percent={compression_efficiency:.6g}, "
+                        f"value={compression_efficiency:.6g}, "
                         f"metric={comp_debug.get('metric', 'total_bit_diff_percent')}, "
                         f"teacher_codec={comp_debug.get('teacher_codec', 'unknown')}, "
+                        f"teacher_refresh={bool(comp_debug.get('teacher_refresh', False))}, "
+                        f"teacher_cache_hit={comp_debug.get('teacher_cache_hit', 'unknown')}, "
+                        f"raw_points={input_points}->{output_points}, "
+                        f"codec_points={int(comp_debug.get('gt_points', input_points))}->{int(comp_debug.get('gen_points', output_points))}, "
+                        f"actual_bit={float(comp_debug.get('gt_actual_bit', float('nan'))):.6g}->{float(comp_debug.get('gen_actual_bit', float('nan'))):.6g}, "
                         f"bpp_diff_percent={float(comp_debug.get('bpp', 0.0)):.6g}"
                     )
                 writer.write(
@@ -1403,7 +1462,7 @@ def test(model, loss, args, writer):
 
             en_fp = time.time()
 
-            save_dir, save_path, run_dir, run_save_path = _resolved_test_save_paths(args, step)
+            save_paths = _resolved_test_save_paths(args, step)
             try:
                 quality_metrics = compute_pointcloud_metrics(
                     input_pcd[:, :3, :],
@@ -1419,27 +1478,32 @@ def test(model, loss, args, writer):
                     "d1_psnr": float("nan"),
                     "d2_psnr": float("nan"),
                 }
-            os.makedirs(save_dir, exist_ok=True)
-            os.makedirs(run_dir, exist_ok=True)
-            print(f"save path: {save_path}")
+            os.makedirs(save_paths["primary_dir"], exist_ok=True)
+            os.makedirs(save_paths["run_dir"], exist_ok=True)
+            os.makedirs(save_paths["codec_eval_dir"], exist_ok=True)
+            print(f"save path: {save_paths['primary_path']}")
 
             ok = write_ply(
-                str(save_path),
+                str(save_paths["primary_path"]),
                 field_list,
                 field_names,
             )
             if not ok:
-                raise RuntimeError(f"write_ply returned False: {save_path}")
-            if not save_path.exists():
-                raise FileNotFoundError(f"Saved PLY was not found after write: {save_path}")
-            shutil.copy2(save_path, run_save_path)
-            save_stat = save_path.stat()
-            run_stat = run_save_path.stat()
+                raise RuntimeError(f"write_ply returned False: {save_paths['primary_path']}")
+            if not save_paths["primary_path"].exists():
+                raise FileNotFoundError(f"Saved PLY was not found after write: {save_paths['primary_path']}")
+            _copy_file_if_needed(save_paths["primary_path"], save_paths["run_path"])
+            _copy_file_if_needed(save_paths["primary_path"], save_paths["codec_eval_path"])
+            _cleanup_codec_eval_slot(save_paths["codec_eval_dir"], step, save_paths["codec_eval_path"])
+            save_stat = save_paths["primary_path"].stat()
+            run_stat = save_paths["run_path"].stat()
+            codec_eval_stat = save_paths["codec_eval_path"].stat()
             en_step = time.time()
             model_time = en_model - st_model
             step_record = {
                 "input_path": str(dataset.files[step]),
-                "output_path": str(save_path),
+                "output_path": str(save_paths["primary_path"]),
+                "codec_eval_path": str(save_paths["codec_eval_path"]),
                 "deleted_points": int(edit_stats["deleted_points"]),
                 "added_points": int(edit_stats["added_points"]),
                 "adjusted_points": int(edit_stats["adjusted_points"]),
@@ -1459,8 +1523,9 @@ def test(model, loss, args, writer):
             writer.write(f"  - Step time: {en_step - st_step}")
             writer.write(
                 "Saved PLY: "
-                f"primary={save_path} (size={save_stat.st_size}B, mtime={save_stat.st_mtime:.6f}), "
-                f"run_copy={run_save_path} (size={run_stat.st_size}B, mtime={run_stat.st_mtime:.6f})\n"
+                f"primary={save_paths['primary_path']} (size={save_stat.st_size}B, mtime={save_stat.st_mtime:.6f}), "
+                f"run_copy={save_paths['run_path']} (size={run_stat.st_size}B, mtime={run_stat.st_mtime:.6f}), "
+                f"codec_eval={save_paths['codec_eval_path']} (size={codec_eval_stat.st_size}B, mtime={codec_eval_stat.st_mtime:.6f})\n"
             )
             _emit_step_result_table(step, step_record, writer)
 
@@ -1470,7 +1535,7 @@ def test(model, loss, args, writer):
             writer.write(
                 "CompressionEfficiencySummary: "
                 f"count={int(comp_arr.size)}, "
-                f"metric=total_bit_diff_percent, "
+                f"metric={compression_efficiency_metric or 'total_bit_diff_percent'}, "
                 f"average={float(comp_arr.mean()):.6g}, "
                 f"max={float(comp_arr.max()):.6g}, "
                 f"min={float(comp_arr.min()):.6g}"
@@ -1552,6 +1617,7 @@ if __name__ == '__main__':
     writer.write(f"Date of Testing: {file_day}-{file_time}")
     writer.write(f"Log Root: {args.log_root}")
     writer.write(f"Output PLY Root: {args.save_ply_dir}")
+    writer.write(f"Codec Eval PLY Root: {args.codec_eval_dir}")
     writer.write(f"Method Name: {getattr(args, 'method_name', 'Mine')}")
     writer.write(f"Surrogate Name: {getattr(args, 'surrogate_name', getattr(args, 'compress', 'OctAttention'))}")
     writer.write(f"Geometry Loss Type: {args.loss_type}")

@@ -10,20 +10,36 @@ except ModuleNotFoundError:
     from models.utils.misc.einops_compat import rearrange
 pointops = None
 KNN_BACKEND = "chunked_torch_cdist"
-_POINTOPS_SRC = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../..", "pointops", "src"))
-if os.path.isdir(_POINTOPS_SRC) and _POINTOPS_SRC not in sys.path:
-    sys.path.append(_POINTOPS_SRC)
-if (
-    os.environ.get("MYNET_USE_POINTOPS_CUDA", "auto").strip().lower() in {"1", "true", "yes", "auto"}
-    and importlib.util.find_spec("pointops_cuda") is not None
-):
+_POINTOPS_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "pointops"))
+_POINTOPS_SRC = os.path.join(_POINTOPS_ROOT, "src")
+_POINTOPS_LEGACY_SRC = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../..", "pointops", "src"))
+for _path in (_POINTOPS_SRC, _POINTOPS_LEGACY_SRC):
+    if os.path.isdir(_path) and _path not in sys.path:
+        sys.path.append(_path)
+_use_pointops = os.environ.get("MYNET_USE_POINTOPS_CUDA", "auto").strip().lower()
+_allow_pointops_build = os.environ.get("MYNET_POINTOPS_ALLOW_BUILD", "0").strip().lower() in {"1", "true", "yes"}
+if _use_pointops in {"1", "true", "yes", "auto"} and importlib.util.find_spec("pointops_cuda") is not None:
     try:
+        import pointops_cuda  # noqa: F401
         from models.pointops.functions import pointops
         KNN_BACKEND = "pointops_cuda"
     except Exception as exc:
-        pointops = None
-        KNN_BACKEND = "chunked_torch_cdist"
-        logging.warning("pointops CUDA extension unavailable; falling back to torch implementations: %s", exc)
+        if _allow_pointops_build:
+            try:
+                from models.pointops.functions import pointops
+                KNN_BACKEND = "pointops_cuda"
+            except Exception as build_exc:
+                pointops = None
+                KNN_BACKEND = "chunked_torch_cdist"
+                logging.warning("pointops CUDA extension unavailable; falling back to torch implementations: %s", build_exc)
+        else:
+            pointops = None
+            KNN_BACKEND = "chunked_torch_cdist"
+            logging.warning(
+                "pointops CUDA extension was found but could not be loaded; falling back to torch cdist. "
+                "Set MYNET_POINTOPS_ALLOW_BUILD=1 to allow an import-time rebuild. Error: %s",
+                exc,
+            )
 import numpy as np
 import random
 try:

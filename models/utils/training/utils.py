@@ -97,6 +97,11 @@ def _format_metric_summary(prefix, metric_keys, values):
     return f"{prefix}: " + ", ".join(parts)
 
 
+def _point_ratio_percent(numerator, denominator):
+    denom = max(int(denominator), 1)
+    return 100.0 * float(numerator) / float(denom)
+
+
 def _new_point_edit_sums():
     return {
         "input_points": 0,
@@ -138,7 +143,26 @@ def _finalize_point_edit_sums(edit_sums):
         return None
     count = max(int(edit_sums.get("count", 0)), 1)
     finalized = dict(edit_sums)
+    finalized["input_points_avg"] = float(edit_sums.get("input_points", 0)) / float(count)
+    finalized["pre_output_points_avg"] = float(edit_sums.get("pre_output_points", 0)) / float(count)
+    finalized["output_points_avg"] = float(edit_sums.get("output_points", 0)) / float(count)
+    finalized["added_points_avg"] = float(edit_sums.get("added_points", 0)) / float(count)
+    finalized["deleted_points_avg"] = float(edit_sums.get("deleted_points", 0)) / float(count)
+    finalized["adjusted_points_avg"] = float(edit_sums.get("adjusted_points", 0)) / float(count)
+    finalized["net_change_avg"] = float(edit_sums.get("net_change", 0)) / float(count)
     finalized["adjust_mean"] = float(edit_sums.get("adjust_mean_sum", 0.0)) / float(count)
+    finalized["added_ratio_percent"] = _point_ratio_percent(
+        finalized.get("added_points", 0),
+        finalized.get("input_points", 0),
+    )
+    finalized["deleted_ratio_percent"] = _point_ratio_percent(
+        finalized.get("deleted_points", 0),
+        finalized.get("input_points", 0),
+    )
+    finalized["adjusted_ratio_percent"] = _point_ratio_percent(
+        finalized.get("adjusted_points", 0),
+        finalized.get("input_points", 0),
+    )
     return finalized
 
 
@@ -239,10 +263,20 @@ def _summarize_point_edits(input_xyz, gen_pts, final_w=None, args=None, edit_ref
         "added_points": int(added_points),
         "deleted_points": int(deleted_points),
         "adjusted_points": int(adjusted_points),
+        "input_points_avg": float(input_points),
+        "pre_output_points_avg": float(pre_output_points),
+        "output_points_avg": float(output_points),
+        "added_points_avg": float(added_points),
+        "deleted_points_avg": float(deleted_points),
+        "adjusted_points_avg": float(adjusted_points),
+        "added_ratio_percent": _point_ratio_percent(added_points, input_points),
+        "deleted_ratio_percent": _point_ratio_percent(deleted_points, input_points),
+        "adjusted_ratio_percent": _point_ratio_percent(adjusted_points, input_points),
         "adjust_threshold": float(threshold),
         "adjust_mean": float(mean_adjust),
         "adjust_max": float(max_adjust),
         "net_change": int(output_points - input_points),
+        "net_change_avg": float(output_points - input_points),
         "keep_mode": None if keep_info is None else keep_info.get("mode"),
     }
 

@@ -1,8 +1,9 @@
 import torch
 import torch.nn as nn
+import time
 
 from .encoder.point_trans import PointTransformer
-from .utils.pointcloud.utils_repkpu import get_knn_pts, index_points
+from .utils.pointcloud.utils_repkpu import KNN_BACKEND, get_knn_pts, index_points
 from .utils.pointcloud.octree_subtree import assign_octree_subtree_keys, subtree_membership_mask
 from .utils.pointcloud.sparse_tensor import build_sparse_point_tensor_single
 from .modules.cause_aggregation import CauseDiagnosisAggregation
@@ -60,6 +61,7 @@ class Network(nn.Module):
         self.debug_tensors = {}
         self.last_structure_debug = {}
         self.last_encoder_debug = {}
+        self.last_runtime_timing = {}
         self._configure_non_encoder_batchnorm()
 
     def _configure_non_encoder_batchnorm(self):
@@ -126,6 +128,14 @@ class Network(nn.Module):
             or getattr(self.args, "trainORtest", "train") != "train"
         )
 
+    def _timing_enabled(self):
+        return bool(getattr(self.args, "debug_timing", False))
+
+    @staticmethod
+    def _sync_if_cuda_tensor(tensor):
+        if torch.is_tensor(tensor) and tensor.is_cuda:
+            torch.cuda.synchronize(tensor.device)
+
     @staticmethod
     def _first_occurrence_indices(inverse, num_unique):
         order = torch.argsort(inverse, stable=True)
@@ -141,6 +151,9 @@ class Network(nn.Module):
     def _voxel_downsample_single(self, pts_xyz, coord_scale):
         num_points = int(pts_xyz.shape[-1])
         max_points = max(int(getattr(self.args, "encoder_pre_downsample_max_points", 0)), 0)
+        cdist_cap = max(int(getattr(self.args, "encoder_cdist_max_points", 0)), 0)
+        if KNN_BACKEND != "pointops_cuda" and cdist_cap > 0:
+            max_points = min(max_points, cdist_cap) if max_points > 0 else cdist_cap
         if max_points <= 0 or num_points <= max_points:
             full_idx = torch.arange(num_points, device=pts_xyz.device, dtype=torch.long)
             return pts_xyz, full_idx, 0.0
@@ -509,7 +522,14 @@ class Network(nn.Module):
                     device=pts_xyz.device,
                 )
 
+        timing_enabled = self._timing_enabled()
+        if timing_enabled:
+            self._sync_if_cuda_tensor(pts_xyz)
+            runtime_t0 = time.time()
         encode_state = self._encode(pts_xyz, coord_scale=coord_scale)
+        if timing_enabled:
+            self._sync_if_cuda_tensor(pts_xyz)
+            runtime_encode_end = time.time()
         fused_feat = encode_state["fused_feat"]
         analysis_xyz = encode_state["analysis_xyz"]
         analysis_counts = encode_state["analysis_counts"]
@@ -517,6 +537,9 @@ class Network(nn.Module):
         analysis_unit_keys = assign_octree_subtree_keys(analysis_xyz, subtree_ref) if subtree_ref is not None else None
         analysis_selection_mask = subtree_membership_mask(analysis_unit_keys, selected_subtree_keys) if analysis_unit_keys is not None and selected_subtree_keys is not None else None
 
+        if timing_enabled:
+            self._sync_if_cuda_tensor(pts_xyz)
+            runtime_structure_start = time.time()
         if keep_sparse_path:
             structure_feat_full_list = []
             subtree_scores_full_list = []
@@ -660,6 +683,9 @@ class Network(nn.Module):
             loss_attr_sparse = None
             loss_policy_sparse = None
 
+        if timing_enabled:
+            self._sync_if_cuda_tensor(pts_xyz)
+            runtime_structure_end = time.time()
         actuator_input = torch.cat([structure_feat_full, subtree_scores_full, policy_probs_full, repair_priority_full], dim=1)
         pts_out, final_w, edit_loss, actuator_stats = self.actuator(
             pts_xyz=pts_xyz,
@@ -671,6 +697,9 @@ class Network(nn.Module):
             coord_scale=coord_scale,
             selection_mask=selection_mask,
         )
+        if timing_enabled:
+            self._sync_if_cuda_tensor(pts_xyz)
+            runtime_actuator_end = time.time()
 
         if compute_internal_losses is None:
             compute_internal_losses = self.training
@@ -759,6 +788,16 @@ class Network(nn.Module):
                 }
         else:
             self.last_structure_debug = {}
+
+        if timing_enabled:
+            self.last_runtime_timing = {
+                "encode": round(runtime_encode_end - runtime_t0, 6),
+                "structure": round(runtime_structure_end - runtime_structure_start, 6),
+                "actuator": round(runtime_actuator_end - runtime_structure_end, 6),
+                "total_forward": round(runtime_actuator_end - runtime_t0, 6),
+            }
+        else:
+            self.last_runtime_timing = {}
 
         if return_attr_output and pts_attr is not None and pts_attr.shape[-1] == pts_out.shape[-1]:
             if pts_attr.shape[1] > 3:

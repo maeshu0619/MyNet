@@ -27,25 +27,25 @@ rule cuda_compile
 rule link
   command = $cxx $in $ldflags -o $out
 
-build pointops_api.o: compile /home/maejima/MasterEx/myNet_new/models/pointops/src/pointops_api.cpp
-build ballquery_cuda.o: compile /home/maejima/MasterEx/myNet_new/models/pointops/src/ballquery/ballquery_cuda.cpp
-build ballquery_cuda_kernel.cuda.o: cuda_compile /home/maejima/MasterEx/myNet_new/models/pointops/src/ballquery/ballquery_cuda_kernel.cu
-build knnquery_cuda.o: compile /home/maejima/MasterEx/myNet_new/models/pointops/src/knnquery/knnquery_cuda.cpp
-build knnquery_cuda_kernel.cuda.o: cuda_compile /home/maejima/MasterEx/myNet_new/models/pointops/src/knnquery/knnquery_cuda_kernel.cu
-build knnquery_heap_cuda.o: compile /home/maejima/MasterEx/myNet_new/models/pointops/src/knnquery_heap/knnquery_heap_cuda.cpp
-build knnquery_heap_cuda_kernel.cuda.o: cuda_compile /home/maejima/MasterEx/myNet_new/models/pointops/src/knnquery_heap/knnquery_heap_cuda_kernel.cu
-build grouping_cuda.o: compile /home/maejima/MasterEx/myNet_new/models/pointops/src/grouping/grouping_cuda.cpp
-build grouping_cuda_kernel.cuda.o: cuda_compile /home/maejima/MasterEx/myNet_new/models/pointops/src/grouping/grouping_cuda_kernel.cu
-build grouping_int_cuda.o: compile /home/maejima/MasterEx/myNet_new/models/pointops/src/grouping_int/grouping_int_cuda.cpp
-build grouping_int_cuda_kernel.cuda.o: cuda_compile /home/maejima/MasterEx/myNet_new/models/pointops/src/grouping_int/grouping_int_cuda_kernel.cu
-build interpolation_cuda.o: compile /home/maejima/MasterEx/myNet_new/models/pointops/src/interpolation/interpolation_cuda.cpp
-build interpolation_cuda_kernel.cuda.o: cuda_compile /home/maejima/MasterEx/myNet_new/models/pointops/src/interpolation/interpolation_cuda_kernel.cu
-build sampling_cuda.o: compile /home/maejima/MasterEx/myNet_new/models/pointops/src/sampling/sampling_cuda.cpp
-build sampling_cuda_kernel.cuda.o: cuda_compile /home/maejima/MasterEx/myNet_new/models/pointops/src/sampling/sampling_cuda_kernel.cu
-build labelstat_cuda.o: compile /home/maejima/MasterEx/myNet_new/models/pointops/src/labelstat/labelstat_cuda.cpp
-build labelstat_cuda_kernel.cuda.o: cuda_compile /home/maejima/MasterEx/myNet_new/models/pointops/src/labelstat/labelstat_cuda_kernel.cu
-build featuredistribute_cuda.o: compile /home/maejima/MasterEx/myNet_new/models/pointops/src/featuredistribute/featuredistribute_cuda.cpp
-build featuredistribute_cuda_kernel.cuda.o: cuda_compile /home/maejima/MasterEx/myNet_new/models/pointops/src/featuredistribute/featuredistribute_cuda_kernel.cu
+build pointops_api.o: compile /home/maejima/MasterEx/myNet/models/pointops/src/pointops_api.cpp
+build ballquery_cuda.o: compile /home/maejima/MasterEx/myNet/models/pointops/src/ballquery/ballquery_cuda.cpp
+build ballquery_cuda_kernel.cuda.o: cuda_compile /home/maejima/MasterEx/myNet/models/pointops/src/ballquery/ballquery_cuda_kernel.cu
+build knnquery_cuda.o: compile /home/maejima/MasterEx/myNet/models/pointops/src/knnquery/knnquery_cuda.cpp
+build knnquery_cuda_kernel.cuda.o: cuda_compile /home/maejima/MasterEx/myNet/models/pointops/src/knnquery/knnquery_cuda_kernel.cu
+build knnquery_heap_cuda.o: compile /home/maejima/MasterEx/myNet/models/pointops/src/knnquery_heap/knnquery_heap_cuda.cpp
+build knnquery_heap_cuda_kernel.cuda.o: cuda_compile /home/maejima/MasterEx/myNet/models/pointops/src/knnquery_heap/knnquery_heap_cuda_kernel.cu
+build grouping_cuda.o: compile /home/maejima/MasterEx/myNet/models/pointops/src/grouping/grouping_cuda.cpp
+build grouping_cuda_kernel.cuda.o: cuda_compile /home/maejima/MasterEx/myNet/models/pointops/src/grouping/grouping_cuda_kernel.cu
+build grouping_int_cuda.o: compile /home/maejima/MasterEx/myNet/models/pointops/src/grouping_int/grouping_int_cuda.cpp
+build grouping_int_cuda_kernel.cuda.o: cuda_compile /home/maejima/MasterEx/myNet/models/pointops/src/grouping_int/grouping_int_cuda_kernel.cu
+build interpolation_cuda.o: compile /home/maejima/MasterEx/myNet/models/pointops/src/interpolation/interpolation_cuda.cpp
+build interpolation_cuda_kernel.cuda.o: cuda_compile /home/maejima/MasterEx/myNet/models/pointops/src/interpolation/interpolation_cuda_kernel.cu
+build sampling_cuda.o: compile /home/maejima/MasterEx/myNet/models/pointops/src/sampling/sampling_cuda.cpp
+build sampling_cuda_kernel.cuda.o: cuda_compile /home/maejima/MasterEx/myNet/models/pointops/src/sampling/sampling_cuda_kernel.cu
+build labelstat_cuda.o: compile /home/maejima/MasterEx/myNet/models/pointops/src/labelstat/labelstat_cuda.cpp
+build labelstat_cuda_kernel.cuda.o: cuda_compile /home/maejima/MasterEx/myNet/models/pointops/src/labelstat/labelstat_cuda_kernel.cu
+build featuredistribute_cuda.o: compile /home/maejima/MasterEx/myNet/models/pointops/src/featuredistribute/featuredistribute_cuda.cpp
+build featuredistribute_cuda_kernel.cuda.o: cuda_compile /home/maejima/MasterEx/myNet/models/pointops/src/featuredistribute/featuredistribute_cuda_kernel.cu
 
 
 

@@ -66,6 +66,8 @@ class CompressionLossMixin:
             codec_key = "sparsepcgc"
         elif backend.startswith("gpcc") or compress_key == "gpcc":
             codec_key = "gpcc"
+        elif backend.startswith("draco") or compress_key == "draco":
+            codec_key = "draco"
         else:
             codec_key = "octattention"
         if self.actual_encoder is None or getattr(self, "actual_encoder_codec_key", None) != codec_key:
@@ -160,6 +162,8 @@ class CompressionLossMixin:
             return max(float(getattr(args, "sparsepcgc_voxel_size", 1.0)), 1e-9)
         if codec_key == "gpcc":
             return max(float(getattr(args, "gpcc_effective_qs", getattr(args, "qs", 1.0))), 1e-9)
+        if codec_key == "draco":
+            return max(float(getattr(args, "draco_effective_qs", getattr(args, "qs", 1.0))), 1e-9)
         return max(float(getattr(args, "qs", 1.0)), 1e-9)
 
     def _attach_octree_aux_stats(self, args, pts_3n, stats):
@@ -168,7 +172,7 @@ class CompressionLossMixin:
             bool(getattr(args, "compression_octree_stat_force", True))
             or float(stats.get("node", 0.0)) <= 0.0
             or float(stats.get("single", 0.0)) <= 0.0
-            or codec_name in {"sparsepcgc", "gpcc"}
+            or codec_name in {"sparsepcgc", "gpcc", "draco"}
         )
         if not need_aux:
             stats.setdefault("octree_node", float(stats.get("node", 0.0)))
@@ -191,9 +195,9 @@ class CompressionLossMixin:
         stats["octree_leaf_count"] = int(aux["leaf_count"])
         stats["octree_single_ratio"] = float(aux["single_ratio"])
         stats["octree_mean_children"] = float(aux["mean_children"])
-        if float(stats.get("node", 0.0)) <= 0.0 or codec_name in {"sparsepcgc", "gpcc"}:
+        if float(stats.get("node", 0.0)) <= 0.0 or codec_name in {"sparsepcgc", "gpcc", "draco"}:
             stats["node"] = aux_node
-        if float(stats.get("single", 0.0)) <= 0.0 or codec_name in {"sparsepcgc", "gpcc"}:
+        if float(stats.get("single", 0.0)) <= 0.0 or codec_name in {"sparsepcgc", "gpcc", "draco"}:
             stats["single"] = aux_single
         stats["bpn"] = float(stats.get("bit", 0.0)) / max(float(stats.get("node", 0.0)), 1.0)
         return stats
@@ -331,7 +335,7 @@ class CompressionLossMixin:
     def get_compression_loss(self, args, gen_xyz, gt_xyz, final_w, cache_key=None, refresh_actual_gen=True):
         self._store_compression_terms()
         backend = self._compression_loss_backend(args)
-        if backend in {"octattention_surrogate", "sparsepcgc_surrogate", "gpcc_surrogate", "surrogate", "soft_surrogate"}:
+        if backend in {"octattention_surrogate", "sparsepcgc_surrogate", "gpcc_surrogate", "draco_surrogate", "surrogate", "soft_surrogate"}:
             return self._get_compression_loss_surrogate(
                 args,
                 gen_xyz=gen_xyz,
@@ -340,7 +344,7 @@ class CompressionLossMixin:
                 cache_key=cache_key,
                 refresh_actual_gen=refresh_actual_gen,
             )
-        if backend in {"octattention_actual", "actual_octattention", "real_octattention", "sparsepcgc_actual", "gpcc_actual"}:
+        if backend in {"octattention_actual", "actual_octattention", "real_octattention", "sparsepcgc_actual", "gpcc_actual", "draco_actual"}:
             return self._get_compression_loss_actual_codec(
                 args,
                 gen_xyz=gen_xyz,
@@ -349,7 +353,7 @@ class CompressionLossMixin:
                 cache_key=cache_key,
                 use_proxy_surrogate=False,
             )
-        if backend in {"octattention_actual_ste", "actual_octattention_ste", "real_octattention_ste", "sparsepcgc_actual_ste", "gpcc_actual_ste"}:
+        if backend in {"octattention_actual_ste", "actual_octattention_ste", "real_octattention_ste", "sparsepcgc_actual_ste", "gpcc_actual_ste", "draco_actual_ste"}:
             return self._get_compression_loss_actual_codec(
                 args,
                 gen_xyz=gen_xyz,
@@ -363,7 +367,8 @@ class CompressionLossMixin:
                 "--compression_loss_backend must be one of: proxy, "
                 "octattention_actual, octattention_actual_ste, octattention_surrogate, "
                 "sparsepcgc_actual, sparsepcgc_actual_ste, sparsepcgc_surrogate, "
-                "gpcc_actual, gpcc_actual_ste, gpcc_surrogate "
+                "gpcc_actual, gpcc_actual_ste, gpcc_surrogate, "
+                "draco_actual, draco_actual_ste, draco_surrogate "
                 f"(got {backend})"
             )
         return self._get_compression_loss_proxy(

@@ -1,5 +1,6 @@
 import numpy as np
 import math
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -199,6 +200,7 @@ class SurrogateCompressionLossMixin:
         codec_key = self._surrogate_backend_label(args).replace("_surrogate", "").replace("_actual", "")
         is_sparsepcgc = 1.0 if codec_key == "sparsepcgc" else 0.0
         is_gpcc = 1.0 if codec_key == "gpcc" else 0.0
+        is_draco = 1.0 if codec_key == "draco" else 0.0
         effective_qs = self._surrogate_effective_qs(args, codec_key)
 
         for b in range(B):
@@ -238,6 +240,7 @@ class SurrogateCompressionLossMixin:
                     gen_xyz.new_tensor(float(q_level) / max(float(getattr(args, "proxy_max_depth", 12)), 1.0), dtype=torch.float32),
                     gen_xyz.new_tensor(is_sparsepcgc, dtype=torch.float32),
                     gen_xyz.new_tensor(is_gpcc, dtype=torch.float32),
+                    gen_xyz.new_tensor(is_draco, dtype=torch.float32),
                 ]
             ).to(device=gen_xyz.device, dtype=torch.float32)
             features.append(torch.cat([torch.stack(global_feat), *level_feat, qstep_feat, codec_feat], dim=0))
@@ -254,6 +257,8 @@ class SurrogateCompressionLossMixin:
             )
         if str(codec_key).strip().lower() == "gpcc":
             return max(float(getattr(args, "gpcc_effective_qs", getattr(args, "qs", 1.0))), 1e-9)
+        if str(codec_key).strip().lower() == "draco":
+            return max(float(getattr(args, "draco_effective_qs", getattr(args, "qs", 1.0))), 1e-9)
         return max(float(getattr(args, "qs", 1.0)), 1e-9)
 
     def _soft_aux_percent_from_features(self, x_soft, x_ref):
@@ -372,6 +377,8 @@ class SurrogateCompressionLossMixin:
         }
 
     def _should_refresh_surrogate_teacher(self, args, entry, refresh_actual_gen=True):
+        if isinstance(refresh_actual_gen, str) and refresh_actual_gen.strip().lower() == "always":
+            return True
         if not bool(refresh_actual_gen):
             return entry is None
         if entry is None:
@@ -464,6 +471,8 @@ class SurrogateCompressionLossMixin:
                 return "sparsepcgc_surrogate"
             if codec == "gpcc":
                 return "gpcc_surrogate"
+            if codec == "draco":
+                return "draco_surrogate"
             return "octattention_surrogate"
         return backend
 
@@ -476,8 +485,29 @@ class SurrogateCompressionLossMixin:
         cache_key=None,
         refresh_actual_gen=True,
     ):
+        timing_enabled = bool(getattr(args, "debug_timing", False))
+        timing = {}
+
+        def _sync_timing():
+            if timing_enabled and torch.is_tensor(gen_xyz) and gen_xyz.is_cuda:
+                torch.cuda.synchronize(gen_xyz.device)
+
+        def _mark_timing(name, start_time):
+            if not timing_enabled:
+                return start_time
+            _sync_timing()
+            now = time.time()
+            timing[name] = now - start_time
+            return now
+
+        if timing_enabled:
+            _sync_timing()
+            timing_cursor = time.time()
+        else:
+            timing_cursor = 0.0
         self._surrogate_call_count = int(getattr(self, "_surrogate_call_count", 0)) + 1
         x_soft = self._build_soft_compression_features(args, gen_xyz, gt_xyz, final_w)
+        timing_cursor = _mark_timing("feature_gen", timing_cursor)
         aux_node_weight = float(getattr(args, "compression_surrogate_aux_node_weight", 0.0))
         aux_single_weight = float(getattr(args, "compression_surrogate_aux_single_weight", 0.0))
         if aux_node_weight > 0.0 or aux_single_weight > 0.0:
@@ -486,6 +516,7 @@ class SurrogateCompressionLossMixin:
         else:
             soft_node_percent = x_soft.new_zeros(())
             soft_single_percent = x_soft.new_zeros(())
+        timing_cursor = _mark_timing("feature_ref_aux", timing_cursor)
         inputs_finite = self._all_finite(gen_xyz, gt_xyz, x_soft)
         target = None
         stats_gen = None
@@ -504,11 +535,15 @@ class SurrogateCompressionLossMixin:
 
         teacher_refreshed = bool(inputs_finite and self._should_refresh_surrogate_teacher(args, target_entry, refresh_actual_gen))
         if teacher_refreshed:
+            actual_t0 = time.time() if timing_enabled else 0.0
             cached_gt = self._get_cached_actual_gt(cache_key)
             if cached_gt is None:
                 cached_gt = self._encode_actual_batch(args, gt_xyz)
                 self._store_cached_actual_gt(cache_key, cached_gt)
             stats_gen = self._encode_actual_batch(args, gen_xyz, final_w=final_w)
+            if timing_enabled:
+                timing["actual_encode"] = time.time() - actual_t0
+                timing_cursor = time.time()
             teacher_codec = str(stats_gen.get("codec", cached_gt.get("codec", "octattention"))).strip().lower()
             actual_bit_percent = self._relative_percent(float(stats_gen["bit"]), float(cached_gt["bit"]))
             actual_bpp_percent = self._relative_percent(float(stats_gen["bpp"]), float(cached_gt["bpp"]))
@@ -528,6 +563,7 @@ class SurrogateCompressionLossMixin:
                 0,
             )
             L_sur = self._train_compression_surrogate(args, x_soft, target, train_steps=warmup_steps)
+            timing_cursor = _mark_timing("surrogate_fit", timing_cursor)
             self._store_surrogate_replay(args, x_soft, target)
             target_percent_value = float(actual_bit_percent)
             gen_points = int(stats_gen["point_count"])
@@ -577,6 +613,7 @@ class SurrogateCompressionLossMixin:
             gen_points = int(target_entry.get("gen_points", gen_points))
             gen_actual_bit = float(target_entry.get("gen_actual_bit", float("nan")))
             L_sur = x_soft.new_zeros(())
+            timing_cursor = _mark_timing("target_cache", timing_cursor)
         else:
             teacher_codec = self._surrogate_backend_label(args).replace("_surrogate", "")
             cached_gt = {
@@ -591,10 +628,12 @@ class SurrogateCompressionLossMixin:
             if not inputs_finite:
                 self._log_surrogate_event("skipped teacher refresh because generator features were non-finite.")
             L_sur = x_soft.new_zeros(())
+            timing_cursor = _mark_timing("target_missing", timing_cursor)
 
         replay_loss = self._train_surrogate_replay(args, gen_xyz.device)
         if replay_loss is not None:
             L_sur = 0.5 * (L_sur + replay_loss) if teacher_refreshed else replay_loss
+        timing_cursor = _mark_timing("surrogate_replay", timing_cursor)
 
         self._ensure_surrogate_device(gen_xyz.device)
         self.compression_surrogate.eval()
@@ -609,6 +648,7 @@ class SurrogateCompressionLossMixin:
                 pred = x_soft.new_zeros((x_soft.shape[0], 1), dtype=torch.float32)
         else:
             pred = x_soft.new_zeros((x_soft.shape[0], 1), dtype=torch.float32)
+        timing_cursor = _mark_timing("surrogate_predict", timing_cursor)
 
         surrogate_bit_percent = pred.reshape(-1).mean() if pred.numel() > 0 else x_soft.new_zeros(())
         actual_bit_percent_t = gen_xyz.new_tensor(float(actual_bit_percent), dtype=torch.float32)
@@ -675,6 +715,7 @@ class SurrogateCompressionLossMixin:
             "gen_octree_single": float(target_entry.get("gen_octree_single", 0.0)) if target_entry is not None and not teacher_refreshed else float(stats_gen.get("octree_single", 0.0)) if stats_gen is not None else 0.0,
             "gt_octree_depth": int(cached_gt.get("octree_depth", target_entry.get("gt_octree_depth", 0) if target_entry else 0)),
             "gen_octree_depth": int(target_entry.get("gen_octree_depth", 0)) if target_entry is not None and not teacher_refreshed else int(stats_gen.get("octree_depth", 0)) if stats_gen is not None else 0,
+            "timing": {key: round(float(value), 6) for key, value in timing.items()},
         }
 
         if self._should_verbose_step(args):

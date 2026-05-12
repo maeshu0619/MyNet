@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 from models.utils.compression.gpcc_tmc3 import GPCCGeometryEncoder
+from models.utils.compression.draco import DracoGeometryEncoder
 from models.utils.compression.proxy_octree import ProxyOctreeConfig, SoftOctreeRateProxy
 
 
@@ -397,7 +398,7 @@ class _SparsePCGCActualEncoder:
 
     def _worker_args(self):
         repo_root = self._repo_root()
-        runner = os.path.join(repo_root, "myNet_new", "models", "utils", "loss", "sparsepcgc_teacher_worker.py")
+        runner = os.path.join(repo_root, "myNet", "models", "utils", "loss", "sparsepcgc_teacher_worker.py")
         root = self._sparsepcgc_root()
         cmd = self._python_command() + [
             runner,
@@ -616,7 +617,7 @@ class _SparsePCGCActualEncoder:
 
 
 class _GPCCActualEncoder:
-    """Thin loss-side wrapper around the myNet_new G-PCC geometry encoder."""
+    """Thin loss-side wrapper around the myNet G-PCC geometry encoder."""
 
     codec_name = "gpcc"
 
@@ -638,6 +639,30 @@ class _GPCCActualEncoder:
         return self.encoder.encode_tensor(pts_3n)
 
 
+class _DracoActualEncoder:
+    codec_name = "draco"
+
+    def __init__(self, args, writer=None):
+        self.encoder = DracoGeometryEncoder(
+            root=getattr(args, "draco_root", ""),
+            encoder_path=getattr(args, "draco_encoder_path", ""),
+            decoder_path=getattr(args, "draco_decoder_path", ""),
+            tmp_root=getattr(args, "draco_tmp_dir", ""),
+            timeout=float(getattr(args, "draco_timeout", 120.0)),
+            effective_qs=float(getattr(args, "draco_effective_qs", getattr(args, "qs", 1.0))),
+            prequantize=bool(getattr(args, "draco_prequantize", True)),
+            position_quantization_bits=int(getattr(args, "draco_position_quantization_bits", 0)),
+            compression_level=int(getattr(args, "draco_compression_level", 7)),
+            skip_decode=bool(getattr(args, "draco_skip_decode", True)),
+            force_point_cloud=bool(getattr(args, "draco_force_point_cloud", True)),
+            merge_duplicated_points=bool(getattr(args, "draco_merge_duplicated_points", True)),
+            writer=writer,
+        )
+
+    def encode_bits(self, pts_3n):
+        return self.encoder.encode_tensor(pts_3n)
+
+
 def _actual_codec_key(args):
     backend = str(getattr(args, "compression_loss_backend", "")).strip().lower()
     compress = str(getattr(args, "compress", "OctAttention")).strip().lower().replace("_", "").replace("-", "")
@@ -645,6 +670,8 @@ def _actual_codec_key(args):
         return "sparsepcgc"
     if backend.startswith("gpcc") or compress == "gpcc":
         return "gpcc"
+    if backend.startswith("draco") or compress == "draco":
+        return "draco"
     return "octattention"
 
 
@@ -654,4 +681,6 @@ def build_actual_encoder(args, writer=None):
         return _SparsePCGCActualEncoder(args, writer=writer)
     if codec_key == "gpcc":
         return _GPCCActualEncoder(args, writer=writer)
+    if codec_key == "draco":
+        return _DracoActualEncoder(args, writer=writer)
     return _OctAttentionActualEncoder(args, writer=writer)
