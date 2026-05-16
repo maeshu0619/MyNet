@@ -11,6 +11,7 @@ import torch
 import torch.optim as optim
 import argparse
 import hashlib
+import math
 from collections import OrderedDict
 
 import time
@@ -26,6 +27,7 @@ from models.utils.pointcloud.octree_subtree import (
     select_octree_subtree_keys,
     should_use_full_cloud_anchor,
 )
+from models.utils.pointcloud.quant_noise import add_uniform_quantization_noise, resolve_uniform_noise_delta
 from models.utils.data.dataset import *
 from models.utils.patching.patch import (
     build_patch_info,
@@ -75,120 +77,55 @@ from models.utils.training.utils import (_adapt_encoder_state_dict_for_sparse_in
                                          _finalize_point_edit_sums,
                                          _summarize_point_edits,
                                          _cuda_bf16_ops_safe,
-                                         _log_grad_flow)
+                                         _log_grad_flow, 
+                                         _capture_param_update_snapshots,
+                                         _log_param_updates,
+                                         _format_named_float_map,
+                                         _uses_actual_total_bit_objective,
+                                         _write_structure_decision_debug,
+                                         _compression_stat_qs,
+                                         _format_triplet,
+                                         _summarize_subtree_octree_stats,)
 from models.utils.training.utils import *
-
-
-def _format_named_float_map(values, max_items=None):
-    if not values:
-        return "n/a"
-    items = list(values.items())
-    if max_items is not None:
-        items = items[:max_items]
-    return ", ".join(f"{key}={float(value):.4f}" for key, value in items)
-
-
-def _uses_actual_total_bit_objective(args):
-    backend_name = str(getattr(args, "compression_loss_backend", "proxy")).strip().lower()
-    return backend_name in {
-        "octattention_actual",
-        "octattention_actual_ste",
-        "octattention_surrogate",
-        "sparsepcgc_actual",
-        "sparsepcgc_actual_ste",
-        "sparsepcgc_surrogate",
-        "gpcc_actual",
-        "gpcc_actual_ste",
-        "gpcc_surrogate",
-        "draco_actual",
-        "draco_actual_ste",
-        "draco_surrogate",
-    }
-
-
-def _write_structure_decision_debug(writer, prefix, structure_debug):
-    if not structure_debug:
-        return
-    cause_mean = structure_debug.get("subtree_cause_mean") or structure_debug.get("cause_mean") or {}
-    policy_mean = structure_debug.get("policy_mean") or {}
-    top_cause = max(cause_mean, key=cause_mean.get) if cause_mean else "n/a"
-    top_policy = max(policy_mean, key=policy_mean.get) if policy_mean else "n/a"
-    writer.write(
-        f"{prefix}: "
-        f"top_cause={top_cause}, top_policy={top_policy}, "
-        f"policy_entropy={float(structure_debug.get('policy_entropy', 0.0)):.6f}, "
-        f"policy_diversity={int(structure_debug.get('policy_diversity', 0))}, "
-        f"add_ratio={float(structure_debug.get('add_ratio', 0.0)):.6f}, "
-        f"cause_mean=[{_format_named_float_map(cause_mean)}], "
-        f"policy_mean=[{_format_named_float_map(policy_mean)}]"
-    )
-    operation_by_cause = structure_debug.get("operation_by_cause") or {}
-    if operation_by_cause:
-        parts = []
-        for cause_name, info in operation_by_cause.items():
-            parts.append(
-                f"{cause_name}->{info.get('operation', 'none')}"
-                f"(count={int(info.get('count', 0))}, conf={float(info.get('confidence', 0.0)):.4f})"
-            )
-        writer.write(f"{prefix}ByCause: " + "; ".join(parts))
-    level_debug = structure_debug.get("octree_level_debug") or []
-    if level_debug:
-        parts = []
-        for item in level_debug:
-            parts.append(
-                f"L{int(item.get('level', 0))}:"
-                f"occ={float(item.get('occupied_mean', 0.0)):.1f},"
-                f"single_ratio={float(item.get('single_ratio_mean', 0.0)):.4f},"
-                f"children={float(item.get('mean_children_mean', 0.0)):.3f}"
-            )
-        writer.write(f"{prefix}OctreeLevels: " + "; ".join(parts))
-
-
-def _compression_stat_qs(args):
-    codec = str(getattr(args, "compress", "OctAttention")).strip().lower().replace("_", "").replace("-", "")
-    if codec == "sparsepcgc":
-        return max(float(getattr(args, "sparsepcgc_voxel_size", 1.0)), 1e-9)
-    if codec == "gpcc":
-        return max(float(getattr(args, "gpcc_effective_qs", getattr(args, "qs", 1.0))), 1e-9)
-    return max(float(getattr(args, "qs", 1.0)), 1e-9)
-
-
-def _format_triplet(values):
-    if not values:
-        return "0/0.0/0"
-    mean = sum(values) / float(max(len(values), 1))
-    return f"{min(values):.0f}/{mean:.1f}/{max(values):.0f}"
-
-
-def _summarize_subtree_octree_stats(input_xyz, groups, args):
-    limit = max(int(getattr(args, "train_subtree_stat_log_limit", 16)), 0)
-    if limit <= 0 or not groups:
-        return None
-    qs = _compression_stat_qs(args)
-    nodes = []
-    singles = []
-    depths = []
-    for _subtree_key, point_idx in groups[:limit]:
-        pts = input_xyz[0, :3, :].index_select(1, point_idx).contiguous()
-        stats = hard_octree_occupancy_stats(
-            pts,
-            qs=qs,
-            max_depth=int(getattr(args, "compression_octree_stat_depth", 0)),
-            quant_mode="sparsepcgc"
-            if str(getattr(args, "compress", "")).strip().lower().replace("-", "").replace("_", "") == "sparsepcgc"
-            else "round",
-            pos_quantscale=int(getattr(args, "sparsepcgc_pos_quantscale", 1)),
-        )
-        nodes.append(float(stats["node_count"]))
-        singles.append(float(stats["single_child_count"]))
-        depths.append(float(stats["max_depth"]))
-    return {
-        "count": len(nodes),
-        "node": _format_triplet(nodes),
-        "single": _format_triplet(singles),
-        "depth": _format_triplet(depths),
-    }
-
+from models.utils.training.noise_debug import (
+    empty_noise_debug,
+    merge_noise_debug_values,
+    prepare_compression_points,
+    accumulate_compression_terms,
+)
+from models.utils.training.correlation import (
+    finite_float_or_none,
+    rolling_pearson,
+    push_rolling_correlation,
+    format_corr,
+)
+from models.utils.training.optim_amp import (
+    build_optimizer_and_scheduler,
+    setup_amp,
+    build_loader_kwargs,
+)
+from models.utils.training.checkpointing import save_episode_checkpoint
+from models.utils.training.train_logging import (
+    log_backend_summary,
+    log_input_mode,
+    log_structure_debug,
+    log_point_edit_stats,
+)
+from models.utils.training.log_step import (
+    log_step_loss,
+    log_compression_stats,
+    log_compression_train_debug,
+    log_codec_actual_correlation,
+    log_sparsepcgc_train_debug,
+    log_step_timing,
+)
+from models.utils.training.log_epoch_episode import (
+    log_epoch_point_edit_average,
+    log_episode_point_edit_average,
+    log_plot_skip_epoch,
+    log_plot_skip_episode,
+)
+from models.utils.training.log_setup import log_training_setup
 
 def train(model, args, loss, writer, plot, notifier=None):
     """==========================================================="""
@@ -209,6 +146,8 @@ def train(model, args, loss, writer, plot, notifier=None):
     if callable(set_cache_expected):
         set_cache_expected(total_train_files)
     patch_info_cache = OrderedDict()
+    sparsepcgc_proxy_actual_pairs = []
+    codec_actual_metric_pairs = {}
 
     # モデル保存先ファイルのセットアップ
     output_dir = os.path.join(args.out_path)
@@ -216,56 +155,33 @@ def train(model, args, loss, writer, plot, notifier=None):
     if not os.path.exists(ckpt_dir):
         os.makedirs(ckpt_dir)
     
-    # 最適化パラメータのセットアップ
-    if args.deform:
-        deform_params = [p for n, p in model.named_parameters() if (('disp_module' in n) or ('actuator' in n)) and p.requires_grad]
-        other_params = [p for n, p in model.named_parameters() if ('disp_module' not in n) and ('actuator' not in n) and ('encoder' not in n) and p.requires_grad]
-    else:
-        deform_params = []
-        other_params = [p for n, p in model.named_parameters() if ('encoder' not in n) and p.requires_grad]
-
-    # ===== 確認ログ =====
-    num_enc_trainable = sum(p.requires_grad for p in model.encoder.parameters())
-    writer.write(f"Trainable encoder params: {num_enc_trainable} (should be 0)")
-
-    assert args.optim in ['adam', 'sgd']
-    if args.optim == 'adam':
-        optimizer = optim.Adam([{'params': other_params}, {'params': deform_params, 'lr': args.lr*0.1}], lr=args.lr, weight_decay=args.weight_decay)
-    else:
-        args.lr = args.lr * 100
-        optimizer = optim.SGD([{'params': other_params}, {'params': deform_params, 'lr': args.lr * 0.1}], lr=args.lr)
-    
-    # スケジュール（学習が進むほどOptimiserの動きを緩やかにする）
-    scheduler_steplr = optim.lr_scheduler.StepLR(optimizer, step_size=args.lr_decay_step, gamma=args.gamma)
-    use_cuda = next(model.parameters()).is_cuda
-    use_amp = bool(use_cuda and getattr(args, "use_amp", False))
-    amp_dtype = _resolve_amp_dtype(args, use_cuda) if use_amp else torch.float16
-    amp_scaler_enabled = bool(use_amp and amp_dtype == torch.float16)
-    scaler = torch.cuda.amp.GradScaler(
-        enabled=amp_scaler_enabled,
-        init_scale=float(getattr(args, "amp_init_scale", 1.0)),
+    optimizer, scheduler_steplr = build_optimizer_and_scheduler(
+        model,
+        args,
+        writer,
     )
-    amp_overflow_patience = max(int(getattr(args, "amp_overflow_patience", 2)), 1)
-    consecutive_amp_skips = 0
-    writer.write(
-        f"AMP: {'enabled' if use_amp else 'disabled'}"
-        + (f" ({'bf16' if amp_dtype == torch.bfloat16 else 'fp16'})" if use_amp else "")
+
+    amp_state = setup_amp(
+        model,
+        args,
+        writer,
     )
+
+    use_cuda = amp_state["use_cuda"]
+    use_amp = amp_state["use_amp"]
+    amp_dtype = amp_state["amp_dtype"]
+    amp_scaler_enabled = amp_state["amp_scaler_enabled"]
+    scaler = amp_state["scaler"]
+    amp_overflow_patience = amp_state["amp_overflow_patience"]
+    consecutive_amp_skips = amp_state["consecutive_amp_skips"]
+
     _warmup_whole_cloud_caches(model, args, loss, seq_datasets, writer, use_cuda, use_amp, amp_dtype)
-
-    loader_num_workers = _use_memory_safe_loader_workers(args, model, writer)
-    loader_kwargs = dict(
-        batch_size=1,
-        shuffle=False,
-        num_workers=loader_num_workers,
-        pin_memory=bool(use_cuda and args.pin_memory),
+    loader_kwargs = build_loader_kwargs(
+        args,
+        model,
+        writer,
+        use_cuda,
     )
-    if loader_kwargs["num_workers"] > 0:
-        loader_kwargs["persistent_workers"] = bool(args.persistent_workers)
-        if bool(getattr(args, "clear_main_ply_cache_for_workers", True)):
-            clear_ply_cache()
-            writer.write("Main-process PLY cache was cleared before worker DataLoaders to avoid duplicated CPU memory.")
-
     """==========================================================="""
     """トレーニング"""
     """==========================================================="""
@@ -299,9 +215,24 @@ def train(model, args, loss, writer, plot, notifier=None):
                 file_path = dataset.files[step]
                 cache_key = _make_step_cache_key(file_path, args)
                 log_this_step = _should_log_step(step + 1, num_steps, args.print_rate)
-                timing_enabled = bool(getattr(args, "debug_timing", False) and log_this_step)
+                profile_this_step = _should_log_step(
+                    global_train_step + 1,
+                    max(int(getattr(args, "_total_train_steps_estimate", num_steps)), 1),
+                    int(getattr(args, "profile_interval", 100)),
+                )
+                timing_enabled = bool(
+                    (getattr(args, "debug_timing", False) and log_this_step)
+                    or (
+                        (
+                            getattr(args, "log_step_time", True)
+                            or getattr(args, "log_gpu_memory", True)
+                        )
+                        and profile_this_step
+                    )
+                )
                 args._global_train_step = int(global_train_step)
                 args._log_this_step = False
+                args._collect_sparsepcgc_debug = bool(log_this_step or profile_this_step)
                 detail_log_this_step = False
                 raw_pts_num = int(pts.shape[1] if pts.dim() == 3 else pts.shape[0])
                 if timing_enabled and use_cuda and torch.cuda.is_available():
@@ -341,6 +272,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                     clear_policy_terms()
                 stage_factors = _stage_loss_factors(args)
                 compute_compression = stage_factors["com"] != 0.0
+                refresh_actual_gen = not bool(getattr(args, "disable_actual_codec_during_train", False))
 
                 subset_step = False
                 subset_enabled = False
@@ -348,6 +280,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                 compression_cache_key = cache_key
                 compression_gt_pts = input_xyz
                 train_edit_stats = None
+                noise_debug = empty_noise_debug()
 
                 if subtree_mode:
                     optimizer.zero_grad(set_to_none=True)
@@ -451,9 +384,9 @@ def train(model, args, loss, writer, plot, notifier=None):
 
                     L_geom = input_xyz.new_zeros(())
                     L_com = input_xyz.new_zeros(())
-                    L_prun = input_xyz.new_zeros(())
-                    L_add = input_xyz.new_zeros(())
-                    L_dis = input_xyz.new_zeros(())
+                    L_attr = input_xyz.new_zeros(())
+                    L_policy = input_xyz.new_zeros(())
+                    L_actuator = input_xyz.new_zeros(())
                     Lp_out = input_xyz.new_zeros(())
                     La_fit = input_xyz.new_zeros(())
                     La_rep = input_xyz.new_zeros(())
@@ -471,9 +404,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                             with autocast_ctx:
                                 (
                                     gen_pts,
-                                    L_prun,
-                                    L_add,
-                                    L_dis,
+                                    L_attr,
+                                    L_policy,
+                                    L_actuator,
                                     final_w,
                                     Lp_out,
                                     La_fit,
@@ -517,13 +450,20 @@ def train(model, args, loss, writer, plot, notifier=None):
                                     out_label=out_label,
                                 )
                                 if stage_factors["com"] != 0.0:
+                                    compression_gen_xyz, noise_debug = prepare_compression_points(
+                                        gen_xyz,
+                                        args,
+                                        model,
+                                        collect_stats=bool(log_this_step or profile_this_step),
+                                    )
                                     L_com, loss_bit, loss_single, loss_nodes, _, _ = loss.get_compression_loss(
                                         args,
-                                        gen_xyz=gen_xyz,
+                                        gen_xyz=compression_gen_xyz,
                                         gt_xyz=input_xyz[:, :3, :],
                                         final_w=final_w_for_loss,
                                         cache_key=cache_key,
-                                        refresh_actual_gen=True,
+                                        refresh_actual_gen=refresh_actual_gen,
+                                        actual_gen_xyz=gen_xyz,
                                     )
                                 else:
                                     zero = input_xyz.new_zeros(())
@@ -534,6 +474,8 @@ def train(model, args, loss, writer, plot, notifier=None):
                         else:
                             num_selected = float(max(len(selected_groups), 1))
                             subtree_edit_sums = _new_point_edit_sums()
+                            subtree_noise_debug_values = []
+                            subtree_compression_term_sums = {}
                             for subtree_key, point_idx in selected_groups:
                                 subtree_xyz = input_xyz.index_select(2, point_idx).contiguous()
                                 subtree_attr = None
@@ -546,9 +488,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 with autocast_ctx:
                                     (
                                         gen_subtree_pts,
-                                        L_prun_sub,
-                                        L_add_sub,
-                                        L_dis_sub,
+                                        L_attr_sub,
+                                        L_policy_sub,
+                                        L_actuator_sub,
                                         final_w_sub,
                                         Lp_out_sub,
                                         La_fit_sub,
@@ -586,13 +528,26 @@ def train(model, args, loss, writer, plot, notifier=None):
                                         out_label=out_label_sub,
                                     )
                                     if stage_factors["com"] != 0.0:
+                                        compression_subtree_xyz, noise_debug_sub = prepare_compression_points(
+                                            gen_subtree_xyz,
+                                            args,
+                                            model,
+                                            collect_stats=bool(log_this_step or profile_this_step),
+                                        )
+                                        subtree_noise_debug_values.append(noise_debug_sub)
                                         L_com_sub, loss_bit_sub, loss_single_sub, loss_nodes_sub, _, _ = loss.get_compression_loss(
                                             args,
-                                            gen_xyz=gen_subtree_xyz,
+                                            gen_xyz=compression_subtree_xyz,
                                             gt_xyz=subtree_xyz[:, :3, :],
                                             final_w=final_w_sub_loss,
                                             cache_key=subtree_cache_key,
-                                            refresh_actual_gen=True,
+                                            refresh_actual_gen=refresh_actual_gen,
+                                            actual_gen_xyz=gen_subtree_xyz,
+                                        )
+                                        accumulate_compression_terms(
+                                            subtree_compression_term_sums,
+                                            getattr(loss, "last_compression_terms", {}) or {},
+                                            1.0 / num_selected,
                                         )
                                     else:
                                         zero = subtree_xyz.new_zeros(())
@@ -603,9 +558,9 @@ def train(model, args, loss, writer, plot, notifier=None):
 
                                 L_geom = L_geom + (L_geom_sub / num_selected)
                                 L_com = L_com + (L_com_sub / num_selected)
-                                L_prun = L_prun + (L_prun_sub / num_selected)
-                                L_add = L_add + (L_add_sub / num_selected)
-                                L_dis = L_dis + (L_dis_sub / num_selected)
+                                L_attr = L_attr + (L_attr_sub / num_selected)
+                                L_policy = L_policy + (L_policy_sub / num_selected)
+                                L_actuator = L_actuator + (L_actuator_sub / num_selected)
                                 Lp_out = Lp_out + (Lp_out_sub / num_selected)
                                 La_fit = La_fit + (La_fit_sub / num_selected)
                                 La_rep = La_rep + (La_rep_sub / num_selected)
@@ -616,6 +571,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 final_w = final_w_sub
                                 out_label = out_label_sub
                             train_edit_stats = _finalize_point_edit_sums(subtree_edit_sums)
+                            noise_debug = merge_noise_debug_values(subtree_noise_debug_values)
+                            if subtree_compression_term_sums:
+                                loss.last_compression_terms = subtree_compression_term_sums
                     finally:
                         args._log_this_step = prev_log_flag
                 elif args.split2patch:
@@ -654,9 +612,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                     patch_count = selected_patch_count
                     geom_weight_sum = 0.0
                     L_geom = input_pcd.new_zeros(())
-                    L_prun = input_pcd.new_zeros(())
-                    L_add = input_pcd.new_zeros(())
-                    L_dis = input_pcd.new_zeros(())
+                    L_attr = input_pcd.new_zeros(())
+                    L_policy = input_pcd.new_zeros(())
+                    L_actuator = input_pcd.new_zeros(())
                     Lp_out = input_pcd.new_zeros(())
                     La_fit = input_pcd.new_zeros(())
                     La_rep = input_pcd.new_zeros(())
@@ -678,9 +636,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 ]
                                 (
                                     gen_chunk,
-                                    L_prun_chunk,
-                                    L_add_chunk,
-                                    L_dis_chunk,
+                                    L_attr_chunk,
+                                    L_policy_chunk,
+                                    L_actuator_chunk,
                                     final_w_chunk,
                                     Lp_out_chunk,
                                     La_fit_chunk,
@@ -706,9 +664,9 @@ def train(model, args, loss, writer, plot, notifier=None):
 
                                 chunk_size = patch_xyz.shape[0]
                                 geom_groups = {}
-                                L_prun = L_prun + L_prun_chunk * chunk_size
-                                L_add = L_add + L_add_chunk * chunk_size
-                                L_dis = L_dis + L_dis_chunk * chunk_size
+                                L_attr = L_attr + L_attr_chunk * chunk_size
+                                L_policy = L_policy + L_policy_chunk * chunk_size
+                                L_actuator = L_actuator + L_actuator_chunk * chunk_size
                                 Lp_out = Lp_out + Lp_out_chunk * chunk_size
                                 La_fit = La_fit + La_fit_chunk * chunk_size
                                 La_rep = La_rep + La_rep_chunk * chunk_size
@@ -841,9 +799,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                             compression_gt_pts = input_xyz
 
                         norm = float(max(patch_count, 1))
-                        L_prun = L_prun / norm
-                        L_add = L_add / norm
-                        L_dis = L_dis / norm
+                        L_attr = L_attr / norm
+                        L_policy = L_policy / norm
+                        L_actuator = L_actuator / norm
                         Lp_out = Lp_out / norm
                         La_fit = La_fit / norm
                         La_rep = La_rep / norm
@@ -863,7 +821,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                     encoder_debug_chunks = [] if detail_log_this_step else None
                     autocast_ctx = torch.cuda.amp.autocast(dtype=amp_dtype, enabled=use_amp) if use_cuda else nullcontext()
                     with autocast_ctx:
-                        gen_patches, L_prun, L_add, L_dis, final_w, Lp_out, La_fit, La_rep, out_label = model.forward(
+                        gen_patches, L_attr, L_policy, L_actuator, final_w, Lp_out, La_fit, La_rep, out_label = model.forward(
                             patches,
                             None,
                             cache_key=cache_key,
@@ -898,18 +856,35 @@ def train(model, args, loss, writer, plot, notifier=None):
                     final_w_for_loss = None
                     if str(getattr(args, "discrete_loss_mode", "hard")).strip().lower() != "hard":
                         final_w_for_loss = final_w
-                    refresh_actual_gen = True
+                    if timing_enabled:
+                        _sync_for_timing(use_cuda)
+                        timing_noise_start = time.time()
+                    if subtree_mode:
+                        compression_gen_xyz = gen_xyz
+                    else:
+                        # 入力や診断前ではなく、編集後・量子化前にだけ一様ノイズを加える。
+                        # 形状損失はcleanなgen_xyz、rate/structure損失はcompression_gen_xyzを見る。
+                        compression_gen_xyz, noise_debug = prepare_compression_points(
+                            gen_xyz,
+                            args,
+                            model,
+                            collect_stats=bool(log_this_step or profile_this_step),
+                        )
+                    if timing_enabled:
+                        _sync_for_timing(use_cuda)
+                        timing_noise_end = time.time()
                     if subtree_mode:
                         pass
                     elif args.split2patch:
                         if compute_compression:
                             L_com, loss_bit, loss_single, loss_nodes, _, _ = loss.get_compression_loss(
                                 args,
-                                gen_xyz=gen_xyz,
+                                gen_xyz=compression_gen_xyz,
                                 gt_xyz=compression_gt_pts[:, :3, :],
                                 final_w=final_w_for_loss,
                                 cache_key=compression_cache_key,
                                 refresh_actual_gen=refresh_actual_gen,
+                                actual_gen_xyz=gen_xyz,
                             )
                         else:
                             zero = gen_xyz.new_zeros(())
@@ -930,11 +905,12 @@ def train(model, args, loss, writer, plot, notifier=None):
                         if compute_compression:
                             L_com, loss_bit, loss_single, loss_nodes, _, _ = loss.get_compression_loss(
                                 args,
-                                gen_xyz=gen_xyz,
+                                gen_xyz=compression_gen_xyz,
                                 gt_xyz=input_xyz[:, :3, :],
                                 final_w=final_w_for_loss,
                                 cache_key=cache_key,
                                 refresh_actual_gen=refresh_actual_gen,
+                                actual_gen_xyz=gen_xyz,
                             )
                         else:
                             zero = gen_xyz.new_zeros(())
@@ -945,6 +921,19 @@ def train(model, args, loss, writer, plot, notifier=None):
                             loss.last_compression_debug = {}
                             loss.last_compression_terms = {}
 
+                if compute_compression:
+                    comp_debug_for_noise = getattr(loss, "last_compression_debug", {}) or {}
+                    comp_debug_for_noise.update(
+                        {
+                            "uniform_noise_enabled": bool(noise_debug.get("enabled", False)),
+                            "uniform_noise_applied": bool(noise_debug.get("applied", False)),
+                            "uniform_noise_delta": float(noise_debug.get("delta", 0.0)),
+                            "uniform_noise_mean_abs": float(noise_debug.get("mean_abs", 0.0)),
+                            "compression_input_noisy": bool(noise_debug.get("applied", False)),
+                        }
+                    )
+                    loss.last_compression_debug = comp_debug_for_noise
+
                 actual_total_bit_backend = _uses_actual_total_bit_objective(args)
                 if actual_total_bit_backend:
                     L_com_objective = float(getattr(args, "w_com", 1.0)) * L_com
@@ -954,12 +943,14 @@ def train(model, args, loss, writer, plot, notifier=None):
                     single_term = terms.get("single", L_com.new_zeros(()))
                     node_term = terms.get("node", L_com.new_zeros(()))
                     bpn_term = terms.get("bpn", L_com.new_zeros(()))
+                    sparsepcgc_term = terms.get("sparsepcgc", L_com.new_zeros(()))
                     lowprob_term = La_fit if torch.is_tensor(La_fit) else L_com.new_zeros(())
                     L_com_objective = float(getattr(args, "w_com", 1.0)) * (
                         float(getattr(args, "com_bit", 0.0)) * bit_term
                         + float(getattr(args, "com_sin", 0.0)) * single_term
                         + float(getattr(args, "com_node", 0.0)) * node_term
                         + float(getattr(args, "com_bpn", 0.0)) * bpn_term
+                        + float(getattr(args, "com_sparsepcgc", 0.0)) * sparsepcgc_term
                         + float(getattr(args, "com_lowprob", 0.0)) * lowprob_term
                     )
                 L_downstream = (
@@ -968,78 +959,89 @@ def train(model, args, loss, writer, plot, notifier=None):
                 )
                 L = (
                     L_downstream
-                    + stage_factors["attr"] * args.w_prun * L_prun
-                    + stage_factors["policy"] * args.w_add * L_add
-                    + stage_factors["repair"] * args.w_dis * L_dis
+                    + stage_factors["attr"] * args.w_attr * L_attr
+                    + stage_factors["policy"] * args.w_policy * L_policy
+                    + stage_factors["repair"] * args.w_actuator * L_actuator
                 )
-                L_policy = L.new_zeros(())
+                L_discrete_policy = L.new_zeros(())
                 if str(getattr(args, "discrete_loss_mode", "hard")).strip().lower() == "hard":
                     policy_loss_fn = getattr(model, "discrete_policy_loss", None)
                     if callable(policy_loss_fn):
-                        L_policy = policy_loss_fn(L_downstream.detach())
-                        L = L + L_policy
+                        L_discrete_policy = policy_loss_fn(L_downstream.detach())
+                        L = L + L_discrete_policy
 
                 if log_this_step:
                     comp_debug = getattr(loss, "last_compression_debug", {}) or {}
                     base_model = model.module if hasattr(model, "module") else model
                     structure_debug = getattr(base_model, "last_structure_debug", {}) or {}
-                    writer.write(
-                        f"StepLoss step={step + 1}/{num_steps}: "
-                        f"L={float(L.detach().cpu()):.6f}, "
-                        f"L_geom={float(L_geom.detach().cpu()):.6f}, "
-                        f"L_com={float(L_com.detach().cpu()):.6f}, "
-                        f"L_com_obj={float(L_com_objective.detach().cpu()):.6f}, "
-                        f"L_prun={float(L_prun.detach().cpu()):.6f}, "
-                        f"L_add={float(L_add.detach().cpu()):.6f}, "
-                        f"L_dis={float(L_dis.detach().cpu()):.6f}, "
-                        f"Lp_out={float(Lp_out.detach().cpu()):.6f}, "
-                        f"La_fit={float(La_fit.detach().cpu()):.6f}, "
-                        f"La_rep={float(La_rep.detach().cpu()):.6f}, "
-                        f"L_policy={float(L_policy.detach().cpu()):.6f}, "
-                        f"bit={float(loss_bit.detach().cpu()):.6f}, "
-                        f"single={float(loss_single.detach().cpu()):.6f}, "
-                        f"nodes={float(loss_nodes.detach().cpu()):.6f}"
+
+                    log_step_loss(
+                        writer,
+                        step,
+                        num_steps,
+                        L,
+                        L_geom,
+                        L_com,
+                        L_com_objective,
+                        L_attr,
+                        L_policy,
+                        L_actuator,
+                        Lp_out,
+                        La_fit,
+                        La_rep,
+                        L_discrete_policy,
+                        loss_bit,
+                        loss_single,
+                        loss_nodes,
                     )
-                    writer.write(
-                        f"CompressionStats step={step + 1}/{num_steps}: "
-                        f"actual_bit:{float(comp_debug.get('gt_actual_bit', float('nan'))):.6f}"
-                        f"->{float(comp_debug.get('gen_actual_bit', float('nan'))):.6f}, "
-                        f"actual_bit_percent={float(comp_debug.get('actual_total_bit_percent', comp_debug.get('total_bit', 0.0))):.6f}, "
-                        f"codec_points={int(comp_debug.get('gt_points', 0))}->{int(comp_debug.get('gen_points', 0))}, "
-                        f"objective={float(comp_debug.get('compression_objective', comp_debug.get('total_bit', 0.0))):.6f}, "
-                        f"surrogate_bit_percent={float(comp_debug.get('surrogate_pred_bit', 0.0)):.6f}, "
-                        f"surrogate_target_bit={float(comp_debug.get('surrogate_target_bit', 0.0)):.6f}, "
-                        f"surrogate_abs_bit_error={float(comp_debug.get('surrogate_abs_bit_error', 0.0)):.6f}, "
-                        f"surrogate_train_loss={float(comp_debug.get('surrogate_train_loss', 0.0)):.6f}, "
-                        f"soft_node={float(comp_debug.get('soft_node_percent', 0.0)):.6f}, "
-                        f"soft_single={float(comp_debug.get('soft_single_percent', 0.0)):.6f}, "
-                        f"octree_node:{float(comp_debug.get('gt_octree_node', 0.0)):.1f}->{float(comp_debug.get('gen_octree_node', 0.0)):.1f}, "
-                        f"octree_single:{float(comp_debug.get('gt_octree_single', 0.0)):.1f}->{float(comp_debug.get('gen_octree_single', 0.0)):.1f}, "
-                        f"teacher_codec={comp_debug.get('teacher_codec', 'unknown')}, "
-                        f"teacher_refresh={bool(comp_debug.get('teacher_refresh', False))}, "
-                        f"teacher_cache_hit={comp_debug.get('teacher_cache_hit', 'unknown')}, "
-                        f"replay={int(comp_debug.get('surrogate_replay_size', 0))}, "
-                        f"teacher_policy={comp_debug.get('teacher_refresh_policy', 'unknown')}"
+
+                    log_compression_stats(
+                        writer,
+                        step,
+                        num_steps,
+                        comp_debug,
                     )
+
+                    before_node, after_node, before_single, after_single = log_compression_train_debug(
+                        writer,
+                        step,
+                        num_steps,
+                        args,
+                        comp_debug,
+                        loss,
+                        L_com,
+                    )
+
+                    log_codec_actual_correlation(
+                        writer,
+                        step,
+                        num_steps,
+                        args,
+                        comp_debug,
+                        codec_actual_metric_pairs,
+                        before_node,
+                        after_node,
+                        before_single,
+                        after_single,
+                    )
+
+                    log_sparsepcgc_train_debug(
+                        writer,
+                        step,
+                        num_steps,
+                        args,
+                        comp_debug,
+                        sparsepcgc_proxy_actual_pairs,
+                    )
+
                     if structure_debug:
-                        writer.write(
-                            f"StructureStats step={step + 1}/{num_steps}: "
-                            f"repair_ratio={float(structure_debug.get('repair_ratio', 0.0)):.6f}, "
-                            f"add_ratio={float(structure_debug.get('add_ratio', 0.0)):.6f}, "
-                            f"add_count={int(structure_debug.get('add_count', 0))}, "
-                            f"add_effective_count={int(structure_debug.get('add_effective_count', 0))}, "
-                            f"add_candidate_ratio={float(structure_debug.get('add_candidate_ratio', 0.0)):.6f}, "
-                            f"add_noise={float(structure_debug.get('add_score_noise', 0.0)):.4f}, "
-                            f"add_weight_mix={float(structure_debug.get('add_weight_random_mix', 0.0)):.4f}, "
-                            f"drop_noise={float(structure_debug.get('drop_score_noise', 0.0)):.4f}, "
-                            f"drop_mix={float(structure_debug.get('drop_random_mix', 0.0)):.4f}, "
-                            f"add_drop_conflict={float(structure_debug.get('add_drop_conflict_loss', 0.0)):.6f}, "
-                            f"added_keep_loss={float(structure_debug.get('added_keep_loss', 0.0)):.6f}, "
-                            f"add_min_offset_loss={float(structure_debug.get('add_min_offset_loss', 0.0)):.6f}, "
-                            f"drop_ratio={float(structure_debug.get('drop_ratio', 0.0)):.6f}, "
-                            f"keep_ratio={float(structure_debug.get('keep_ratio', 0.0)):.6f}, "
-                            f"delta_norm={float(structure_debug.get('delta_norm', 0.0)):.6f}"
+                        log_structure_debug(
+                            writer,
+                            structure_debug,
+                            step,
+                            num_steps,
                         )
+
                         _write_structure_decision_debug(
                             writer,
                             f"StructureDecision step={step + 1}/{num_steps}",
@@ -1052,11 +1054,19 @@ def train(model, args, loss, writer, plot, notifier=None):
                 """--- どのlossがどの勾配を作っているか確認 ---"""
                 # backward_and_measure("geom", args.w_geom * L_geom, model, optimizer, writer, args)                
                 # backward_and_measure("com", args.w_com  * L_com,  model, optimizer, writer, args)
-                # backward_and_measure("prun", args.w_prun * L_prun, model, optimizer, writer, args)
-                # backward_and_measure("add" , args.w_add  * L_add,  model, optimizer, writer, args)
+                # backward_and_measure("attr", args.w_attr * L_attr, model, optimizer, writer, args)
+                # backward_and_measure("policy" , args.w_policy  * L_policy,  model, optimizer, writer, args)
 
                 step_completed = False
                 total_loss_finite = bool(torch.isfinite(L.detach()).all().item())
+                param_update_snapshots = None
+                if total_loss_finite:
+                    param_update_snapshots = _capture_param_update_snapshots(
+                        args,
+                        model,
+                        step + 1,
+                        num_steps,
+                    )
                 if not total_loss_finite:
                     writer.write(
                         f"Skipped optimizer step due to non-finite total loss at "
@@ -1115,6 +1125,15 @@ def train(model, args, loss, writer, plot, notifier=None):
                     optimizer.step()
                     step_completed = True
                     consecutive_amp_skips = 0
+                if step_completed:
+                    _log_param_updates(
+                        args,
+                        writer,
+                        model,
+                        param_update_snapshots,
+                        step + 1,
+                        num_steps,
+                    )
                 if timing_enabled:
                     _sync_for_timing(use_cuda)
                     timing_step_end = time.time()
@@ -1128,14 +1147,14 @@ def train(model, args, loss, writer, plot, notifier=None):
                             L,
                             L_geom,
                             L_com,
-                            L_prun,
-                            L_add,
+                            L_attr,
+                            L_policy,
                             loss_single,
                         loss_nodes,
                         Lp_out,
                         La_fit,
                         La_rep,
-                        L_dis,
+                        L_actuator,
                         *_surrogate_plot_metrics(loss),
                     ],
                     L.device,
@@ -1146,14 +1165,14 @@ def train(model, args, loss, writer, plot, notifier=None):
                     L,
                     L_geom,
                     L_com,
-                    L_prun,
-                    L_add,
+                    L_attr,
+                    L_policy,
                     loss_single,
                     loss_nodes,
                     Lp_out,
                     La_fit,
                     La_rep,
-                    L_dis,
+                    L_actuator,
                     *_surrogate_plot_metrics(loss),
                 ]
                 _add_metric_sums(episode_metric_sums, step_metric_values, L.device)
@@ -1186,50 +1205,38 @@ def train(model, args, loss, writer, plot, notifier=None):
                 if timing_enabled:
                     _sync_for_timing(use_cuda)
                     en_step = time.time()
-                    base_model = model.module if hasattr(model, "module") else model
-                    comp_debug = getattr(loss, "last_compression_debug", {}) or {}
-                    comp_timing = comp_debug.get("timing", {}) or {}
-                    runtime_timing = getattr(base_model, "last_runtime_timing", {}) or {}
-                    encoder_debug = getattr(base_model, "last_encoder_debug", {}) or {}
-                    cuda_peak_mb = 0.0
-                    if use_cuda and torch.cuda.is_available():
-                        cuda_peak_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
-                    writer.write(
-                        "StepTiming "
-                        f"step={step + 1}/{num_steps}: "
-                        f"data={timing_data_end - timing_data_start:.4f}s, "
-                        f"model={timing_model_end - timing_model_start:.4f}s, "
-                        f"loss={timing_loss_end - timing_loss_start:.4f}s, "
-                        f"backward_opt={timing_step_end - timing_loss_end:.4f}s, "
-                        f"metrics_log={en_step - timing_step_end:.4f}s, "
-                        f"total={en_step - st_step:.4f}s, "
-                        f"cuda_peak_mb={cuda_peak_mb:.1f}, "
-                        f"knn_backend={KNN_BACKEND}, "
-                        f"encoder_raw={encoder_debug.get('raw_points', 'n/a')}, "
-                        f"encoder_coarse={encoder_debug.get('coarse_points', 'n/a')}, "
-                        f"runtime={runtime_timing}, "
-                        f"compression_timing={comp_timing}"
+
+                    log_step_timing(
+                        writer=writer,
+                        args=args,
+                        step=step,
+                        num_steps=num_steps,
+                        epoch=epoch,
+                        global_train_step=global_train_step,
+                        use_cuda=use_cuda,
+                        st_step=st_step,
+                        timing_data_start=timing_data_start,
+                        timing_data_end=timing_data_end,
+                        timing_model_start=timing_model_start,
+                        timing_model_end=timing_model_end,
+                        timing_noise_start=timing_noise_start,
+                        timing_noise_end=timing_noise_end,
+                        timing_loss_start=timing_loss_start,
+                        timing_loss_end=timing_loss_end,
+                        timing_step_end=timing_step_end,
+                        en_step=en_step,
+                        loss=loss,
+                        model=model,
+                        KNN_BACKEND=KNN_BACKEND,
                     )
                 else:
                     en_step = time.time()
                 if log_this_step:
-                    input_avg = float(train_edit_stats.get("input_points_avg", train_edit_stats.get("input_points", 0)))
-                    pre_output_avg = float(
-                        train_edit_stats.get("pre_output_points_avg", train_edit_stats.get("pre_output_points", 0))
-                    )
-                    output_avg = float(train_edit_stats.get("output_points_avg", train_edit_stats.get("output_points", 0)))
-                    writer.write(
-                        "PointEditStats "
-                        f"step={step + 1}/{num_steps}: "
-                        f"input_mean={input_avg:.3f}, "
-                        f"pre_output_mean={pre_output_avg:.3f}, "
-                        f"output_mean={output_avg:.3f}, "
-                        f"added_ratio={float(train_edit_stats.get('added_ratio_percent', 0.0)):.4f}%, "
-                        f"deleted_ratio={float(train_edit_stats.get('deleted_ratio_percent', 0.0)):.4f}%, "
-                        f"adjusted_ratio={float(train_edit_stats.get('adjusted_ratio_percent', 0.0)):.4f}%, "
-                        f"adjust_mean={float(train_edit_stats.get('adjust_mean', 0.0)):.6g}, "
-                        f"adjust_max={float(train_edit_stats.get('adjust_max', 0.0)):.6g}, "
-                        f"keep_mode={train_edit_stats.get('keep_mode', 'none')}"
+                    log_point_edit_stats(
+                        writer,
+                        train_edit_stats,
+                        step,
+                        num_steps,
                     )
                     print(
                         f"Epi{episode + 1}/Epo{epoch + 1}/Step{step + 1}:"
@@ -1249,24 +1256,18 @@ def train(model, args, loss, writer, plot, notifier=None):
                 epoch_avgs = _metric_avgs_to_floats(epoch_metric_sums)
                 plot.epo_avg = epoch_avgs
                 plot_epoch_info = plot.record_metrics("epo", global_epoch + 1, epoch_avgs)
-                if plot_epoch_info.get("skipped", False):
-                    writer.write(
-                        "PlotSkipEpoch: "
-                        f"epoch={global_epoch + 1}, "
-                        f"reason={plot_epoch_info.get('reason', 'unknown')}"
-                    )
+                log_plot_skip_epoch(
+                    writer,
+                    plot_epoch_info,
+                    global_epoch,
+                )
                 writer.write(_format_metric_summary("EpochAvg", plot.metric_keys, epoch_avgs))
             epoch_edit_info = plot.record_point_edits("epo", global_epoch + 1)
-            if not epoch_edit_info.get("skipped", False):
-                added, deleted, adjusted = epoch_edit_info.get("plot_values", [None, None, None])
-                writer.write(
-                    "EpochPointEditAverage: "
-                    f"epoch={global_epoch + 1}, "
-                    f"added_ratio={0.0 if added is None else float(added):.4f}%, "
-                    f"deleted_ratio={0.0 if deleted is None else float(deleted):.4f}%, "
-                    f"adjusted_ratio={0.0 if adjusted is None else float(adjusted):.4f}%, "
-                    f"steps={int(epoch_edit_info.get('accepted_steps', 0))}"
-                )
+            log_epoch_point_edit_average(
+                writer,
+                epoch_edit_info,
+                global_epoch,
+            )
             global_epoch += 1
             plot.plot_loss_curve("step")
             plot.plot_loss_curve("epo")
@@ -1277,44 +1278,34 @@ def train(model, args, loss, writer, plot, notifier=None):
         if episode_metric_sums is not None:
             plot.epi_avg = _metric_avgs_to_floats(episode_metric_sums)
             plot_episode_info = plot.record_metrics("epi", episode + 1, plot.epi_avg)
-            if plot_episode_info.get("skipped", False):
-                writer.write(
-                    "PlotSkipEpisode: "
-                    f"episode={episode + 1}, "
-                    f"reason={plot_episode_info.get('reason', 'unknown')}"
-                )
+            log_plot_skip_episode(
+                writer,
+                plot_episode_info,
+                episode,
+            )
         else:
             plot.epi_avg = [None for _ in range(plot.num_loss)]
         writer.write(_format_metric_summary("EpisodeAvg", plot.metric_keys, plot.epi_avg))
         episode_edit_info = plot.record_point_edits("epi", episode + 1)
-        if not episode_edit_info.get("skipped", False):
-            added, deleted, adjusted = episode_edit_info.get("plot_values", [None, None, None])
-            writer.write(
-                "EpisodePointEditAverage: "
-                f"episode={episode + 1}, "
-                f"added_ratio={0.0 if added is None else float(added):.4f}%, "
-                f"deleted_ratio={0.0 if deleted is None else float(deleted):.4f}%, "
-                f"adjusted_ratio={0.0 if adjusted is None else float(adjusted):.4f}%, "
-                f"steps={int(episode_edit_info.get('accepted_steps', 0))}"
-            )
+        log_episode_point_edit_average(
+            writer,
+            episode_edit_info,
+            episode,
+        )
         plot.plot_loss_curve("epi")
         plot.plot_point_edit_curve("epi")
         writer.write(f"Saved episode plots/csv: {plot.save_dir}")
         writer.flush()
 
         # 毎エピソードと最高スコアのモデルを保存
-        model_name = f'{episode}.pth'
-        model_path = os.path.join(ckpt_dir, model_name)
-        torch.save(model.state_dict(), model_path)
-        if plot.epi_loss_return() < best_loss:
-            best_loss = plot.epi_loss_return()
-            model_name = f'best.pth'
-            model_path = os.path.join(ckpt_dir, model_name)
-            torch.save(model.state_dict(), model_path)
-            writer.write(
-                f"New best model at epoch {epoch+1}, "
-                f"avg_epi_loss={best_loss:.6f}\n"
-            )
+        best_loss, model_path = save_episode_checkpoint(
+            model=model,
+            ckpt_dir=ckpt_dir,
+            plot=plot,
+            writer=writer,
+            episode=episode,
+            best_loss=best_loss,
+        )
         if notifier is not None:
             notifier.episode_finished(
                 episode=episode + 1,
@@ -1365,207 +1356,14 @@ if __name__ == '__main__':
     setup_plot_t0 = time.time()
     plot = PlotMaker(args)
     writer.write(f"SetupTiming: plot_init={time.time() - setup_plot_t0:.3f}s")
-    writer.write(f"Date of Training: {file_day}-{file_time}")
-    writer.write(f"Log Root: {args.log_root}")
-    writer.write(f"Checkpoint Root: {args.out_path}")
-    writer.write(f"Method Name: {getattr(args, 'method_name', 'Mine')}")
-    writer.write(f"Surrogate Name: {getattr(args, 'surrogate_name', getattr(args, 'compress', 'OctAttention'))}")
-    writer.write(f"Geometry Loss Type: {args.loss_type}")
-    writer.write(f"Discrete Loss Mode: {args.discrete_loss_mode}")
-    writer.write(
-        "Optimization Modes: "
-        f"geometry={'ste_hard' if args.discrete_loss_mode == 'ste_hard' else ('weighted_soft' if args.discrete_loss_mode == 'weighted_soft' else 'hard')}, "
-        f"compression={args.compression_loss_backend}"
-    )
-    writer.write(
-        "Gradient Diagnostics: "
-        f"compression_grad_probe={bool(getattr(args, 'compression_grad_probe', False))}"
-        f"(every={int(getattr(args, 'compression_grad_probe_every', 1))}), "
-        f"debug_grad_flow={bool(getattr(args, 'debug_grad_flow', False))}"
-        f"(rate={int(getattr(args, 'debug_grad_flow_rate', 1))})"
-    )
-    compression_backend = str(getattr(args, "compression_loss_backend", "proxy")).strip().lower()
-    actual_total_bit_backend = _uses_actual_total_bit_objective(args)
-    surrogate_backend = compression_backend.endswith("_surrogate")
-    if surrogate_backend:
-        writer.write(
-            "Compression Forward Metric: surrogate_pred_bit_percent plus soft Octree auxiliaries; "
-            "actual_total_bit_percent is logged only when/after teacher refresh."
-        )
-        writer.write(
-            "Compression Teacher Refresh: "
-            f"periodic(interval={int(getattr(args, 'compression_surrogate_refresh_interval', 0))}, "
-            f"warmup_steps={int(getattr(args, 'compression_surrogate_warmup_steps', 0))}, "
-            f"replay_steps={int(getattr(args, 'compression_surrogate_replay_steps', 0))}, "
-            f"replay_batch={int(getattr(args, 'compression_surrogate_replay_batch', 0))}, "
-            f"forward={getattr(args, 'compression_surrogate_forward_mode', 'surrogate')}, "
-            f"aux_node={float(getattr(args, 'compression_surrogate_aux_node_weight', 0.0))}, "
-            f"aux_single={float(getattr(args, 'compression_surrogate_aux_single_weight', 0.0))}, "
-            f"reuse_last_target={bool(getattr(args, 'compression_surrogate_reuse_last_target', True))})"
-        )
-        writer.write("Compression Surrogate Backward: enabled")
-        writer.write(
-            f"Surrogate compression uses predicted bit objective plus soft Octree auxiliaries on {compression_backend}; "
-            "legacy comp_bit/com_sin/com_node/com_bpn/com_lowprob weights are not used directly."
-        )
 
-    if actual_total_bit_backend:
-        writer.write(
-            "Loss Weight: "
-            f"geom={args.w_geom}, "
-            f"comp_total={args.w_com} (actual_total_bit_percent), "
-            f"attr={args.w_prun}, policy={args.w_add}, repair={args.w_dis}"
-        )
-    else:
-        writer.write(
-            "Loss Weight: "
-            f"geom={args.w_geom}, "
-            f"comp_total={args.w_com}, comp_bit={args.com_bit}, comp_single={args.com_sin}, "
-            f"comp_node={args.com_node}, comp_bpn={getattr(args, 'com_bpn', 0.0)}, "
-            f"comp_lowprob={args.com_lowprob}, "
-            f"attr={args.w_prun}, policy={args.w_add}, repair={args.w_dis}"
-        )
-    writer.write(
-        "Network Design: Mine octree structure repair "
-        "(node_count / single_child_chain / low_probability_occupancy / context_difficulty / sparse / outlier / shape)."
+    log_training_setup(
+        writer,
+        args,
+        file_day,
+        file_time,
     )
 
-    if bool(getattr(args, "train_patch_subset_enable", False)):
-        writer.write("Model Input is Whole Point Cloud (Octree Subtree Mode)")
-        writer.write(
-            "Compression Teacher Scope: actual_bit_percent is measured on the current subtree/full-cloud training sample, "
-            "not on the offline multi-frame evaluation set."
-        )
-    elif args.split2patch:
-        writer.write(f"Model Input is Patch")
-        writer.write(
-            "Compression Teacher Scope: actual_bit_percent is measured on the current training patch, "
-            "not on the offline full-cloud evaluation set."
-        )
-    else:
-        writer.write(f"Model Input is Whole Point Cloud")
-    writer.write(
-        f"Input Sampling: max_input_points={args.max_input_points}, "
-        f"safe_max_input_points={getattr(args, 'safe_max_input_points', 0)}, "
-        f"allow_unbounded_input={getattr(args, 'allow_unbounded_input', False)}, "
-        f"encoder_sparse_tensor={bool(getattr(args, 'encoder_sparse_tensor', True))}, "
-        f"sparse_tensor_keep_after_encoder={bool(getattr(args, 'sparse_tensor_keep_after_encoder', True))}, "
-        f"encoder_raw_downsample_factor={float(getattr(args, 'encoder_raw_downsample_factor', 1.0))}, "
-        f"encoder_pre_downsample={bool(getattr(args, 'encoder_pre_downsample', False))}, "
-        f"encoder_pre_downsample_mode={getattr(args, 'encoder_pre_downsample_mode', 'voxel')}, "
-        f"encoder_pre_downsample_max_points={int(getattr(args, 'encoder_pre_downsample_max_points', 0))}, "
-        f"encoder_cdist_max_points={int(getattr(args, 'encoder_cdist_max_points', 0))}, "
-        f"encoder_feature_propagation={getattr(args, 'encoder_feature_propagation', 'knn_inverse_distance')}, "
-        f"encoder_feature_propagation_k={int(getattr(args, 'encoder_feature_propagation_k', 3))}, "
-        f"input_sampling={args.input_sampling}, split2patch={args.split2patch}, "
-        f"patch_rate={args.patch_rate}, "
-        f"patch_build_mode={getattr(args, 'patch_build_mode', 'spatial_sort')}, "
-        f"patch_owned_ratio={float(getattr(args, 'patch_owned_ratio', 0.875))}, "
-        f"patch_sort_grid_size={int(getattr(args, 'patch_sort_grid_size', 1024))}, "
-        f"patch_parallel_mode={getattr(args, 'patch_parallel_mode', 'auto')}, "
-        f"patch_batch_size={int(getattr(args, 'patch_batch_size', 1))}, "
-        f"patch_budget_train={int(getattr(args, 'patch_parallel_points_budget_train', 0))}, "
-        f"patch_info_cache={bool(getattr(args, 'patch_info_cache', True))}, "
-        f"train_patch_subset_enable={bool(getattr(args, 'train_patch_subset_enable', False))}, "
-        f"train_subtree_level={int(getattr(args, 'train_subtree_level', 0))}, "
-        f"train_subtree_randomize_level={bool(getattr(args, 'train_subtree_randomize_level', False))}, "
-        f"train_subtree_level_jitter={int(getattr(args, 'train_subtree_level_jitter', 0))}, "
-        f"train_subtree_level_min={int(getattr(args, 'train_subtree_level_min', 0))}, "
-        f"train_subtree_level_max={int(getattr(args, 'train_subtree_level_max', 0))}, "
-        f"train_subtree_random_full_range={bool(getattr(args, 'train_subtree_random_full_range', False))}, "
-        f"train_subtree_level_sampling={getattr(args, 'train_subtree_level_sampling', 'uniform_random')}, "
-        f"train_subtree_level_curriculum={bool(getattr(args, 'train_subtree_level_curriculum', True))}, "
-        f"train_subtree_curriculum_direction={getattr(args, 'train_subtree_curriculum_direction', 'deep_to_shallow')}, "
-        f"train_subtree_curriculum_fraction={float(getattr(args, 'train_subtree_curriculum_fraction', 1.0))}, "
-        f"train_subtree_depth_percent_curriculum={bool(getattr(args, 'train_subtree_depth_percent_curriculum', False))}, "
-        f"train_subtree_depth_percent_start={getattr(args, 'train_subtree_depth_percent_start', [])}, "
-        f"train_subtree_depth_percent_end={getattr(args, 'train_subtree_depth_percent_end', [])}, "
-        f"train_patch_subset_patches_per_step={int(getattr(args, 'train_patch_subset_patches_per_step', 0))}, "
-        f"train_patch_subset_anchor_interval={int(getattr(args, 'train_patch_subset_anchor_interval', 0))}, "
-        f"train_subtree_full_cloud_prob={float(getattr(args, 'train_subtree_full_cloud_prob', 0.0))}, "
-        f"train_patch_subset_sampling={getattr(args, 'train_patch_subset_sampling', 'coverage_cycle')}, "
-        f"train_subtree_stat_log_limit={int(getattr(args, 'train_subtree_stat_log_limit', 0))}"
-    )
-    writer.write(
-        f"Runtime Tradeoff: k={args.k}, encoder_query_chunk={args.encoder_query_chunk}, "
-        f"structure_geo_max_points={args.structure_geo_max_points}, "
-        f"knn_backend={getattr(args, 'knn_backend', 'pointops_cuda')}"
-    )
-    writer.write(
-        "Point Edit Count Thresholds: "
-        f"drop_keep_threshold={float(getattr(args, 'operation_count_drop_threshold', 0.5))}, "
-        f"adjust_threshold={float(getattr(args, 'operation_count_adjust_threshold', 1e-6))}"
-    )
-    writer.write(
-        "Repair Exploration: "
-        f"add_weight_mode={getattr(args, 'repair_add_weight_mode', 'hard')}, "
-        f"target_add_ratio={float(getattr(args, 'target_add_ratio', 0.0))}, "
-        f"max_add_ratio={float(getattr(args, 'max_add_ratio', 0.0))}, "
-        f"explore_fraction={float(getattr(args, 'repair_exploration_fraction', 0.0))}, "
-        f"add_candidate_ratio={float(getattr(args, 'repair_add_candidate_ratio_start', 0.0))}"
-        f"->{float(getattr(args, 'repair_add_candidate_ratio_end', 0.0))}, "
-        f"add_score_noise={float(getattr(args, 'repair_add_score_noise_start', 0.0))}"
-        f"->{float(getattr(args, 'repair_add_score_noise_end', 0.0))}, "
-        f"add_weight_mix={float(getattr(args, 'repair_add_weight_random_mix_start', 0.0))}"
-        f"->{float(getattr(args, 'repair_add_weight_random_mix_end', 0.0))}, "
-        f"drop_score_noise={float(getattr(args, 'repair_drop_score_noise_start', 0.0))}"
-        f"->{float(getattr(args, 'repair_drop_score_noise_end', 0.0))}, "
-        f"drop_mix={float(getattr(args, 'repair_drop_random_mix_start', 0.0))}"
-        f"->{float(getattr(args, 'repair_drop_random_mix_end', 0.0))}"
-    )
-    writer.write(f"Octree Diagnostic Levels: {getattr(args, 'octree_diag_levels', '4,6,8,10,12')}")
-    writer.write(f"Step Log Frequency: print_rate={args.print_rate}")
-    writer.write(f"Mail Notify: {'enabled' if args.mail_notify else 'disabled'} -> {args.mail_to}")
-    writer.write(f"Compression Codec: {getattr(args, 'compress', 'OctAttention')}")
-    writer.write(f"OctAttention Teacher Device: {args.octattention_teacher_device}")
-    if compression_backend.startswith("sparsepcgc"):
-        writer.write(
-            "SparsePCGC Teacher: "
-            f"env={getattr(args, 'sparsepcgc_env', 'sparsepcgc')}, "
-            f"python={getattr(args, 'sparsepcgc_python', '') or '(auto)'}, "
-            f"mode={getattr(args, 'sparsepcgc_mode', 'dense_lossless')}, "
-            f"device={getattr(args, 'sparsepcgc_device', 'auto')}, "
-            f"match_qs={bool(getattr(args, 'sparsepcgc_match_qs', True))}, "
-            f"voxel_size={float(getattr(args, 'sparsepcgc_voxel_size', 1.0))}, "
-            f"pos_quantscale={int(getattr(args, 'sparsepcgc_pos_quantscale', 1))}, "
-            f"effective_qs={float(getattr(args, 'sparsepcgc_effective_qs', 0.0))}, "
-            f"root={getattr(args, 'sparsepcgc_root', '')}, "
-            f"skip_decode={bool(getattr(args, 'sparsepcgc_skip_decode', True))}"
-        )
-        writer.write(
-            "SparsePCGC Quantization Alignment: "
-            "teacher=round(x/voxel_size)->unique->round(coord/posQuantscale)->unique, "
-            f"network_sparse_quant=sparsepcgc_twostep, "
-            f"surrogate_effective_qs={float(getattr(args, 'sparsepcgc_effective_qs', 0.0))}, "
-            f"surrogate_levels={getattr(args, 'compression_surrogate_levels', '4,6,8')}"
-        )
-    if compression_backend.startswith("gpcc"):
-        writer.write(
-            "G-PCC Teacher: "
-            f"encoder={getattr(args, 'gpcc_encoder_path', '')}, "
-            f"cfg={getattr(args, 'gpcc_cfg_dir', '')}, "
-            f"match_qs={bool(getattr(args, 'gpcc_match_qs', True))}, "
-            f"prequantize={bool(getattr(args, 'gpcc_prequantize', True))}, "
-            f"effective_qs={float(getattr(args, 'gpcc_effective_qs', 0.0))}, "
-            f"geometry_only={bool(getattr(args, 'gpcc_disable_attribute_coding', True))}, "
-            f"merge_duplicates={bool(getattr(args, 'gpcc_merge_duplicated_points', True))}"
-        )
-    if compression_backend.startswith("draco"):
-        writer.write(
-            "Draco Teacher: "
-            f"encoder={getattr(args, 'draco_encoder_path', '')}, "
-            f"decoder={getattr(args, 'draco_decoder_path', '')}, "
-            f"match_qs={bool(getattr(args, 'draco_match_qs', True))}, "
-            f"prequantize={bool(getattr(args, 'draco_prequantize', True))}, "
-            f"effective_qs={float(getattr(args, 'draco_effective_qs', 0.0))}, "
-            f"qp={int(getattr(args, 'draco_position_quantization_bits', 0))}, "
-            f"cl={int(getattr(args, 'draco_compression_level', 7))}, "
-            f"point_cloud={bool(getattr(args, 'draco_force_point_cloud', True))}, "
-            f"merge_duplicates={bool(getattr(args, 'draco_merge_duplicated_points', True))}, "
-            f"skip_decode={bool(getattr(args, 'draco_skip_decode', True))}"
-        )
-    writer.write(f"Compression Rate Metric: {args.compression_rate_metric}")
-    writer.write(f"Compression Loss Backend: {args.compression_loss_backend}")
     writer.write(
         f"Two-Stage Training: enabled={bool(getattr(args, 'two_stage_training', False))}, "
         f"base_stage={args.training_stage}, diagnosis_ratio={getattr(args, 'diagnosis_episode_ratio', 0.0)}, "

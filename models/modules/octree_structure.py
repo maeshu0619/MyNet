@@ -17,9 +17,21 @@ class OctreeStructureAnalysis(nn.Module):
         self.qs = self._effective_qs(args)
         self.k_geo = max(int(getattr(args, "structure_geo_k", 8)), 3)
         self.geo_max_points = max(int(getattr(args, "structure_geo_max_points", 4096)), 0)
-        self.feature_dim = 35
+        self.feature_dim = 40
         self.max_depth = int(getattr(args, "proxy_max_depth", 12))
         self.diag_levels = self._parse_diag_levels(getattr(args, "octree_diag_levels", "4,6,8,10,12"))
+        neighbor_offsets = [
+            (dx, dy, dz)
+            for dx in (-1, 0, 1)
+            for dy in (-1, 0, 1)
+            for dz in (-1, 0, 1)
+            if not (dx == 0 and dy == 0 and dz == 0)
+        ]
+        self.register_buffer(
+            "neighbor_offsets",
+            torch.tensor(neighbor_offsets, dtype=torch.long),
+            persistent=False,
+        )
 
         proxy_cfg = ProxyOctreeConfig(
             max_depth=self.max_depth,
@@ -134,6 +146,57 @@ class OctreeStructureAnalysis(nn.Module):
             )
         return stats.to(dtype=pts_xyz.dtype)
 
+    @staticmethod
+    def _coord_keys(coords, mins, spans):
+        shifted = coords - mins.view(1, 3)
+        return (
+            shifted[:, 0] * spans[1].clamp_min(1) * spans[2].clamp_min(1)
+            + shifted[:, 1] * spans[2].clamp_min(1)
+            + shifted[:, 2]
+        )
+
+    @classmethod
+    def _coords_membership(cls, query_coords, reference_coords):
+        if query_coords.numel() == 0 or reference_coords.numel() == 0:
+            return torch.zeros((query_coords.shape[0],), device=query_coords.device, dtype=torch.bool)
+        combined = torch.cat([query_coords, reference_coords], dim=0)
+        mins = combined.amin(dim=0)
+        spans = (combined.amax(dim=0) - mins + 1).to(torch.long)
+        query_keys = cls._coord_keys(query_coords.to(torch.long), mins, spans)
+        reference_keys = torch.unique(cls._coord_keys(reference_coords.to(torch.long), mins, spans), sorted=True)
+        pos = torch.searchsorted(reference_keys, query_keys)
+        in_bounds = pos < reference_keys.numel()
+        safe_pos = pos.clamp(max=max(int(reference_keys.numel()) - 1, 0))
+        return in_bounds & (reference_keys[safe_pos] == query_keys)
+
+    def _quantized_voxel_stats(self, pts_xyz, qs_override, snap_delta_norm):
+        B, _, N = pts_xyz.shape
+        if N <= 0:
+            return pts_xyz.new_zeros((B, 4, N))
+        qs = qs_override.to(device=pts_xyz.device, dtype=pts_xyz.dtype).view(B, 1, 1).clamp_min(1e-9)
+        coords = torch.round(pts_xyz / qs).to(torch.long)
+        offsets = self.neighbor_offsets.to(device=pts_xyz.device, dtype=torch.long)
+        stats = []
+        for b in range(B):
+            coord_b = coords[b].transpose(0, 1).contiguous()
+            unique_coords, inverse = torch.unique(coord_b, dim=0, sorted=True, return_inverse=True)
+            voxel_count = int(unique_coords.shape[0])
+            if voxel_count <= 0:
+                stats.append(pts_xyz.new_zeros((4, N)))
+                continue
+            counts = torch.bincount(inverse, minlength=voxel_count).to(device=pts_xyz.device, dtype=pts_xyz.dtype)
+            point_counts = counts.index_select(0, inverse).clamp_min(1.0)
+            merge_pressure = ((point_counts - 1.0) / point_counts).view(1, N)
+            density = self._normalize_pointwise(point_counts.view(1, 1, N)).view(1, N).clamp(0.0, 4.0) / 4.0
+            targets = coord_b[:, None, :] + offsets.view(1, -1, 3)
+            occupied = self._coords_membership(targets.reshape(-1, 3), unique_coords).view(N, -1)
+            neighbor_empty = (1.0 - occupied.to(dtype=pts_xyz.dtype).mean(dim=1)).view(1, N)
+            quant_residual = (
+                torch.linalg.norm(snap_delta_norm[b], dim=0, keepdim=True) / (3.0 ** 0.5)
+            ).clamp(0.0, 1.0)
+            stats.append(torch.cat([merge_pressure, density, neighbor_empty, quant_residual], dim=0))
+        return torch.stack(stats, dim=0).to(dtype=pts_xyz.dtype)
+
     def _level_octree_stats_single(self, pts_xyz, qs_value):
         if pts_xyz.shape[-1] <= 0:
             return []
@@ -242,9 +305,14 @@ class OctreeStructureAnalysis(nn.Module):
 
         phase, snap_delta, snap_delta_norm = self._grid_phase(work_xyz, qs_override)
         geo_stats = self._local_geometry_stats(work_xyz)
+        quant_stats = self._quantized_voxel_stats(work_xyz, qs_override, snap_delta_norm)
         local_density = geo_stats[:, 0:1, :]
         local_curvature = geo_stats[:, 1:2, :]
         local_anisotropy = geo_stats[:, 2:3, :]
+        quant_merge = quant_stats[:, 0:1, :]
+        quant_density = quant_stats[:, 1:2, :]
+        quant_empty = quant_stats[:, 2:3, :]
+        quant_residual = quant_stats[:, 3:4, :]
         phase_centered = phase - 0.5
         radius = torch.linalg.norm(work_xyz, dim=1, keepdim=True)
         abs_xyz = work_xyz.abs()
@@ -261,6 +329,12 @@ class OctreeStructureAnalysis(nn.Module):
         ).clamp(0.0, 4.0) / 4.0
         context_proxy = self._normalize_pointwise(
             bit_entropy * (0.5 + torch.abs(child_id - 0.5)) * (1.0 + sparse_proxy)
+        ).clamp(0.0, 4.0) / 4.0
+        quant_proxy = self._normalize_pointwise(
+            0.45 * quant_merge
+            + 0.25 * quant_empty
+            + 0.20 * quant_density
+            + 0.10 * quant_residual
         ).clamp(0.0, 4.0) / 4.0
         density_outlier = (1.0 - local_density.clamp(0.0, 1.0))
         outlier_proxy = (sparse_proxy * (1.0 - self_occ).clamp(0.0, 1.0) * (1.0 - neighbor_occ).clamp(0.0, 1.0))
@@ -282,6 +356,7 @@ class OctreeStructureAnalysis(nn.Module):
                 single_proxy.clamp(0.0, 1.0),
                 lowprob_proxy.clamp(0.0, 1.0),
                 context_proxy.clamp(0.0, 1.0),
+                quant_proxy.clamp(0.0, 1.0),
                 sparse_proxy.clamp(0.0, 1.0),
                 outlier_proxy.clamp(0.0, 1.0),
                 shape_proxy.clamp(0.0, 1.0),
@@ -302,6 +377,7 @@ class OctreeStructureAnalysis(nn.Module):
                 phase_centered,
                 snap_delta_norm.clamp(-2.0, 2.0),
                 geo_stats,
+                quant_stats,
                 oct_ctx[:, :8, :],
                 cause_targets,
                 sparse_proxy,
@@ -318,11 +394,13 @@ class OctreeStructureAnalysis(nn.Module):
             "oct_ctx": oct_ctx.to(dtype=input_dtype),
             "snap_delta": snap_delta.to(dtype=input_dtype),
             "geo_stats": geo_stats.to(dtype=input_dtype),
+            "quant_stats": quant_stats.to(dtype=input_dtype),
             "qs_override": qs_override.to(dtype=input_dtype),
             "single_proxy": single_proxy.to(dtype=input_dtype),
             "node_proxy": node_proxy.to(dtype=input_dtype),
             "lowprob_proxy": lowprob_proxy.to(dtype=input_dtype),
             "context_proxy": context_proxy.to(dtype=input_dtype),
+            "quant_proxy": quant_proxy.to(dtype=input_dtype),
             "sparse_proxy": sparse_proxy.to(dtype=input_dtype),
             "outlier_proxy": outlier_proxy.to(dtype=input_dtype),
             "occupancy_nll_proxy": occupancy_nll.to(dtype=input_dtype),

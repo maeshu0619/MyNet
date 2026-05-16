@@ -277,8 +277,11 @@ class SoftOctreeRateProxy(nn.Module):
         B, _, N = gen_xyz.shape
         device = gen_xyz.device
         dtype = gen_xyz.dtype
-        hard_w = self._normalize_point_weights(None, B, N, device, dtype)
         ste_w = self._normalize_point_weights(final_w, B, N, device, dtype)
+        hard_w = (ste_w.detach() >= 0.5).to(dtype=dtype)
+        for b in range(B):
+            if not bool(hard_w[b].any().item()):
+                hard_w[b, torch.argmax(ste_w[b].detach())] = 1.0
 
         hard_rate_total = gen_xyz.new_zeros(())
         hard_node_count = gen_xyz.new_zeros(())
@@ -451,7 +454,7 @@ class SoftOctreeRateProxy(nn.Module):
     def _prepare_single_hard_octattention_eval(self, pts_xyz: torch.Tensor, point_w: torch.Tensor, qs_value: Optional[float] = None):
         finite_pts = torch.isfinite(pts_xyz).all(dim=0)
         finite_w = torch.isfinite(point_w)
-        valid = finite_pts & finite_w
+        valid = finite_pts & finite_w & (point_w.detach() > 0.0)
 
         if not valid.any():
             return None

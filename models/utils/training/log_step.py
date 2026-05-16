@@ -1,0 +1,303 @@
+# models/utils/training/log_step.py
+
+import torch
+
+from models.utils.training.correlation import (
+    finite_float_or_none,
+    push_rolling_correlation,
+    format_corr,
+    rolling_pearson,
+)
+
+
+def _to_float(value, default=0.0):
+    if torch.is_tensor(value):
+        return float(value.detach().cpu())
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def log_step_loss(
+    writer,
+    step,
+    num_steps,
+    L,
+    L_geom,
+    L_com,
+    L_com_objective,
+    L_attr,
+    L_policy,
+    L_actuator,
+    Lp_out,
+    La_fit,
+    La_rep,
+    L_discrete_policy,
+    loss_bit,
+    loss_single,
+    loss_nodes,
+):
+    writer.write(
+        f"StepLoss step={step + 1}/{num_steps}: "
+        f"L={_to_float(L):.6f}, "
+        f"L_geom={_to_float(L_geom):.6f}, "
+        f"L_com={_to_float(L_com):.6f}, "
+        f"L_com_obj={_to_float(L_com_objective):.6f}, "
+        f"L_attr={_to_float(L_attr):.6f}, "
+        f"L_policy={_to_float(L_policy):.6f}, "
+        f"L_actuator={_to_float(L_actuator):.6f}, "
+        f"Lp_out={_to_float(Lp_out):.6f}, "
+        f"La_fit={_to_float(La_fit):.6f}, "
+        f"La_rep={_to_float(La_rep):.6f}, "
+        f"L_discrete_policy={_to_float(L_discrete_policy):.6f}, "
+        f"bit={_to_float(loss_bit):.6f}, "
+        f"single={_to_float(loss_single):.6f}, "
+        f"nodes={_to_float(loss_nodes):.6f}"
+    )
+
+
+def log_compression_stats(writer, step, num_steps, comp_debug):
+    writer.write(
+        f"CompressionStats step={step + 1}/{num_steps}: "
+        f"actual_bit:{float(comp_debug.get('gt_actual_bit', float('nan'))):.6f}"
+        f"->{float(comp_debug.get('gen_actual_bit', float('nan'))):.6f}, "
+        f"actual_bit_percent={float(comp_debug.get('actual_total_bit_percent', comp_debug.get('total_bit', 0.0))):.6f}, "
+        f"codec_points={int(comp_debug.get('gt_points', 0))}->{int(comp_debug.get('gen_points', 0))}, "
+        f"objective={float(comp_debug.get('compression_objective', comp_debug.get('total_bit', 0.0))):.6f}, "
+        f"surrogate_bit_percent={float(comp_debug.get('surrogate_pred_bit', 0.0)):.6f}, "
+        f"surrogate_target_bit={float(comp_debug.get('surrogate_target_bit', 0.0)):.6f}, "
+        f"surrogate_abs_bit_error={float(comp_debug.get('surrogate_abs_bit_error', 0.0)):.6f}, "
+        f"surrogate_train_loss={float(comp_debug.get('surrogate_train_loss', 0.0)):.6f}, "
+        f"soft_node={float(comp_debug.get('soft_node_percent', 0.0)):.6f}, "
+        f"soft_single={float(comp_debug.get('soft_single_percent', 0.0)):.6f}, "
+        f"octree_node:{float(comp_debug.get('gt_octree_node', 0.0)):.1f}->{float(comp_debug.get('gen_octree_node', 0.0)):.1f}, "
+        f"octree_single:{float(comp_debug.get('gt_octree_single', 0.0)):.1f}->{float(comp_debug.get('gen_octree_single', 0.0)):.1f}, "
+        f"teacher_codec={comp_debug.get('teacher_codec', 'unknown')}, "
+        f"teacher_refresh={bool(comp_debug.get('teacher_refresh', False))}, "
+        f"teacher_cache_hit={comp_debug.get('teacher_cache_hit', 'unknown')}, "
+        f"replay={int(comp_debug.get('surrogate_replay_size', 0))}, "
+        f"teacher_policy={comp_debug.get('teacher_refresh_policy', 'unknown')}"
+    )
+
+
+def log_compression_train_debug(writer, step, num_steps, args, comp_debug, loss, L_com):
+    before_node = float(comp_debug.get("gt_octree_node", comp_debug.get("gt_node_abs", 0.0)))
+    after_node = float(comp_debug.get("gen_octree_node", comp_debug.get("gen_node_abs", 0.0)))
+    before_single = float(comp_debug.get("gt_octree_single", comp_debug.get("gt_single_abs", 0.0)))
+    after_single = float(comp_debug.get("gen_octree_single", comp_debug.get("gen_single_abs", 0.0)))
+    rate_before = float(comp_debug.get("rate_proxy_before", comp_debug.get("gt_actual_bit", comp_debug.get("gt_bit_abs", 0.0))))
+    rate_after = float(comp_debug.get("rate_proxy_after", comp_debug.get("gen_actual_bit", comp_debug.get("gen_bit_abs", 0.0))))
+    terms = getattr(loss, "last_compression_terms", {}) or {}
+
+    writer.write(
+        f"CompressionTrainDebug step={step + 1}/{num_steps}: "
+        f"before_points={int(comp_debug.get('gt_points', 0))}, "
+        f"after_points={int(comp_debug.get('gen_points', 0))}, "
+        f"before_node={before_node:.3f}, after_node={after_node:.3f}, "
+        f"node_delta={after_node - before_node:.3f}, "
+        f"before_single={before_single:.3f}, after_single={after_single:.3f}, "
+        f"single_delta={after_single - before_single:.3f}, "
+        f"rate_proxy_before={rate_before:.6f}, rate_proxy_after={rate_after:.6f}, "
+        f"rate_proxy_delta={float(comp_debug.get('rate_proxy_delta', comp_debug.get('total_bit', 0.0))):.6f}, "
+        f"actual_compression_delta={float(comp_debug.get('actual_total_bit_percent', comp_debug.get('total_bit', 0.0))):.6f}, "
+        f"uniform_noise[enabled={bool(comp_debug.get('uniform_noise_enabled', False))}, "
+        f"applied={bool(comp_debug.get('uniform_noise_applied', False))}, "
+        f"delta={float(comp_debug.get('uniform_noise_delta', 0.0)):.6g}, "
+        f"mean_abs={float(comp_debug.get('uniform_noise_mean_abs', 0.0)):.6g}], "
+        f"actual_codec[disabled={bool(comp_debug.get('actual_codec_disabled_during_train', False))}, "
+        f"skipped_by_interval={bool(comp_debug.get('actual_codec_skipped_by_interval', False))}], "
+        f"weights[w_com={float(getattr(args, 'w_com', 0.0)):.6g}, "
+        f"com_bit={float(getattr(args, 'com_bit', 0.0)):.6g}, "
+        f"com_single={float(getattr(args, 'com_sin', 0.0)):.6g}, "
+        f"com_node={float(getattr(args, 'com_node', 0.0)):.6g}, "
+        f"com_sparsepcgc={float(getattr(args, 'com_sparsepcgc', 0.0)):.6g}, "
+        f"aux_node={float(getattr(args, 'compression_surrogate_aux_node_weight', 0.0)):.6g}, "
+        f"aux_single={float(getattr(args, 'compression_surrogate_aux_single_weight', 0.0)):.6g}], "
+        f"terms[bit={_to_float(terms.get('bit', L_com.new_zeros(()))):.6f}, "
+        f"single={_to_float(terms.get('single', L_com.new_zeros(()))):.6f}, "
+        f"node={_to_float(terms.get('node', L_com.new_zeros(()))):.6f}, "
+        f"sparsepcgc={_to_float(terms.get('sparsepcgc', L_com.new_zeros(()))):.6f}]"
+    )
+
+    return before_node, after_node, before_single, after_single
+
+
+def log_codec_actual_correlation(
+    writer,
+    step,
+    num_steps,
+    args,
+    comp_debug,
+    codec_actual_metric_pairs,
+    before_node,
+    after_node,
+    before_single,
+    after_single,
+):
+    actual_delta_for_corr = finite_float_or_none(
+        comp_debug.get("actual_total_bit_percent", comp_debug.get("total_bit", None))
+    )
+
+    if actual_delta_for_corr is None:
+        return
+
+    codec_for_corr = str(
+        comp_debug.get("teacher_codec", getattr(args, "compress", "unknown"))
+    ).lower()
+    max_corr_samples = max(int(getattr(args, "sparsepcgc_corr_window", 100)), 2)
+
+    corr_metrics = {
+        "proxy_delta": comp_debug.get("rate_proxy_delta", comp_debug.get("total_bit", None)),
+        "node_delta": after_node - before_node,
+        "single_delta": after_single - before_single,
+        "point_delta": int(comp_debug.get("gen_points", 0)) - int(comp_debug.get("gt_points", 0)),
+    }
+
+    if "sparsepcgc_before_active_coords" in comp_debug:
+        corr_metrics.update({
+            "sparse_active_delta": comp_debug.get("sparsepcgc_active_coord_delta", None),
+            "sparse_occupied_delta": comp_debug.get("sparsepcgc_occupied_voxel_delta", None),
+            "sparse_isolated_delta": comp_debug.get("sparsepcgc_isolated_delta", None),
+            "sparse_density_var_delta": comp_debug.get("sparsepcgc_local_density_var_delta", None),
+            "sparse_neighbor_delta": comp_debug.get("sparsepcgc_mean_neighbors_delta", None),
+            "sparse_duplicate_delta": comp_debug.get("sparsepcgc_duplicate_delta", None),
+        })
+
+    corr_chunks = []
+    for metric_name, metric_value in corr_metrics.items():
+        corr, count = push_rolling_correlation(
+            codec_actual_metric_pairs,
+            f"{codec_for_corr}:{metric_name}",
+            metric_value,
+            actual_delta_for_corr,
+            max_corr_samples,
+        )
+        corr_chunks.append(f"{metric_name}={format_corr(corr, count)}")
+
+    writer.write(
+        f"CodecActualCorrelation step={step + 1}/{num_steps}: "
+        f"codec={codec_for_corr}, "
+        f"actual_delta_percent={actual_delta_for_corr:.6f}, "
+        + ", ".join(corr_chunks)
+    )
+
+
+def log_sparsepcgc_train_debug(
+    writer,
+    step,
+    num_steps,
+    args,
+    comp_debug,
+    sparsepcgc_proxy_actual_pairs,
+):
+    if "sparsepcgc_before_active_coords" not in comp_debug:
+        return
+
+    actual_delta_for_corr = finite_float_or_none(
+        comp_debug.get("actual_total_bit_percent", None)
+    )
+    proxy_delta_for_corr = finite_float_or_none(
+        comp_debug.get("rate_proxy_delta", comp_debug.get("total_bit", None))
+    )
+
+    if actual_delta_for_corr is not None and proxy_delta_for_corr is not None:
+        sparsepcgc_proxy_actual_pairs.append((proxy_delta_for_corr, actual_delta_for_corr))
+        max_corr_samples = max(int(getattr(args, "sparsepcgc_corr_window", 100)), 2)
+        if len(sparsepcgc_proxy_actual_pairs) > max_corr_samples:
+            del sparsepcgc_proxy_actual_pairs[:-max_corr_samples]
+
+    proxy_actual_corr = rolling_pearson(sparsepcgc_proxy_actual_pairs)
+    proxy_actual_corr_text = "n/a" if proxy_actual_corr is None else f"{proxy_actual_corr:.6f}"
+
+    writer.write(
+        f"SparsePCGCTrainDebug step={step + 1}/{num_steps}: "
+        f"actual_bits={float(comp_debug.get('gt_actual_bit', float('nan'))):.6f}"
+        f"->{float(comp_debug.get('gen_actual_bit', float('nan'))):.6f}, "
+        f"actual_delta_percent={float(comp_debug.get('actual_total_bit_percent', comp_debug.get('total_bit', 0.0))):.6f}, "
+        f"proxy_actual_corr={proxy_actual_corr_text}, "
+        f"active={int(comp_debug.get('sparsepcgc_before_active_coords', 0))}"
+        f"->{int(comp_debug.get('sparsepcgc_after_active_coords', 0))}, "
+        f"active_delta={int(comp_debug.get('sparsepcgc_active_coord_delta', 0))}, "
+        f"isolated={int(comp_debug.get('sparsepcgc_before_isolated_voxels', 0))}"
+        f"->{int(comp_debug.get('sparsepcgc_after_isolated_voxels', 0))}, "
+        f"isolated_delta={int(comp_debug.get('sparsepcgc_isolated_delta', 0))}, "
+        f"density_var={float(comp_debug.get('sparsepcgc_before_local_density_var', 0.0)):.6f}"
+        f"->{float(comp_debug.get('sparsepcgc_after_local_density_var', 0.0)):.6f}, "
+        f"mean_neighbors={float(comp_debug.get('sparsepcgc_before_mean_neighbors', 0.0)):.6f}"
+        f"->{float(comp_debug.get('sparsepcgc_after_mean_neighbors', 0.0)):.6f}, "
+        f"aux={float(comp_debug.get('sparsepcgc_aux_loss', 0.0)):.6f}, "
+        f"active_loss={float(comp_debug.get('sparsepcgc_active_coord_loss', 0.0)):.6f}, "
+        f"isolated_proxy={float(comp_debug.get('sparsepcgc_isolated_proxy_loss', 0.0)):.6f}, "
+        f"entropy_proxy={float(comp_debug.get('sparsepcgc_entropy_proxy_loss', 0.0)):.6f}, "
+        f"density_proxy={float(comp_debug.get('sparsepcgc_density_proxy_loss', 0.0)):.6f}"
+    )
+
+def log_step_timing(
+    writer,
+    args,
+    step,
+    num_steps,
+    epoch,
+    global_train_step,
+    use_cuda,
+    st_step,
+    timing_data_start,
+    timing_data_end,
+    timing_model_start,
+    timing_model_end,
+    timing_noise_start,
+    timing_noise_end,
+    timing_loss_start,
+    timing_loss_end,
+    timing_step_end,
+    en_step,
+    loss,
+    model,
+    KNN_BACKEND,
+):
+    base_model = model.module if hasattr(model, "module") else model
+    comp_debug = getattr(loss, "last_compression_debug", {}) or {}
+    comp_timing = comp_debug.get("timing", {}) or {}
+    runtime_timing = getattr(base_model, "last_runtime_timing", {}) or {}
+    encoder_debug = getattr(base_model, "last_encoder_debug", {}) or {}
+
+    cuda_peak_mb = 0.0
+    cuda_alloc_mb = 0.0
+    cuda_reserved_mb = 0.0
+
+    if use_cuda and torch.cuda.is_available():
+        cuda_peak_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
+        cuda_alloc_mb = torch.cuda.memory_allocated() / (1024 ** 2)
+        cuda_reserved_mb = torch.cuda.memory_reserved() / (1024 ** 2)
+
+    writer.write(
+        "StepTiming "
+        f"step={step + 1}/{num_steps}: "
+        f"compress={getattr(args, 'compress', 'unknown')}, "
+        f"data={timing_data_end - timing_data_start:.4f}s, "
+        f"model={timing_model_end - timing_model_start:.4f}s, "
+        f"noise={timing_noise_end - timing_noise_start:.6f}s, "
+        f"loss={timing_loss_end - timing_loss_start:.4f}s, "
+        f"backward_opt={timing_step_end - timing_loss_end:.4f}s, "
+        f"metrics_log={en_step - timing_step_end:.4f}s, "
+        f"total={en_step - st_step:.4f}s, "
+        f"cuda_peak_mb={cuda_peak_mb:.1f}, "
+        f"cuda_alloc_mb={cuda_alloc_mb:.1f}, "
+        f"cuda_reserved_mb={cuda_reserved_mb:.1f}, "
+        f"knn_backend={KNN_BACKEND}, "
+        f"encoder_raw={encoder_debug.get('raw_points', 'n/a')}, "
+        f"encoder_coarse={encoder_debug.get('coarse_points', 'n/a')}, "
+        f"runtime={runtime_timing}, "
+        f"compression_timing={comp_timing}"
+    )
+
+    if bool(getattr(args, "log_gpu_memory", True)) and use_cuda and torch.cuda.is_available():
+        writer.write(
+            "[GPU] "
+            f"compress={getattr(args, 'compress', 'unknown')} "
+            f"epoch={epoch + 1} iter={global_train_step + 1} "
+            f"allocated={cuda_alloc_mb:.1f}MB "
+            f"reserved={cuda_reserved_mb:.1f}MB "
+            f"max_allocated={cuda_peak_mb:.1f}MB"
+        )

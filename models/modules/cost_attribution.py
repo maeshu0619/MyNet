@@ -8,8 +8,9 @@ CAUSE_NAMES = (
     "single_child_chain",
     "low_probability_occupancy",
     "context_difficulty",
+    "quantization_waste",
     "sparse_fragmentation",
-    "outlier",
+    "local_outlier",
     "shape_preservation",
 )
 

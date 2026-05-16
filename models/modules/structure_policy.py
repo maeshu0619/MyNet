@@ -40,21 +40,27 @@ class StructureRepairPolicy(nn.Module):
         single = cause_targets[:, 1:2, :]
         lowprob = cause_targets[:, 2:3, :]
         context = cause_targets[:, 3:4, :]
-        sparse = cause_targets[:, 4:5, :]
-        outlier = cause_targets[:, 5:6, :]
-        shape = cause_targets[:, 6:7, :]
+        if cause_targets.shape[1] >= 8:
+            quant = cause_targets[:, 4:5, :]
+            sparse = cause_targets[:, 5:6, :]
+            outlier = cause_targets[:, 6:7, :]
+        else:
+            quant = torch.zeros_like(node)
+            sparse = cause_targets[:, 4:5, :]
+            outlier = cause_targets[:, 5:6, :]
+        shape = cause_targets[:, -1:, :]
         max_cost = torch.maximum(
-            torch.maximum(node, single),
-            torch.maximum(lowprob, torch.maximum(context, torch.maximum(sparse, outlier))),
+            torch.maximum(torch.maximum(node, single), torch.maximum(lowprob, context)),
+            torch.maximum(quant, torch.maximum(sparse, outlier)),
         )
 
         preserve = (0.60 * shape + 0.40 * (1.0 - max_cost)).clamp_min(0.02)
         chain_collapse = single.clamp_min(0.02)
-        sibling_merge = (0.55 * sparse + 0.45 * node).clamp_min(0.02)
-        parent_absorb = (0.70 * node + 0.30 * single).clamp_min(0.02)
-        context_smooth = (0.55 * lowprob + 0.45 * context).clamp_min(0.02)
+        sibling_merge = (0.35 * sparse + 0.30 * quant + 0.35 * node).clamp_min(0.02)
+        parent_absorb = (0.60 * node + 0.25 * single + 0.15 * quant).clamp_min(0.02)
+        context_smooth = (0.45 * lowprob + 0.35 * context + 0.20 * sparse).clamp_min(0.02)
         geometry_compensate = (shape * max_cost).clamp_min(0.02)
-        outlier_suppression = outlier.clamp_min(0.02)
+        outlier_suppression = (0.65 * outlier + 0.35 * quant).clamp_min(0.02)
         raw = torch.cat(
             [
                 preserve,

@@ -398,6 +398,7 @@ class Network(nn.Module):
                 float(getattr(self.args, "attr_single_weight", 1.5)),
                 float(getattr(self.args, "attr_lowprob_weight", 1.5)),
                 float(getattr(self.args, "attr_context_weight", 1.0)),
+                float(getattr(self.args, "attr_quant_weight", 1.25)),
                 float(getattr(self.args, "attr_sparse_weight", 1.0)),
                 float(getattr(self.args, "attr_outlier_weight", 1.0)),
                 float(getattr(self.args, "attr_shape_weight", 0.75)),
@@ -540,6 +541,9 @@ class Network(nn.Module):
         if timing_enabled:
             self._sync_if_cuda_tensor(pts_xyz)
             runtime_structure_start = time.time()
+            runtime_diagnosis_total = 0.0
+            runtime_attribution_total = 0.0
+            runtime_decision_total = 0.0
         if keep_sparse_path:
             structure_feat_full_list = []
             subtree_scores_full_list = []
@@ -549,6 +553,7 @@ class Network(nn.Module):
             single_proxy_full_list = []
             node_proxy_full_list = []
             lowprob_proxy_full_list = []
+            quant_proxy_full_list = []
             cause_scores_means = []
             subtree_scores_means = []
             policy_probs_means = []
@@ -568,11 +573,26 @@ class Network(nn.Module):
                 fused_feat_b = fused_feat[b:b + 1, :, :analysis_count]
                 coord_scale_b = None if coord_scale is None else coord_scale[b:b + 1]
 
+                if timing_enabled:
+                    self._sync_if_cuda_tensor(pts_xyz)
+                    runtime_diag_start = time.time()
                 structure_b = self.structure_analyzer(analysis_xyz_b, coord_scale=coord_scale_b)
+                if timing_enabled:
+                    self._sync_if_cuda_tensor(pts_xyz)
+                    runtime_diag_end = time.time()
+                    runtime_diagnosis_total += runtime_diag_end - runtime_diag_start
                 structure_feat_b = structure_b["features"].to(device=pts_xyz.device, dtype=fused_feat_b.dtype)
                 cause_targets_b = structure_b["cause_targets"].to(device=pts_xyz.device, dtype=fused_feat_b.dtype)
                 cause_input_b = torch.cat([fused_feat_b, structure_feat_b], dim=1)
+                if timing_enabled:
+                    self._sync_if_cuda_tensor(pts_xyz)
+                    runtime_attr_start = time.time()
                 cause_scores_b, cause_logits_b = self.cost_attributor(cause_input_b)
+                if timing_enabled:
+                    self._sync_if_cuda_tensor(pts_xyz)
+                    runtime_attr_end = time.time()
+                    runtime_attribution_total += runtime_attr_end - runtime_attr_start
+                    runtime_decision_start = time.time()
                 aggregated_b = self.cause_aggregator(
                     pts_xyz=analysis_xyz_b,
                     cause_scores=cause_scores_b,
@@ -584,6 +604,10 @@ class Network(nn.Module):
                 repair_priority_b = aggregated_b["priority"].to(device=pts_xyz.device, dtype=fused_feat_b.dtype)
                 policy_input_b = torch.cat([fused_feat_b, structure_feat_b, subtree_scores_b, repair_priority_b], dim=1)
                 policy_probs_b, policy_logits_b = self.policy_module(policy_input_b)
+                if timing_enabled:
+                    self._sync_if_cuda_tensor(pts_xyz)
+                    runtime_decision_end = time.time()
+                    runtime_decision_total += runtime_decision_end - runtime_decision_start
 
                 full_xyz_b = pts_xyz[b:b + 1]
                 if analysis_xyz_b.shape[-1] == full_xyz_b.shape[-1]:
@@ -595,6 +619,7 @@ class Network(nn.Module):
                     single_proxy_full_list.append(structure_b["single_proxy"].to(device=pts_xyz.device, dtype=pts_xyz.dtype))
                     node_proxy_full_list.append(structure_b["node_proxy"].to(device=pts_xyz.device, dtype=pts_xyz.dtype))
                     lowprob_proxy_full_list.append(structure_b["occupancy_nll_proxy"].to(device=pts_xyz.device, dtype=pts_xyz.dtype))
+                    quant_proxy_full_list.append(structure_b["quant_proxy"].to(device=pts_xyz.device, dtype=pts_xyz.dtype))
                 else:
                     structure_feat_full_list.append(self._propagate_encoder_features(full_xyz_b, analysis_xyz_b, structure_feat_b))
                     subtree_scores_full_list.append(self._propagate_encoder_features(full_xyz_b, analysis_xyz_b, subtree_scores_b))
@@ -605,9 +630,11 @@ class Network(nn.Module):
                     single_proxy_b = structure_b["single_proxy"].to(device=pts_xyz.device, dtype=pts_xyz.dtype)
                     node_proxy_b = structure_b["node_proxy"].to(device=pts_xyz.device, dtype=pts_xyz.dtype)
                     lowprob_proxy_b = structure_b["occupancy_nll_proxy"].to(device=pts_xyz.device, dtype=pts_xyz.dtype)
+                    quant_proxy_b = structure_b["quant_proxy"].to(device=pts_xyz.device, dtype=pts_xyz.dtype)
                     single_proxy_full_list.append(self._propagate_encoder_features(full_xyz_b, analysis_xyz_b, single_proxy_b))
                     node_proxy_full_list.append(self._propagate_encoder_features(full_xyz_b, analysis_xyz_b, node_proxy_b))
                     lowprob_proxy_full_list.append(self._propagate_encoder_features(full_xyz_b, analysis_xyz_b, lowprob_proxy_b))
+                    quant_proxy_full_list.append(self._propagate_encoder_features(full_xyz_b, analysis_xyz_b, quant_proxy_b))
 
                 cause_scores_means.append(cause_scores_b.mean(dim=2))
                 subtree_scores_means.append(subtree_scores_b.mean(dim=2))
@@ -644,6 +671,7 @@ class Network(nn.Module):
                 "single_proxy_full": torch.cat(single_proxy_full_list, dim=0),
                 "node_proxy_full": torch.cat(node_proxy_full_list, dim=0),
                 "lowprob_proxy_full": torch.cat(lowprob_proxy_full_list, dim=0),
+                "quant_proxy_full": torch.cat(quant_proxy_full_list, dim=0),
             }
             cause_mean = torch.stack(cause_scores_means, dim=0).mean(dim=0).squeeze(0).detach().cpu()
             subtree_mean = torch.stack(subtree_scores_means, dim=0).mean(dim=0).squeeze(0).detach().cpu()
@@ -656,12 +684,27 @@ class Network(nn.Module):
                 loss_policy_sparse = pts_xyz.new_zeros(())
         else:
             analysis_xyz = pts_xyz
+            if timing_enabled:
+                self._sync_if_cuda_tensor(pts_xyz)
+                runtime_diag_start = time.time()
             structure = self.structure_analyzer(analysis_xyz, coord_scale=coord_scale)
+            if timing_enabled:
+                self._sync_if_cuda_tensor(pts_xyz)
+                runtime_diag_end = time.time()
+                runtime_diagnosis_total += runtime_diag_end - runtime_diag_start
             structure_feat = structure["features"].to(device=pts_xyz.device, dtype=fused_feat.dtype)
             cause_targets = structure["cause_targets"].to(device=pts_xyz.device, dtype=fused_feat.dtype)
 
             cause_input = torch.cat([fused_feat, structure_feat], dim=1)
+            if timing_enabled:
+                self._sync_if_cuda_tensor(pts_xyz)
+                runtime_attr_start = time.time()
             cause_scores, cause_logits = self.cost_attributor(cause_input)
+            if timing_enabled:
+                self._sync_if_cuda_tensor(pts_xyz)
+                runtime_attr_end = time.time()
+                runtime_attribution_total += runtime_attr_end - runtime_attr_start
+                runtime_decision_start = time.time()
             aggregated = self.cause_aggregator(
                 pts_xyz=analysis_xyz,
                 cause_scores=cause_scores,
@@ -673,6 +716,10 @@ class Network(nn.Module):
             repair_priority = aggregated["priority"].to(device=pts_xyz.device, dtype=fused_feat.dtype)
             policy_input = torch.cat([fused_feat, structure_feat, subtree_scores, repair_priority], dim=1)
             policy_probs, policy_logits = self.policy_module(policy_input)
+            if timing_enabled:
+                self._sync_if_cuda_tensor(pts_xyz)
+                runtime_decision_end = time.time()
+                runtime_decision_total += runtime_decision_end - runtime_decision_start
             structure_feat_full = structure_feat
             subtree_scores_full = subtree_scores
             policy_probs_full = policy_probs
@@ -680,6 +727,7 @@ class Network(nn.Module):
             structure["single_proxy_full"] = structure["single_proxy"].to(device=pts_xyz.device, dtype=pts_xyz.dtype)
             structure["node_proxy_full"] = structure["node_proxy"].to(device=pts_xyz.device, dtype=pts_xyz.dtype)
             structure["lowprob_proxy_full"] = structure["occupancy_nll_proxy"].to(device=pts_xyz.device, dtype=pts_xyz.dtype)
+            structure["quant_proxy_full"] = structure["quant_proxy"].to(device=pts_xyz.device, dtype=pts_xyz.dtype)
             loss_attr_sparse = None
             loss_policy_sparse = None
 
@@ -732,6 +780,7 @@ class Network(nn.Module):
         single_chain_score = self._masked_point_mean(structure["single_proxy_full"].pow(2), selection_mask)
         lowprob_score = self._masked_point_mean(structure["lowprob_proxy_full"], selection_mask)
         node_score = self._masked_point_mean(structure["node_proxy_full"], selection_mask)
+        quant_score = self._masked_point_mean(structure["quant_proxy_full"], selection_mask)
 
         if self._should_collect_runtime_debug():
             with torch.no_grad():
@@ -766,6 +815,26 @@ class Network(nn.Module):
                     "drop_ratio": float(actuator_stats["drop_prob"].mean().detach().cpu()),
                     "keep_ratio": float(actuator_stats["keep_prob"].mean().detach().cpu()),
                     "delta_norm": float(actuator_stats["delta"].norm(dim=1).mean().detach().cpu()),
+                    "move_ratio": float(actuator_stats.get("move_ratio", pts_xyz.new_zeros(())).detach().cpu()),
+                    "move_score_mean": float(actuator_stats.get("move_score_mean", pts_xyz.new_zeros(())).detach().cpu()),
+                    "move_target_valid_ratio": float(actuator_stats.get("move_target_valid_ratio", pts_xyz.new_zeros(())).detach().cpu()),
+                    "moved_delta_mean": float(actuator_stats.get("moved_delta_mean", pts_xyz.new_zeros(())).detach().cpu()),
+                    "before_occupied_voxel_count": int(actuator_stats.get("before_occupied_voxel_count", 0)),
+                    "after_occupied_voxel_count": int(actuator_stats.get("after_occupied_voxel_count", 0)),
+                    "occupied_voxel_delta": int(actuator_stats.get("occupied_voxel_delta", 0)),
+                    "delete_target_voxel_count": int(actuator_stats.get("delete_target_voxel_count", 0)),
+                    "delete_emptied_voxel_count": int(actuator_stats.get("delete_emptied_voxel_count", 0)),
+                    "delete_removed_point_count": int(actuator_stats.get("delete_removed_point_count", 0)),
+                    "add_target_voxel_count": int(actuator_stats.get("add_target_voxel_count", 0)),
+                    "add_actual_point_count": int(actuator_stats.get("add_actual_point_count", 0)),
+                    "move_source_voxel_count": int(actuator_stats.get("move_source_voxel_count", 0)),
+                    "move_target_voxel_count": int(actuator_stats.get("move_target_voxel_count", 0)),
+                    "moved_different_voxel_count": int(actuator_stats.get("moved_different_voxel_count", 0)),
+                    "same_voxel_adjust_count": int(actuator_stats.get("same_voxel_adjust_count", 0)),
+                    "preserve_ratio": float(actuator_stats.get("preserve_ratio", pts_xyz.new_zeros(())).detach().cpu()),
+                    "quant_score": float(quant_score.detach().cpu()),
+                    "quant_move_conflict_loss": float(actuator_stats.get("quant_move_conflict_loss", pts_xyz.new_zeros(())).detach().cpu()),
+                    "local_edit_guard": float(actuator_stats.get("local_edit_guard", pts_xyz.new_zeros(())).detach().cpu()),
                     "analysis_points_mean": float(sum(analysis_counts) / max(len(analysis_counts), 1)) if keep_sparse_path else float(pts_xyz.shape[-1]),
                     "cause_mean": {
                         name: float(cause_mean[i])
@@ -790,11 +859,21 @@ class Network(nn.Module):
             self.last_structure_debug = {}
 
         if timing_enabled:
+            actuator_runtime = getattr(self.actuator, "last_runtime_timing", {}) or {}
             self.last_runtime_timing = {
                 "encode": round(runtime_encode_end - runtime_t0, 6),
                 "structure": round(runtime_structure_end - runtime_structure_start, 6),
                 "actuator": round(runtime_actuator_end - runtime_structure_end, 6),
                 "total_forward": round(runtime_actuator_end - runtime_t0, 6),
+                "feature_extraction": round(runtime_encode_end - runtime_t0, 6),
+                "structure_diagnosis": round(runtime_diagnosis_total, 6),
+                "codec_cost_attribution": round(runtime_attribution_total, 6),
+                "point_edit_decision": round(runtime_decision_total, 6),
+                "delete_module": round(float(actuator_runtime.get("delete", 0.0)), 6),
+                "add_module": round(float(actuator_runtime.get("add", 0.0)), 6),
+                "adjust_move_module": round(float(actuator_runtime.get("adjust_move", 0.0)), 6),
+                "postprocess": round(float(actuator_runtime.get("postprocess", 0.0)), 6),
+                "actuator_setup": round(float(actuator_runtime.get("setup", 0.0)), 6),
             }
         else:
             self.last_runtime_timing = {}

@@ -1,0 +1,184 @@
+# models/utils/training/log_setup.py
+
+from models.utils.pointcloud.quant_noise import resolve_uniform_noise_delta
+from models.utils.training.utils import _uses_actual_total_bit_objective
+
+
+def log_basic_setup(writer, args, file_day, file_time):
+    writer.write(f"Date of Training: {file_day}-{file_time}")
+    writer.write(f"Log Root: {args.log_root}")
+    writer.write(f"Checkpoint Root: {args.out_path}")
+    writer.write(f"Method Name: {getattr(args, 'method_name', 'Mine')}")
+    writer.write(
+        f"Surrogate Name: "
+        f"{getattr(args, 'surrogate_name', getattr(args, 'compress', 'OctAttention'))}"
+    )
+    writer.write(f"Geometry Loss Type: {args.loss_type}")
+    writer.write(f"Discrete Loss Mode: {args.discrete_loss_mode}")
+    writer.write(
+        "Optimization Modes: "
+        f"geometry={'ste_hard' if args.discrete_loss_mode == 'ste_hard' else ('weighted_soft' if args.discrete_loss_mode == 'weighted_soft' else 'hard')}, "
+        f"compression={args.compression_loss_backend}"
+    )
+    writer.write(
+        "Compression Delta Sign: "
+        "delta_percent=(after_bits-before_bits)/before_bits*100; negative means improved compression."
+    )
+    writer.write(
+        "Gradient Diagnostics: "
+        f"compression_grad_probe={bool(getattr(args, 'compression_grad_probe', False))}"
+        f"(every={int(getattr(args, 'compression_grad_probe_every', 1))}), "
+        f"debug_grad_flow={bool(getattr(args, 'debug_grad_flow', False))}"
+        f"(rate={int(getattr(args, 'debug_grad_flow_rate', 1))})"
+    )
+
+
+def log_loss_weight_setup(writer, args):
+    compression_backend = str(
+        getattr(args, "compression_loss_backend", "proxy")
+    ).strip().lower()
+    actual_total_bit_backend = _uses_actual_total_bit_objective(args)
+    surrogate_backend = compression_backend.endswith("_surrogate")
+
+    if surrogate_backend:
+        writer.write(
+            "Compression Forward Metric: surrogate_pred_bit_percent plus soft Octree auxiliaries; "
+            "actual_total_bit_percent is logged only when/after teacher refresh."
+        )
+        writer.write(
+            "Compression Teacher Refresh: "
+            f"periodic(interval={int(getattr(args, 'compression_surrogate_refresh_interval', 0))}, "
+            f"warmup_steps={int(getattr(args, 'compression_surrogate_warmup_steps', 0))}, "
+            f"replay_steps={int(getattr(args, 'compression_surrogate_replay_steps', 0))}, "
+            f"replay_batch={int(getattr(args, 'compression_surrogate_replay_batch', 0))}, "
+            f"forward={getattr(args, 'compression_surrogate_forward_mode', 'surrogate')}, "
+            f"aux_node={float(getattr(args, 'compression_surrogate_aux_node_weight', 0.0))}, "
+            f"aux_single={float(getattr(args, 'compression_surrogate_aux_single_weight', 0.0))}, "
+            f"reuse_last_target={bool(getattr(args, 'compression_surrogate_reuse_last_target', True))})"
+        )
+        writer.write("Compression Surrogate Backward: enabled")
+        writer.write(
+            f"Surrogate compression uses predicted bit objective plus soft Octree auxiliaries on {compression_backend}; "
+            "legacy comp_bit/com_sin/com_node/com_bpn/com_lowprob weights are not used directly."
+        )
+
+    if actual_total_bit_backend:
+        writer.write(
+            "Loss Weight: "
+            f"geom={args.w_geom}, "
+            f"comp_total={args.w_com} (actual_total_bit_percent), "
+            f"attr={args.w_attr}, policy={args.w_policy}, actuator={args.w_actuator}"
+        )
+    else:
+        writer.write(
+            "Loss Weight: "
+            f"geom={args.w_geom}, "
+            f"comp_total={args.w_com}, comp_bit={args.com_bit}, comp_single={args.com_sin}, "
+            f"comp_node={args.com_node}, comp_bpn={getattr(args, 'com_bpn', 0.0)}, "
+            f"comp_sparsepcgc={getattr(args, 'com_sparsepcgc', 0.0)}, comp_lowprob={args.com_lowprob}, "
+            f"attr={args.w_attr}, policy={args.w_policy}, actuator={args.w_actuator}"
+        )
+
+
+def log_runtime_setup(writer, args):
+    writer.write(
+        f"Runtime Tradeoff: k={args.k}, encoder_query_chunk={args.encoder_query_chunk}, "
+        f"structure_geo_max_points={args.structure_geo_max_points}, "
+        f"knn_backend={getattr(args, 'knn_backend', 'pointops_cuda')}"
+    )
+    writer.write(
+        "Point Edit Count Thresholds: "
+        f"drop_keep_threshold={float(getattr(args, 'operation_count_drop_threshold', 0.5))}, "
+        f"adjust_threshold={float(getattr(args, 'operation_count_adjust_threshold', 1e-6))}"
+    )
+    writer.write(
+        "Uniform Quantization Noise: "
+        f"use={bool(getattr(args, 'use_uniform_noise', True))}, "
+        f"delta={resolve_uniform_noise_delta(args):.6g}, "
+        "scope=train_only_after_edit_before_rate_struct, "
+        "shape_loss=clean_X_edit, rate_struct_loss=noisy_X_edit, "
+        "actual_codec_eval=clean_X_edit, "
+        "supported_compress=gpcc,draco,octattention,sparsepcgc"
+    )
+    writer.write(
+        "Profiling: "
+        f"log_step_time={bool(getattr(args, 'log_step_time', True))}, "
+        f"log_gpu_memory={bool(getattr(args, 'log_gpu_memory', True))}, "
+        f"profile_interval={int(getattr(args, 'profile_interval', 100))}, "
+        f"actual_eval_interval={int(getattr(args, 'actual_eval_interval', 1000))}, "
+        f"disable_actual_codec_during_train={bool(getattr(args, 'disable_actual_codec_during_train', False))}"
+    )
+
+
+def log_codec_setup(writer, args):
+    compression_backend = str(
+        getattr(args, "compression_loss_backend", "proxy")
+    ).strip().lower()
+
+    writer.write(f"Compression Codec: {getattr(args, 'compress', 'OctAttention')}")
+    writer.write(f"OctAttention Teacher Device: {args.octattention_teacher_device}")
+
+    if compression_backend.startswith("sparsepcgc"):
+        writer.write(
+            "SparsePCGC Teacher: "
+            f"env={getattr(args, 'sparsepcgc_env', 'sparsepcgc')}, "
+            f"python={getattr(args, 'sparsepcgc_python', '') or '(auto)'}, "
+            f"mode={getattr(args, 'sparsepcgc_mode', 'dense_lossless')}, "
+            f"device={getattr(args, 'sparsepcgc_device', 'auto')}, "
+            f"match_qs={bool(getattr(args, 'sparsepcgc_match_qs', True))}, "
+            f"voxel_size={float(getattr(args, 'sparsepcgc_voxel_size', 1.0))}, "
+            f"pos_quantscale={int(getattr(args, 'sparsepcgc_pos_quantscale', 1))}, "
+            f"effective_qs={float(getattr(args, 'sparsepcgc_effective_qs', 0.0))}, "
+            f"root={getattr(args, 'sparsepcgc_root', '')}, "
+            f"skip_decode={bool(getattr(args, 'sparsepcgc_skip_decode', True))}"
+        )
+        writer.write(
+            "SparsePCGC Quantization Alignment: "
+            "teacher=round(x/voxel_size)->unique->round(coord/posQuantscale)->unique, "
+            f"network_sparse_quant=sparsepcgc_twostep, "
+            f"surrogate_effective_qs={float(getattr(args, 'sparsepcgc_effective_qs', 0.0))}, "
+            f"surrogate_levels={getattr(args, 'compression_surrogate_levels', '4,6,8')}"
+        )
+
+    if compression_backend.startswith("gpcc"):
+        writer.write(
+            "G-PCC Teacher: "
+            f"encoder={getattr(args, 'gpcc_encoder_path', '')}, "
+            f"cfg={getattr(args, 'gpcc_cfg_dir', '')}, "
+            f"match_qs={bool(getattr(args, 'gpcc_match_qs', True))}, "
+            f"prequantize={bool(getattr(args, 'gpcc_prequantize', True))}, "
+            f"effective_qs={float(getattr(args, 'gpcc_effective_qs', 0.0))}, "
+            f"geometry_only={bool(getattr(args, 'gpcc_disable_attribute_coding', True))}, "
+            f"merge_duplicates={bool(getattr(args, 'gpcc_merge_duplicated_points', True))}"
+        )
+
+    if compression_backend.startswith("draco"):
+        writer.write(
+            "Draco Teacher: "
+            f"encoder={getattr(args, 'draco_encoder_path', '')}, "
+            f"decoder={getattr(args, 'draco_decoder_path', '')}, "
+            f"match_qs={bool(getattr(args, 'draco_match_qs', True))}, "
+            f"prequantize={bool(getattr(args, 'draco_prequantize', True))}, "
+            f"effective_qs={float(getattr(args, 'draco_effective_qs', 0.0))}, "
+            f"qp={int(getattr(args, 'draco_position_quantization_bits', 0))}, "
+            f"cl={int(getattr(args, 'draco_compression_level', 7))}, "
+            f"point_cloud={bool(getattr(args, 'draco_force_point_cloud', True))}, "
+            f"merge_duplicates={bool(getattr(args, 'draco_merge_duplicated_points', True))}, "
+            f"skip_decode={bool(getattr(args, 'draco_skip_decode', True))}"
+        )
+
+    writer.write(f"Compression Rate Metric: {args.compression_rate_metric}")
+    writer.write(f"Compression Loss Backend: {args.compression_loss_backend}")
+
+
+def log_training_setup(writer, args, file_day, file_time):
+    log_basic_setup(writer, args, file_day, file_time)
+    log_loss_weight_setup(writer, args)
+    log_runtime_setup(writer, args)
+    log_codec_setup(writer, args, )
+    writer.write(
+        f"Two-Stage Training: enabled={bool(getattr(args, 'two_stage_training', False))}, "
+        f"base_stage={args.training_stage}, diagnosis_ratio={getattr(args, 'diagnosis_episode_ratio', 0.0)}, "
+        f"diagnosis_episodes={getattr(args, 'diagnosis_episodes', 0)}"
+    )
+    writer.write(f"Module BatchNorm Running Stats: {args.module_bn_use_running_stats}")

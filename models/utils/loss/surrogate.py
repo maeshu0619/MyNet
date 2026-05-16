@@ -295,6 +295,12 @@ class SurrogateCompressionLossMixin:
         backend = self._surrogate_backend_label(args)
         return f"{backend}|{cache_key or ''}"
 
+    def _surrogate_target_is_current_step(self, args, entry):
+        if entry is None:
+            return False
+        current_step = int(getattr(args, "_global_train_step", getattr(self, "_surrogate_call_count", 0)))
+        return int(entry.get("global_step", -1)) == current_step
+
     def _get_cached_surrogate_target(self, args, cache_key):
         entry = None
         key = self._surrogate_target_cache_key(args, cache_key)
@@ -302,13 +308,17 @@ class SurrogateCompressionLossMixin:
         cache = getattr(self, "surrogate_target_cache", None)
         if cache is not None and key in cache:
             cache.move_to_end(key)
-            entry = dict(cache[key])
-            entry["cache_hit"] = "exact"
-        elif bool(getattr(args, "compression_surrogate_reuse_last_target", True)):
+            cached_entry = dict(cache[key])
+            entry = cached_entry
+            entry["cache_hit"] = "exact" if self._surrogate_target_is_current_step(args, cached_entry) else "stale"
+        if entry is None and not cache_key and bool(getattr(args, "compression_surrogate_reuse_last_target", False)):
             last_entry = getattr(self, "last_surrogate_target_entry", None)
-            if last_entry is not None and str(last_entry.get("backend_label", backend)) == backend:
+            if (
+                last_entry is not None
+                and str(last_entry.get("backend_label", backend)) == backend
+            ):
                 entry = dict(last_entry)
-                entry["cache_hit"] = "last"
+                entry["cache_hit"] = "last" if self._surrogate_target_is_current_step(args, last_entry) else "last_stale"
         return entry
 
     def _store_cached_surrogate_target(self, args, cache_key, entry):
@@ -380,13 +390,15 @@ class SurrogateCompressionLossMixin:
         if isinstance(refresh_actual_gen, str) and refresh_actual_gen.strip().lower() == "always":
             return True
         if not bool(refresh_actual_gen):
-            return entry is None
-        if entry is None:
-            return True
+            return False
         interval = max(int(getattr(args, "compression_surrogate_refresh_interval", 0)), 0)
+        step = int(getattr(args, "_global_train_step", getattr(self, "_surrogate_call_count", 0)))
+        if entry is None:
+            # 新しいsampleでも毎回actual codecを呼ばず、global step間隔で教師を更新する。
+            # これにより外部codecの重複実行を避け、GPU/CPU時間がstepごとに膨らむのを防ぐ。
+            return step == 0 or (interval > 0 and step % interval == 0)
         if interval <= 0:
             return False
-        step = int(getattr(args, "_global_train_step", getattr(self, "_surrogate_call_count", 0)))
         last_step = int(entry.get("global_step", -10**12))
         return (step - last_step) >= interval
 
@@ -484,6 +496,7 @@ class SurrogateCompressionLossMixin:
         final_w,
         cache_key=None,
         refresh_actual_gen=True,
+        actual_gen_xyz=None,
     ):
         timing_enabled = bool(getattr(args, "debug_timing", False))
         timing = {}
@@ -540,7 +553,9 @@ class SurrogateCompressionLossMixin:
             if cached_gt is None:
                 cached_gt = self._encode_actual_batch(args, gt_xyz)
                 self._store_cached_actual_gt(cache_key, cached_gt)
-            stats_gen = self._encode_actual_batch(args, gen_xyz, final_w=final_w)
+            # actual codec教師は評価指標なので、train用ノイズなしの編集点群で測る。
+            actual_xyz = gen_xyz if actual_gen_xyz is None else actual_gen_xyz
+            stats_gen = self._encode_actual_batch(args, actual_xyz, final_w=final_w)
             if timing_enabled:
                 timing["actual_encode"] = time.time() - actual_t0
                 timing_cursor = time.time()
@@ -661,7 +676,9 @@ class SurrogateCompressionLossMixin:
         else:
             main_loss = surrogate_bit_percent if inputs_finite else actual_bit_percent_t
         aux_loss = aux_node_weight * loss_nodes + aux_single_weight * loss_single
-        L_com = main_loss + aux_loss
+        sparse_terms = self._sparsepcgc_aux_feature_terms(args, gen_xyz, gt_xyz, final_w)
+        sparse_aux_loss = float(getattr(args, "com_sparsepcgc", 1.0)) * sparse_terms["loss"]
+        L_com = main_loss + aux_loss + sparse_aux_loss
         backend_label = self._surrogate_backend_label(args, teacher_codec)
         self._store_compression_terms(
             bit=surrogate_bit_percent,
@@ -673,12 +690,29 @@ class SurrogateCompressionLossMixin:
             hard=actual_bit_percent_t,
             surrogate=surrogate_bit_percent,
             aux=aux_loss,
+            sparsepcgc=sparse_terms["loss"],
             backend=backend_label,
         )
 
         pred_percent = surrogate_bit_percent.detach().reshape(())
         target_percent = pred_percent.new_tensor(float(target_percent_value)).detach().reshape(())
         surrogate_abs_bit_error = (pred_percent - target_percent).abs()
+        rate_proxy_before_value = float(cached_gt["bit"])
+        rate_proxy_after_value = rate_proxy_before_value * (1.0 + self._scalar(pred_percent) / 100.0)
+        gt_octree_node_value = float(cached_gt.get("octree_node", cached_gt.get("node", 0.0)))
+        gt_octree_single_value = float(cached_gt.get("octree_single", cached_gt.get("single", 0.0)))
+        if target_entry is not None and not teacher_refreshed:
+            gen_octree_node_value = float(target_entry.get("gen_octree_node", 0.0))
+            gen_octree_single_value = float(target_entry.get("gen_octree_single", 0.0))
+            gen_octree_depth_value = int(target_entry.get("gen_octree_depth", 0))
+        elif stats_gen is not None:
+            gen_octree_node_value = float(stats_gen.get("octree_node", 0.0))
+            gen_octree_single_value = float(stats_gen.get("octree_single", 0.0))
+            gen_octree_depth_value = int(stats_gen.get("octree_depth", 0))
+        else:
+            gen_octree_node_value = 0.0
+            gen_octree_single_value = 0.0
+            gen_octree_depth_value = 0
         self.last_compression_debug = {
             "metric": "actual_total_bit_percent",
             "teacher_codec": teacher_codec,
@@ -686,16 +720,26 @@ class SurrogateCompressionLossMixin:
             "compression_objective": self._scalar(L_com),
             "compression_main_loss": self._scalar(main_loss),
             "compression_aux_loss": self._scalar(aux_loss),
+            "sparsepcgc_aux_loss": self._scalar(sparse_terms["loss"].detach()),
+            "sparsepcgc_active_coord_loss": self._scalar(sparse_terms["active"].detach()),
+            "sparsepcgc_isolated_proxy_loss": self._scalar(sparse_terms["single"].detach()),
+            "sparsepcgc_entropy_proxy_loss": self._scalar(sparse_terms["entropy"].detach()),
+            "sparsepcgc_density_proxy_loss": self._scalar(sparse_terms["density"].detach()),
             "bpp": float(actual_bpp_percent),
             "gt_points": int(cached_gt["point_count"]),
             "gen_points": gen_points,
             "gt_actual_bit": float(cached_gt["bit"]),
             "gen_actual_bit": gen_actual_bit,
             "actual_total_bit_percent": self._scalar(actual_bit_percent_t),
+            "rate_proxy_before": rate_proxy_before_value,
+            "rate_proxy_after": rate_proxy_after_value,
+            "rate_proxy_delta": self._scalar(surrogate_bit_percent.detach()),
             "actual_single_percent": float(actual_single_percent),
             "actual_node_percent": float(actual_node_percent),
             "soft_single_percent": self._scalar(loss_single.detach()),
             "soft_node_percent": self._scalar(loss_nodes.detach()),
+            "node_delta": gen_octree_node_value - gt_octree_node_value,
+            "single_delta": gen_octree_single_value - gt_octree_single_value,
             "surrogate_pred_bit": self._scalar(pred_percent),
             "surrogate_objective_bit": self._scalar(surrogate_bit_percent.detach()),
             "surrogate_target_bit": self._scalar(target_percent),
@@ -709,14 +753,23 @@ class SurrogateCompressionLossMixin:
             "teacher_refresh_policy": self._surrogate_refresh_policy_label(args),
             "surrogate_backward_enabled": bool(inputs_finite),
             "inputs_finite": bool(inputs_finite),
-            "gt_octree_node": float(cached_gt.get("octree_node", cached_gt.get("node", 0.0))),
-            "gen_octree_node": float(target_entry.get("gen_octree_node", 0.0)) if target_entry is not None and not teacher_refreshed else float(stats_gen.get("octree_node", 0.0)) if stats_gen is not None else 0.0,
-            "gt_octree_single": float(cached_gt.get("octree_single", cached_gt.get("single", 0.0))),
-            "gen_octree_single": float(target_entry.get("gen_octree_single", 0.0)) if target_entry is not None and not teacher_refreshed else float(stats_gen.get("octree_single", 0.0)) if stats_gen is not None else 0.0,
+            "gt_octree_node": gt_octree_node_value,
+            "gen_octree_node": gen_octree_node_value,
+            "gt_octree_single": gt_octree_single_value,
+            "gen_octree_single": gen_octree_single_value,
             "gt_octree_depth": int(cached_gt.get("octree_depth", target_entry.get("gt_octree_depth", 0) if target_entry else 0)),
-            "gen_octree_depth": int(target_entry.get("gen_octree_depth", 0)) if target_entry is not None and not teacher_refreshed else int(stats_gen.get("octree_depth", 0)) if stats_gen is not None else 0,
+            "gen_octree_depth": gen_octree_depth_value,
             "timing": {key: round(float(value), 6) for key, value in timing.items()},
         }
+        debug_gen_xyz = gen_xyz if actual_gen_xyz is None else actual_gen_xyz
+        self._maybe_update_sparsepcgc_debug(
+            args,
+            self.last_compression_debug,
+            gen_xyz=debug_gen_xyz,
+            gt_xyz=gt_xyz,
+            final_w=final_w,
+            codec_name=teacher_codec,
+        )
 
         if self._should_verbose_step(args):
             msg = (

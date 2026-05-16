@@ -1,4 +1,5 @@
 import math
+import time
 
 import torch
 import torch.nn as nn
@@ -15,12 +16,25 @@ class StructureRepairActuator(nn.Module):
     def __init__(self, in_channels, hidden_dim=64, args=None):
         super().__init__()
         self.args = args
-        self.offset_head = nn.Sequential(
+        self.last_runtime_timing = {}
+        neighbor_offsets = [
+            (dx, dy, dz)
+            for dx in (-1, 0, 1)
+            for dy in (-1, 0, 1)
+            for dz in (-1, 0, 1)
+            if not (dx == 0 and dy == 0 and dz == 0)
+        ]
+        self.register_buffer(
+            "neighbor_offsets",
+            torch.tensor(neighbor_offsets, dtype=torch.float32),
+            persistent=False,
+        )
+        self.move_voxel_head = nn.Sequential(
             nn.Conv1d(in_channels, hidden_dim, 1),
             nn.ReLU(inplace=True),
             nn.Conv1d(hidden_dim, hidden_dim, 1),
             nn.ReLU(inplace=True),
-            nn.Conv1d(hidden_dim, 3, 1),
+            nn.Conv1d(hidden_dim, len(neighbor_offsets), 1),
         )
         self.drop_head = nn.Sequential(
             nn.Conv1d(in_channels, hidden_dim, 1),
@@ -36,19 +50,19 @@ class StructureRepairActuator(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv1d(hidden_dim, 1, 1),
         )
-        self.add_dir_head = nn.Sequential(
+        self.add_voxel_head = nn.Sequential(
             nn.Conv1d(in_channels, hidden_dim, 1),
             nn.ReLU(inplace=True),
             nn.Conv1d(hidden_dim, hidden_dim, 1),
             nn.ReLU(inplace=True),
-            nn.Conv1d(hidden_dim, 3, 1),
+            nn.Conv1d(hidden_dim, len(neighbor_offsets), 1),
         )
-        nn.init.zeros_(self.offset_head[-1].weight)
-        nn.init.zeros_(self.offset_head[-1].bias)
+        nn.init.zeros_(self.move_voxel_head[-1].weight)
+        nn.init.zeros_(self.move_voxel_head[-1].bias)
         nn.init.zeros_(self.drop_head[-1].weight)
         nn.init.zeros_(self.add_head[-1].weight)
-        nn.init.zeros_(self.add_dir_head[-1].weight)
-        nn.init.zeros_(self.add_dir_head[-1].bias)
+        nn.init.zeros_(self.add_voxel_head[-1].weight)
+        nn.init.zeros_(self.add_voxel_head[-1].bias)
         target_repair_ratio = float(
             getattr(self.args, "target_repair_ratio", getattr(self.args, "target_disp_ratio", 0.20))
         )
@@ -81,6 +95,19 @@ class StructureRepairActuator(nn.Module):
             return max(float(getattr(self.args, "gpcc_effective_qs", getattr(self.args, "qs", 1.0))), 1e-9)
         return max(float(getattr(self.args, "qs", 2.0)), 1e-9)
 
+    def _add_enabled(self):
+        return bool(getattr(self.args, "add", True))
+
+    def _prune_enabled(self):
+        return bool(getattr(self.args, "prune", True))
+
+    def _disp_enabled(self):
+        return bool(getattr(self.args, "disp", True))
+
+    def _threshold_cap_mode(self):
+        mode = str(getattr(self.args, "repair_selection_mode", "target")).strip().lower().replace("-", "_")
+        return mode in {"threshold_cap", "cap", "optional", "threshold"}
+
     def _max_offset(self, pts_xyz, coord_scale):
         raw_max = float(getattr(self.args, "max_repair_offset", getattr(self.args, "max_disp_offset", 0.002)))
         qstep_max = float(getattr(self.args, "max_repair_qstep", 0.25)) * self._effective_qs()
@@ -93,6 +120,302 @@ class StructureRepairActuator(nn.Module):
                 scale = scale.expand(pts_xyz.shape[0], -1, -1)
             return raw_max / scale.clamp_min(1e-9)
         return pts_xyz.new_full((pts_xyz.shape[0], 1, 1), raw_max / max(float(coord_scale), 1e-9))
+
+    def _voxel_step(self, pts_xyz, coord_scale):
+        qstep = self._effective_qs()
+        if coord_scale is None:
+            return pts_xyz.new_full((pts_xyz.shape[0], 1, 1), qstep)
+        if torch.is_tensor(coord_scale):
+            scale = coord_scale.to(device=pts_xyz.device, dtype=pts_xyz.dtype).reshape(-1, 1, 1)
+            if scale.shape[0] == 1 and pts_xyz.shape[0] > 1:
+                scale = scale.expand(pts_xyz.shape[0], -1, -1)
+            return qstep / scale.clamp_min(1e-9)
+        return pts_xyz.new_full((pts_xyz.shape[0], 1, 1), qstep / max(float(coord_scale), 1e-9))
+
+    @staticmethod
+    def _voxel_coords(pts_xyz, voxel_step):
+        return torch.round(pts_xyz / voxel_step.clamp_min(1e-9)).to(torch.long)
+
+    @staticmethod
+    def _coord_keys(coords, mins, spans):
+        shifted = coords - mins.view(1, 3)
+        return (
+            shifted[:, 0] * spans[1].clamp_min(1) * spans[2].clamp_min(1)
+            + shifted[:, 1] * spans[2].clamp_min(1)
+            + shifted[:, 2]
+        )
+
+    @classmethod
+    def _coords_membership(cls, query_coords, reference_coords):
+        if query_coords.numel() == 0:
+            return torch.zeros((query_coords.shape[0],), device=query_coords.device, dtype=torch.bool)
+        if reference_coords.numel() == 0:
+            return torch.zeros((query_coords.shape[0],), device=query_coords.device, dtype=torch.bool)
+        combined = torch.cat([query_coords, reference_coords], dim=0)
+        mins = combined.amin(dim=0)
+        spans = (combined.amax(dim=0) - mins + 1).to(torch.long)
+        query_keys = cls._coord_keys(query_coords.to(torch.long), mins, spans)
+        reference_keys = torch.unique(cls._coord_keys(reference_coords.to(torch.long), mins, spans), sorted=True)
+        pos = torch.searchsorted(reference_keys, query_keys)
+        in_bounds = pos < reference_keys.numel()
+        safe_pos = pos.clamp(max=max(int(reference_keys.numel()) - 1, 0))
+        return in_bounds & (reference_keys[safe_pos] == query_keys)
+
+    def _empty_neighbor_target_mask(self, voxel_coords):
+        B, _, N = voxel_coords.shape
+        offsets = self.neighbor_offsets.to(device=voxel_coords.device, dtype=torch.long)
+        masks = []
+        for b in range(B):
+            current = voxel_coords[b].transpose(0, 1).contiguous()
+            targets = current[:, None, :] + offsets.view(1, -1, 3)
+            occupied = self._coords_membership(targets.reshape(-1, 3), current).view(N, -1)
+            masks.append(~occupied)
+        return torch.stack(masks, dim=0)
+
+    @staticmethod
+    def _voxel_point_counts(voxel_coords):
+        B, _, N = voxel_coords.shape
+        counts = torch.zeros((B, 1, N), device=voxel_coords.device, dtype=torch.float32)
+        for b in range(B):
+            coords = voxel_coords[b].transpose(0, 1).contiguous()
+            if coords.numel() == 0:
+                continue
+            _, inverse = torch.unique(coords, dim=0, sorted=True, return_inverse=True)
+            voxel_counts = torch.bincount(inverse, minlength=int(inverse.max().item()) + 1).to(
+                device=voxel_coords.device,
+                dtype=torch.float32,
+            )
+            counts[b, 0] = voxel_counts.index_select(0, inverse)
+        return counts
+
+    @classmethod
+    def _unique_voxel_count(cls, voxel_coords, point_mask=None):
+        B = voxel_coords.shape[0]
+        total = 0
+        if point_mask is not None:
+            if point_mask.ndim == 3:
+                point_mask = point_mask.squeeze(1)
+            point_mask = point_mask.to(device=voxel_coords.device, dtype=torch.bool)
+        for b in range(B):
+            coords = voxel_coords[b].transpose(0, 1).contiguous()
+            if point_mask is not None:
+                coords = coords[point_mask[b]]
+            if coords.numel() == 0:
+                continue
+            total += int(torch.unique(coords, dim=0).shape[0])
+        return total
+
+    @classmethod
+    def _selected_voxels_absent_count(cls, before_coords, selected_mask, after_coords, after_mask):
+        if selected_mask.ndim == 3:
+            selected_mask = selected_mask.squeeze(1)
+        if after_mask.ndim == 3:
+            after_mask = after_mask.squeeze(1)
+        selected_mask = selected_mask.to(device=before_coords.device, dtype=torch.bool)
+        after_mask = after_mask.to(device=after_coords.device, dtype=torch.bool)
+        total = 0
+        for b in range(before_coords.shape[0]):
+            selected_coords = before_coords[b].transpose(0, 1).contiguous()[selected_mask[b]]
+            if selected_coords.numel() == 0:
+                continue
+            selected_coords = torch.unique(selected_coords, dim=0)
+            kept_after = after_coords[b].transpose(0, 1).contiguous()[after_mask[b]]
+            present = cls._coords_membership(selected_coords, kept_after)
+            total += int((~present).sum().item())
+        return total
+
+    def _neighbor_target_membership_mask(self, voxel_coords, reference_mask):
+        B, _, N = voxel_coords.shape
+        offsets = self.neighbor_offsets.to(device=voxel_coords.device, dtype=torch.long)
+        if reference_mask.ndim == 3:
+            reference_mask = reference_mask.squeeze(1)
+        reference_mask = reference_mask.to(device=voxel_coords.device, dtype=torch.bool)
+        masks = []
+        for b in range(B):
+            current = voxel_coords[b].transpose(0, 1).contiguous()
+            reference = current[reference_mask[b]]
+            targets = current[:, None, :] + offsets.view(1, -1, 3)
+            masks.append(self._coords_membership(targets.reshape(-1, 3), reference).view(N, -1))
+        return torch.stack(masks, dim=0)
+
+    @staticmethod
+    def _voxel_mean_logits(logits, voxel_coords):
+        B, K, N = logits.shape
+        out = torch.empty_like(logits)
+        for b in range(B):
+            coords = voxel_coords[b].transpose(0, 1).contiguous()
+            if coords.numel() == 0:
+                out[b] = logits[b]
+                continue
+            _, inverse = torch.unique(coords, dim=0, sorted=True, return_inverse=True)
+            voxel_count = int(inverse.max().item()) + 1
+            index = inverse.view(1, N).expand(K, N)
+            sums = logits.new_zeros((K, voxel_count))
+            sums.scatter_add_(1, index, logits[b])
+            counts = torch.bincount(inverse, minlength=voxel_count).to(
+                device=logits.device,
+                dtype=logits.dtype,
+            ).clamp_min(1.0)
+            means = sums / counts.view(1, voxel_count)
+            out[b] = means.index_select(1, inverse)
+        return out
+
+    @staticmethod
+    def _first_unique_coord_mask(voxel_coords):
+        B, _, N = voxel_coords.shape
+        unique_mask = torch.zeros((B, N), device=voxel_coords.device, dtype=torch.bool)
+        for b in range(B):
+            seen = set()
+            coords = voxel_coords[b].transpose(0, 1).detach().cpu().tolist()
+            for idx, coord in enumerate(coords):
+                key = (int(coord[0]), int(coord[1]), int(coord[2]))
+                if key in seen:
+                    continue
+                seen.add(key)
+                unique_mask[b, idx] = True
+        return unique_mask
+
+    @staticmethod
+    def _voxel_max_scores(scores, inverse, voxel_count):
+        voxel_scores = scores.new_full((voxel_count,), -1.0e6)
+        scatter_reduce = getattr(voxel_scores, "scatter_reduce_", None)
+        if callable(scatter_reduce):
+            scatter_reduce(0, inverse, scores, reduce="amax", include_self=True)
+            return voxel_scores
+        for voxel_id in range(int(voxel_count)):
+            mask = inverse == voxel_id
+            if bool(mask.any().item()):
+                voxel_scores[voxel_id] = scores[mask].max()
+        return voxel_scores
+
+    @classmethod
+    def _top_voxel_indices_by_score(cls, scores, inverse, voxel_count, drop_count):
+        voxel_scores = cls._voxel_max_scores(scores, inverse, voxel_count)
+        if int(drop_count) <= 0:
+            return torch.empty((0,), device=scores.device, dtype=torch.long)
+        if bool((voxel_scores > -1.0e6).all().item()):
+            return torch.topk(voxel_scores, k=drop_count, largest=True, sorted=False).indices
+        order = torch.argsort(scores.detach(), descending=True)
+        sorted_voxels = inverse.index_select(0, order).detach().cpu().tolist()
+        selected = []
+        seen = set()
+        for voxel_id in sorted_voxels:
+            voxel_id = int(voxel_id)
+            if voxel_id in seen:
+                continue
+            seen.add(voxel_id)
+            selected.append(voxel_id)
+            if len(selected) >= drop_count:
+                break
+        if len(selected) < drop_count:
+            for voxel_id in range(int(voxel_count)):
+                if voxel_id in seen:
+                    continue
+                selected.append(voxel_id)
+                if len(selected) >= drop_count:
+                    break
+        return torch.as_tensor(selected, device=scores.device, dtype=torch.long)
+
+    def _hard_voxel_drop_mask(
+        self,
+        voxel_coords,
+        drop_scores,
+        target_drop_ratio,
+        max_drop_ratio,
+        selection_mask,
+        hard_threshold=0.0,
+    ):
+        B, _, N = drop_scores.shape
+        hard_drop = torch.zeros_like(drop_scores, dtype=torch.bool)
+        threshold_cap_mode = self._threshold_cap_mode()
+        if N <= 0 or float(max_drop_ratio) <= 0.0:
+            return hard_drop
+        if not threshold_cap_mode and float(target_drop_ratio) <= 0.0:
+            return hard_drop
+        if selection_mask is None:
+            valid_all = torch.ones((B, N), device=drop_scores.device, dtype=torch.bool)
+        else:
+            valid_all = selection_mask.squeeze(1) if selection_mask.ndim == 3 else selection_mask
+            valid_all = valid_all.to(device=drop_scores.device, dtype=torch.bool)
+        for b in range(B):
+            valid = valid_all[b]
+            if not bool(valid.any().item()):
+                continue
+            coords = voxel_coords[b].transpose(0, 1).contiguous()
+            valid_coords = coords[valid]
+            unique_coords, inverse = torch.unique(valid_coords, dim=0, sorted=True, return_inverse=True)
+            voxel_count = int(unique_coords.shape[0])
+            if voxel_count <= 1:
+                continue
+            cap_count = int(round(float(max_drop_ratio) * float(voxel_count)))
+            if threshold_cap_mode:
+                drop_count = min(max(cap_count, 0), voxel_count - 1)
+            else:
+                target_count = int(round(float(target_drop_ratio) * float(voxel_count)))
+                if target_drop_ratio > 0.0:
+                    target_count = max(target_count, 1)
+                if max_drop_ratio > 0.0:
+                    cap_count = max(cap_count, 1)
+                drop_count = min(target_count, cap_count, voxel_count - 1)
+            if drop_count <= 0:
+                continue
+            scores = drop_scores[b, 0, valid].detach()
+            selected_voxel_idx = self._top_voxel_indices_by_score(scores, inverse, voxel_count, drop_count)
+            if threshold_cap_mode:
+                voxel_scores = self._voxel_max_scores(scores, inverse, voxel_count)
+                selected_scores = voxel_scores.index_select(0, selected_voxel_idx)
+                selected_voxel_idx = selected_voxel_idx[selected_scores >= float(hard_threshold)]
+                if selected_voxel_idx.numel() <= 0:
+                    continue
+            selected_coords = unique_coords.index_select(0, selected_voxel_idx)
+            selected_points = self._coords_membership(coords, selected_coords)
+            hard_drop[b, 0] = selected_points
+        return hard_drop
+
+    def _hard_point_topk_mask(
+        self,
+        scores,
+        target_ratio,
+        selection_mask=None,
+        exclude_mask=None,
+        hard_threshold=0.0,
+    ):
+        B, _, N = scores.shape
+        hard_mask = torch.zeros_like(scores, dtype=torch.bool)
+        if N <= 0 or float(target_ratio) <= 0.0:
+            return hard_mask
+        threshold_cap_mode = self._threshold_cap_mode()
+        if selection_mask is None:
+            valid_all = torch.ones((B, N), device=scores.device, dtype=torch.bool)
+        else:
+            valid_all = selection_mask.squeeze(1) if selection_mask.ndim == 3 else selection_mask
+            valid_all = valid_all.to(device=scores.device, dtype=torch.bool)
+        if exclude_mask is not None:
+            exclude = exclude_mask.squeeze(1) if exclude_mask.ndim == 3 else exclude_mask
+            valid_all = valid_all & (~exclude.to(device=scores.device, dtype=torch.bool))
+        for b in range(B):
+            score_values = scores[b, 0].detach()
+            valid = valid_all[b] & torch.isfinite(score_values) & (score_values > 0.0)
+            valid_count = int(valid.sum().item())
+            if valid_count <= 0:
+                continue
+            count = int(round(float(target_ratio) * float(valid_count)))
+            if threshold_cap_mode:
+                count = min(max(count, 0), valid_count)
+            else:
+                count = min(max(count, 1), valid_count)
+            if count <= 0:
+                continue
+            mask_value = torch.finfo(scores.dtype).min
+            masked_scores = score_values.masked_fill(~valid, mask_value)
+            idx = torch.topk(masked_scores, k=count, largest=True, sorted=False).indices
+            if threshold_cap_mode:
+                idx_scores = score_values.index_select(0, idx)
+                idx = idx[idx_scores >= float(hard_threshold)]
+                if idx.numel() <= 0:
+                    continue
+            hard_mask[b, 0, idx] = True
+        return hard_mask
 
     @staticmethod
     def _clip_vector(delta, max_norm):
@@ -145,7 +468,7 @@ class StructureRepairActuator(nn.Module):
         return max(max_ratio, 0.0)
 
     def _target_add_count(self, point_count):
-        if point_count <= 0 or not bool(getattr(self.args, "add", True)):
+        if point_count <= 0 or not self._add_enabled():
             return 0, 0.0
         max_ratio = self._max_add_ratio()
         if max_ratio <= 0.0:
@@ -190,7 +513,8 @@ class StructureRepairActuator(nn.Module):
             keep = keep_prob.squeeze(1) if keep_prob.ndim == 3 else keep_prob
             keep = keep.to(device=add_scores.device, dtype=add_scores.dtype)
             valid = valid & (keep.detach() >= float(keep_threshold))
-        masked = add_scores.masked_fill(~valid, -1.0e6)
+        mask_value = torch.finfo(add_scores.dtype).min
+        masked = add_scores.masked_fill(~valid, mask_value)
         all_invalid = ~valid.any(dim=1)
         if bool(all_invalid.any().item()):
             masked = torch.where(all_invalid[:, None], add_scores, masked)
@@ -207,6 +531,24 @@ class StructureRepairActuator(nn.Module):
         coord_scale=None,
         selection_mask=None,
     ):
+        timing_enabled = bool(getattr(self.args, "debug_timing", False))
+        runtime_timing = {}
+        if timing_enabled:
+            if pts_xyz.is_cuda:
+                torch.cuda.synchronize(pts_xyz.device)
+            runtime_start = time.perf_counter()
+            runtime_cursor = runtime_start
+
+            def _mark_runtime(name):
+                nonlocal runtime_cursor
+                if pts_xyz.is_cuda:
+                    torch.cuda.synchronize(pts_xyz.device)
+                now = time.perf_counter()
+                runtime_timing[name] = float(now - runtime_cursor)
+                runtime_cursor = now
+        else:
+            runtime_start = None
+
         snap_strength = float(getattr(self.args, "repair_snap_strength", getattr(self.args, "disp_snap_strength", 0.35)))
         max_offset = self._max_offset(pts_xyz, coord_scale)
         stage = str(getattr(self.args, "training_stage", "joint")).strip().lower()
@@ -214,6 +556,11 @@ class StructureRepairActuator(nn.Module):
             actuator_strength = float(getattr(self.args, "diagnosis_actuator_strength", 0.1))
         else:
             actuator_strength = float(getattr(self.args, "repair_actuator_strength", 1.0))
+        add_enabled = self._add_enabled()
+        prune_enabled = self._prune_enabled()
+        disp_enabled = self._disp_enabled()
+        operation_enabled = add_enabled or prune_enabled or disp_enabled
+        threshold_cap_mode = self._threshold_cap_mode()
 
         preserve = policy_probs[:, 0:1, :]
         p_chain = policy_probs[:, 1:2, :]
@@ -231,6 +578,8 @@ class StructureRepairActuator(nn.Module):
             selection_mask = selection_mask.to(device=pts_xyz.device, dtype=pts_xyz.dtype)
             base_repair_gate = base_repair_gate * selection_mask
         target_ratio = float(getattr(self.args, "target_repair_ratio", getattr(self.args, "target_disp_ratio", 0.20)))
+        if not operation_enabled:
+            target_ratio = 0.0
         if bool(getattr(self.args, "repair_priority_gate", True)) and repair_priority is not None:
             priority = repair_priority.to(device=pts_xyz.device, dtype=pts_xyz.dtype).clamp(0.0, 1.0)
             priority_gate = self._priority_topk_gate(
@@ -249,8 +598,32 @@ class StructureRepairActuator(nn.Module):
         node_score = cause_scores[:, 0:1, :]
         single_score = cause_scores[:, 1:2, :]
         lowprob_score = cause_scores[:, 2:3, :] if cause_scores.shape[1] > 2 else preserve.new_zeros(preserve.shape)
-        shape_idx = 6 if cause_scores.shape[1] > 6 else 5
-        shape_score = cause_scores[:, shape_idx:shape_idx+1, :]
+        if cause_scores.shape[1] >= 8:
+            quant_score = cause_scores[:, 4:5, :]
+            sparse_score = cause_scores[:, 5:6, :]
+            local_outlier_score = cause_scores[:, 6:7, :]
+        else:
+            quant_score = preserve.new_zeros(preserve.shape)
+            sparse_score = cause_scores[:, 4:5, :] if cause_scores.shape[1] > 4 else preserve.new_zeros(preserve.shape)
+            local_outlier_score = cause_scores[:, 5:6, :] if cause_scores.shape[1] > 5 else preserve.new_zeros(preserve.shape)
+        shape_score = cause_scores[:, -1:, :]
+
+        voxel_step = self._voxel_step(pts_xyz, coord_scale)
+        voxel_norm = (voxel_step * math.sqrt(3.0)).clamp_min(1e-9)
+        voxel_coords = self._voxel_coords(pts_xyz, voxel_step)
+        neighbor_offsets = self.neighbor_offsets.to(device=pts_xyz.device, dtype=pts_xyz.dtype)
+        neighbor_offsets_long = self.neighbor_offsets.to(device=pts_xyz.device, dtype=torch.long)
+        empty_target_mask = self._empty_neighbor_target_mask(voxel_coords)
+        B, _, N = pts_xyz.shape
+        if selection_mask is None:
+            selection_bool = torch.ones((B, N), device=pts_xyz.device, dtype=torch.bool)
+        else:
+            selection_bool = selection_mask.squeeze(1) if selection_mask.ndim == 3 else selection_mask
+            selection_bool = selection_bool.to(device=pts_xyz.device, dtype=torch.bool)
+        voxel_point_counts = self._voxel_point_counts(voxel_coords).to(device=pts_xyz.device)
+        before_occupied_voxels = self._unique_voxel_count(voxel_coords, selection_bool)
+        if timing_enabled:
+            _mark_runtime("setup")
 
         delete_prior = (
             0.95 * p_outlier
@@ -261,11 +634,16 @@ class StructureRepairActuator(nn.Module):
             + 0.25 * node_score
             + 0.25 * single_score
             + 0.15 * lowprob_score
+            + 0.45 * quant_score
+            + 0.25 * sparse_score
+            + 0.35 * local_outlier_score
             - 0.85 * preserve
             - 0.75 * shape_score
         )
-        target_drop_ratio = float(getattr(self.args, "target_drop_ratio", 0.01))
+        target_drop_ratio = float(getattr(self.args, "target_drop_ratio", 0.01)) if prune_enabled else 0.0
         max_drop_ratio = max(float(getattr(self.args, "max_drop_ratio", max(target_drop_ratio, 0.01))), target_drop_ratio)
+        if not prune_enabled:
+            max_drop_ratio = 0.0
         delete_prior = torch.sigmoid(delete_prior.clamp(-8.0, 8.0))
         drop_score_noise = max(
             self._annealed_value("repair_drop_score_noise_start", "repair_drop_score_noise_end"),
@@ -280,39 +658,116 @@ class StructureRepairActuator(nn.Module):
             max(self._annealed_value("repair_drop_random_mix_start", "repair_drop_random_mix_end"), 0.0),
             1.0,
         )
-        if self.training and drop_random_mix > 0.0:
+        if self.training and prune_enabled and drop_random_mix > 0.0:
             random_drop = self._random_ratio_mask_like(drop_prob, max_drop_ratio, selection_mask)
             drop_prob = ((1.0 - drop_random_mix) * drop_prob + drop_random_mix * random_drop).clamp(0.0, 1.0)
-        keep_prob = (1.0 - drop_prob).clamp(1e-4, 1.0)
-
-        snap_delta = structure["snap_delta"].to(device=pts_xyz.device, dtype=pts_xyz.dtype)
-        learned_delta = torch.tanh(self.offset_head(actuator_features)) * max_offset
-        motion_gate = repair_gate * keep_prob
-
-        # Give each named policy a genuinely different geometric primitive so
-        # the diagnosis/policy path is not only cosmetic.  All paths remain
-        # small and geometry-preserving, but they bias edits differently.
-        delta_chain = snap_strength * 1.20 * snap_delta
-        delta_sibling = snap_strength * 0.60 * snap_delta + 0.40 * learned_delta
-        delta_parent = snap_strength * 0.90 * snap_delta + 0.20 * learned_delta
-        delta_context = 0.85 * learned_delta
-        delta_comp = 0.55 * learned_delta - 0.20 * snap_strength * snap_delta
-        delta_outlier = 0.15 * learned_delta
-
-        primitive_delta = (
-            p_chain * delta_chain
-            + p_sibling * delta_sibling
-            + p_parent * delta_parent
-            + p_context * delta_context
-            + p_comp * delta_comp
-            + p_outlier * delta_outlier
+        if not prune_enabled:
+            drop_prob = torch.zeros_like(drop_prob)
+        drop_prob = self._voxel_mean_logits(drop_prob, voxel_coords).clamp(0.0, 1.0)
+        # 削除は点単位ではなくcodec量子化step上のleaf voxel単位で決める。
+        # Octree occupancyはVoxelが1点でも残ると変わらないため、選択Voxel内の点をまとめて削除する。
+        delete_candidate_mask = selection_bool.clone()
+        delete_max_points = int(getattr(self.args, "repair_delete_max_points_per_voxel", 8))
+        if delete_max_points > 0:
+            delete_candidate_mask = delete_candidate_mask & (
+                voxel_point_counts.squeeze(1) <= float(delete_max_points)
+            )
+        hard_drop_mask = self._hard_voxel_drop_mask(
+            voxel_coords,
+            drop_prob,
+            target_drop_ratio=target_drop_ratio,
+            max_drop_ratio=max_drop_ratio,
+            selection_mask=delete_candidate_mask.unsqueeze(1),
+            hard_threshold=float(getattr(self.args, "repair_drop_hard_threshold", 0.5)),
         )
-        raw_delta = actuator_strength * motion_gate * primitive_delta
-        delta = self._clip_vector(raw_delta, max_offset)
+        hard_drop = hard_drop_mask.to(dtype=pts_xyz.dtype)
+        drop_prob_st = hard_drop - drop_prob.detach() + drop_prob
+        keep_prob = (1.0 - drop_prob_st).clamp(0.0, 1.0)
+        if timing_enabled:
+            _mark_runtime("delete")
+
+        move_score = (repair_gate * (1.0 - hard_drop)).clamp(0.0, 1.0)
+        move_target_ratio = target_ratio if disp_enabled else 0.0
+        require_empty_move = bool(getattr(self.args, "repair_move_require_empty_target", True))
+        prefer_occupied_move = bool(getattr(self.args, "repair_move_prefer_occupied_target", False)) and not require_empty_move
+        dropped_target_mask = self._neighbor_target_membership_mask(voxel_coords, hard_drop_mask)
+        move_target_valid = torch.ones_like(move_score)
+        if not disp_enabled:
+            move_score = torch.zeros_like(move_score)
+        move_score = self._voxel_mean_logits(move_score, voxel_coords).clamp(0.0, 1.0)
+        if require_empty_move:
+            valid_move_points = empty_target_mask & (~dropped_target_mask)
+        elif prefer_occupied_move:
+            valid_move_points = (~empty_target_mask) & (~dropped_target_mask)
+        else:
+            valid_move_points = torch.ones_like(empty_target_mask, dtype=torch.bool) & (~dropped_target_mask)
+        has_valid_move_target = valid_move_points.any(dim=2).unsqueeze(1).to(dtype=move_score.dtype)
+        if require_empty_move:
+            move_target_valid = has_valid_move_target
+            move_score = move_score * has_valid_move_target
+        elif prefer_occupied_move:
+            move_target_valid = has_valid_move_target
+            move_score = move_score * has_valid_move_target
+        # 調整もsource voxelを先に選ぶ。Voxel内の一部だけを微小移動してもoccupancyが変わらないため、
+        # 選択source voxel内の点を同じtarget voxel候補へ移す方針にする。
+        move_candidate_mask = selection_bool & (~hard_drop_mask.squeeze(1))
+        move_max_points = int(getattr(self.args, "repair_move_max_points_per_voxel", 8))
+        if move_max_points > 0:
+            move_candidate_mask = move_candidate_mask & (
+                voxel_point_counts.squeeze(1) <= float(move_max_points)
+            )
+        move_candidate_mask = move_candidate_mask & has_valid_move_target.squeeze(1).to(dtype=torch.bool)
+        hard_move_mask = self._hard_voxel_drop_mask(
+            voxel_coords,
+            move_score,
+            target_drop_ratio=move_target_ratio,
+            max_drop_ratio=move_target_ratio,
+            selection_mask=move_candidate_mask.unsqueeze(1),
+            hard_threshold=float(getattr(self.args, "repair_move_hard_threshold", 0.5)),
+        )
+        hard_move = hard_move_mask.to(dtype=pts_xyz.dtype)
+        move_mask = hard_move - move_score.detach() + move_score
+        move_mask = move_mask * keep_prob
+
+        move_logits = self.move_voxel_head(actuator_features)
+        move_logits = self._voxel_mean_logits(move_logits, voxel_coords)
+        move_valid_target = valid_move_points.transpose(1, 2)
+        no_valid_move = ~move_valid_target.any(dim=1, keepdim=True)
+        safe_valid_move = torch.where(no_valid_move, torch.ones_like(move_valid_target), move_valid_target)
+        # float16でもoverflowしない負値を使う
+        mask_value = torch.finfo(move_logits.dtype).min
+        move_logits = move_logits.masked_fill(~safe_valid_move, mask_value)
+
+        move_probs = torch.softmax(move_logits, dim=1)
+        move_idx = move_probs.detach().argmax(dim=1, keepdim=True)
+        hard_move_dir = torch.zeros_like(move_probs)
+        hard_move_dir.scatter_(1, move_idx, 1.0)
+        move_dir = hard_move_dir - move_probs.detach() + move_probs
+        move_selected_valid = (
+            move_dir * move_valid_target.to(dtype=move_dir.dtype)
+        ).sum(dim=1, keepdim=True)
+        quant_move_conflict_loss = self._masked_mean(
+            move_mask * (1.0 - move_selected_valid).clamp(0.0, 1.0),
+            selection_mask,
+        )
+        selected_offsets = torch.einsum("bkn,kc->bcn", move_dir, neighbor_offsets)
+        target_centers = (voxel_coords.to(dtype=pts_xyz.dtype) + selected_offsets) * voxel_step
+        primitive_delta = target_centers - pts_xyz
+        delta = move_mask * primitive_delta
         pts_out = pts_xyz + delta
+        move_idx_flat = move_idx.squeeze(1)
+        selected_offsets_long = neighbor_offsets_long.index_select(0, move_idx_flat.reshape(-1))
+        selected_offsets_long = selected_offsets_long.view(B, N, 3).transpose(1, 2).contiguous()
+        move_target_voxel_coords = voxel_coords + selected_offsets_long
+        same_voxel_move_mask = (
+            hard_move_mask.squeeze(1)
+            & (move_target_voxel_coords == voxel_coords).all(dim=1)
+        )
+        moved_different_voxel_mask = hard_move_mask.squeeze(1) & (~same_voxel_move_mask)
+        if timing_enabled:
+            _mark_runtime("adjust_move")
 
         final_w = keep_prob
-        B, _, N = pts_xyz.shape
         add_k, add_candidate_ratio = self._target_add_count(N)
         add_ratio = pts_xyz.new_zeros(())
         add_ratio_loss = pts_xyz.new_zeros(())
@@ -321,10 +776,12 @@ class StructureRepairActuator(nn.Module):
         add_drop_conflict_loss = pts_xyz.new_zeros(())
         added_keep_loss = pts_xyz.new_zeros(())
         add_min_offset_loss = pts_xyz.new_zeros(())
+        quant_add_guard = pts_xyz.new_zeros(())
         add_prob = pts_xyz.new_zeros((B, 1, N))
         add_priority = add_prob
         add_count_value = 0
         add_effective_count_value = 0
+        add_target_voxel_count_value = 0
         add_score_noise = max(
             self._annealed_value("repair_add_score_noise_start", "repair_add_score_noise_end"),
             0.0,
@@ -336,107 +793,175 @@ class StructureRepairActuator(nn.Module):
         if add_k > 0:
             learned_add_logit = self.add_head(actuator_features)
             add_prior = (
-                0.80 * p_sibling
-                + 0.70 * p_parent
-                + 0.65 * p_context
-                + 0.70 * p_comp
-                + 0.55 * node_score
-                + 0.45 * lowprob_score
-                + 0.35 * single_score
+                0.25 * p_sibling
+                + 0.20 * p_parent
+                + 0.35 * p_context
+                + 1.00 * p_comp
+                + 0.15 * lowprob_score
                 - 0.90 * preserve
-                - 0.60 * p_outlier
+                - 0.75 * p_outlier
+                - 0.85 * quant_score
+                - 0.55 * sparse_score
+                - 0.45 * local_outlier_score
                 - 0.65 * shape_score
             )
             add_logit = learned_add_logit + add_prior
             if self.training and add_score_noise > 0.0:
                 add_logit = add_logit + self._gumbel_like(add_logit) * add_score_noise
-            add_priority = torch.sigmoid(add_logit.clamp(-8.0, 8.0))
-            add_scores = self._mask_add_scores(
-                add_logit.squeeze(1),
-                selection_mask,
-                keep_prob=keep_prob,
-                keep_threshold=float(getattr(self.args, "add_noop_keep_threshold", 0.5)),
-            )
-            add_idx = torch.topk(add_scores.detach(), k=add_k, dim=1, largest=True, sorted=False).indices
-            add_idx = torch.sort(add_idx, dim=1).values
-            hard_add_mask = torch.zeros_like(add_scores)
-            hard_add_mask.scatter_(1, add_idx, 1.0)
-
-            tau = max(float(getattr(self.args, "add_soft_match_tau", 0.05)), 1e-6)
-            threshold = torch.gather(add_scores, 1, add_idx[:, -1:].detach())
-            soft_add_mask = torch.sigmoid((add_scores - threshold) / tau)
-            hard_ratio = hard_add_mask.mean(dim=1, keepdim=True)
-            soft_mean = soft_add_mask.mean(dim=1, keepdim=True).detach().clamp_min(1e-12)
-            soft_add_mask = (soft_add_mask * (hard_ratio / soft_mean)).clamp(0.0, 1.0)
-            add_mask_st = hard_add_mask - soft_add_mask.detach() + soft_add_mask
-            add_weight_mode = str(getattr(self.args, "repair_add_weight_mode", "hard")).strip().lower()
-            if add_weight_mode == "soft":
-                add_prob = add_mask_st.unsqueeze(1) * add_priority
+            add_voxel_logits = self.add_voxel_head(actuator_features)
+            add_logit = self._voxel_mean_logits(add_logit, voxel_coords)
+            add_voxel_logits = self._voxel_mean_logits(add_voxel_logits, voxel_coords)
+            pair_logits = (add_voxel_logits + add_logit).permute(0, 2, 1).contiguous()
+            if selection_mask is None:
+                base_valid = torch.ones((B, N), device=pts_xyz.device, dtype=torch.bool)
             else:
-                add_prob = add_mask_st.unsqueeze(1)
+                base_valid = selection_mask.squeeze(1) if selection_mask.ndim == 3 else selection_mask
+                base_valid = base_valid.to(device=pts_xyz.device, dtype=torch.bool)
+            keep_threshold = float(getattr(self.args, "add_noop_keep_threshold", 0.5))
+            base_valid = base_valid & (~hard_drop_mask.squeeze(1))
+            if keep_threshold > 0.0:
+                base_valid = base_valid & (keep_prob.detach().squeeze(1) >= keep_threshold)
+            # 追加は空Voxelを選んで、そのVoxel中心に点を置く。
+            # 既存occupied voxelへ追加してもoccupancyが変わらず、Octree rateの改善信号が弱くなるため。
+            valid_pair = empty_target_mask & base_valid.unsqueeze(2)
+            valid_counts = valid_pair.reshape(B, -1).sum(dim=1)
+            effective_add_k = min(int(add_k), int(valid_counts.min().detach().cpu().item()))
+            if effective_add_k > 0:
+                mask_value = torch.finfo(pair_logits.dtype).min
+                pair_scores = pair_logits.masked_fill(~valid_pair, mask_value).reshape(B, -1)
+                top_pair_values, top_pair_idx = torch.topk(
+                    pair_scores.detach(),
+                    k=effective_add_k,
+                    dim=1,
+                    largest=True,
+                    sorted=False,
+                )
+                pair_priority_flat = torch.sigmoid(pair_scores.clamp(-8.0, 8.0))
+                selected_pair_strength = torch.gather(pair_priority_flat, 1, top_pair_idx)
+                add_base_idx = torch.div(top_pair_idx, neighbor_offsets.shape[0], rounding_mode="floor")
+                add_dir_idx = top_pair_idx.remainder(neighbor_offsets.shape[0])
+                idx_expand_xyz = add_base_idx.unsqueeze(1).expand(-1, 3, -1)
+                selected_base_voxels_long = torch.gather(voxel_coords, 2, idx_expand_xyz)
+                selected_offsets_add_long = neighbor_offsets_long.index_select(0, add_dir_idx.reshape(-1))
+                selected_offsets_add_long = selected_offsets_add_long.view(B, effective_add_k, 3).transpose(1, 2)
+                selected_add_voxels_long = selected_base_voxels_long + selected_offsets_add_long
+                unique_add_target_mask = self._first_unique_coord_mask(selected_add_voxels_long).to(
+                    dtype=pair_scores.dtype
+                )
+                if threshold_cap_mode:
+                    hard_top_add = (
+                        selected_pair_strength >= float(getattr(self.args, "repair_add_hard_threshold", 0.5))
+                    ).to(dtype=pair_scores.dtype)
+                else:
+                    hard_top_add = torch.ones_like(selected_pair_strength)
+                hard_top_add = hard_top_add * unique_add_target_mask
+                hard_add_pair = torch.zeros_like(pair_scores)
+                hard_add_pair.scatter_(1, top_pair_idx, hard_top_add)
 
-            learned_add_delta = torch.tanh(self.add_dir_head(actuator_features)) * max_offset
-            center_dir = pts_out - pts_out.mean(dim=2, keepdim=True)
-            center_norm = torch.linalg.norm(center_dir, dim=1, keepdim=True).clamp_min(1e-12)
-            center_delta = 0.25 * max_offset * center_dir / center_norm
-            add_delta_all = actuator_strength * (
-                0.50 * primitive_delta
-                + 0.35 * learned_add_delta
-                + 0.15 * center_delta
-            )
-            add_delta_all = self._clip_vector(add_delta_all, max_offset)
+                tau = max(float(getattr(self.args, "add_soft_match_tau", 0.05)), 1e-6)
+                threshold = top_pair_values.min(dim=1, keepdim=True).values.detach()
+                soft_add_pair = torch.sigmoid((pair_scores - threshold) / tau)
+                soft_add_pair = soft_add_pair * valid_pair.reshape(B, -1).to(dtype=soft_add_pair.dtype)
+                hard_ratio = hard_add_pair.mean(dim=1, keepdim=True)
+                soft_mean = soft_add_pair.mean(dim=1, keepdim=True).detach().clamp_min(1e-12)
+                soft_add_pair = (soft_add_pair * (hard_ratio / soft_mean)).clamp(0.0, 1.0)
+                add_pair_st = hard_add_pair - soft_add_pair.detach() + soft_add_pair
+                add_pair_st = add_pair_st.view(B, N, -1)
+                add_prob = add_pair_st.sum(dim=2, keepdim=True).transpose(1, 2).clamp(0.0, 1.0)
+                pair_priority = torch.sigmoid(pair_logits.clamp(-8.0, 8.0))
+                add_priority = pair_priority.max(dim=2, keepdim=True).values.transpose(1, 2)
 
-            idx_expand_xyz = add_idx.unsqueeze(1).expand(-1, 3, -1)
-            idx_expand_w = add_idx.unsqueeze(1)
-            added_base = torch.gather(pts_out, 2, idx_expand_xyz)
-            added_delta = torch.gather(add_delta_all, 2, idx_expand_xyz)
-            added_pts = added_base + added_delta
-            selected_add_strength = torch.gather(add_priority, 2, idx_expand_w)
-            added_w = torch.gather(add_prob, 2, idx_expand_w)
-            if add_weight_mode == "soft":
-                added_w = selected_add_strength
-            if self.training and add_weight_random_mix > 0.0:
-                random_w = torch.rand_like(added_w)
-                added_w = ((1.0 - add_weight_random_mix) * added_w + add_weight_random_mix * random_w).clamp(0.0, 1.0)
+                selected_base_voxels = selected_base_voxels_long.to(dtype=pts_xyz.dtype)
+                selected_offsets_add = selected_offsets_add_long.to(dtype=pts_xyz.dtype)
+                added_pts = selected_add_voxels_long.to(dtype=pts_xyz.dtype) * voxel_step
+                added_base = torch.gather(pts_out, 2, idx_expand_xyz)
+                added_delta = added_pts - added_base
+                selected_add_strength = torch.gather(pair_priority.reshape(B, -1), 1, top_pair_idx).unsqueeze(1)
+                selected_hard_add = torch.gather(hard_add_pair, 1, top_pair_idx).unsqueeze(1)
+                add_weight_mode = str(getattr(self.args, "repair_add_weight_mode", "hard")).strip().lower()
+                if add_weight_mode == "soft":
+                    added_w = selected_add_strength * selected_hard_add.detach()
+                else:
+                    added_w = selected_hard_add - selected_add_strength.detach() + selected_add_strength
 
-            pts_out = torch.cat([pts_out, added_pts], dim=2)
-            final_w = torch.cat([final_w, added_w], dim=2)
+                pts_out = torch.cat([pts_out, added_pts], dim=2)
+                final_w = torch.cat([final_w, added_w], dim=2)
 
-            add_ratio = added_w.sum() / max(float(B * N), 1.0)
-            target_add_ratio = pts_xyz.new_tensor(float(getattr(self.args, "target_add_ratio", 0.01)))
-            add_ratio_loss = (add_ratio - target_add_ratio).pow(2)
-            add_shape_guard = self._masked_mean(add_prob * shape_score, selection_mask)
-            add_drop_conflict_loss = self._masked_mean(add_prob * drop_prob.detach(), selection_mask)
-            if str(getattr(self.args, "repair_add_weight_mode", "hard")).strip().lower() == "soft":
-                added_keep_loss = (added_w * (1.0 - added_w)).mean()
-            else:
-                added_keep_loss = (1.0 - selected_add_strength).pow(2).mean()
-            added_delta_norm = torch.linalg.norm(added_delta, dim=1, keepdim=True) / max_offset.clamp_min(1e-12)
-            add_offset_reg = (added_delta_norm.pow(2) * added_w.detach()).sum() / added_w.detach().sum().clamp_min(1.0)
-            min_offset_qstep = max(float(getattr(self.args, "repair_add_min_offset_qstep", 0.20)), 0.0)
-            max_offset_qstep = max(float(getattr(self.args, "max_repair_qstep", 0.25)), min_offset_qstep, 1e-6)
-            min_offset_norm = min(min_offset_qstep / max_offset_qstep, 1.0)
-            if min_offset_norm > 0.0:
-                min_offset_shortfall = torch.relu(added_delta_norm.new_tensor(min_offset_norm) - added_delta_norm).pow(2)
-                add_min_offset_loss = (
-                    min_offset_shortfall * selected_add_strength.detach()
-                ).sum() / selected_add_strength.detach().sum().clamp_min(1.0)
-            add_count_value = int(add_k)
-            hardening_threshold = float(
-                getattr(self.args, "operation_count_drop_threshold", getattr(self.args, "test_drop_threshold", 0.5))
-            )
-            add_effective_count_value = int((added_w.detach() >= hardening_threshold).sum().item())
+                add_ratio = added_w.sum() / max(float(B * N), 1.0)
+                target_add_ratio = pts_xyz.new_tensor(
+                    float(getattr(self.args, "target_add_ratio", 0.01)) if add_enabled else 0.0
+                )
+                if threshold_cap_mode:
+                    max_add_ratio_t = pts_xyz.new_tensor(self._max_add_ratio())
+                    add_ratio_loss = torch.relu(add_ratio - max_add_ratio_t).pow(2)
+                else:
+                    add_ratio_loss = (add_ratio - target_add_ratio).pow(2)
+                add_shape_guard = self._masked_mean(add_prob * shape_score, selection_mask)
+                quant_add_guard = self._masked_mean(
+                    add_prob * (quant_score + sparse_score).clamp(0.0, 1.0),
+                    selection_mask,
+                )
+                add_drop_conflict_loss = add_prob.new_zeros(())
+                selected_hard_add_det = selected_hard_add.detach()
+                added_keep_loss = (
+                    (1.0 - selected_add_strength).pow(2) * selected_hard_add_det
+                ).sum() / selected_hard_add_det.sum().clamp_min(1.0)
+                added_delta_norm = torch.linalg.norm(added_delta, dim=1, keepdim=True) / voxel_norm.clamp_min(1e-12)
+                add_offset_reg = (added_delta_norm.pow(2) * added_w.detach()).sum() / added_w.detach().sum().clamp_min(1.0)
+                add_min_offset_loss = add_prob.new_zeros(())
+                add_count_value = int(selected_hard_add.detach().sum().item())
+                hardening_threshold = float(
+                    getattr(self.args, "operation_count_drop_threshold", getattr(self.args, "test_drop_threshold", 0.5))
+                )
+                add_effective_count_value = int((added_w.detach() >= hardening_threshold).sum().item())
+                add_target_voxel_count_value = self._unique_voxel_count(
+                    selected_add_voxels_long,
+                    (selected_hard_add.detach() >= hardening_threshold),
+                )
+        if timing_enabled:
+            _mark_runtime("add")
+
+        hardening_threshold = float(
+            getattr(self.args, "operation_count_drop_threshold", getattr(self.args, "test_drop_threshold", 0.5))
+        )
+        final_voxel_coords = self._voxel_coords(pts_out, voxel_step)
+        hard_keep_mask = final_w.detach() >= hardening_threshold
+        after_occupied_voxels = self._unique_voxel_count(final_voxel_coords, hard_keep_mask)
+        delete_target_voxel_count_value = self._unique_voxel_count(voxel_coords, hard_drop_mask)
+        delete_removed_point_count_value = int(hard_drop_mask.detach().sum().item())
+        delete_emptied_voxel_count_value = self._selected_voxels_absent_count(
+            voxel_coords,
+            hard_drop_mask,
+            final_voxel_coords,
+            hard_keep_mask,
+        )
+        move_source_voxel_count_value = self._unique_voxel_count(voxel_coords, hard_move_mask)
+        move_target_voxel_count_value = self._unique_voxel_count(move_target_voxel_coords, hard_move_mask)
+        same_voxel_adjust_count_value = int(same_voxel_move_mask.detach().sum().item())
+        moved_different_voxel_count_value = int(moved_different_voxel_mask.detach().sum().item())
+        preserve_hard = (~hard_drop_mask) & (~hard_move_mask)
+        preserve_ratio = preserve_hard.to(dtype=pts_xyz.dtype).mean()
 
         delta_norm = torch.linalg.norm(delta, dim=1, keepdim=True)
-        normalized_delta = delta_norm / max_offset.clamp_min(1e-12)
-        edit_reg = self._masked_mean(normalized_delta.pow(2) * motion_gate.detach(), selection_mask)
+        normalized_delta = delta_norm / voxel_norm.clamp_min(1e-12)
+        edit_reg = self._masked_mean(normalized_delta.pow(2) * hard_move, selection_mask)
+        moved_points = hard_move.sum().clamp_min(1.0)
+        moved_delta_mean = (delta_norm * hard_move).sum() / moved_points
 
-        ratio_loss = (self._masked_mean(repair_gate, selection_mask) - target_ratio) ** 2
-        shape_guard = self._masked_mean(repair_gate * cause_scores[:, shape_idx:shape_idx+1, :], selection_mask)
+        repair_gate_mean = self._masked_mean(repair_gate, selection_mask)
+        if threshold_cap_mode:
+            ratio_loss = torch.relu(repair_gate_mean - target_ratio) ** 2
+        else:
+            ratio_loss = (repair_gate_mean - target_ratio) ** 2
+        shape_guard = self._masked_mean(repair_gate * shape_score, selection_mask)
         drop_ratio = self._masked_mean(drop_prob, selection_mask)
-        drop_ratio_loss = (drop_ratio - target_drop_ratio) ** 2
+        if threshold_cap_mode:
+            drop_ratio_loss = drop_ratio.new_zeros(())
+        else:
+            drop_ratio_loss = (drop_ratio - target_drop_ratio) ** 2
         drop_cap_loss = torch.relu(drop_ratio - max_drop_ratio) ** 2
         drop_shape_guard = self._masked_mean(drop_prob * shape_score, selection_mask)
+        local_edit_guard = self._masked_mean((drop_prob + move_mask).clamp(0.0, 1.0) * shape_score, selection_mask)
         loss = (
             edit_reg
             + float(getattr(self.args, "repair_ratio_weight", 0.1)) * ratio_loss
@@ -449,7 +974,15 @@ class StructureRepairActuator(nn.Module):
             + float(getattr(self.args, "repair_add_drop_conflict_weight", 2.0)) * add_drop_conflict_loss
             + float(getattr(self.args, "repair_add_keep_weight", 1.0)) * added_keep_loss
             + float(getattr(self.args, "repair_add_min_offset_weight", 0.5)) * add_min_offset_loss
+            + float(getattr(self.args, "repair_quant_guard_weight", 1.0)) * (quant_move_conflict_loss + quant_add_guard)
+            + float(getattr(self.args, "repair_local_guard_weight", 0.25)) * local_edit_guard
         )
+        if timing_enabled:
+            _mark_runtime("postprocess")
+            runtime_timing["total"] = float(time.perf_counter() - runtime_start)
+            self.last_runtime_timing = runtime_timing
+        else:
+            self.last_runtime_timing = {}
 
         self.debug_tensors = {
             "repair_gate": repair_gate.mean().detach(),
@@ -459,10 +992,35 @@ class StructureRepairActuator(nn.Module):
             "add_weight_random_mix": pts_xyz.new_tensor(float(add_weight_random_mix)).detach(),
             "drop_score_noise": pts_xyz.new_tensor(float(drop_score_noise)).detach(),
             "drop_random_mix": pts_xyz.new_tensor(float(drop_random_mix)).detach(),
+            "add_enabled": pts_xyz.new_tensor(float(add_enabled)).detach(),
+            "prune_enabled": pts_xyz.new_tensor(float(prune_enabled)).detach(),
+            "disp_enabled": pts_xyz.new_tensor(float(disp_enabled)).detach(),
+            "threshold_cap_mode": pts_xyz.new_tensor(float(threshold_cap_mode)).detach(),
             "add_drop_conflict_loss": add_drop_conflict_loss.detach(),
             "added_keep_loss": added_keep_loss.detach(),
             "add_min_offset_loss": add_min_offset_loss.detach(),
+            "quant_move_conflict_loss": quant_move_conflict_loss.detach(),
+            "quant_add_guard": quant_add_guard.detach(),
+            "local_edit_guard": local_edit_guard.detach(),
+            "quant_score_mean": quant_score.mean().detach(),
             "delta_norm": delta_norm.mean().detach(),
+            "moved_delta_mean": moved_delta_mean.detach(),
+            "move_ratio": hard_move.mean().detach(),
+            "move_score_mean": move_score.mean().detach(),
+            "move_target_valid_ratio": move_target_valid.mean().detach(),
+            "before_occupied_voxel_count": pts_xyz.new_tensor(float(before_occupied_voxels)).detach(),
+            "after_occupied_voxel_count": pts_xyz.new_tensor(float(after_occupied_voxels)).detach(),
+            "occupied_voxel_delta": pts_xyz.new_tensor(float(after_occupied_voxels - before_occupied_voxels)).detach(),
+            "delete_target_voxel_count": pts_xyz.new_tensor(float(delete_target_voxel_count_value)).detach(),
+            "delete_emptied_voxel_count": pts_xyz.new_tensor(float(delete_emptied_voxel_count_value)).detach(),
+            "delete_removed_point_count": pts_xyz.new_tensor(float(delete_removed_point_count_value)).detach(),
+            "add_target_voxel_count": pts_xyz.new_tensor(float(add_target_voxel_count_value)).detach(),
+            "add_actual_point_count": pts_xyz.new_tensor(float(add_effective_count_value)).detach(),
+            "move_source_voxel_count": pts_xyz.new_tensor(float(move_source_voxel_count_value)).detach(),
+            "move_target_voxel_count": pts_xyz.new_tensor(float(move_target_voxel_count_value)).detach(),
+            "moved_different_voxel_count": pts_xyz.new_tensor(float(moved_different_voxel_count_value)).detach(),
+            "same_voxel_adjust_count": pts_xyz.new_tensor(float(same_voxel_adjust_count_value)).detach(),
+            "preserve_ratio": preserve_ratio.detach(),
             "edit_reg": edit_reg.detach(),
             "drop_ratio": drop_ratio.detach(),
             "keep_ratio": keep_prob.mean().detach(),
@@ -487,8 +1045,29 @@ class StructureRepairActuator(nn.Module):
             "add_weight_random_mix": float(add_weight_random_mix),
             "drop_score_noise": float(drop_score_noise),
             "drop_random_mix": float(drop_random_mix),
+            "add_enabled": bool(add_enabled),
+            "prune_enabled": bool(prune_enabled),
+            "disp_enabled": bool(disp_enabled),
+            "threshold_cap_mode": bool(threshold_cap_mode),
             "delta": delta,
             "primitive_delta": primitive_delta,
+            "move_ratio": hard_move.mean(),
+            "move_score_mean": move_score.mean(),
+            "move_target_valid_ratio": move_target_valid.mean(),
+            "moved_delta_mean": moved_delta_mean,
+            "before_occupied_voxel_count": before_occupied_voxels,
+            "after_occupied_voxel_count": after_occupied_voxels,
+            "occupied_voxel_delta": after_occupied_voxels - before_occupied_voxels,
+            "delete_target_voxel_count": delete_target_voxel_count_value,
+            "delete_emptied_voxel_count": delete_emptied_voxel_count_value,
+            "delete_removed_point_count": delete_removed_point_count_value,
+            "add_target_voxel_count": add_target_voxel_count_value,
+            "add_actual_point_count": add_effective_count_value,
+            "move_source_voxel_count": move_source_voxel_count_value,
+            "move_target_voxel_count": move_target_voxel_count_value,
+            "moved_different_voxel_count": moved_different_voxel_count_value,
+            "same_voxel_adjust_count": same_voxel_adjust_count_value,
+            "preserve_ratio": preserve_ratio,
             "edit_reg": edit_reg,
             "ratio_loss": ratio_loss,
             "shape_guard": shape_guard,
@@ -501,4 +1080,7 @@ class StructureRepairActuator(nn.Module):
             "add_drop_conflict_loss": add_drop_conflict_loss,
             "added_keep_loss": added_keep_loss,
             "add_min_offset_loss": add_min_offset_loss,
+            "quant_move_conflict_loss": quant_move_conflict_loss,
+            "quant_add_guard": quant_add_guard,
+            "local_edit_guard": local_edit_guard,
         }

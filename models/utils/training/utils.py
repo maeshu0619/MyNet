@@ -22,6 +22,134 @@ from models.utils.training.utils_grad import *
 from models.network import Network
 from models.utils.loss.loss import Loss
 from models.utils.notify.mail_notify import TrainingMailNotifier
+from models.utils.compression.octree_stats import hard_octree_occupancy_stats
+
+
+
+def _format_named_float_map(values, max_items=None):
+    if not values:
+        return "n/a"
+    items = list(values.items())
+    if max_items is not None:
+        items = items[:max_items]
+    return ", ".join(f"{key}={float(value):.4f}" for key, value in items)
+
+
+def _uses_actual_total_bit_objective(args):
+    backend_name = str(getattr(args, "compression_loss_backend", "proxy")).strip().lower()
+    return backend_name in {
+        "octattention_actual",
+        "octattention_actual_ste",
+        "octattention_surrogate",
+        "sparsepcgc_actual",
+        "sparsepcgc_actual_ste",
+        "sparsepcgc_surrogate",
+        "gpcc_actual",
+        "gpcc_actual_ste",
+        "gpcc_surrogate",
+        "draco_actual",
+        "draco_actual_ste",
+        "draco_surrogate",
+    }
+
+
+def _write_structure_decision_debug(writer, prefix, structure_debug):
+    if not structure_debug:
+        return
+
+    cause_mean = structure_debug.get("subtree_cause_mean") or structure_debug.get("cause_mean") or {}
+    policy_mean = structure_debug.get("policy_mean") or {}
+
+    top_cause = max(cause_mean, key=cause_mean.get) if cause_mean else "n/a"
+    top_policy = max(policy_mean, key=policy_mean.get) if policy_mean else "n/a"
+
+    writer.write(
+        f"{prefix}: "
+        f"top_cause={top_cause}, top_policy={top_policy}, "
+        f"policy_entropy={float(structure_debug.get('policy_entropy', 0.0)):.6f}, "
+        f"policy_diversity={int(structure_debug.get('policy_diversity', 0))}, "
+        f"add_ratio={float(structure_debug.get('add_ratio', 0.0)):.6f}, "
+        f"cause_mean=[{_format_named_float_map(cause_mean)}], "
+        f"policy_mean=[{_format_named_float_map(policy_mean)}]"
+    )
+
+    operation_by_cause = structure_debug.get("operation_by_cause") or {}
+    if operation_by_cause:
+        parts = []
+        for cause_name, info in operation_by_cause.items():
+            parts.append(
+                f"{cause_name}->{info.get('operation', 'none')}"
+                f"(count={int(info.get('count', 0))}, conf={float(info.get('confidence', 0.0)):.4f})"
+            )
+        writer.write(f"{prefix}ByCause: " + "; ".join(parts))
+
+    level_debug = structure_debug.get("octree_level_debug") or []
+    if level_debug:
+        parts = []
+        for item in level_debug:
+            parts.append(
+                f"L{int(item.get('level', 0))}:"
+                f"occ={float(item.get('occupied_mean', 0.0)):.1f},"
+                f"single_ratio={float(item.get('single_ratio_mean', 0.0)):.4f},"
+                f"children={float(item.get('mean_children_mean', 0.0)):.3f}"
+            )
+        writer.write(f"{prefix}OctreeLevels: " + "; ".join(parts))
+
+
+def _compression_stat_qs(args):
+    codec = str(getattr(args, "compress", "OctAttention")).strip().lower().replace("_", "").replace("-", "")
+
+    if codec == "sparsepcgc":
+        return max(float(getattr(args, "sparsepcgc_voxel_size", 1.0)), 1e-9)
+
+    if codec == "gpcc":
+        return max(float(getattr(args, "gpcc_effective_qs", getattr(args, "qs", 1.0))), 1e-9)
+
+    return max(float(getattr(args, "qs", 1.0)), 1e-9)
+
+
+def _format_triplet(values):
+    if not values:
+        return "0/0.0/0"
+
+    mean = sum(values) / float(max(len(values), 1))
+    return f"{min(values):.0f}/{mean:.1f}/{max(values):.0f}"
+
+
+def _summarize_subtree_octree_stats(input_xyz, groups, args):
+    limit = max(int(getattr(args, "train_subtree_stat_log_limit", 16)), 0)
+    if limit <= 0 or not groups:
+        return None
+
+    qs = _compression_stat_qs(args)
+
+    nodes = []
+    singles = []
+    depths = []
+
+    for _subtree_key, point_idx in groups[:limit]:
+        pts = input_xyz[0, :3, :].index_select(1, point_idx).contiguous()
+
+        stats = hard_octree_occupancy_stats(
+            pts,
+            qs=qs,
+            max_depth=int(getattr(args, "compression_octree_stat_depth", 0)),
+            quant_mode="sparsepcgc"
+            if str(getattr(args, "compress", "")).strip().lower().replace("-", "").replace("_", "") == "sparsepcgc"
+            else "round",
+            pos_quantscale=int(getattr(args, "sparsepcgc_pos_quantscale", 1)),
+        )
+
+        nodes.append(float(stats["node_count"]))
+        singles.append(float(stats["single_child_count"]))
+        depths.append(float(stats["max_depth"]))
+
+    return {
+        "count": len(nodes),
+        "node": _format_triplet(nodes),
+        "single": _format_triplet(singles),
+        "depth": _format_triplet(depths),
+    }
 
 def _should_log_step(step_idx, total_count, rate):
     rate = int(rate)
@@ -469,6 +597,100 @@ def _module_grad_summary(module):
     return f"norm={norm:.3e}, max={max_abs:.3e}, active={active}, none={missing}, finite={finite}"
 
 
+def _named_trainable_child_modules(base_model):
+    actuator = getattr(base_model, "disp_module", None)
+    modules = [
+        ("cost_attr", getattr(base_model, "prun_module", None)),
+        ("repair_policy", getattr(base_model, "adding_module", None)),
+        ("actuator", actuator),
+    ]
+    if actuator is not None:
+        modules.extend(
+            [
+                ("delete_branch", getattr(actuator, "drop_head", None)),
+                ("add_branch", getattr(actuator, "add_head", None)),
+                ("add_target_branch", getattr(actuator, "add_voxel_head", None)),
+                ("move_branch", getattr(actuator, "move_voxel_head", None)),
+            ]
+        )
+    return modules
+
+
+def _trainable_parameters(module):
+    if module is None:
+        return []
+    return [param for param in module.parameters() if param.requires_grad]
+
+
+def _first_trainable_parameter(module):
+    for param in _trainable_parameters(module):
+        return param
+    return None
+
+
+def _snapshot_module_parameters(module):
+    params = _trainable_parameters(module)
+    if not params:
+        return None
+    return [param.detach().clone() for param in params]
+
+
+def _capture_param_update_snapshots(args, model, step_idx, total_count):
+    if not bool(getattr(args, "debug_grad_flow", False)):
+        return None
+    if not _should_log_step(step_idx, total_count, getattr(args, "debug_grad_flow_rate", 1)):
+        return None
+    base_model = model.module if hasattr(model, "module") else model
+    snapshots = {}
+    for name, module in _named_trainable_child_modules(base_model):
+        snapshot = _snapshot_module_parameters(module)
+        if snapshot is None:
+            continue
+        # debug時だけ、そのstep内でdetach済みcloneを保持する。
+        # ログ後に参照を捨てるため、過去stepのGPU tensorや計算グラフは蓄積しない。
+        snapshots[name] = snapshot
+    return snapshots
+
+
+def _log_param_updates(args, writer, model, snapshots, step_idx, total_count):
+    if not snapshots:
+        return
+    if not bool(getattr(args, "debug_grad_flow", False)):
+        return
+    if not _should_log_step(step_idx, total_count, getattr(args, "debug_grad_flow_rate", 1)):
+        return
+    base_model = model.module if hasattr(model, "module") else model
+    parts = []
+    for name, module in _named_trainable_child_modules(base_model):
+        before = snapshots.get(name)
+        params = _trainable_parameters(module)
+        if before is None or not params:
+            parts.append(f"{name}(missing)")
+            continue
+        if len(before) != len(params):
+            parts.append(f"{name}(shape_changed)")
+            continue
+        total_sq = 0.0
+        max_abs = 0.0
+        shape_changed = False
+        for param, before_param in zip(params, before):
+            after = param.detach()
+            if tuple(after.shape) != tuple(before_param.shape):
+                shape_changed = True
+                break
+            diff = (after - before_param.to(device=after.device, dtype=after.dtype)).float()
+            total_sq += float(diff.pow(2).sum().detach().cpu())
+            max_abs = max(max_abs, float(diff.abs().max().detach().cpu()))
+        if shape_changed:
+            parts.append(f"{name}(shape_changed)")
+            continue
+        parts.append(
+            f"{name}(delta_norm={(total_sq ** 0.5):.3e}, "
+            f"delta_max={max_abs:.3e})"
+        )
+    writer.write("ParamUpdate: " + " | ".join(parts))
+
+
 def _log_grad_flow(args, writer, model, step_idx, total_count):
     if not bool(getattr(args, "debug_grad_flow", False)):
         return
@@ -476,9 +698,8 @@ def _log_grad_flow(args, writer, model, step_idx, total_count):
         return
     base_model = model.module if hasattr(model, "module") else model
     parts = [
-        f"cost_attr({_module_grad_summary(getattr(base_model, 'prun_module', None))})",
-        f"repair_policy({_module_grad_summary(getattr(base_model, 'adding_module', None))})",
-        f"actuator({_module_grad_summary(getattr(base_model, 'disp_module', None))})",
+        f"{name}({_module_grad_summary(module)})"
+        for name, module in _named_trainable_child_modules(base_model)
     ]
     writer.write("GradFlow: " + " | ".join(parts))
 

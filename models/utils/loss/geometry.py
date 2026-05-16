@@ -126,17 +126,20 @@ class GeometryLossMixin:
                 L_d2_hard = compute_d2_psnr(gen_pts_f, gt_pts_f, use_torch_ops=use_torch_d2)
                 if use_weighted_forward:
                     L_d2_soft = compute_d2_psnr(gen_pts_f, gt_pts_f, final_w=final_w_f, use_torch_ops=use_torch_d2)
-                    L_d2 = self.lambda_p * L_d2_hard + L_d2_soft
+                    L_d2_psnr = self.lambda_p * L_d2_hard + L_d2_soft
                 else:
-                    L_d2 = L_d2_hard
+                    L_d2_psnr = L_d2_hard
 
-            L_geom += L_cd + float(getattr(args, "geom_d2_weight", 0.2)) * L_d2
+            L_d2_term = -float(getattr(args, "geom_d2_weight", 0.2)) * L_d2_psnr
+            L_geom += L_cd + L_d2_term
             self._set_geometry_debug(
                 mode="cd+d2",
                 value=float(L_geom.detach()),
                 hard=float(L_cd_hard.detach() if 'L_cd_hard' in locals() else L_cd.detach()),
                 surrogate=float(L_cd_surrogate.detach() if 'L_cd_surrogate' in locals() else L_cd.detach()),
                 weighted=float(L_cd.detach()),
+                d2_psnr=float(L_d2_psnr.detach()),
+                d2_term=float(L_d2_term.detach()),
                 gen_points=int(gen_pts.shape[-1]),
                 gt_points=int(gt_pts.shape[-1]),
             )
@@ -144,7 +147,8 @@ class GeometryLossMixin:
                 self.writer.write(
                     f"L_geom  :{self._scalar(L_geom):.4f}->"
                     f"L_cd:{self._scalar(L_cd):.4f}, "
-                    f"L_d2:{self._scalar(L_d2):.4f}"
+                    f"D2PSNR:{self._scalar(L_d2_psnr):.4f}, "
+                    f"L_d2_term:{self._scalar(L_d2_term):.4f}"
                 )
 
         return L_geom

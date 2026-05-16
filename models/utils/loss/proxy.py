@@ -65,7 +65,16 @@ class ProxyCompressionLossMixin:
         )
         return L_com, L_bit, L_nodes, L_single
 
-    def _get_compression_loss_proxy(self, args, gen_xyz, gt_xyz, final_w, cache_key=None, run_grad_probe=True):
+    def _get_compression_loss_proxy(
+        self,
+        args,
+        gen_xyz,
+        gt_xyz,
+        final_w,
+        cache_key=None,
+        run_grad_probe=True,
+        actual_gen_xyz=None,
+    ):
         self._ensure_rate_proxy_device(gen_xyz.device)
         cached_gt = self._get_cached_gt(cache_key, gen_xyz.device)
         if cached_gt is None:
@@ -109,7 +118,7 @@ class ProxyCompressionLossMixin:
                     final_w=final_w.to(torch.float32) if use_weighted_forward else None,
                 )
 
-        L_com_hard_or_weighted, _, _, _ = self._compression_terms_from_proxy(
+        L_com_forward, L_bit_forward, L_nodes_forward, L_single_forward = self._compression_terms_from_proxy(
             out_gen,
             bit_ref=bit_gt,
             nodes_ref=nodes_gt,
@@ -119,9 +128,15 @@ class ProxyCompressionLossMixin:
             gt_point_count=gt_point_count,
         )
 
-        L_com = L_com_hard_or_weighted
+        L_com = L_com_forward
+        L_bit_objective = L_bit_forward
+        L_nodes_objective = L_nodes_forward
+        L_single_objective = L_single_forward
+        sparse_terms = self._sparsepcgc_aux_feature_terms(args, gen_xyz, gt_xyz, final_w)
+        L_sparse_objective = sparse_terms["loss"]
+        L_com = L_com + L_sparse_objective
         if use_ste_hard:
-            L_com_surrogate, _, _, _ = self._compression_terms_from_proxy(
+            L_com_surrogate, L_bit_surrogate, L_nodes_surrogate, L_single_surrogate = self._compression_terms_from_proxy(
                 out_surrogate,
                 bit_ref=bit_gt,
                 nodes_ref=nodes_gt,
@@ -130,7 +145,14 @@ class ProxyCompressionLossMixin:
                 gen_point_count=gen_point_count,
                 gt_point_count=gt_point_count,
             )
-            L_com = self._compose_discrete_loss(L_com_hard_or_weighted, L_com_surrogate, args)
+            L_com = self._compose_discrete_loss(L_com_forward, L_com_surrogate, args)
+            L_bit_objective = self._compose_discrete_loss(L_bit_forward, L_bit_surrogate, args)
+            L_nodes_objective = self._compose_discrete_loss(L_nodes_forward, L_nodes_surrogate, args)
+            L_single_objective = self._compose_discrete_loss(L_single_forward, L_single_surrogate, args)
+            sparse_surrogate_terms = self._sparsepcgc_aux_feature_terms(args, gen_xyz, gt_xyz, final_w)
+            L_sparse_objective = sparse_surrogate_terms["loss"]
+            sparse_terms = sparse_surrogate_terms
+            L_com = L_com + L_sparse_objective
 
         if args.trainORtest == "test":
             self.writer.write(f"=== Compression Stats ===")
@@ -172,6 +194,7 @@ class ProxyCompressionLossMixin:
         self.last_compression_debug = {
             "metric": self._compression_rate_metric(args),
             "total_bit": self._scalar(loss_total_bit),
+            "compression_objective": self._scalar(L_com.detach()),
             "bpp": self._scalar(loss_bpp),
             "gt_points": gt_point_count,
             "gen_points": gen_point_count,
@@ -185,12 +208,31 @@ class ProxyCompressionLossMixin:
             "gen_single_abs": self._scalar(stats_gen.get("single", 0.0)),
             "gt_node_abs": float(stats_gt.get("node", 0.0)),
             "gen_node_abs": self._scalar(stats_gen.get("node", 0.0)),
+            "rate_proxy_before": float(stats_gt.get("bit", 0.0)),
+            "rate_proxy_after": self._scalar(stats_gen.get("bit", 0.0)),
+            "rate_proxy_delta": self._scalar(loss_total_bit),
+            "node_delta": self._scalar(nodes_gen - nodes_gt_t),
+            "single_delta": self._scalar(single_gen - single_gt_t),
+            "sparsepcgc_aux_loss": self._scalar(sparse_terms["loss"].detach()),
+            "sparsepcgc_active_coord_loss": self._scalar(sparse_terms["active"].detach()),
+            "sparsepcgc_isolated_proxy_loss": self._scalar(sparse_terms["single"].detach()),
+            "sparsepcgc_entropy_proxy_loss": self._scalar(sparse_terms["entropy"].detach()),
+            "sparsepcgc_density_proxy_loss": self._scalar(sparse_terms["density"].detach()),
         }
+        debug_gen_xyz = gen_xyz if actual_gen_xyz is None else actual_gen_xyz
+        self._maybe_update_sparsepcgc_debug(
+            args,
+            self.last_compression_debug,
+            gen_xyz=debug_gen_xyz,
+            gt_xyz=gt_xyz,
+            final_w=final_w,
+        )
         self._store_compression_terms(
-            bit=L_bit,
-            single=L_single,
-            node=L_nodes,
+            bit=L_bit_objective,
+            single=L_single_objective,
+            node=L_nodes_objective,
             bpn=gen_xyz.new_zeros(()),
+            sparsepcgc=L_sparse_objective,
             objective=L_com,
             backend="proxy",
         )
