@@ -1,7 +1,7 @@
 # models/utils/training/log_setup.py
 
 from models.utils.pointcloud.quant_noise import resolve_uniform_noise_delta
-from models.utils.training.utils import _uses_actual_total_bit_objective
+from models.utils.training.utils import uses_actual_total_bit_objective
 
 
 def log_basic_setup(writer, args, file_day, file_time):
@@ -42,7 +42,7 @@ def log_loss_weight_setup(writer, args):
     compression_backend = str(
         getattr(args, "compression_loss_backend", "proxy")
     ).strip().lower()
-    actual_total_bit_backend = _uses_actual_total_bit_objective(args)
+    actual_total_bit_backend = uses_actual_total_bit_objective(args)
     surrogate_backend = compression_backend.endswith("_surrogate")
 
     if surrogate_backend:

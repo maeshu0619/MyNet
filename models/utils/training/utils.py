@@ -26,7 +26,7 @@ from models.utils.compression.octree_stats import hard_octree_occupancy_stats
 
 
 
-def _format_named_float_map(values, max_items=None):
+def format_named_float_map(values, max_items=None):
     if not values:
         return "n/a"
     items = list(values.items())
@@ -35,7 +35,7 @@ def _format_named_float_map(values, max_items=None):
     return ", ".join(f"{key}={float(value):.4f}" for key, value in items)
 
 
-def _uses_actual_total_bit_objective(args):
+def uses_actual_total_bit_objective(args):
     backend_name = str(getattr(args, "compression_loss_backend", "proxy")).strip().lower()
     return backend_name in {
         "octattention_actual",
@@ -53,7 +53,7 @@ def _uses_actual_total_bit_objective(args):
     }
 
 
-def _write_structure_decision_debug(writer, prefix, structure_debug):
+def write_structure_decision_debug(writer, prefix, structure_debug):
     if not structure_debug:
         return
 
@@ -69,8 +69,8 @@ def _write_structure_decision_debug(writer, prefix, structure_debug):
         f"policy_entropy={float(structure_debug.get('policy_entropy', 0.0)):.6f}, "
         f"policy_diversity={int(structure_debug.get('policy_diversity', 0))}, "
         f"add_ratio={float(structure_debug.get('add_ratio', 0.0)):.6f}, "
-        f"cause_mean=[{_format_named_float_map(cause_mean)}], "
-        f"policy_mean=[{_format_named_float_map(policy_mean)}]"
+        f"cause_mean=[{format_named_float_map(cause_mean)}], "
+        f"policy_mean=[{format_named_float_map(policy_mean)}]"
     )
 
     operation_by_cause = structure_debug.get("operation_by_cause") or {}
@@ -96,7 +96,7 @@ def _write_structure_decision_debug(writer, prefix, structure_debug):
         writer.write(f"{prefix}OctreeLevels: " + "; ".join(parts))
 
 
-def _compression_stat_qs(args):
+def compression_stat_qs(args):
     codec = str(getattr(args, "compress", "OctAttention")).strip().lower().replace("_", "").replace("-", "")
 
     if codec == "sparsepcgc":
@@ -108,7 +108,7 @@ def _compression_stat_qs(args):
     return max(float(getattr(args, "qs", 1.0)), 1e-9)
 
 
-def _format_triplet(values):
+def format_triplet(values):
     if not values:
         return "0/0.0/0"
 
@@ -116,12 +116,12 @@ def _format_triplet(values):
     return f"{min(values):.0f}/{mean:.1f}/{max(values):.0f}"
 
 
-def _summarize_subtree_octree_stats(input_xyz, groups, args):
+def summarize_subtree_octree_stats(input_xyz, groups, args):
     limit = max(int(getattr(args, "train_subtree_stat_log_limit", 16)), 0)
     if limit <= 0 or not groups:
         return None
 
-    qs = _compression_stat_qs(args)
+    qs = compression_stat_qs(args)
 
     nodes = []
     singles = []
@@ -146,12 +146,12 @@ def _summarize_subtree_octree_stats(input_xyz, groups, args):
 
     return {
         "count": len(nodes),
-        "node": _format_triplet(nodes),
-        "single": _format_triplet(singles),
-        "depth": _format_triplet(depths),
+        "node": format_triplet(nodes),
+        "single": format_triplet(singles),
+        "depth": format_triplet(depths),
     }
 
-def _should_log_step(step_idx, total_count, rate):
+def should_log_step(step_idx, total_count, rate):
     rate = int(rate)
     if total_count <= 0:
         return False
@@ -161,13 +161,13 @@ def _should_log_step(step_idx, total_count, rate):
         return False
     return step_idx % rate == 0
 
-def _new_metric_sums(device, num_metrics):
+def new_metric_sums(device, num_metrics):
     return {
         "sums": [torch.zeros((), device=device, dtype=torch.float32) for _ in range(num_metrics)],
         "counts": [0 for _ in range(num_metrics)],
     }
 
-def _metric_tensor(value, device):
+def metric_tensor(value, device):
     if torch.is_tensor(value):
         tensor = value.detach().to(device=device, dtype=torch.float32)
         if tensor.numel() != 1:
@@ -184,16 +184,16 @@ def _metric_tensor(value, device):
     return torch.tensor(scalar, device=device, dtype=torch.float32)
 
 
-def _add_metric_sums(metric_sums, values, device):
+def add_metric_sums(metric_sums, values, device):
     for idx, value in enumerate(values):
-        tensor = _metric_tensor(value, device)
+        tensor = metric_tensor(value, device)
         if tensor is None:
             continue
         metric_sums["sums"][idx] = metric_sums["sums"][idx] + tensor
         metric_sums["counts"][idx] += 1
 
 
-def _metric_avgs_to_floats(metric_sums, count=None):
+def metric_avgs_to_floats(metric_sums, count=None):
     avgs = []
     for value, valid_count in zip(metric_sums["sums"], metric_sums["counts"]):
         if valid_count <= 0:
@@ -203,7 +203,7 @@ def _metric_avgs_to_floats(metric_sums, count=None):
     return avgs
 
 
-def _surrogate_plot_metrics(loss_obj):
+def surrogate_plot_metrics(loss_obj):
     comp_debug = getattr(loss_obj, "last_compression_debug", {}) or {}
     return [
         float(comp_debug.get("surrogate_train_loss", 0.0)),
@@ -212,7 +212,7 @@ def _surrogate_plot_metrics(loss_obj):
     ]
 
 
-def _format_metric_summary(prefix, metric_keys, values):
+def format_metric_summary(prefix, metric_keys, values):
     parts = []
     for key, value in zip(metric_keys, values):
         try:
@@ -225,12 +225,12 @@ def _format_metric_summary(prefix, metric_keys, values):
     return f"{prefix}: " + ", ".join(parts)
 
 
-def _point_ratio_percent(numerator, denominator):
+def point_ratio_percent(numerator, denominator):
     denom = max(int(denominator), 1)
     return 100.0 * float(numerator) / float(denom)
 
 
-def _new_point_edit_sums():
+def new_point_edit_sums():
     return {
         "input_points": 0,
         "pre_output_points": 0,
@@ -245,11 +245,11 @@ def _new_point_edit_sums():
     }
 
 
-def _add_point_edit_sums(edit_sums, edit_stats):
+def add_point_edit_sums(edit_sums, edit_stats):
     if edit_stats is None:
         return edit_sums
     if edit_sums is None:
-        edit_sums = _new_point_edit_sums()
+        edit_sums = new_point_edit_sums()
     for key in (
         "input_points",
         "pre_output_points",
@@ -266,7 +266,7 @@ def _add_point_edit_sums(edit_sums, edit_stats):
     return edit_sums
 
 
-def _finalize_point_edit_sums(edit_sums):
+def finalize_point_edit_sums(edit_sums):
     if edit_sums is None:
         return None
     count = max(int(edit_sums.get("count", 0)), 1)
@@ -279,22 +279,22 @@ def _finalize_point_edit_sums(edit_sums):
     finalized["adjusted_points_avg"] = float(edit_sums.get("adjusted_points", 0)) / float(count)
     finalized["net_change_avg"] = float(edit_sums.get("net_change", 0)) / float(count)
     finalized["adjust_mean"] = float(edit_sums.get("adjust_mean_sum", 0.0)) / float(count)
-    finalized["added_ratio_percent"] = _point_ratio_percent(
+    finalized["added_ratio_percent"] = point_ratio_percent(
         finalized.get("added_points", 0),
         finalized.get("input_points", 0),
     )
-    finalized["deleted_ratio_percent"] = _point_ratio_percent(
+    finalized["deleted_ratio_percent"] = point_ratio_percent(
         finalized.get("deleted_points", 0),
         finalized.get("input_points", 0),
     )
-    finalized["adjusted_ratio_percent"] = _point_ratio_percent(
+    finalized["adjusted_ratio_percent"] = point_ratio_percent(
         finalized.get("adjusted_points", 0),
         finalized.get("input_points", 0),
     )
     return finalized
 
 
-def _aligned_edit_ref_xyz(input_xyz, output_points):
+def aligned_edit_ref_xyz(input_xyz, output_points):
     ref_xyz = input_xyz[:, :3, :]
     output_points = int(output_points)
     if ref_xyz.shape[-1] == output_points:
@@ -305,7 +305,7 @@ def _aligned_edit_ref_xyz(input_xyz, output_points):
     return torch.cat([ref_xyz, pad], dim=2).contiguous()
 
 
-def _compute_edit_keep_mask(final_w, args):
+def compute_edit_keep_mask(final_w, args):
     if final_w is None:
         return None, None
     flat_w = final_w.detach().reshape(-1)
@@ -343,13 +343,13 @@ def _compute_edit_keep_mask(final_w, args):
     }
 
 
-def _summarize_point_edits(input_xyz, gen_pts, final_w=None, args=None, edit_ref_xyz=None):
+def summarize_point_edits(input_xyz, gen_pts, final_w=None, args=None, edit_ref_xyz=None):
     if gen_pts is None:
         return None
     input_points = int(input_xyz.shape[-1])
     pre_output_points = int(gen_pts.shape[-1])
     added_points = max(pre_output_points - input_points, 0)
-    keep_mask, keep_info = _compute_edit_keep_mask(final_w, args) if args is not None else (None, None)
+    keep_mask, keep_info = compute_edit_keep_mask(final_w, args) if args is not None else (None, None)
     if keep_info is not None and keep_info.get("keep_count") is not None:
         output_points = int(keep_info["keep_count"])
         deleted_points = max(pre_output_points - output_points, 0)
@@ -358,7 +358,7 @@ def _summarize_point_edits(input_xyz, gen_pts, final_w=None, args=None, edit_ref
         deleted_points = max(input_points + added_points - output_points, 0)
 
     if edit_ref_xyz is None:
-        edit_ref_xyz = _aligned_edit_ref_xyz(input_xyz, pre_output_points)
+        edit_ref_xyz = aligned_edit_ref_xyz(input_xyz, pre_output_points)
     compare_points = min(int(gen_pts.shape[-1]), int(edit_ref_xyz.shape[-1]))
     adjusted_points = 0
     max_adjust = 0.0
@@ -397,9 +397,9 @@ def _summarize_point_edits(input_xyz, gen_pts, final_w=None, args=None, edit_ref
         "added_points_avg": float(added_points),
         "deleted_points_avg": float(deleted_points),
         "adjusted_points_avg": float(adjusted_points),
-        "added_ratio_percent": _point_ratio_percent(added_points, input_points),
-        "deleted_ratio_percent": _point_ratio_percent(deleted_points, input_points),
-        "adjusted_ratio_percent": _point_ratio_percent(adjusted_points, input_points),
+        "added_ratio_percent": point_ratio_percent(added_points, input_points),
+        "deleted_ratio_percent": point_ratio_percent(deleted_points, input_points),
+        "adjusted_ratio_percent": point_ratio_percent(adjusted_points, input_points),
         "adjust_threshold": float(threshold),
         "adjust_mean": float(mean_adjust),
         "adjust_max": float(max_adjust),
@@ -409,7 +409,7 @@ def _summarize_point_edits(input_xyz, gen_pts, final_w=None, args=None, edit_ref
     }
 
 
-def _make_step_cache_key(file_path, args):
+def make_step_cache_key(file_path, args):
     return (
         f"{file_path}"
         f"|max_input_points={int(getattr(args, 'max_input_points', 0))}"
@@ -424,7 +424,7 @@ def _make_step_cache_key(file_path, args):
         f"|patch_sort_grid_size={int(getattr(args, 'patch_sort_grid_size', 1024))}"
     )
 
-def _effective_patch_batch_size(args, patch_count=None, patch_size=None, is_train=True, writer=None):
+def effective_patch_batch_size(args, patch_count=None, patch_size=None, is_train=True, writer=None):
     patch_count = max(int(patch_count or getattr(args, "patch_batch_size", 1)), 1)
     mode = str(getattr(args, "patch_parallel_mode", "auto")).strip().lower()
     fixed = max(int(getattr(args, "patch_batch_size", 1)), 1)
@@ -508,7 +508,7 @@ def make_patch_subset_cache_key(cache_key, selected_patch_ids, total_patch_count
     return f"{cache_key}|subset={subset_hash}"
 
 
-def _format_bytes(num_bytes):
+def format_bytes(num_bytes):
     num_bytes = float(max(num_bytes, 0))
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if num_bytes < 1024.0 or unit == "TB":
@@ -516,7 +516,7 @@ def _format_bytes(num_bytes):
         num_bytes /= 1024.0
 
 
-def _process_rss_bytes():
+def process_rss_bytes():
     try:
         with open("/proc/self/status", "r", encoding="utf-8") as f:
             for line in f:
@@ -527,22 +527,22 @@ def _process_rss_bytes():
     return None
 
 
-def _log_cache_status(model, writer, prefix):
+def log_cache_status(model, writer, prefix):
     stats_fn = getattr(model, "input_cache_stats", None)
     if not callable(stats_fn):
         return
     stats = stats_fn()
     max_bytes = stats.get("max_bytes", 0)
-    mem_limit = "unlimited" if max_bytes <= 0 else _format_bytes(max_bytes)
-    rss = _process_rss_bytes()
-    rss_text = "" if rss is None else f", rss={_format_bytes(rss)}"
+    mem_limit = "unlimited" if max_bytes <= 0 else format_bytes(max_bytes)
+    rss = process_rss_bytes()
+    rss_text = "" if rss is None else f", rss={format_bytes(rss)}"
     writer.write(
         f"{prefix}: frozen_cache={stats.get('entries', 0)}/{stats.get('max_entries', 0)} "
-        f"entries, memory={_format_bytes(stats.get('bytes', 0))}/{mem_limit}{rss_text}"
+        f"entries, memory={format_bytes(stats.get('bytes', 0))}/{mem_limit}{rss_text}"
     )
 
 
-def _adapt_encoder_state_dict_for_sparse_input(model, encoder_state, writer=None):
+def adapt_encoder_state_dict_for_sparse_input(model, encoder_state, writer=None):
     key = "stem.0.weight"
     model_state = model.encoder.state_dict()
     if key not in encoder_state or key not in model_state:
@@ -572,7 +572,7 @@ def _adapt_encoder_state_dict_for_sparse_input(model, encoder_state, writer=None
     return adapted
 
 
-def _module_grad_summary(module):
+def module_grad_summary(module):
     if module is None:
         return "missing"
     total_sq = 0.0
@@ -597,7 +597,7 @@ def _module_grad_summary(module):
     return f"norm={norm:.3e}, max={max_abs:.3e}, active={active}, none={missing}, finite={finite}"
 
 
-def _named_trainable_child_modules(base_model):
+def named_trainable_child_modules(base_model):
     actuator = getattr(base_model, "disp_module", None)
     modules = [
         ("cost_attr", getattr(base_model, "prun_module", None)),
@@ -616,34 +616,34 @@ def _named_trainable_child_modules(base_model):
     return modules
 
 
-def _trainable_parameters(module):
+def trainable_parameters(module):
     if module is None:
         return []
     return [param for param in module.parameters() if param.requires_grad]
 
 
-def _first_trainable_parameter(module):
-    for param in _trainable_parameters(module):
+def first_trainable_parameter(module):
+    for param in trainable_parameters(module):
         return param
     return None
 
 
-def _snapshot_module_parameters(module):
-    params = _trainable_parameters(module)
+def snapshot_module_parameters(module):
+    params = trainable_parameters(module)
     if not params:
         return None
     return [param.detach().clone() for param in params]
 
 
-def _capture_param_update_snapshots(args, model, step_idx, total_count):
+def capture_param_update_snapshots(args, model, step_idx, total_count):
     if not bool(getattr(args, "debug_grad_flow", False)):
         return None
-    if not _should_log_step(step_idx, total_count, getattr(args, "debug_grad_flow_rate", 1)):
+    if not should_log_step(step_idx, total_count, getattr(args, "debug_grad_flow_rate", 1)):
         return None
     base_model = model.module if hasattr(model, "module") else model
     snapshots = {}
-    for name, module in _named_trainable_child_modules(base_model):
-        snapshot = _snapshot_module_parameters(module)
+    for name, module in named_trainable_child_modules(base_model):
+        snapshot = snapshot_module_parameters(module)
         if snapshot is None:
             continue
         # debug時だけ、そのstep内でdetach済みcloneを保持する。
@@ -652,18 +652,18 @@ def _capture_param_update_snapshots(args, model, step_idx, total_count):
     return snapshots
 
 
-def _log_param_updates(args, writer, model, snapshots, step_idx, total_count):
+def log_param_updates(args, writer, model, snapshots, step_idx, total_count):
     if not snapshots:
         return
     if not bool(getattr(args, "debug_grad_flow", False)):
         return
-    if not _should_log_step(step_idx, total_count, getattr(args, "debug_grad_flow_rate", 1)):
+    if not should_log_step(step_idx, total_count, getattr(args, "debug_grad_flow_rate", 1)):
         return
     base_model = model.module if hasattr(model, "module") else model
     parts = []
-    for name, module in _named_trainable_child_modules(base_model):
+    for name, module in named_trainable_child_modules(base_model):
         before = snapshots.get(name)
-        params = _trainable_parameters(module)
+        params = trainable_parameters(module)
         if before is None or not params:
             parts.append(f"{name}(missing)")
             continue
@@ -691,25 +691,25 @@ def _log_param_updates(args, writer, model, snapshots, step_idx, total_count):
     writer.write("ParamUpdate: " + " | ".join(parts))
 
 
-def _log_grad_flow(args, writer, model, step_idx, total_count):
+def log_grad_flow(args, writer, model, step_idx, total_count):
     if not bool(getattr(args, "debug_grad_flow", False)):
         return
-    if not _should_log_step(step_idx, total_count, getattr(args, "debug_grad_flow_rate", 1)):
+    if not should_log_step(step_idx, total_count, getattr(args, "debug_grad_flow_rate", 1)):
         return
     base_model = model.module if hasattr(model, "module") else model
     parts = [
-        f"{name}({_module_grad_summary(module)})"
-        for name, module in _named_trainable_child_modules(base_model)
+        f"{name}({module_grad_summary(module)})"
+        for name, module in named_trainable_child_modules(base_model)
     ]
     writer.write("GradFlow: " + " | ".join(parts))
 
 
-def _sync_for_timing(use_cuda):
+def sync_for_timing(use_cuda):
     if use_cuda and torch.cuda.is_available():
         torch.cuda.synchronize()
 
 
-def _use_memory_safe_loader_workers(args, model, writer):
+def use_memory_safe_loader_workers(args, model, writer):
     requested_workers = max(int(args.num_workers), 0)
     if requested_workers <= 0:
         return 0
@@ -750,7 +750,7 @@ def _use_memory_safe_loader_workers(args, model, writer):
     return 0
 
 
-def _resolve_training_stage_for_episode(args, episode_idx):
+def resolve_training_stage_for_episode(args, episode_idx):
     if not bool(getattr(args, "two_stage_training", False)):
         return str(getattr(args, "training_stage", "joint")).strip().lower()
     diagnosis_episodes = int(getattr(args, "diagnosis_episodes", 0))
@@ -760,7 +760,7 @@ def _resolve_training_stage_for_episode(args, episode_idx):
     return "diagnosis" if int(episode_idx) < diagnosis_episodes else "joint"
 
 
-def _stage_loss_factors(args):
+def stage_loss_factors(args):
     stage = str(getattr(args, "training_stage", "joint")).strip().lower()
     if stage == "diagnosis":
         return {
@@ -779,7 +779,7 @@ def _stage_loss_factors(args):
     }
 
 
-def _get_patch_info(input_pcd, args, cache_key, patch_info_cache):
+def get_patch_info(input_pcd, args, cache_key, patch_info_cache):
     cache_enabled = bool(getattr(args, "patch_info_cache", True))
     cache_max_entries = max(int(getattr(args, "cache_max_entries", 64)), 0)
     if cache_enabled and cache_key:
@@ -799,7 +799,7 @@ def _get_patch_info(input_pcd, args, cache_key, patch_info_cache):
     return patch_info
 
 
-def _accumulate_grouped_patch_geometry(
+def accumulate_grouped_patch_geometry(
     geom_groups,
     loss,
     args,
@@ -829,7 +829,7 @@ def _accumulate_grouped_patch_geometry(
     return total, total_weight
 
 
-def _stable_index_subset(num_points, max_points, method, key, seed):
+def stable_index_subset(num_points, max_points, method, key, seed):
     if max_points <= 0 or num_points <= max_points:
         return None
 
@@ -849,7 +849,7 @@ def _stable_index_subset(num_points, max_points, method, key, seed):
     return torch.randperm(num_points, generator=generator)[:max_points]
 
 
-def _downsample_input_batch(input_pcd, args, cache_key):
+def downsample_input_batch(input_pcd, args, cache_key):
     max_points = int(getattr(args, "max_input_points", 0))
     if max_points <= 0 and not bool(getattr(args, "allow_unbounded_input", False)):
         max_points = int(getattr(args, "safe_max_input_points", 0))
@@ -859,7 +859,7 @@ def _downsample_input_batch(input_pcd, args, cache_key):
         raise ValueError(f"Expected input_pcd to have shape [B, N, C], got {tuple(input_pcd.shape)}")
 
     num_points = input_pcd.shape[1]
-    idx = _stable_index_subset(
+    idx = stable_index_subset(
         num_points=num_points,
         max_points=max_points,
         method=getattr(args, "input_sampling", "random"),
@@ -871,13 +871,13 @@ def _downsample_input_batch(input_pcd, args, cache_key):
     return input_pcd.index_select(1, idx)
 
 
-def _sample_geometry_audit_tensors(gen_pts, gt_pts, final_w, out_label, args, cache_key):
+def sample_geometry_audit_tensors(gen_pts, gt_pts, final_w, out_label, args, cache_key):
     max_points = max(int(getattr(args, "geometry_audit_max_points", 0)), 0)
     if max_points <= 0:
         return gen_pts, gt_pts, final_w, out_label
 
     def _sample_pts(tensor, key_suffix):
-        idx = _stable_index_subset(
+        idx = stable_index_subset(
             num_points=tensor.shape[-1],
             max_points=max_points,
             method=getattr(args, "input_sampling", "random"),
@@ -903,12 +903,12 @@ def _sample_geometry_audit_tensors(gen_pts, gt_pts, final_w, out_label, args, ca
     return gen_pts_audit, gt_pts_audit, final_w_audit, out_label_audit
 
 
-def _run_geometry_audit(loss_obj, args, gen_pts, gt_pts, final_w, out_label, cache_key):
+def run_geometry_audit(loss_obj, args, gen_pts, gt_pts, final_w, out_label, cache_key):
     if gen_pts.dim() == 3 and gen_pts.shape[1] > 3:
         gen_pts = gen_pts[:, :3, :]
     if gt_pts.dim() == 3 and gt_pts.shape[1] > 3:
         gt_pts = gt_pts[:, :3, :]
-    gen_a, gt_a, w_a, label_a = _sample_geometry_audit_tensors(
+    gen_a, gt_a, w_a, label_a = sample_geometry_audit_tensors(
         gen_pts,
         gt_pts,
         final_w,
@@ -931,22 +931,22 @@ def _run_geometry_audit(loss_obj, args, gen_pts, gt_pts, final_w, out_label, cac
     return geom_debug
 
 
-def _move_xyz_to_device(pts, use_cuda):
+def move_xyz_to_device(pts, use_cuda):
     input_xyz = pts[..., :3]
     if use_cuda:
         input_xyz = input_xyz.cuda(non_blocking=True)
     return rearrange(input_xyz, 'b n c -> b c n').contiguous()
 
 
-def _prepare_whole_cloud_inputs(pts, args, cache_key, use_cuda):
+def prepare_whole_cloud_inputs(pts, args, cache_key, use_cuda):
     input_xyz = pts if pts.dim() == 3 else pts.unsqueeze(0)
-    input_xyz = _downsample_input_batch(input_xyz, args, cache_key)
-    input_xyz = _move_xyz_to_device(input_xyz, use_cuda)
+    input_xyz = downsample_input_batch(input_xyz, args, cache_key)
+    input_xyz = move_xyz_to_device(input_xyz, use_cuda)
     patches, centroid, furthest_distance = normalize_point_cloud(input_xyz)
     return input_xyz, patches, centroid[:, :3, :], furthest_distance
 
 
-def _warmup_whole_cloud_caches(model, args, loss, seq_datasets, writer, use_cuda, use_amp, amp_dtype):
+def warmup_whole_cloud_caches(model, args, loss, seq_datasets, writer, use_cuda, use_amp, amp_dtype):
     if args.split2patch:
         return
 
@@ -968,7 +968,7 @@ def _warmup_whole_cloud_caches(model, args, loss, seq_datasets, writer, use_cuda
 
     writer.write(f"=== Warmup Cache Start ({target_files}/{total_files} files) ===")
     if warmup_frozen:
-        _log_cache_status(model, writer, "Warmup cache initial")
+        log_cache_status(model, writer, "Warmup cache initial")
     warmup_log_rate = max(int(getattr(args, "warmup_log_rate", 0)), 0)
     auto_disable_partial_cache = bool(getattr(args, "auto_disable_partial_frozen_cache", True))
     frozen_cache_checked = False
@@ -990,8 +990,8 @@ def _warmup_whole_cloud_caches(model, args, loss, seq_datasets, writer, use_cuda
                     break
 
                 file_path = dataset.files[step]
-                cache_key = _make_step_cache_key(file_path, args)
-                input_xyz, patches, _, _ = _prepare_whole_cloud_inputs(pts, args, cache_key, use_cuda)
+                cache_key = make_step_cache_key(file_path, args)
+                input_xyz, patches, _, _ = prepare_whole_cloud_inputs(pts, args, cache_key, use_cuda)
                 autocast_ctx = torch.cuda.amp.autocast(dtype=amp_dtype, enabled=bool(use_cuda and use_amp)) if use_cuda else nullcontext()
                 with autocast_ctx:
                     if warmup_frozen:
@@ -1034,7 +1034,7 @@ def _warmup_whole_cloud_caches(model, args, loss, seq_datasets, writer, use_cuda
                         f"(total={total_files}, elapsed={elapsed:.1f}s, {sec_per_file:.2f}s/file)"
                     )
                     if warmup_frozen:
-                        _log_cache_status(model, writer, "Warmup cache status")
+                        log_cache_status(model, writer, "Warmup cache status")
                 if warmup_max_seconds > 0 and elapsed >= warmup_max_seconds:
                     stop_warmup = True
                     stop_reason = f"time limit reached ({warmup_max_seconds:.1f}s)"
@@ -1046,7 +1046,7 @@ def _warmup_whole_cloud_caches(model, args, loss, seq_datasets, writer, use_cuda
     if use_cuda:
         torch.cuda.empty_cache()
     if warmup_frozen:
-        _log_cache_status(model, writer, "Warmup cache final")
+        log_cache_status(model, writer, "Warmup cache final")
     elapsed = time.time() - warmup_start
     if stop_reason is not None:
         writer.write(f"Warmup cache stopped: {stop_reason}")
@@ -1054,7 +1054,7 @@ def _warmup_whole_cloud_caches(model, args, loss, seq_datasets, writer, use_cuda
     writer.write("=== Warmup Cache Done ===")
 
 
-def _cuda_bf16_ops_safe():
+def cuda_bf16_ops_safe():
     if not (torch.cuda.is_available() and hasattr(torch.cuda, "is_bf16_supported")):
         return False
     if not torch.cuda.is_bf16_supported():
@@ -1067,12 +1067,12 @@ def _cuda_bf16_ops_safe():
         return False
 
 
-def _resolve_amp_dtype(args, use_cuda):
+def resolve_amp_dtype(args, use_cuda):
     if not use_cuda:
         return torch.float16
 
     requested = str(getattr(args, "amp_dtype", "auto")).strip().lower()
-    bf16_safe = _cuda_bf16_ops_safe()
+    bf16_safe = cuda_bf16_ops_safe()
 
     if requested == "auto":
         return torch.bfloat16 if bf16_safe else torch.float16

@@ -5,8 +5,8 @@ import torch.optim as optim
 
 from models.utils.data.dataset import clear_ply_cache
 from models.utils.training.utils import (
-    _resolve_amp_dtype,
-    _use_memory_safe_loader_workers,
+    resolve_amp_dtype,
+    use_memory_safe_loader_workers,
 )
 
 
@@ -74,7 +74,7 @@ def setup_amp(model, args, writer):
     use_cuda = next(model.parameters()).is_cuda
     use_amp = bool(use_cuda and getattr(args, "use_amp", False))
 
-    amp_dtype = _resolve_amp_dtype(args, use_cuda) if use_amp else torch.float16
+    amp_dtype = resolve_amp_dtype(args, use_cuda) if use_amp else torch.float16
     amp_scaler_enabled = bool(use_amp and amp_dtype == torch.float16)
 
     scaler = torch.cuda.amp.GradScaler(
@@ -108,7 +108,7 @@ def setup_amp(model, args, writer):
 
 
 def build_loader_kwargs(args, model, writer, use_cuda):
-    loader_num_workers = _use_memory_safe_loader_workers(args, model, writer)
+    loader_num_workers = use_memory_safe_loader_workers(args, model, writer)
 
     loader_kwargs = dict(
         batch_size=1,

@@ -530,7 +530,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--sparsepcgc_aux_reward_clip', default=50.0, type=float, help='SparsePCGC補助lossのpercent項clip幅。0で無効')
     parser.add_argument('--sparsepcgc_corr_window', default=100, type=int, help='SparsePCGC proxy-actual相関を計算する直近サンプル数')
     parser.add_argument('--sparsepcgc_disable_add', default=True, type=str2bool, help='SparsePCGCでは新規active coordinate増加を避けるため追加操作を既定で止める')
-    parser.add_argument('--surrogate_pretrain_steps', default=1000, type=int, help='main network更新前にSurrogateだけをactual teacherへfitさせるstep数')
+    parser.add_argument('--surrogate_pretrain_steps', default=0, type=int, help='main network更新前にSurrogateだけをactual teacherへfitさせるstep数')
     parser.add_argument('--surrogate_pretrain_lr', default=1e-4, type=float, help='Surrogate pretrain中のlearning rate')
     parser.add_argument('--surrogate_pretrain_actual_refresh_interval', default=10, type=int, help='Surrogate pretrain中のactual teacher refresh間隔')
     parser.add_argument('--surrogate_pretrain_freeze_network', default=True, type=str2bool, help='Surrogate pretrain中にmain networkをfreezeするか')
