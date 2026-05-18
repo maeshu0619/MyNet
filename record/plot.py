@@ -110,7 +110,7 @@ class PlotMaker():
         self.title = [
             "Loss", 
             "Loss of Geometry", 
-            "Actual Compression Delta [%] = 100 * (b' - b) / b", 
+            "Compression Objective / Delta (legacy mixed; see compression_metrics CSV)",
             "Loss of Octree Cost Attribution",
             "Loss of Structure Repair Policy",
             "Loss of Single Child Nodes", 

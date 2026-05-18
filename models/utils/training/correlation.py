@@ -2,9 +2,13 @@
 
 import math
 
+import torch
+
 
 def finite_float_or_none(value):
     try:
+        if torch.is_tensor(value):
+            value = value.detach().cpu()
         scalar = float(value)
     except (TypeError, ValueError):
         return None

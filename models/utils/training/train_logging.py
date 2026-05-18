@@ -22,6 +22,11 @@ def log_backend_summary(args, writer):
         f"{'ste_hard' if args.discrete_loss_mode == 'ste_hard' else ('weighted_soft' if args.discrete_loss_mode == 'weighted_soft' else 'hard')}, "
         f"compression={args.compression_loss_backend}"
     )
+    if str(getattr(args, "discrete_loss_mode", "")).strip().lower() == "hard":
+        writer.write(
+            "Discrete Loss Warning: hard mode sets final_w_for_loss=None in train.py; "
+            "delete weights are not used by geometry/compression losses. Prefer ste_hard for learning."
+        )
 
     writer.write(
         "Compression Delta Sign: "
@@ -72,16 +77,23 @@ def log_structure_debug(writer, structure_debug, step, num_steps):
         return
 
     writer.write(
-        f"StructureStats step={step + 1}/{num_steps}: "
-        f"repair_ratio={float(structure_debug.get('repair_ratio', 0.0)):.6f}, "
-        f"add_ratio={float(structure_debug.get('add_ratio', 0.0)):.6f}, "
-        f"add_count={int(structure_debug.get('add_count', 0))}, "
-        f"drop_ratio={float(structure_debug.get('drop_ratio', 0.0)):.6f}, "
-        f"keep_ratio={float(structure_debug.get('keep_ratio', 0.0)):.6f}, "
-        f"delta_norm={float(structure_debug.get('delta_norm', 0.0)):.6f}, "
-        f"move_ratio={float(structure_debug.get('move_ratio', 0.0)):.6f}, "
-        f"preserve_ratio={float(structure_debug.get('preserve_ratio', 0.0)):.6f}"
-    )
+            f"StructureStats step={step + 1}/{num_steps}: "
+            f"repair_ratio={float(structure_debug.get('repair_ratio', 0.0)):.6f}, "
+            f"add_ratio={float(structure_debug.get('add_ratio', 0.0)):.6f}, "
+            f"add_prob_mean={float(structure_debug.get('add_prob_mean', 0.0)):.6f}, "
+            f"add_count={int(structure_debug.get('add_count', 0))}, "
+            f"add_effective_count={int(structure_debug.get('add_effective_count', 0))}, "
+            f"drop_ratio={float(structure_debug.get('drop_ratio', 0.0)):.6f}, "
+            f"hard_drop_ratio={float(structure_debug.get('hard_drop_ratio', 0.0)):.6f}, "
+            f"keep_ratio={float(structure_debug.get('keep_ratio', 0.0)):.6f}, "
+            f"delta_norm={float(structure_debug.get('delta_norm', 0.0)):.6f}, "
+            f"move_ratio={float(structure_debug.get('move_ratio', 0.0)):.6f}, "
+            f"hard_move_count={int(structure_debug.get('hard_move_count', 0))}, "
+            f"preserve_ratio={float(structure_debug.get('preserve_ratio', 0.0)):.6f}, "
+            f"enabled[add={bool(structure_debug.get('add_enabled', False))}, "
+            f"prune={bool(structure_debug.get('prune_enabled', False))}, "
+            f"disp={bool(structure_debug.get('disp_enabled', False))}]"
+        )
 
     writer.write(
         f"VoxelOperationStats step={step + 1}/{num_steps}: "
@@ -93,7 +105,12 @@ def log_structure_debug(writer, structure_debug, step, num_steps):
         f"add_voxels={int(structure_debug.get('add_target_voxel_count', 0))}, "
         f"add_points={int(structure_debug.get('add_actual_point_count', 0))}, "
         f"move_source_voxels={int(structure_debug.get('move_source_voxel_count', 0))}, "
-        f"move_target_voxels={int(structure_debug.get('move_target_voxel_count', 0))}"
+        f"move_target_voxels={int(structure_debug.get('move_target_voxel_count', 0))}, "
+        f"move_source_emptied={int(structure_debug.get('move_source_emptied_voxel_count', 0))}, "
+        f"move_target_new={int(structure_debug.get('move_target_new_voxel_count', 0))}, "
+        f"move_source_not_emptied={int(structure_debug.get('move_source_not_emptied_count', 0))}, "
+        f"same_voxel_adjust={int(structure_debug.get('same_voxel_adjust_count', 0))}, "
+        f"different_voxel_move={int(structure_debug.get('moved_different_voxel_count', 0))}"
     )
 
 

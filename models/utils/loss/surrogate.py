@@ -291,6 +291,16 @@ class SurrogateCompressionLossMixin:
             return False
         return True
 
+    @staticmethod
+    def _surrogate_update_allowed_by_schedule(args):
+        if bool(getattr(args, "_surrogate_pretrain_active", False)):
+            return True
+        if not bool(getattr(args, "surrogate_update_during_training", True)):
+            return False
+        interval = max(int(getattr(args, "surrogate_update_interval", 1)), 1)
+        step = int(getattr(args, "_global_train_step", 0))
+        return (step % interval) == 0
+
     def _surrogate_target_cache_key(self, args, cache_key):
         backend = self._surrogate_backend_label(args)
         return f"{backend}|{cache_key or ''}"
@@ -311,6 +321,16 @@ class SurrogateCompressionLossMixin:
             cached_entry = dict(cache[key])
             entry = cached_entry
             entry["cache_hit"] = "exact" if self._surrogate_target_is_current_step(args, cached_entry) else "stale"
+        if entry is not None and bool(getattr(args, "_surrogate_pretrain_active", False)):
+            current_step = int(getattr(args, "_global_train_step", getattr(self, "_surrogate_call_count", 0)))
+            entry_step = int(entry.get("global_step", current_step))
+            entry_age = max(current_step - entry_step, 0)
+            max_age = max(int(getattr(args, "surrogate_pretrain_max_target_age", 20)), 0)
+            if entry_age > 0 and (
+                not bool(getattr(args, "surrogate_pretrain_allow_stale_target", True))
+                or entry_age > max_age
+            ):
+                entry = None
         if entry is None and not cache_key and bool(getattr(args, "compression_surrogate_reuse_last_target", False)):
             last_entry = getattr(self, "last_surrogate_target_entry", None)
             if (
@@ -319,6 +339,22 @@ class SurrogateCompressionLossMixin:
             ):
                 entry = dict(last_entry)
                 entry["cache_hit"] = "last" if self._surrogate_target_is_current_step(args, last_entry) else "last_stale"
+        if (
+            entry is None
+            and bool(getattr(args, "_surrogate_pretrain_active", False))
+            and bool(getattr(args, "surrogate_pretrain_allow_stale_target", True))
+        ):
+            last_entry = getattr(self, "last_surrogate_target_entry", None)
+            if (
+                last_entry is not None
+                and str(last_entry.get("backend_label", backend)) == backend
+            ):
+                current_step = int(getattr(args, "_global_train_step", getattr(self, "_surrogate_call_count", 0)))
+                last_step = int(last_entry.get("global_step", -10**12))
+                max_age = max(int(getattr(args, "surrogate_pretrain_max_target_age", 20)), 0)
+                if 0 <= current_step - last_step <= max_age:
+                    entry = dict(last_entry)
+                    entry["cache_hit"] = "pretrain_last_stale"
         return entry
 
     def _store_cached_surrogate_target(self, args, cache_key, entry):
@@ -336,25 +372,43 @@ class SurrogateCompressionLossMixin:
             cache.popitem(last=False)
 
     def _store_surrogate_replay(self, args, x_soft, target):
-        max_entries = max(int(getattr(self, "surrogate_replay_max_entries", 0)), 0)
+        if bool(getattr(args, "_surrogate_pretrain_active", False)):
+            max_entries = max(
+                int(getattr(args, "surrogate_pretrain_replay_buffer_size", getattr(self, "surrogate_replay_max_entries", 0))),
+                0,
+            )
+        else:
+            max_entries = max(int(getattr(self, "surrogate_replay_max_entries", 0)), 0)
         if max_entries <= 0 or not self._all_finite(x_soft, target):
             return
         x_cpu = x_soft.detach().to(device="cpu", dtype=torch.float32)
         y_cpu = target.detach().to(device="cpu", dtype=torch.float32)
         if y_cpu.shape[0] == 1 and x_cpu.shape[0] > 1:
             y_cpu = y_cpu.expand(x_cpu.shape[0], -1).contiguous()
+        meta = {
+            "global_step": int(getattr(args, "_global_train_step", getattr(self, "_surrogate_call_count", 0))),
+            "surrogate_step": int(getattr(self, "_surrogate_step", 0)),
+            "stored_at": time.time(),
+        }
         for idx in range(x_cpu.shape[0]):
-            entry = (x_cpu[idx].clone(), y_cpu[min(idx, y_cpu.shape[0] - 1)].clone())
+            entry = (x_cpu[idx].clone(), y_cpu[min(idx, y_cpu.shape[0] - 1)].clone(), dict(meta))
             if len(self.surrogate_replay) < max_entries:
                 self.surrogate_replay.append(entry)
             else:
                 self.surrogate_replay[self.surrogate_replay_next] = entry
                 self.surrogate_replay_next = (self.surrogate_replay_next + 1) % max_entries
+            while len(self.surrogate_replay) > max_entries:
+                self.surrogate_replay.pop(0)
+                self.surrogate_replay_next = min(self.surrogate_replay_next, max(len(self.surrogate_replay) - 1, 0))
 
     def _sample_surrogate_replay(self, args, device):
         replay = getattr(self, "surrogate_replay", None)
         if not replay:
             return None, None
+        if bool(getattr(args, "_surrogate_pretrain_active", False)):
+            min_size = max(int(getattr(args, "surrogate_pretrain_replay_min_size", 0)), 0)
+            if len(replay) < min_size:
+                return None, None
         batch = min(max(int(getattr(args, "compression_surrogate_replay_batch", 8)), 1), len(replay))
         start = int(getattr(self, "_surrogate_call_count", 0)) % len(replay)
         indices = [(start + offset) % len(replay) for offset in range(batch)]
@@ -363,12 +417,20 @@ class SurrogateCompressionLossMixin:
         return x, y
 
     def _train_surrogate_replay(self, args, device):
+        self._last_surrogate_replay_sample_count = 0
+        self._last_surrogate_replay_steps = 0
+        if bool(getattr(args, "_surrogate_pretrain_active", False)) and not bool(
+            getattr(args, "surrogate_pretrain_use_replay", True)
+        ):
+            return None
         replay_steps = max(int(getattr(args, "compression_surrogate_replay_steps", 0)), 0)
         if replay_steps <= 0:
             return None
         x_replay, y_replay = self._sample_surrogate_replay(args, device)
         if x_replay is None:
             return None
+        self._last_surrogate_replay_sample_count = int(x_replay.shape[0])
+        self._last_surrogate_replay_steps = int(replay_steps)
         return self._train_compression_surrogate(args, x_replay, y_replay, train_steps=replay_steps)
 
     @staticmethod
@@ -382,6 +444,8 @@ class SurrogateCompressionLossMixin:
             "octree_single": float(entry.get("gt_octree_single", entry.get("gt_single", 0.0))),
             "octree_node": float(entry.get("gt_octree_node", entry.get("gt_node", 0.0))),
             "octree_depth": int(entry.get("gt_octree_depth", 0)),
+            "encode_time": float(entry.get("gt_actual_encode_time", 0.0)),
+            "unique_coord_count": int(entry.get("gt_unique_coord_count", entry.get("gt_points", 0))),
             "point_count": int(entry.get("gt_points", 0)),
             "codec": str(entry.get("teacher_codec", "octattention")),
         }
@@ -407,8 +471,10 @@ class SurrogateCompressionLossMixin:
             f"periodic_interval={int(getattr(args, 'compression_surrogate_refresh_interval', 0))},"
             f"warmup_steps={int(getattr(args, 'compression_surrogate_warmup_steps', 0))},"
             f"replay_steps={int(getattr(args, 'compression_surrogate_replay_steps', 0))},"
+            f"replay_batch={int(getattr(args, 'compression_surrogate_replay_batch', 0))},"
             f"forward={getattr(args, 'compression_surrogate_forward_mode', 'surrogate')},"
-            f"reuse_last_target={bool(getattr(args, 'compression_surrogate_reuse_last_target', True))}"
+            f"reuse_last_target={bool(getattr(args, 'compression_surrogate_reuse_last_target', True))},"
+            f"pretrain_stale={bool(getattr(args, 'surrogate_pretrain_allow_stale_target', False))}"
         )
 
     def _train_compression_surrogate(self, args, x_soft, target, train_steps=None):
@@ -419,6 +485,8 @@ class SurrogateCompressionLossMixin:
         if train_steps <= 0:
             return x_soft.new_zeros(())
         if not self._can_update_compression_surrogate(args):
+            return x_soft.new_zeros(())
+        if not self._surrogate_update_allowed_by_schedule(args):
             return x_soft.new_zeros(())
         if not self._all_finite(x_soft, target):
             self._log_surrogate_event("skipped train step because x_soft/target was non-finite.")
@@ -498,7 +566,7 @@ class SurrogateCompressionLossMixin:
         refresh_actual_gen=True,
         actual_gen_xyz=None,
     ):
-        timing_enabled = bool(getattr(args, "debug_timing", False))
+        timing_enabled = bool(getattr(args, "debug_timing", False) or getattr(args, "_surrogate_pretrain_timing_enabled", False))
         timing = {}
 
         def _sync_timing():
@@ -530,11 +598,26 @@ class SurrogateCompressionLossMixin:
             soft_node_percent = x_soft.new_zeros(())
             soft_single_percent = x_soft.new_zeros(())
         timing_cursor = _mark_timing("feature_ref_aux", timing_cursor)
+        sparse_terms = self._sparsepcgc_aux_feature_terms(args, gen_xyz, gt_xyz, final_w)
+        timing_cursor = _mark_timing("sparsepcgc_aux_proxy", timing_cursor)
         inputs_finite = self._all_finite(gen_xyz, gt_xyz, x_soft)
         target = None
         stats_gen = None
         target_entry = self._get_cached_surrogate_target(args, cache_key)
         target_cache_hit = str(target_entry.get("cache_hit", "miss")) if target_entry is not None else "miss"
+        pretrain_mode = str(getattr(args, "_surrogate_pretrain_mode", getattr(args, "surrogate_pretrain_mode", ""))).strip().lower()
+        pretrain_teacher_type = str(
+            getattr(args, "_surrogate_pretrain_teacher_type", getattr(args, "surrogate_pretrain_subtree_teacher_type", ""))
+        ).strip().lower()
+        local_proxy_teacher = bool(
+            getattr(args, "_surrogate_pretrain_active", False)
+            and pretrain_mode in {"subtree", "hybrid"}
+            and pretrain_teacher_type == "local_proxy"
+            and not bool(refresh_actual_gen)
+        )
+        if local_proxy_teacher:
+            target_entry = None
+            target_cache_hit = "local_proxy"
         actual_bit_percent = 0.0
         actual_bpp_percent = 0.0
         actual_single_percent = 0.0
@@ -580,6 +663,7 @@ class SurrogateCompressionLossMixin:
             L_sur = self._train_compression_surrogate(args, x_soft, target, train_steps=warmup_steps)
             timing_cursor = _mark_timing("surrogate_fit", timing_cursor)
             self._store_surrogate_replay(args, x_soft, target)
+            actual_value_source = "fresh_teacher"
             target_percent_value = float(actual_bit_percent)
             gen_points = int(stats_gen["point_count"])
             gen_actual_bit = float(stats_gen["bit"])
@@ -599,6 +683,10 @@ class SurrogateCompressionLossMixin:
                     "gen_points": int(gen_points),
                     "gt_actual_bit": float(cached_gt["bit"]),
                     "gen_actual_bit": float(gen_actual_bit),
+                    "gt_actual_encode_time": float(cached_gt.get("encode_time", 0.0)),
+                    "gen_actual_encode_time": float(stats_gen.get("encode_time", 0.0)),
+                    "gt_unique_coord_count": int(cached_gt.get("unique_coord_count", cached_gt.get("point_count", 0))),
+                    "gen_unique_coord_count": int(stats_gen.get("unique_coord_count", stats_gen.get("point_count", gen_points))),
                     "gt_bpp": float(cached_gt["bpp"]),
                     "gen_bpp": float(stats_gen["bpp"]),
                     "gt_bpn": float(cached_gt["bpn"]),
@@ -617,6 +705,36 @@ class SurrogateCompressionLossMixin:
                     "surrogate_step": int(getattr(self, "_surrogate_step", 0)),
                 },
             )
+        elif local_proxy_teacher and inputs_finite:
+            teacher_codec = self._surrogate_backend_label(args).replace("_surrogate", "")
+            cached_gt = {
+                "bit": 0.0,
+                "bpp": 0.0,
+                "bpn": 0.0,
+                "single": 0.0,
+                "node": 0.0,
+                "octree_single": 0.0,
+                "octree_node": 0.0,
+                "octree_depth": 0,
+                "point_count": int(gt_xyz.shape[-1]),
+                "codec": teacher_codec,
+            }
+            local_proxy_target = (
+                aux_node_weight * soft_node_percent.to(device=gen_xyz.device, dtype=torch.float32)
+                + aux_single_weight * soft_single_percent.to(device=gen_xyz.device, dtype=torch.float32)
+                + float(getattr(args, "com_sparsepcgc", 1.0))
+                * sparse_terms["loss"].to(device=gen_xyz.device, dtype=torch.float32)
+            ).detach()
+            local_proxy_target = local_proxy_target.reshape(-1).mean().reshape(1, 1)
+            if not self._all_finite(local_proxy_target):
+                local_proxy_target = gen_xyz.new_zeros((1, 1), dtype=torch.float32)
+            target = local_proxy_target
+            target_percent_value = self._scalar(local_proxy_target.reshape(()))
+            L_sur = self._train_compression_surrogate(args, x_soft, target)
+            timing_cursor = _mark_timing("surrogate_fit", timing_cursor)
+            self._store_surrogate_replay(args, x_soft, target)
+            actual_value_source = "local_proxy"
+            gen_points = int(gen_xyz.shape[-1])
         elif target_entry is not None:
             teacher_codec = str(target_entry.get("teacher_codec", "octattention")).strip().lower()
             cached_gt = self._surrogate_cache_stats_from_entry(target_entry)
@@ -627,7 +745,15 @@ class SurrogateCompressionLossMixin:
             target_percent_value = float(target_entry.get("target_bit_percent", actual_bit_percent))
             gen_points = int(target_entry.get("gen_points", gen_points))
             gen_actual_bit = float(target_entry.get("gen_actual_bit", float("nan")))
-            L_sur = x_soft.new_zeros(())
+            stale_hit = "stale" in str(target_cache_hit).lower()
+            actual_value_source = "stale_target" if stale_hit else "target_cache"
+            if bool(getattr(args, "_surrogate_pretrain_active", False)) and not bool(
+                getattr(args, "surrogate_pretrain_skip_on_target_miss", False)
+            ):
+                target = torch.tensor([[target_percent_value]], device=gen_xyz.device, dtype=torch.float32)
+                L_sur = self._train_compression_surrogate(args, x_soft, target)
+            else:
+                L_sur = x_soft.new_zeros(())
             timing_cursor = _mark_timing("target_cache", timing_cursor)
         else:
             teacher_codec = self._surrogate_backend_label(args).replace("_surrogate", "")
@@ -643,11 +769,17 @@ class SurrogateCompressionLossMixin:
             if not inputs_finite:
                 self._log_surrogate_event("skipped teacher refresh because generator features were non-finite.")
             L_sur = x_soft.new_zeros(())
+            actual_value_source = "target_missing_skip" if bool(
+                getattr(args, "surrogate_pretrain_skip_on_target_miss", False)
+            ) else "missing"
             timing_cursor = _mark_timing("target_missing", timing_cursor)
 
-        replay_loss = self._train_surrogate_replay(args, gen_xyz.device)
+        update_on_teacher_only = bool(getattr(args, "surrogate_update_on_teacher_refresh_only", False))
+        replay_loss = None if (update_on_teacher_only and not teacher_refreshed) else self._train_surrogate_replay(args, gen_xyz.device)
+        replay_sample_count = int(getattr(self, "_last_surrogate_replay_sample_count", 0))
+        replay_steps = int(getattr(self, "_last_surrogate_replay_steps", 0))
         if replay_loss is not None:
-            L_sur = 0.5 * (L_sur + replay_loss) if teacher_refreshed else replay_loss
+            L_sur = 0.5 * (L_sur + replay_loss) if (teacher_refreshed or actual_value_source == "local_proxy") else replay_loss
         timing_cursor = _mark_timing("surrogate_replay", timing_cursor)
 
         self._ensure_surrogate_device(gen_xyz.device)
@@ -676,11 +808,14 @@ class SurrogateCompressionLossMixin:
         else:
             main_loss = surrogate_bit_percent if inputs_finite else actual_bit_percent_t
         aux_loss = aux_node_weight * loss_nodes + aux_single_weight * loss_single
-        sparse_terms = self._sparsepcgc_aux_feature_terms(args, gen_xyz, gt_xyz, final_w)
-        sparse_aux_loss = float(getattr(args, "com_sparsepcgc", 1.0)) * sparse_terms["loss"]
-        L_com = main_loss + aux_loss + sparse_aux_loss
+        sparsepcgc_aux_weight = float(getattr(args, "com_sparsepcgc", 1.0))
+        sparse_aux_raw = sparse_terms["loss"]
+        sparse_aux_loss = sparsepcgc_aux_weight * sparse_aux_raw
+        lcom_without_sparse = main_loss + aux_loss
+        L_com = lcom_without_sparse + sparse_aux_loss
         backend_label = self._surrogate_backend_label(args, teacher_codec)
         self._store_compression_terms(
+            main=main_loss,
             bit=surrogate_bit_percent,
             node=loss_nodes,
             single=loss_single,
@@ -696,7 +831,18 @@ class SurrogateCompressionLossMixin:
 
         pred_percent = surrogate_bit_percent.detach().reshape(())
         target_percent = pred_percent.new_tensor(float(target_percent_value)).detach().reshape(())
-        surrogate_abs_bit_error = (pred_percent - target_percent).abs()
+        surrogate_signed_bit_error = pred_percent - target_percent
+        surrogate_abs_bit_error = surrogate_signed_bit_error.abs()
+        current_step_for_debug = int(
+            getattr(args, "_global_train_step", getattr(self, "_surrogate_call_count", 0))
+        )
+        if teacher_refreshed:
+            target_step_for_debug = current_step_for_debug
+        elif target_entry is not None:
+            target_step_for_debug = int(target_entry.get("global_step", current_step_for_debug))
+        else:
+            target_step_for_debug = current_step_for_debug
+        teacher_target_age = max(current_step_for_debug - target_step_for_debug, 0)
         rate_proxy_before_value = float(cached_gt["bit"])
         rate_proxy_after_value = rate_proxy_before_value * (1.0 + self._scalar(pred_percent) / 100.0)
         gt_octree_node_value = float(cached_gt.get("octree_node", cached_gt.get("node", 0.0)))
@@ -713,6 +859,27 @@ class SurrogateCompressionLossMixin:
             gen_octree_node_value = 0.0
             gen_octree_single_value = 0.0
             gen_octree_depth_value = 0
+        teacher_stale = bool((target_entry is not None) and (not teacher_refreshed) and ("stale" in str(target_cache_hit).lower()))
+        teacher_replayed = bool(replay_loss is not None)
+        teacher_skipped = bool(
+            (not teacher_refreshed)
+            and target_entry is None
+            and replay_loss is None
+            and actual_value_source != "local_proxy"
+        )
+        if teacher_refreshed:
+            teacher_mode = "refresh"
+        elif actual_value_source == "local_proxy":
+            teacher_mode = "local_proxy"
+        elif teacher_stale:
+            teacher_mode = "stale"
+        elif target_entry is not None:
+            teacher_mode = "cache"
+        elif teacher_replayed:
+            teacher_mode = "replay"
+        else:
+            teacher_mode = "skip"
+
         self.last_compression_debug = {
             "metric": "actual_total_bit_percent",
             "teacher_codec": teacher_codec,
@@ -721,16 +888,34 @@ class SurrogateCompressionLossMixin:
             "compression_main_loss": self._scalar(main_loss),
             "compression_aux_loss": self._scalar(aux_loss),
             "sparsepcgc_aux_loss": self._scalar(sparse_terms["loss"].detach()),
+            "sparsepcgc_aux_raw": self._scalar(sparse_aux_raw.detach()),
+            "sparsepcgc_aux_weighted": self._scalar(sparse_aux_loss.detach()),
+            "sparsepcgc_aux_weight": sparsepcgc_aux_weight,
+            "com_sparsepcgc_weight": sparsepcgc_aux_weight,
+            "lcom_without_sparsepcgc_aux": self._scalar(lcom_without_sparse.detach()),
+            "lcom_with_sparsepcgc_aux": self._scalar(L_com.detach()),
             "sparsepcgc_active_coord_loss": self._scalar(sparse_terms["active"].detach()),
             "sparsepcgc_isolated_proxy_loss": self._scalar(sparse_terms["single"].detach()),
             "sparsepcgc_entropy_proxy_loss": self._scalar(sparse_terms["entropy"].detach()),
             "sparsepcgc_density_proxy_loss": self._scalar(sparse_terms["density"].detach()),
+            "occupancy_entropy": self._scalar(sparse_terms["entropy"].detach()),
+            "nll_delta": self._scalar(sparse_terms["entropy"].detach()),
             "bpp": float(actual_bpp_percent),
             "gt_points": int(cached_gt["point_count"]),
             "gen_points": gen_points,
             "gt_actual_bit": float(cached_gt["bit"]),
             "gen_actual_bit": gen_actual_bit,
+            "gt_actual_encode_time": float(cached_gt.get("encode_time", 0.0)),
+            "gen_actual_encode_time": float(stats_gen.get("encode_time", 0.0)) if stats_gen is not None else 0.0,
+            "actual_encode_time_total": float(cached_gt.get("encode_time", 0.0))
+            + (float(stats_gen.get("encode_time", 0.0)) if stats_gen is not None else 0.0),
+            "gt_unique_coord_count": int(cached_gt.get("unique_coord_count", cached_gt.get("point_count", 0))),
+            "gen_unique_coord_count": int(
+                stats_gen.get("unique_coord_count", stats_gen.get("point_count", gen_points))
+            ) if stats_gen is not None else int(target_entry.get("gen_unique_coord_count", gen_points)) if target_entry is not None else gen_points,
             "actual_total_bit_percent": self._scalar(actual_bit_percent_t),
+            "actual_value_is_fresh": bool(teacher_refreshed),
+            "actual_value_source": actual_value_source,
             "rate_proxy_before": rate_proxy_before_value,
             "rate_proxy_after": rate_proxy_after_value,
             "rate_proxy_delta": self._scalar(surrogate_bit_percent.detach()),
@@ -744,14 +929,37 @@ class SurrogateCompressionLossMixin:
             "surrogate_objective_bit": self._scalar(surrogate_bit_percent.detach()),
             "surrogate_target_bit": self._scalar(target_percent),
             "surrogate_abs_bit_error": self._scalar(surrogate_abs_bit_error),
+            "surrogate_signed_bit_error": self._scalar(surrogate_signed_bit_error.detach()),
             "surrogate_abs_mean_error": self._scalar(surrogate_abs_bit_error),
             "surrogate_train_loss": self._scalar(L_sur),
             "surrogate_replay_size": int(len(getattr(self, "surrogate_replay", []))),
+            "surrogate_replay_sample_count": replay_sample_count,
+            "surrogate_replay_steps": replay_steps,
+            "surrogate_replay_used": teacher_replayed,
             "surrogate_forward_mode": forward_mode,
             "teacher_refresh": bool(teacher_refreshed),
+            "teacher_refreshed": bool(teacher_refreshed),
+            "teacher_replayed": bool(teacher_replayed),
+            "teacher_stale": bool(teacher_stale),
+            "teacher_skipped": bool(teacher_skipped),
+            "teacher_mode": teacher_mode,
             "teacher_cache_hit": target_cache_hit,
+            "teacher_target_age": int(teacher_target_age),
+            "teacher_refresh_interval": int(getattr(args, "compression_surrogate_refresh_interval", 0)),
+            "actual_eval_interval": int(getattr(args, "actual_eval_interval", 0)),
+            "reuse_last_target": bool(getattr(args, "compression_surrogate_reuse_last_target", True)),
             "teacher_refresh_policy": self._surrogate_refresh_policy_label(args),
             "surrogate_backward_enabled": bool(inputs_finite),
+            "surrogate_update_during_training": bool(getattr(args, "surrogate_update_during_training", True)),
+            "surrogate_update_interval": int(getattr(args, "surrogate_update_interval", 1)),
+            "surrogate_update_on_teacher_refresh_only": bool(
+                getattr(args, "surrogate_update_on_teacher_refresh_only", False)
+            ),
+            "surrogate_pretrain_active": bool(getattr(args, "_surrogate_pretrain_active", False)),
+            "surrogate_pretrain_mode": pretrain_mode,
+            "surrogate_pretrain_teacher_type": pretrain_teacher_type,
+            "surrogate_pretrain_actual_scope": str(getattr(args, "_surrogate_pretrain_actual_scope", "")),
+            "surrogate_pretrain_full_calibration": bool(getattr(args, "_surrogate_pretrain_full_calibration", False)),
             "inputs_finite": bool(inputs_finite),
             "gt_octree_node": gt_octree_node_value,
             "gen_octree_node": gen_octree_node_value,

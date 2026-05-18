@@ -20,6 +20,11 @@ def log_basic_setup(writer, args, file_day, file_time):
         f"geometry={'ste_hard' if args.discrete_loss_mode == 'ste_hard' else ('weighted_soft' if args.discrete_loss_mode == 'weighted_soft' else 'hard')}, "
         f"compression={args.compression_loss_backend}"
     )
+    if str(getattr(args, "discrete_loss_mode", "")).strip().lower() == "hard":
+        writer.write(
+            "Discrete Loss Warning: hard mode sets final_w_for_loss=None in train.py; "
+            "delete weights are not used by geometry/compression losses. Prefer ste_hard for learning."
+        )
     writer.write(
         "Compression Delta Sign: "
         "delta_percent=(after_bits-before_bits)/before_bits*100; negative means improved compression."
@@ -48,6 +53,7 @@ def log_loss_weight_setup(writer, args):
         writer.write(
             "Compression Teacher Refresh: "
             f"periodic(interval={int(getattr(args, 'compression_surrogate_refresh_interval', 0))}, "
+            f"actual_eval_interval={int(getattr(args, 'actual_eval_interval', 1000))}, "
             f"warmup_steps={int(getattr(args, 'compression_surrogate_warmup_steps', 0))}, "
             f"replay_steps={int(getattr(args, 'compression_surrogate_replay_steps', 0))}, "
             f"replay_batch={int(getattr(args, 'compression_surrogate_replay_batch', 0))}, "
@@ -55,6 +61,24 @@ def log_loss_weight_setup(writer, args):
             f"aux_node={float(getattr(args, 'compression_surrogate_aux_node_weight', 0.0))}, "
             f"aux_single={float(getattr(args, 'compression_surrogate_aux_single_weight', 0.0))}, "
             f"reuse_last_target={bool(getattr(args, 'compression_surrogate_reuse_last_target', True))})"
+        )
+        writer.write(
+            "Surrogate Pretrain/Online Update: "
+            f"pretrain_steps={int(getattr(args, 'surrogate_pretrain_steps', 0))}, "
+            f"pretrain_lr={float(getattr(args, 'surrogate_pretrain_lr', 1e-4))}, "
+            f"pretrain_mode={getattr(args, 'surrogate_pretrain_mode', 'full')}, "
+            f"pretrain_subtree_teacher={getattr(args, 'surrogate_pretrain_subtree_teacher_type', 'local_proxy')}, "
+            f"pretrain_full_calibration_interval={int(getattr(args, 'surrogate_pretrain_full_calibration_interval', 0))}, "
+            f"pretrain_full_calibration_steps={int(getattr(args, 'surrogate_pretrain_full_calibration_steps', 1))}, "
+            f"pretrain_actual_refresh_interval={int(getattr(args, 'surrogate_pretrain_actual_refresh_interval', 0))}, "
+            f"pretrain_replay={bool(getattr(args, 'surrogate_pretrain_use_replay', True))}, "
+            f"pretrain_replay_steps={int(getattr(args, 'surrogate_pretrain_replay_steps', 0))}, "
+            f"pretrain_replay_batch={int(getattr(args, 'surrogate_pretrain_replay_batch_size', 0))}, "
+            f"pretrain_sparsepcgc_debug_interval={int(getattr(args, 'surrogate_pretrain_sparsepcgc_debug_interval', 0))}, "
+            f"update_during_training={bool(getattr(args, 'surrogate_update_during_training', True))}, "
+            f"update_interval={int(getattr(args, 'surrogate_update_interval', 1))}, "
+            f"joint_lr_scale={float(getattr(args, 'surrogate_joint_lr_scale', 0.1))}, "
+            f"teacher_refresh_only={bool(getattr(args, 'surrogate_update_on_teacher_refresh_only', False))}"
         )
         writer.write("Compression Surrogate Backward: enabled")
         writer.write(
@@ -106,7 +130,23 @@ def log_runtime_setup(writer, args):
         f"log_gpu_memory={bool(getattr(args, 'log_gpu_memory', True))}, "
         f"profile_interval={int(getattr(args, 'profile_interval', 100))}, "
         f"actual_eval_interval={int(getattr(args, 'actual_eval_interval', 1000))}, "
-        f"disable_actual_codec_during_train={bool(getattr(args, 'disable_actual_codec_during_train', False))}"
+        f"disable_actual_codec_during_train={bool(getattr(args, 'disable_actual_codec_during_train', False))}, "
+        f"actual_codec_fallback_to_proxy_on_error={bool(getattr(args, 'actual_codec_fallback_to_proxy_on_error', True))}"
+    )
+    writer.write(
+        "Checkpoint Selection: "
+        "primary=actual_total_bit_percent(fresh only), "
+        f"geom_gate={bool(getattr(args, 'checkpoint_geom_gate', True))}"
+        f"(rel={float(getattr(args, 'checkpoint_geom_rel_factor', 1.5)):.6g}, "
+        f"abs={float(getattr(args, 'checkpoint_geom_abs_max', 0.0)):.6g}), "
+        f"safety_gate={bool(getattr(args, 'checkpoint_safety_gate', True))}"
+        f"(repair_abs={float(getattr(args, 'checkpoint_repair_abs_max', 10.0)):.6g}, "
+        f"node_abs={float(getattr(args, 'checkpoint_node_abs_max', 100.0)):.6g}, "
+        f"single_abs={float(getattr(args, 'checkpoint_single_abs_max', 100.0)):.6g}, "
+        f"op_ratio_max={float(getattr(args, 'checkpoint_operation_ratio_max', 100.0)):.6g}), "
+        f"metric_csv[compression={bool(getattr(args, 'save_compression_metric_csv', True))}, "
+        f"operation={bool(getattr(args, 'save_operation_metric_csv', True))}, "
+        f"checkpoint={bool(getattr(args, 'save_checkpoint_metric_csv', True))}]"
     )
 
 
@@ -133,6 +173,17 @@ def log_codec_setup(writer, args):
             f"skip_decode={bool(getattr(args, 'sparsepcgc_skip_decode', True))}"
         )
         writer.write(
+            "SparsePCGC Operation Safety: "
+            f"disable_add={bool(getattr(args, 'sparsepcgc_disable_add', True))}, "
+            f"add_experiment={bool(getattr(args, 'sparsepcgc_enable_add_experiment', False))}, "
+            f"add_only_cp={bool(getattr(args, 'sparsepcgc_add_only_when_compression_primary', True))}, "
+            f"move_existing_target_only={bool(getattr(args, 'sparsepcgc_move_existing_target_only', True))}, "
+            f"target_add_ratio={float(getattr(args, 'target_add_ratio', 0.0))}, "
+            f"max_add_ratio={float(getattr(args, 'max_add_ratio', 0.0))}, "
+            f"exp_target={float(getattr(args, 'sparsepcgc_add_target_ratio', 0.001))}, "
+            f"exp_max={float(getattr(args, 'sparsepcgc_add_max_ratio', 0.003))}"
+        )
+        writer.write(
             "SparsePCGC Quantization Alignment: "
             "teacher=round(x/voxel_size)->unique->round(coord/posQuantscale)->unique, "
             f"network_sparse_quant=sparsepcgc_twostep, "
@@ -149,7 +200,8 @@ def log_codec_setup(writer, args):
             f"prequantize={bool(getattr(args, 'gpcc_prequantize', True))}, "
             f"effective_qs={float(getattr(args, 'gpcc_effective_qs', 0.0))}, "
             f"geometry_only={bool(getattr(args, 'gpcc_disable_attribute_coding', True))}, "
-            f"merge_duplicates={bool(getattr(args, 'gpcc_merge_duplicated_points', True))}"
+            f"merge_duplicates={bool(getattr(args, 'gpcc_merge_duplicated_points', True))}, "
+            f"timeout={float(getattr(args, 'gpcc_timeout', 120.0))}"
         )
 
     if compression_backend.startswith("draco"):

@@ -2,6 +2,7 @@ import argparse
 import csv
 import datetime
 import gc
+import multiprocessing as mp
 import os
 import time
 from pathlib import Path
@@ -12,7 +13,7 @@ from torch.utils.data import DataLoader
 
 from models.network import Network
 from models.utils.config.args import parse_pugan_args
-from models.utils.data.dataset import PlyDirDataset
+from models.utils.data.dataset import PlyDirDataset, clear_ply_cache
 from models.utils.io.utils_ply import write_ply
 from models.utils.pointcloud.utils_repkpu import rearrange
 from models.utils.testing.utils import (
@@ -29,6 +30,8 @@ from models.utils.testing.utils import (
 )
 from record.write import Writing
 
+def terminal_log(message):
+    print(str(message), flush=True)
 
 def _sync_cuda(use_cuda):
     if use_cuda and torch.cuda.is_available():
@@ -57,20 +60,56 @@ def _ratio(count, denom):
     return float(count) / max(float(denom), 1.0)
 
 
+def _sparsepcgc_unique_count(points_3n, args):
+    if points_3n is None or points_3n.numel() == 0:
+        return 0
+    voxel_size = max(float(getattr(args, "sparsepcgc_voxel_size", 1.0)), 1e-9)
+    pos_q = max(int(getattr(args, "sparsepcgc_pos_quantscale", 1)), 1)
+    coords = torch.round(points_3n[:3, :].transpose(0, 1).contiguous().to(torch.float32) / voxel_size)
+    if pos_q > 1:
+        coords = torch.round(coords / float(pos_q))
+    coords = coords.to(torch.long)
+    if coords.numel() == 0:
+        return 0
+    return int(torch.unique(coords, dim=0).shape[0])
+
+
 def _csv_fields():
     return [
         "sample_id",
         "input_path",
         "output_path",
         "inference_mode",
+        "train_or_eval_mode",
+        "hardening_mode",
+        "selection_threshold",
+        "topk_selected_count",
         "input_points",
         "output_points",
+        "output_unique_count",
+        "codec_points_before",
+        "codec_points_after",
+        "codec_unique_before",
+        "codec_unique_after",
+        "active_coord_before",
+        "active_coord_after",
         "add_points",
         "delete_points",
         "adjust_points",
         "add_ratio",
         "delete_ratio",
         "adjust_ratio",
+        "soft_add_count",
+        "hard_add_count",
+        "add_effective_count",
+        "add_prob_mean",
+        "add_prob_max",
+        "add_score_mean",
+        "add_score_max",
+        "add_candidate_ratio",
+        "add_candidate_count",
+        "add_after_quant_unique_count",
+        "add_removed_by_unique_count",
         "preserve_ratio",
         "same_voxel_adjust_count",
         "different_voxel_move_count",
@@ -96,9 +135,7 @@ def _csv_fields():
 
 def _output_point_path(args, step, input_path):
     output_dir = Path(os.path.abspath(os.path.expanduser(args.save_ply_dir)))
-    stem = Path(input_path).stem
-    return output_dir / f"{step:04d}_{stem}_edited.ply"
-
+    return output_dir / f"{step:04d}_Mine.ply"
 
 def _save_output_points(args, step, input_path, gen_pts):
     if not bool(getattr(args, "save_test_ply", False)):
@@ -178,6 +215,60 @@ def _load_trained_model(args, writer):
     return model
 
 
+def _mp_start_method(args):
+    method = str(getattr(args, "mp_start_method", "auto")).strip().lower()
+    if method in {"", "none"}:
+        method = "auto"
+    if method != "auto" and method not in mp.get_all_start_methods():
+        choices = ", ".join(["auto"] + mp.get_all_start_methods())
+        raise ValueError(f"--mp_start_method must be one of: {choices}")
+    return method
+
+
+def _configure_mp_start_method(args):
+    method = _mp_start_method(args)
+    if method == "auto":
+        return
+    current = mp.get_start_method(allow_none=True)
+    if current != method:
+        mp.set_start_method(method, force=True)
+
+
+def _build_test_loader_kwargs(args, use_cuda, writer):
+    requested_workers = max(int(getattr(args, "num_workers", 0)), 0)
+    loader_kwargs = {
+        "batch_size": 1,
+        "shuffle": False,
+        "num_workers": requested_workers,
+        "pin_memory": bool(use_cuda and getattr(args, "pin_memory", False)),
+    }
+    if requested_workers <= 0:
+        return loader_kwargs
+
+    method = _mp_start_method(args)
+    cuda_fork_unsafe = (
+        use_cuda
+        and torch.cuda.is_available()
+        and torch.cuda.is_initialized()
+        and method in {"auto", "fork"}
+    )
+    if cuda_fork_unsafe:
+        loader_kwargs["num_workers"] = 0
+        writer.write(
+            "DataLoader workers were disabled for test.py because CUDA was already initialized "
+            f"and fork workers can segfault ({requested_workers} requested). "
+            "Use --mp_start_method spawn to keep worker loading enabled."
+        )
+        return loader_kwargs
+
+    if method != "auto":
+        loader_kwargs["multiprocessing_context"] = mp.get_context(method)
+    loader_kwargs["persistent_workers"] = bool(getattr(args, "persistent_workers", False))
+    if bool(getattr(args, "clear_main_ply_cache_for_workers", True)):
+        clear_ply_cache()
+    return loader_kwargs
+
+
 def _write_summary(rows, writer):
     if not rows:
         writer.write("InferenceProfileSummary: no samples processed")
@@ -231,6 +322,9 @@ def test(model, args, writer):
     writer.write(f"output_log: {args.output_log}")
     writer.write(f"save_output_points: {bool(getattr(args, 'save_test_ply', False))}")
     writer.write(f"output_dir: {args.save_ply_dir}")
+    terminal_log(f"Profile CSV: {args.output_log}")
+    terminal_log(f"Save output points: {bool(getattr(args, 'save_test_ply', False))}")
+    terminal_log(f"Output point directory: {args.save_ply_dir}")
     writer.write(
         "Disabled in test.py: compression codec eval, actual compression delta, "
         "before/after bits, BD-rate, D1/D2, Chamfer, point-to-plane, codec temp files."
@@ -238,15 +332,20 @@ def test(model, args, writer):
 
     dataset = PlyDirDataset(args, args.input_dir_test)
     use_cuda = next(model.parameters()).is_cuda
-    loader_kwargs = {
-        "batch_size": 1,
-        "shuffle": False,
-        "num_workers": max(int(getattr(args, "num_workers", 0)), 0),
-        "pin_memory": bool(use_cuda and getattr(args, "pin_memory", False)),
-    }
-    if loader_kwargs["num_workers"] > 0:
-        loader_kwargs["persistent_workers"] = bool(getattr(args, "persistent_workers", False))
+    loader_kwargs = _build_test_loader_kwargs(args, use_cuda, writer)
+    writer.write(
+        "DataLoader: "
+        f"files={len(dataset)}, workers={loader_kwargs['num_workers']}, "
+        f"pin_memory={loader_kwargs['pin_memory']}, "
+        f"ply_loader={getattr(args, 'ply_loader', 'numpy')}"
+    )
     loader = DataLoader(dataset, **loader_kwargs)
+    terminal_log(
+        "DataLoader Ready: "
+        f"files={len(dataset)}, workers={loader_kwargs['num_workers']}, "
+        f"pin_memory={loader_kwargs['pin_memory']}, "
+        f"ply_loader={getattr(args, 'ply_loader', 'numpy')}"
+    )
 
     output_log = Path(os.path.abspath(os.path.expanduser(args.output_log)))
     output_log.parent.mkdir(parents=True, exist_ok=True)
@@ -269,6 +368,12 @@ def test(model, args, writer):
         for step, pts in enumerate(loader):
             if max_samples > 0 and len(rows) >= max_samples:
                 break
+
+            total_files = len(dataset)
+            if max_samples > 0:
+                total_files = min(total_files, max_samples)
+
+            terminal_log(f"Step Start: step={step + 1}/{total_files}")
 
             sample_start = time.perf_counter()
             data_loading_time = sample_start - fetch_start
@@ -346,6 +451,8 @@ def test(model, args, writer):
 
             input_points = int(input_pcd.shape[-1])
             output_points = int(gen_pts.shape[-1])
+            codec_unique_before = _sparsepcgc_unique_count(input_pcd[0, :3, :], args)
+            codec_unique_after = _sparsepcgc_unique_count(gen_pts[0, :3, :], args)
             add_points = _to_int(
                 structure_debug.get("add_actual_point_count", edit_stats.get("added_points", 0))
             )
@@ -359,20 +466,49 @@ def test(model, args, writer):
                     max(0.0, 1.0 - _ratio(add_points + delete_points + adjust_points, input_points)),
                 )
             )
+            add_candidate_ratio = _to_float(structure_debug.get("add_candidate_ratio", 0.0))
+            add_candidate_count = int(round(float(input_points) * add_candidate_ratio))
+            soft_add_count = _to_float(structure_debug.get("add_ratio", 0.0)) * float(input_points)
+            positive_unique_delta = max(codec_unique_after - codec_unique_before, 0)
+            add_removed_by_unique = max(add_points - positive_unique_delta, 0)
 
             row = {
                 "sample_id": step,
                 "input_path": input_path,
                 "output_path": output_path,
                 "inference_mode": inference_result.get("mode", requested_mode),
+                "train_or_eval_mode": "test",
+                "hardening_mode": hardening_info.get("mode", "none"),
+                "selection_threshold": _to_float(
+                    getattr(args, "operation_count_drop_threshold", getattr(args, "test_drop_threshold", 0.5))
+                ),
+                "topk_selected_count": hardening_info.get("keep_count", output_points),
                 "input_points": input_points,
                 "output_points": output_points,
+                "output_unique_count": codec_unique_after,
+                "codec_points_before": input_points,
+                "codec_points_after": output_points,
+                "codec_unique_before": codec_unique_before,
+                "codec_unique_after": codec_unique_after,
+                "active_coord_before": codec_unique_before,
+                "active_coord_after": codec_unique_after,
                 "add_points": add_points,
                 "delete_points": delete_points,
                 "adjust_points": adjust_points,
                 "add_ratio": _ratio(add_points, input_points),
                 "delete_ratio": _ratio(delete_points, input_points),
                 "adjust_ratio": _ratio(adjust_points, input_points),
+                "soft_add_count": soft_add_count,
+                "hard_add_count": add_points,
+                "add_effective_count": add_points,
+                "add_prob_mean": _to_float(structure_debug.get("add_prob_mean", 0.0)),
+                "add_prob_max": _to_float(structure_debug.get("add_prob_max", 0.0)),
+                "add_score_mean": _to_float(structure_debug.get("add_priority_mean", 0.0)),
+                "add_score_max": _to_float(structure_debug.get("add_priority_max", 0.0)),
+                "add_candidate_ratio": add_candidate_ratio,
+                "add_candidate_count": add_candidate_count,
+                "add_after_quant_unique_count": positive_unique_delta,
+                "add_removed_by_unique_count": add_removed_by_unique,
                 "preserve_ratio": preserve_ratio,
                 "same_voxel_adjust_count": _to_int(structure_debug.get("same_voxel_adjust_count", 0)),
                 "different_voxel_move_count": _to_int(structure_debug.get("moved_different_voxel_count", 0)),
@@ -408,6 +544,21 @@ def test(model, args, writer):
                 f"add={add_points}, delete={delete_points}, adjust={adjust_points}, "
                 f"preserve_ratio={preserve_ratio:.6f}, total={total_inference_time:.6f}s"
             )
+            total_files = len(dataset)
+            shown_step = step + 1
+
+            terminal_log(
+                "Progress: "
+                f"step={shown_step}/{total_files}, "
+                f"sample_id={step}, "
+                f"input={input_points}, output={output_points}, "
+                f"add={add_points}, delete={delete_points}, adjust={adjust_points}, "
+                f"forward={row['model_forward_total_time']:.6f}s, "
+                f"preprocess={row['preprocess_time']:.6f}s, "
+                f"postprocess={row['postprocess_time']:.6f}s, "
+                f"save={row['save_time']:.6f}s, "
+                f"total={total_inference_time:.6f}s"
+            )
             if raw_points != input_points:
                 writer.write(f"InputDownsample: {raw_points} -> {input_points}")
             if profile_this_sample:
@@ -433,7 +584,8 @@ def test(model, args, writer):
                     f"kept_original={hardening_counts['kept_original']}, "
                     f"deleted_original={hardening_counts['deleted_original']}, "
                     f"kept_added={hardening_counts['kept_added']}, "
-                    f"deleted_added={hardening_counts['deleted_added']}"
+                    f"deleted_added={hardening_counts['deleted_added']}, "
+                    f"nonfinite_w={hardening_info.get('weight_nonfinite_count', 0)}"
                 )
 
             fetch_start = time.perf_counter()
@@ -456,6 +608,7 @@ if __name__ == "__main__":
     parser.add_argument("--trainORtest", default="test", type=str, help="run mode")
     args = parse_pugan_args(parser, file_day, file_time)
     args.trainORtest = "test"
+    _configure_mp_start_method(args)
 
     if torch.cuda.is_available() and not args.cpu and args.use_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -479,15 +632,30 @@ if __name__ == "__main__":
     writer.write(f"Checkpoint Path: {args.ckpt}")
     writer.write(f"Profile CSV: {args.output_log}")
 
+    terminal_log("=== Test Setup Start ===")
+    terminal_log(f"Date of Testing: {file_day}-{file_time}")
+    terminal_log(f"Checkpoint Path: {args.ckpt}")
+    terminal_log(f"Profile CSV: {args.output_log}")
+
+    model_load_start = time.perf_counter()
     model = _load_trained_model(args, writer)
+    model_load_time = time.perf_counter() - model_load_start
+
     writer.write("Model checkpoint loaded. model.eval() is active.")
+    terminal_log(f"=== Setup Complete === model_load_time={model_load_time:.3f}s")
 
     start = time.perf_counter()
     writer.write("=== Start Inference Profiling ===")
+    terminal_log("=== Start Inference Profiling ===")
+
     test(model, args, writer)
     elapsed = time.perf_counter() - start
 
     finish_date = datetime.datetime.now().strftime("%Y/%m/%d - %H:%M:%S")
     writer.write(f"Testing time: {elapsed}")
     writer.write(f"Date of finishing testing: {finish_date}")
+
+    terminal_log(f"=== Testing Finished === elapsed={elapsed:.3f}s")
+    terminal_log(f"Date of finishing testing: {finish_date}")
+
     writer.close()

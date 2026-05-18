@@ -19,6 +19,21 @@ def _to_float(value, default=0.0):
         return float(default)
 
 
+def _compression_debug_fresh_actual(args, comp_debug):
+    backend = str(getattr(args, "compression_loss_backend", "proxy")).strip().lower()
+    if bool(comp_debug.get("actual_value_is_fresh", False)):
+        return True
+    if backend.endswith("_surrogate"):
+        return bool(comp_debug.get("teacher_refresh", False))
+    if "_actual" in backend:
+        return (
+            not bool(comp_debug.get("actual_codec_disabled_during_train", False))
+            and not bool(comp_debug.get("actual_codec_skipped_by_interval", False))
+            and not bool(comp_debug.get("actual_codec_fallback_to_proxy", False))
+        )
+    return False
+
+
 def log_step_loss(
     writer,
     step,
@@ -64,19 +79,37 @@ def log_compression_stats(writer, step, num_steps, comp_debug):
         f"->{float(comp_debug.get('gen_actual_bit', float('nan'))):.6f}, "
         f"actual_bit_percent={float(comp_debug.get('actual_total_bit_percent', comp_debug.get('total_bit', 0.0))):.6f}, "
         f"codec_points={int(comp_debug.get('gt_points', 0))}->{int(comp_debug.get('gen_points', 0))}, "
+        f"unique_coords={int(comp_debug.get('gt_unique_coord_count', 0))}->{int(comp_debug.get('gen_unique_coord_count', 0))}, "
+        f"actual_encode_time={float(comp_debug.get('actual_encode_time_total', 0.0)):.4f}s"
+        f"(before={float(comp_debug.get('gt_actual_encode_time', 0.0)):.4f}, "
+        f"after={float(comp_debug.get('gen_actual_encode_time', 0.0)):.4f}), "
         f"objective={float(comp_debug.get('compression_objective', comp_debug.get('total_bit', 0.0))):.6f}, "
         f"surrogate_bit_percent={float(comp_debug.get('surrogate_pred_bit', 0.0)):.6f}, "
         f"surrogate_target_bit={float(comp_debug.get('surrogate_target_bit', 0.0)):.6f}, "
         f"surrogate_abs_bit_error={float(comp_debug.get('surrogate_abs_bit_error', 0.0)):.6f}, "
+        f"surrogate_signed_bit_error={float(comp_debug.get('surrogate_signed_bit_error', 0.0)):.6f}, "
         f"surrogate_train_loss={float(comp_debug.get('surrogate_train_loss', 0.0)):.6f}, "
+        f"lcom_main={float(comp_debug.get('compression_main_loss', 0.0)):.6f}, "
+        f"lcom_aux={float(comp_debug.get('compression_aux_loss', 0.0)):.6f}, "
+        f"lcom_sparsepcgc_aux={float(comp_debug.get('sparsepcgc_aux_loss', 0.0)):.6f}, "
+        f"sparsepcgc_aux_weighted={float(comp_debug.get('sparsepcgc_aux_weighted', 0.0)):.6f}, "
+        f"lcom_without_sparse={float(comp_debug.get('lcom_without_sparsepcgc_aux', 0.0)):.6f}, "
         f"soft_node={float(comp_debug.get('soft_node_percent', 0.0)):.6f}, "
         f"soft_single={float(comp_debug.get('soft_single_percent', 0.0)):.6f}, "
         f"octree_node:{float(comp_debug.get('gt_octree_node', 0.0)):.1f}->{float(comp_debug.get('gen_octree_node', 0.0)):.1f}, "
         f"octree_single:{float(comp_debug.get('gt_octree_single', 0.0)):.1f}->{float(comp_debug.get('gen_octree_single', 0.0)):.1f}, "
         f"teacher_codec={comp_debug.get('teacher_codec', 'unknown')}, "
         f"teacher_refresh={bool(comp_debug.get('teacher_refresh', False))}, "
+        f"teacher_mode={comp_debug.get('teacher_mode', 'unknown')}, "
         f"teacher_cache_hit={comp_debug.get('teacher_cache_hit', 'unknown')}, "
+        f"teacher_target_age={int(comp_debug.get('teacher_target_age', 0))}, "
+        f"actual_value_source={comp_debug.get('actual_value_source', 'unknown')}, "
+        f"actual_value_is_fresh={bool(comp_debug.get('actual_value_is_fresh', False))}, "
+        f"teacher_interval={int(comp_debug.get('teacher_refresh_interval', 0))}, "
+        f"actual_eval_interval={int(comp_debug.get('actual_eval_interval', 0))}, "
+        f"reuse_last_target={bool(comp_debug.get('reuse_last_target', True))}, "
         f"replay={int(comp_debug.get('surrogate_replay_size', 0))}, "
+        f"replay_samples={int(comp_debug.get('surrogate_replay_sample_count', 0))}, "
         f"teacher_policy={comp_debug.get('teacher_refresh_policy', 'unknown')}"
     )
 
@@ -106,7 +139,11 @@ def log_compression_train_debug(writer, step, num_steps, args, comp_debug, loss,
         f"delta={float(comp_debug.get('uniform_noise_delta', 0.0)):.6g}, "
         f"mean_abs={float(comp_debug.get('uniform_noise_mean_abs', 0.0)):.6g}], "
         f"actual_codec[disabled={bool(comp_debug.get('actual_codec_disabled_during_train', False))}, "
-        f"skipped_by_interval={bool(comp_debug.get('actual_codec_skipped_by_interval', False))}], "
+        f"skipped_by_interval={bool(comp_debug.get('actual_codec_skipped_by_interval', False))}, "
+        f"fallback_to_proxy={bool(comp_debug.get('actual_codec_fallback_to_proxy', False))}, "
+        f"fresh={bool(comp_debug.get('actual_value_is_fresh', False))}, "
+        f"source={comp_debug.get('actual_value_source', 'unknown')}, "
+        f"error={str(comp_debug.get('actual_codec_error', ''))[:160]}], "
         f"weights[w_com={float(getattr(args, 'w_com', 0.0)):.6g}, "
         f"com_bit={float(getattr(args, 'com_bit', 0.0)):.6g}, "
         f"com_single={float(getattr(args, 'com_sin', 0.0)):.6g}, "
@@ -117,7 +154,12 @@ def log_compression_train_debug(writer, step, num_steps, args, comp_debug, loss,
         f"terms[bit={_to_float(terms.get('bit', L_com.new_zeros(()))):.6f}, "
         f"single={_to_float(terms.get('single', L_com.new_zeros(()))):.6f}, "
         f"node={_to_float(terms.get('node', L_com.new_zeros(()))):.6f}, "
-        f"sparsepcgc={_to_float(terms.get('sparsepcgc', L_com.new_zeros(()))):.6f}]"
+        f"sparsepcgc={_to_float(terms.get('sparsepcgc', L_com.new_zeros(()))):.6f}], "
+        f"corr[surrogate={_to_float(comp_debug.get('corr_surrogate_actual', float('nan')), float('nan')):.6f}, "
+        f"lcom={_to_float(comp_debug.get('corr_lcom_actual', float('nan')), float('nan')):.6f}, "
+        f"cp_main={_to_float(comp_debug.get('corr_cp_main_actual', float('nan')), float('nan')):.6f}, "
+        f"sparse_aux={_to_float(comp_debug.get('corr_sparsepcgc_aux_actual', float('nan')), float('nan')):.6f}, "
+        f"lcom_no_sparse={_to_float(comp_debug.get('corr_lcom_without_sparsepcgc_aux_actual', float('nan')), float('nan')):.6f}]"
     )
 
     return before_node, after_node, before_single, after_single
@@ -141,6 +183,12 @@ def log_codec_actual_correlation(
 
     if actual_delta_for_corr is None:
         return
+    if not _compression_debug_fresh_actual(args, comp_debug):
+        writer.write(
+            f"CodecActualCorrelation step={step + 1}/{num_steps}: "
+            "skipped because actual delta is cached or proxy-derived."
+        )
+        return
 
     codec_for_corr = str(
         comp_debug.get("teacher_codec", getattr(args, "compress", "unknown"))
@@ -152,6 +200,10 @@ def log_codec_actual_correlation(
         "node_delta": after_node - before_node,
         "single_delta": after_single - before_single,
         "point_delta": int(comp_debug.get("gen_points", 0)) - int(comp_debug.get("gt_points", 0)),
+        "unique_coord_delta": int(comp_debug.get("gen_unique_coord_count", 0)) - int(comp_debug.get("gt_unique_coord_count", 0)),
+        "surrogate_pred": comp_debug.get("surrogate_pred_bit", None),
+        "sparsepcgc_aux": comp_debug.get("sparsepcgc_aux_weighted", comp_debug.get("sparsepcgc_aux_loss", None)),
+        "lcom_without_sparsepcgc_aux": comp_debug.get("lcom_without_sparsepcgc_aux", None),
     }
 
     if "sparsepcgc_before_active_coords" in comp_debug:
@@ -160,6 +212,7 @@ def log_codec_actual_correlation(
             "sparse_occupied_delta": comp_debug.get("sparsepcgc_occupied_voxel_delta", None),
             "sparse_isolated_delta": comp_debug.get("sparsepcgc_isolated_delta", None),
             "sparse_density_var_delta": comp_debug.get("sparsepcgc_local_density_var_delta", None),
+            "sparse_density_delta": comp_debug.get("sparsepcgc_sparse_density_delta", None),
             "sparse_neighbor_delta": comp_debug.get("sparsepcgc_mean_neighbors_delta", None),
             "sparse_duplicate_delta": comp_debug.get("sparsepcgc_duplicate_delta", None),
         })
@@ -201,7 +254,11 @@ def log_sparsepcgc_train_debug(
         comp_debug.get("rate_proxy_delta", comp_debug.get("total_bit", None))
     )
 
-    if actual_delta_for_corr is not None and proxy_delta_for_corr is not None:
+    if (
+        actual_delta_for_corr is not None
+        and proxy_delta_for_corr is not None
+        and _compression_debug_fresh_actual(args, comp_debug)
+    ):
         sparsepcgc_proxy_actual_pairs.append((proxy_delta_for_corr, actual_delta_for_corr))
         max_corr_samples = max(int(getattr(args, "sparsepcgc_corr_window", 100)), 2)
         if len(sparsepcgc_proxy_actual_pairs) > max_corr_samples:
@@ -216,6 +273,8 @@ def log_sparsepcgc_train_debug(
         f"->{float(comp_debug.get('gen_actual_bit', float('nan'))):.6f}, "
         f"actual_delta_percent={float(comp_debug.get('actual_total_bit_percent', comp_debug.get('total_bit', 0.0))):.6f}, "
         f"proxy_actual_corr={proxy_actual_corr_text}, "
+        f"unique={int(comp_debug.get('gt_unique_coord_count', 0))}"
+        f"->{int(comp_debug.get('gen_unique_coord_count', 0))}, "
         f"active={int(comp_debug.get('sparsepcgc_before_active_coords', 0))}"
         f"->{int(comp_debug.get('sparsepcgc_after_active_coords', 0))}, "
         f"active_delta={int(comp_debug.get('sparsepcgc_active_coord_delta', 0))}, "

@@ -211,6 +211,8 @@ class ProxyCompressionLossMixin:
             "rate_proxy_before": float(stats_gt.get("bit", 0.0)),
             "rate_proxy_after": self._scalar(stats_gen.get("bit", 0.0)),
             "rate_proxy_delta": self._scalar(loss_total_bit),
+            "actual_value_is_fresh": False,
+            "actual_value_source": "proxy",
             "node_delta": self._scalar(nodes_gen - nodes_gt_t),
             "single_delta": self._scalar(single_gen - single_gt_t),
             "sparsepcgc_aux_loss": self._scalar(sparse_terms["loss"].detach()),
@@ -228,6 +230,7 @@ class ProxyCompressionLossMixin:
             final_w=final_w,
         )
         self._store_compression_terms(
+            main=L_bit_objective,
             bit=L_bit_objective,
             single=L_single_objective,
             node=L_nodes_objective,

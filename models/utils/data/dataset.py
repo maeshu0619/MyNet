@@ -123,32 +123,44 @@ def _try_import_open3d():
     return _o3d
 
 
-def load_ply(path, return_color=True):
+def _validate_loaded_points(points, path):
+    if points.ndim != 2 or points.shape[0] == 0 or points.shape[1] < 3:
+        raise ValueError(f"Empty or invalid point cloud: {path} (shape={points.shape})")
+    return np.ascontiguousarray(points, dtype=np.float32)
+
+
+def _load_ply_open3d(path, return_color=True):
     o3d = _try_import_open3d()
     if o3d is None:
-        pts = _load_ply_numpy(path, return_color=return_color)
-        if pts.ndim != 2 or pts.shape[0] == 0 or pts.shape[1] < 3:
-            raise ValueError(f"Empty or invalid point cloud: {path} (shape={pts.shape})")
-        return pts
+        return _load_ply_numpy(path, return_color=return_color)
 
     pcd = o3d.io.read_point_cloud(path)
-
-    # 座標 (N,3)
     xyz = np.asarray(pcd.points, dtype=np.float32)
-    if xyz.ndim != 2 or xyz.shape[0] == 0 or xyz.shape[1] != 3:
-        raise ValueError(f"Empty or invalid point cloud: {path} (shape={xyz.shape})")
 
     if not return_color:
         return xyz
 
-    # 色 (N,3) があるなら取得、なければゼロ埋め
     if pcd.has_colors():
-        rgb = np.asarray(pcd.colors, dtype=np.float32)  # 通常 0〜1
+        rgb = np.asarray(pcd.colors, dtype=np.float32)
     else:
         rgb = np.zeros_like(xyz, dtype=np.float32)
 
-    pts = np.concatenate([xyz, rgb], axis=1).astype(np.float32)
-    return pts
+    return np.concatenate([xyz, rgb], axis=1).astype(np.float32)
+
+
+def load_ply(path, return_color=True, loader="numpy"):
+    loader = str(loader or "numpy").strip().lower()
+    if loader in {"numpy", "np"}:
+        return _validate_loaded_points(_load_ply_numpy(path, return_color=return_color), path)
+    if loader in {"open3d", "o3d"}:
+        return _validate_loaded_points(_load_ply_open3d(path, return_color=return_color), path)
+    if loader == "auto":
+        try:
+            points = _load_ply_numpy(path, return_color=return_color)
+        except Exception:
+            points = _load_ply_open3d(path, return_color=return_color)
+        return _validate_loaded_points(points, path)
+    raise ValueError(f"Unsupported PLY loader: {loader}")
 
 
 def clear_ply_cache():
@@ -165,6 +177,7 @@ class PlyDirDataset(torch.utils.data.Dataset):
     def __init__(self, args, path):
         path = _resolve_data_path(path)
         self.use_cache = bool(getattr(args, "dataset_cache", True))
+        self.ply_loader = str(getattr(args, "ply_loader", "numpy")).strip().lower()
         if args.trainORtest == "train":
             max_files = args.max_files
         else:
@@ -199,7 +212,7 @@ class PlyDirDataset(torch.utils.data.Dataset):
             if cached is not None:
                 return cached
 
-        points = load_ply(path)
+        points = load_ply(path, loader=self.ply_loader)
         points = torch.from_numpy(points)
         if self.use_cache:
             _PLY_CACHE[path] = points

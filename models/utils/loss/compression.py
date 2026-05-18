@@ -1,3 +1,5 @@
+import time
+
 import numpy as np
 import torch
 
@@ -117,6 +119,7 @@ class CompressionLossMixin:
                 "active": 0,
                 "duplicates": 0,
                 "isolated": 0,
+                "sparse_density": 0.0,
                 "local_density_var": 0.0,
                 "mean_neighbors": 0.0,
             }
@@ -130,6 +133,7 @@ class CompressionLossMixin:
             "active": active,
             "duplicates": int(point_count - active),
             "isolated": isolated,
+            "sparse_density": float(active) / max(float(point_count), 1.0),
             "local_density_var": density_var,
             "mean_neighbors": mean_neighbors,
         }
@@ -140,11 +144,13 @@ class CompressionLossMixin:
             "active": 0,
             "duplicates": 0,
             "isolated": 0,
+            "sparse_density": 0.0,
             "local_density_var": 0.0,
             "mean_neighbors": 0.0,
         }
         if xyz is None:
             return stats
+        sparse_density_vals = []
         density_vals = []
         neighbor_vals = []
         with torch.no_grad():
@@ -153,8 +159,10 @@ class CompressionLossMixin:
                 item = self._sparsepcgc_hard_stats_single(args, pts_b)
                 for key in ("points", "active", "duplicates", "isolated"):
                     stats[key] += int(item[key])
+                sparse_density_vals.append(float(item["sparse_density"]))
                 density_vals.append(float(item["local_density_var"]))
                 neighbor_vals.append(float(item["mean_neighbors"]))
+        stats["sparse_density"] = float(sum(sparse_density_vals) / max(len(sparse_density_vals), 1))
         stats["local_density_var"] = float(sum(density_vals) / max(len(density_vals), 1))
         stats["mean_neighbors"] = float(sum(neighbor_vals) / max(len(neighbor_vals), 1))
         return stats
@@ -175,6 +183,9 @@ class CompressionLossMixin:
             "sparsepcgc_before_isolated_voxels": int(before["isolated"]),
             "sparsepcgc_after_isolated_voxels": int(after["isolated"]),
             "sparsepcgc_isolated_delta": int(after["isolated"] - before["isolated"]),
+            "sparsepcgc_before_sparse_density": float(before["sparse_density"]),
+            "sparsepcgc_after_sparse_density": float(after["sparse_density"]),
+            "sparsepcgc_sparse_density_delta": float(after["sparse_density"] - before["sparse_density"]),
             "sparsepcgc_before_local_density_var": float(before["local_density_var"]),
             "sparsepcgc_after_local_density_var": float(after["local_density_var"]),
             "sparsepcgc_local_density_var_delta": float(after["local_density_var"] - before["local_density_var"]),
@@ -186,11 +197,16 @@ class CompressionLossMixin:
     def _maybe_update_sparsepcgc_debug(self, args, debug, gen_xyz, gt_xyz, final_w=None, codec_name=None):
         if not self._is_sparsepcgc_context(args, codec_name=codec_name):
             return debug
+        debug["sparsepcgc_debug_collected"] = False
+        debug["sparsepcgc_debug_time"] = 0.0
         # SparsePCGCのhard統計はactive coordinate集合を実際に作るため重い。
         # 学習信号はsoft proxy側から流し、hard統計はログ/診断対象stepだけ計算する。
         if not bool(getattr(args, "_collect_sparsepcgc_debug", False)):
             return debug
+        start = time.time()
         debug.update(self._sparsepcgc_debug_metrics(args, gen_xyz=gen_xyz, gt_xyz=gt_xyz, final_w=final_w))
+        debug["sparsepcgc_debug_collected"] = True
+        debug["sparsepcgc_debug_time"] = float(time.time() - start)
         return debug
 
     def _sparsepcgc_aux_feature_terms(self, args, gen_xyz, gt_xyz, final_w):
@@ -329,8 +345,11 @@ class CompressionLossMixin:
         stats_list = []
         for b in range(xyz.shape[0]):
             pts_b = self._select_actual_points(xyz[b].to(torch.float32), final_w, args, b)
-            stats = dict(encoder.encode_bits(pts_b))
-            stats = self._attach_octree_aux_stats(args, pts_b, stats)
+            # actual codec評価は教師/ログ用で微分しない。ここをinference_modeにして、
+            # 外部codecやhard quantize周辺に不要な計算グラフを残さない。
+            with torch.inference_mode():
+                stats = dict(encoder.encode_bits(pts_b))
+                stats = self._attach_octree_aux_stats(args, pts_b, stats)
             stats_list.append(stats)
         total_bit = sum(s["bit"] for s in stats_list)
         total_single = sum(s["single"] for s in stats_list)
@@ -338,6 +357,8 @@ class CompressionLossMixin:
         total_points = sum(s["point_count"] for s in stats_list)
         total_octree_single = sum(float(s.get("octree_single", s.get("single", 0.0))) for s in stats_list)
         total_octree_node = sum(float(s.get("octree_node", s.get("node", 0.0))) for s in stats_list)
+        total_encode_time = sum(float(s.get("encode_time", 0.0)) for s in stats_list)
+        total_unique_coord = sum(int(s.get("unique_coord_count", s.get("point_count", 0))) for s in stats_list)
         max_octree_depth = max((int(s.get("octree_depth", 0)) for s in stats_list), default=0)
         total_leaf = sum(int(s.get("octree_leaf_count", s.get("point_count", 0))) for s in stats_list)
         return {
@@ -350,6 +371,8 @@ class CompressionLossMixin:
             "octree_node": float(total_octree_node),
             "octree_depth": int(max_octree_depth),
             "octree_leaf_count": int(total_leaf),
+            "encode_time": float(total_encode_time),
+            "unique_coord_count": int(total_unique_coord),
             "point_count": int(total_points),
             "codec": str(getattr(encoder, "codec_name", "octattention")),
             "per_batch": stats_list,
@@ -504,6 +527,7 @@ class CompressionLossMixin:
             self._relative_percent(float(stats_gen["node"]), float(cached_gt["node"]), ref_min=1.0)
         )
         self._store_compression_terms(
+            main=L_com,
             bit=L_com_hard,
             single=gen_xyz.new_zeros(()),
             node=gen_xyz.new_zeros(()),
@@ -521,6 +545,8 @@ class CompressionLossMixin:
             "gt_actual_bit": gt_bit,
             "gen_actual_bit": gen_bit,
             "actual_total_bit_percent": loss_bit_percent,
+            "actual_value_is_fresh": True,
+            "actual_value_source": "actual_codec",
             "rate_proxy_before": gt_bit,
             "rate_proxy_after": gen_bit,
             "rate_proxy_delta": loss_bit_percent,
@@ -622,15 +648,39 @@ class CompressionLossMixin:
                 self.last_compression_debug["actual_eval_interval"] = int(interval)
                 return L_com, loss_bit, loss_single, loss_nodes, cached_gt, stats_gt
         if backend in {"octattention_surrogate", "sparsepcgc_surrogate", "gpcc_surrogate", "draco_surrogate", "surrogate", "soft_surrogate"}:
-            return self._get_compression_loss_surrogate(
-                args,
-                gen_xyz=gen_xyz,
-                gt_xyz=gt_xyz,
-                final_w=final_w,
-                cache_key=cache_key,
-                refresh_actual_gen=refresh_actual_gen,
-                actual_gen_xyz=actual_gen_xyz,
-            )
+            try:
+                return self._get_compression_loss_surrogate(
+                    args,
+                    gen_xyz=gen_xyz,
+                    gt_xyz=gt_xyz,
+                    final_w=final_w,
+                    cache_key=cache_key,
+                    refresh_actual_gen=refresh_actual_gen,
+                    actual_gen_xyz=actual_gen_xyz,
+                )
+            except Exception as exc:
+                if not bool(getattr(args, "actual_codec_fallback_to_proxy_on_error", True)):
+                    raise
+                error_text = f"{type(exc).__name__}: {str(exc)}"
+                log_fn = getattr(self, "_log_surrogate_event", None)
+                if callable(log_fn):
+                    log_fn(
+                        "actual/surrogate teacher failed; falling back to proxy loss "
+                        f"for this step. backend={backend}, error={error_text[:500]}"
+                    )
+                L_com, loss_bit, loss_single, loss_nodes, cached_gt, stats_gt = self._get_compression_loss_proxy(
+                    args,
+                    gen_xyz=gen_xyz,
+                    gt_xyz=gt_xyz,
+                    final_w=final_w,
+                    cache_key=cache_key,
+                    run_grad_probe=True,
+                    actual_gen_xyz=actual_gen_xyz,
+                )
+                self.last_compression_debug["actual_codec_error"] = error_text[:1000]
+                self.last_compression_debug["actual_codec_fallback_to_proxy"] = True
+                self.last_compression_debug["requested_backend"] = backend
+                return L_com, loss_bit, loss_single, loss_nodes, cached_gt, stats_gt
         if backend in {"octattention_actual", "actual_octattention", "real_octattention", "sparsepcgc_actual", "gpcc_actual", "draco_actual"}:
             return self._get_compression_loss_actual_codec(
                 args,

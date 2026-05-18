@@ -463,9 +463,44 @@ class StructureRepairActuator(nn.Module):
         return start + (end - start) * phase
 
     def _max_add_ratio(self):
-        target_ratio = max(float(getattr(self.args, "target_add_ratio", 0.01)), 0.0)
-        max_ratio = max(float(getattr(self.args, "max_add_ratio", max(target_ratio, 0.0))), target_ratio)
+        target_ratio = self._target_add_ratio_value()
+        if self._sparsepcgc_add_experiment_active():
+            max_ratio = max(float(getattr(self.args, "sparsepcgc_add_max_ratio", 0.003)), target_ratio)
+            max_ratio = max_ratio * self._sparsepcgc_add_warmup()
+            max_ratio = max(max_ratio, target_ratio)
+        else:
+            max_ratio = max(float(getattr(self.args, "max_add_ratio", max(target_ratio, 0.0))), target_ratio)
         return max(max_ratio, 0.0)
+
+    def _target_add_ratio_value(self):
+        if self._sparsepcgc_add_experiment_active():
+            ratio = max(float(getattr(self.args, "sparsepcgc_add_target_ratio", 0.001)), 0.0)
+            return ratio * self._sparsepcgc_add_warmup()
+        return max(float(getattr(self.args, "target_add_ratio", 0.01)), 0.0)
+
+    def _sparsepcgc_add_warmup(self):
+        steps = max(int(getattr(self.args, "sparsepcgc_add_warmup_steps", 0)), 0)
+        if steps <= 0:
+            return 1.0
+        step = int(getattr(self.args, "_global_train_step", 0)) + 1
+        return min(1.0, max(0.0, float(step) / float(steps)))
+
+    def _sparsepcgc_add_experiment_active(self):
+        compress_key = (
+            str(getattr(self.args, "compress", ""))
+            .strip()
+            .lower()
+            .replace("-", "")
+            .replace("_", "")
+            .replace(" ", "")
+        )
+        if compress_key != "sparsepcgc":
+            return False
+        if not bool(getattr(self.args, "sparsepcgc_enable_add_experiment", False)):
+            return False
+        if bool(getattr(self.args, "sparsepcgc_add_only_when_compression_primary", True)):
+            return str(getattr(self.args, "loss_mode", "legacy_total")).strip().lower() == "compression_primary"
+        return True
 
     def _target_add_count(self, point_count):
         if point_count <= 0 or not self._add_enabled():
@@ -551,14 +586,35 @@ class StructureRepairActuator(nn.Module):
 
         snap_strength = float(getattr(self.args, "repair_snap_strength", getattr(self.args, "disp_snap_strength", 0.35)))
         max_offset = self._max_offset(pts_xyz, coord_scale)
-        stage = str(getattr(self.args, "training_stage", "joint")).strip().lower()
+        stage_raw = str(getattr(self.args, "training_stage", "joint")).strip().lower()
+        force_joint_actuator = (
+            str(getattr(self.args, "loss_mode", "legacy_total")).strip().lower() == "compression_primary"
+            and bool(getattr(self.args, "cp_force_joint_actuator", True))
+        )
+        # compression_primaryではloss構造を固定するため、actuator強度もjoint相当に固定する。
+        # legacy_totalでは既存のdiagnosis/joint差をそのまま残す。
+        stage = "joint" if force_joint_actuator else stage_raw
         if stage == "diagnosis":
             actuator_strength = float(getattr(self.args, "diagnosis_actuator_strength", 0.1))
         else:
             actuator_strength = float(getattr(self.args, "repair_actuator_strength", 1.0))
+        compress_key = (
+            str(getattr(self.args, "compress", ""))
+            .strip()
+            .lower()
+            .replace("-", "")
+            .replace("_", "")
+            .replace(" ", "")
+        )
+        sparsepcgc_context = compress_key == "sparsepcgc"
         add_enabled = self._add_enabled()
         prune_enabled = self._prune_enabled()
         disp_enabled = self._disp_enabled()
+        # SparsePCGCはSparse Tensorのactive coordinate数がbit数に直結しやすい。
+        # 新規empty voxelへのaddはactive coordinateを増やすため、既定ではSparsePCGC時だけ止める。
+        sparsepcgc_add_experiment_active = self._sparsepcgc_add_experiment_active()
+        if sparsepcgc_context and bool(getattr(self.args, "sparsepcgc_disable_add", True)) and not sparsepcgc_add_experiment_active:
+            add_enabled = False
         operation_enabled = add_enabled or prune_enabled or disp_enabled
         threshold_cap_mode = self._threshold_cap_mode()
 
@@ -690,6 +746,11 @@ class StructureRepairActuator(nn.Module):
         move_target_ratio = target_ratio if disp_enabled else 0.0
         require_empty_move = bool(getattr(self.args, "repair_move_require_empty_target", True))
         prefer_occupied_move = bool(getattr(self.args, "repair_move_prefer_occupied_target", False)) and not require_empty_move
+        # SparsePCGCではtargetを新規empty voxelにするとactive coordinateが増えやすい。
+        # 既存occupied targetへのmergeを優先し、sourceが空になる操作だけがactive削減へ効くようにする。
+        if sparsepcgc_context and bool(getattr(self.args, "sparsepcgc_move_existing_target_only", True)):
+            require_empty_move = False
+            prefer_occupied_move = True
         dropped_target_mask = self._neighbor_target_membership_mask(voxel_coords, hard_drop_mask)
         move_target_valid = torch.ones_like(move_score)
         if not disp_enabled:
@@ -805,6 +866,8 @@ class StructureRepairActuator(nn.Module):
                 - 0.45 * local_outlier_score
                 - 0.65 * shape_score
             )
+            if sparsepcgc_add_experiment_active and not bool(getattr(self.args, "sparsepcgc_add_use_candidate_score", True)):
+                add_prior = torch.zeros_like(add_prior)
             add_logit = learned_add_logit + add_prior
             if self.training and add_score_noise > 0.0:
                 add_logit = add_logit + self._gumbel_like(add_logit) * add_score_noise
@@ -888,9 +951,7 @@ class StructureRepairActuator(nn.Module):
                 final_w = torch.cat([final_w, added_w], dim=2)
 
                 add_ratio = added_w.sum() / max(float(B * N), 1.0)
-                target_add_ratio = pts_xyz.new_tensor(
-                    float(getattr(self.args, "target_add_ratio", 0.01)) if add_enabled else 0.0
-                )
+                target_add_ratio = pts_xyz.new_tensor(self._target_add_ratio_value() if add_enabled else 0.0)
                 if threshold_cap_mode:
                     max_add_ratio_t = pts_xyz.new_tensor(self._max_add_ratio())
                     add_ratio_loss = torch.relu(add_ratio - max_add_ratio_t).pow(2)
@@ -937,8 +998,26 @@ class StructureRepairActuator(nn.Module):
         )
         move_source_voxel_count_value = self._unique_voxel_count(voxel_coords, hard_move_mask)
         move_target_voxel_count_value = self._unique_voxel_count(move_target_voxel_coords, hard_move_mask)
+        move_source_emptied_voxel_count_value = self._selected_voxels_absent_count(
+            voxel_coords,
+            hard_move_mask,
+            final_voxel_coords,
+            hard_keep_mask,
+        )
+        move_target_new_voxel_count_value = self._selected_voxels_absent_count(
+            move_target_voxel_coords,
+            hard_move_mask,
+            voxel_coords,
+            selection_bool,
+        )
+        move_source_not_emptied_count_value = max(
+            int(move_source_voxel_count_value) - int(move_source_emptied_voxel_count_value),
+            0,
+        )
         same_voxel_adjust_count_value = int(same_voxel_move_mask.detach().sum().item())
         moved_different_voxel_count_value = int(moved_different_voxel_mask.detach().sum().item())
+        hard_drop_count_value = int(hard_drop.detach().sum().item())
+        hard_move_count_value = int(hard_move.detach().sum().item())
         preserve_hard = (~hard_drop_mask) & (~hard_move_mask)
         preserve_ratio = preserve_hard.to(dtype=pts_xyz.dtype).mean()
 
@@ -985,9 +1064,15 @@ class StructureRepairActuator(nn.Module):
             self.last_runtime_timing = {}
 
         self.debug_tensors = {
-            "repair_gate": repair_gate.mean().detach(),
+                "repair_gate": repair_gate.mean().detach(),
             "add_ratio": add_ratio.detach(),
+            "add_prob_mean": add_prob.mean().detach(),
+            "add_prob_max": add_prob.max().detach() if add_prob.numel() > 0 else pts_xyz.new_zeros(()).detach(),
+            "add_priority_mean": add_priority.mean().detach(),
+            "add_priority_max": add_priority.max().detach() if add_priority.numel() > 0 else pts_xyz.new_zeros(()).detach(),
             "add_candidate_ratio": pts_xyz.new_tensor(float(add_candidate_ratio)).detach(),
+            "sparsepcgc_add_experiment_enabled": pts_xyz.new_tensor(float(sparsepcgc_add_experiment_active)).detach(),
+            "sparsepcgc_add_warmup": pts_xyz.new_tensor(float(self._sparsepcgc_add_warmup())).detach(),
             "add_score_noise": pts_xyz.new_tensor(float(add_score_noise)).detach(),
             "add_weight_random_mix": pts_xyz.new_tensor(float(add_weight_random_mix)).detach(),
             "drop_score_noise": pts_xyz.new_tensor(float(drop_score_noise)).detach(),
@@ -995,6 +1080,8 @@ class StructureRepairActuator(nn.Module):
             "add_enabled": pts_xyz.new_tensor(float(add_enabled)).detach(),
             "prune_enabled": pts_xyz.new_tensor(float(prune_enabled)).detach(),
             "disp_enabled": pts_xyz.new_tensor(float(disp_enabled)).detach(),
+            "actuator_strength": pts_xyz.new_tensor(float(actuator_strength)).detach(),
+            "force_joint_actuator": pts_xyz.new_tensor(float(force_joint_actuator)).detach(),
             "threshold_cap_mode": pts_xyz.new_tensor(float(threshold_cap_mode)).detach(),
             "add_drop_conflict_loss": add_drop_conflict_loss.detach(),
             "added_keep_loss": added_keep_loss.detach(),
@@ -1005,19 +1092,25 @@ class StructureRepairActuator(nn.Module):
             "quant_score_mean": quant_score.mean().detach(),
             "delta_norm": delta_norm.mean().detach(),
             "moved_delta_mean": moved_delta_mean.detach(),
-            "move_ratio": hard_move.mean().detach(),
-            "move_score_mean": move_score.mean().detach(),
+                "move_ratio": hard_move.mean().detach(),
+                "hard_move_count": pts_xyz.new_tensor(float(hard_move_count_value)).detach(),
+                "move_score_mean": move_score.mean().detach(),
             "move_target_valid_ratio": move_target_valid.mean().detach(),
             "before_occupied_voxel_count": pts_xyz.new_tensor(float(before_occupied_voxels)).detach(),
             "after_occupied_voxel_count": pts_xyz.new_tensor(float(after_occupied_voxels)).detach(),
             "occupied_voxel_delta": pts_xyz.new_tensor(float(after_occupied_voxels - before_occupied_voxels)).detach(),
             "delete_target_voxel_count": pts_xyz.new_tensor(float(delete_target_voxel_count_value)).detach(),
             "delete_emptied_voxel_count": pts_xyz.new_tensor(float(delete_emptied_voxel_count_value)).detach(),
-            "delete_removed_point_count": pts_xyz.new_tensor(float(delete_removed_point_count_value)).detach(),
-            "add_target_voxel_count": pts_xyz.new_tensor(float(add_target_voxel_count_value)).detach(),
+                "delete_removed_point_count": pts_xyz.new_tensor(float(delete_removed_point_count_value)).detach(),
+                "hard_drop_ratio": hard_drop.mean().detach(),
+                "hard_drop_count": pts_xyz.new_tensor(float(hard_drop_count_value)).detach(),
+                "add_target_voxel_count": pts_xyz.new_tensor(float(add_target_voxel_count_value)).detach(),
             "add_actual_point_count": pts_xyz.new_tensor(float(add_effective_count_value)).detach(),
             "move_source_voxel_count": pts_xyz.new_tensor(float(move_source_voxel_count_value)).detach(),
             "move_target_voxel_count": pts_xyz.new_tensor(float(move_target_voxel_count_value)).detach(),
+            "move_source_emptied_voxel_count": pts_xyz.new_tensor(float(move_source_emptied_voxel_count_value)).detach(),
+            "move_target_new_voxel_count": pts_xyz.new_tensor(float(move_target_new_voxel_count_value)).detach(),
+            "move_source_not_emptied_count": pts_xyz.new_tensor(float(move_source_not_emptied_count_value)).detach(),
             "moved_different_voxel_count": pts_xyz.new_tensor(float(moved_different_voxel_count_value)).detach(),
             "same_voxel_adjust_count": pts_xyz.new_tensor(float(same_voxel_adjust_count_value)).detach(),
             "preserve_ratio": preserve_ratio.detach(),
@@ -1035,12 +1128,18 @@ class StructureRepairActuator(nn.Module):
             "repair_gate": repair_gate,
             "drop_prob": drop_prob,
             "keep_prob": keep_prob,
-            "add_prob": add_prob,
-            "add_priority": add_priority,
-            "add_ratio": add_ratio,
-            "add_count": add_count_value,
+                "add_prob": add_prob,
+                "add_priority": add_priority,
+                "add_ratio": add_ratio,
+                "add_prob_mean": add_prob.mean(),
+                "add_prob_max": add_prob.max() if add_prob.numel() > 0 else pts_xyz.new_zeros(()),
+                "add_priority_mean": add_priority.mean(),
+                "add_priority_max": add_priority.max() if add_priority.numel() > 0 else pts_xyz.new_zeros(()),
+                "add_count": add_count_value,
             "add_effective_count": add_effective_count_value,
             "add_candidate_ratio": float(add_candidate_ratio),
+            "sparsepcgc_add_experiment_enabled": bool(sparsepcgc_add_experiment_active),
+            "sparsepcgc_add_warmup": float(self._sparsepcgc_add_warmup()),
             "add_score_noise": float(add_score_noise),
             "add_weight_random_mix": float(add_weight_random_mix),
             "drop_score_noise": float(drop_score_noise),
@@ -1048,11 +1147,16 @@ class StructureRepairActuator(nn.Module):
             "add_enabled": bool(add_enabled),
             "prune_enabled": bool(prune_enabled),
             "disp_enabled": bool(disp_enabled),
+            "actuator_stage": stage,
+            "actuator_stage_raw": stage_raw,
+            "actuator_strength": float(actuator_strength),
+            "force_joint_actuator": bool(force_joint_actuator),
             "threshold_cap_mode": bool(threshold_cap_mode),
             "delta": delta,
             "primitive_delta": primitive_delta,
-            "move_ratio": hard_move.mean(),
-            "move_score_mean": move_score.mean(),
+                "move_ratio": hard_move.mean(),
+                "hard_move_count": hard_move_count_value,
+                "move_score_mean": move_score.mean(),
             "move_target_valid_ratio": move_target_valid.mean(),
             "moved_delta_mean": moved_delta_mean,
             "before_occupied_voxel_count": before_occupied_voxels,
@@ -1060,11 +1164,16 @@ class StructureRepairActuator(nn.Module):
             "occupied_voxel_delta": after_occupied_voxels - before_occupied_voxels,
             "delete_target_voxel_count": delete_target_voxel_count_value,
             "delete_emptied_voxel_count": delete_emptied_voxel_count_value,
-            "delete_removed_point_count": delete_removed_point_count_value,
-            "add_target_voxel_count": add_target_voxel_count_value,
+                "delete_removed_point_count": delete_removed_point_count_value,
+                "hard_drop_ratio": hard_drop.mean(),
+                "hard_drop_count": hard_drop_count_value,
+                "add_target_voxel_count": add_target_voxel_count_value,
             "add_actual_point_count": add_effective_count_value,
             "move_source_voxel_count": move_source_voxel_count_value,
             "move_target_voxel_count": move_target_voxel_count_value,
+            "move_source_emptied_voxel_count": move_source_emptied_voxel_count_value,
+            "move_target_new_voxel_count": move_target_new_voxel_count_value,
+            "move_source_not_emptied_count": move_source_not_emptied_count_value,
             "moved_different_voxel_count": moved_different_voxel_count_value,
             "same_voxel_adjust_count": same_voxel_adjust_count_value,
             "preserve_ratio": preserve_ratio,

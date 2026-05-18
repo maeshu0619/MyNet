@@ -516,16 +516,27 @@ def _compute_drop_hardening(final_w, args):
             "total_count": None,
         }
 
-    flat_w = final_w.reshape(-1)
+    flat_w_raw = final_w.detach().reshape(-1)
+    total_count = int(flat_w_raw.numel())
+    finite_mask = torch.isfinite(flat_w_raw)
+    nonfinite_count = int((~finite_mask).sum().item()) if total_count > 0 else 0
+    nan_count = int(torch.isnan(flat_w_raw).sum().item()) if total_count > 0 else 0
+    posinf_count = int((flat_w_raw == float("inf")).sum().item()) if total_count > 0 else 0
+    neginf_count = int((flat_w_raw == float("-inf")).sum().item()) if total_count > 0 else 0
+    flat_w = torch.nan_to_num(flat_w_raw, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
     drop_th = float(getattr(args, "test_drop_threshold", 0.5))
-    total_count = int(flat_w.numel())
+    if not np.isfinite(drop_th):
+        drop_th = 0.5
     keep_mask = flat_w >= drop_th
     keep_count = int(keep_mask.sum().item())
     expected_keep = None
     hardening_mode = "threshold"
 
     if total_count > 0 and (keep_count <= 0 or keep_count >= total_count):
-        expected_keep = int(round(float(flat_w.clamp(0.0, 1.0).sum().item())))
+        expected_keep_value = float(flat_w.sum().item())
+        if not np.isfinite(expected_keep_value):
+            expected_keep_value = float(keep_count)
+        expected_keep = int(round(expected_keep_value))
         expected_keep = min(max(expected_keep, 1), total_count)
         if 0 < expected_keep < total_count:
             topk_idx = torch.topk(flat_w, k=expected_keep, largest=True, sorted=False).indices
@@ -544,6 +555,10 @@ def _compute_drop_hardening(final_w, args):
         "weight_min": float(flat_w.min().detach().cpu()) if total_count > 0 else None,
         "weight_mean": float(flat_w.mean().detach().cpu()) if total_count > 0 else None,
         "weight_max": float(flat_w.max().detach().cpu()) if total_count > 0 else None,
+        "weight_nonfinite_count": nonfinite_count,
+        "weight_nan_count": nan_count,
+        "weight_posinf_count": posinf_count,
+        "weight_neginf_count": neginf_count,
     }
 
 

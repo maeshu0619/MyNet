@@ -1,26 +1,192 @@
 # models/utils/training/checkpointing.py
 
+import math
 import os
 import torch
 
 
-def save_episode_checkpoint(model, ckpt_dir, plot, writer, episode, best_loss):
+def _finite_float(value, default=None):
+    if torch.is_tensor(value):
+        try:
+            value = float(value.detach().cpu())
+        except Exception:
+            return default
+    try:
+        value = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return value if math.isfinite(value) else default
+
+
+def _save_state_dict(model, ckpt_dir, filename):
+    path = os.path.join(ckpt_dir, filename)
+    torch.save(model.state_dict(), path)
+    return path
+
+
+def _ensure_best_trackers(best_trackers, best_loss):
+    if best_trackers is None:
+        best_trackers = {}
+    best_trackers.setdefault("legacy_loss", _finite_float(best_loss, float("inf")))
+    best_trackers.setdefault("loss_by_stage", {})
+    best_trackers.setdefault("actual_candidate", float("inf"))
+    best_trackers.setdefault("actual_improved", float("inf"))
+    best_trackers.setdefault("actual_by_stage", {})
+    best_trackers.setdefault("has_actual_candidate", False)
+    best_trackers.setdefault("has_actual_improved", False)
+    best_trackers.setdefault("best_pth_source", None)
+    return best_trackers
+
+
+def _is_actual_backend(args):
+    backend = str(getattr(args, "compression_loss_backend", "proxy")).strip().lower()
+    return backend.endswith("_surrogate") or "_actual" in backend
+
+
+def _format_metric(value):
+    value = _finite_float(value, None)
+    return "n/a" if value is None else f"{value:.6f}"
+
+
+def save_episode_checkpoint(
+    model,
+    ckpt_dir,
+    plot,
+    writer,
+    episode,
+    best_loss,
+    *,
+    args=None,
+    stage=None,
+    checkpoint_metrics=None,
+    best_trackers=None,
+):
     # 既存仕様を維持するため、保存名は train.py の元コードと同じにする
     model_name = f"{episode}.pth"
-    model_path = os.path.join(ckpt_dir, model_name)
-    torch.save(model.state_dict(), model_path)
+    model_path = _save_state_dict(model, ckpt_dir, model_name)
 
-    current_loss = plot.epi_loss_return()
+    checkpoint_metrics = checkpoint_metrics or {}
+    best_trackers = _ensure_best_trackers(best_trackers, best_loss)
+    current_loss = _finite_float(checkpoint_metrics.get("total_loss"), None)
+    if current_loss is None:
+        current_loss = plot.epi_loss_return()
+    stage_name = str(stage or checkpoint_metrics.get("stage") or "unknown").strip().lower() or "unknown"
+    actual_backend = _is_actual_backend(args) if args is not None else False
+    checkpoint_updates = []
+    not_updated_reasons = []
 
-    if current_loss < best_loss:
+    if current_loss < best_trackers["legacy_loss"]:
+        best_trackers["legacy_loss"] = current_loss
         best_loss = current_loss
-        model_name = "best.pth"
-        model_path = os.path.join(ckpt_dir, model_name)
-        torch.save(model.state_dict(), model_path)
-
+        model_path = _save_state_dict(model, ckpt_dir, "best_loss_legacy.pth")
+        checkpoint_updates.append("best_loss_legacy")
         writer.write(
-            f"New best model at episode {episode + 1}, "
-            f"avg_epi_loss={best_loss:.6f}\n"
+            f"New legacy loss best at episode {episode + 1}, "
+            f"avg_epi_loss={current_loss:.6f}"
         )
+        if not actual_backend:
+            model_path = _save_state_dict(model, ckpt_dir, "best.pth")
+            best_trackers["best_pth_source"] = "best_loss_legacy"
 
-    return best_loss, model_path
+    loss_by_stage = best_trackers["loss_by_stage"]
+    stage_loss_best = _finite_float(loss_by_stage.get(stage_name), float("inf"))
+    if current_loss < stage_loss_best:
+        loss_by_stage[stage_name] = current_loss
+        filename = f"best_loss_{stage_name}.pth"
+        model_path = _save_state_dict(model, ckpt_dir, filename)
+        checkpoint_updates.append(filename.replace(".pth", ""))
+        writer.write(
+            f"New {stage_name} loss best at episode {episode + 1}, "
+            f"avg_epi_loss={current_loss:.6f}, path={filename}"
+        )
+        if (not actual_backend) and stage_name == "joint":
+            model_path = _save_state_dict(model, ckpt_dir, "best.pth")
+            best_trackers["best_pth_source"] = filename
+
+    actual_delta = _finite_float(checkpoint_metrics.get("fresh_actual_delta"), None)
+    fresh_count = int(checkpoint_metrics.get("fresh_actual_count") or 0)
+    cached_count = int(checkpoint_metrics.get("cached_actual_count") or 0)
+    geometry_ok = bool(checkpoint_metrics.get("geometry_ok", False))
+    safety_ok = bool(checkpoint_metrics.get("safety_ok", False))
+    if actual_backend and actual_delta is not None and fresh_count > 0:
+        if actual_delta < best_trackers["actual_candidate"]:
+            best_trackers["actual_candidate"] = actual_delta
+            best_trackers["has_actual_candidate"] = True
+            model_path = _save_state_dict(model, ckpt_dir, "best_actual_delta_candidate.pth")
+            checkpoint_updates.append("best_actual_delta_candidate")
+            writer.write(
+                f"New actual-delta candidate at episode {episode + 1}, "
+                f"fresh_actual_delta={actual_delta:.6f}, fresh_count={fresh_count}, "
+                f"geom_ok={geometry_ok}, safety_ok={safety_ok}"
+            )
+            if not best_trackers["has_actual_improved"]:
+                model_path = _save_state_dict(model, ckpt_dir, "best.pth")
+                best_trackers["best_pth_source"] = "best_actual_delta_candidate"
+        else:
+            not_updated_reasons.append("actual_not_improved")
+
+        actual_by_stage = best_trackers["actual_by_stage"]
+        stage_actual_best = _finite_float(actual_by_stage.get(stage_name), float("inf"))
+        if actual_delta < stage_actual_best:
+            actual_by_stage[stage_name] = actual_delta
+            filename = f"best_actual_delta_{stage_name}.pth"
+            model_path = _save_state_dict(model, ckpt_dir, filename)
+            checkpoint_updates.append(filename.replace(".pth", ""))
+            writer.write(
+                f"New {stage_name} actual-delta best at episode {episode + 1}, "
+                f"fresh_actual_delta={actual_delta:.6f}, path={filename}"
+            )
+
+        if actual_delta < 0.0 and geometry_ok and safety_ok and actual_delta < best_trackers["actual_improved"]:
+            best_trackers["actual_improved"] = actual_delta
+            best_trackers["has_actual_improved"] = True
+            model_path = _save_state_dict(model, ckpt_dir, "best_actual_delta_improved.pth")
+            model_path = _save_state_dict(model, ckpt_dir, "best.pth")
+            best_trackers["best_pth_source"] = "best_actual_delta_improved"
+            checkpoint_updates.append("best_actual_delta_improved")
+            writer.write(
+                f"New improved actual-delta best at episode {episode + 1}, "
+                f"fresh_actual_delta={actual_delta:.6f}, fresh_count={fresh_count}, "
+                "path=best_actual_delta_improved.pth and best.pth"
+            )
+        else:
+            if actual_delta >= 0.0 or actual_delta >= best_trackers["actual_improved"]:
+                not_updated_reasons.append("actual_not_improved")
+            if not geometry_ok:
+                not_updated_reasons.append("geometry_gate_failed")
+            if not safety_ok:
+                not_updated_reasons.append("safety_gate_failed")
+    elif actual_backend:
+        if actual_delta is None:
+            not_updated_reasons.append("nonfinite_metric")
+        if fresh_count <= 0:
+            not_updated_reasons.append("cached_actual_only" if cached_count > 0 else "no_fresh_actual")
+        fallback_path = None
+        if not best_trackers["has_actual_candidate"]:
+            joint_loss = _finite_float(loss_by_stage.get("joint"), None)
+            if joint_loss is not None and stage_name == "joint" and current_loss <= joint_loss:
+                fallback_path = "best_loss_joint.pth"
+            elif best_trackers["legacy_loss"] == current_loss:
+                fallback_path = "best_loss_legacy.pth"
+        if fallback_path:
+            model_path = _save_state_dict(model, ckpt_dir, "best.pth")
+            best_trackers["best_pth_source"] = fallback_path
+            checkpoint_updates.append("fallback")
+        else:
+            not_updated_reasons.append("fallback_not_allowed")
+    if not checkpoint_updates and not not_updated_reasons:
+        not_updated_reasons.append("actual_not_improved" if actual_backend else "loss_not_improved")
+
+    writer.write(
+        "CheckpointSummary: "
+        f"episode={episode + 1}, stage={stage_name}, "
+        f"loss={_format_metric(current_loss)}, "
+        f"fresh_actual_delta={_format_metric(actual_delta)}, "
+        f"fresh_count={fresh_count}, "
+        f"geom_ok={geometry_ok}, safety_ok={safety_ok}, "
+        f"best_pth_source={best_trackers.get('best_pth_source')}, "
+        f"updates={','.join(dict.fromkeys(checkpoint_updates)) or 'none'}, "
+        f"not_updated_reasons={','.join(dict.fromkeys(not_updated_reasons)) or 'none'}"
+    )
+
+    return best_trackers["legacy_loss"], model_path, best_trackers

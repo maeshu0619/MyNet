@@ -545,6 +545,7 @@ class _SparsePCGCActualEncoder:
 
     def encode_bits(self, pts_3n):
         self._lazy_init()
+        encode_t0 = time.time()
         tmp_dir = self._make_tmp_dir()
         try:
             ply_path = os.path.join(tmp_dir, "input.ply")
@@ -582,6 +583,7 @@ class _SparsePCGCActualEncoder:
                 "point_count": point_count,
                 "codec": self.codec_name,
                 "mode": str(getattr(self.args, "sparsepcgc_mode", "dense_lossless")),
+                "encode_time": float(time.time() - encode_t0),
             }
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)

@@ -2,6 +2,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 
 import numpy as np
 import torch
@@ -151,6 +152,7 @@ class GPCCGeometryEncoder:
 
     def encode_tensor(self, pts_3n):
         self.validate()
+        encode_t0 = time.time()
         coords = self._quantized_coords(pts_3n)
         point_count = int(coords.shape[0])
         if point_count <= 0:
@@ -162,6 +164,7 @@ class GPCCGeometryEncoder:
                 "node": 0.0,
                 "point_count": 0,
                 "codec": self.codec_name,
+                "encode_time": float(time.time() - encode_t0),
             }
 
         tmp_dir = self._make_tmp_dir()
@@ -189,6 +192,8 @@ class GPCCGeometryEncoder:
                     f"stdout_tail={stdout_tail}\nstderr_tail={stderr_tail}"
                 )
             bit = float(os.path.getsize(bin_path) * 8) if os.path.isfile(bin_path) else 0.0
+            bbox_min = coords.amin(dim=0).detach().cpu().tolist() if coords.numel() > 0 else [0, 0, 0]
+            bbox_max = coords.amax(dim=0).detach().cpu().tolist() if coords.numel() > 0 else [0, 0, 0]
             return {
                 "bit": bit,
                 "bpp": bit / max(float(point_count), 1.0),
@@ -198,6 +203,11 @@ class GPCCGeometryEncoder:
                 "point_count": point_count,
                 "codec": self.codec_name,
                 "mode": "tmc3_geometry_octree",
+                "encode_time": float(time.time() - encode_t0),
+                "unique_coord_count": int(point_count),
+                "bbox_min": bbox_min,
+                "bbox_max": bbox_max,
+                "bitstream_bytes": int(os.path.getsize(bin_path)) if os.path.isfile(bin_path) else 0,
             }
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)

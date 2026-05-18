@@ -125,6 +125,7 @@ class Network(nn.Module):
     def _should_collect_runtime_debug(self):
         return bool(
             (getattr(self.args, "verbose_step_logs", False) and getattr(self.args, "_log_this_step", True))
+            or getattr(self.args, "_collect_structure_debug", False)
             or getattr(self.args, "trainORtest", "train") != "train"
         )
 
@@ -779,6 +780,10 @@ class Network(nn.Module):
         # the training script and plots.
         single_chain_score = self._masked_point_mean(structure["single_proxy_full"].pow(2), selection_mask)
         lowprob_score = self._masked_point_mean(structure["lowprob_proxy_full"], selection_mask)
+        lowprob_ratio = self._masked_point_mean(
+            (structure["lowprob_proxy_full"] > 0.5).to(dtype=pts_xyz.dtype),
+            selection_mask,
+        )
         node_score = self._masked_point_mean(structure["node_proxy_full"], selection_mask)
         quant_score = self._masked_point_mean(structure["quant_proxy_full"], selection_mask)
 
@@ -800,23 +805,39 @@ class Network(nn.Module):
                     "loss_attr": float(loss_attr.detach().cpu()),
                     "loss_policy": float(loss_policy.detach().cpu()),
                     "loss_repair": float(loss_repair.detach().cpu()),
-                    "repair_ratio": float(repair_gate.mean().detach().cpu()),
-                    "add_ratio": float(actuator_stats.get("add_ratio", pts_xyz.new_zeros(())).detach().cpu()),
-                    "add_count": int(actuator_stats.get("add_count", 0)),
-                    "add_effective_count": int(actuator_stats.get("add_effective_count", 0)),
+                        "repair_ratio": float(repair_gate.mean().detach().cpu()),
+                        "add_ratio": float(actuator_stats.get("add_ratio", pts_xyz.new_zeros(())).detach().cpu()),
+                        "add_prob_mean": float(actuator_stats.get("add_prob_mean", pts_xyz.new_zeros(())).detach().cpu()),
+                        "add_prob_max": float(actuator_stats.get("add_prob_max", pts_xyz.new_zeros(())).detach().cpu()),
+                        "add_priority_mean": float(actuator_stats.get("add_priority_mean", pts_xyz.new_zeros(())).detach().cpu()),
+                        "add_priority_max": float(actuator_stats.get("add_priority_max", pts_xyz.new_zeros(())).detach().cpu()),
+                        "add_count": int(actuator_stats.get("add_count", 0)),
+                        "add_effective_count": int(actuator_stats.get("add_effective_count", 0)),
                     "add_candidate_ratio": float(actuator_stats.get("add_candidate_ratio", 0.0)),
-                    "add_score_noise": float(actuator_stats.get("add_score_noise", 0.0)),
-                    "add_weight_random_mix": float(actuator_stats.get("add_weight_random_mix", 0.0)),
-                    "drop_score_noise": float(actuator_stats.get("drop_score_noise", 0.0)),
-                    "drop_random_mix": float(actuator_stats.get("drop_random_mix", 0.0)),
-                    "add_drop_conflict_loss": float(actuator_stats.get("add_drop_conflict_loss", pts_xyz.new_zeros(())).detach().cpu()),
+                    "sparsepcgc_add_experiment_enabled": bool(actuator_stats.get("sparsepcgc_add_experiment_enabled", False)),
+                    "sparsepcgc_add_warmup": float(actuator_stats.get("sparsepcgc_add_warmup", 1.0)),
+                        "add_score_noise": float(actuator_stats.get("add_score_noise", 0.0)),
+                        "add_weight_random_mix": float(actuator_stats.get("add_weight_random_mix", 0.0)),
+                        "drop_score_noise": float(actuator_stats.get("drop_score_noise", 0.0)),
+                        "drop_random_mix": float(actuator_stats.get("drop_random_mix", 0.0)),
+                        "add_enabled": bool(actuator_stats.get("add_enabled", False)),
+                        "prune_enabled": bool(actuator_stats.get("prune_enabled", False)),
+                        "disp_enabled": bool(actuator_stats.get("disp_enabled", False)),
+                        "actuator_stage": str(actuator_stats.get("actuator_stage", "unknown")),
+                        "actuator_stage_raw": str(actuator_stats.get("actuator_stage_raw", "unknown")),
+                        "actuator_strength": float(actuator_stats.get("actuator_strength", 0.0)),
+                        "force_joint_actuator": bool(actuator_stats.get("force_joint_actuator", False)),
+                        "add_drop_conflict_loss": float(actuator_stats.get("add_drop_conflict_loss", pts_xyz.new_zeros(())).detach().cpu()),
                     "added_keep_loss": float(actuator_stats.get("added_keep_loss", pts_xyz.new_zeros(())).detach().cpu()),
                     "add_min_offset_loss": float(actuator_stats.get("add_min_offset_loss", pts_xyz.new_zeros(())).detach().cpu()),
-                    "drop_ratio": float(actuator_stats["drop_prob"].mean().detach().cpu()),
-                    "keep_ratio": float(actuator_stats["keep_prob"].mean().detach().cpu()),
+                        "drop_ratio": float(actuator_stats["drop_prob"].mean().detach().cpu()),
+                        "hard_drop_ratio": float(actuator_stats.get("hard_drop_ratio", pts_xyz.new_zeros(())).detach().cpu()),
+                        "hard_drop_count": int(actuator_stats.get("hard_drop_count", 0)),
+                        "keep_ratio": float(actuator_stats["keep_prob"].mean().detach().cpu()),
                     "delta_norm": float(actuator_stats["delta"].norm(dim=1).mean().detach().cpu()),
-                    "move_ratio": float(actuator_stats.get("move_ratio", pts_xyz.new_zeros(())).detach().cpu()),
-                    "move_score_mean": float(actuator_stats.get("move_score_mean", pts_xyz.new_zeros(())).detach().cpu()),
+                        "move_ratio": float(actuator_stats.get("move_ratio", pts_xyz.new_zeros(())).detach().cpu()),
+                        "hard_move_count": int(actuator_stats.get("hard_move_count", 0)),
+                        "move_score_mean": float(actuator_stats.get("move_score_mean", pts_xyz.new_zeros(())).detach().cpu()),
                     "move_target_valid_ratio": float(actuator_stats.get("move_target_valid_ratio", pts_xyz.new_zeros(())).detach().cpu()),
                     "moved_delta_mean": float(actuator_stats.get("moved_delta_mean", pts_xyz.new_zeros(())).detach().cpu()),
                     "before_occupied_voxel_count": int(actuator_stats.get("before_occupied_voxel_count", 0)),
@@ -852,6 +873,10 @@ class Network(nn.Module):
                     "policy_argmax_counts": policy_argmax_counts,
                     "operation_by_cause": self._operation_by_cause(debug_cause_scores, debug_policy_probs),
                     "policy_entropy": float(policy_entropy.detach().cpu()),
+                    "occupancy_nll_proxy": float(lowprob_score.detach().cpu()),
+                    "lowprob_occupancy_ratio": float(lowprob_ratio.detach().cpu()),
+                    "single_chain_score": float(single_chain_score.detach().cpu()),
+                    "node_score": float(node_score.detach().cpu()),
                     "policy_diversity": int(active_policy_count),
                     "octree_level_debug": structure.get("level_debug"),
                 }
