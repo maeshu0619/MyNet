@@ -1,4 +1,5 @@
 import math
+import os
 import time
 from contextlib import nullcontext
 import torch
@@ -15,6 +16,11 @@ from ..training.checkpoint_metrics import *
 from ..training.scalar_utils import *
 from ..training.noise_debug import *
 from ..training.utils import *
+from ..training.for_better_logging import (
+    log_for_better_event,
+    log_for_better_pretrain_complete,
+    log_for_better_pretrain_step,
+)
 from ..pointcloud.utils_repkpu import *
 from ..pointcloud.octree_subtree import *
 
@@ -186,6 +192,22 @@ def build_surrogate_pretrain_subtree_sample(pts, args, cache_key, use_cuda, glob
         for subtree_key, point_idx in all_groups
         if int(point_idx.numel()) >= min_subtree_points
     ]
+    if (
+        not eligible_groups
+        and all_groups
+        and min_subtree_points > 1
+        and bool(getattr(args, "surrogate_pretrain_skip_min_points_miss", True))
+    ):
+        return {
+            "skip_reason": "min_points_miss",
+            "sampling_time": time.perf_counter() - sample_t0,
+            "depth": int(subtree_depth_meta.get("depth", 0)),
+            "point_count": 0,
+            "total_subtree_count": total_subtree_count,
+            "eligible_subtree_count": 0,
+            "selected_subtree_count": 0,
+            "retry_count": 0,
+        }
     group_source = eligible_groups or all_groups
     skip_reason = "none"
     if not group_source:
@@ -276,6 +298,7 @@ def run_surrogate_pretrain(
     use_cuda,
     use_amp,
     amp_dtype,
+    for_better_path=None,
 ):
     print(f"Surrogate pretrain step: {int(getattr(args, 'surrogate_pretrain_steps', 0))}")
     steps = max(int(getattr(args, "surrogate_pretrain_steps", 0)), 0)
@@ -312,6 +335,22 @@ def run_surrogate_pretrain(
         f"subtree_steps_per_full={int(getattr(args, 'surrogate_pretrain_subtree_steps_per_full', full_calibration_interval))}, "
         f"max_wall_time_sec={max_wall_time_sec:.1f}"
     )
+    log_for_better_event(
+        for_better_path,
+        "surrogate_pretrain_start",
+        steps=steps,
+        mode=pretrain_mode,
+        teacher_type=teacher_type,
+        refresh_interval=refresh_interval,
+        replay_enabled=replay_enabled,
+        replay_steps=replay_steps,
+        replay_batch=replay_batch,
+        replay_buffer_size=replay_buffer_size,
+        sparsepcgc_debug_interval=debug_interval,
+        full_calibration_interval=full_calibration_interval,
+        full_calibration_steps=full_calibration_steps,
+        max_wall_time_sec=max_wall_time_sec,
+    )
     if pretrain_mode == "full" and steps >= 1000:
         writer.write(
             "[WARN] surrogate_pretrain_mode=full with "
@@ -322,6 +361,17 @@ def run_surrogate_pretrain(
             "[SurrogatePretrain] mode=subtree uses "
             f"{teacher_type} teacher. Full SparsePCGC actual codec will not be called every step."
         )
+        if teacher_type == "local_proxy":
+            writer.write(
+                "[WARN] surrogate_pretrain_subtree_teacher_type=local_proxy is NOT actual SparsePCGC bit; "
+                "it uses differentiable local proxy scale. Local-proxy samples are not stored in actual replay by default."
+            )
+            log_for_better_event(
+                for_better_path,
+                "surrogate_pretrain_local_proxy_not_actual",
+                message="subtree local_proxy trains on differentiable proxy terms, not actual SparsePCGC bit; local_proxy replay storage is disabled by default.",
+                store_local_proxy_replay=bool(getattr(args, "surrogate_pretrain_store_local_proxy_replay", False)),
+            )
     elif pretrain_mode == "hybrid":
         writer.write(
             "[SurrogatePretrain] mode=hybrid uses subtree steps plus full calibration. "
@@ -566,7 +616,7 @@ def run_surrogate_pretrain(
                                         args.surrogate_pretrain_allow_stale_target = saved_stale
                                         args.compression_surrogate_reuse_last_target = saved_reuse
                         else:
-                            input_xyz, patches, centroid_xyz, fd_xyz = _prepare_whole_cloud_inputs(
+                            input_xyz, patches, centroid_xyz, fd_xyz = prepare_whole_cloud_inputs(
                                 pts,
                                 args,
                                 cache_key,
@@ -652,7 +702,7 @@ def run_surrogate_pretrain(
                         )
                     )
                     gpu_alloc_mb = cuda_alloc_mb(use_cuda)
-                    cpu_rss_mb = ()
+                    cpu_rss_mb = process_rss_mb()
                     current_lr = optimizer_lrs(surrogate_optimizer)
                     param_norm = surrogate_param_norm(loss)
                     row = {
@@ -713,9 +763,16 @@ def run_surrogate_pretrain(
                     should_print = step_number == 1 or step_number % print_interval == 0 or step_number >= steps
                     if should_print:
                         actual_text = "NA" if actual_value is None else f"{case_float(actual_value, float('nan')):.6f}"
-                        abs_text = "NA" if abs_error is None else f"{case_float(abs_error, float('nan')):.6f}"
+                        pred_text = "NA" if pred_value is None else f"{case_float(pred_value, float('nan')):.6f}"
+                        fit_loss_value = finite_float_or_none(comp_debug.get("surrogate_train_loss"))
+                        loss_text = "NA" if fit_loss_value is None else f"{case_float(fit_loss_value, float('nan')):.6f}"
+                        target_abs_error = finite_float_or_none(comp_debug.get("surrogate_abs_bit_error"))
+                        error_label = "abs" if abs_error is not None else "target_abs"
+                        error_value = abs_error if abs_error is not None else target_abs_error
+                        error_text = "NA" if error_value is None else f"{case_float(error_value, float('nan')):.6f}"
                         writer.write(
                             "[SurrogatePretrain] "
+                            f"mode={pretrain_mode} "
                             f"step={step_number}/{steps} "
                             f"teacher={row['teacher_mode']} "
                             f"depth={row['pretrain_subtree_depth'] if subtree_enabled else 'NA'} "
@@ -728,6 +785,16 @@ def run_surrogate_pretrain(
                         )
                     row["pretrain_log_time"] = time.perf_counter() - log_t0
                     last_log_time = row["pretrain_log_time"]
+                    log_for_better_pretrain_step(
+                        for_better_path,
+                        row,
+                        comp_debug=comp_debug,
+                        extra={
+                            "full_calibration": bool(full_calibration),
+                            "actual_scope": actual_scope,
+                            "subtree_enabled": bool(subtree_enabled),
+                        },
+                    )
                     append_csv_row(
                         metric_csv_paths.get("surrogate_pretrain_step"),
                         SURROGATE_PRETRAIN_COLUMNS,
@@ -808,6 +875,18 @@ def run_surrogate_pretrain(
             f"surrogate_param_norm={case_float(final_param_norm, float('nan')):.6f} "
             f"lr={optimizer_lrs(surrogate_optimizer)[0] if optimizer_lrs(surrogate_optimizer) else 'NA'}"
         )
+        log_for_better_pretrain_complete(
+            for_better_path,
+            mode=pretrain_mode,
+            completed_steps=completed_steps,
+            fresh_actual_count=fresh_actual_count,
+            corr=last_corr,
+            sign_match=last_sign_match,
+            mean_abs_error=mean_finite(abs_error_history),
+            early_stop_reason=early_stop_reason or "none",
+            surrogate_param_norm=final_param_norm,
+            surrogate_lr=optimizer_lrs(surrogate_optimizer),
+        )
         if bool(getattr(args, "surrogate_pretrain_checkpoint", True)):
             path = os.path.join(ckpt_dir, "surrogate_pretrain.pth")
             torch.save(
@@ -839,6 +918,13 @@ def run_surrogate_pretrain(
                 f"original={','.join(f'{lr:.6g}' for lr in original_surrogate_lrs)}, "
                 f"scale={joint_scale:.6g}, "
                 f"joint={','.join(f'{lr:.6g}' for lr in joint_lrs)}"
+            )
+            log_for_better_event(
+                for_better_path,
+                "surrogate_pretrain_joint_lr",
+                original_lrs=original_surrogate_lrs,
+                joint_scale=joint_scale,
+                joint_lrs=joint_lrs,
             )
         if model_was_training:
             model.train()

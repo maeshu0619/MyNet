@@ -1,42 +1,8 @@
-from models.utils.training.utils import (_adapt_encoder_state_dict_for_sparse_input,
-                                         _resolve_amp_dtype,
-                                         _warmup_whole_cloud_caches,
-                                         _use_memory_safe_loader_workers,
-                                         _resolve_training_stage_for_episode,
-                                         _stage_loss_factors,
-                                         _make_step_cache_key,
-                                         _should_log_step,
-                                         _downsample_input_batch,
-                                         _get_patch_info,
-                                         _effective_patch_batch_size,
-                                         select_patch_subset_ids,
-                                         make_patch_subset_cache_key,
-                                         _accumulate_grouped_patch_geometry,
-                                         _run_geometry_audit,
-                                         _new_metric_sums,
-                                         _add_metric_sums,
-                                         _surrogate_plot_metrics,
-                                         _sync_for_timing,
-                                         _prepare_whole_cloud_inputs,
-                                         _metric_avgs_to_floats,
-                                         _format_metric_summary,
-                                         _new_point_edit_sums,
-                                         _add_point_edit_sums,
-                                         _finalize_point_edit_sums,
-                                         _summarize_point_edits,
-                                         _cuda_bf16_ops_safe,
-                                         _log_grad_flow, 
-                                         _format_named_float_map,
-                                         _uses_actual_total_bit_objective,
-                                         _write_structure_decision_debug,
-                                         _compression_stat_qs,
-                                         _format_triplet,
-                                         _summarize_subtree_octree_stats,)
 from models.utils.training.utils import *
 
 def subtree_pcd_setup(pts, args, cache_key, use_cuda):
     input_pcd = pts if pts.dim() == 3 else pts.unsqueeze(0)
-    input_pcd = _downsample_input_batch(input_pcd, args, cache_key)
+    input_pcd = downsample_input_batch(input_pcd, args, cache_key)
     if use_cuda:
         input_pcd = input_pcd.cuda(non_blocking=True)
     input_pcd = rearrange(input_pcd, 'b n c -> b c n').contiguous()
@@ -45,7 +11,7 @@ def subtree_pcd_setup(pts, args, cache_key, use_cuda):
 
 def split2patch_pcd_setup(pts, args, cache_key, use_cuda):
     input_pcd = pts if pts.dim() == 3 else pts.unsqueeze(0)
-    input_pcd = _downsample_input_batch(input_pcd, args, cache_key)
+    input_pcd = downsample_input_batch(input_pcd, args, cache_key)
     if use_cuda:
         input_pcd = input_pcd.cuda(non_blocking=True)
     input_pcd = rearrange(input_pcd, 'b n c -> b c n').contiguous()
@@ -76,7 +42,7 @@ def If_log_this_step(point_idx, selected_groups, is_anchor_step, eligible_groups
         stat_groups = selected_groups
         loss_scope = "subtree_output_vs_subtree_input"
     mean_points = sum(point_counts) / float(max(len(point_counts), 1))
-    octree_stat = _summarize_subtree_octree_stats(input_xyz, stat_groups, args)
+    octree_stat = summarize_subtree_octree_stats(input_xyz, stat_groups, args)
     octree_stat_text = ""
     if octree_stat is not None:
         octree_stat_text = (

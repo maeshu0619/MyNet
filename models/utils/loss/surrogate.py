@@ -91,6 +91,19 @@ class SurrogateCompressionLossMixin:
         self.compression_surrogate.eval()
         self._set_surrogate_trainable(False)
         self._log_surrogate_event(f"reset network ({reason}).")
+        for_better_path = getattr(self.args, "_for_better_path", None)
+        if for_better_path:
+            try:
+                from models.utils.training.for_better_logging import log_for_better_event
+
+                log_for_better_event(
+                    for_better_path,
+                    "compression_surrogate_reset",
+                    reason=reason,
+                    global_step=int(getattr(self.args, "_global_train_step", 0)),
+                )
+            except Exception:
+                pass
 
     def _surrogate_target_from_actual(self, args, stats_gen, stats_ref, device):
         target_percent = self._relative_percent(float(stats_gen["bit"]), float(stats_ref["bit"]))
@@ -623,6 +636,12 @@ class SurrogateCompressionLossMixin:
         actual_single_percent = 0.0
         actual_node_percent = 0.0
         target_percent_value = 0.0
+        target_raw_percent_value = 0.0
+        target_train_percent_value = 0.0
+        target_was_clamped = False
+        target_scale = "none"
+        target_teacher_source = "none"
+        local_proxy_replay_stored = False
         gen_points = int(gen_xyz.shape[-1])
         gen_actual_bit = float("nan")
         cached_gt = None
@@ -656,6 +675,11 @@ class SurrogateCompressionLossMixin:
                 ref_min=1.0,
             )
             target = self._surrogate_target_from_actual(args, stats_gen, cached_gt, gen_xyz.device)
+            target_raw_percent_value = float(actual_bit_percent)
+            target_train_percent_value = self._scalar(target.reshape(()))
+            target_was_clamped = abs(target_train_percent_value - target_raw_percent_value) > 1e-6
+            target_scale = "actual_bit_percent"
+            target_teacher_source = "fresh_actual"
             warmup_steps = max(
                 int(getattr(args, "compression_surrogate_warmup_steps", getattr(args, "compression_surrogate_train_steps", 2))),
                 0,
@@ -730,9 +754,19 @@ class SurrogateCompressionLossMixin:
                 local_proxy_target = gen_xyz.new_zeros((1, 1), dtype=torch.float32)
             target = local_proxy_target
             target_percent_value = self._scalar(local_proxy_target.reshape(()))
+            target_raw_percent_value = float(target_percent_value)
+            clip = float(getattr(args, "compression_surrogate_pred_clip", 0.0))
+            if clip > 0.0:
+                target = target.clamp(min=-clip, max=clip)
+            target_train_percent_value = self._scalar(target.reshape(()))
+            target_was_clamped = abs(target_train_percent_value - target_raw_percent_value) > 1e-6
+            target_scale = "local_proxy_aux"
+            target_teacher_source = "local_proxy"
             L_sur = self._train_compression_surrogate(args, x_soft, target)
             timing_cursor = _mark_timing("surrogate_fit", timing_cursor)
-            self._store_surrogate_replay(args, x_soft, target)
+            local_proxy_replay_stored = bool(getattr(args, "surrogate_pretrain_store_local_proxy_replay", False))
+            if local_proxy_replay_stored:
+                self._store_surrogate_replay(args, x_soft, target)
             actual_value_source = "local_proxy"
             gen_points = int(gen_xyz.shape[-1])
         elif target_entry is not None:
@@ -751,9 +785,21 @@ class SurrogateCompressionLossMixin:
                 getattr(args, "surrogate_pretrain_skip_on_target_miss", False)
             ):
                 target = torch.tensor([[target_percent_value]], device=gen_xyz.device, dtype=torch.float32)
+                target_raw_percent_value = float(target_percent_value)
+                clip = float(getattr(args, "compression_surrogate_pred_clip", 0.0))
+                if clip > 0.0:
+                    target = target.clamp(min=-clip, max=clip)
+                target_train_percent_value = self._scalar(target.reshape(()))
+                target_was_clamped = abs(target_train_percent_value - target_raw_percent_value) > 1e-6
+                target_scale = "actual_bit_percent_cache"
+                target_teacher_source = actual_value_source
                 L_sur = self._train_compression_surrogate(args, x_soft, target)
             else:
                 L_sur = x_soft.new_zeros(())
+                target_raw_percent_value = float(target_percent_value)
+                target_train_percent_value = float(target_percent_value)
+                target_scale = "actual_bit_percent_cache_no_update"
+                target_teacher_source = actual_value_source
             timing_cursor = _mark_timing("target_cache", timing_cursor)
         else:
             teacher_codec = self._surrogate_backend_label(args).replace("_surrogate", "")
@@ -879,6 +925,11 @@ class SurrogateCompressionLossMixin:
             teacher_mode = "replay"
         else:
             teacher_mode = "skip"
+        if target_teacher_source == "none":
+            target_teacher_source = actual_value_source
+        teacher_is_actual = bool(actual_value_source in {"fresh_teacher", "target_cache", "stale_target"})
+        teacher_is_local_proxy = bool(actual_value_source == "local_proxy")
+        pred_clip_value = float(getattr(args, "compression_surrogate_pred_clip", 0.0))
 
         self.last_compression_debug = {
             "metric": "actual_total_bit_percent",
@@ -916,6 +967,23 @@ class SurrogateCompressionLossMixin:
             "actual_total_bit_percent": self._scalar(actual_bit_percent_t),
             "actual_value_is_fresh": bool(teacher_refreshed),
             "actual_value_source": actual_value_source,
+            "actual_value_source_detail": (
+                "actual SparsePCGC/codec relative bit percent"
+                if teacher_is_actual
+                else "local differentiable proxy, not actual SparsePCGC bit"
+                if teacher_is_local_proxy
+                else str(actual_value_source)
+            ),
+            "surrogate_teacher_source": target_teacher_source,
+            "surrogate_teacher_is_actual": bool(teacher_is_actual),
+            "surrogate_teacher_is_local_proxy": bool(teacher_is_local_proxy),
+            "surrogate_target_scale": target_scale,
+            "surrogate_target_raw_bit": float(target_raw_percent_value),
+            "surrogate_target_train_bit": float(target_train_percent_value),
+            "surrogate_target_clamped": bool(target_was_clamped),
+            "surrogate_pred_clip": pred_clip_value,
+            "surrogate_local_proxy_replay_stored": bool(local_proxy_replay_stored),
+            "relative_percent_direction": "positive=worse_bits_increase; negative=better_bits_decrease",
             "rate_proxy_before": rate_proxy_before_value,
             "rate_proxy_after": rate_proxy_after_value,
             "rate_proxy_delta": self._scalar(surrogate_bit_percent.detach()),

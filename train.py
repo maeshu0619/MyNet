@@ -54,6 +54,12 @@ from models.utils.training.actual_codec_status import *
 from models.utils.training.metric_rows import *
 from models.utils.training.episode_metrics import *
 from models.utils.training.checkpoint_metrics import *
+from models.utils.training.for_better_logging import (
+    init_for_better_logger,
+    log_for_better_episode,
+    log_for_better_event,
+    log_for_better_step,
+)
 
 from models.utils.surrogate.pretrain import *
 
@@ -81,6 +87,7 @@ def train(model, args, loss, writer, plot, notifier=None):
     case_debug_path = init_case_debug_csv(args, plot, writer)
     case_debug_counts = {"good": 0, "bad": 0}
     metric_csv_paths = init_metric_csvs(args, plot, writer)
+    for_better_path = init_for_better_logger(args, plot, writer)
     checkpoint_gate_refs = {}
     best_trackers = None
 
@@ -129,6 +136,7 @@ def train(model, args, loss, writer, plot, notifier=None):
         use_cuda=use_cuda,
         use_amp=use_amp,
         amp_dtype=amp_dtype,
+        for_better_path=for_better_path,
     )
     post_pretrain_norm = surrogate_param_norm(loss)
     surrogate_optimizer = getattr(loss, "surrogate_optimizer", None)
@@ -142,6 +150,13 @@ def train(model, args, loss, writer, plot, notifier=None):
         f"[Training] {pretrain_label} "
         f"surrogate_param_norm={case_float(post_pretrain_norm, float('nan')):.6f} "
         f"lr={surrogate_lrs[0] if surrogate_lrs else 'NA'}"
+    )
+    log_for_better_event(
+        for_better_path,
+        "training_start_after_surrogate_pretrain",
+        label=pretrain_label,
+        surrogate_param_norm=post_pretrain_norm,
+        surrogate_lrs=surrogate_lrs,
     )
     optimizer.zero_grad(set_to_none=True)
     """==========================================================="""
@@ -160,6 +175,13 @@ def train(model, args, loss, writer, plot, notifier=None):
                 "Stage Loss Factors: "
                 f"geom={stage_factors['geom']}, com={stage_factors['com']}, "
                 f"attr={stage_factors['attr']}, policy={stage_factors['policy']}, repair={stage_factors['repair']}"
+            )
+            log_for_better_event(
+                for_better_path,
+                "stage_switch",
+                episode=episode + 1,
+                stage=current_stage,
+                stage_factors=stage_factors,
             )
             prev_stage = current_stage
         writer.write(f"◆◆◆ Episode {episode + 1} / {args.episodes} ◆◆◆")
@@ -263,6 +285,15 @@ def train(model, args, loss, writer, plot, notifier=None):
                 compression_gt_pts = input_xyz
                 train_edit_stats = None
                 noise_debug = empty_noise_debug()
+                subtree_depth_meta = {}
+                total_subtree_count = 0
+                eligible_subtree_count = 0
+                actual_eligible_subtree_count = 0
+                selected_subtree_count = 0
+                min_subtree_points = 0
+                anchor_reason = "not_subtree_mode"
+                subtree_point_counts = [int(input_xyz.shape[-1])]
+                subtree_loss_scope = "full_cloud"
 
                 if subtree_mode:
                     optimizer.zero_grad(set_to_none=True)
@@ -288,10 +319,14 @@ def train(model, args, loss, writer, plot, notifier=None):
                         for subtree_key, point_idx in zip(all_subtree_keys, subtree_index_lists)
                         if int(point_idx.numel()) >= min_subtree_points
                     ]
+                    actual_eligible_subtree_count = int(len(eligible_groups))
+                    min_points_miss = bool(total_subtree_count > 0 and not eligible_groups and min_subtree_points > 1)
                     if eligible_groups:
                         candidate_subtree_keys = all_subtree_keys.new_tensor(
                             [subtree_key for subtree_key, _ in eligible_groups]
                         )
+                    elif min_points_miss and bool(getattr(args, "train_subtree_anchor_on_min_points_miss", False)):
+                        candidate_subtree_keys = all_subtree_keys.new_empty((0,), dtype=all_subtree_keys.dtype)
                     else:
                         candidate_subtree_keys = all_subtree_keys
                     eligible_subtree_count = int(candidate_subtree_keys.numel())
@@ -300,6 +335,28 @@ def train(model, args, loss, writer, plot, notifier=None):
                         global_step=global_train_step,
                         cache_key=cache_key,
                     )
+                    if min_points_miss and bool(getattr(args, "train_subtree_anchor_on_min_points_miss", False)):
+                        is_anchor_step = True
+                        anchor_reason = "min_points_miss_full_anchor"
+                        log_for_better_event(
+                            for_better_path,
+                            "subtree_min_points_miss",
+                            global_step=global_train_step + 1,
+                            sampled_depth=int(subtree_depth_meta["depth"]),
+                            min_subtree_points=min_subtree_points,
+                            total_subtree_count=total_subtree_count,
+                            action="full_anchor",
+                        )
+                    elif min_points_miss:
+                        log_for_better_event(
+                            for_better_path,
+                            "subtree_min_points_miss",
+                            global_step=global_train_step + 1,
+                            sampled_depth=int(subtree_depth_meta["depth"]),
+                            min_subtree_points=min_subtree_points,
+                            total_subtree_count=total_subtree_count,
+                            action="legacy_all_subtrees_fallback",
+                        )
                     selected_subtree_keys = candidate_subtree_keys
                     if eligible_subtree_count > 0 and not is_anchor_step:
                         selected_subtree_keys = select_octree_subtree_keys(candidate_subtree_keys, global_train_step, args)
@@ -324,17 +381,23 @@ def train(model, args, loss, writer, plot, notifier=None):
                             selected_groups = [max(group_source, key=lambda item: int(item[1].numel()))]
                         if not selected_groups:
                             raise RuntimeError("Subtree mode did not select any subtree group.")
+                    if is_anchor_step:
+                        subtree_point_counts = [int(point_idx.numel()) for _, point_idx in (eligible_groups or [])]
+                        if not subtree_point_counts:
+                            subtree_point_counts = [int(input_xyz.shape[-1])]
+                        subtree_loss_scope = "full_cloud_output_vs_full_cloud_input"
+                    else:
+                        subtree_point_counts = [int(point_idx.numel()) for _, point_idx in selected_groups]
+                        subtree_loss_scope = "subtree_output_vs_subtree_input"
                     if log_this_step and bool(getattr(args, "train_patch_subset_log", True)):
                         if is_anchor_step:
-                            point_counts = [int(point_idx.numel()) for _, point_idx in (eligible_groups or [])]
-                            if not point_counts:
-                                point_counts = [int(input_xyz.shape[-1])]
+                            point_counts = list(subtree_point_counts)
                             stat_groups = eligible_groups or [(0, torch.arange(input_xyz.shape[-1], device=input_xyz.device))]
-                            loss_scope = "full_cloud_output_vs_full_cloud_input"
+                            loss_scope = subtree_loss_scope
                         else:
-                            point_counts = [int(point_idx.numel()) for _, point_idx in selected_groups]
+                            point_counts = list(subtree_point_counts)
                             stat_groups = selected_groups
-                            loss_scope = "subtree_output_vs_subtree_input"
+                            loss_scope = subtree_loss_scope
                         mean_points = sum(point_counts) / float(max(len(point_counts), 1))
                         octree_stat = summarize_subtree_octree_stats(input_xyz, stat_groups, args)
                         octree_stat_text = ""
@@ -1140,6 +1203,13 @@ def train(model, args, loss, writer, plot, notifier=None):
                 step_completed = False
                 total_loss_finite = bool(torch.isfinite(L.detach()).all().item())
                 param_update_snapshots = None
+                amp_info = {
+                    "enabled": bool(amp_scaler_enabled),
+                    "found_inf": None,
+                    "scale_before": None,
+                    "scale_after": None,
+                    "consecutive_amp_skips": int(consecutive_amp_skips),
+                }
                 if total_loss_finite:
                     param_update_snapshots = capture_param_update_snapshots(
                         args,
@@ -1154,6 +1224,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                     )
                 elif amp_scaler_enabled:
                     scale_before = float(scaler.get_scale())
+                    amp_info["scale_before"] = scale_before
                     scaler.scale(L).backward()
                     scaler.unscale_(optimizer)
                     grad_clip = float(getattr(args, "train_grad_clip", 0.0))
@@ -1173,6 +1244,8 @@ def train(model, args, loss, writer, plot, notifier=None):
                         )
                     scaler.update()
                     scale_after = float(scaler.get_scale())
+                    amp_info["found_inf"] = found_inf
+                    amp_info["scale_after"] = scale_after
                     step_completed = found_inf == 0.0 and scale_after >= scale_before
                     if step_completed:
                         consecutive_amp_skips = 0
@@ -1329,18 +1402,103 @@ def train(model, args, loss, writer, plot, notifier=None):
                         f"{en_step-st_step:.4f}s   |   "
                         f"{datetime.datetime.now().strftime('%Y/%m/%d %H:%M:%S')}"
                     )
+                amp_info["consecutive_amp_skips"] = int(consecutive_amp_skips)
+                point_count_min = min(subtree_point_counts) if subtree_point_counts else None
+                point_count_max = max(subtree_point_counts) if subtree_point_counts else None
+                point_count_mean = (
+                    sum(subtree_point_counts) / float(len(subtree_point_counts))
+                    if subtree_point_counts
+                    else None
+                )
+                subtree_meta_for_better = {
+                    "enabled": bool(subtree_mode),
+                    "depth": subtree_depth_meta.get("depth"),
+                    "base_depth": subtree_depth_meta.get("base_depth"),
+                    "min_depth": subtree_depth_meta.get("min_depth"),
+                    "max_depth": subtree_depth_meta.get("max_depth"),
+                    "uncapped_min_depth": subtree_depth_meta.get("uncapped_min_depth"),
+                    "uncapped_max_depth": subtree_depth_meta.get("uncapped_max_depth"),
+                    "data_max_depth": subtree_depth_meta.get("data_max_depth"),
+                    "curriculum_phase": subtree_depth_meta.get("curriculum_phase"),
+                    "percent_mode": subtree_depth_meta.get("depth_percent_curriculum"),
+                    "percent_range": subtree_depth_meta.get("depth_percent_range"),
+                    "point_count_min": point_count_min,
+                    "point_count_mean": point_count_mean,
+                    "point_count_max": point_count_max,
+                    "selected_subtree_count": selected_subtree_count,
+                    "eligible_subtree_count": eligible_subtree_count,
+                    "actual_eligible_subtree_count": actual_eligible_subtree_count,
+                    "total_subtree_count": total_subtree_count,
+                    "min_subtree_points": min_subtree_points,
+                    "is_anchor_step": bool(is_anchor_step),
+                    "anchor_reason": anchor_reason,
+                    "loss_scope": subtree_loss_scope,
+                    "subset_step": bool(subset_step),
+                    "subset_enabled": bool(subset_enabled),
+                }
+                log_for_better_step(
+                    for_better_path,
+                    args=args,
+                    model=model,
+                    loss_obj=loss,
+                    optimizer=optimizer,
+                    global_step=global_train_step,
+                    episode=episode,
+                    epoch=epoch,
+                    step=step,
+                    stage=current_stage,
+                    stage_factors=stage_factors,
+                    compression_row=compression_metric_row,
+                    operation_row=operation_metric_row,
+                    comp_debug=comp_debug,
+                    structure_debug=structure_debug,
+                    edit_stats=train_edit_stats,
+                    subtree_meta=subtree_meta_for_better,
+                    loss_values={
+                        "L": L,
+                        "L_geom": L_geom,
+                        "L_com": L_com,
+                        "L_com_objective": L_com_objective,
+                        "L_attr": L_attr,
+                        "L_policy": L_policy,
+                        "L_actuator": L_actuator,
+                        "loss_bit": loss_bit,
+                        "loss_single": loss_single,
+                        "loss_nodes": loss_nodes,
+                    },
+                    step_completed=step_completed,
+                    total_loss_finite=total_loss_finite,
+                    amp_info=amp_info,
+                    timing={"step_seconds": en_step - st_step},
+                )
                 global_train_step += 1
                 max_train_steps = int(getattr(args, "max_train_steps", 0))
                 if max_train_steps > 0 and global_train_step >= max_train_steps:
                     writer.write(f"MaxTrainSteps reached: {global_train_step}/{max_train_steps}; stopping debug run.")
+                    log_for_better_event(
+                        for_better_path,
+                        "max_train_steps_reached",
+                        global_step=global_train_step,
+                        max_train_steps=max_train_steps,
+                    )
                     writer.flush()
                     return
 
             # lr scheduler
+            lr_before_scheduler = [float(group.get("lr", 0.0)) for group in optimizer.param_groups]
             if epoch_has_optimizer_step:
                 scheduler_steplr.step()
             else:
                 writer.write("No successful optimizer step in this epoch; lr_scheduler.step() was skipped.")
+            lr_after_scheduler = [float(group.get("lr", 0.0)) for group in optimizer.param_groups]
+            if lr_after_scheduler != lr_before_scheduler:
+                log_for_better_event(
+                    for_better_path,
+                    "scheduler_lr_step",
+                    global_epoch=global_epoch + 1,
+                    lr_before=lr_before_scheduler,
+                    lr_after=lr_after_scheduler,
+                )
 
             # ログの記録
             if epoch_metric_sums is not None:
@@ -1433,6 +1591,17 @@ def train(model, args, loss, writer, plot, notifier=None):
             stage=current_stage,
             checkpoint_metrics=checkpoint_metrics,
             best_trackers=best_trackers,
+        )
+        log_for_better_episode(
+            for_better_path,
+            args=args,
+            episode=episode,
+            stage=current_stage,
+            checkpoint_metrics=checkpoint_metrics,
+            compression_episode_metrics=compression_episode_metrics,
+            operation_episode_metrics=operation_episode_metrics,
+            best_trackers=best_trackers,
+            model_path=model_path,
         )
         if notifier is not None:
             notifier.episode_finished(
