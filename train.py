@@ -642,7 +642,77 @@ def _summarize_octree_level_debug(level_debug, value_key):
     return ";".join(chunks) if chunks else None
 
 
-def _with_pretrain_subtree_depth_overrides(args, callback):
+def _infer_octree_depth_from_xyz(input_xyz, args):
+    """
+    input_xyz から点群全体をOctree分割したときの最大深さを推定する。
+    量子化座標を想定し、最大座標スパンから ceil(log2(span + 1)) を計算する。
+    失敗した場合は args 側の既存設定にフォールバックする。
+    """
+    fallback_candidates = [
+        "octree_depth",
+        "max_octree_depth",
+        "max_depth",
+        "depth",
+        "bitdepth",
+        "bit_depth",
+        "coord_bit_depth",
+        "train_subtree_level_max",
+        "train_subtree_level_min",
+    ]
+
+    fallback_depth = None
+    for name in fallback_candidates:
+        value = getattr(args, name, None)
+        try:
+            value = int(value)
+            if value > 0:
+                fallback_depth = value
+                break
+        except (TypeError, ValueError):
+            pass
+
+    if input_xyz is None:
+        return fallback_depth if fallback_depth is not None else 1
+
+    try:
+        with torch.no_grad():
+            xyz = input_xyz.detach()
+            if xyz.dim() == 2:
+                # [3, N] or [N, 3] を想定
+                if xyz.shape[0] == 3:
+                    coord_min = xyz.amin(dim=1)
+                    coord_max = xyz.amax(dim=1)
+                else:
+                    coord_min = xyz.amin(dim=0)
+                    coord_max = xyz.amax(dim=0)
+            elif xyz.dim() == 3:
+                # [B, 3, N] を想定
+                coord_min = xyz[:, :3, :].amin(dim=2)
+                coord_max = xyz[:, :3, :].amax(dim=2)
+            else:
+                return fallback_depth if fallback_depth is not None else 1
+
+            max_span = coord_max.sub(coord_min).amax()
+            if torch.is_tensor(max_span):
+                max_span = float(max_span.detach().cpu())
+
+            if not math.isfinite(max_span) or max_span <= 0:
+                return fallback_depth if fallback_depth is not None else 1
+
+            # 座標範囲が 0〜1023 なら span=1023, span+1=1024, depth=10
+            estimated_depth = int(math.ceil(math.log2(max(max_span + 1.0, 2.0))))
+            estimated_depth = max(1, estimated_depth)
+
+            # args側に明示的な最大depthがある場合は、それを超えないようにする
+            if fallback_depth is not None:
+                estimated_depth = min(estimated_depth, int(fallback_depth))
+
+            return estimated_depth
+    except Exception:
+        return fallback_depth if fallback_depth is not None else 1
+
+
+def _with_pretrain_subtree_depth_overrides(args, callback, input_xyz=None):
     saved = {
         "train_subtree_level_min": getattr(args, "train_subtree_level_min", 0),
         "train_subtree_level_max": getattr(args, "train_subtree_level_max", 0),
@@ -650,21 +720,34 @@ def _with_pretrain_subtree_depth_overrides(args, callback):
         "_train_subtree_depth_cli_override": getattr(args, "_train_subtree_depth_cli_override", False),
     }
     try:
-        depth_min = int(getattr(args, "surrogate_pretrain_subtree_depth_min", -1))
-        depth_max = int(getattr(args, "surrogate_pretrain_subtree_depth_max", -1))
-        if depth_min > 0 or depth_max > 0:
-            if depth_min <= 0:
-                depth_min = depth_max
-            if depth_max <= 0:
-                depth_max = depth_min
-            if depth_min > depth_max:
-                depth_min, depth_max = depth_max, depth_min
-            args.train_subtree_level_min = int(depth_min)
-            args.train_subtree_level_max = int(depth_max)
-            args._train_subtree_depth_cli_override = True
-        if not bool(getattr(args, "surrogate_pretrain_subtree_random_depth", True)):
+        # 点群全体をOctree分割したときの最大深さを推定
+        full_octree_depth = _infer_octree_depth_from_xyz(input_xyz, args)
+
+        # 浅すぎ・深すぎを避けるため、最大深さの10%〜80%を使う
+        depth_min = int(math.ceil(float(full_octree_depth) * 0.10))
+        depth_max = int(math.floor(float(full_octree_depth) * 0.80))
+
+        # depth=0 や範囲崩壊を防ぐ
+        depth_min = max(1, depth_min)
+        depth_max = max(depth_min, depth_max)
+
+        # 念のため最大深さを超えないようにする
+        depth_min = min(depth_min, full_octree_depth)
+        depth_max = min(depth_max, full_octree_depth)
+
+        if depth_min > depth_max:
+            depth_min, depth_max = depth_max, depth_min
+
+        args.train_subtree_level_min = int(depth_min)
+        args.train_subtree_level_max = int(depth_max)
+        args._train_subtree_depth_cli_override = True
+
+        # 10%〜80%の範囲からランダムに選ばせる
+        if bool(getattr(args, "surrogate_pretrain_subtree_random_depth", True)):
+            args.train_subtree_randomize_level = True
+        else:
             args.train_subtree_randomize_level = False
-            args._train_subtree_depth_cli_override = True
+
         return callback()
     finally:
         for key, value in saved.items():
@@ -689,7 +772,11 @@ def _build_surrogate_pretrain_subtree_sample(pts, args, cache_key, use_cuda, glo
             cache_key=cache_key,
         )
 
-    subtree_depth_meta = _with_pretrain_subtree_depth_overrides(args, _sample_depth)
+    subtree_depth_meta = _with_pretrain_subtree_depth_overrides(
+        args,
+        _sample_depth,
+        input_xyz=input_xyz,
+    )
     subtree_ref = build_octree_subtree_reference(
         input_xyz,
         args,
@@ -1783,6 +1870,7 @@ def _run_surrogate_pretrain(
     use_amp,
     amp_dtype,
 ):
+    print(f"Surrogate pretrain step: {int(getattr(args, 'surrogate_pretrain_steps', 0))}")
     steps = max(int(getattr(args, "surrogate_pretrain_steps", 0)), 0)
     if steps <= 0:
         return
@@ -1916,6 +2004,7 @@ def _run_surrogate_pretrain(
                 loader = torch.utils.data.DataLoader(dataset, **loader_kwargs)
                 data_wait_t0 = time.perf_counter()
                 for local_step, pts in enumerate(loader):
+                    surrogate_st = time.time()
                     data_time = time.perf_counter() - data_wait_t0
                     if completed_steps >= steps or early_stop_reason is not None:
                         break
@@ -2288,6 +2377,8 @@ def _run_surrogate_pretrain(
                         early_stop_hits = 0
 
                     completed_steps += 1
+                    surrogate_en = time.time()
+                    print(f"Surrogate Step: {completed_steps + 1}/{steps} | {surrogate_en - surrogate_st}sec")
                     if max_wall_time_sec > 0.0:
                         elapsed_wall = time.perf_counter() - pretrain_start_time
                         if elapsed_wall >= max_wall_time_sec:
