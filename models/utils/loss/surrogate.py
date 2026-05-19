@@ -308,11 +308,76 @@ class SurrogateCompressionLossMixin:
     def _surrogate_update_allowed_by_schedule(args):
         if bool(getattr(args, "_surrogate_pretrain_active", False)):
             return True
+        if bool(getattr(args, "_surrogate_auto_frozen", False)):
+            return False
         if not bool(getattr(args, "surrogate_update_during_training", True)):
             return False
         interval = max(int(getattr(args, "surrogate_update_interval", 1)), 1)
         step = int(getattr(args, "_global_train_step", 0))
         return (step % interval) == 0
+
+    def _update_surrogate_auto_freeze_state(self, args, *, abs_error, train_loss, teacher_is_actual):
+        if bool(getattr(args, "_surrogate_pretrain_active", False)) or not bool(
+            getattr(args, "surrogate_auto_freeze", True)
+        ):
+            setattr(args, "_surrogate_auto_frozen", False)
+            return {"frozen": False, "streak": 0, "event": "disabled"}
+        frozen = bool(getattr(args, "_surrogate_auto_frozen", False))
+        streak = int(getattr(args, "_surrogate_auto_freeze_streak", 0))
+        if not teacher_is_actual:
+            return {"frozen": frozen, "streak": streak, "event": "no_actual_teacher"}
+        abs_error = float(abs_error)
+        train_loss = float(train_loss)
+        if not (math.isfinite(abs_error) and math.isfinite(train_loss)):
+            setattr(args, "_surrogate_auto_frozen", False)
+            setattr(args, "_surrogate_auto_freeze_streak", 0)
+            return {"frozen": False, "streak": 0, "event": "non_finite_resume"}
+
+        freeze_ok = (
+            abs_error <= float(getattr(args, "surrogate_freeze_abs_error", 1.0))
+            and train_loss <= float(getattr(args, "surrogate_freeze_train_loss", 1.0))
+        )
+        if frozen:
+            resume = (
+                abs_error >= float(getattr(args, "surrogate_resume_abs_error", 2.0))
+                or train_loss >= float(getattr(args, "surrogate_resume_train_loss", 2.0))
+            )
+            if resume:
+                frozen = False
+                streak = 0
+                event = "resume"
+            else:
+                event = "frozen"
+        else:
+            streak = streak + 1 if freeze_ok else 0
+            if streak >= max(int(getattr(args, "surrogate_freeze_patience", 8)), 1):
+                frozen = True
+                event = "freeze"
+            else:
+                event = "warmup"
+        setattr(args, "_surrogate_auto_frozen", bool(frozen))
+        setattr(args, "_surrogate_auto_freeze_streak", int(streak))
+        return {"frozen": bool(frozen), "streak": int(streak), "event": event}
+
+    @staticmethod
+    def _compression_main_grad_scale(args, *, actual_bit_percent, abs_error):
+        if not bool(getattr(args, "compression_good_step_boost", True)):
+            return 1.0, "disabled"
+        if bool(getattr(args, "compression_boost_requires_surrogate_frozen", True)) and not bool(
+            getattr(args, "_surrogate_auto_frozen", False)
+        ):
+            return 1.0, "surrogate_not_frozen"
+        abs_error = float(abs_error)
+        if not math.isfinite(abs_error) or abs_error > float(getattr(args, "compression_boost_max_abs_error", 1.0)):
+            return 1.0, "surrogate_error_high"
+        actual_bit_percent = float(actual_bit_percent)
+        if not math.isfinite(actual_bit_percent):
+            return 1.0, "actual_non_finite"
+        if actual_bit_percent < 0.0:
+            return float(getattr(args, "compression_good_step_boost_scale", 1.5)), "good_actual_delta"
+        if actual_bit_percent > 0.0:
+            return float(getattr(args, "compression_bad_step_penalty_scale", 1.25)), "bad_actual_delta"
+        return 1.0, "neutral_actual_delta"
 
     def _surrogate_target_cache_key(self, args, cache_key):
         backend = self._surrogate_backend_label(args)
@@ -746,7 +811,7 @@ class SurrogateCompressionLossMixin:
             local_proxy_target = (
                 aux_node_weight * soft_node_percent.to(device=gen_xyz.device, dtype=torch.float32)
                 + aux_single_weight * soft_single_percent.to(device=gen_xyz.device, dtype=torch.float32)
-                + float(getattr(args, "com_sparsepcgc", 1.0))
+                + float(getattr(args, "com_sparsepcgc", 0.0))
                 * sparse_terms["loss"].to(device=gen_xyz.device, dtype=torch.float32)
             ).detach()
             local_proxy_target = local_proxy_target.reshape(-1).mean().reshape(1, 1)
@@ -845,20 +910,45 @@ class SurrogateCompressionLossMixin:
 
         surrogate_bit_percent = pred.reshape(-1).mean() if pred.numel() > 0 else x_soft.new_zeros(())
         actual_bit_percent_t = gen_xyz.new_tensor(float(actual_bit_percent), dtype=torch.float32)
+        pred_percent = surrogate_bit_percent.detach().reshape(())
+        target_percent = pred_percent.new_tensor(float(target_percent_value)).detach().reshape(())
+        surrogate_signed_bit_error = pred_percent - target_percent
+        surrogate_abs_bit_error = surrogate_signed_bit_error.abs()
+        teacher_is_actual_for_control = bool(actual_value_source in {"fresh_teacher", "target_cache", "stale_target"})
+        auto_freeze_debug = self._update_surrogate_auto_freeze_state(
+            args,
+            abs_error=self._scalar(surrogate_abs_bit_error),
+            train_loss=self._scalar(L_sur),
+            teacher_is_actual=teacher_is_actual_for_control,
+        )
+        main_grad_scale, main_grad_scale_reason = self._compression_main_grad_scale(
+            args,
+            actual_bit_percent=float(actual_bit_percent),
+            abs_error=self._scalar(surrogate_abs_bit_error),
+        )
         loss_single = soft_single_percent.to(device=gen_xyz.device, dtype=torch.float32)
         loss_nodes = soft_node_percent.to(device=gen_xyz.device, dtype=torch.float32)
-        forward_mode = str(getattr(args, "compression_surrogate_forward_mode", "surrogate")).strip().lower()
+        forward_mode = str(getattr(args, "compression_surrogate_forward_mode", "teacher_ste")).strip().lower()
         if forward_mode == "teacher_ste":
             surrogate_loss = surrogate_bit_percent if inputs_finite else None
-            main_loss = self._compose_discrete_loss(actual_bit_percent_t, surrogate_loss, args)
+            if surrogate_loss is None:
+                main_loss = actual_bit_percent_t
+            else:
+                surrogate_weight = self._surrogate_weight(args) * float(main_grad_scale)
+                main_loss = actual_bit_percent_t + surrogate_weight * (surrogate_loss - surrogate_loss.detach())
         else:
-            main_loss = surrogate_bit_percent if inputs_finite else actual_bit_percent_t
+            main_loss = (float(main_grad_scale) * surrogate_bit_percent) if inputs_finite else actual_bit_percent_t
         aux_loss = aux_node_weight * loss_nodes + aux_single_weight * loss_single
-        sparsepcgc_aux_weight = float(getattr(args, "com_sparsepcgc", 1.0))
+        aux_objective = aux_loss if bool(getattr(args, "compression_surrogate_aux_in_objective", False)) else aux_loss.new_zeros(())
+        sparsepcgc_aux_weight = float(getattr(args, "com_sparsepcgc", 0.0))
         sparse_aux_raw = sparse_terms["loss"]
         sparse_aux_loss = sparsepcgc_aux_weight * sparse_aux_raw
-        lcom_without_sparse = main_loss + aux_loss
-        L_com = lcom_without_sparse + sparse_aux_loss
+        sparsepcgc_aux_backprop = bool(getattr(args, "sparsepcgc_aux_backprop", False))
+        sparse_aux_objective = sparse_aux_loss if sparsepcgc_aux_backprop else sparse_aux_loss.new_zeros(())
+        sparse_aux_term = sparse_terms["loss"] if sparsepcgc_aux_backprop else sparse_terms["loss"].detach()
+        lcom_without_sparse = main_loss + aux_objective
+        lcom_with_sparse = main_loss + aux_loss + sparse_aux_loss
+        L_com = lcom_without_sparse + sparse_aux_objective
         backend_label = self._surrogate_backend_label(args, teacher_codec)
         self._store_compression_terms(
             main=main_loss,
@@ -871,14 +961,10 @@ class SurrogateCompressionLossMixin:
             hard=actual_bit_percent_t,
             surrogate=surrogate_bit_percent,
             aux=aux_loss,
-            sparsepcgc=sparse_terms["loss"],
+            sparsepcgc=sparse_aux_term,
             backend=backend_label,
         )
 
-        pred_percent = surrogate_bit_percent.detach().reshape(())
-        target_percent = pred_percent.new_tensor(float(target_percent_value)).detach().reshape(())
-        surrogate_signed_bit_error = pred_percent - target_percent
-        surrogate_abs_bit_error = surrogate_signed_bit_error.abs()
         current_step_for_debug = int(
             getattr(args, "_global_train_step", getattr(self, "_surrogate_call_count", 0))
         )
@@ -938,13 +1024,17 @@ class SurrogateCompressionLossMixin:
             "compression_objective": self._scalar(L_com),
             "compression_main_loss": self._scalar(main_loss),
             "compression_aux_loss": self._scalar(aux_loss),
+            "compression_aux_in_objective": bool(getattr(args, "compression_surrogate_aux_in_objective", False)),
+            "compression_main_grad_scale": float(main_grad_scale),
+            "compression_main_grad_scale_reason": str(main_grad_scale_reason),
             "sparsepcgc_aux_loss": self._scalar(sparse_terms["loss"].detach()),
             "sparsepcgc_aux_raw": self._scalar(sparse_aux_raw.detach()),
             "sparsepcgc_aux_weighted": self._scalar(sparse_aux_loss.detach()),
             "sparsepcgc_aux_weight": sparsepcgc_aux_weight,
+            "sparsepcgc_aux_backprop": bool(sparsepcgc_aux_backprop),
             "com_sparsepcgc_weight": sparsepcgc_aux_weight,
             "lcom_without_sparsepcgc_aux": self._scalar(lcom_without_sparse.detach()),
-            "lcom_with_sparsepcgc_aux": self._scalar(L_com.detach()),
+            "lcom_with_sparsepcgc_aux": self._scalar(lcom_with_sparse.detach()),
             "sparsepcgc_active_coord_loss": self._scalar(sparse_terms["active"].detach()),
             "sparsepcgc_isolated_proxy_loss": self._scalar(sparse_terms["single"].detach()),
             "sparsepcgc_entropy_proxy_loss": self._scalar(sparse_terms["entropy"].detach()),
@@ -1023,6 +1113,9 @@ class SurrogateCompressionLossMixin:
             "surrogate_update_on_teacher_refresh_only": bool(
                 getattr(args, "surrogate_update_on_teacher_refresh_only", False)
             ),
+            "surrogate_auto_frozen": bool(auto_freeze_debug.get("frozen", False)),
+            "surrogate_auto_freeze_streak": int(auto_freeze_debug.get("streak", 0)),
+            "surrogate_auto_freeze_event": str(auto_freeze_debug.get("event", "")),
             "surrogate_pretrain_active": bool(getattr(args, "_surrogate_pretrain_active", False)),
             "surrogate_pretrain_mode": pretrain_mode,
             "surrogate_pretrain_teacher_type": pretrain_teacher_type,

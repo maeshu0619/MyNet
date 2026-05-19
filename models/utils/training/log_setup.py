@@ -47,8 +47,8 @@ def log_loss_weight_setup(writer, args):
 
     if surrogate_backend:
         writer.write(
-            "Compression Forward Metric: surrogate_pred_bit_percent plus soft Octree auxiliaries; "
-            "actual_total_bit_percent is logged only when/after teacher refresh."
+            "Compression Forward Metric: actual_total_bit_percent=100*(Mine_bits-GT_bits)/GT_bits "
+            "with surrogate backward; soft auxiliaries are diagnostics unless explicitly enabled."
         )
         writer.write(
             "Compression Teacher Refresh: "
@@ -57,9 +57,10 @@ def log_loss_weight_setup(writer, args):
             f"warmup_steps={int(getattr(args, 'compression_surrogate_warmup_steps', 0))}, "
             f"replay_steps={int(getattr(args, 'compression_surrogate_replay_steps', 0))}, "
             f"replay_batch={int(getattr(args, 'compression_surrogate_replay_batch', 0))}, "
-            f"forward={getattr(args, 'compression_surrogate_forward_mode', 'surrogate')}, "
+            f"forward={getattr(args, 'compression_surrogate_forward_mode', 'teacher_ste')}, "
             f"aux_node={float(getattr(args, 'compression_surrogate_aux_node_weight', 0.0))}, "
             f"aux_single={float(getattr(args, 'compression_surrogate_aux_single_weight', 0.0))}, "
+            f"aux_in_objective={bool(getattr(args, 'compression_surrogate_aux_in_objective', False))}, "
             f"reuse_last_target={bool(getattr(args, 'compression_surrogate_reuse_last_target', True))})"
         )
         writer.write(
@@ -67,7 +68,7 @@ def log_loss_weight_setup(writer, args):
             f"pretrain_steps={int(getattr(args, 'surrogate_pretrain_steps', 0))}, "
             f"pretrain_lr={float(getattr(args, 'surrogate_pretrain_lr', 1e-4))}, "
             f"pretrain_mode={getattr(args, 'surrogate_pretrain_mode', 'full')}, "
-            f"pretrain_subtree_teacher={getattr(args, 'surrogate_pretrain_subtree_teacher_type', 'local_proxy')}, "
+            f"pretrain_subtree_teacher={getattr(args, 'surrogate_pretrain_subtree_teacher_type', 'local_actual')}, "
             f"pretrain_full_calibration_interval={int(getattr(args, 'surrogate_pretrain_full_calibration_interval', 0))}, "
             f"pretrain_full_calibration_steps={int(getattr(args, 'surrogate_pretrain_full_calibration_steps', 1))}, "
             f"pretrain_actual_refresh_interval={int(getattr(args, 'surrogate_pretrain_actual_refresh_interval', 0))}, "
@@ -82,8 +83,9 @@ def log_loss_weight_setup(writer, args):
         )
         writer.write("Compression Surrogate Backward: enabled")
         writer.write(
-            f"Surrogate compression uses predicted bit objective plus soft Octree auxiliaries on {compression_backend}; "
-            "legacy comp_bit/com_sin/com_node/com_bpn/com_lowprob weights are not used directly."
+            f"Surrogate compression objective on {compression_backend}: "
+            "actual_total_bit_percent = 100*(Mine_bits-GT_bits)/GT_bits with surrogate backward; "
+            "soft auxiliary proxies are diagnostics unless explicitly enabled."
         )
 
     if actual_total_bit_backend:

@@ -145,7 +145,9 @@ def init_for_better_logger(args, plot, writer=None):
     if not for_better_bool(getattr(args, "for_better_log", True), True):
         return None
     save_dir = getattr(plot, "save_dir", None) or getattr(args, "out_path", ".")
-    path = os.path.join(save_dir, "ForBetter.txt")
+    args_time = str(getattr(args, "time", "") or "").strip()
+    filename = f"{args_time}_ForBetter.txt" if args_time else "ForBetter.txt"
+    path = os.path.join(save_dir, filename)
     try:
         os.makedirs(save_dir, exist_ok=True)
         with open(path, "w", encoding="utf-8") as handle:
@@ -165,8 +167,12 @@ def init_for_better_logger(args, plot, writer=None):
         "surrogate_pretrain_skip_min_points_miss": getattr(args, "surrogate_pretrain_skip_min_points_miss", None),
         "surrogate_update_during_training": getattr(args, "surrogate_update_during_training", None),
         "surrogate_update_interval": getattr(args, "surrogate_update_interval", None),
+        "surrogate_auto_freeze": getattr(args, "surrogate_auto_freeze", None),
+        "surrogate_freeze_abs_error": getattr(args, "surrogate_freeze_abs_error", None),
         "compression_surrogate_refresh_interval": getattr(args, "compression_surrogate_refresh_interval", None),
         "compression_surrogate_reuse_last_target": getattr(args, "compression_surrogate_reuse_last_target", None),
+        "compression_surrogate_aux_in_objective": getattr(args, "compression_surrogate_aux_in_objective", None),
+        "compression_good_step_boost": getattr(args, "compression_good_step_boost", None),
         "surrogate_pretrain_allow_stale_target": getattr(args, "surrogate_pretrain_allow_stale_target", None),
         "train_patch_subset_enable": getattr(args, "train_patch_subset_enable", None),
         "train_subtree_level_min": getattr(args, "train_subtree_level_min", None),
@@ -186,6 +192,7 @@ def init_for_better_logger(args, plot, writer=None):
         "com_sin": getattr(args, "com_sin", None),
         "com_node": getattr(args, "com_node", None),
         "com_sparsepcgc": getattr(args, "com_sparsepcgc", None),
+        "sparsepcgc_aux_backprop": getattr(args, "sparsepcgc_aux_backprop", None),
         "sparsepcgc_add_status": sparsepcgc_add_control_status(args),
     }
     log_for_better_event(path, "setup", **setup_fields)

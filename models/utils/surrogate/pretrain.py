@@ -174,53 +174,94 @@ def build_surrogate_pretrain_subtree_sample(pts, args, cache_key, use_cuda, glob
         sample_depth_for_pretrain,
         input_xyz=input_xyz,
     )
-    subtree_ref = build_octree_subtree_reference(
-        input_xyz,
-        args,
-        depth=int(subtree_depth_meta["depth"]),
-    )
-    full_subtree_keys = assign_octree_subtree_keys(input_xyz, subtree_ref)
-    all_subtree_keys, subtree_index_lists = build_subtree_index_map(full_subtree_keys)
-    total_subtree_count = int(all_subtree_keys.numel())
     min_subtree_points = max(int(getattr(args, "train_subtree_min_points", 1)), 1)
-    all_groups = [
-        (int(subtree_key.detach().cpu()), point_idx)
-        for subtree_key, point_idx in zip(all_subtree_keys, subtree_index_lists)
-    ]
-    eligible_groups = [
-        (subtree_key, point_idx)
-        for subtree_key, point_idx in all_groups
-        if int(point_idx.numel()) >= min_subtree_points
-    ]
-    if (
-        not eligible_groups
-        and all_groups
-        and min_subtree_points > 1
-        and bool(getattr(args, "surrogate_pretrain_skip_min_points_miss", True))
+    requested_depth = max(int(subtree_depth_meta.get("depth", 1)), 1)
+    fallback = None
+    selected_depth_state = None
+    retry_count = 0
+    for depth in range(requested_depth, 0, -1):
+        subtree_ref_candidate = build_octree_subtree_reference(input_xyz, args, depth=int(depth))
+        full_subtree_keys = assign_octree_subtree_keys(input_xyz, subtree_ref_candidate)
+        all_subtree_keys_candidate, subtree_index_lists = build_subtree_index_map(full_subtree_keys)
+        all_groups = [
+            (int(subtree_key.detach().cpu()), point_idx)
+            for subtree_key, point_idx in zip(all_subtree_keys_candidate, subtree_index_lists)
+        ]
+        eligible_groups = [
+            (subtree_key, point_idx)
+            for subtree_key, point_idx in all_groups
+            if int(point_idx.numel()) >= min_subtree_points
+        ]
+        if all_groups:
+            largest_group = max(all_groups, key=lambda item: int(item[1].numel()))
+            fallback_points = int(fallback[3][0][1].numel()) if fallback is not None else -1
+        if all_groups and (fallback is None or int(largest_group[1].numel()) > fallback_points):
+            fallback = (
+                subtree_ref_candidate,
+                all_subtree_keys_candidate,
+                all_groups,
+                [largest_group],
+                retry_count,
+                int(depth),
+                "min_points_miss_fallback_largest",
+                0,
+            )
+        if eligible_groups:
+            selected_depth_state = (
+                subtree_ref_candidate,
+                all_subtree_keys_candidate,
+                all_groups,
+                eligible_groups,
+                retry_count,
+                int(depth),
+                "depth_retry" if int(depth) != requested_depth else "none",
+                len(eligible_groups),
+            )
+            break
+        retry_count += 1
+
+    if selected_depth_state is None and fallback is not None and not bool(
+        getattr(args, "surrogate_pretrain_skip_min_points_miss", False)
     ):
+        selected_depth_state = fallback
+
+    if selected_depth_state is None and fallback is not None:
         return {
             "skip_reason": "min_points_miss",
             "sampling_time": time.perf_counter() - sample_t0,
-            "depth": int(subtree_depth_meta.get("depth", 0)),
+            "depth": requested_depth,
             "point_count": 0,
-            "total_subtree_count": total_subtree_count,
+            "total_subtree_count": len(fallback[2]),
             "eligible_subtree_count": 0,
             "selected_subtree_count": 0,
-            "retry_count": 0,
+            "retry_count": retry_count,
         }
-    group_source = eligible_groups or all_groups
-    skip_reason = "none"
-    if not group_source:
+
+    if selected_depth_state is None:
         return {
             "skip_reason": "no_valid_subtree",
             "sampling_time": time.perf_counter() - sample_t0,
-            "depth": int(subtree_depth_meta.get("depth", 0)),
+            "depth": requested_depth,
             "point_count": 0,
-            "total_subtree_count": total_subtree_count,
+            "total_subtree_count": 0,
             "eligible_subtree_count": 0,
             "selected_subtree_count": 0,
-            "retry_count": 0,
+            "retry_count": retry_count,
         }
+
+    (
+        subtree_ref,
+        all_subtree_keys,
+        all_groups,
+        group_source,
+        retry_count,
+        selected_depth,
+        skip_reason,
+        eligible_count,
+    ) = selected_depth_state
+    subtree_depth_meta = dict(subtree_depth_meta)
+    subtree_depth_meta["depth"] = selected_depth
+    total_subtree_count = int(all_subtree_keys.numel())
 
     selected_groups = group_source
     if bool(getattr(args, "surrogate_pretrain_subtree_reuse_train_sampler", True)):
@@ -263,10 +304,10 @@ def build_surrogate_pretrain_subtree_sample(pts, args, cache_key, use_cuda, glob
         "point_count": point_count,
         "bbox_min": format_xyz_triplet(bbox_min),
         "bbox_max": format_xyz_triplet(bbox_max),
-        "retry_count": 0,
+        "retry_count": retry_count,
         "skip_reason": skip_reason,
         "total_subtree_count": total_subtree_count,
-        "eligible_subtree_count": int(len(eligible_groups)),
+        "eligible_subtree_count": int(eligible_count),
         "selected_subtree_count": int(len(selected_groups)),
         "depth": int(subtree_ref["depth"][0].item()),
         "sampling_time": time.perf_counter() - sample_t0,
@@ -318,7 +359,7 @@ def run_surrogate_pretrain(
     replay_batch = max(int(getattr(args, "surrogate_pretrain_replay_batch_size", 16)), 1)
     replay_buffer_size = max(int(getattr(args, "surrogate_pretrain_replay_buffer_size", 256)), 0)
     debug_interval = int(getattr(args, "surrogate_pretrain_sparsepcgc_debug_interval", 10))
-    teacher_type = str(getattr(args, "surrogate_pretrain_subtree_teacher_type", "local_proxy")).strip().lower()
+    teacher_type = str(getattr(args, "surrogate_pretrain_subtree_teacher_type", "local_actual")).strip().lower()
     full_calibration_interval = max(int(getattr(args, "surrogate_pretrain_full_calibration_interval", 50)), 1)
     full_calibration_steps = max(int(getattr(args, "surrogate_pretrain_full_calibration_steps", 1)), 1)
     max_wall_time_sec = max(float(getattr(args, "surrogate_pretrain_max_wall_time_sec", 0.0)), 0.0)
