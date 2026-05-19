@@ -61,6 +61,7 @@ def log_loss_weight_setup(writer, args):
             f"aux_node={float(getattr(args, 'compression_surrogate_aux_node_weight', 0.0))}, "
             f"aux_single={float(getattr(args, 'compression_surrogate_aux_single_weight', 0.0))}, "
             f"aux_in_objective={bool(getattr(args, 'compression_surrogate_aux_in_objective', False))}, "
+            f"log_soft_aux={bool(getattr(args, 'compression_surrogate_log_soft_aux', True))}, "
             f"reuse_last_target={bool(getattr(args, 'compression_surrogate_reuse_last_target', True))})"
         )
         writer.write(
@@ -69,6 +70,8 @@ def log_loss_weight_setup(writer, args):
             f"pretrain_lr={float(getattr(args, 'surrogate_pretrain_lr', 1e-4))}, "
             f"pretrain_mode={getattr(args, 'surrogate_pretrain_mode', 'full')}, "
             f"pretrain_subtree_teacher={getattr(args, 'surrogate_pretrain_subtree_teacher_type', 'local_actual')}, "
+            f"pretrain_depth_percent={float(getattr(args, 'surrogate_pretrain_subtree_depth_percent_min', 0.05)):.3g}-"
+            f"{float(getattr(args, 'surrogate_pretrain_subtree_depth_percent_max', 0.50)):.3g}, "
             f"pretrain_full_calibration_interval={int(getattr(args, 'surrogate_pretrain_full_calibration_interval', 0))}, "
             f"pretrain_full_calibration_steps={int(getattr(args, 'surrogate_pretrain_full_calibration_steps', 1))}, "
             f"pretrain_actual_refresh_interval={int(getattr(args, 'surrogate_pretrain_actual_refresh_interval', 0))}, "
@@ -182,8 +185,11 @@ def log_codec_setup(writer, args):
             f"move_existing_target_only={bool(getattr(args, 'sparsepcgc_move_existing_target_only', True))}, "
             f"target_add_ratio={float(getattr(args, 'target_add_ratio', 0.0))}, "
             f"max_add_ratio={float(getattr(args, 'max_add_ratio', 0.0))}, "
-            f"exp_target={float(getattr(args, 'sparsepcgc_add_target_ratio', 0.001))}, "
-            f"exp_max={float(getattr(args, 'sparsepcgc_add_max_ratio', 0.003))}"
+            f"add_hard_threshold={float(getattr(args, 'repair_add_hard_threshold', 0.5))}, "
+            f"move_hard_threshold={float(getattr(args, 'repair_move_hard_threshold', 0.5))}, "
+            f"move_source_prior_weight={float(getattr(args, 'sparsepcgc_move_source_prior_weight', 0.0))}, "
+            f"exp_target={float(getattr(args, 'sparsepcgc_add_target_ratio', 0.005))}, "
+            f"exp_max={float(getattr(args, 'sparsepcgc_add_max_ratio', 0.10))}"
         )
         writer.write(
             "SparsePCGC Quantization Alignment: "

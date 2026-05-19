@@ -66,6 +66,8 @@ def build_compression_metric_row(
         "proxy_delta_percent": case_float(comp_debug.get("rate_proxy_delta", comp_debug.get("total_bit", float("nan"))), float("nan")),
         "actual_bits_before": case_float(comp_debug.get("gt_actual_bit", comp_debug.get("gt_bit_abs", float("nan"))), float("nan")),
         "actual_bits_after": case_float(comp_debug.get("gen_actual_bit", comp_debug.get("gen_bit_abs", float("nan"))), float("nan")),
+        "gt_actual_bit": case_float(comp_debug.get("gt_actual_bit", comp_debug.get("gt_bit_abs", float("nan"))), float("nan")),
+        "gen_actual_bit": case_float(comp_debug.get("gen_actual_bit", comp_debug.get("gen_bit_abs", float("nan"))), float("nan")),
         "point_count_before": case_int(comp_debug.get("gt_points", 0)),
         "point_count_after": case_int(comp_debug.get("gen_points", 0)),
         "unique_coord_before": case_int(comp_debug.get("gt_unique_coord_count", 0)),
@@ -151,10 +153,11 @@ def build_operation_metric_row(
     input_points = case_float(edit_stats.get("input_points_avg", edit_stats.get("input_points", float("nan"))), float("nan"))
     add_candidate_ratio = case_float(structure_debug.get("add_candidate_ratio", float("nan")), float("nan"))
     add_candidate_count = None
-    if math.isfinite(input_points) and math.isfinite(add_candidate_ratio):
+    debug_add_candidate_count = structure_debug.get("add_candidate_count", None)
+    if debug_add_candidate_count is not None:
+        add_candidate_count = case_int(debug_add_candidate_count, 0)
+    elif math.isfinite(input_points) and math.isfinite(add_candidate_ratio):
         add_candidate_count = int(round(input_points * add_candidate_ratio))
-        if add_candidate_ratio > 0.0 and input_points > 0.0:
-            add_candidate_count = max(add_candidate_count, 1)
     add_effective_count = case_int(structure_debug.get("add_effective_count", structure_debug.get("add_actual_point_count", 0)))
     unique_delta = unique_after - unique_before
     positive_unique_delta = max(unique_delta, 0)
@@ -205,6 +208,7 @@ def build_operation_metric_row(
         "delete_target_voxels": case_int(structure_debug.get("delete_target_voxel_count", 0)),
         "delete_emptied_voxels": case_int(structure_debug.get("delete_emptied_voxel_count", 0)),
         "move_score_mean": case_float(structure_debug.get("move_score_mean", float("nan")), float("nan")),
+        "move_source_prior_mean": case_float(structure_debug.get("move_source_prior_mean", float("nan")), float("nan")),
         "hard_move_ratio": case_float(structure_debug.get("move_ratio", float("nan")), float("nan")),
         "hard_move_count": case_int(structure_debug.get("hard_move_count", 0)),
         "move_source_voxels": case_int(structure_debug.get("move_source_voxel_count", 0)),

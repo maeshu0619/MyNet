@@ -360,19 +360,25 @@ class SurrogateCompressionLossMixin:
         return {"frozen": bool(frozen), "streak": int(streak), "event": event}
 
     @staticmethod
-    def _compression_main_grad_scale(args, *, actual_bit_percent, abs_error):
+    def _compression_main_grad_scale(args, *, actual_bit_percent, abs_error, train_loss=0.0):
         if not bool(getattr(args, "compression_good_step_boost", True)):
             return 1.0, "disabled"
-        if bool(getattr(args, "compression_boost_requires_surrogate_frozen", True)) and not bool(
-            getattr(args, "_surrogate_auto_frozen", False)
-        ):
-            return 1.0, "surrogate_not_frozen"
         abs_error = float(abs_error)
         if not math.isfinite(abs_error) or abs_error > float(getattr(args, "compression_boost_max_abs_error", 1.0)):
             return 1.0, "surrogate_error_high"
         actual_bit_percent = float(actual_bit_percent)
         if not math.isfinite(actual_bit_percent):
             return 1.0, "actual_non_finite"
+        frozen = bool(getattr(args, "_surrogate_auto_frozen", False))
+        if bool(getattr(args, "compression_boost_requires_surrogate_frozen", True)) and not frozen:
+            train_loss = float(train_loss)
+            if (
+                actual_bit_percent < 0.0
+                and math.isfinite(train_loss)
+                and train_loss <= float(getattr(args, "compression_good_step_prefreeze_max_train_loss", 4.0))
+            ):
+                return float(getattr(args, "compression_good_step_prefreeze_scale", 1.15)), "good_actual_delta_prefreeze"
+            return 1.0, "surrogate_not_frozen"
         if actual_bit_percent < 0.0:
             return float(getattr(args, "compression_good_step_boost_scale", 1.5)), "good_actual_delta"
         if actual_bit_percent > 0.0:
@@ -669,7 +675,8 @@ class SurrogateCompressionLossMixin:
         timing_cursor = _mark_timing("feature_gen", timing_cursor)
         aux_node_weight = float(getattr(args, "compression_surrogate_aux_node_weight", 0.0))
         aux_single_weight = float(getattr(args, "compression_surrogate_aux_single_weight", 0.0))
-        if aux_node_weight > 0.0 or aux_single_weight > 0.0:
+        log_soft_aux = bool(getattr(args, "compression_surrogate_log_soft_aux", True))
+        if log_soft_aux or aux_node_weight > 0.0 or aux_single_weight > 0.0:
             x_ref = self._build_soft_compression_features(args, gt_xyz, gt_xyz, None)
             soft_node_percent, soft_single_percent = self._soft_aux_percent_from_features(x_soft, x_ref)
         else:
@@ -750,6 +757,15 @@ class SurrogateCompressionLossMixin:
                 0,
             )
             L_sur = self._train_compression_surrogate(args, x_soft, target, train_steps=warmup_steps)
+            extra_good_steps = max(int(getattr(args, "compression_good_step_extra_surrogate_steps", 0)), 0)
+            if (
+                extra_good_steps > 0
+                and float(actual_bit_percent) < 0.0
+                and not bool(getattr(args, "_surrogate_pretrain_active", False))
+            ):
+                L_sur_extra = self._train_compression_surrogate(args, x_soft, target, train_steps=extra_good_steps)
+                if self._all_finite(L_sur_extra):
+                    L_sur = L_sur_extra
             timing_cursor = _mark_timing("surrogate_fit", timing_cursor)
             self._store_surrogate_replay(args, x_soft, target)
             actual_value_source = "fresh_teacher"
@@ -925,6 +941,7 @@ class SurrogateCompressionLossMixin:
             args,
             actual_bit_percent=float(actual_bit_percent),
             abs_error=self._scalar(surrogate_abs_bit_error),
+            train_loss=self._scalar(L_sur),
         )
         loss_single = soft_single_percent.to(device=gen_xyz.device, dtype=torch.float32)
         loss_nodes = soft_node_percent.to(device=gen_xyz.device, dtype=torch.float32)

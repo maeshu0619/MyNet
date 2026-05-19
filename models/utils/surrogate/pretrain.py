@@ -121,9 +121,24 @@ def with_pretrain_subtree_depth_overrides(args, callback, input_xyz=None):
         # 点群全体をOctree分割したときの最大深さを推定
         full_octree_depth = infer_octree_depth_from_xyz(input_xyz, args)
 
-        # 浅すぎ・深すぎを避けるため、最大深さの10%〜80%を使う
-        depth_min = int(math.ceil(float(full_octree_depth) * 0.10))
-        depth_max = int(math.floor(float(full_octree_depth) * 0.80))
+        if (
+            int(getattr(args, "surrogate_pretrain_subtree_depth_min", -1)) > 0
+            or int(getattr(args, "surrogate_pretrain_subtree_depth_max", -1)) > 0
+        ):
+            depth_min = int(getattr(args, "surrogate_pretrain_subtree_depth_min", -1))
+            depth_max = int(getattr(args, "surrogate_pretrain_subtree_depth_max", -1))
+            if depth_min <= 0:
+                depth_min = 1
+            if depth_max <= 0:
+                depth_max = full_octree_depth
+            pct_min = float(depth_min) / float(max(full_octree_depth, 1))
+            pct_max = float(depth_max) / float(max(full_octree_depth, 1))
+        else:
+            pct_min = min(max(float(getattr(args, "surrogate_pretrain_subtree_depth_percent_min", 0.05)), 0.01), 1.0)
+            pct_max = min(max(float(getattr(args, "surrogate_pretrain_subtree_depth_percent_max", 0.50)), 0.01), 1.0)
+            pct_min, pct_max = sorted((pct_min, pct_max))
+            depth_min = int(math.ceil(float(full_octree_depth) * pct_min))
+            depth_max = int(math.floor(float(full_octree_depth) * pct_max))
 
         # depth=0 や範囲崩壊を防ぐ
         depth_min = max(1, depth_min)
@@ -146,7 +161,11 @@ def with_pretrain_subtree_depth_overrides(args, callback, input_xyz=None):
         else:
             args.train_subtree_randomize_level = False
 
-        return callback()
+        result = callback()
+        if isinstance(result, dict):
+            result["pretrain_depth_percent_range"] = (float(pct_min), float(pct_max))
+            result["pretrain_depth_absolute_range"] = (int(depth_min), int(depth_max))
+        return result
     finally:
         for key, value in saved.items():
             setattr(args, key, value)
@@ -310,6 +329,9 @@ def build_surrogate_pretrain_subtree_sample(pts, args, cache_key, use_cuda, glob
         "eligible_subtree_count": int(eligible_count),
         "selected_subtree_count": int(len(selected_groups)),
         "depth": int(subtree_ref["depth"][0].item()),
+        "requested_depth": int(requested_depth),
+        "depth_percent_range": subtree_depth_meta.get("pretrain_depth_percent_range"),
+        "depth_absolute_range": subtree_depth_meta.get("pretrain_depth_absolute_range"),
         "sampling_time": time.perf_counter() - sample_t0,
     }
 
@@ -336,13 +358,14 @@ def run_surrogate_pretrain(
     metric_csv_paths,
     ckpt_dir,
     writer,
+    plot=None,
     use_cuda,
     use_amp,
     amp_dtype,
     for_better_path=None,
 ):
-    print(f"Surrogate pretrain step: {int(getattr(args, 'surrogate_pretrain_steps', 0))}")
-    steps = max(int(getattr(args, "surrogate_pretrain_steps", 0)), 0)
+    print(f"Surrogate pretrain step: {int(getattr(args, 'surrogate_step', 0))}")
+    steps = max(int(getattr(args, "surrogate_step", 0)), 0)
     if steps <= 0:
         return
     backend = str(getattr(args, "compression_loss_backend", "proxy")).strip().lower()
@@ -374,6 +397,8 @@ def run_surrogate_pretrain(
         f"teacher_type={teacher_type}, full_calibration_interval={full_calibration_interval}, "
         f"full_calibration_steps={full_calibration_steps}, "
         f"subtree_steps_per_full={int(getattr(args, 'surrogate_pretrain_subtree_steps_per_full', full_calibration_interval))}, "
+        f"subtree_depth_percent={float(getattr(args, 'surrogate_pretrain_subtree_depth_percent_min', 0.05)):.3g}-"
+        f"{float(getattr(args, 'surrogate_pretrain_subtree_depth_percent_max', 0.50)):.3g}, "
         f"max_wall_time_sec={max_wall_time_sec:.1f}"
     )
     log_for_better_event(
@@ -390,6 +415,8 @@ def run_surrogate_pretrain(
         sparsepcgc_debug_interval=debug_interval,
         full_calibration_interval=full_calibration_interval,
         full_calibration_steps=full_calibration_steps,
+        subtree_depth_percent_min=float(getattr(args, "surrogate_pretrain_subtree_depth_percent_min", 0.05)),
+        subtree_depth_percent_max=float(getattr(args, "surrogate_pretrain_subtree_depth_percent_max", 0.50)),
         max_wall_time_sec=max_wall_time_sec,
     )
     if pretrain_mode == "full" and steps >= 1000:
@@ -562,6 +589,9 @@ def run_surrogate_pretrain(
                         "total_subtree_count": 0,
                         "eligible_subtree_count": 0,
                         "selected_subtree_count": 0,
+                        "requested_depth": 0,
+                        "depth_percent_range": None,
+                        "depth_absolute_range": None,
                     }
                     comp_debug = None
                     refresh_actual_arg = "always" if full_calibration else should_refresh_actual
@@ -594,6 +624,9 @@ def run_surrogate_pretrain(
                                     "total_subtree_count": case_int(subtree_sample.get("total_subtree_count", 0)),
                                     "eligible_subtree_count": case_int(subtree_sample.get("eligible_subtree_count", 0)),
                                     "selected_subtree_count": case_int(subtree_sample.get("selected_subtree_count", 0)),
+                                    "requested_depth": case_int(subtree_sample.get("requested_depth", 0)),
+                                    "depth_percent_range": subtree_sample.get("depth_percent_range"),
+                                    "depth_absolute_range": subtree_sample.get("depth_absolute_range"),
                                 }
                             )
                             if subtree_meta["point_count"] <= 0 or subtree_meta["skip_reason"] == "empty_selected_subtree":
@@ -790,6 +823,9 @@ def run_surrogate_pretrain(
                         "pretrain_subtree_bbox_max": subtree_meta["bbox_max"],
                         "pretrain_subtree_retry_count": subtree_meta["retry_count"],
                         "pretrain_subtree_skip_reason": subtree_meta["skip_reason"],
+                        "pretrain_subtree_requested_depth": subtree_meta["requested_depth"] if subtree_enabled else None,
+                        "pretrain_subtree_depth_percent_range": subtree_meta["depth_percent_range"] if subtree_enabled else None,
+                        "pretrain_subtree_depth_absolute_range": subtree_meta["depth_absolute_range"] if subtree_enabled else None,
                         "pretrain_subtree_key": subtree_meta["subtree_key"],
                         "pretrain_subtree_total_count": subtree_meta["total_subtree_count"],
                         "pretrain_subtree_eligible_count": subtree_meta["eligible_subtree_count"],
@@ -798,6 +834,7 @@ def run_surrogate_pretrain(
                         "pretrain_actual_scope": actual_scope,
                         "surrogate_param_norm": param_norm,
                         "surrogate_pretrain_lr": current_lr[0] if current_lr else None,
+                        "surrogate_pretrain_mean_error": finite_float_or_none(comp_debug.get("surrogate_mean_error",comp_debug.get("surrogate_mean_bit_error", None),)),
                     }
 
                     log_t0 = time.perf_counter()
@@ -841,6 +878,8 @@ def run_surrogate_pretrain(
                         SURROGATE_PRETRAIN_COLUMNS,
                         row,
                     )
+                    if plot is not None and hasattr(plot, "record_surrogate_pretrain"):
+                        plot.record_surrogate_pretrain(step_number, row)
 
                     if step_number in {1, 3} or (step_number % max(print_interval, 1) == 0):
                         estimated_total = avg_step_time * float(steps)
@@ -850,7 +889,7 @@ def run_surrogate_pretrain(
                                 "[WARN] Surrogate pretrain estimated time is "
                                 f"{estimated_total / 3600.0:.1f} hours. Consider increasing "
                                 "--surrogate_pretrain_actual_refresh_interval, enabling replay, "
-                                "using --surrogate_pretrain_mode subtree/hybrid, or reducing --surrogate_pretrain_steps."
+                                "using --surrogate_pretrain_mode subtree/hybrid, or reducing --surrogate_step."
                             )
 
                     min_corr = float(getattr(args, "surrogate_pretrain_min_corr", -1.0))
@@ -928,6 +967,9 @@ def run_surrogate_pretrain(
             surrogate_param_norm=final_param_norm,
             surrogate_lr=optimizer_lrs(surrogate_optimizer),
         )
+        if plot is not None and hasattr(plot, "plot_surrogate_pretrain_curve"):
+            plot.plot_surrogate_pretrain_curve()
+            writer.write(f"Saved surrogate pretrain plot/csv: {plot.save_dir}")
         if bool(getattr(args, "surrogate_pretrain_checkpoint", True)):
             path = os.path.join(ckpt_dir, "surrogate_pretrain.pth")
             torch.save(

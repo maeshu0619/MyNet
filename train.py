@@ -133,6 +133,7 @@ def train(model, args, loss, writer, plot, notifier=None):
         metric_csv_paths=metric_csv_paths,
         ckpt_dir=ckpt_dir,
         writer=writer,
+        plot=plot,
         use_cuda=use_cuda,
         use_amp=use_amp,
         amp_dtype=amp_dtype,

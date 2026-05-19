@@ -347,10 +347,11 @@ class StructureRepairActuator(nn.Module):
             voxel_count = int(unique_coords.shape[0])
             if voxel_count <= 1:
                 continue
-            cap_count = int(round(float(max_drop_ratio) * float(voxel_count)))
             if threshold_cap_mode:
+                cap_count = int(math.ceil(float(max_drop_ratio) * float(voxel_count)))
                 drop_count = min(max(cap_count, 0), voxel_count - 1)
             else:
+                cap_count = int(round(float(max_drop_ratio) * float(voxel_count)))
                 target_count = int(round(float(target_drop_ratio) * float(voxel_count)))
                 if target_drop_ratio > 0.0:
                     target_count = max(target_count, 1)
@@ -513,10 +514,8 @@ class StructureRepairActuator(nn.Module):
         phase = self._exploration_phase()
         candidate_ratio = start + (end - start) * phase
         candidate_ratio = min(max(candidate_ratio, 0.0), max_ratio)
-        max_add_points = max(1, int(round(max_ratio * float(point_count))))
-        add_points = int(round(candidate_ratio * float(point_count)))
-        if candidate_ratio > 0.0:
-            add_points = max(add_points, 1)
+        max_add_points = int(math.ceil(max_ratio * float(point_count))) if max_ratio > 0.0 else 0
+        add_points = int(math.ceil(candidate_ratio * float(point_count))) if candidate_ratio > 0.0 else 0
         return min(add_points, max_add_points, point_count), float(candidate_ratio)
 
     @staticmethod
@@ -743,6 +742,29 @@ class StructureRepairActuator(nn.Module):
             _mark_runtime("delete")
 
         move_score = (repair_gate * (1.0 - hard_drop)).clamp(0.0, 1.0)
+        move_source_prior = torch.sigmoid(
+            (
+                0.70 * p_comp
+                + 0.55 * quant_score
+                + 0.45 * sparse_score
+                + 0.35 * p_chain
+                + 0.25 * p_sibling
+                + 0.20 * local_outlier_score
+                - 0.45 * preserve
+                - 0.65 * shape_score
+            ).clamp(-8.0, 8.0)
+        )
+        prior_weight = float(getattr(self.args, "repair_move_source_prior_weight", 0.35))
+        if sparsepcgc_context:
+            prior_weight = max(
+                prior_weight,
+                float(getattr(self.args, "sparsepcgc_move_source_prior_weight", 0.55)),
+            )
+        if prior_weight > 0.0:
+            source_prior = (move_source_prior * prior_weight).clamp(0.0, 1.0)
+            if selection_mask is not None:
+                source_prior = source_prior * selection_mask.to(device=pts_xyz.device, dtype=pts_xyz.dtype)
+            move_score = torch.maximum(move_score, source_prior * (1.0 - hard_drop))
         move_target_ratio = target_ratio if disp_enabled else 0.0
         require_empty_move = bool(getattr(self.args, "repair_move_require_empty_target", True))
         prefer_occupied_move = bool(getattr(self.args, "repair_move_prefer_occupied_target", False)) and not require_empty_move
@@ -918,6 +940,11 @@ class StructureRepairActuator(nn.Module):
                 else:
                     hard_top_add = torch.ones_like(selected_pair_strength)
                 hard_top_add = hard_top_add * unique_add_target_mask
+                if self.training and add_weight_random_mix > 0.0:
+                    random_hard_add = (
+                        torch.rand_like(hard_top_add) < float(add_weight_random_mix)
+                    ).to(dtype=hard_top_add.dtype)
+                    hard_top_add = torch.maximum(hard_top_add, random_hard_add * unique_add_target_mask)
                 hard_add_pair = torch.zeros_like(pair_scores)
                 hard_add_pair.scatter_(1, top_pair_idx, hard_top_add)
 
@@ -1071,6 +1098,7 @@ class StructureRepairActuator(nn.Module):
             "add_priority_mean": add_priority.mean().detach(),
             "add_priority_max": add_priority.max().detach() if add_priority.numel() > 0 else pts_xyz.new_zeros(()).detach(),
             "add_candidate_ratio": pts_xyz.new_tensor(float(add_candidate_ratio)).detach(),
+            "add_candidate_count": pts_xyz.new_tensor(float(add_k)).detach(),
             "sparsepcgc_add_experiment_enabled": pts_xyz.new_tensor(float(sparsepcgc_add_experiment_active)).detach(),
             "sparsepcgc_add_warmup": pts_xyz.new_tensor(float(self._sparsepcgc_add_warmup())).detach(),
             "add_score_noise": pts_xyz.new_tensor(float(add_score_noise)).detach(),
@@ -1095,6 +1123,7 @@ class StructureRepairActuator(nn.Module):
                 "move_ratio": hard_move.mean().detach(),
                 "hard_move_count": pts_xyz.new_tensor(float(hard_move_count_value)).detach(),
                 "move_score_mean": move_score.mean().detach(),
+                "move_source_prior_mean": move_source_prior.mean().detach(),
             "move_target_valid_ratio": move_target_valid.mean().detach(),
             "before_occupied_voxel_count": pts_xyz.new_tensor(float(before_occupied_voxels)).detach(),
             "after_occupied_voxel_count": pts_xyz.new_tensor(float(after_occupied_voxels)).detach(),
@@ -1138,6 +1167,7 @@ class StructureRepairActuator(nn.Module):
                 "add_count": add_count_value,
             "add_effective_count": add_effective_count_value,
             "add_candidate_ratio": float(add_candidate_ratio),
+            "add_candidate_count": int(add_k),
             "sparsepcgc_add_experiment_enabled": bool(sparsepcgc_add_experiment_active),
             "sparsepcgc_add_warmup": float(self._sparsepcgc_add_warmup()),
             "add_score_noise": float(add_score_noise),
@@ -1157,6 +1187,7 @@ class StructureRepairActuator(nn.Module):
                 "move_ratio": hard_move.mean(),
                 "hard_move_count": hard_move_count_value,
                 "move_score_mean": move_score.mean(),
+                "move_source_prior_mean": move_source_prior.mean(),
             "move_target_valid_ratio": move_target_valid.mean(),
             "moved_delta_mean": moved_delta_mean,
             "before_occupied_voxel_count": before_occupied_voxels,

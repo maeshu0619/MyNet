@@ -110,7 +110,7 @@ class PlotMaker():
         self.title = [
             "Loss", 
             "Loss of Geometry", 
-            "Compression Objective / Delta (legacy mixed; see compression_metrics CSV)",
+            "Compression Objective / Delta (100*(Mine-GT)/GT)",
             "Loss of Octree Cost Attribution",
             "Loss of Structure Repair Policy",
             "Loss of Single Child Nodes", 
@@ -659,3 +659,130 @@ class PlotMaker():
         if loss is None and self.epi_loss_his[0]:
             loss = self._metric_float(self.epi_loss_his[0][-1])
         return float("inf") if loss is None else loss
+
+    def record_surrogate_pretrain(self, step, row):
+        """
+        Surrogate事前学習のうち、本番学習のSurrogateプロットと同じ3指標だけを記録する。
+        """
+        if not hasattr(self, "surrogate_pretrain_keys"):
+            self.surrogate_pretrain_keys = [
+                "surrogate_pretrain_loss",
+                "surrogate_pretrain_abs_error",
+                "surrogate_pretrain_mean_error",
+            ]
+            self.surrogate_pretrain_titles = {
+                "surrogate_pretrain_loss": "Surrogate Teacher Fit Loss (SmoothL1)",
+                "surrogate_pretrain_abs_error": "Surrogate Bit Prediction Error (%)",
+                "surrogate_pretrain_mean_error": "Surrogate Mean Prediction Error (bit/node/single/bpn, %)",
+            }
+            self.surrogate_pretrain_x_his = []
+            self.surrogate_pretrain_his = {
+                key: [] for key in self.surrogate_pretrain_keys
+            }
+
+        self.surrogate_pretrain_x_his.append(int(step))
+
+        self.surrogate_pretrain_his["surrogate_pretrain_loss"].append(
+            self._metric_float(row.get("surrogate_pretrain_loss"))
+        )
+        self.surrogate_pretrain_his["surrogate_pretrain_abs_error"].append(
+            self._metric_float(row.get("surrogate_pretrain_abs_error"))
+        )
+
+        mean_error = row.get("surrogate_pretrain_mean_error", None)
+        if mean_error is None:
+            pred_value = self._metric_float(row.get("surrogate_pretrain_pred_bit_percent"))
+            actual_value = self._metric_float(row.get("surrogate_pretrain_actual_bit_percent"))
+            if pred_value is not None and actual_value is not None:
+                mean_error = abs(pred_value - actual_value)
+            else:
+                mean_error = None
+
+        self.surrogate_pretrain_his["surrogate_pretrain_mean_error"].append(
+            self._metric_float(mean_error)
+        )
+
+
+    def plot_surrogate_pretrain_curve(self):
+        """
+        Surrogate事前学習の3指標を、本番学習のSurrogateグラフと同じ形式で保存する。
+        """
+        if not hasattr(self, "surrogate_pretrain_x_his"):
+            return
+        if len(self.surrogate_pretrain_x_his) == 0:
+            return
+
+        os.makedirs(self.save_dir, exist_ok=True)
+
+        csv_path = os.path.join(
+            self.save_dir,
+            f"{self.args.time}_surrogate_pretrain_metrics.csv"
+        )
+        with open(csv_path, "w", encoding="utf-8") as f:
+            f.write("step," + ",".join(self.surrogate_pretrain_keys) + "\n")
+            for row_idx, step in enumerate(self.surrogate_pretrain_x_his):
+                values = [str(int(step))]
+                for key in self.surrogate_pretrain_keys:
+                    value = self.surrogate_pretrain_his[key][row_idx]
+                    values.append("" if value is None else f"{value:.10g}")
+                f.write(",".join(values) + "\n")
+
+        plot_mod = _get_pyplot()
+        if plot_mod is None:
+            return
+
+        fig, axes = plot_mod.subplots(
+            len(self.surrogate_pretrain_keys),
+            1,
+            figsize=(self.x_len, self.y_len * len(self.surrogate_pretrain_keys)),
+        )
+
+        if len(self.surrogate_pretrain_keys) == 1:
+            axes = [axes]
+
+        x_values = list(self.surrogate_pretrain_x_his)
+
+        for ax, key in zip(axes, self.surrogate_pretrain_keys):
+            values = self._plot_values(self.surrogate_pretrain_his[key])
+            plot_x, plot_values = self._downsample_series(x_values, values)
+
+            if any(math.isfinite(value) for value in plot_values):
+                ax.plot(
+                    plot_x,
+                    plot_values,
+                    marker="o",
+                    linewidth=2,
+                    markersize=3,
+                )
+            else:
+                ax.text(
+                    0.5,
+                    0.5,
+                    "no finite data",
+                    ha="center",
+                    va="center",
+                    transform=ax.transAxes,
+                    alpha=0.7,
+                )
+
+            ax.axhline(0.0, color="black", linewidth=0.7, alpha=0.4)
+            ax.set_xlabel("Surrogate Pretrain Step")
+            ax.set_ylabel(key)
+            ax.set_title(self.surrogate_pretrain_titles.get(key, key))
+            ax.grid(True, alpha=0.35)
+
+            if len(plot_x) >= 2:
+                ax.set_xlim(min(plot_x), max(plot_x))
+                try:
+                    from matplotlib.ticker import MaxNLocator
+                    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+                except Exception:
+                    pass
+
+        fig.tight_layout()
+        save_path = os.path.join(
+            self.save_dir,
+            f"{self.args.time}_surrogate_pretrain.png"
+        )
+        plot_mod.savefig(save_path, dpi=140)
+        plot_mod.close(fig)
