@@ -63,73 +63,61 @@ def train(model, args, loss, writer, plot, notifier=None):
     """==========================================================="""
     """セットアップ"""
     """==========================================================="""
-    set_seed(args.seed, deterministic=getattr(args, "deterministic", False))
-    best_loss = float('inf')
-
-    # ===== Loss histogram (fixed size, safe) =====
-    seq_dirs = collect_seq_dirs2(args.input_dir, dataset_name=args.dataname)
+    """基本情報"""
+    set_seed(args.seed, deterministic=getattr(args, "deterministic", False)) # ランスシードを固定し、学習結果の再現性を確保する
+    best_loss = float('inf') # 後続の計算・ログのため
+    seq_dirs = collect_seq_dirs2(args.input_dir, dataset_name=args.dataname) # 入力ディレクトリから学習対象のシーケンスディレクトリ一覧を集める
     num_seq = len(seq_dirs)
-
     writer.write(f"Total seq directories: {num_seq}")
-    seq_datasets = [(seq_dir, PlyDirDataset(args, seq_dir)) for seq_dir in seq_dirs]
-    total_train_files = sum(len(dataset) for _, dataset in seq_datasets)
-    args._total_train_steps_estimate = max(int(getattr(args, "episodes", 1)), 1) * max(int(total_train_files), 1)
-    set_cache_expected = getattr(model, "set_expected_input_cache_entries", None)
+    seq_datasets = [(seq_dir, PlyDirDataset(args, seq_dir)) for seq_dir in seq_dirs] # 各シーケンス内のPLY点群ファイルを読み込むデータセットを作る
+    total_train_files = sum(len(dataset) for _, dataset in seq_datasets) # 全シーケンスに含まれる点群ファイル数を合計し、総Step数の見積もりなどに使用
+    args._total_train_steps_estimate = max(int(getattr(args, "episodes", 1)), 1) * max(int(total_train_files), 1) # Episode数と点群ファイル数からそう学修Step数を概算
+    set_cache_expected = getattr(model, "set_expected_input_cache_entries", None) # モデル側に入力キャッシュ件数を設定する変数
     if callable(set_cache_expected):
-        set_cache_expected(total_train_files)
-    patch_info_cache = OrderedDict()
-    sparsepcgc_proxy_actual_pairs = []
-    codec_actual_metric_pairs = {}
-    case_debug_path = init_case_debug_csv(args, plot, writer)
-    case_debug_counts = {"good": 0, "bad": 0}
-    metric_csv_paths = init_metric_csvs(args, plot, writer)
-    for_better_path = init_for_better_logger(args, plot, writer)
-    checkpoint_gate_refs = {}
-    best_trackers = None
-    actual_guard_state = {"best_delta": float("inf"), "best_path": None, "bad_count": 0}
+        set_cache_expected(total_train_files) # モデルに学習ファイル総数を通知し、入力キャッシュの総低用量を設定
+    patch_info_cache = OrderedDict() # パッチ分割結果を入力ファイルごとに再利用するため
 
-    # モデル保存先ファイルのセットアップ
+    """圧縮予測と実圧縮"""
+    sparsepcgc_proxy_actual_pairs = [] # Sparse PCGCのProxy推定値と実測値のペアの保存
+    codec_actual_metric_pairs = {} # Codex Proxy値とActual Codec値の対応保存
+    case_debug_path = init_case_debug_csv(args, plot, writer) # 圧縮効率が良い/悪いケースを後から分析するためのCSVの初期化
+    case_debug_counts = {"good": 0, "bad": 0}
+    metric_csv_paths = init_metric_csvs(args, plot, writer) # 圧縮メトリクス/点操作メトリクス/ChackPoint判定値などの書き込み
+
+    """原因診断のためのログ"""
+    for_better_path = init_for_better_logger(args, plot, writer) # 改善・改悪要因を記録する詳細分析ログ
+    checkpoint_gate_refs = {} # ChackPoint保存判定で使う基準値や過去値を保持
+    best_trackers = None # 複数指標でBest CheckPointを追跡するための状態を初期化
+    actual_guard_state = {"best_delta": float("inf"), "best_path": None, "bad_count": 0} # 実Codex評価が悪化したときに、巻き戻す
+
+    """モデル保存先ファイルのセットアップ"""
     output_dir = os.path.join(args.out_path)
     ckpt_dir = os.path.join(output_dir)
     if not os.path.exists(ckpt_dir):
         os.makedirs(ckpt_dir)
     
-    optimizer, scheduler_steplr = build_optimizer_and_scheduler( model, args, writer)
+    """学習セットアップ"""
+    optimizer, scheduler_steplr = build_optimizer_and_scheduler( model, args, writer) # モデルの重み更新に使うOptimizerと学習率を変えるStepLR schedduler
+    amp_state = setup_amp( model, args, writer) # CUDA利用可否
+    use_cuda = amp_state["use_cuda"] # GPU使用の有無
+    use_amp = amp_state["use_amp"] # 自動混合精度で計算するか否か
+    amp_dtype = amp_state["amp_dtype"] # AMPで使う浮動小数点型の保存
+    amp_scaler_enabled = amp_state["amp_scaler_enabled"] # GradScalerを使うのか否か
+    scaler = amp_state["scaler"] # AMPのGradScaler。AMPでスケーリングされた勾配を逆スケーリングしてOptimizerに渡すために使う
+    amp_overflow_patience = amp_state["amp_overflow_patience"] # AMPでオーバーフローが起きたときに、学習を安定させるためにOptimizerのステップをスキップする回数の設定
+    consecutive_amp_skips = amp_state["consecutive_amp_skips"] # AMPでオーバーフローが起きたときにOptimizerのステップをスキップする回数のカウンタ
+    warmup_whole_cloud_caches(model, args, loss, seq_datasets, writer, use_cuda, use_amp, amp_dtype) # 全体点群処理で使う重い前処理やCodec関連情報を先に作り、学習中の初回Stepだけ極端に遅くなるのを抑える
+    loader_kwargs = build_loader_kwargs( args, model, writer, use_cuda) # DataLoaderに渡すBatchSize等の設定
 
-    amp_state = setup_amp( model, args, writer)
-
-    use_cuda = amp_state["use_cuda"]
-    use_amp = amp_state["use_amp"]
-    amp_dtype = amp_state["amp_dtype"]
-    amp_scaler_enabled = amp_state["amp_scaler_enabled"]
-    scaler = amp_state["scaler"]
-    amp_overflow_patience = amp_state["amp_overflow_patience"]
-    consecutive_amp_skips = amp_state["consecutive_amp_skips"]
-
-    warmup_whole_cloud_caches(model, args, loss, seq_datasets, writer, use_cuda, use_amp, amp_dtype)
-    loader_kwargs = build_loader_kwargs( args, model, writer, use_cuda)
-    run_surrogate_pretrain(
-        model=model,
-        args=args,
-        loss=loss,
-        seq_datasets=seq_datasets,
-        loader_kwargs=loader_kwargs,
-        metric_csv_paths=metric_csv_paths,
-        ckpt_dir=ckpt_dir,
-        writer=writer,
-        plot=plot,
-        use_cuda=use_cuda,
-        use_amp=use_amp,
-        amp_dtype=amp_dtype,
-        for_better_path=for_better_path,
-    )
-    post_pretrain_norm = surrogate_param_norm(loss)
-    surrogate_optimizer = getattr(loss, "surrogate_optimizer", None)
-    surrogate_lrs = optimizer_lrs(surrogate_optimizer)
-    pretrain_label = ( "start after surrogate pretrain" if int(getattr(args, "surrogate_step", 0)) > 0 else "start")
+    """Surrogate事前学習セットアップ"""
+    run_surrogate_pretrain(model=model, args=args, loss=loss, seq_datasets=seq_datasets, loader_kwargs=loader_kwargs, metric_csv_paths=metric_csv_paths, ckpt_dir=ckpt_dir, writer=writer, plot=plot, use_cuda=use_cuda, use_amp=use_amp, amp_dtype=amp_dtype, for_better_path=for_better_path)
+    post_pretrain_norm = surrogate_param_norm(loss) # Surrogateのパタラメータノルムを計算し、事前学習後に重みが拘引されたか、以上に大きくないかを確認
+    surrogate_optimizer = getattr(loss, "surrogate_optimizer", None) # Lossオブジェクト内にあるSurrogate用のOptimizerを取得
+    surrogate_lrs = optimizer_lrs(surrogate_optimizer) # Surrogate用Optimizerの学習率一覧を取り出す
+    pretrain_label = ( "start after surrogate pretrain" if int(getattr(args, "surrogate_step", 0)) > 0 else "start") # Surrogate事前学習を実行したか否かでログの表示名を変える
     writer.write( f"[Training] {pretrain_label} " f"surrogate_param_norm={case_float(post_pretrain_norm, float('nan')):.6f} " f"lr={surrogate_lrs[0] if surrogate_lrs else 'NA'}")
-    log_for_better_event( for_better_path, "training_start_after_surrogate_pretrain", label=pretrain_label, surrogate_param_norm=post_pretrain_norm, surrogate_lrs=surrogate_lrs)
-    optimizer.zero_grad(set_to_none=True)
+    log_for_better_event( for_better_path, "training_start_after_surrogate_pretrain", label=pretrain_label, surrogate_param_norm=post_pretrain_norm, surrogate_lrs=surrogate_lrs) # Surrogate事前学習後の状態を詳細分ん積ログへ保存し、本学修開始時の条件として後から確認できるようにする
+    optimizer.zero_grad(set_to_none=True) # 本学習開始前にOptimizer内の勾配を削除
 
     """==========================================================="""
     """トレーニング"""
@@ -137,38 +125,47 @@ def train(model, args, loss, writer, plot, notifier=None):
     prev_stage = None
     global_train_step = 0
     global_epoch = 0
-    for episode in range(args.episodes):
-        current_stage = resolve_training_stage_for_episode(args, episode)
+    for episode in range(args.episodes): # Episode開始
+        writer.write(f"◆◆◆ Episode {episode + 1} / {args.episodes} ◆◆◆")
+        
+        """Stage変更"""
+        current_stage = resolve_training_stage_for_episode(args, episode) # 現在のEpisode番号から学習ステージを決め、形状重視、圧縮重視、Joint学習重視などの損失構成を切り替える
         args.training_stage = current_stage
-        if current_stage != prev_stage:
-            stage_factors = stage_loss_factors(args)
+        if current_stage != prev_stage: # 前EpisodeとStageが異なる場合
+            stage_factors = stage_loss_factors(args) # 現在Stageでっ各損失をどの比率で扱うか取得する
             writer.write(f"Training Stage Switch: episode={episode + 1}, stage={current_stage}")
             writer.write( "Stage Loss Factors: " f"geom={stage_factors['geom']}, com={stage_factors['com']}, " f"attr={stage_factors['attr']}, policy={stage_factors['policy']}, repair={stage_factors['repair']}")
             log_for_better_event( for_better_path, "stage_switch", episode=episode + 1, stage=current_stage, stage_factors=stage_factors)
             prev_stage = current_stage
-        writer.write(f"◆◆◆ Episode {episode + 1} / {args.episodes} ◆◆◆")
+            
         model.train()
+
+        """変数の初期化"""
         episode_metric_sums = None
         episode_checkpoint_sums = new_checkpoint_metric_sum()
         episode_compression_sums = new_compression_episode_sum()
         episode_operation_sums = new_operation_episode_sum()
-        for epoch, (seq_dir, dataset) in enumerate(seq_datasets):
-            writer.write(f"●●● Epoch {epoch + 1}/{num_seq} : {seq_dir} ●●●")
-            loader = torch.utils.data.DataLoader(dataset, **loader_kwargs)
+
+        for epoch, (seq_dir, dataset) in enumerate(seq_datasets): # Epoch開始
+            writer.write(f"⦿⦿⦿ Epoch {epoch + 1}/{num_seq} : {seq_dir} ⦿⦿⦿")
+
+            """基本情報のセットアップ"""
+            loader = torch.utils.data.DataLoader(dataset, **loader_kwargs) # 現在のDatasetから点群ファイルを順に読み出す
             num_steps = len(dataset)
             epoch_has_optimizer_step = False
             epoch_metric_sums = None
 
-            for step, pts in enumerate(loader):
+            for step, pts in enumerate(loader): # Step開始
+                """基本情報のセットアップ"""
                 st_step = time.time()
                 file_path = dataset.files[step]
-                cache_key = make_step_cache_key(file_path, args)
-                log_this_step = should_log_step(step + 1, num_steps, args.print_rate)
-                profile_this_step = should_log_step(
-                    global_train_step + 1,
-                    max(int(getattr(args, "_total_train_steps_estimate", num_steps)), 1),
-                    int(getattr(args, "profile_interval", 100)),
-                )
+                cache_key = make_step_cache_key(file_path, args) # ファイルパスと設定から一意なキーを作り、前処理結果、Codec結果、Patch情報などのキャッシュ参照に使う
+                raw_pts_num = int(pts.shape[1] if pts.dim() == 3 else pts.shape[0]) # 受け取ったデータの元点数を数え、点数比較やログに使用
+                subtree_mode = bool(getattr(args, "train_patch_subset_enable", False)) # Octree Subtreeの部分学修を行うか否かの判定
+                
+                """ログ判定"""
+                log_this_step = should_log_step(step + 1, num_steps, args.print_rate) # このStepで通常ログを出すか判定
+                profile_this_step = should_log_step(global_train_step + 1, max(int(getattr(args, "_total_train_steps_estimate", num_steps)), 1), int(getattr(args, "profile_interval", 100))) # Profileログを出すStepあ否かの判定
                 timing_enabled = bool(
                     (getattr(args, "debug_timing", False) and log_this_step)
                     or (
@@ -179,88 +176,98 @@ def train(model, args, loss, writer, plot, notifier=None):
                         and profile_this_step
                     )
                 )
-                args._global_train_step = int(global_train_step)
+                
+                """ログ用の変数セット"""
+                args._global_train_step = int(global_train_step) # 現在の累積Step番号を保存
                 args._log_this_step = False
-                sparsepcgc_csv_debug = ( str(getattr(args, "compress", "")).strip().lower().replace("-", "").replace("_", "") == "sparsepcgc" and bool(getattr(args, "save_compression_metric_csv", True)))
-                operation_csv_debug = bool( getattr(args, "save_operation_metric_csv", getattr(args, "save_operation_metrics_csv", True)))
+                sparsepcgc_csv_debug = ( str(getattr(args, "compress", "")).strip().lower().replace("-", "").replace("_", "") == "sparsepcgc" and bool(getattr(args, "save_compression_metric_csv", True))) # Sparse PCGC専用ログ
+                operation_csv_debug = bool( getattr(args, "save_operation_metric_csv", getattr(args, "save_operation_metrics_csv", True))) # 点操作メトリクスCSVを保存するか判定し、点移動量や追加/削除などのDebug収集条件に使用
                 args._collect_sparsepcgc_debug = bool(log_this_step or profile_this_step or sparsepcgc_csv_debug)
                 args._collect_structure_debug = bool( log_this_step or profile_this_step or operation_csv_debug or sparsepcgc_add_experiment_active(args))
                 detail_log_this_step = False
-                raw_pts_num = int(pts.shape[1] if pts.dim() == 3 else pts.shape[0])
-                if timing_enabled and use_cuda and torch.cuda.is_available():
+                
+                """学習設定"""
+                if timing_enabled and use_cuda and torch.cuda.is_available(): # GPU計測のためのリセット
                     torch.cuda.reset_peak_memory_stats()
 
-                # pts: [1, N, 3]
-                if timing_enabled:
-                    sync_for_timing(use_cuda)
-                    timing_data_start = time.time()
-                subtree_mode = bool(getattr(args, "train_patch_subset_enable", False))
-                if subtree_mode:
-                    input_pcd = pts if pts.dim() == 3 else pts.unsqueeze(0)
-                    input_pcd = downsample_input_batch(input_pcd, args, cache_key)
+                if timing_enabled: # 時間計測が有効なら入力整形処理の開始時刻を記録
+                    sync_for_timing(use_cuda) # GPUを使用している場合は、正確な時間計測のためにGPUの処理が完了するのを待つ
+                    timing_data_start = time.time() # 時間計測開始
+                if subtree_mode: # Subtree部分学習モード
+                    input_pcd = pts if pts.dim() == 3 else pts.unsqueeze(0) # 形式変換
+                    input_pcd = downsample_input_batch(input_pcd, args, cache_key) # 点数が多すぎる場合に入力点群を間引き、GPUメモリ消費と計算時間を抑える
+                    if use_cuda:
+                        input_pcd = input_pcd.cuda(non_blocking=True) # 点群テンソルをGPUへ転送
+                    input_pcd = rearrange(input_pcd, 'b n c -> b c n').contiguous() # 形式変換
+                    input_xyz = input_pcd[:, :3, :] # 座標情報のみ抽出
+                elif args.split2patch: # パッチ分割モード
+                    input_pcd = pts if pts.dim() == 3 else pts.unsqueeze(0) # 形式変換
+                    input_pcd = downsample_input_batch(input_pcd, args, cache_key) # 点数の制限
                     if use_cuda:
                         input_pcd = input_pcd.cuda(non_blocking=True)
-                    input_pcd = rearrange(input_pcd, 'b n c -> b c n').contiguous()
-                    input_xyz = input_pcd[:, :3, :]
-                elif args.split2patch:
-                    input_pcd = pts if pts.dim() == 3 else pts.unsqueeze(0)
-                    input_pcd = downsample_input_batch(input_pcd, args, cache_key)
-                    if use_cuda:
-                        input_pcd = input_pcd.cuda(non_blocking=True)
-                    input_pcd = rearrange(input_pcd, 'b n c -> b c n').contiguous()
-                    input_xyz = input_pcd[:, :3, :]
+                    input_pcd = rearrange(input_pcd, 'b n c -> b c n').contiguous() # 形式変換
+                    input_xyz = input_pcd[:, :3, :] # 座標情報のみ抽出
                 else:
-                    input_xyz, patches, centroid_xyz, fd_xyz = prepare_whole_cloud_inputs(pts, args, cache_key, use_cuda)
+                    input_xyz, patches, centroid_xyz, fd_xyz = prepare_whole_cloud_inputs(pts, args, cache_key, use_cuda) # 全体点群を入力とする
                     input_pcd = input_xyz
 
                 pcd_pts_num = input_xyz.shape[-1]
-                if timing_enabled:
-                    sync_for_timing(use_cuda)
-                    timing_data_end = time.time()
-                    timing_model_start = timing_data_end
 
-                clear_policy_terms = getattr(model, "clear_discrete_policy_terms", None)
+                if timing_enabled: # 時間計測が有効なStepなら
+                    sync_for_timing(use_cuda) # CUDA処理の同期
+                    timing_data_end = time.time() # 入力整形処理の終了時刻を記録
+                    timing_model_start = timing_data_end # モデル処理の開始時刻の記録
+
+                """学習基本情報セットアップ"""
+                clear_policy_terms = getattr(model, "clear_discrete_policy_terms", None) # モデルが前Stepで保持した離散方策用の一次損失・Log Probability・報酬情報などを消す関数を持っているか否か
                 if callable(clear_policy_terms):
-                    clear_policy_terms()
-                loss_mode = lossmode(args)
-                compression_primary_mode = loss_mode == "compression_primary"
-                stage_factors = stage_loss_factors(args)
+                    clear_policy_terms() # 前Stepの離散方策関連の一時値を消す
+                loss_mode = lossmode(args) # 損失モードの取得
+                compression_primary_mode = loss_mode == "compression_primary" # 圧縮損失重視
+                stage_factors = stage_loss_factors(args) # 現在の学習Stageに応じた損失項の比率
                 if compression_primary_mode and not bool(getattr(args, "cp_use_stage_factors", False)):
-                    stage_factors = {name: 1.0 for name in stage_factors}
-                compute_compression = True if compression_primary_mode else stage_factors["com"] != 0.0
-                refresh_actual_gen = not bool(getattr(args, "disable_actual_codec_during_train", False))
+                    stage_factors = {name: 1.0 for name in stage_factors} # 全Stage係数を全て1.0にする
+                # compute_compression = True if compression_primary_mode else stage_factors["com"] != 0.0 # このStepで圧縮損失を実際に計算するか決める
+                compute_compression = True
+                # refresh_actual_gen = not bool(getattr(args, "disable_actual_codec_during_train", False)) # 学習中に出力点群を実Codecに通して実圧縮結果を更新するか決める
+                refresh_actual_gen = True
 
-                subset_step = False
-                subset_enabled = False
-                is_anchor_step = True
-                compression_cache_key = cache_key
-                compression_gt_pts = input_xyz
-                train_edit_stats = None
-                noise_debug = empty_noise_debug()
-                subtree_depth_meta = {}
-                total_subtree_count = 0
-                eligible_subtree_count = 0
-                actual_eligible_subtree_count = 0
-                selected_subtree_count = 0
-                min_subtree_points = 0
+                """変数の初期化と設定"""
+                subset_step = False # 部分学習か否か
+                subset_enabled = False # 部分集合学習が有効か否か
+                is_anchor_step = True # 初期状態では全体点ん群を使うAnchor Stepとする
+                compression_cache_key = cache_key # キャッシュキーの初期化
+                compression_gt_pts = input_xyz # 圧縮損失で比較する教師側点群を入力点群にする
+                train_edit_stats = None # 点操作を見計算状態にする
+                noise_debug = empty_noise_debug() # 圧縮損失用に量子化前の点群に加えるノイズのデバッグ情報を初期化
+                subtree_depth_meta = {} # 深度などの情報保存
+                total_subtree_count = 0 # Subtree総数を0で初期化
+                eligible_subtree_count = 0 # 学習対象候補として残ったSubtreeの初期化
+                actual_eligible_subtree_count = 0 # 条件を満たしたSubtreeを初期化
+                selected_subtree_count = 0 # このStepで実際にForwardとLoss計算に用いるSubtreeを初期化
+                min_subtree_points = 0 # Subtreeとしてさいようするための最小点数条件を初期化
+                subtree_point_counts = [int(input_xyz.shape[-1])] # Subtree点数分布の初期値として、全体点群の点数をリストで保存
                 anchor_reason = "not_subtree_mode"
-                subtree_point_counts = [int(input_xyz.shape[-1])]
                 subtree_loss_scope = "full_cloud"
 
+                """Subtree分割学習"""
                 if subtree_mode:
-                    optimizer.zero_grad(set_to_none=True)
-                    subset_enabled = True
-                    input_attr_full = input_pcd[:, 3:, :].contiguous() if input_pcd.shape[1] > 3 else None
-                    subtree_depth_meta = sample_train_subtree_depth( input_xyz, args, global_step=global_train_step, cache_key=cache_key)
-                    requested_subtree_depth = int(subtree_depth_meta["depth"])
-                    min_subtree_points = max(int(getattr(args, "train_subtree_min_points", 1)), 1)
-                    subtree_group_state = build_octree_subtree_groups_with_retry( input_xyz, args, requested_subtree_depth, min_subtree_points, allow_largest_fallback=True)
-                    subtree_ref = subtree_group_state["subtree_ref"]
+                    """Subtree分割学習のセットアップ"""
+                    optimizer.zero_grad(set_to_none=True) # 残った勾配の削除
+                    subset_enabled = True # 部分集合学習を有効にする
+                    input_attr_full = input_pcd[:, 3:, :].contiguous() if input_pcd.shape[1] > 3 else None # 属性のとりだし
+                    subtree_depth_meta = sample_train_subtree_depth( input_xyz, args, global_step=global_train_step, cache_key=cache_key) # Octree深度の決定
+                    requested_subtree_depth = int(subtree_depth_meta["depth"]) # 深度を整数で取り出す
+                    min_subtree_points = max(int(getattr(args, "train_subtree_min_points", 1)), 1) # Subtreeとして採用する点数の最小点数
+                    subtree_group_state = build_octree_subtree_groups_with_retry( input_xyz, args, requested_subtree_depth, min_subtree_points, allow_largest_fallback=True) # 入力点群から指定深度のOctree Subtree群を作る
+                    
+                    """Subtree情報"""
+                    subtree_ref = subtree_group_state["subtree_ref"] # Subtree参照情報の抽出
                     if subtree_ref is None:
                         raise RuntimeError("Subtree mode did not find any valid octree subtree.")
-                    subtree_depth_meta = dict(subtree_depth_meta)
-                    subtree_depth_meta["requested_depth"] = int(requested_subtree_depth)
-                    subtree_depth_meta["depth"] = int(subtree_group_state.get("depth", requested_subtree_depth))
+                    subtree_depth_meta = dict(subtree_depth_meta) # 深度メタ情報変換
+                    subtree_depth_meta["requested_depth"] = int(requested_subtree_depth) # 保存
+                    subtree_depth_meta["depth"] = int(subtree_group_state.get("depth", requested_subtree_depth)) # 
                     subtree_depth_meta["retry_count"] = int(subtree_group_state.get("retry_count", 0))
                     subtree_depth_meta["selection_reason"] = str(subtree_group_state.get("selection_reason", "none"))
                     all_subtree_keys = subtree_group_state["unique_keys"]

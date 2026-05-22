@@ -720,7 +720,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--train_subtree_depth_percent_curriculum', default=True, type=str2bool, help='全体Octree深さに対する割合でsubtree深さ範囲を決める')
     parser.add_argument('--train_subtree_depth_percent_start', default='0.0,0.50', type=str, help='学習開始時のsubtree深さ割合範囲(min,max)')
     parser.add_argument('--train_subtree_depth_percent_end', default='0.0,0.50', type=str, help='学習終了時のsubtree深さ割合範囲(min,max)')
-    parser.add_argument('--train_subtree_min_points', default=4, type=int, help='train時に優先的に選ぶsubtreeの最小点数（満たす候補が無ければフォールバック）')
+    parser.add_argument('--train_subtree_min_points', default=5, type=int, help='train時に優先的に選ぶsubtreeの最小点数（満たす候補が無ければフォールバック）')
     parser.add_argument('--train_patch_subset_patches_per_step', default=1, type=int, help='1 stepで処理するsubtree数')
     parser.add_argument('--train_patch_subset_anchor_interval', default=32, type=int, help='subtree subset学習時に何stepごとにfull-cloud anchor学習を挟むか(0なら間隔指定なし)')
     parser.add_argument('--train_subtree_full_cloud_prob', default=0.03, type=float, help='subtree subset学習時に確率的にfull-cloud anchorへ切り替える確率')
