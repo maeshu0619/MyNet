@@ -266,55 +266,61 @@ def train(model, args, loss, writer, plot, notifier=None):
                     if subtree_ref is None:
                         raise RuntimeError("Subtree mode did not find any valid octree subtree.")
                     subtree_depth_meta = dict(subtree_depth_meta) # 深度メタ情報変換
-                    subtree_depth_meta["requested_depth"] = int(requested_subtree_depth) # 保存
-                    subtree_depth_meta["depth"] = int(subtree_group_state.get("depth", requested_subtree_depth)) # 
-                    subtree_depth_meta["retry_count"] = int(subtree_group_state.get("retry_count", 0))
-                    subtree_depth_meta["selection_reason"] = str(subtree_group_state.get("selection_reason", "none"))
-                    all_subtree_keys = subtree_group_state["unique_keys"]
-                    subtree_index_lists = subtree_group_state["index_lists"]
-                    all_groups = subtree_group_state["all_groups"]
-                    total_subtree_count = int(all_subtree_keys.numel())
-                    eligible_groups = list(subtree_group_state.get("eligible_groups", []))
-                    actual_eligible_subtree_count = int(len(eligible_groups))
-                    min_points_miss = bool(total_subtree_count > 0 and not eligible_groups and min_subtree_points > 1)
-                    candidate_groups = eligible_groups or list(subtree_group_state.get("groups", [])) or all_groups
-                    candidate_subtree_keys = all_subtree_keys.new_tensor(
+                    subtree_depth_meta["requested_depth"] = int(requested_subtree_depth) # 要求された深度情報の保存
+                    subtree_depth_meta["depth"] = int(subtree_group_state.get("depth", requested_subtree_depth)) # 実際に採用された深度情報の保存
+                    subtree_depth_meta["retry_count"] = int(subtree_group_state.get("retry_count", 0)) # 深度変更の再試行が何回行われたか
+                    subtree_depth_meta["selection_reason"] = str(subtree_group_state.get("selection_reason", "none")) #  なぜその深度・Subtreeが選ばれたか
+                    all_subtree_keys = subtree_group_state["unique_keys"] # 入力点群内に存在する全Subtreeの識別Keyを取り出す
+                    subtree_index_lists = subtree_group_state["index_lists"] # 各Subtree内の点インデックス
+                    all_groups = subtree_group_state["all_groups"] # 全Subtreeに関して、情報を抜き出す
+                    
+                    """Subtree決定"""
+                    total_subtree_count = int(all_subtree_keys.numel()) # 入力点群から作られたSubtreeの総数を数える
+                    eligible_groups = list(subtree_group_state.get("eligible_groups", [])) # 最小点数条件などを満たした学習候補Subtreeを取り出す
+                    actual_eligible_subtree_count = int(len(eligible_groups)) # 条件を満たしたSubtreeを数える
+                    min_points_miss = bool(total_subtree_count > 0 and not eligible_groups and min_subtree_points > 1) # Subtree自体はあるが、最小点数条件を満たすSubtreeがないかを判定する
+                    candidate_groups = eligible_groups or list(subtree_group_state.get("groups", [])) or all_groups # 学習に使う候補Subtree集合を決める
+                    candidate_subtree_keys = all_subtree_keys.new_tensor( # 候補SubtreeのKeyを元のSubtree Keyと同じテンソルとして作る
                         [subtree_key for subtree_key, _ in candidate_groups],
                         dtype=all_subtree_keys.dtype,
                     ) if candidate_groups else all_subtree_keys.new_empty((0,), dtype=all_subtree_keys.dtype)
-                    eligible_subtree_count = int(candidate_subtree_keys.numel())
-                    is_anchor_step, anchor_reason = should_use_full_cloud_anchor( args, global_step=global_train_step, cache_key=cache_key)
+                    eligible_subtree_count = int(candidate_subtree_keys.numel()) # FallBack後も含めた学習候補Subtreeを数える
 
-                    if ( min_points_miss and eligible_subtree_count <= 0 and bool(getattr(args, "train_subtree_anchor_on_min_points_miss", False))):
+                    """Subtree分割学習の再セットアップ"""
+                    is_anchor_step, anchor_reason = should_use_full_cloud_anchor( args, global_step=global_train_step, cache_key=cache_key) # このStepをSubtree学習が全点群学習にするか判定
+                    if ( min_points_miss and eligible_subtree_count <= 0 and bool(getattr(args, "train_subtree_anchor_on_min_points_miss", False))): # 最小点群数を満たすSubtreeがない
                         is_anchor_step = True
                         anchor_reason = "min_points_miss_full_anchor"
                         log_for_better_event( for_better_path, "subtree_min_points_miss", global_step=global_train_step + 1, sampled_depth=int(subtree_depth_meta["depth"]), min_subtree_points=min_subtree_points, total_subtree_count=total_subtree_count, action="full_anchor")
                     elif min_points_miss:
                         log_for_better_event( for_better_path, "subtree_min_points_miss", global_step=global_train_step + 1, sampled_depth=int(subtree_depth_meta["depth"]), min_subtree_points=min_subtree_points, total_subtree_count=total_subtree_count, action="legacy_all_subtrees_fallback")
-
-                    selected_subtree_keys = candidate_subtree_keys
+                    selected_subtree_keys = candidate_subtree_keys # 初期状態では候補Subtreeを全て選択対象にする
                     if eligible_subtree_count > 0 and not is_anchor_step:
                         selected_subtree_keys = select_octree_subtree_keys(candidate_subtree_keys, global_train_step, args)
-                    selected_subtree_count = int(selected_subtree_keys.numel())
-                    subset_step = (not is_anchor_step) and selected_subtree_count < eligible_subtree_count
-                    encoder_debug_chunks = [] if detail_log_this_step else None
+                    selected_subtree_count = int(selected_subtree_keys.numel()) # 実際に選択されたSubtree数を数える
+                    subset_step = (not is_anchor_step) and selected_subtree_count < eligible_subtree_count # 候補の一部だけを使ったStepか否かの判定
+                    encoder_debug_chunks = [] if detail_log_this_step else None # 詳細ログ対象Stepなら、各Subtree Forward時のEncoder Debugを保存するリスト
+                    
+                    """Selected Groupsの作成"""
                     selected_groups = None
-                    if not is_anchor_step:
-                        selected_key_set = set(selected_subtree_keys.detach().cpu().tolist())
-                        group_source = candidate_groups
-                        selected_groups = [ (subtree_key, point_idx) for subtree_key, point_idx in group_source if subtree_key in selected_key_set]
+                    if not is_anchor_step: # Anchorでないとき
+                        selected_key_set = set(selected_subtree_keys.detach().cpu().tolist()) # 選択されたSubtree Keyの集合
+                        group_source = candidate_groups # 選択元となるSubtreeグループ集合
+                        selected_groups = [ (subtree_key, point_idx) for subtree_key, point_idx in group_source if subtree_key in selected_key_set] # 選択されたSubtree Keyに対応する情報の抽出
                         if not selected_groups and group_source:
                             selected_groups = [max(group_source, key=lambda item: int(item[1].numel()))]
                         if not selected_groups:
                             raise RuntimeError("Subtree mode did not select any subtree group.")
-                    if is_anchor_step:
-                        subtree_point_counts = [int(point_idx.numel()) for _, point_idx in (eligible_groups or [])]
+                    if is_anchor_step: # Anchorのとき
+                        subtree_point_counts = [int(point_idx.numel()) for _, point_idx in (eligible_groups or [])] # 候補Subtreeの点数分布を記録するための一覧
                         if not subtree_point_counts:
                             subtree_point_counts = [int(input_xyz.shape[-1])]
                         subtree_loss_scope = "full_cloud_output_vs_full_cloud_input"
                     else:
                         subtree_point_counts = [int(point_idx.numel()) for _, point_idx in selected_groups]
                         subtree_loss_scope = "subtree_output_vs_subtree_input"
+                        
+                    """ログ"""
                     if log_this_step and bool(getattr(args, "train_patch_subset_log", True)):
                         if is_anchor_step:
                             point_counts = list(subtree_point_counts)
@@ -355,7 +361,8 @@ def train(model, args, loss, writer, plot, notifier=None):
                             f"loss_scope={loss_scope}"
                             f"{octree_stat_text}"
                         )
-
+                    
+                    """損失項の初期化"""
                     L_geom = input_xyz.new_zeros(())
                     L_com = input_xyz.new_zeros(())
                     L_attr = input_xyz.new_zeros(())
@@ -370,77 +377,124 @@ def train(model, args, loss, writer, plot, notifier=None):
                     gen_xyz = None
                     final_w = None
                     out_label = None
+                    
+                    """モデルの実行"""
                     prev_log_flag = getattr(args, "_log_this_step", False)
                     try:
-                        args._log_this_step = bool(getattr(args, "verbose_step_logs", False) and detail_log_this_step)
+                        args._log_this_step = bool(getattr(args, "verbose_step_logs", False) and detail_log_this_step) # このSubtree処理内で詳細ログを出すか否か決定
                         if is_anchor_step:
-                            autocast_ctx = torch.cuda.amp.autocast(dtype=amp_dtype, enabled=use_amp) if use_cuda else nullcontext()
-                            with autocast_ctx:
-                                ( gen_pts, L_attr, L_policy, L_actuator, final_w, Lp_out, La_fit, La_rep, out_label) = model.forward( input_xyz, input_attr_full, cache_key=cache_key, return_attr_output=False, subtree_ref=subtree_ref, selected_subtree_keys=None)
-                            if final_w is not None and not torch.isfinite(final_w).all():
+                            """全点群の場合"""
+                            writer.write("Running full cloud Anchor step.") # Anchor Stepであることをログに出す
+                            autocast_ctx = torch.cuda.amp.autocast(dtype=amp_dtype, enabled=use_amp) if use_cuda else nullcontext() # CUDAかつAMP有効なら混合精度計算の文脈を作る
+                            with autocast_ctx: # 全体点群をモデルに入力し、出力点群と各種補助損失・点編集重みを得る
+                                """モデルの実行"""
+                                gen_pts, L_attr, L_policy, L_actuator, final_w, Lp_out, La_fit, La_rep, out_label = model.forward(
+                                    input_xyz, 
+                                    input_attr_full, 
+                                    cache_key=cache_key, 
+                                    return_attr_output=False,
+                                    subtree_ref=subtree_ref, 
+                                    selected_subtree_keys=None
+                                    )
+                            if final_w is not None and not torch.isfinite(final_w).all(): # final重みにNanやinfが混ざっていないか確認
                                 writer.write( "Warning: final_w contains NaN/Inf. " "It will be sanitized before point-edit summary and losses.")
-                                final_w = torch.nan_to_num(final_w, nan=0.0, posinf=1.0, neginf=0.0)
-                                final_w = final_w.clamp(0.0, 1.0)
+                                final_w = torch.nan_to_num(final_w, nan=0.0, posinf=1.0, neginf=0.0) # 変換
+                                final_w = final_w.clamp(0.0, 1.0) # 変換
                             if detail_log_this_step:
-                                base_model = model.module if hasattr(model, "module") else model
-                                encoder_debug_chunks.append(dict(getattr(base_model, "last_encoder_debug", {}) or {}))
+                                base_model = model.module if hasattr(model, "module") else model # DataParallelで包まれているばあいは中身のモデルを取り出す
+                                encoder_debug_chunks.append(dict(getattr(base_model, "last_encoder_debug", {}) or {})) # Encoder Debug情報をコピーして保存
                             gen_xyz = gen_pts[:, :3, :]
-                            train_edit_stats = summarize_point_edits( input_xyz=input_xyz[:, :3, :], gen_pts=gen_pts, final_w=final_w, args=args)
+                            train_edit_stats = summarize_point_edits( input_xyz=input_xyz[:, :3, :], gen_pts=gen_pts, final_w=final_w, args=args) # 入力点群と出力点群を比較し、各操作の編集統計を計算
                             final_w_for_loss = None
                             if str(getattr(args, "discretelossmode", "hard")).strip().lower() != "hard":
                                 final_w_for_loss = final_w
-                            autocast_ctx = torch.cuda.amp.autocast(dtype=amp_dtype, enabled=use_amp) if use_cuda else nullcontext()
+                            autocast_ctx = torch.cuda.amp.autocast(dtype=amp_dtype, enabled=use_amp) if use_cuda else nullcontext() # 形状損失と圧縮損失の計算もAMP文脈で行うための設定を作る
                             with autocast_ctx:
+                                """形状損失の計算"""
                                 L_geom = loss.get_geometry_loss( args, gen_pts=gen_xyz, gt_pts=input_xyz[:, :3, :], final_w=final_w_for_loss, out_label=out_label)
+                                
+                                """圧縮損失の計算"""
                                 if stage_factors["com"] != 0.0:
-                                    compression_gen_xyz, noise_debug = prepare_compression_points( gen_xyz, args, model, collect_stats=bool(log_this_step or profile_this_step))
-                                    L_com, loss_bit, loss_single, loss_nodes, _, _ = loss.get_compression_loss( args, gen_xyz=compression_gen_xyz, gt_xyz=input_xyz[:, :3, :], final_w=final_w_for_loss, cache_key=cache_key, refresh_actual_gen=refresh_actual_gen, actual_gen_xyz=gen_xyz)
+                                    compression_gen_xyz, noise_debug = prepare_compression_points( gen_xyz, args, model, collect_stats=bool(log_this_step or profile_this_step)) # 圧縮損失用の入力点群を作る
+                                    L_com, loss_bit, loss_single, loss_nodes, _, _ = loss.get_compression_loss( # 圧縮損失の計算
+                                        args, 
+                                        gen_xyz=compression_gen_xyz, 
+                                        gt_xyz=input_xyz[:, :3, :], 
+                                        final_w=final_w_for_loss, 
+                                        cache_key=cache_key, 
+                                        refresh_actual_gen=refresh_actual_gen, 
+                                        actual_gen_xyz=gen_xyz
+                                        )
                                 else:
+                                    writer.write("!!! Skipping compression loss calculation due to stage factor setting. !!!")
                                     zero = input_xyz.new_zeros(())
                                     L_com = zero
                                     loss_bit = zero
                                     loss_single = zero
                                     loss_nodes = zero
                         else:
-                            num_selected = float(max(len(selected_groups), 1))
-                            subtree_edit_sums = new_point_edit_sums()
-                            subtree_noise_debug_values = []
-                            subtree_compression_term_sums = {}
-                            for subtree_key, point_idx in selected_groups:
-                                subtree_xyz = input_xyz.index_select(2, point_idx).contiguous()
+                            """Subtreeの場合"""
+                            writer.write("Running subtree step with selected Subtree.") # Subtree Stepであることをログに出す
+                            num_selected = float(max(len(selected_groups), 1)) # 選択されたSubtree数をFloatで取得
+                            subtree_edit_sums = new_point_edit_sums() # 複数Subtreeの点編集統計を累積するための変数を初期化
+                            subtree_noise_debug_values = [] # 各Subtreeで圧縮用ノイズを加えたかなどを統合
+                            subtree_compression_term_sums = {} # Subtreeごとの圧縮損失内訳を累積する辞書
+
+                            for subtree_key, point_idx in selected_groups: # 選択されたSubtreeを1つずつ取り出し、それぞれ日いて点群を切り出し、Forward、形状損失、圧縮損失を計算
+                                subtree_xyz = input_xyz.index_select(2, point_idx).contiguous() # 全体対入力点群から現在Subtreeに属する点だけを取り出す
                                 subtree_attr = None
                                 if input_attr_full is not None:
-                                    subtree_attr = input_attr_full.index_select(2, point_idx).contiguous()
+                                    subtree_attr = input_attr_full.index_select(2, point_idx).contiguous() # 属性を取り出す
                                 subtree_cache_key = ( f"{cache_key}|subtree_depth={int(subtree_ref['depth'][0].item())}|subtree_key={subtree_key}")
-                                autocast_ctx = torch.cuda.amp.autocast(dtype=amp_dtype, enabled=use_amp) if use_cuda else nullcontext()
+                                autocast_ctx = torch.cuda.amp.autocast(dtype=amp_dtype, enabled=use_amp) if use_cuda else nullcontext() # Subtree Forward用のAMP文脈を作る
                                 with autocast_ctx:
-                                    ( gen_subtree_pts, L_attr_sub, L_policy_sub, L_actuator_sub, final_w_sub, Lp_out_sub, La_fit_sub, La_rep_sub, out_label_sub) = model.forward( subtree_xyz, subtree_attr, cache_key=subtree_cache_key, return_attr_output=False)
+                                    """モデルの実行"""
+                                    gen_subtree_pts, L_attr_sub, L_policy_sub, L_actuator_sub, final_w_sub, Lp_out_sub, La_fit_sub, La_rep_sub, out_label_sub = model.forward(
+                                        subtree_xyz, 
+                                        subtree_attr, 
+                                        cache_key=subtree_cache_key, 
+                                        return_attr_output=False
+                                        )
+
+                                """詳細のログ"""
                                 if detail_log_this_step:
                                     base_model = model.module if hasattr(model, "module") else model
                                     encoder_debug_chunks.append(dict(getattr(base_model, "last_encoder_debug", {}) or {}))
 
                                 gen_subtree_xyz = gen_subtree_pts[:, :3, :]
-                                subtree_edit_stats = summarize_point_edits( input_xyz=subtree_xyz[:, :3, :], gen_pts=gen_subtree_pts, final_w=final_w_sub, args=args)
-                                add_point_edit_sums(subtree_edit_sums, subtree_edit_stats)
+                                subtree_edit_stats = summarize_point_edits( input_xyz=subtree_xyz[:, :3, :], gen_pts=gen_subtree_pts, final_w=final_w_sub, args=args) # Subtree入力とSubtree出力を比較し、操作などを計算する
+                                add_point_edit_sums(subtree_edit_sums, subtree_edit_stats) # 現在Subtreeの編集統計を、Step全体の編集統計に累積する
                                 final_w_sub_loss = None
                                 if str(getattr(args, "discretelossmode", "hard")).strip().lower() != "hard":
                                     final_w_sub_loss = final_w_sub
 
-                                autocast_ctx = torch.cuda.amp.autocast(dtype=amp_dtype, enabled=use_amp) if use_cuda else nullcontext()
+                                """損失計算"""
+                                autocast_ctx = torch.cuda.amp.autocast(dtype=amp_dtype, enabled=use_amp) if use_cuda else nullcontext() # Subtree損失計算用のAMP文脈を作る
                                 with autocast_ctx:
+                                    """形状損失の計算"""
                                     L_geom_sub = loss.get_geometry_loss( args, gen_pts=gen_subtree_xyz, gt_pts=subtree_xyz[:, :3, :], final_w=final_w_sub_loss, out_label=out_label_sub)
                                     if stage_factors["com"] != 0.0:
-                                        compression_subtree_xyz, noise_debug_sub = prepare_compression_points( gen_subtree_xyz, args, model, collect_stats=bool(log_this_step or profile_this_step))
-                                        subtree_noise_debug_values.append(noise_debug_sub)
-                                        L_com_sub, loss_bit_sub, loss_single_sub, loss_nodes_sub, _, _ = loss.get_compression_loss( args, gen_xyz=compression_subtree_xyz, gt_xyz=subtree_xyz[:, :3, :], final_w=final_w_sub_loss, cache_key=subtree_cache_key, refresh_actual_gen=refresh_actual_gen, actual_gen_xyz=gen_subtree_xyz)
-                                        accumulate_compression_terms( subtree_compression_term_sums, getattr(loss, "last_compression_terms", {}) or {}, 1.0 / num_selected)
+                                        """圧縮損失の計算"""
+                                        compression_subtree_xyz, noise_debug_sub = prepare_compression_points( gen_subtree_xyz, args, model, collect_stats=bool(log_this_step or profile_this_step)) # Subtree出力を圧縮損失用に整える
+                                        subtree_noise_debug_values.append(noise_debug_sub) # 現在Subtreeのノイズ情報を保持する
+                                        L_com_sub, loss_bit_sub, loss_single_sub, loss_nodes_sub, _, _ = loss.get_compression_loss( # 損失計算
+                                            args, 
+                                            gen_xyz=compression_subtree_xyz,
+                                            gt_xyz=subtree_xyz[:, :3, :], 
+                                            final_w=final_w_sub_loss, 
+                                            cache_key=subtree_cache_key, 
+                                            refresh_actual_gen=refresh_actual_gen, 
+                                            actual_gen_xyz=gen_subtree_xyz
+                                            )
+                                        accumulate_compression_terms( subtree_compression_term_sums, getattr(loss, "last_compression_terms", {}) or {}, 1.0 / num_selected) # 現在Subtreeで計算された圧縮損失内訳を1/Subtree数の重みをつけて、Step全体の圧縮損失内訳に累積する
                                     else:
                                         zero = subtree_xyz.new_zeros(())
                                         L_com_sub = zero
                                         loss_bit_sub = zero
                                         loss_single_sub = zero
                                         loss_nodes_sub = zero
-
+                                
+                                """損失項の計算"""
                                 L_geom = L_geom + (L_geom_sub / num_selected)
                                 L_com = L_com + (L_com_sub / num_selected)
                                 L_attr = L_attr + (L_attr_sub / num_selected)
@@ -461,226 +515,41 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 loss.last_compression_terms = subtree_compression_term_sums
                     finally:
                         args._log_this_step = prev_log_flag
-                elif args.split2patch:
-                    optimizer.zero_grad(set_to_none=True)
-                    patch_info = get_patch_info(input_pcd, args, cache_key, patch_info_cache)
-                    total_patch_count = int(patch_info["num_patches"])
-                    subset_enabled = bool(getattr(args, "train_patch_subset_enable", False))
-                    selected_patch_ids = torch.arange( total_patch_count, device=patch_info["patch_xyz"].device, dtype=torch.long)
-                    if subset_enabled:
-                        is_anchor_step, _ = should_use_full_cloud_anchor( args, global_step=global_train_step, cache_key=cache_key)
-                        if not is_anchor_step:
-                            selected_patch_ids = select_patch_subset_ids(patch_info, global_train_step, args)
-                    selected_patch_count = int(selected_patch_ids.numel())
-                    subset_step = bool( subset_enabled and (not is_anchor_step) and selected_patch_count < total_patch_count)
-                    encoder_debug_chunks = [] if detail_log_this_step else None
-                    pb = effective_patch_batch_size( args, patch_count=selected_patch_count, patch_size=args.num_points, is_train=True, writer=writer)
-                    patch_outputs = []
-                    patch_count = selected_patch_count
-                    geom_weight_sum = 0.0
-                    L_geom = input_pcd.new_zeros(())
-                    L_attr = input_pcd.new_zeros(())
-                    L_policy = input_pcd.new_zeros(())
-                    L_actuator = input_pcd.new_zeros(())
-                    Lp_out = input_pcd.new_zeros(())
-                    La_fit = input_pcd.new_zeros(())
-                    La_rep = input_pcd.new_zeros(())
-                    autocast_ctx = torch.cuda.amp.autocast(dtype=amp_dtype, enabled=use_amp) if use_cuda else nullcontext()
-                    with autocast_ctx:
-                        prev_patch_geom_log = getattr(args, "_log_this_step", True)
-                        args._log_this_step = False
-                        try:
-                            for i in range(0, patch_count, pb):
-                                chunk_patch_ids = selected_patch_ids[i:i+pb]
-                                chunk_patch_ids_list = chunk_patch_ids.detach().cpu().tolist()
-                                patch_xyz = patch_info["patch_xyz"].index_select(0, chunk_patch_ids)
-                                patch_attr = patch_info["patch_attr"].index_select(0, chunk_patch_ids)
-                                patch_centroid = patch_info["patch_centroid"].index_select(0, chunk_patch_ids)
-                                patch_scale = patch_info["patch_scale"].index_select(0, chunk_patch_ids)
-                                patch_cache_keys = [ f"{cache_key}|patch={patch_id}" for patch_id in chunk_patch_ids_list]
-                                ( gen_chunk, L_attr_chunk, L_policy_chunk, L_actuator_chunk, final_w_chunk, Lp_out_chunk, La_fit_chunk, La_rep_chunk, _, patch_meta_chunk) = model.forward( patch_xyz, patch_attr, cache_key=patch_cache_keys, return_patch_meta=True, coord_scale=patch_scale, return_attr_output=False)
-                                if detail_log_this_step:
-                                    base_model = model.module if hasattr(model, "module") else model
-                                    encoder_debug_chunks.append(dict(getattr(base_model, "last_encoder_debug", {}) or {}))
-                                gen_chunk = denormalize_patch_output( gen_chunk, patch_centroid, patch_scale)
-                                chunk_size = patch_xyz.shape[0]
-                                geom_groups = {}
-                                L_attr = L_attr + L_attr_chunk * chunk_size
-                                L_policy = L_policy + L_policy_chunk * chunk_size
-                                L_actuator = L_actuator + L_actuator_chunk * chunk_size
-                                Lp_out = Lp_out + Lp_out_chunk * chunk_size
-                                La_fit = La_fit + La_fit_chunk * chunk_size
-                                La_rep = La_rep + La_rep_chunk * chunk_size
-
-                                for local_idx in range(chunk_size):
-                                    patch_id = int(chunk_patch_ids_list[local_idx])
-                                    patch_input_idx = patch_info["patch_input_idx"][patch_id]
-                                    owned_input_mask = patch_info["owned_input_mask"][patch_id]
-                                    anchor_idx_local = patch_meta_chunk["anchor_idx_local"][local_idx].clamp_(0, patch_input_idx.shape[0] - 1)
-                                    valid_mask = patch_meta_chunk["output_valid_mask"][local_idx]
-                                    owned_output_mask = owned_input_mask.index_select(0, anchor_idx_local)
-                                    select_mask = valid_mask & owned_output_mask
-                                    selected_pts = gen_chunk[local_idx, :, select_mask]
-                                    selected_w = None
-                                    if final_w_chunk is not None:
-                                        selected_w = final_w_chunk[local_idx, :, select_mask]
-                                    represented_owned_mask = torch.zeros_like(owned_input_mask)
-                                    if select_mask.any():
-                                        represented_owned_mask[anchor_idx_local[select_mask]] = True
-                                    missing_owned_mask = owned_input_mask & (~represented_owned_mask)
-                                    fallback_pts = None
-                                    fallback_w = None
-                                    if missing_owned_mask.any():
-                                        patch_input_xyz_world = (patch_info["patch_centroid"][patch_id:patch_id+1] + patch_info["patch_xyz"][patch_id:patch_id+1] * patch_info["patch_scale"][patch_id:patch_id+1])
-                                        fallback_pts = patch_input_xyz_world[0, :, missing_owned_mask]
-                                        if final_w_chunk is not None:
-                                            fallback_w = final_w_chunk.new_ones((1, int(missing_owned_mask.sum().item())))
-
-                                    owned_local_idx = torch.nonzero(owned_input_mask, as_tuple=False).flatten()
-                                    owned_global_idx = None
-                                    owned_out_label = None
-                                    if owned_local_idx.numel() > 0:
-                                        owned_global_idx = patch_input_idx.index_select(0, owned_local_idx)
-                                        if patch_meta_chunk["out_label"] is not None:
-                                            owned_out_label = patch_meta_chunk["out_label"][local_idx, owned_local_idx]
-
-                                    if valid_mask.any():
-                                        gen_patch_valid = gen_chunk[local_idx:local_idx+1, :3, valid_mask]
-                                        if str(getattr(args, "discretelossmode", "hard")).strip().lower() == "hard":
-                                            final_w_owned = None
-                                        else:
-                                            final_w_owned = None if final_w_chunk is None else final_w_chunk[local_idx:local_idx+1, :, valid_mask]
-
-                                        gt_patch_owned = input_pcd[:, :3, patch_input_idx[owned_input_mask]].contiguous()
-                                        local_weight = float(max(int(owned_input_mask.sum().item()), 1))
-                                        can_batch_geom = ( owned_out_label is None or int(torch.count_nonzero(owned_out_label).detach().cpu()) == 0)
-                                        if can_batch_geom:
-                                            geom_key = ( int(gen_patch_valid.shape[-1]), int(gt_patch_owned.shape[-1]), final_w_owned is not None)
-                                            group = geom_groups.get(geom_key)
-                                            if group is None:
-                                                group = { "gen": [], "gt": [], "final_w": [] if final_w_owned is not None else None, "weight": 0.0}
-                                                geom_groups[geom_key] = group
-                                            group["gen"].append(gen_patch_valid)
-                                            group["gt"].append(gt_patch_owned)
-                                            if final_w_owned is not None:
-                                                group["final_w"].append(final_w_owned)
-                                            group["weight"] += local_weight
-                                        else:
-                                            out_label_owned = owned_out_label.unsqueeze(0)
-                                            L_geom = L_geom + loss.get_geometry_loss(
-                                                args,
-                                                gen_pts=gen_patch_valid,
-                                                gt_pts=gt_patch_owned,
-                                                final_w=final_w_owned,
-                                                out_label=out_label_owned,
-                                            ) * local_weight
-                                            geom_weight_sum += local_weight
-                                    patch_outputs.append( { "patch_id": patch_id, "selected_pts": selected_pts, "selected_w": selected_w, "fallback_pts": fallback_pts, "fallback_w": fallback_w, "owned_global_idx": owned_global_idx, "owned_out_label": owned_out_label, "patch_meta": { "anchor_idx_local": anchor_idx_local, "output_valid_mask": valid_mask, "out_label": None if patch_meta_chunk["out_label"] is None else patch_meta_chunk["out_label"][local_idx]}})
-                                geom_chunk, geom_chunk_weight = accumulate_grouped_patch_geometry( geom_groups, loss, args)
-                                if geom_chunk is not None and geom_chunk_weight > 0.0:
-                                    L_geom = L_geom + geom_chunk
-                                    geom_weight_sum += geom_chunk_weight
-                        finally:
-                            args._log_this_step = prev_patch_geom_log
-                        if subset_step:
-                            gen_pts, compression_gt_pts, final_w, out_label = merge_patch_subset_outputs( patch_info, patch_outputs, input_pcd=input_pcd, device=input_pcd.device, dtype=input_pcd.dtype)
-                            compression_cache_key = make_patch_subset_cache_key( cache_key, selected_patch_ids, total_patch_count=total_patch_count)
-                        else:
-                            gen_pts, final_w, out_label = merge_patch_outputs( patch_info, patch_outputs, device=input_pcd.device, dtype=input_pcd.dtype)
-                            compression_gt_pts = input_xyz
-
-                        norm = float(max(patch_count, 1))
-                        L_attr = L_attr / norm
-                        L_policy = L_policy / norm
-                        L_actuator = L_actuator / norm
-                        Lp_out = Lp_out / norm
-                        La_fit = La_fit / norm
-                        La_rep = La_rep / norm
-                        if geom_weight_sum > 0:
-                            L_geom = L_geom / geom_weight_sum
-                    gen_xyz = gen_pts[:, :3, :]
-                    train_edit_stats = summarize_point_edits( input_xyz=compression_gt_pts[:, :3, :], gen_pts=gen_pts, final_w=final_w, args=args)
-
-                else:
-                    optimizer.zero_grad(set_to_none=True)
-                    args._log_this_step = bool(getattr(args, "verbose_step_logs", False) and detail_log_this_step)
-                    encoder_debug_chunks = [] if detail_log_this_step else None
-                    autocast_ctx = torch.cuda.amp.autocast(dtype=amp_dtype, enabled=use_amp) if use_cuda else nullcontext()
-                    with autocast_ctx:
-                        gen_patches, L_attr, L_policy, L_actuator, final_w, Lp_out, La_fit, La_rep, out_label = model.forward( patches, None, cache_key=cache_key, coord_scale=fd_xyz, return_attr_output=False)
-                    if detail_log_this_step:
-                        base_model = model.module if hasattr(model, "module") else model
-                        encoder_debug_chunks.append(dict(getattr(base_model, "last_encoder_debug", {}) or {}))
-
-                    # 元スケールに戻す
-                    gen_xyz = centroid_xyz + gen_patches[:, :3, :] * fd_xyz
-                    gen_pts = gen_xyz.contiguous()
-                    gen_xyz = gen_pts[:, :3, :]
-                    train_edit_stats = summarize_point_edits( input_xyz=input_xyz[:, :3, :], gen_pts=gen_pts, final_w=final_w, args=args)
-                    L_geom = None
 
                 if timing_enabled:
                     sync_for_timing(use_cuda)
                     timing_model_end = time.time()
 
-                # ---------- Loss計算と最適化 ----------
+                """損失の計算"""
                 if timing_enabled:
                     timing_loss_start = time.time()
-                autocast_ctx = torch.cuda.amp.autocast(dtype=amp_dtype, enabled=use_amp) if use_cuda else nullcontext()
+                autocast_ctx = torch.cuda.amp.autocast(dtype=amp_dtype, enabled=use_amp) if use_cuda else nullcontext() # Loss計算用のAMPコンテキストを作る
                 with autocast_ctx:
-                    final_w_for_loss = None
-                    if str(getattr(args, "discretelossmode", "hard")).strip().lower() != "hard":
+                    final_w_for_loss = None # Lossに渡す点操作重みの初期化
+                    if str(getattr(args, "discretelossmode", "hard")).strip().lower() != "hard": # 離散損失モードがHard以外か判定する
                         final_w_for_loss = final_w
                     if timing_enabled:
                         sync_for_timing(use_cuda)
                         timing_noise_start = time.time()
                     if subtree_mode:
                         compression_gen_xyz = gen_xyz
-                    else:
-                        # 入力や診断前ではなく、編集後・量子化前にだけ一様ノイズを加える。
-                        # 形状損失はcleanなgen_xyz、rate/structure損失はcompression_gen_xyzを見る。
-                        compression_gen_xyz, noise_debug = prepare_compression_points( gen_xyz, args, model, collect_stats=bool(log_this_step or profile_this_step))
+                    else: # 入力や診断前ではなく、編集後・量子化前にだけ一様ノイズを加える
+                        compression_gen_xyz, noise_debug = prepare_compression_points( gen_xyz, args, model, collect_stats=bool(log_this_step or profile_this_step)) # 出力点群から圧縮損失用点群を作る
                     if timing_enabled:
                         sync_for_timing(use_cuda)
                         timing_noise_end = time.time()
-                    if subtree_mode:
-                        pass
-                    elif args.split2patch:
-                        if compute_compression:
-                            L_com, loss_bit, loss_single, loss_nodes, _, _ = loss.get_compression_loss( args, gen_xyz=compression_gen_xyz, gt_xyz=compression_gt_pts[:, :3, :], final_w=final_w_for_loss, cache_key=compression_cache_key, refresh_actual_gen=refresh_actual_gen, actual_gen_xyz=gen_xyz)
-                        else:
-                            zero = gen_xyz.new_zeros(())
-                            L_com = zero
-                            loss_bit = zero
-                            loss_single = zero
-                            loss_nodes = zero
-                            loss.last_compression_debug = {}
-                            loss.last_compression_terms = {}
-                    else:
-                        L_geom = loss.get_geometry_loss( args, gen_pts=gen_xyz, gt_pts=input_xyz, final_w=final_w_for_loss, out_label=out_label)
-                        if compute_compression:
-                            L_com, loss_bit, loss_single, loss_nodes, _, _ = loss.get_compression_loss( args, gen_xyz=compression_gen_xyz, gt_xyz=input_xyz[:, :3, :], final_w=final_w_for_loss, cache_key=cache_key, refresh_actual_gen=refresh_actual_gen, actual_gen_xyz=gen_xyz)
-                        else:
-                            zero = gen_xyz.new_zeros(())
-                            L_com = zero
-                            loss_bit = zero
-                            loss_single = zero
-                            loss_nodes = zero
-                            loss.last_compression_debug = {}
-                            loss.last_compression_terms = {}
 
-                if compute_compression:
-                    comp_debug_for_noise = getattr(loss, "last_compression_debug", {}) or {}
-                    comp_debug_for_noise.update( { "uniform_noise_enabled": bool(noise_debug.get("enabled", False)), "uniform_noise_applied": bool(noise_debug.get("applied", False)), "uniform_noise_delta": float(noise_debug.get("delta", 0.0)), "uniform_noise_mean_abs": float(noise_debug.get("mean_abs", 0.0)), "compression_input_noisy": bool(noise_debug.get("applied", False))})
-                    loss.last_compression_debug = comp_debug_for_noise
+                if compute_compression: # このStepで圧縮損失を計算した場合
+                    comp_debug_for_noise = getattr(loss, "last_compression_debug", {}) or {} # 圧縮辞書の取得
+                    comp_debug_for_noise.update( { "uniform_noise_enabled": bool(noise_debug.get("enabled", False)), "uniform_noise_applied": bool(noise_debug.get("applied", False)), "uniform_noise_delta": float(noise_debug.get("delta", 0.0)), "uniform_noise_mean_abs": float(noise_debug.get("mean_abs", 0.0)), "compression_input_noisy": bool(noise_debug.get("applied", False))}) # 平均絶対ノイズを追加
+                    loss.last_compression_debug = comp_debug_for_noise # ノイズ情報を追記した圧縮Debug辞書をLossに保存しなおす
 
-                # legacy_totalは既存互換の総合lossとして残す。
-                # compression_primaryはactual codec値ではなく、last_compression_termsのgrad tensorを主目的に使う。
-                terms = getattr(loss, "last_compression_terms", {}) or {}
-                actual_total_bit_backend = uses_actual_total_bit_objective(args)
-                if actual_total_bit_backend:
+                """圧縮損失の合成"""
+                terms = getattr(loss, "last_compression_terms", {}) or {} # 直前の圧縮損失の内訳の取得
+                actual_total_bit_backend = uses_actual_total_bit_objective(args) # 圧縮目的をL_comの単一のビット数項にするか否か
+                if actual_total_bit_backend: # L_comをそのまま
                     L_com_objective = float(getattr(args, "w_com", 1.0)) * L_com
-                else:
+                else: # 内訳を重み付きで合成
                     bit_term = terms.get("bit", L_com.new_zeros(()))
                     single_term = terms.get("single", L_com.new_zeros(()))
                     node_term = terms.get("node", L_com.new_zeros(()))
@@ -688,35 +557,42 @@ def train(model, args, loss, writer, plot, notifier=None):
                     sparsepcgc_term = terms.get("sparsepcgc", L_com.new_zeros(()))
                     lowprob_term = La_fit if torch.is_tensor(La_fit) else L_com.new_zeros(())
                     L_com_objective = float(getattr(args, "w_com", 1.0)) * ( float(getattr(args, "com_bit", 0.0)) * bit_term + float(getattr(args, "com_sin", 0.0)) * single_term + float(getattr(args, "com_node", 0.0)) * node_term + float(getattr(args, "com_bpn", 0.0)) * bpn_term + float(getattr(args, "com_sparsepcgc", 0.0)) * sparsepcgc_term + float(getattr(args, "com_lowprob", 0.0)) * lowprob_term)
-                legacy_L_downstream = ( stage_factors["geom"] * args.w_geom * L_geom + stage_factors["com"] * L_com_objective)
+                
+                """形状損失を合成"""
+                legacy_L_downstream = ( stage_factors["geom"] * args.w_geom * L_geom + stage_factors["com"] * L_com_objective) # 形状損失と圧縮損失の合成
+                
+                """属性/方策/操作損失を合成"""
                 legacy_L_total = ( legacy_L_downstream + stage_factors["attr"] * args.w_attr * L_attr + stage_factors["policy"] * args.w_policy * L_policy + stage_factors["repair"] * args.w_actuator * L_actuator)
+                
+                """損失の合成"""
                 L = legacy_L_total
                 L_downstream = legacy_L_downstream
                 L_discrete_policy = L.new_zeros(())
-                cp_debug = {}
-                if compression_primary_mode:
+                cp_debug = {} # compression primaryモード用のdebug情報を空辞書で初期化
+                if compression_primary_mode: # 圧縮優先の場合、圧縮損失を重視した損失を再計算
                     L, L_com_objective, cp_debug = build_compression_primary_loss( args, terms=terms, L_com=L_com, L_geom=L_geom, L_actuator=L_actuator, global_train_step=global_train_step, stage_factors=stage_factors)
                     L_downstream = L_com_objective
                     L_discrete_policy = L.new_zeros(())
                 elif str(getattr(args, "discretelossmode", "hard")).strip().lower() == "hard":
-                    policy_loss_fn = getattr(model, "discrete_policy_loss", None)
+                    policy_loss_fn = getattr(model, "discrete_policy_loss", None) # モデルが保持しているHard離散方策用の損失関数を取得する
                     if callable(policy_loss_fn):
                         L_discrete_policy = policy_loss_fn(L_downstream.detach())
                         L = L + L_discrete_policy
 
-                comp_debug = dict(getattr(loss, "last_compression_debug", {}) or {})
-                if cp_debug:
-                    comp_debug.update(cp_debug)
-                    loss.last_compression_debug = comp_debug
-                base_model = model.module if hasattr(model, "module") else model
-                structure_debug = getattr(base_model, "last_structure_debug", {}) or {}
+                """情報精査"""
+                comp_debug = dict(getattr(loss, "last_compression_debug", {}) or {}) # 直前の圧縮Debug情報を取り出す
+                if cp_debug: # Compression Primaryモード用のDebug情報が存在するか判定
+                    comp_debug.update(cp_debug) # 圧縮目的のDebug情報を追加
+                    loss.last_compression_debug = comp_debug # 統合後のcomp_debugをLossに保存
+                base_model = model.module if hasattr(model, "module") else model # DataParallelで包まれている場合は中身のモデルを取り出す
+                structure_debug = getattr(base_model, "last_structure_debug", {}) or {} # モデル内部で記録された構造解析・構造修復のDebug情報を取得
                 if train_edit_stats is None:
-                    train_edit_stats = summarize_point_edits( input_xyz=input_xyz[:, :3, :], gen_pts=gen_pts, final_w=final_w, args=args)
-                corr_debug = update_actual_correlation_debug(args, comp_debug, L_com, codec_actual_metric_pairs)
-                if corr_debug:
-                    comp_debug.update(corr_debug)
-                    loss.last_compression_debug = comp_debug
-                    corr_value = finite_float_or_none(corr_debug.get("corr_surrogate_actual"))
+                    train_edit_stats = summarize_point_edits( input_xyz=input_xyz[:, :3, :], gen_pts=gen_pts, final_w=final_w, args=args) # 入力/出力点群を比較し、操作を計算
+                corr_debug = update_actual_correlation_debug(args, comp_debug, L_com, codec_actual_metric_pairs) # 圧縮推定値と実圧縮値の対応更新
+                if corr_debug: # 相関診断結果が得られたら
+                    comp_debug.update(corr_debug) # 診断情報の追加
+                    loss.last_compression_debug = comp_debug # 相関診断を追加したcomp_debugを保存しなおす
+                    corr_value = finite_float_or_none(corr_debug.get("corr_surrogate_actual")) # Surrogateと実圧縮の相関地を取り出す
                     if ( log_this_step and bool(getattr(args, "surrogate_realign_on_low_corr", False)) and corr_value is not None and corr_value < float(getattr(args, "surrogate_realign_min_corr", 0.3))):
                         writer.write( "SurrogateRealignNotice: " f"corr_surrogate_actual={corr_value:.6f} below " f"{float(getattr(args, 'surrogate_realign_min_corr', 0.3)):.6f}; " f"realign_steps={int(getattr(args, 'surrogate_realign_steps', 0))} " "(current implementation logs the trigger; extra realign steps are not run unless added later).")
                 skip_optimizer_reason = None
@@ -724,76 +600,75 @@ def train(model, args, loss, writer, plot, notifier=None):
                     skip_optimizer_reason = "actual_codec_fallback_to_proxy"
                     comp_debug["optimizer_skip_reason"] = skip_optimizer_reason
                     loss.last_compression_debug = comp_debug
-                compression_metric_row = build_compression_metric_row( args, global_step=global_train_step, episode=episode, epoch=epoch, step=step, stage=current_stage, comp_debug=comp_debug, L_com=L_com)
-                operation_metric_row = build_operation_metric_row( args, global_step=global_train_step, episode=episode, epoch=epoch, step=step, stage=current_stage, comp_debug=comp_debug, structure_debug=structure_debug, edit_stats=train_edit_stats)
-                append_csv_row( metric_csv_paths.get("compression_step"), COMPRESSION_METRIC_COLUMNS, compression_metric_row)
-                accumulate_compression_episode(episode_compression_sums, compression_metric_row)
-                append_csv_row( metric_csv_paths.get("operation_step"), OPERATION_METRIC_COLUMNS, operation_metric_row)
-                accumulate_operation_episode(episode_operation_sums, operation_metric_row)
-                maybe_record_case_debug( args, writer, case_debug_path, case_debug_counts, global_step=global_train_step, episode=episode, epoch=epoch, step=step, file_path=file_path, comp_debug=comp_debug, structure_debug=structure_debug, edit_stats=train_edit_stats, L=L, L_geom=L_geom, L_com=L_com, L_actuator=L_actuator)
+                    
+                """CSV"""
+                compression_metric_row = build_compression_metric_row( args, global_step=global_train_step, episode=episode, epoch=epoch, step=step, stage=current_stage, comp_debug=comp_debug, L_com=L_com) # 圧縮StepCSVに書き込む1行を作る
+                operation_metric_row = build_operation_metric_row( args, global_step=global_train_step, episode=episode, epoch=epoch, step=step, stage=current_stage, comp_debug=comp_debug, structure_debug=structure_debug, edit_stats=train_edit_stats) # 点操作StepCSVに書き込む1行を作る
+                append_csv_row( metric_csv_paths.get("compression_step"), COMPRESSION_METRIC_COLUMNS, compression_metric_row) # 圧縮メトリクスのStep単位CSV1行追記
+                accumulate_compression_episode(episode_compression_sums, compression_metric_row) # Step単位の圧縮メトリクスをEpisode累積器へ加算する
+                append_csv_row( metric_csv_paths.get("operation_step"), OPERATION_METRIC_COLUMNS, operation_metric_row) # 点操作メトリクスのStep単位CSVへ1行追記
+                accumulate_operation_episode(episode_operation_sums, operation_metric_row) # Step単位の点操作メトリクスをEpisode累積器へ加算
+                maybe_record_case_debug( args, writer, case_debug_path, case_debug_counts, global_step=global_train_step, episode=episode, epoch=epoch, step=step, file_path=file_path, comp_debug=comp_debug, structure_debug=structure_debug, edit_stats=train_edit_stats, L=L, L_geom=L_geom, L_com=L_com, L_actuator=L_actuator) # 圧縮改善が良いケース・悪いケースを条件に応じてCase Debag CSVへ保存
 
+                """ログ"""
                 if log_this_step:
                     log_step_loss( writer, step, num_steps, L, L_geom, L_com, L_com_objective, L_attr, L_policy, L_actuator, Lp_out, La_fit, La_rep, L_discrete_policy, loss_bit, loss_single, loss_nodes)
                     if cp_debug and bool(getattr(args, "cp_log_grad_terms", True)):
                         log_compression_primary_terms(writer, step, num_steps, cp_debug)
-
                     log_compression_stats( writer, step, num_steps, comp_debug)
-
                     before_node, after_node, before_single, after_single = log_compression_train_debug( writer, step, num_steps, args, comp_debug, loss, L_com)
-
                     log_codec_actual_correlation( writer, step, num_steps, args, comp_debug, codec_actual_metric_pairs, before_node, after_node, before_single, after_single)
-
                     log_sparsepcgc_train_debug( writer, step, num_steps, args, comp_debug, sparsepcgc_proxy_actual_pairs)
-
                     if structure_debug:
                         log_structure_debug( writer, structure_debug, step, num_steps)
-
                         write_structure_decision_debug( writer, f"StructureDecision step={step + 1}/{num_steps}", structure_debug)
                 if timing_enabled:
                     sync_for_timing(use_cuda)
                     timing_loss_end = time.time()
                 
-                """--- どのlossがどの勾配を作っているか確認 ---"""
+                """勾配確認"""
                 # backward_and_measure("geom", args.w_geom * L_geom, model, optimizer, writer, args)                
                 # backward_and_measure("com", args.w_com  * L_com,  model, optimizer, writer, args)
                 # backward_and_measure("attr", args.w_attr * L_attr, model, optimizer, writer, args)
                 # backward_and_measure("policy" , args.w_policy  * L_policy,  model, optimizer, writer, args)
 
-                step_completed = False
-                total_loss_finite = bool(torch.isfinite(L.detach()).all().item()) and skip_optimizer_reason is None
-                param_update_snapshots = None
-                amp_info = { "enabled": bool(amp_scaler_enabled), "found_inf": None, "scale_before": None, "scale_after": None, "consecutive_amp_skips": int(consecutive_amp_skips)}
-                if total_loss_finite:
+                """勾配を流す"""
+                step_completed = False # Optimizer更新が成功したかのフラグ
+                total_loss_finite = bool(torch.isfinite(L.detach()).all().item()) and skip_optimizer_reason is None # LがNanなどでないか否かの判定
+                param_update_snapshots = None # 更新前パラメータの記録を見作成で初期化
+                amp_info = { "enabled": bool(amp_scaler_enabled), "found_inf": None, "scale_before": None, "scale_after": None, "consecutive_amp_skips": int(consecutive_amp_skips)} # AMPの状態を記録する辞書を作る
+                if total_loss_finite: # 総損失がInfでないとき、更新前パラメータを記録
                     param_update_snapshots = capture_param_update_snapshots( args, model, step + 1, num_steps)
-                if skip_optimizer_reason is not None:
+                if skip_optimizer_reason is not None: # Optimizer更新を止める必要があるか否かの判定
                     writer.write( "Skipped optimizer step because actual codec teacher fell back to proxy at " f"episode={episode + 1}, epoch={epoch + 1}, step={step + 1}/{num_steps}; " "this prevents proxy-only updates from replacing real-compression imitation.")
                 elif not total_loss_finite:
                     writer.write( f"Skipped optimizer step due to non-finite total loss at " f"episode={episode + 1}, epoch={epoch + 1}, step={step + 1}/{num_steps}.")
-                elif amp_scaler_enabled:
-                    scale_before = float(scaler.get_scale())
-                    amp_info["scale_before"] = scale_before
-                    scaler.scale(L).backward()
-                    scaler.unscale_(optimizer)
-                    grad_clip = float(getattr(args, "train_grad_clip", 0.0))
+                elif amp_scaler_enabled: # AMP用の逆伝播・更新処理へ進む
+                    """AMP更新/勾配"""
+                    scale_before = float(scaler.get_scale()) # BackWard前のAMP loss caleを取得
+                    amp_info["scale_before"] = scale_before # AMP Debug情報に更新前ぉssSacleを保存
+                    scaler.scale(L).backward() # LをAMP用にスケーリングしてから逆伝播
+                    scaler.unscale_(optimizer) # Optimizer内の勾配を元のスケールへ戻す
+                    grad_clip = float(getattr(args, "train_grad_clip", 0.0)) # 勾配ノルムの上限値を設定から取得する
                     if grad_clip > 0.0:
-                        torch.nn.utils.clip_grad_norm_( [p for p in model.parameters() if p.requires_grad], max_norm=grad_clip)
+                        torch.nn.utils.clip_grad_norm_( [p for p in model.parameters() if p.requires_grad], max_norm=grad_clip) # 学習対象パラメータの勾配ノルムをGrad Clip以下に制限
                     if bool(getattr(args, "debug_grad_flow", False)):
-                        log_grad_flow(args, writer, model, step + 1, num_steps)
-                    scaler.step(optimizer)
-                    optimizer_state = scaler._per_optimizer_states[id(optimizer)]
+                        log_grad_flow(args, writer, model, step + 1, num_steps) # 各層・各モジュールに勾配が届いているか否かの判定ログ
+                    scaler.step(optimizer) # Optimizer更新
+                    optimizer_state = scaler._per_optimizer_states[id(optimizer)] # このOptimizerに対するGradScaler内部状態を取得
                     found_inf = 0.0
                     if optimizer_state["found_inf_per_device"]:
-                        found_inf = float( sum(v.item() for v in optimizer_state["found_inf_per_device"].values()))
-                    scaler.update()
-                    scale_after = float(scaler.get_scale())
-                    amp_info["found_inf"] = found_inf
-                    amp_info["scale_after"] = scale_after
-                    step_completed = found_inf == 0.0 and scale_after >= scale_before
-                    if step_completed:
+                        found_inf = float( sum(v.item() for v in optimizer_state["found_inf_per_device"].values())) # GPUごとのInf検出値を合計し、、このStepでAMP Overflowが発生したかを数値化
+                    scaler.update() # GradScalerのLoss Scaleを更新
+                    scale_after = float(scaler.get_scale()) # 更新後のAMP loss scaleを取得
+                    amp_info["found_inf"] = found_inf # Inf/NaN勾配の検出量をAMP Debug情報へ保存する
+                    amp_info["scale_after"] = scale_after # 更新後Loss ScaleをAMP Debug情報へ保存
+                    step_completed = found_inf == 0.0 and scale_after >= scale_before # Inf/NaNが検出されなければOptimizer更新成功とする
+                    if step_completed: # 成功した場合の処理
                         consecutive_amp_skips = 0
                     else:
-                        consecutive_amp_skips += 1
-                        if consecutive_amp_skips >= amp_overflow_patience:
+                        consecutive_amp_skips += 1 # Skipの連続回数を1回増やす
+                        if consecutive_amp_skips >= amp_overflow_patience: # AMP Overflowが設定回数以上連続したかの判定
                             consecutive_amp_skips = 0
                             if use_cuda and cuda_bf16_ops_safe():
                                 amp_dtype = torch.bfloat16
@@ -805,33 +680,34 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 scaler = torch.cuda.amp.GradScaler(enabled=False)
                                 writer.write( "float16 AMP overflow persisted; disabled AMP and continue in float32.")
                 else:
-                    L.backward()
-                    grad_clip = float(getattr(args, "train_grad_clip", 0.0))
+                    L.backward() # 通常の勾配を流す
+                    grad_clip = float(getattr(args, "train_grad_clip", 0.0)) # 勾配クリップの上限値取得
                     if grad_clip > 0.0:
-                        torch.nn.utils.clip_grad_norm_( [p for p in model.parameters() if p.requires_grad], max_norm=grad_clip)
-                    log_grad_flow(args, writer, model, step + 1, num_steps)
-                    optimizer.step()
-                    step_completed = True
-                    consecutive_amp_skips = 0
-                if step_completed:
+                        torch.nn.utils.clip_grad_norm_( [p for p in model.parameters() if p.requires_grad], max_norm=grad_clip) # 勾配爆発抑制
+                    log_grad_flow(args, writer, model, step + 1, num_steps) # 各モジュールの勾配状態をログに出す
+                    optimizer.step() # モデルパラメータの更新
+                    step_completed = True # 更新フラグをTrueにする
+                    consecutive_amp_skips = 0 # AMP loss scale連続Skip回数を0に戻す
+                if step_completed: # Optimizer更新が成功したら差分ログを出す
                     log_param_updates( args, writer, model, param_update_snapshots, step + 1, num_steps)
                 if timing_enabled:
                     sync_for_timing(use_cuda)
                     timing_step_end = time.time()
-                epoch_has_optimizer_step = epoch_has_optimizer_step or step_completed
+                epoch_has_optimizer_step = epoch_has_optimizer_step or step_completed # このEpoch内で一回でも更新が成功したかを記録
                 
+                """損失ログの記録"""
                 if epoch_metric_sums is None:
-                    epoch_metric_sums = new_metric_sums(L.device, plot.num_loss)
-                add_metric_sums( epoch_metric_sums, [ L, L_geom, L_com, L_attr, L_policy, loss_single, loss_nodes, Lp_out, La_fit, La_rep, L_actuator, *surrogate_plot_metrics(loss)], L.device)
+                    epoch_metric_sums = new_metric_sums(L.device, plot.num_loss) # Epoch内で初めのStepなら損失累積器を作る
+                add_metric_sums( epoch_metric_sums, [ L, L_geom, L_com, L_attr, L_policy, loss_single, loss_nodes, Lp_out, La_fit, La_rep, L_actuator, *surrogate_plot_metrics(loss)], L.device) # 現在Stepの損失値をEpoch累積器へ加算
                 if episode_metric_sums is None:
-                    episode_metric_sums = new_metric_sums(L.device, plot.num_loss)
-                step_metric_values = [ L, L_geom, L_com, L_attr, L_policy, loss_single, loss_nodes, Lp_out, La_fit, La_rep, L_actuator, *surrogate_plot_metrics(loss)]
-                add_metric_sums(episode_metric_sums, step_metric_values, L.device)
-                accumulate_checkpoint_metrics( episode_checkpoint_sums, compression_metric_row, operation_metric_row, step_metric_values)
+                    episode_metric_sums = new_metric_sums(L.device, plot.num_loss) # Episode内で初めのEpochなら損失累積器を作る
+                step_metric_values = [ L, L_geom, L_com, L_attr, L_policy, loss_single, loss_nodes, Lp_out, La_fit, La_rep, L_actuator, *surrogate_plot_metrics(loss)] # 記録対象
+                add_metric_sums(episode_metric_sums, step_metric_values, L.device) # 現在Stepの損失一覧
+                accumulate_checkpoint_metrics( episode_checkpoint_sums, compression_metric_row, operation_metric_row, step_metric_values) # ChackPoint判定用メトリクス
                 if train_edit_stats is None:
-                        train_edit_stats = summarize_point_edits( input_xyz=input_xyz[:, :3, :], gen_pts=gen_pts, final_w=final_w, args=args)
-                plot.record_point_edits("step", global_train_step + 1, train_edit_stats)
-                plot_step_info = plot.record_metrics("step", global_train_step + 1, step_metric_values)
+                    train_edit_stats = summarize_point_edits( input_xyz=input_xyz[:, :3, :], gen_pts=gen_pts, final_w=final_w, args=args) # 点操作情報を計算
+                plot.record_point_edits("step", global_train_step + 1, train_edit_stats) # 点操作統計をCSVに記録
+                plot_step_info = plot.record_metrics("step", global_train_step + 1, step_metric_values) # Step単位の損失値をCSVに保存
                 if plot_step_info.get("skipped", False):
                     threshold_text = f"{plot_step_info.get('threshold', float('nan')):.6g}"
                     baseline = plot_step_info.get("baseline", None)
@@ -863,25 +739,25 @@ def train(model, args, loss, writer, plot, notifier=None):
                     writer.flush()
                     return
 
-            # lr scheduler
-            lr_before_scheduler = [float(group.get("lr", 0.0)) for group in optimizer.param_groups]
+            """lr scheduler"""
+            lr_before_scheduler = [float(group.get("lr", 0.0)) for group in optimizer.param_groups] # Schedulerを進める前の各Optimizer Patameter Groupの学習率を取得
             if epoch_has_optimizer_step:
-                scheduler_steplr.step()
+                scheduler_steplr.step() # Epoch内で少なくとも1回は重み更新できた場合に、StepLP Schedulerを進める
             else:
                 writer.write("No successful optimizer step in this epoch; lr_scheduler.step() was skipped.")
-            lr_after_scheduler = [float(group.get("lr", 0.0)) for group in optimizer.param_groups]
-            if lr_after_scheduler != lr_before_scheduler:
+            lr_after_scheduler = [float(group.get("lr", 0.0)) for group in optimizer.param_groups] # Scheduler処理後の各Parameter Groupの学習率を取得
+            if lr_after_scheduler != lr_before_scheduler: # 学習率が変わったら、ログに記録
                 log_for_better_event( for_better_path, "scheduler_lr_step", global_epoch=global_epoch + 1, lr_before=lr_before_scheduler, lr_after=lr_after_scheduler)
 
-            # ログの記録
-            if epoch_metric_sums is not None:
-                epoch_avgs = metric_avgs_to_floats(epoch_metric_sums)
-                plot.epo_avg = epoch_avgs
-                plot_epoch_info = plot.record_metrics("epo", global_epoch + 1, epoch_avgs)
-                log_plot_skip_epoch( writer, plot_epoch_info, global_epoch)
+            """ログの記録"""
+            if epoch_metric_sums is not None: # このEpoch内でStep損失が1回以上累積されているか判定
+                epoch_avgs = metric_avgs_to_floats(epoch_metric_sums) # Epoch内で累積した損失合計を件数で割り、PythonのFloatリストへ変換
+                plot.epo_avg = epoch_avgs # 計算下Epoch平均損失をPlot管理機に保存
+                plot_epoch_info = plot.record_metrics("epo", global_epoch + 1, epoch_avgs) # Epoch単位の平均損失をPlot用CSVへ記録
+                log_plot_skip_epoch( writer, plot_epoch_info, global_epoch) # Epoch単位の平均損失をCSVに記録
                 writer.write(format_metric_summary("EpochAvg", plot.metric_keys, epoch_avgs))
-            epoch_edit_info = plot.record_point_edits("epo", global_epoch + 1)
-            log_epoch_point_edit_average( writer, epoch_edit_info, global_epoch)
+            epoch_edit_info = plot.record_point_edits("epo", global_epoch + 1) # Epoch内で記録されたStep単位の点編集統計を集計
+            log_epoch_point_edit_average( writer, epoch_edit_info, global_epoch) # Epoch単位の点ん操作統計をログに記録
             global_epoch += 1
             plot.plot_loss_curve("step")
             plot.plot_loss_curve("epo")

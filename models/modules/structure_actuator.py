@@ -222,6 +222,36 @@ class StructureRepairActuator(nn.Module):
             return inverse == selected_voxel_idx.reshape(()).to(device=inverse.device, dtype=inverse.dtype)
         return torch.isin(inverse, selected_voxel_idx.to(device=inverse.device, dtype=inverse.dtype))
 
+    @staticmethod
+    def _top_unique_voxels_from_point_scores(scores, inverse, count):
+        if int(count) <= 0 or scores.numel() == 0:
+            empty = inverse.new_empty((0,), dtype=torch.long)
+            return empty, scores.new_empty((0,))
+
+        order = torch.argsort(scores.detach(), descending=True)
+        sorted_voxels = inverse.index_select(0, order).to(dtype=torch.long)
+        sorted_scores = scores.index_select(0, order)
+        positions = torch.arange(sorted_voxels.numel(), device=sorted_voxels.device, dtype=torch.long)
+
+        # First occurrence in score-sorted order is the per-voxel max score.
+        # This avoids the old Python loop fallback on PyTorch versions without scatter_reduce_.
+        stride = int(sorted_voxels.numel()) + 1
+        voxel_then_pos = sorted_voxels * stride + positions
+        by_voxel = torch.argsort(voxel_then_pos)
+        voxels_by_id = sorted_voxels.index_select(0, by_voxel)
+        pos_by_id = positions.index_select(0, by_voxel)
+        first = torch.ones_like(pos_by_id, dtype=torch.bool)
+        if pos_by_id.numel() > 1:
+            first[1:] = voxels_by_id[1:] != voxels_by_id[:-1]
+        first_pos = pos_by_id[first]
+        if first_pos.numel() == 0:
+            empty = inverse.new_empty((0,), dtype=torch.long)
+            return empty, scores.new_empty((0,))
+
+        k = min(int(count), int(first_pos.numel()))
+        selected_pos = torch.topk(first_pos, k=k, largest=False, sorted=False).values
+        return sorted_voxels.index_select(0, selected_pos), sorted_scores.index_select(0, selected_pos)
+
     def _empty_neighbor_target_mask(self, voxel_coords, voxel_cache=None):
         B, _, N = voxel_coords.shape
         offsets = self.neighbor_offsets.to(device=voxel_coords.device, dtype=torch.long)
@@ -489,12 +519,12 @@ class StructureRepairActuator(nn.Module):
             masked_scores = score_values.masked_fill(~finite_valid, score_floor)
             if callable(scatter_reduce):
                 voxel_scores.scatter_reduce_(0, inverse_all, masked_scores, reduce="amax", include_self=True)
+                valid_voxels = voxel_scores > invalid_threshold
+                voxel_count = int(valid_voxels.sum().item())
             else:
-                for voxel_id in torch.unique(inverse_all[finite_valid], sorted=False):
-                    voxel_id_i = int(voxel_id.item())
-                    voxel_scores[voxel_id_i] = score_values[finite_valid & (inverse_all == voxel_id_i)].max()
-            valid_voxels = voxel_scores > invalid_threshold
-            voxel_count = int(valid_voxels.sum().item())
+                valid_inverse = inverse_all[finite_valid]
+                valid_scores = score_values[finite_valid]
+                voxel_count = int(torch.unique(valid_inverse, sorted=False).numel())
             if voxel_count <= 1:
                 continue
             if threshold_cap_mode:
@@ -510,18 +540,29 @@ class StructureRepairActuator(nn.Module):
                 drop_count = min(target_count, cap_count, voxel_count - 1)
             if drop_count <= 0:
                 continue
-            candidate_scores = voxel_scores.masked_fill(~valid_voxels, score_floor)
-            selected_voxel_idx = torch.topk(
-                candidate_scores,
-                k=min(int(drop_count), int(voxel_count)),
-                largest=True,
-                sorted=False,
-            ).indices
-            if threshold_cap_mode:
-                selected_scores = voxel_scores.index_select(0, selected_voxel_idx)
-                selected_voxel_idx = selected_voxel_idx[selected_scores >= float(hard_threshold)]
-                if selected_voxel_idx.numel() <= 0:
-                    continue
+            if callable(scatter_reduce):
+                candidate_scores = voxel_scores.masked_fill(~valid_voxels, score_floor)
+                selected_voxel_idx = torch.topk(
+                    candidate_scores,
+                    k=min(int(drop_count), int(voxel_count)),
+                    largest=True,
+                    sorted=False,
+                ).indices
+                if threshold_cap_mode:
+                    selected_scores = voxel_scores.index_select(0, selected_voxel_idx)
+                    selected_voxel_idx = selected_voxel_idx[selected_scores >= float(hard_threshold)]
+                    if selected_voxel_idx.numel() <= 0:
+                        continue
+            else:
+                selected_voxel_idx, selected_scores = self._top_unique_voxels_from_point_scores(
+                    valid_scores,
+                    valid_inverse,
+                    drop_count,
+                )
+                if threshold_cap_mode:
+                    selected_voxel_idx = selected_voxel_idx[selected_scores >= float(hard_threshold)]
+                    if selected_voxel_idx.numel() <= 0:
+                        continue
             selected_points = self._isin_voxel_ids(inverse_all, selected_voxel_idx)
             hard_drop[b, 0] = selected_points
         return hard_drop
