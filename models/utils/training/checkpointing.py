@@ -18,9 +18,39 @@ def _finite_float(value, default=None):
     return value if math.isfinite(value) else default
 
 
-def _save_state_dict(model, ckpt_dir, filename):
+def surrogate_sidecar_filename(filename):
+    stem, ext = os.path.splitext(str(filename))
+    if not ext:
+        ext = ".pth"
+    return f"{stem}_surrogate{ext}"
+
+
+def _save_surrogate_state(loss, ckpt_dir, filename):
+    if loss is None:
+        return None
+    surrogate = getattr(loss, "compression_surrogate", None)
+    if surrogate is None:
+        return None
+    optimizer = getattr(loss, "surrogate_optimizer", None)
+    loss_args = getattr(loss, "args", None)
+    payload = {
+        "compression_surrogate_state_dict": surrogate.state_dict(),
+        "surrogate_optimizer_state_dict": None if optimizer is None else optimizer.state_dict(),
+        "surrogate_step": int(getattr(loss, "_surrogate_step", 0)),
+        "surrogate_feature_dim": int(getattr(loss, "surrogate_feature_dim", 0) or 0),
+        "surrogate_levels": list(getattr(loss, "surrogate_levels", []) or []),
+        "compression_loss_backend": None if loss_args is None else getattr(loss_args, "compression_loss_backend", None),
+        "compress": None if loss_args is None else getattr(loss_args, "compress", None),
+    }
+    path = os.path.join(ckpt_dir, surrogate_sidecar_filename(filename))
+    torch.save(payload, path)
+    return path
+
+
+def _save_state_dict(model, ckpt_dir, filename, loss=None):
     path = os.path.join(ckpt_dir, filename)
     torch.save(model.state_dict(), path)
+    _save_surrogate_state(loss, ckpt_dir, filename)
     return path
 
 
@@ -60,10 +90,11 @@ def save_episode_checkpoint(
     stage=None,
     checkpoint_metrics=None,
     best_trackers=None,
+    loss=None,
 ):
     # 既存仕様を維持するため、保存名は train.py の元コードと同じにする
     model_name = f"{episode}.pth"
-    model_path = _save_state_dict(model, ckpt_dir, model_name)
+    model_path = _save_state_dict(model, ckpt_dir, model_name, loss=loss)
 
     checkpoint_metrics = checkpoint_metrics or {}
     best_trackers = _ensure_best_trackers(best_trackers, best_loss)
@@ -78,14 +109,14 @@ def save_episode_checkpoint(
     if current_loss < best_trackers["legacy_loss"]:
         best_trackers["legacy_loss"] = current_loss
         best_loss = current_loss
-        model_path = _save_state_dict(model, ckpt_dir, "best_loss_legacy.pth")
+        model_path = _save_state_dict(model, ckpt_dir, "best_loss_legacy.pth", loss=loss)
         checkpoint_updates.append("best_loss_legacy")
         writer.write(
             f"New legacy loss best at episode {episode + 1}, "
             f"avg_epi_loss={current_loss:.6f}"
         )
         if not actual_backend:
-            model_path = _save_state_dict(model, ckpt_dir, "best.pth")
+            model_path = _save_state_dict(model, ckpt_dir, "best.pth", loss=loss)
             best_trackers["best_pth_source"] = "best_loss_legacy"
 
     loss_by_stage = best_trackers["loss_by_stage"]
@@ -93,14 +124,14 @@ def save_episode_checkpoint(
     if current_loss < stage_loss_best:
         loss_by_stage[stage_name] = current_loss
         filename = f"best_loss_{stage_name}.pth"
-        model_path = _save_state_dict(model, ckpt_dir, filename)
+        model_path = _save_state_dict(model, ckpt_dir, filename, loss=loss)
         checkpoint_updates.append(filename.replace(".pth", ""))
         writer.write(
             f"New {stage_name} loss best at episode {episode + 1}, "
             f"avg_epi_loss={current_loss:.6f}, path={filename}"
         )
         if (not actual_backend) and stage_name == "joint":
-            model_path = _save_state_dict(model, ckpt_dir, "best.pth")
+            model_path = _save_state_dict(model, ckpt_dir, "best.pth", loss=loss)
             best_trackers["best_pth_source"] = filename
 
     actual_delta = _finite_float(checkpoint_metrics.get("fresh_actual_delta"), None)
@@ -112,7 +143,7 @@ def save_episode_checkpoint(
         if actual_delta < best_trackers["actual_candidate"]:
             best_trackers["actual_candidate"] = actual_delta
             best_trackers["has_actual_candidate"] = True
-            model_path = _save_state_dict(model, ckpt_dir, "best_actual_delta_candidate.pth")
+            model_path = _save_state_dict(model, ckpt_dir, "best_actual_delta_candidate.pth", loss=loss)
             checkpoint_updates.append("best_actual_delta_candidate")
             writer.write(
                 f"New actual-delta candidate at episode {episode + 1}, "
@@ -120,7 +151,7 @@ def save_episode_checkpoint(
                 f"geom_ok={geometry_ok}, safety_ok={safety_ok}"
             )
             if not best_trackers["has_actual_improved"]:
-                model_path = _save_state_dict(model, ckpt_dir, "best.pth")
+                model_path = _save_state_dict(model, ckpt_dir, "best.pth", loss=loss)
                 best_trackers["best_pth_source"] = "best_actual_delta_candidate"
         else:
             not_updated_reasons.append("actual_not_improved")
@@ -130,7 +161,7 @@ def save_episode_checkpoint(
         if actual_delta < stage_actual_best:
             actual_by_stage[stage_name] = actual_delta
             filename = f"best_actual_delta_{stage_name}.pth"
-            model_path = _save_state_dict(model, ckpt_dir, filename)
+            model_path = _save_state_dict(model, ckpt_dir, filename, loss=loss)
             checkpoint_updates.append(filename.replace(".pth", ""))
             writer.write(
                 f"New {stage_name} actual-delta best at episode {episode + 1}, "
@@ -140,8 +171,8 @@ def save_episode_checkpoint(
         if actual_delta < 0.0 and geometry_ok and safety_ok and actual_delta < best_trackers["actual_improved"]:
             best_trackers["actual_improved"] = actual_delta
             best_trackers["has_actual_improved"] = True
-            model_path = _save_state_dict(model, ckpt_dir, "best_actual_delta_improved.pth")
-            model_path = _save_state_dict(model, ckpt_dir, "best.pth")
+            model_path = _save_state_dict(model, ckpt_dir, "best_actual_delta_improved.pth", loss=loss)
+            model_path = _save_state_dict(model, ckpt_dir, "best.pth", loss=loss)
             best_trackers["best_pth_source"] = "best_actual_delta_improved"
             checkpoint_updates.append("best_actual_delta_improved")
             writer.write(
@@ -169,7 +200,7 @@ def save_episode_checkpoint(
             elif best_trackers["legacy_loss"] == current_loss:
                 fallback_path = "best_loss_legacy.pth"
         if fallback_path:
-            model_path = _save_state_dict(model, ckpt_dir, "best.pth")
+            model_path = _save_state_dict(model, ckpt_dir, "best.pth", loss=loss)
             best_trackers["best_pth_source"] = fallback_path
             checkpoint_updates.append("fallback")
         else:

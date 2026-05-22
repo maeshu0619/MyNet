@@ -676,14 +676,25 @@ class SurrogateCompressionLossMixin:
         aux_node_weight = float(getattr(args, "compression_surrogate_aux_node_weight", 0.0))
         aux_single_weight = float(getattr(args, "compression_surrogate_aux_single_weight", 0.0))
         log_soft_aux = bool(getattr(args, "compression_surrogate_log_soft_aux", True))
-        if log_soft_aux or aux_node_weight > 0.0 or aux_single_weight > 0.0:
+        need_soft_aux = bool(log_soft_aux or aux_node_weight > 0.0 or aux_single_weight > 0.0)
+        need_sparse_aux = bool(getattr(args, "sparsepcgc_aux_loss", True) and self._is_sparsepcgc_context(args))
+        x_ref = None
+        if need_soft_aux or need_sparse_aux:
             x_ref = self._build_soft_compression_features(args, gt_xyz, gt_xyz, None)
+        if need_soft_aux:
             soft_node_percent, soft_single_percent = self._soft_aux_percent_from_features(x_soft, x_ref)
         else:
             soft_node_percent = x_soft.new_zeros(())
             soft_single_percent = x_soft.new_zeros(())
         timing_cursor = _mark_timing("feature_ref_aux", timing_cursor)
-        sparse_terms = self._sparsepcgc_aux_feature_terms(args, gen_xyz, gt_xyz, final_w)
+        sparse_terms = self._sparsepcgc_aux_feature_terms(
+            args,
+            gen_xyz,
+            gt_xyz,
+            final_w,
+            x_gen=x_soft,
+            x_ref=x_ref,
+        )
         timing_cursor = _mark_timing("sparsepcgc_aux_proxy", timing_cursor)
         inputs_finite = self._all_finite(gen_xyz, gt_xyz, x_soft)
         target = None

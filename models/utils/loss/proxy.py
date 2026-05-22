@@ -149,9 +149,7 @@ class ProxyCompressionLossMixin:
             L_bit_objective = self._compose_discrete_loss(L_bit_forward, L_bit_surrogate, args)
             L_nodes_objective = self._compose_discrete_loss(L_nodes_forward, L_nodes_surrogate, args)
             L_single_objective = self._compose_discrete_loss(L_single_forward, L_single_surrogate, args)
-            sparse_surrogate_terms = self._sparsepcgc_aux_feature_terms(args, gen_xyz, gt_xyz, final_w)
-            L_sparse_objective = sparse_surrogate_terms["loss"]
-            sparse_terms = sparse_surrogate_terms
+            L_sparse_objective = sparse_terms["loss"]
             L_com = L_com + L_sparse_objective
 
         if args.trainORtest == "test":

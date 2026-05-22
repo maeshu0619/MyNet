@@ -209,15 +209,17 @@ class CompressionLossMixin:
         debug["sparsepcgc_debug_time"] = float(time.time() - start)
         return debug
 
-    def _sparsepcgc_aux_feature_terms(self, args, gen_xyz, gt_xyz, final_w):
+    def _sparsepcgc_aux_feature_terms(self, args, gen_xyz, gt_xyz, final_w, x_gen=None, x_ref=None):
         if not bool(getattr(args, "sparsepcgc_aux_loss", True)):
             zero = gen_xyz.new_zeros(())
             return {"loss": zero, "active": zero, "single": zero, "entropy": zero, "density": zero}
         if not self._is_sparsepcgc_context(args):
             zero = gen_xyz.new_zeros(())
             return {"loss": zero, "active": zero, "single": zero, "entropy": zero, "density": zero}
-        x_gen = self._build_soft_compression_features(args, gen_xyz, gt_xyz, final_w)
-        x_ref = self._build_soft_compression_features(args, gt_xyz, gt_xyz, None)
+        if x_gen is None:
+            x_gen = self._build_soft_compression_features(args, gen_xyz, gt_xyz, final_w)
+        if x_ref is None:
+            x_ref = self._build_soft_compression_features(args, gt_xyz, gt_xyz, None)
         level_dim = 5 * len(self.surrogate_levels)
         q_start = 11 + level_dim
         if x_gen.shape[1] < q_start + 5 or x_ref.shape[1] < q_start + 5:
@@ -298,6 +300,22 @@ class CompressionLossMixin:
             if hasattr(self, "last_surrogate_target_entry"):
                 self.last_surrogate_target_entry = None
         return self.actual_encoder
+
+    def _reset_actual_encoder_after_error(self):
+        old_encoder = getattr(self, "actual_encoder", None)
+        if old_encoder is not None and hasattr(old_encoder, "close"):
+            try:
+                old_encoder.close()
+            except Exception:
+                pass
+        self.actual_encoder = None
+        self.actual_encoder_codec_key = None
+        for name in ("actual_gt_cache", "surrogate_target_cache"):
+            cache = getattr(self, name, None)
+            if hasattr(cache, "clear"):
+                cache.clear()
+        if hasattr(self, "last_surrogate_target_entry"):
+            self.last_surrogate_target_entry = None
 
     @staticmethod
     def _effective_keep_mask_from_weights(weights, args):
@@ -467,6 +485,7 @@ class CompressionLossMixin:
         return (
             bool(getattr(args, "disable_actual_codec_during_train", False))
             and str(getattr(args, "trainORtest", "train")).strip().lower() == "train"
+            and not bool(getattr(args, "_surrogate_pretrain_active", False))
         )
 
     def _get_compression_loss_actual_codec(
@@ -600,16 +619,30 @@ class CompressionLossMixin:
     ):
         self._store_compression_terms()
         backend = self._compression_loss_backend(args)
+        surrogate_backends = {"octattention_surrogate", "sparsepcgc_surrogate", "gpcc_surrogate", "draco_surrogate", "surrogate", "soft_surrogate"}
         if backend != "proxy" and self._actual_codec_disabled_for_train(args):
-            L_com, loss_bit, loss_single, loss_nodes, cached_gt, stats_gt = self._get_compression_loss_proxy(
-                args,
-                gen_xyz=gen_xyz,
-                gt_xyz=gt_xyz,
-                final_w=final_w,
-                cache_key=cache_key,
-                run_grad_probe=True,
-                actual_gen_xyz=actual_gen_xyz,
-            )
+            has_surrogate_teacher = bool(getattr(self, "last_surrogate_target_entry", None) is not None)
+            has_surrogate_teacher = has_surrogate_teacher or bool(getattr(self, "surrogate_replay", []))
+            if backend in surrogate_backends and has_surrogate_teacher:
+                L_com, loss_bit, loss_single, loss_nodes, cached_gt, stats_gt = self._get_compression_loss_surrogate(
+                    args,
+                    gen_xyz=gen_xyz,
+                    gt_xyz=gt_xyz,
+                    final_w=final_w,
+                    cache_key=cache_key,
+                    refresh_actual_gen=False,
+                    actual_gen_xyz=actual_gen_xyz,
+                )
+            else:
+                L_com, loss_bit, loss_single, loss_nodes, cached_gt, stats_gt = self._get_compression_loss_proxy(
+                    args,
+                    gen_xyz=gen_xyz,
+                    gt_xyz=gt_xyz,
+                    final_w=final_w,
+                    cache_key=cache_key,
+                    run_grad_probe=True,
+                    actual_gen_xyz=actual_gen_xyz,
+                )
             self.last_compression_debug["actual_codec_disabled_during_train"] = True
             self.last_compression_debug["requested_backend"] = backend
             return L_com, loss_bit, loss_single, loss_nodes, cached_gt, stats_gt
@@ -647,7 +680,7 @@ class CompressionLossMixin:
                 self.last_compression_debug["requested_backend"] = backend
                 self.last_compression_debug["actual_eval_interval"] = int(interval)
                 return L_com, loss_bit, loss_single, loss_nodes, cached_gt, stats_gt
-        if backend in {"octattention_surrogate", "sparsepcgc_surrogate", "gpcc_surrogate", "draco_surrogate", "surrogate", "soft_surrogate"}:
+        if backend in surrogate_backends:
             try:
                 return self._get_compression_loss_surrogate(
                     args,
@@ -662,6 +695,7 @@ class CompressionLossMixin:
                 if not bool(getattr(args, "actual_codec_fallback_to_proxy_on_error", True)):
                     raise
                 error_text = f"{type(exc).__name__}: {str(exc)}"
+                self._reset_actual_encoder_after_error()
                 log_fn = getattr(self, "_log_surrogate_event", None)
                 if callable(log_fn):
                     log_fn(

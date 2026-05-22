@@ -115,16 +115,17 @@ def with_pretrain_subtree_depth_overrides(args, callback, input_xyz=None):
         "train_subtree_level_min": getattr(args, "train_subtree_level_min", 0),
         "train_subtree_level_max": getattr(args, "train_subtree_level_max", 0),
         "train_subtree_randomize_level": getattr(args, "train_subtree_randomize_level", False),
+        "train_subtree_depth_percent_curriculum": getattr(args, "train_subtree_depth_percent_curriculum", True),
+        "train_subtree_depth_percent_start": getattr(args, "train_subtree_depth_percent_start", (0.0, 0.50)),
+        "train_subtree_depth_percent_end": getattr(args, "train_subtree_depth_percent_end", (0.0, 0.50)),
         "_train_subtree_depth_cli_override": getattr(args, "_train_subtree_depth_cli_override", False),
     }
     try:
-        # 点群全体をOctree分割したときの最大深さを推定
-        full_octree_depth = infer_octree_depth_from_xyz(input_xyz, args)
-
         if (
             int(getattr(args, "surrogate_pretrain_subtree_depth_min", -1)) > 0
             or int(getattr(args, "surrogate_pretrain_subtree_depth_max", -1)) > 0
         ):
+            full_octree_depth = infer_octree_depth_from_xyz(input_xyz, args)
             depth_min = int(getattr(args, "surrogate_pretrain_subtree_depth_min", -1))
             depth_max = int(getattr(args, "surrogate_pretrain_subtree_depth_max", -1))
             if depth_min <= 0:
@@ -133,29 +134,25 @@ def with_pretrain_subtree_depth_overrides(args, callback, input_xyz=None):
                 depth_max = full_octree_depth
             pct_min = float(depth_min) / float(max(full_octree_depth, 1))
             pct_max = float(depth_max) / float(max(full_octree_depth, 1))
+            depth_min = max(1, min(int(depth_min), int(full_octree_depth)))
+            depth_max = max(depth_min, min(int(depth_max), int(full_octree_depth)))
+            if depth_min > depth_max:
+                depth_min, depth_max = depth_max, depth_min
+            args.train_subtree_level_min = int(depth_min)
+            args.train_subtree_level_max = int(depth_max)
+            args._train_subtree_depth_cli_override = True
         else:
-            pct_min = min(max(float(getattr(args, "surrogate_pretrain_subtree_depth_percent_min", 0.05)), 0.01), 1.0)
-            pct_max = min(max(float(getattr(args, "surrogate_pretrain_subtree_depth_percent_max", 0.50)), 0.01), 1.0)
-            pct_min, pct_max = sorted((pct_min, pct_max))
-            depth_min = int(math.ceil(float(full_octree_depth) * pct_min))
-            depth_max = int(math.floor(float(full_octree_depth) * pct_max))
+            pct_min, pct_max = surrogate_pretrain_depth_percent_range(args)
+            pct_min, pct_max = sorted((float(pct_min), float(pct_max)))
+            args.train_subtree_level_min = 0
+            args.train_subtree_level_max = 0
+            args.train_subtree_depth_percent_curriculum = True
+            args.train_subtree_depth_percent_start = (float(pct_min), float(pct_max))
+            args.train_subtree_depth_percent_end = (float(pct_min), float(pct_max))
+            args._train_subtree_depth_cli_override = False
+            depth_min, depth_max = None, None
 
-        # depth=0 や範囲崩壊を防ぐ
-        depth_min = max(1, depth_min)
-        depth_max = max(depth_min, depth_max)
-
-        # 念のため最大深さを超えないようにする
-        depth_min = min(depth_min, full_octree_depth)
-        depth_max = min(depth_max, full_octree_depth)
-
-        if depth_min > depth_max:
-            depth_min, depth_max = depth_max, depth_min
-
-        args.train_subtree_level_min = int(depth_min)
-        args.train_subtree_level_max = int(depth_max)
-        args._train_subtree_depth_cli_override = True
-
-        # 10%〜80%の範囲からランダムに選ばせる
+        # 通常trainと同じ sample_train_subtree_depth 経路から深さを選ばせる。
         if bool(getattr(args, "surrogate_pretrain_subtree_random_depth", True)):
             args.train_subtree_randomize_level = True
         else:
@@ -164,7 +161,13 @@ def with_pretrain_subtree_depth_overrides(args, callback, input_xyz=None):
         result = callback()
         if isinstance(result, dict):
             result["pretrain_depth_percent_range"] = (float(pct_min), float(pct_max))
-            result["pretrain_depth_absolute_range"] = (int(depth_min), int(depth_max))
+            if depth_min is not None and depth_max is not None:
+                result["pretrain_depth_absolute_range"] = (int(depth_min), int(depth_max))
+            else:
+                result["pretrain_depth_absolute_range"] = (
+                    int(result.get("min_depth", 0)),
+                    int(result.get("max_depth", 0)),
+                )
         return result
     finally:
         for key, value in saved.items():
@@ -195,68 +198,28 @@ def build_surrogate_pretrain_subtree_sample(pts, args, cache_key, use_cuda, glob
     )
     min_subtree_points = max(int(getattr(args, "train_subtree_min_points", 1)), 1)
     requested_depth = max(int(subtree_depth_meta.get("depth", 1)), 1)
-    fallback = None
-    selected_depth_state = None
-    retry_count = 0
-    for depth in range(requested_depth, 0, -1):
-        subtree_ref_candidate = build_octree_subtree_reference(input_xyz, args, depth=int(depth))
-        full_subtree_keys = assign_octree_subtree_keys(input_xyz, subtree_ref_candidate)
-        all_subtree_keys_candidate, subtree_index_lists = build_subtree_index_map(full_subtree_keys)
-        all_groups = [
-            (int(subtree_key.detach().cpu()), point_idx)
-            for subtree_key, point_idx in zip(all_subtree_keys_candidate, subtree_index_lists)
-        ]
-        eligible_groups = [
-            (subtree_key, point_idx)
-            for subtree_key, point_idx in all_groups
-            if int(point_idx.numel()) >= min_subtree_points
-        ]
-        if all_groups:
-            largest_group = max(all_groups, key=lambda item: int(item[1].numel()))
-            fallback_points = int(fallback[3][0][1].numel()) if fallback is not None else -1
-        if all_groups and (fallback is None or int(largest_group[1].numel()) > fallback_points):
-            fallback = (
-                subtree_ref_candidate,
-                all_subtree_keys_candidate,
-                all_groups,
-                [largest_group],
-                retry_count,
-                int(depth),
-                "min_points_miss_fallback_largest",
-                0,
-            )
-        if eligible_groups:
-            selected_depth_state = (
-                subtree_ref_candidate,
-                all_subtree_keys_candidate,
-                all_groups,
-                eligible_groups,
-                retry_count,
-                int(depth),
-                "depth_retry" if int(depth) != requested_depth else "none",
-                len(eligible_groups),
-            )
-            break
-        retry_count += 1
+    group_state = build_octree_subtree_groups_with_retry(
+        input_xyz,
+        args,
+        requested_depth=requested_depth,
+        min_points=min_subtree_points,
+        allow_largest_fallback=not bool(getattr(args, "surrogate_pretrain_skip_min_points_miss", False)),
+    )
+    retry_count = int(group_state.get("retry_count", 0))
 
-    if selected_depth_state is None and fallback is not None and not bool(
-        getattr(args, "surrogate_pretrain_skip_min_points_miss", False)
-    ):
-        selected_depth_state = fallback
-
-    if selected_depth_state is None and fallback is not None:
+    if not group_state.get("groups") and group_state.get("all_groups"):
         return {
             "skip_reason": "min_points_miss",
             "sampling_time": time.perf_counter() - sample_t0,
             "depth": requested_depth,
             "point_count": 0,
-            "total_subtree_count": len(fallback[2]),
+            "total_subtree_count": len(group_state.get("all_groups", [])),
             "eligible_subtree_count": 0,
             "selected_subtree_count": 0,
             "retry_count": retry_count,
         }
 
-    if selected_depth_state is None:
+    if not group_state.get("groups"):
         return {
             "skip_reason": "no_valid_subtree",
             "sampling_time": time.perf_counter() - sample_t0,
@@ -268,16 +231,13 @@ def build_surrogate_pretrain_subtree_sample(pts, args, cache_key, use_cuda, glob
             "retry_count": retry_count,
         }
 
-    (
-        subtree_ref,
-        all_subtree_keys,
-        all_groups,
-        group_source,
-        retry_count,
-        selected_depth,
-        skip_reason,
-        eligible_count,
-    ) = selected_depth_state
+    subtree_ref = group_state["subtree_ref"]
+    all_subtree_keys = group_state["unique_keys"]
+    all_groups = group_state["all_groups"]
+    group_source = group_state["groups"]
+    selected_depth = int(group_state["depth"])
+    skip_reason = str(group_state.get("selection_reason", "none"))
+    eligible_count = int(group_state.get("eligible_count", len(group_source)))
     subtree_depth_meta = dict(subtree_depth_meta)
     subtree_depth_meta["depth"] = selected_depth
     total_subtree_count = int(all_subtree_keys.numel())
@@ -397,7 +357,7 @@ def run_surrogate_pretrain(
         f"teacher_type={teacher_type}, full_calibration_interval={full_calibration_interval}, "
         f"full_calibration_steps={full_calibration_steps}, "
         f"subtree_steps_per_full={int(getattr(args, 'surrogate_pretrain_subtree_steps_per_full', full_calibration_interval))}, "
-        f"subtree_depth_percent={float(getattr(args, 'surrogate_pretrain_subtree_depth_percent_min', 0.05)):.3g}-"
+        f"subtree_depth_percent={float(getattr(args, 'surrogate_pretrain_subtree_depth_percent_min', 0.0)):.3g}-"
         f"{float(getattr(args, 'surrogate_pretrain_subtree_depth_percent_max', 0.50)):.3g}, "
         f"max_wall_time_sec={max_wall_time_sec:.1f}"
     )
@@ -415,7 +375,7 @@ def run_surrogate_pretrain(
         sparsepcgc_debug_interval=debug_interval,
         full_calibration_interval=full_calibration_interval,
         full_calibration_steps=full_calibration_steps,
-        subtree_depth_percent_min=float(getattr(args, "surrogate_pretrain_subtree_depth_percent_min", 0.05)),
+        subtree_depth_percent_min=float(getattr(args, "surrogate_pretrain_subtree_depth_percent_min", 0.0)),
         subtree_depth_percent_max=float(getattr(args, "surrogate_pretrain_subtree_depth_percent_max", 0.50)),
         max_wall_time_sec=max_wall_time_sec,
     )
@@ -975,6 +935,11 @@ def run_surrogate_pretrain(
             torch.save(
                 {
                     "compression_surrogate": loss.compression_surrogate.state_dict(),
+                    "compression_surrogate_state_dict": loss.compression_surrogate.state_dict(),
+                    "surrogate_optimizer_state_dict": None if surrogate_optimizer is None else surrogate_optimizer.state_dict(),
+                    "surrogate_step": int(getattr(loss, "_surrogate_step", 0)),
+                    "surrogate_feature_dim": int(getattr(loss, "surrogate_feature_dim", 0) or 0),
+                    "surrogate_levels": list(getattr(loss, "surrogate_levels", []) or []),
                     "completed_steps": completed_steps,
                     "fresh_actual_count": fresh_actual_count,
                     "corr": last_corr,

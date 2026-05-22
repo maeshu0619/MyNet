@@ -56,7 +56,9 @@ def _chunked_min_cdist(src, dst):
 class chamfer_3DFunction(Function):
     @staticmethod
     def forward(ctx, xyz1, xyz2):
-        if chamfer_3D is None:
+        use_fallback = chamfer_3D is None or (not xyz1.is_cuda) or (not xyz2.is_cuda)
+        ctx.use_fallback = bool(use_fallback)
+        if use_fallback:
             dist1, idx1 = _chunked_min_cdist(xyz1, xyz2)
             dist2, idx2 = _chunked_min_cdist(xyz2, xyz1)
             ctx.save_for_backward(xyz1, xyz2, idx1, idx2)
@@ -83,7 +85,7 @@ class chamfer_3DFunction(Function):
 
     @staticmethod
     def backward(ctx, graddist1, graddist2, gradidx1, gradidx2):
-        if chamfer_3D is None:
+        if getattr(ctx, "use_fallback", chamfer_3D is None):
             xyz1, xyz2, idx1, idx2 = ctx.saved_tensors
             grad1 = torch.zeros_like(xyz1)
             grad2 = torch.zeros_like(xyz2)

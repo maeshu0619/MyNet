@@ -126,7 +126,6 @@ class Network(nn.Module):
         return bool(
             (getattr(self.args, "verbose_step_logs", False) and getattr(self.args, "_log_this_step", True))
             or getattr(self.args, "_collect_structure_debug", False)
-            or getattr(self.args, "trainORtest", "train") != "train"
         )
 
     def _timing_enabled(self):
@@ -219,6 +218,21 @@ class Network(nn.Module):
             propagated.append(self._propagate_encoder_features(full_xyz_b, coarse_xyz_b, coarse_feat_b))
         return torch.cat(propagated, dim=0)
 
+    @staticmethod
+    def _propagate_batch_features_by_index(coarse_feat, coarse_counts, full_to_coarse_idx):
+        if not full_to_coarse_idx:
+            return None
+        propagated = []
+        for b, idx in enumerate(full_to_coarse_idx):
+            if idx is None:
+                return None
+            coarse_count = int(coarse_counts[b])
+            if coarse_count <= 0:
+                return None
+            idx = idx.to(device=coarse_feat.device, dtype=torch.long).clamp(0, coarse_count - 1)
+            propagated.append(coarse_feat[b:b + 1, :, :coarse_count].index_select(2, idx))
+        return torch.cat(propagated, dim=0)
+
     def _encoder_sparse_qs_mode_and_pos(self):
         compress_key = (
             str(getattr(self.args, "compress", ""))
@@ -246,17 +260,22 @@ class Network(nn.Module):
         raw_counts = []
         pre_sparse_counts = []
         voxel_sizes = []
+        full_to_coarse_idx = []
         if bool(getattr(self.args, "encoder_sparse_tensor", True)):
             sparse_xyz_list = []
             sparse_full_xyz_list = []
             sparse_feat_list = []
             scale = self._normalize_coord_scale(pts_xyz, coord_scale)
             sparse_qs, sparse_quant_mode, sparse_pos_q = self._encoder_sparse_qs_mode_and_pos()
+            encoder_max_points = int(getattr(self.args, "encoder_pre_downsample_max_points", 0))
+            cdist_cap = max(int(getattr(self.args, "encoder_cdist_max_points", 0)), 0)
+            if KNN_BACKEND != "pointops_cuda" and cdist_cap > 0:
+                encoder_max_points = min(encoder_max_points, cdist_cap) if encoder_max_points > 0 else cdist_cap
             for b in range(pts_xyz.shape[0]):
                 sparse_tensor = build_sparse_point_tensor_single(
                     pts_xyz[b],
                     scale[b:b + 1],
-                    max_points=int(getattr(self.args, "encoder_pre_downsample_max_points", 0)),
+                    max_points=encoder_max_points,
                     qs=sparse_qs,
                     raw_downsample_factor=float(getattr(self.args, "encoder_raw_downsample_factor", 1.0)),
                     voxel_scale=float(getattr(self.args, "encoder_pre_downsample_voxel_scale", 1.0)),
@@ -277,6 +296,7 @@ class Network(nn.Module):
                 encoder_counts.append(int(sparse_xyz_b.shape[-1]))
                 full_counts.append(int(pts_xyz.shape[-1]))
                 voxel_sizes.append(float(sparse_tensor["voxel_size"]))
+                full_to_coarse_idx.append(sparse_tensor.get("full_to_coarse_idx"))
             if sparse_xyz_list:
                 max_sparse = max(x.shape[-1] for x in sparse_xyz_list)
                 padded_xyz = []
@@ -348,8 +368,14 @@ class Network(nn.Module):
         )
         if keep_sparse_path:
             if encoder_input.shape[-1] != analysis_xyz.shape[-1]:
-                local_feat = self._propagate_batch_features(analysis_xyz, encoder_input, encoder_counts, local_sparse)
-                fused_feat = self._propagate_batch_features(analysis_xyz, encoder_input, encoder_counts, fused_sparse)
+                local_by_index = self._propagate_batch_features_by_index(local_sparse, encoder_counts, full_to_coarse_idx)
+                fused_by_index = self._propagate_batch_features_by_index(fused_sparse, encoder_counts, full_to_coarse_idx)
+                if local_by_index is not None and fused_by_index is not None:
+                    local_feat = local_by_index
+                    fused_feat = fused_by_index
+                else:
+                    local_feat = self._propagate_batch_features(analysis_xyz, encoder_input, encoder_counts, local_sparse)
+                    fused_feat = self._propagate_batch_features(analysis_xyz, encoder_input, encoder_counts, fused_sparse)
         elif encoder_input.shape[-1] != pts_xyz.shape[-1]:
             local_feat = self._propagate_batch_features(pts_xyz, encoder_input, encoder_counts, local_sparse)
             fused_feat = self._propagate_batch_features(pts_xyz, encoder_input, encoder_counts, fused_sparse)
@@ -371,7 +397,11 @@ class Network(nn.Module):
                 "full_points": full_counts,
                 "coarse_points": encoder_counts,
                 "voxel_size": voxel_sizes,
-                "propagation": str(getattr(self.args, "encoder_feature_propagation", "knn_inverse_distance")).strip().lower(),
+                "propagation": (
+                    "voxel_assignment"
+                    if keep_sparse_path and full_to_coarse_idx
+                    else str(getattr(self.args, "encoder_feature_propagation", "knn_inverse_distance")).strip().lower()
+                ),
                 "propagation_k": int(getattr(self.args, "encoder_feature_propagation_k", 3)),
                 "feature_dim": int(getattr(self.args, "encoder_input_dim", 3)),
                 "kept_sparse_after_encoder": keep_sparse_path,

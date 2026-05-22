@@ -4,8 +4,8 @@ import sys
 from pathlib import Path
 from cfgs.utils import str2bool
 
-pretrained_date = "20260518"
-pretrained_time = "225925"
+pretrained_date = "20260519"
+pretrained_time = "144143"
 # method_com = "OctAttention"
 method_com = "SparsePCGC"
 # method_com = "G-PCC"
@@ -170,6 +170,35 @@ def _compress_display_name(raw_value: str) -> str:
     return text if text else "OctAttention"
 
 
+def _pretrained_checkpoint_path(date_value: str, time_value: str, compress_value: str, model_stem: str = model_name) -> str:
+    display = _compress_display_name(compress_value)
+    raw = str(compress_value).strip()
+    run_names = []
+    for name in (
+        f"{time_value}_{display}",
+        f"{time_value}_{raw}",
+        f"{time_value}_{raw.lower()}",
+        f"{time_value}_sparsePCGC" if _compress_key(compress_value) == "sparsepcgc" else "",
+    ):
+        if name and name not in run_names:
+            run_names.append(name)
+
+    roots = []
+    for train_dir in ("Mynetwork_train", "MyNetwork_train"):
+        roots.append(_LOG_ROOT / str(date_value) / train_dir)
+        roots.append(_LOG_ROOT / str(date_value) / train_dir / "pretrained")
+
+    candidates = [
+        root / run_name / f"{model_stem}.pth"
+        for root in roots
+        for run_name in run_names
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate.resolve())
+    return str(candidates[0].resolve())
+
+
 def parse_pugan_args(parser, file_day, file_time):
     """基本情報"""
     parser.add_argument('--date', default=f'{file_day}', type=str, help='日付')
@@ -331,6 +360,8 @@ def parse_pugan_args(parser, file_day, file_time):
     """Train"""
     parser.add_argument('--save_dir', default=str((_DATA_ROOT / 'trained_model').resolve()), type=str, help='モデル保存ディレクトリ')
     parser.add_argument('--ckpt', default=_default_checkpoint_path(), type=str, help='チェックポイントのパス')
+    parser.add_argument('--pretrained_date', default=pretrained_date, type=str, help='test.pyで読む学習済みモデルの日付')
+    parser.add_argument('--pretrained_time', default=pretrained_time, type=str, help='test.pyで読む学習済みモデルの時刻')
     parser.add_argument('--out_path', default=str((_LOG_ROOT / file_day / "MyNetwork_train" / "pretrained" / file_time).resolve()), type=str, help='チェックポイント保存先')
     parser.add_argument('--log_root', default=str(_LOG_ROOT), type=str, help='学習・推論ログ保存ルート')
     parser.add_argument('--optim', default='adam', type=str, help='最適化手法（adamまたはsgd）')
@@ -349,34 +380,6 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--operation_count_drop_threshold', default=0.50, type=float, help='学習ログで削除点として数えるkeep確率のしきい値')
     parser.add_argument('--operation_count_adjust_threshold', default=1e-6, type=float, help='学習ログで調整点として数える最小移動距離')
 
-    # 損失関数のパラメータ
-    # 現行の総損失:
-    #   L_total = s_geom * w_geom * L_geom
-    #           + s_com  * L_com_objective
-    #           + s_attr * w_attr * L_attr
-    #           + s_policy * w_policy * L_policy
-    #           + s_repair * w_actuator * L_actuator
-    #
-    #   L_com_objective =
-    #       w_com * L_com                              (actual/surrogate backend)
-    #       w_com * (com_bit*bit + com_sin*single
-    #              + com_node*node + com_bpn*bpn
-    #              + com_lowprob*lowprob)            (proxy backend)
-    #
-    #   L_geom(cd+d2) = L_cd - geom_d2_weight * D2PSNR
-    #
-    # そのほかの現行lossパラメータ:
-    #   - 原因分解: attr_* , loss_attr_scale
-    #   - 修復ポリシー: repair_policy_entropy_weight , loss_policy_scale
-    #   - 修復アクチュエータ:
-    #       target_repair_ratio / target_drop_ratio / max_drop_ratio
-    #       target_add_ratio / max_add_ratio
-    #       repair_ratio_weight / repair_shape_guard_weight
-    #       repair_drop_ratio_weight / repair_drop_shape_guard_weight
-    #       repair_add_ratio_weight / repair_add_shape_guard_weight
-    #       repair_add_offset_weight / repair_add_drop_conflict_weight
-    #       repair_add_keep_weight / repair_add_min_offset_qstep
-    #       repair_add_min_offset_weight / loss_repair_scale
     parser.add_argument(
         '--loss_mode',
         default='compression_primary',
@@ -560,7 +563,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--surrogate_pretrain_subtree_stub_only', default=False, type=str2bool, help='旧互換用。Trueでもsubtree/hybrid実装が使える場合は実行する')
     parser.add_argument('--surrogate_pretrain_subtree_depth_min', default=-1, type=int, help='pretrain subtree深さの最小値。負値ならtrain_subtree設定を使う')
     parser.add_argument('--surrogate_pretrain_subtree_depth_max', default=-1, type=int, help='pretrain subtree深さの最大値。負値ならtrain_subtree設定を使う')
-    parser.add_argument('--surrogate_pretrain_subtree_depth_percent_min', default=0.05, type=float, help='pretrain subtree深さを全体Octree深さ比で選ぶ時の最小割合')
+    parser.add_argument('--surrogate_pretrain_subtree_depth_percent_min', default=0.0, type=float, help='pretrain subtree深さを全体Octree深さ比で選ぶ時の最小割合')
     parser.add_argument('--surrogate_pretrain_subtree_depth_percent_max', default=0.50, type=float, help='pretrain subtree深さを全体Octree深さ比で選ぶ時の最大割合')
     parser.add_argument('--surrogate_pretrain_subtree_random_depth', default=True, type=str2bool, help='pretrain subtree深さをランダム/coverage samplingするか')
     parser.add_argument('--surrogate_pretrain_subtree_reuse_train_sampler', default=True, type=str2bool, help='通常trainのOctree subtree sampling helperをpretrainでも使うか')
@@ -628,6 +631,14 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--actual_eval_interval', default=1000, type=int, help='train時のactual codec教師refresh間隔。0なら初回以外refreshしない')
     parser.add_argument('--disable_actual_codec_during_train', default=False, type=str2bool, help='train中のactual codec呼び出しをproxyへ置き換えて無効化するか')
     parser.add_argument('--actual_codec_fallback_to_proxy_on_error', default=True, type=str2bool, help='actual/surrogate teacherがtimeout等で失敗した場合にproxy lossへfallbackしてtrainを継続する')
+    parser.add_argument('--skip_optimizer_on_actual_fallback', default=True, type=str2bool, help='actual/surrogate teacher失敗でproxy fallbackしたstepはoptimizer更新をスキップする')
+    parser.add_argument('--actual_compression_guard', default=True, type=str2bool, help='episode平均のfresh actual圧縮損失が悪化し続けたらbestへ戻してLRを下げる')
+    parser.add_argument('--actual_guard_patience', default=2, type=int, help='actual圧縮悪化を何episode連続で許容するか')
+    parser.add_argument('--actual_guard_tolerance', default=0.25, type=float, help='best actual圧縮損失から何percentage pointの悪化まで許容するか')
+    parser.add_argument('--actual_guard_lr_decay', default=0.5, type=float, help='actual guard発動時のoptimizer LR倍率')
+    parser.add_argument('--actual_guard_min_fresh', default=1, type=int, help='actual guardを判定する最低fresh actual計測数')
+    parser.add_argument('--actual_guard_restore_best', default=True, type=str2bool, help='actual guard発動時にbest episode checkpointへ戻す')
+    parser.add_argument('--actual_guard_improvement_epsilon', default=1e-6, type=float, help='actual guardのbest更新に必要な最小改善幅')
     parser.add_argument('--max_train_steps', default=0, type=int, help='デバッグ用: 0より大きい場合、そのglobal step数でtrain loopを早期終了する')
     parser.add_argument('--save_good_bad_cases', default=False, type=str2bool, help='actual deltaが大きく改善/悪化したstepのdebug summaryをCSV保存する')
     parser.add_argument('--good_case_delta_threshold', default=-5.0, type=float, help='good caseとして保存するactual compression delta[%%]の閾値')
@@ -655,19 +666,21 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--output_dir', default=None, type=str, help='test.py用alias: 編集後点群保存先。指定時は--save_ply_dirを上書き')
     parser.add_argument('--max_test_samples', default=0, type=int, help='test.pyで処理する最大sample数。0以下なら全件')
     parser.add_argument('--input_dir_test', default=str(_data_subset_dir("ground")), type=str, help='テスト用入力点群のパス')
-    parser.add_argument('--max_files_test', default=10, type=int, help='テスト時に読み込む最大ファイル数')
+    parser.add_argument('--max_files_test', default=5, type=int, help='テスト時に読み込む最大ファイル数')
     parser.add_argument('--save_ply_dir', default=str(_data_subset_dir("test", dataname, dataset_name)), type=str, help='出力点群の保存先')
     parser.add_argument('--codec_eval_dir', default=str(_data_subset_dir("test")), type=str, help='encoder2decoder.py 系が参照する評価用PLYの同期先')
     parser.add_argument('--test_compute_loss', default=True, type=str2bool, help='test.pyで幾何・圧縮統計をログ出力するか')
     parser.add_argument('--skip_actual_codec', default=True, type=str2bool, help='test.pyではactual codec評価を省きproxy統計だけで高速評価するか')
     parser.add_argument('--codec_eval_interval', default=0, type=int, help='test.pyでactual codec評価を行う間隔。0なら無効、1なら全sample')
-    parser.add_argument('--profile_test', default=True, type=str2bool, help='test.pyでsample別の処理時間/GPUメモリをログ出力するか')
+    parser.add_argument('--profile_test', default=False, type=str2bool, help='test.pyでsample別の処理時間/GPUメモリをログ出力するか')
     parser.add_argument('--save_test_ply', default=True, type=str2bool, help='test.pyで編集後PLYを保存するか')
     parser.add_argument('--test_drop_threshold', default=0.50, type=float, help='test.pyで点削除ゲートをhard化するしきい値。全点keep/全点dropになる場合はsum(final_w)ベースのexpected_keepへ自動フォールバック')
     parser.add_argument('--test_adjust_threshold', default=1e-6, type=float, help='test.pyで点が調整されたと数える最小移動距離')
     parser.add_argument('--test_inference_mode', default='full_cloud', type=str, help='推論方法(auto/full_cloud/subtree_merge/patch/direct/legacy)')
+    parser.add_argument('--test_allow_subtree_merge', default=False, type=str2bool, help='Trueの時だけtest.pyでsubtree_merge推論を許可する')
     parser.add_argument('--test_auto_time_tolerance', default=0.10, type=float, help='auto選択で時間差がこの比率以内ならメモリ節約側を優先')
-    parser.add_argument('--test_subtree_level', default=0, type=int, help='subtree_merge時に使うSubtree深さ(0ならtrain_subtree_level/repair_unit_level)')
+    parser.add_argument('--test_subtree_level', default=6, type=int, help='subtree_merge時に使うSubtree深さ(0ならtrain_subtree_level/repair_unit_level)')
+    parser.add_argument('--test_subtree_batch_size', default=8, type=int, help='subtree_merge時に複数Subtreeをまとめて推論する数(Add有効時は安全のため1)')
     parser.add_argument('--test_subtree_min_points', default=4, type=int, help='subtree_merge時に各Subtreeへ最低限含めたい点数')
     parser.add_argument('--test_metric_max_points', default=8192, type=int, help='testログ用CD/D1/D2計算で使う最大点数（0で全点）')
     parser.add_argument('--test_metric_normal_k', default=16, type=int, help='testログ用D2PSNRの法線推定k近傍数')
@@ -705,8 +718,8 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--train_subtree_curriculum_fraction', default=1.0, type=float, help='全学習stepのうちsubtree深さcurriculumに使う割合（1.0なら全stepで徐々に変化）')
     parser.add_argument('--train_subtree_curriculum_direction', default='deep_to_shallow', type=str, help='subtree深さcurriculumの向き(deep_to_shallow/shallow_to_deep)')
     parser.add_argument('--train_subtree_depth_percent_curriculum', default=True, type=str2bool, help='全体Octree深さに対する割合でsubtree深さ範囲を決める')
-    parser.add_argument('--train_subtree_depth_percent_start', default='0.70,0.90', type=str, help='学習開始時のsubtree深さ割合範囲(min,max)')
-    parser.add_argument('--train_subtree_depth_percent_end', default='0.10,0.60', type=str, help='学習終了時のsubtree深さ割合範囲(min,max)')
+    parser.add_argument('--train_subtree_depth_percent_start', default='0.0,0.50', type=str, help='学習開始時のsubtree深さ割合範囲(min,max)')
+    parser.add_argument('--train_subtree_depth_percent_end', default='0.0,0.50', type=str, help='学習終了時のsubtree深さ割合範囲(min,max)')
     parser.add_argument('--train_subtree_min_points', default=4, type=int, help='train時に優先的に選ぶsubtreeの最小点数（満たす候補が無ければフォールバック）')
     parser.add_argument('--train_patch_subset_patches_per_step', default=1, type=int, help='1 stepで処理するsubtree数')
     parser.add_argument('--train_patch_subset_anchor_interval', default=32, type=int, help='subtree subset学習時に何stepごとにfull-cloud anchor学習を挟むか(0なら間隔指定なし)')
@@ -769,6 +782,8 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--mail_sendmail_path', default='/usr/sbin/sendmail', type=str, help='sendmailコマンドのパス')
 
     args = parser.parse_args()
+    args._add_cli_provided = _cli_option_was_provided("--add")
+    args._use_amp_cli_provided = _cli_option_was_provided("--use_amp")
     if not _cli_option_was_provided("--input_dir_test"):
         args.input_dir_test = str(_data_subset_dir("ground", args.dataname, args.dataset_name))
     if not _cli_option_was_provided("--save_ply_dir"):
@@ -885,6 +900,15 @@ def parse_pugan_args(parser, file_day, file_time):
     args.run_name = str(getattr(args, "run_name", "")).strip()
     if not args.run_name:
         args.run_name = f"{args.time}_{args.surrogate_name}"
+    args.pretrained_date = str(getattr(args, "pretrained_date", pretrained_date)).strip()
+    args.pretrained_time = str(getattr(args, "pretrained_time", pretrained_time)).strip()
+    if not _cli_option_was_provided("--ckpt") and not getattr(args, "checkpoint", None):
+        args.ckpt = _pretrained_checkpoint_path(
+            args.pretrained_date,
+            args.pretrained_time,
+            args.compress,
+            model_stem=model_name,
+        )
     if not _cli_option_was_provided("--out_path"):
         args.out_path = str((_LOG_ROOT / args.date / "MyNetwork_train" / "pretrained" / args.run_name).resolve())
     actual_bit_backends = {
@@ -1046,7 +1070,7 @@ def parse_pugan_args(parser, file_day, file_time):
         int(getattr(args, "compression_surrogate_replay_entries", 0)),
         0,
     )
-    args.surrogate_pretrain_steps = max(int(getattr(args, "surrogate_pretrain_steps", 0)), 0)
+    args.surrogate_step = max(int(getattr(args, "surrogate_step", 0)), 0)
     args.surrogate_pretrain_lr = max(float(getattr(args, "surrogate_pretrain_lr", 1e-4)), 0.0)
     args.surrogate_pretrain_actual_refresh_interval = max(
         int(getattr(args, "surrogate_pretrain_actual_refresh_interval", 10)),
@@ -1127,11 +1151,11 @@ def parse_pugan_args(parser, file_day, file_time):
             args.surrogate_pretrain_subtree_depth_min,
         )
     args.surrogate_pretrain_subtree_depth_percent_min = min(
-        max(float(getattr(args, "surrogate_pretrain_subtree_depth_percent_min", 0.05)), 0.01),
+        max(float(getattr(args, "surrogate_pretrain_subtree_depth_percent_min", 0.0)), 0.0),
         1.0,
     )
     args.surrogate_pretrain_subtree_depth_percent_max = min(
-        max(float(getattr(args, "surrogate_pretrain_subtree_depth_percent_max", 0.50)), 0.01),
+        max(float(getattr(args, "surrogate_pretrain_subtree_depth_percent_max", 0.50)), 0.0),
         1.0,
     )
     if args.surrogate_pretrain_subtree_depth_percent_min > args.surrogate_pretrain_subtree_depth_percent_max:
@@ -1236,6 +1260,14 @@ def parse_pugan_args(parser, file_day, file_time):
     args.actual_eval_interval = max(int(getattr(args, "actual_eval_interval", 1000)), 0)
     args.disable_actual_codec_during_train = bool(getattr(args, "disable_actual_codec_during_train", False))
     args.actual_codec_fallback_to_proxy_on_error = bool(getattr(args, "actual_codec_fallback_to_proxy_on_error", True))
+    args.skip_optimizer_on_actual_fallback = bool(getattr(args, "skip_optimizer_on_actual_fallback", True))
+    args.actual_compression_guard = bool(getattr(args, "actual_compression_guard", True))
+    args.actual_guard_patience = max(int(getattr(args, "actual_guard_patience", 2)), 1)
+    args.actual_guard_tolerance = max(float(getattr(args, "actual_guard_tolerance", 0.25)), 0.0)
+    args.actual_guard_lr_decay = min(max(float(getattr(args, "actual_guard_lr_decay", 0.5)), 0.0), 1.0)
+    args.actual_guard_min_fresh = max(int(getattr(args, "actual_guard_min_fresh", 1)), 1)
+    args.actual_guard_restore_best = bool(getattr(args, "actual_guard_restore_best", True))
+    args.actual_guard_improvement_epsilon = max(float(getattr(args, "actual_guard_improvement_epsilon", 1e-6)), 0.0)
     args.max_train_steps = max(int(getattr(args, "max_train_steps", 0)), 0)
     args.save_good_bad_cases = bool(getattr(args, "save_good_bad_cases", False))
     args.good_case_delta_threshold = float(getattr(args, "good_case_delta_threshold", -5.0))
@@ -1304,14 +1336,16 @@ def parse_pugan_args(parser, file_day, file_time):
     args.compression_octree_stat_force = bool(getattr(args, "compression_octree_stat_force", True))
     sparsepcgc_backend = compress_key == "sparsepcgc" or args.compression_loss_backend.startswith("sparsepcgc_")
     if sparsepcgc_backend:
-        if not _cli_option_was_provided("--surrogate_pretrain_steps"):
-            args.surrogate_pretrain_steps = max(int(getattr(args, "surrogate_pretrain_steps", 0)), 2000)
+        if not _cli_option_was_provided("--surrogate_step"):
+            args.surrogate_step = max(int(getattr(args, "surrogate_step", 0)), 2000)
         if not _cli_option_was_provided("--compression_surrogate_forward_mode"):
             args.compression_surrogate_forward_mode = "teacher_ste"
         if not _cli_option_was_provided("--compression_surrogate_refresh_interval"):
-            args.compression_surrogate_refresh_interval = 1
+            args.compression_surrogate_refresh_interval = max(int(getattr(args, "compression_surrogate_refresh_interval", 0)), 50)
         if not _cli_option_was_provided("--compression_surrogate_reuse_last_target"):
-            args.compression_surrogate_reuse_last_target = False
+            args.compression_surrogate_reuse_last_target = True
+        if not _cli_option_was_provided("--train_subtree_anchor_on_min_points_miss"):
+            args.train_subtree_anchor_on_min_points_miss = True
         if not _cli_option_was_provided("--compression_surrogate_train_steps"):
             args.compression_surrogate_train_steps = max(args.compression_surrogate_train_steps, 4)
         if not _cli_option_was_provided("--compression_surrogate_warmup_steps"):
@@ -1399,7 +1433,7 @@ def parse_pugan_args(parser, file_day, file_time):
         if not _cli_option_was_provided("--train_subtree_curriculum_fraction"):
             args.train_subtree_curriculum_fraction = 1.0
         if not _cli_option_was_provided("--train_subtree_min_points"):
-            args.train_subtree_min_points = max(int(getattr(args, "train_subtree_min_points", 1)), 128)
+            args.train_subtree_min_points = max(int(getattr(args, "train_subtree_min_points", 1)), 4)
         if not _cli_option_was_provided("--train_patch_subset_anchor_interval"):
             args.train_patch_subset_anchor_interval = 0
         if not _cli_option_was_provided("--train_subtree_full_cloud_prob"):
@@ -1415,6 +1449,13 @@ def parse_pugan_args(parser, file_day, file_time):
 
     actual_codec_surrogate_backend = args.compression_loss_backend.endswith("_surrogate")
     if actual_codec_surrogate_backend:
+        if not _cli_option_was_provided("--disable_actual_codec_during_train"):
+            args.disable_actual_codec_during_train = True
+        if bool(getattr(args, "disable_actual_codec_during_train", False)):
+            if not _cli_option_was_provided("--compression_surrogate_replay_steps"):
+                args.compression_surrogate_replay_steps = 0
+            if not _cli_option_was_provided("--surrogate_update_on_teacher_refresh_only"):
+                args.surrogate_update_on_teacher_refresh_only = True
         if not _cli_option_was_provided("--compression_surrogate_forward_mode"):
             args.compression_surrogate_forward_mode = "teacher_ste"
         if (not sparsepcgc_backend) and (not _cli_option_was_provided("--compression_surrogate_refresh_interval")):
@@ -1502,9 +1543,11 @@ def parse_pugan_args(parser, file_day, file_time):
             f"(got {args.test_inference_mode})"
         )
     args.test_auto_time_tolerance = min(max(float(getattr(args, "test_auto_time_tolerance", 0.10)), 0.0), 1.0)
+    args.test_allow_subtree_merge = bool(getattr(args, "test_allow_subtree_merge", False))
     args.test_subtree_level = int(getattr(args, "test_subtree_level", 0))
     if args.test_subtree_level < 0:
         raise ValueError("--test_subtree_level must be >= 0")
+    args.test_subtree_batch_size = max(int(getattr(args, "test_subtree_batch_size", 1)), 1)
     args.test_subtree_min_points = max(
         int(getattr(args, "test_subtree_min_points", getattr(args, "train_subtree_min_points", 1))),
         1,
@@ -1562,10 +1605,10 @@ def parse_pugan_args(parser, file_day, file_time):
         getattr(args, "train_subtree_depth_percent_curriculum", True)
     )
     args.train_subtree_depth_percent_start = _parse_csv_floats(
-        getattr(args, "train_subtree_depth_percent_start", "0.70,0.90")
+        getattr(args, "train_subtree_depth_percent_start", "0.0,0.50")
     )
     args.train_subtree_depth_percent_end = _parse_csv_floats(
-        getattr(args, "train_subtree_depth_percent_end", "0.10,0.60")
+        getattr(args, "train_subtree_depth_percent_end", "0.0,0.50")
     )
     for label, values in (
         ("--train_subtree_depth_percent_start", args.train_subtree_depth_percent_start),

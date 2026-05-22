@@ -69,6 +69,25 @@ def _percent_range(values, fallback):
     return lo, hi
 
 
+def surrogate_pretrain_depth_percent_range(args, fallback=(0.0, 0.50)):
+    """Depth percent range shared by surrogate pretrain and train subtree sampling."""
+    lo = float(getattr(args, "surrogate_pretrain_subtree_depth_percent_min", fallback[0]))
+    hi = float(getattr(args, "surrogate_pretrain_subtree_depth_percent_max", fallback[1]))
+    return _percent_range((lo, hi), fallback)
+
+
+def percent_depth_bounds(data_max_level, pct_lo, pct_hi, *, min_depth=1):
+    data_max_level = max(int(data_max_level), 1)
+    pct_lo, pct_hi = sorted((float(pct_lo), float(pct_hi)))
+    pct_lo = min(max(pct_lo, 0.0), 1.0)
+    pct_hi = min(max(pct_hi, 0.0), 1.0)
+    min_level = max(int(min_depth), min(int(math.ceil(float(data_max_level) * pct_lo)), data_max_level))
+    max_level = max(int(min_depth), min(int(math.floor(float(data_max_level) * pct_hi)), data_max_level))
+    if min_level > max_level:
+        min_level, max_level = max_level, min_level
+    return int(min_level), int(max_level)
+
+
 def _sample_depth_from_range(min_level, max_level, args, global_step, cache_key):
     min_level = int(min_level)
     max_level = int(max_level)
@@ -127,21 +146,19 @@ def sample_train_subtree_depth(pts_xyz: torch.Tensor, args, global_step: int = 0
             curriculum_phase = min(max(float(global_step) / float(phase_denom), 0.0), 1.0)
         else:
             curriculum_phase = 0.0
+        shared_lo, shared_hi = surrogate_pretrain_depth_percent_range(args)
         start_lo, start_hi = _percent_range(
-            getattr(args, "train_subtree_depth_percent_start", "0.70,0.90"),
-            (0.70, 0.90),
+            getattr(args, "train_subtree_depth_percent_start", f"{shared_lo},{shared_hi}"),
+            (shared_lo, shared_hi),
         )
         end_lo, end_hi = _percent_range(
-            getattr(args, "train_subtree_depth_percent_end", "0.10,0.60"),
-            (0.10, 0.60),
+            getattr(args, "train_subtree_depth_percent_end", f"{shared_lo},{shared_hi}"),
+            (shared_lo, shared_hi),
         )
         pct_lo = start_lo + (end_lo - start_lo) * curriculum_phase
         pct_hi = start_hi + (end_hi - start_hi) * curriculum_phase
         pct_lo, pct_hi = sorted((pct_lo, pct_hi))
-        min_level = max(1, min(int(math.ceil(float(data_max_level) * pct_lo)), int(data_max_level)))
-        max_level = max(1, min(int(math.floor(float(data_max_level) * pct_hi)), int(data_max_level)))
-        if min_level > max_level:
-            min_level, max_level = max_level, min_level
+        min_level, max_level = percent_depth_bounds(data_max_level, pct_lo, pct_hi)
         chosen = _sample_depth_from_range(min_level, max_level, args, global_step, cache_key)
         return {
             "depth": int(chosen),
@@ -348,6 +365,91 @@ def build_subtree_index_map(unit_keys: torch.Tensor):
         index_lists.append(sorted_idx[start:end])
         start = end
     return unique_keys, index_lists
+
+
+def build_octree_subtree_groups_with_retry(
+    pts_xyz: torch.Tensor,
+    args,
+    requested_depth: int,
+    min_points: int = 1,
+    *,
+    allow_largest_fallback: bool = True,
+):
+    requested_depth = max(int(requested_depth), 1)
+    min_points = max(int(min_points), 1)
+    fallback = None
+    retry_count = 0
+
+    for depth in range(requested_depth, 0, -1):
+        subtree_ref = build_octree_subtree_reference(pts_xyz, args, depth=int(depth))
+        unit_keys = assign_octree_subtree_keys(pts_xyz, subtree_ref)
+        unique_keys, index_lists = build_subtree_index_map(unit_keys)
+        all_groups = [
+            (int(subtree_key.detach().cpu()), point_idx)
+            for subtree_key, point_idx in zip(unique_keys, index_lists)
+        ]
+        eligible_groups = [
+            (subtree_key, point_idx)
+            for subtree_key, point_idx in all_groups
+            if int(point_idx.numel()) >= min_points
+        ]
+
+        if all_groups:
+            largest_group = max(all_groups, key=lambda item: int(item[1].numel()))
+            fallback_points = int(fallback["groups"][0][1].numel()) if fallback is not None else -1
+            if fallback is None or int(largest_group[1].numel()) > fallback_points:
+                fallback = {
+                    "subtree_ref": subtree_ref,
+                    "unique_keys": unique_keys,
+                    "index_lists": index_lists,
+                    "all_groups": all_groups,
+                    "groups": [largest_group],
+                    "eligible_groups": [],
+                    "eligible_count": 0,
+                    "retry_count": int(retry_count),
+                    "depth": int(depth),
+                    "requested_depth": int(requested_depth),
+                    "selection_reason": "min_points_miss_fallback_largest",
+                    "total_subtree_count": int(unique_keys.numel()),
+                }
+
+        if eligible_groups:
+            return {
+                "subtree_ref": subtree_ref,
+                "unique_keys": unique_keys,
+                "index_lists": index_lists,
+                "all_groups": all_groups,
+                "groups": eligible_groups,
+                "eligible_groups": eligible_groups,
+                "eligible_count": int(len(eligible_groups)),
+                "retry_count": int(retry_count),
+                "depth": int(depth),
+                "requested_depth": int(requested_depth),
+                "selection_reason": "depth_retry" if int(depth) != int(requested_depth) else "none",
+                "total_subtree_count": int(unique_keys.numel()),
+            }
+        retry_count += 1
+
+    if fallback is not None and allow_largest_fallback:
+        fallback = dict(fallback)
+        fallback["retry_count"] = int(retry_count)
+        return fallback
+
+    empty = pts_xyz.new_empty((0,), dtype=torch.long)
+    return {
+        "subtree_ref": None,
+        "unique_keys": empty,
+        "index_lists": [],
+        "all_groups": [],
+        "groups": [],
+        "eligible_groups": [],
+        "eligible_count": 0,
+        "retry_count": int(retry_count),
+        "depth": int(requested_depth),
+        "requested_depth": int(requested_depth),
+        "selection_reason": "no_valid_subtree",
+        "total_subtree_count": 0,
+    }
 
 
 def select_octree_subtree_keys(sorted_keys: torch.Tensor, global_step: int, args) -> torch.Tensor:

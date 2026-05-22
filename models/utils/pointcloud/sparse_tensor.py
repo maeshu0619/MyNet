@@ -65,7 +65,8 @@ def _downsample_sparse_tensor_points(
     if num_points <= target_points:
         feat = sparse_xyz.new_ones((1, num_points))
         counts = sparse_xyz.new_ones((num_points,))
-        return sparse_xyz, feat, counts, float(base_voxel_size)
+        full_to_coarse = torch.arange(num_points, device=sparse_xyz.device, dtype=torch.long)
+        return sparse_xyz, feat, counts, float(base_voxel_size), full_to_coarse
 
     span = (sparse_xyz.amax(dim=1, keepdim=True) - sparse_xyz.amin(dim=1, keepdim=True)).amax().clamp_min(1e-9)
     base_from_budget = float(span.item()) / max(float(target_points), 1.0) ** (1.0 / 3.0)
@@ -74,21 +75,49 @@ def _downsample_sparse_tensor_points(
     max_iters = max(int(max_iters), 1)
 
     coords = None
+    inverse = None
     centers = None
     counts = None
     for _ in range(max_iters):
-        coords, _, centers, counts = _voxelize_once(sparse_xyz, voxel_size)
+        coords, inverse, centers, counts = _voxelize_once(sparse_xyz, voxel_size)
         if int(coords.shape[0]) <= target_points:
             break
         voxel_size *= growth
 
+    full_to_coarse = inverse
     if int(centers.shape[-1]) > target_points:
+        old_centers = centers
         keep = torch.argsort(counts, descending=True)[:target_points]
         keep = torch.sort(keep).values
         centers = centers.index_select(1, keep)
         counts = counts.index_select(0, keep)
+
+        old_to_new = torch.full(
+            (int(old_centers.shape[-1]),),
+            -1,
+            device=sparse_xyz.device,
+            dtype=torch.long,
+        )
+        old_to_new.scatter_(
+            0,
+            keep,
+            torch.arange(int(keep.numel()), device=sparse_xyz.device, dtype=torch.long),
+        )
+        missing_unique = torch.nonzero(old_to_new < 0, as_tuple=False).flatten()
+        if int(missing_unique.numel()) > 0:
+            kept_centers = centers.transpose(0, 1).contiguous().unsqueeze(0)
+            max_elems = 16 * 1024 * 1024
+            chunk = max(1, min(int(missing_unique.numel()), max_elems // max(int(centers.shape[-1]), 1)))
+            for start in range(0, int(missing_unique.numel()), chunk):
+                end = min(start + chunk, int(missing_unique.numel()))
+                query_idx = missing_unique[start:end]
+                query = old_centers.index_select(1, query_idx).transpose(0, 1).contiguous().unsqueeze(0)
+                nearest = torch.cdist(query, kept_centers).argmin(dim=-1).reshape(-1).to(torch.long)
+                old_to_new.index_copy_(0, query_idx, nearest)
+        full_to_coarse = old_to_new.index_select(0, inverse).clamp_(0, int(centers.shape[-1]) - 1)
+
     feat = sparse_xyz.new_ones((1, int(centers.shape[-1])))
-    return centers, feat, counts, float(voxel_size)
+    return centers, feat, counts, float(voxel_size), full_to_coarse.to(torch.long)
 
 
 def build_sparse_point_tensor_single(
@@ -117,6 +146,7 @@ def build_sparse_point_tensor_single(
             "coords_xyz": [3, M] encoder-side downsampled sparse coordinates,
             "feat": [1, M] encoder-side downsampled occupancy feature,
             "counts": [M],
+            "full_to_coarse_idx": [N],  # sparse/full point -> encoder sparse point
             "raw_points": int,
             "pre_downsample_points": int,  # sparse tensor point count before encoder downsampling
             "voxel_size": float,
@@ -138,7 +168,7 @@ def build_sparse_point_tensor_single(
     if max_points > 0:
         target_points = min(target_points, max_points)
 
-    centers, feat, counts, voxel_size = _downsample_sparse_tensor_points(
+    centers, feat, counts, voxel_size, full_to_coarse = _downsample_sparse_tensor_points(
         sparse_xyz,
         target_points=target_points,
         base_voxel_size=sparse_voxel_size,
@@ -152,6 +182,7 @@ def build_sparse_point_tensor_single(
         "coords_xyz": centers,
         "feat": feat,
         "counts": counts,
+        "full_to_coarse_idx": full_to_coarse,
         "raw_points": raw_points,
         "pre_downsample_points": num_points,
         "voxel_size": float(voxel_size),

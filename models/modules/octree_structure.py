@@ -101,7 +101,7 @@ class OctreeStructureAnalysis(nn.Module):
         return bool(
             getattr(self.args, "verbose_step_logs", False)
             and getattr(self.args, "_log_this_step", True)
-        ) or getattr(self.args, "trainORtest", "train") != "train"
+        ) or bool(getattr(self.args, "_collect_octree_level_debug", False))
 
     def _grid_phase(self, pts_xyz, qs_override):
         B, _, _ = pts_xyz.shape
@@ -189,7 +189,14 @@ class OctreeStructureAnalysis(nn.Module):
             merge_pressure = ((point_counts - 1.0) / point_counts).view(1, N)
             density = self._normalize_pointwise(point_counts.view(1, 1, N)).view(1, N).clamp(0.0, 4.0) / 4.0
             targets = coord_b[:, None, :] + offsets.view(1, -1, 3)
-            occupied = self._coords_membership(targets.reshape(-1, 3), unique_coords).view(N, -1)
+            key_mins = unique_coords.amin(dim=0) - 1
+            key_spans = (unique_coords.amax(dim=0) - unique_coords.amin(dim=0) + 3).to(torch.long).clamp_min(1)
+            occupied_keys = torch.sort(self._coord_keys(unique_coords.to(torch.long), key_mins, key_spans)).values
+            query_keys = self._coord_keys(targets.reshape(-1, 3).to(torch.long), key_mins, key_spans)
+            pos = torch.searchsorted(occupied_keys, query_keys)
+            in_bounds = pos < occupied_keys.numel()
+            safe_pos = pos.clamp(max=max(int(occupied_keys.numel()) - 1, 0))
+            occupied = (in_bounds & (occupied_keys[safe_pos] == query_keys)).view(N, -1)
             neighbor_empty = (1.0 - occupied.to(dtype=pts_xyz.dtype).mean(dim=1)).view(1, N)
             quant_residual = (
                 torch.linalg.norm(snap_delta_norm[b], dim=0, keepdim=True) / (3.0 ** 0.5)

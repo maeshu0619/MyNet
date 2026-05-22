@@ -755,7 +755,7 @@ def _run_full_cloud_inference(model, input_pcd, args, cache_key, use_cuda, use_a
     input_xyz = input_pcd[:, :3, :]
     input_attr = _extract_input_attr(input_pcd)
     encoder_debug_chunks = []
-    subtree_ref = _build_inference_subtree_ref(input_xyz, args) if bool(getattr(args, "train_patch_subset_enable", False)) else None
+    subtree_ref = None
     with _autocast_context(use_cuda, use_amp, amp_dtype):
         model_out = model.forward(
             input_xyz,
@@ -776,25 +776,10 @@ def _run_full_cloud_inference(model, input_pcd, args, cache_key, use_cuda, use_a
         "structure_debug_chunks": structure_debug_chunks,
         "edit_ref_xyz": _aligned_edit_ref_xyz(input_xyz, model_out[0].shape[-1]),
     }
-    if subtree_ref is not None:
-        subtree_keys = assign_octree_subtree_keys(input_xyz, subtree_ref)
-        _, subtree_index_lists = build_subtree_index_map(subtree_keys)
-        point_counts = [int(point_idx.numel()) for point_idx in subtree_index_lists]
-        result["subtree_stats"] = {
-            "depth": int(subtree_ref["depth"][0].item()),
-            "count": len(point_counts),
-            "min_points": min(point_counts) if point_counts else 0,
-            "mean_points": (sum(point_counts) / float(max(len(point_counts), 1))) if point_counts else 0.0,
-            "max_points": max(point_counts) if point_counts else 0,
-            "target_min_points": max(
-                int(getattr(args, "test_subtree_min_points", getattr(args, "train_subtree_min_points", 1))),
-                1,
-            ),
-        }
     return result
 
 
-def _run_subtree_merge_inference(model, input_pcd, args, cache_key, use_cuda, use_amp, amp_dtype):
+def _run_subtree_merge_inference(model, input_pcd, args, cache_key, use_cuda, use_amp, amp_dtype, writer=None):
     input_xyz = input_pcd[:, :3, :]
     input_attr = _extract_input_attr(input_pcd)
     _, groups, subtree_stats = _build_test_subtree_groups(input_xyz, args)
@@ -803,29 +788,85 @@ def _run_subtree_merge_inference(model, input_pcd, args, cache_key, use_cuda, us
     merged_pts = []
     merged_weights = []
     merged_refs = []
+    subtree_batch_size = max(int(getattr(args, "test_subtree_batch_size", 1)), 1)
+    if bool(getattr(args, "add", True)):
+        subtree_batch_size = 1
+    chunk_total = (len(groups) + subtree_batch_size - 1) // subtree_batch_size
+    progress_msg = (
+        "SubtreeMerge Start: "
+        f"depth={int(subtree_stats['depth'])}, groups={len(groups)}, "
+        f"batch_size={subtree_batch_size}, "
+        f"min/mean/max_points={int(subtree_stats['min_points'])}/"
+        f"{float(subtree_stats['mean_points']):.1f}/{int(subtree_stats['max_points'])}"
+    )
+    print(progress_msg, flush=True)
+    if writer is not None and hasattr(writer, "write"):
+        writer.write(progress_msg)
     prev_log_flag = getattr(args, "_log_this_step", False)
     try:
         args._log_this_step = bool(getattr(args, "verbose_step_logs", False))
-        for subtree_key, point_idx in groups:
-            subtree_xyz = input_xyz.index_select(2, point_idx).contiguous()
-            subtree_attr = input_attr.index_select(2, point_idx).contiguous() if input_attr is not None else None
-            subtree_cache_key = (
-                f"{cache_key}|test_subtree_depth={int(subtree_stats['depth'])}|subtree_key={subtree_key}"
+        for chunk_idx, group_start in enumerate(range(0, len(groups), subtree_batch_size), start=1):
+            group_chunk = groups[group_start:group_start + subtree_batch_size]
+            counts = [int(point_idx.numel()) for _, point_idx in group_chunk]
+            max_count = max(counts) if counts else 0
+            if max_count <= 0:
+                continue
+            print(
+                "SubtreeMerge Chunk Start: "
+                f"chunk={chunk_idx}/{chunk_total}, "
+                f"groups={len(group_chunk)}, max_points={max_count}",
+                flush=True,
             )
+
+            subtree_xyz_chunks = []
+            subtree_attr_chunks = []
+            subtree_cache_keys = []
+            for subtree_key, point_idx in group_chunk:
+                subtree_xyz = input_xyz.index_select(2, point_idx).contiguous()
+                pad_count = max_count - int(subtree_xyz.shape[-1])
+                if pad_count > 0:
+                    subtree_xyz = torch.cat(
+                        [subtree_xyz, subtree_xyz[:, :, -1:].expand(-1, -1, pad_count)],
+                        dim=2,
+                    )
+                subtree_xyz_chunks.append(subtree_xyz)
+                if input_attr is not None:
+                    subtree_attr = input_attr.index_select(2, point_idx).contiguous()
+                    if pad_count > 0:
+                        subtree_attr = torch.cat(
+                            [subtree_attr, subtree_attr[:, :, -1:].expand(-1, -1, pad_count)],
+                            dim=2,
+                        )
+                    subtree_attr_chunks.append(subtree_attr)
+                subtree_cache_keys.append(
+                    f"{cache_key}|test_subtree_depth={int(subtree_stats['depth'])}|subtree_key={subtree_key}"
+                )
+
+            batch_xyz = torch.cat(subtree_xyz_chunks, dim=0).contiguous()
+            batch_attr = torch.cat(subtree_attr_chunks, dim=0).contiguous() if subtree_attr_chunks else None
             with _autocast_context(use_cuda, use_amp, amp_dtype):
                 model_out = model.forward(
-                    subtree_xyz,
-                    subtree_attr,
-                    cache_key=subtree_cache_key,
+                    batch_xyz,
+                    batch_attr,
+                    cache_key=subtree_cache_keys,
                     compute_internal_losses=False,
+                )
+            print(
+                "SubtreeMerge Chunk Done: "
+                f"chunk={chunk_idx}/{chunk_total}",
+                flush=True,
             )
             base_model = model.module if hasattr(model, "module") else model
             encoder_debug_chunks.append(dict(getattr(base_model, "last_encoder_debug", {}) or {}))
             structure_debug_chunks.append(dict(getattr(base_model, "last_structure_debug", {}) or {}))
-            merged_pts.append(model_out[0].squeeze(0))
-            merged_refs.append(_aligned_edit_ref_xyz(subtree_xyz, model_out[0].shape[-1]).squeeze(0))
-            if model_out[4] is not None:
-                merged_weights.append(model_out[4].squeeze(0))
+
+            for local_idx, ((_, point_idx), count) in enumerate(zip(group_chunk, counts)):
+                count = int(count)
+                merged_pts.append(model_out[0][local_idx, :, :count].contiguous())
+                subtree_xyz = input_xyz.index_select(2, point_idx).contiguous()
+                merged_refs.append(_aligned_edit_ref_xyz(subtree_xyz, count).squeeze(0))
+                if model_out[4] is not None:
+                    merged_weights.append(model_out[4][local_idx, :, :count].contiguous())
     finally:
         args._log_this_step = prev_log_flag
 
@@ -1013,7 +1054,7 @@ def _run_named_inference_mode(mode_name, model, input_pcd, args, cache_key, use_
     if mode_name == "full_cloud":
         return _run_full_cloud_inference(model, input_pcd, args, cache_key, use_cuda, use_amp, amp_dtype)
     if mode_name == "subtree_merge":
-        return _run_subtree_merge_inference(model, input_pcd, args, cache_key, use_cuda, use_amp, amp_dtype)
+        return _run_subtree_merge_inference(model, input_pcd, args, cache_key, use_cuda, use_amp, amp_dtype, writer=writer)
     if mode_name == "patch":
         return _run_patch_inference(model, input_pcd, args, cache_key, use_cuda, use_amp, amp_dtype, writer=writer)
     if mode_name == "direct":

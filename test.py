@@ -77,60 +77,82 @@ def _sparsepcgc_unique_count(points_3n, args):
 def _csv_fields():
     return [
         "sample_id",
+        "step",
         "input_path",
         "output_path",
         "inference_mode",
-        "train_or_eval_mode",
-        "hardening_mode",
-        "selection_threshold",
-        "topk_selected_count",
         "input_points",
         "output_points",
-        "output_unique_count",
-        "codec_points_before",
-        "codec_points_after",
-        "codec_unique_before",
-        "codec_unique_after",
-        "active_coord_before",
-        "active_coord_after",
         "add_points",
         "delete_points",
         "adjust_points",
         "add_ratio",
         "delete_ratio",
         "adjust_ratio",
-        "soft_add_count",
-        "hard_add_count",
-        "add_effective_count",
-        "add_prob_mean",
-        "add_prob_max",
-        "add_score_mean",
-        "add_score_max",
-        "add_candidate_ratio",
-        "add_candidate_count",
-        "add_after_quant_unique_count",
-        "add_removed_by_unique_count",
-        "preserve_ratio",
-        "same_voxel_adjust_count",
-        "different_voxel_move_count",
-        "delete_target_voxel_count",
-        "add_target_voxel_count",
-        "move_source_voxel_count",
-        "move_target_voxel_count",
         "data_loading_time",
         "preprocess_time",
-        "feature_time",
-        "attribution_time",
-        "structure_diagnosis_time",
-        "point_edit_decision_time",
-        "delete_time",
-        "add_time",
-        "adjust_time",
         "postprocess_time",
         "model_forward_total_time",
         "total_inference_time",
         "save_time",
     ]
+
+
+def _emit_table(title, headers, rows, writer):
+    rows = [tuple(str(value) for value in row) for row in rows]
+    headers = tuple(str(value) for value in headers)
+    widths = [
+        max(len(headers[index]), *(len(row[index]) for row in rows))
+        for index in range(len(headers))
+    ]
+
+    def _row(row):
+        return "| " + " | ".join(row[index].ljust(widths[index]) for index in range(len(headers))) + " |"
+
+    writer.write(title)
+    writer.write(_row(headers))
+    writer.write("| " + " | ".join("-" * width for width in widths) + " |")
+    for row in rows:
+        writer.write(_row(row))
+
+
+def _write_step_table(row, writer):
+    _emit_table(
+        f"Step {int(row['step'])} Result",
+        ["input_points", "output_points", "added", "deleted", "adjusted", "model_time_s", "total_time_s"],
+        [
+            (
+                row["input_points"],
+                row["output_points"],
+                row["add_points"],
+                row["delete_points"],
+                row["adjust_points"],
+                f"{row['model_forward_total_time']:.6f}",
+                f"{row['total_inference_time']:.6f}",
+            )
+        ],
+        writer,
+    )
+
+
+def _write_average_table(rows, writer):
+    if not rows:
+        writer.write("Average Result: no samples processed")
+        return
+    keys = [
+        ("input_points", "input_points"),
+        ("output_points", "output_points"),
+        ("add_points", "added"),
+        ("delete_points", "deleted"),
+        ("adjust_points", "adjusted"),
+        ("model_forward_total_time", "model_time_s"),
+        ("total_inference_time", "total_time_s"),
+    ]
+    values = []
+    for key, label in keys:
+        arr = np.asarray([_to_float(row.get(key, 0.0)) for row in rows], dtype=np.float64)
+        values.append((label, f"{float(arr.mean()):.6f}"))
+    _emit_table("Average Result", ["metric", "mean"], values, writer)
 
 
 def _output_point_path(args, step, input_path):
@@ -176,9 +198,11 @@ def _load_state_payload(path):
 
 def _load_trained_model(args, writer):
     model = Network(args, writer)
+    model_state = _load_state_payload(args.ckpt)
+    checkpoint_has_encoder = any(str(key).startswith("encoder.") for key in model_state.keys())
 
     repkpu_ckpt = os.path.join(os.path.dirname(__file__), "repkpu_model", "ckpt-best.pth")
-    if os.path.exists(repkpu_ckpt):
+    if os.path.exists(repkpu_ckpt) and not checkpoint_has_encoder:
         ckpt = torch.load(repkpu_ckpt, map_location="cpu")
         encoder_state = {
             k.replace("encoder.", ""): v
@@ -197,7 +221,6 @@ def _load_trained_model(args, writer):
         model.encoder.load_state_dict(encoder_state, strict=False)
         del ckpt, encoder_state
 
-    model_state = _load_state_payload(args.ckpt)
     model_state = _adapt_model_state_dict_for_sparse_input(model, model_state, writer=writer)
     model_state = _adapt_state_dict_to_model_shapes(
         model_state,
@@ -270,53 +293,39 @@ def _build_test_loader_kwargs(args, use_cuda, writer):
 
 
 def _write_summary(rows, writer):
-    if not rows:
-        writer.write("InferenceProfileSummary: no samples processed")
-        return
-    numeric_keys = [
-        "input_points",
-        "output_points",
-        "add_points",
-        "delete_points",
-        "adjust_points",
-        "add_ratio",
-        "delete_ratio",
-        "adjust_ratio",
-        "preserve_ratio",
-        "data_loading_time",
-        "preprocess_time",
-        "feature_time",
-        "attribution_time",
-        "structure_diagnosis_time",
-        "point_edit_decision_time",
-        "delete_time",
-        "add_time",
-        "adjust_time",
-        "postprocess_time",
-        "model_forward_total_time",
-        "total_inference_time",
-        "save_time",
-    ]
-    writer.write("=== Inference Profile Summary ===")
-    for key in numeric_keys:
-        values = np.asarray([_to_float(row.get(key, 0.0)) for row in rows], dtype=np.float64)
-        writer.write(
-            f"{key}: mean={float(values.mean()):.6g}, "
-            f"min={float(values.min()):.6g}, max={float(values.max()):.6g}"
-        )
+    _write_average_table(rows, writer)
 
 
 def test(model, args, writer):
     model.eval()
     args.trainORtest = "test"
-    # test.pyは推論profile専用にする。圧縮/品質評価は別スクリプトで実行する。
+    # test.pyは推論・操作数ログ・PLY保存専用にする。
     args.test_compute_loss = False
     args.skip_actual_codec = True
     args.codec_eval_interval = 0
     args.use_uniform_noise = False
-    args.debug_timing = True
+    args.test_compute_quality_metrics = False
+    args.debug_timing = False
+    args.verbose_step_logs = False
+    args.log_step_time = False
+    args.log_gpu_memory = False
+    args._collect_structure_debug = False
+    args._collect_octree_level_debug = False
+    args._collect_sparsepcgc_debug = False
+    if not bool(getattr(args, "_use_amp_cli_provided", False)):
+        args.use_amp = False
+    compress_key = str(getattr(args, "compress", "")).strip().lower().replace("-", "").replace("_", "")
+    if (
+        compress_key == "sparsepcgc"
+        and not bool(getattr(args, "sparsepcgc_enable_add_experiment", False))
+        and not bool(getattr(args, "_add_cli_provided", False))
+    ):
+        args.add = False
+        args.target_add_ratio = 0.0
+        args.max_add_ratio = 0.0
+        writer.write("SparsePCGC Add is disabled for test inference unless --add or sparsepcgc_enable_add_experiment is explicit.")
 
-    writer.write("Test Role: inference_only_profile")
+    writer.write("Test Role: inference_only")
     writer.write(f"checkpoint: {args.ckpt}")
     writer.write(f"input_dir: {args.input_dir_test}")
     writer.write(f"output_log: {args.output_log}")
@@ -325,10 +334,7 @@ def test(model, args, writer):
     terminal_log(f"Profile CSV: {args.output_log}")
     terminal_log(f"Save output points: {bool(getattr(args, 'save_test_ply', False))}")
     terminal_log(f"Output point directory: {args.save_ply_dir}")
-    writer.write(
-        "Disabled in test.py: compression codec eval, actual compression delta, "
-        "before/after bits, BD-rate, D1/D2, Chamfer, point-to-plane, codec temp files."
-    )
+    writer.write("Disabled in test.py: compression eval, shape quality metrics, detailed structure debug.")
 
     dataset = PlyDirDataset(args, args.input_dir_test)
     use_cuda = next(model.parameters()).is_cuda
@@ -353,7 +359,10 @@ def test(model, args, writer):
     requested_mode = str(getattr(args, "test_inference_mode", "full_cloud")).strip().lower()
     if requested_mode == "auto":
         requested_mode = "full_cloud"
-        writer.write("InferenceMode: auto is treated as full_cloud to avoid benchmark-style double forward.")
+        writer.write(f"InferenceMode: auto resolved to {requested_mode}.")
+    if requested_mode == "subtree_merge" and not bool(getattr(args, "test_allow_subtree_merge", False)):
+        writer.write("InferenceMode: subtree_merge disabled; using pure full_cloud inference.")
+        requested_mode = "full_cloud"
 
     use_amp = bool(use_cuda and getattr(args, "use_amp", False))
     amp_dtype = torch.float16
@@ -387,18 +396,23 @@ def test(model, args, writer):
             input_pcd = rearrange(input_pcd, "b n c -> b c n").contiguous()
             _sync_cuda(use_cuda)
             preprocess_time = time.perf_counter() - preprocess_start
-
-            profile_this_sample = bool(
-                getattr(args, "profile_test", True)
-                and (
-                    step == 0
-                    or (step + 1) % max(int(getattr(args, "profile_interval", 100)), 1) == 0
-                )
+            terminal_log(
+                "Step Preprocess Done: "
+                f"step={step + 1}/{total_files}, "
+                f"points={int(input_pcd.shape[-1])}, "
+                f"time={preprocess_time:.6f}s"
             )
-            args._log_this_step = profile_this_sample
+
+            args._log_this_step = False
+            args._collect_structure_debug = False
+            args._collect_octree_level_debug = False
             args._collect_sparsepcgc_debug = False
 
             forward_start = time.perf_counter()
+            terminal_log(
+                "Step Forward Start: "
+                f"step={step + 1}/{total_files}, mode={requested_mode}"
+            )
             inference_result = _run_named_inference_mode(
                 requested_mode,
                 model,
@@ -412,6 +426,12 @@ def test(model, args, writer):
             )
             _sync_cuda(use_cuda)
             model_forward_total_time = time.perf_counter() - forward_start
+            terminal_log(
+                "Step Forward Done: "
+                f"step={step + 1}/{total_files}, "
+                f"mode={inference_result.get('mode', requested_mode)}, "
+                f"time={model_forward_total_time:.6f}s"
+            )
 
             post_start = time.perf_counter()
             gen_pts = inference_result["gen_pts"]
@@ -432,17 +452,13 @@ def test(model, args, writer):
                 keep_mask=keep_mask,
                 args=args,
             )
-            base_model = model.module if hasattr(model, "module") else model
-            structure_debug = _aggregate_structure_debug_chunks(
-                inference_result.get("structure_debug_chunks", [])
-            ) or getattr(base_model, "last_structure_debug", {}) or {}
-            runtime_timing = getattr(base_model, "last_runtime_timing", {}) or {}
-            hardening_counts = _summarize_hardening_counts(
-                input_points=int(input_pcd.shape[-1]),
-                pre_output_points=int(pre_harden_gen_pts.shape[-1]),
-                keep_mask=keep_mask,
-            )
             postprocess_time = time.perf_counter() - post_start
+            terminal_log(
+                "Step Postprocess Done: "
+                f"step={step + 1}/{total_files}, "
+                f"output_points={int(gen_pts.shape[-1])}, "
+                f"time={postprocess_time:.6f}s"
+            )
 
             save_start = time.perf_counter()
             output_path = _save_output_points(args, step, input_path, gen_pts)
@@ -451,86 +467,28 @@ def test(model, args, writer):
 
             input_points = int(input_pcd.shape[-1])
             output_points = int(gen_pts.shape[-1])
-            codec_unique_before = _sparsepcgc_unique_count(input_pcd[0, :3, :], args)
-            codec_unique_after = _sparsepcgc_unique_count(gen_pts[0, :3, :], args)
-            add_points = _to_int(
-                structure_debug.get("add_actual_point_count", edit_stats.get("added_points", 0))
-            )
-            delete_points = _to_int(
-                structure_debug.get("delete_removed_point_count", edit_stats.get("deleted_points", 0))
-            )
+            add_points = _to_int(edit_stats.get("added_points", 0))
+            delete_points = _to_int(edit_stats.get("deleted_points", 0))
             adjust_points = _to_int(edit_stats.get("adjusted_points", 0))
-            preserve_ratio = _to_float(
-                structure_debug.get(
-                    "preserve_ratio",
-                    max(0.0, 1.0 - _ratio(add_points + delete_points + adjust_points, input_points)),
-                )
-            )
-            add_candidate_ratio = _to_float(structure_debug.get("add_candidate_ratio", 0.0))
-            add_candidate_count = int(round(float(input_points) * add_candidate_ratio))
-            soft_add_count = _to_float(structure_debug.get("add_ratio", 0.0)) * float(input_points)
-            positive_unique_delta = max(codec_unique_after - codec_unique_before, 0)
-            add_removed_by_unique = max(add_points - positive_unique_delta, 0)
 
             row = {
                 "sample_id": step,
+                "step": step + 1,
                 "input_path": input_path,
                 "output_path": output_path,
                 "inference_mode": inference_result.get("mode", requested_mode),
-                "train_or_eval_mode": "test",
-                "hardening_mode": hardening_info.get("mode", "none"),
-                "selection_threshold": _to_float(
-                    getattr(args, "operation_count_drop_threshold", getattr(args, "test_drop_threshold", 0.5))
-                ),
-                "topk_selected_count": hardening_info.get("keep_count", output_points),
                 "input_points": input_points,
                 "output_points": output_points,
-                "output_unique_count": codec_unique_after,
-                "codec_points_before": input_points,
-                "codec_points_after": output_points,
-                "codec_unique_before": codec_unique_before,
-                "codec_unique_after": codec_unique_after,
-                "active_coord_before": codec_unique_before,
-                "active_coord_after": codec_unique_after,
                 "add_points": add_points,
                 "delete_points": delete_points,
                 "adjust_points": adjust_points,
                 "add_ratio": _ratio(add_points, input_points),
                 "delete_ratio": _ratio(delete_points, input_points),
                 "adjust_ratio": _ratio(adjust_points, input_points),
-                "soft_add_count": soft_add_count,
-                "hard_add_count": add_points,
-                "add_effective_count": add_points,
-                "add_prob_mean": _to_float(structure_debug.get("add_prob_mean", 0.0)),
-                "add_prob_max": _to_float(structure_debug.get("add_prob_max", 0.0)),
-                "add_score_mean": _to_float(structure_debug.get("add_priority_mean", 0.0)),
-                "add_score_max": _to_float(structure_debug.get("add_priority_max", 0.0)),
-                "add_candidate_ratio": add_candidate_ratio,
-                "add_candidate_count": add_candidate_count,
-                "add_after_quant_unique_count": positive_unique_delta,
-                "add_removed_by_unique_count": add_removed_by_unique,
-                "preserve_ratio": preserve_ratio,
-                "same_voxel_adjust_count": _to_int(structure_debug.get("same_voxel_adjust_count", 0)),
-                "different_voxel_move_count": _to_int(structure_debug.get("moved_different_voxel_count", 0)),
-                "delete_target_voxel_count": _to_int(structure_debug.get("delete_target_voxel_count", 0)),
-                "add_target_voxel_count": _to_int(structure_debug.get("add_target_voxel_count", 0)),
-                "move_source_voxel_count": _to_int(structure_debug.get("move_source_voxel_count", 0)),
-                "move_target_voxel_count": _to_int(structure_debug.get("move_target_voxel_count", 0)),
                 "data_loading_time": data_loading_time,
                 "preprocess_time": preprocess_time,
-                "feature_time": _runtime_value(runtime_timing, "feature_extraction", "encode"),
-                "attribution_time": _runtime_value(runtime_timing, "codec_cost_attribution"),
-                "structure_diagnosis_time": _runtime_value(runtime_timing, "structure_diagnosis"),
-                "point_edit_decision_time": _runtime_value(runtime_timing, "point_edit_decision"),
-                "delete_time": _runtime_value(runtime_timing, "delete_module"),
-                "add_time": _runtime_value(runtime_timing, "add_module"),
-                "adjust_time": _runtime_value(runtime_timing, "adjust_move_module"),
-                "postprocess_time": postprocess_time + _runtime_value(runtime_timing, "postprocess"),
-                "model_forward_total_time": _runtime_value(
-                    runtime_timing,
-                    "total_forward",
-                    "model_forward_total_time",
-                ) or model_forward_total_time,
+                "postprocess_time": postprocess_time,
+                "model_forward_total_time": model_forward_total_time,
                 "total_inference_time": total_inference_time,
                 "save_time": save_time,
             }
@@ -539,12 +497,15 @@ def test(model, args, writer):
             rows.append({key: row[key] for key in row})
 
             writer.write(
-                "InferenceProfile: "
-                f"sample={step}, input={input_points}, output={output_points}, "
+                "InferenceStep: "
+                f"step={step + 1}, input={input_points}, output={output_points}, "
                 f"add={add_points}, delete={delete_points}, adjust={adjust_points}, "
-                f"preserve_ratio={preserve_ratio:.6f}, total={total_inference_time:.6f}s"
+                f"model={model_forward_total_time:.6f}s, total={total_inference_time:.6f}s"
             )
+            _write_step_table(row, writer)
             total_files = len(dataset)
+            if max_samples > 0:
+                total_files = min(total_files, max_samples)
             shown_step = step + 1
 
             terminal_log(
@@ -561,32 +522,6 @@ def test(model, args, writer):
             )
             if raw_points != input_points:
                 writer.write(f"InputDownsample: {raw_points} -> {input_points}")
-            if profile_this_sample:
-                writer.write(
-                    "ModuleTiming: "
-                    f"feature={row['feature_time']:.6f}s, "
-                    f"attribution={row['attribution_time']:.6f}s, "
-                    f"diagnosis={row['structure_diagnosis_time']:.6f}s, "
-                    f"decision={row['point_edit_decision_time']:.6f}s, "
-                    f"delete={row['delete_time']:.6f}s, "
-                    f"add={row['add_time']:.6f}s, "
-                    f"adjust={row['adjust_time']:.6f}s, "
-                    f"postprocess={row['postprocess_time']:.6f}s"
-                )
-                _write_structure_decision_debug(
-                    writer,
-                    f"TestStructureDecision sample={step}",
-                    structure_debug,
-                )
-                writer.write(
-                    "HardeningStats: "
-                    f"mode={hardening_info.get('mode', 'none')}, "
-                    f"kept_original={hardening_counts['kept_original']}, "
-                    f"deleted_original={hardening_counts['deleted_original']}, "
-                    f"kept_added={hardening_counts['kept_added']}, "
-                    f"deleted_added={hardening_counts['deleted_added']}, "
-                    f"nonfinite_w={hardening_info.get('weight_nonfinite_count', 0)}"
-                )
 
             fetch_start = time.perf_counter()
 

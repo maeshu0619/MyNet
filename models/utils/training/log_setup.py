@@ -70,7 +70,7 @@ def log_loss_weight_setup(writer, args):
             f"pretrain_lr={float(getattr(args, 'surrogate_pretrain_lr', 1e-4))}, "
             f"pretrain_mode={getattr(args, 'surrogate_pretrain_mode', 'full')}, "
             f"pretrain_subtree_teacher={getattr(args, 'surrogate_pretrain_subtree_teacher_type', 'local_actual')}, "
-            f"pretrain_depth_percent={float(getattr(args, 'surrogate_pretrain_subtree_depth_percent_min', 0.05)):.3g}-"
+            f"pretrain_depth_percent={float(getattr(args, 'surrogate_pretrain_subtree_depth_percent_min', 0.0)):.3g}-"
             f"{float(getattr(args, 'surrogate_pretrain_subtree_depth_percent_max', 0.50)):.3g}, "
             f"pretrain_full_calibration_interval={int(getattr(args, 'surrogate_pretrain_full_calibration_interval', 0))}, "
             f"pretrain_full_calibration_steps={int(getattr(args, 'surrogate_pretrain_full_calibration_steps', 1))}, "
@@ -136,7 +136,8 @@ def log_runtime_setup(writer, args):
         f"profile_interval={int(getattr(args, 'profile_interval', 100))}, "
         f"actual_eval_interval={int(getattr(args, 'actual_eval_interval', 1000))}, "
         f"disable_actual_codec_during_train={bool(getattr(args, 'disable_actual_codec_during_train', False))}, "
-        f"actual_codec_fallback_to_proxy_on_error={bool(getattr(args, 'actual_codec_fallback_to_proxy_on_error', True))}"
+        f"actual_codec_fallback_to_proxy_on_error={bool(getattr(args, 'actual_codec_fallback_to_proxy_on_error', True))}, "
+        f"skip_optimizer_on_actual_fallback={bool(getattr(args, 'skip_optimizer_on_actual_fallback', True))}"
     )
     writer.write(
         "Checkpoint Selection: "
@@ -152,6 +153,14 @@ def log_runtime_setup(writer, args):
         f"metric_csv[compression={bool(getattr(args, 'save_compression_metric_csv', True))}, "
         f"operation={bool(getattr(args, 'save_operation_metric_csv', True))}, "
         f"checkpoint={bool(getattr(args, 'save_checkpoint_metric_csv', True))}]"
+    )
+    writer.write(
+        "Actual Compression Guard: "
+        f"enabled={bool(getattr(args, 'actual_compression_guard', True))}, "
+        f"patience={int(getattr(args, 'actual_guard_patience', 2))}, "
+        f"tolerance={float(getattr(args, 'actual_guard_tolerance', 0.25)):.6g}, "
+        f"lr_decay={float(getattr(args, 'actual_guard_lr_decay', 0.5)):.6g}, "
+        f"restore_best={bool(getattr(args, 'actual_guard_restore_best', True))}"
     )
 
 

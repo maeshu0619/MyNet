@@ -538,7 +538,14 @@ class SoftOctreeRateProxy(nn.Module):
             return ctx
 
         depth = max(1, min(int(ctx_level), int(max_level)))
-        depth_maps = self._build_soft_depth_maps(safe_pts, safe_w, offset_np, max_level, qs_value=qs_value)
+        depth_maps = self._build_soft_depth_maps(
+            safe_pts,
+            safe_w,
+            offset_np,
+            max_level,
+            qs_value=qs_value,
+            depths=(depth,),
+        )
         child_occ = self._build_pointwise_child_occupancy(
             pts_xyz=safe_pts,
             offset_np=offset_np,
@@ -624,20 +631,20 @@ class SoftOctreeRateProxy(nn.Module):
         if pts_xyz.numel() == 0:
             return np.zeros((3,), dtype=np.float64), 0
 
-        pts_np = pts_xyz.detach().transpose(0, 1).contiguous().cpu().numpy().astype(np.float64, copy=False)
-        offset_np = pts_np.min(axis=0)
+        pts = pts_xyz.detach().transpose(0, 1).contiguous()
+        offset = pts.amin(dim=0)
         qs = max(float(self.cfg.eps), float(self.cfg.qs) if qs_value is None else float(qs_value))
-        qpts = np.round((pts_np - offset_np[None, :]) / qs).astype(np.int64)
-        qpts = np.unique(qpts, axis=0)
-        if qpts.shape[0] < 2:
-            return offset_np, 0
+        qpts = torch.round((pts - offset.unsqueeze(0)) / qs).to(torch.long)
+        qpts = torch.unique(qpts, dim=0, sorted=False)
+        if int(qpts.shape[0]) < 2:
+            return offset, 0
 
-        max_coord = int(qpts.max())
+        max_coord = int(qpts.max().item())
         max_level = int(math.ceil(math.log2(max(max_coord + 1, 1))))
         max_level = max(max_level, 1)
         if self.cfg.max_depth > 0:
             max_level = min(max_level, int(self.cfg.max_depth))
-        return offset_np, max_level
+        return offset, max_level
 
     def _normalize_point_weights(self, final_w, B, N, device, dtype):
         if final_w is None:
@@ -799,13 +806,13 @@ class SoftOctreeRateProxy(nn.Module):
     def _build_point_depth_coords(
         self,
         pts_xyz: torch.Tensor,
-        offset_np: np.ndarray,
+        offset_np,
         max_level: int,
         depth: int,
         qs_value: float,
     ):
         pts = pts_xyz.transpose(0, 1).contiguous()
-        offset = torch.from_numpy(offset_np).to(device=pts_xyz.device, dtype=pts_xyz.dtype)
+        offset = self._offset_to_tensor(offset_np, pts_xyz.device, pts_xyz.dtype)
         q = torch.round((pts - offset.unsqueeze(0)) / float(max(qs_value, self.cfg.eps))).to(torch.long)
         if max_level > depth:
             q = torch.bitwise_right_shift(q, max_level - depth)
@@ -816,7 +823,7 @@ class SoftOctreeRateProxy(nn.Module):
     def _build_pointwise_child_occupancy(
         self,
         pts_xyz: torch.Tensor,
-        offset_np: np.ndarray,
+        offset_np,
         max_level: int,
         depth: int,
         qs_value: float,
@@ -841,7 +848,7 @@ class SoftOctreeRateProxy(nn.Module):
         self,
         pts_xyz: torch.Tensor,
         point_w: torch.Tensor,
-        offset_np: np.ndarray,
+        offset_np,
         oct_seq_np: np.ndarray,
         max_level: int,
         qs_value: float,
@@ -891,15 +898,16 @@ class SoftOctreeRateProxy(nn.Module):
         self,
         pts_xyz: torch.Tensor,
         point_w: torch.Tensor,
-        offset_np: np.ndarray,
+        offset_np,
         max_level: int,
         qs_value: float,
+        depths=None,
     ):
         device = pts_xyz.device
         dtype = pts_xyz.dtype
 
         pts = pts_xyz.transpose(0, 1).contiguous()
-        offset = torch.from_numpy(offset_np).to(device=device, dtype=dtype)
+        offset = self._offset_to_tensor(offset_np, device, dtype)
         q = (pts - offset.unsqueeze(0)) / float(max(qs_value, self.cfg.eps))
 
         base = torch.floor(q)
@@ -932,7 +940,11 @@ class SoftOctreeRateProxy(nn.Module):
         if not all_keys:
             empty_key = torch.empty((0,), device=device, dtype=torch.long)
             empty_occ = torch.empty((0,), device=device, dtype=dtype)
-            return {depth: (empty_key, empty_occ) for depth in range(1, max_level + 1)}
+            if depths is None:
+                depth_iter = range(1, max_level + 1)
+            else:
+                depth_iter = sorted({int(depth) for depth in depths if 1 <= int(depth) <= int(max_level)})
+            return {depth: (empty_key, empty_occ) for depth in depth_iter}
 
         leaf_keys = torch.cat(all_keys, dim=0)
         leaf_mass = torch.cat(all_mass, dim=0)
@@ -942,8 +954,12 @@ class SoftOctreeRateProxy(nn.Module):
         uniq_leaf_mass.index_add_(0, inverse, leaf_mass)
         leaf_coords = self._keys_to_coords(uniq_leaf_keys, leaf_grid)
 
+        if depths is None:
+            depth_iter = range(1, max_level + 1)
+        else:
+            depth_iter = sorted({int(depth) for depth in depths if 1 <= int(depth) <= int(max_level)})
         depth_maps = {}
-        for depth in range(1, max_level + 1):
+        for depth in depth_iter:
             shift = max_level - depth
             if shift > 0:
                 depth_coords = torch.bitwise_right_shift(leaf_coords, shift)
@@ -959,6 +975,12 @@ class SoftOctreeRateProxy(nn.Module):
             depth_maps[depth] = (uniq_depth_keys, depth_occ.clamp_(0.0, 1.0))
 
         return depth_maps
+
+    @staticmethod
+    def _offset_to_tensor(offset, device, dtype):
+        if torch.is_tensor(offset):
+            return offset.to(device=device, dtype=dtype)
+        return torch.from_numpy(offset).to(device=device, dtype=dtype)
 
     def _resolve_teacher_device(self, output_device: torch.device):
         mode = str(getattr(self.cfg, "teacher_device", "auto")).strip().lower()

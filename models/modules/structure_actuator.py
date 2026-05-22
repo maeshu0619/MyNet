@@ -161,21 +161,95 @@ class StructureRepairActuator(nn.Module):
         safe_pos = pos.clamp(max=max(int(reference_keys.numel()) - 1, 0))
         return in_bounds & (reference_keys[safe_pos] == query_keys)
 
-    def _empty_neighbor_target_mask(self, voxel_coords):
+    def _build_voxel_cache(self, voxel_coords):
+        cache = []
+        B, _, _ = voxel_coords.shape
+        for b in range(B):
+            coords = voxel_coords[b].transpose(0, 1).contiguous()
+            if coords.numel() == 0:
+                empty = coords.new_empty((0,), dtype=torch.long)
+                cache.append(
+                    {
+                        "coords": coords,
+                        "unique_coords": coords.new_empty((0, 3), dtype=torch.long),
+                        "inverse": empty,
+                        "counts": empty.to(dtype=torch.float32),
+                        "occupied_keys": empty,
+                        "key_mins": coords.new_zeros((3,), dtype=torch.long),
+                        "key_spans": coords.new_ones((3,), dtype=torch.long),
+                        "voxel_count": 0,
+                    }
+                )
+                continue
+            unique_coords, inverse = torch.unique(coords, dim=0, sorted=True, return_inverse=True)
+            voxel_count = int(unique_coords.shape[0])
+            counts = torch.bincount(inverse, minlength=voxel_count).to(
+                device=voxel_coords.device,
+                dtype=torch.float32,
+            )
+            key_min = unique_coords.amin(dim=0) - 1
+            key_span = (unique_coords.amax(dim=0) - unique_coords.amin(dim=0) + 3).to(torch.long).clamp_min(1)
+            occupied_keys = torch.sort(self._coord_keys(unique_coords, key_min, key_span)).values
+            cache.append(
+                {
+                    "coords": coords,
+                    "unique_coords": unique_coords,
+                    "inverse": inverse,
+                    "counts": counts,
+                    "occupied_keys": occupied_keys,
+                    "key_mins": key_min,
+                    "key_spans": key_span,
+                    "voxel_count": voxel_count,
+                }
+            )
+        return cache
+
+    @classmethod
+    def _coords_membership_cached(cls, query_coords, reference_keys, key_mins, key_spans):
+        if query_coords.numel() == 0 or reference_keys.numel() == 0:
+            return torch.zeros((query_coords.shape[0],), device=query_coords.device, dtype=torch.bool)
+        query_keys = cls._coord_keys(query_coords.to(torch.long), key_mins, key_spans)
+        pos = torch.searchsorted(reference_keys, query_keys)
+        in_bounds = pos < reference_keys.numel()
+        safe_pos = pos.clamp(max=max(int(reference_keys.numel()) - 1, 0))
+        return in_bounds & (reference_keys[safe_pos] == query_keys)
+
+    @staticmethod
+    def _isin_voxel_ids(inverse, selected_voxel_idx):
+        if selected_voxel_idx.numel() == 0:
+            return torch.zeros_like(inverse, dtype=torch.bool)
+        if selected_voxel_idx.numel() == 1:
+            return inverse == selected_voxel_idx.reshape(()).to(device=inverse.device, dtype=inverse.dtype)
+        return torch.isin(inverse, selected_voxel_idx.to(device=inverse.device, dtype=inverse.dtype))
+
+    def _empty_neighbor_target_mask(self, voxel_coords, voxel_cache=None):
         B, _, N = voxel_coords.shape
         offsets = self.neighbor_offsets.to(device=voxel_coords.device, dtype=torch.long)
+        voxel_cache = self._build_voxel_cache(voxel_coords) if voxel_cache is None else voxel_cache
         masks = []
         for b in range(B):
-            current = voxel_coords[b].transpose(0, 1).contiguous()
+            item = voxel_cache[b]
+            current = item["coords"]
             targets = current[:, None, :] + offsets.view(1, -1, 3)
-            occupied = self._coords_membership(targets.reshape(-1, 3), current).view(N, -1)
+            occupied = self._coords_membership_cached(
+                targets.reshape(-1, 3),
+                item["occupied_keys"],
+                item["key_mins"],
+                item["key_spans"],
+            ).view(N, -1)
             masks.append(~occupied)
         return torch.stack(masks, dim=0)
 
     @staticmethod
-    def _voxel_point_counts(voxel_coords):
+    def _voxel_point_counts(voxel_coords, voxel_cache=None):
         B, _, N = voxel_coords.shape
         counts = torch.zeros((B, 1, N), device=voxel_coords.device, dtype=torch.float32)
+        if voxel_cache is not None:
+            for b, item in enumerate(voxel_cache):
+                if item["voxel_count"] <= 0:
+                    continue
+                counts[b, 0] = item["counts"].index_select(0, item["inverse"])
+            return counts
         for b in range(B):
             coords = voxel_coords[b].transpose(0, 1).contiguous()
             if coords.numel() == 0:
@@ -205,6 +279,27 @@ class StructureRepairActuator(nn.Module):
             total += int(torch.unique(coords, dim=0).shape[0])
         return total
 
+    @staticmethod
+    def _unique_voxel_count_from_cache(voxel_cache, point_mask=None):
+        total = 0
+        if point_mask is not None:
+            if point_mask.ndim == 3:
+                point_mask = point_mask.squeeze(1)
+            point_mask = point_mask.to(dtype=torch.bool)
+        for b, item in enumerate(voxel_cache):
+            voxel_count = int(item["voxel_count"])
+            if voxel_count <= 0:
+                continue
+            if point_mask is None:
+                total += voxel_count
+                continue
+            mask_b = point_mask[b].to(device=item["inverse"].device, dtype=torch.bool)
+            if not bool(mask_b.any().item()):
+                continue
+            selected_inverse = item["inverse"][mask_b]
+            total += int(torch.unique(selected_inverse, sorted=False).numel())
+        return total
+
     @classmethod
     def _selected_voxels_absent_count(cls, before_coords, selected_mask, after_coords, after_mask):
         if selected_mask.ndim == 3:
@@ -224,24 +319,51 @@ class StructureRepairActuator(nn.Module):
             total += int((~present).sum().item())
         return total
 
-    def _neighbor_target_membership_mask(self, voxel_coords, reference_mask):
+    def _neighbor_target_membership_mask(self, voxel_coords, reference_mask, voxel_cache=None):
         B, _, N = voxel_coords.shape
         offsets = self.neighbor_offsets.to(device=voxel_coords.device, dtype=torch.long)
+        voxel_cache = self._build_voxel_cache(voxel_coords) if voxel_cache is None else voxel_cache
         if reference_mask.ndim == 3:
             reference_mask = reference_mask.squeeze(1)
         reference_mask = reference_mask.to(device=voxel_coords.device, dtype=torch.bool)
         masks = []
         for b in range(B):
-            current = voxel_coords[b].transpose(0, 1).contiguous()
+            item = voxel_cache[b]
+            current = item["coords"]
             reference = current[reference_mask[b]]
             targets = current[:, None, :] + offsets.view(1, -1, 3)
-            masks.append(self._coords_membership(targets.reshape(-1, 3), reference).view(N, -1))
+            if reference.numel() == 0:
+                masks.append(torch.zeros((N, offsets.shape[0]), device=voxel_coords.device, dtype=torch.bool))
+                continue
+            reference_keys = torch.sort(self._coord_keys(reference, item["key_mins"], item["key_spans"])).values
+            masks.append(
+                self._coords_membership_cached(
+                    targets.reshape(-1, 3),
+                    reference_keys,
+                    item["key_mins"],
+                    item["key_spans"],
+                ).view(N, -1)
+            )
         return torch.stack(masks, dim=0)
 
     @staticmethod
-    def _voxel_mean_logits(logits, voxel_coords):
+    def _voxel_mean_logits(logits, voxel_coords, voxel_cache=None):
         B, K, N = logits.shape
         out = torch.empty_like(logits)
+        if voxel_cache is not None:
+            for b, item in enumerate(voxel_cache):
+                voxel_count = int(item["voxel_count"])
+                if voxel_count <= 0:
+                    out[b] = logits[b]
+                    continue
+                inverse = item["inverse"]
+                index = inverse.view(1, N).expand(K, N)
+                sums = logits.new_zeros((K, voxel_count))
+                sums.scatter_add_(1, index, logits[b])
+                counts = item["counts"].to(device=logits.device, dtype=logits.dtype).clamp_min(1.0)
+                means = sums / counts.view(1, voxel_count)
+                out[b] = means.index_select(1, inverse)
+            return out
         for b in range(B):
             coords = voxel_coords[b].transpose(0, 1).contiguous()
             if coords.numel() == 0:
@@ -265,14 +387,22 @@ class StructureRepairActuator(nn.Module):
         B, _, N = voxel_coords.shape
         unique_mask = torch.zeros((B, N), device=voxel_coords.device, dtype=torch.bool)
         for b in range(B):
-            seen = set()
-            coords = voxel_coords[b].transpose(0, 1).detach().cpu().tolist()
-            for idx, coord in enumerate(coords):
-                key = (int(coord[0]), int(coord[1]), int(coord[2]))
-                if key in seen:
-                    continue
-                seen.add(key)
-                unique_mask[b, idx] = True
+            coords = voxel_coords[b].transpose(0, 1).contiguous()
+            if coords.numel() == 0:
+                continue
+
+            _, inverse = torch.unique(coords, dim=0, sorted=True, return_inverse=True)
+
+            idx = torch.arange(inverse.numel(), device=inverse.device, dtype=inverse.dtype)
+            sort_key = inverse * inverse.numel() + idx
+            order = torch.argsort(sort_key)
+
+            sorted_inverse = inverse.index_select(0, order)
+            first = torch.ones_like(sorted_inverse, dtype=torch.bool)
+            if sorted_inverse.numel() > 1:
+                first[1:] = sorted_inverse[1:] != sorted_inverse[:-1]
+            unique_mask[b, order[first]] = True
+
         return unique_mask
 
     @staticmethod
@@ -324,6 +454,7 @@ class StructureRepairActuator(nn.Module):
         max_drop_ratio,
         selection_mask,
         hard_threshold=0.0,
+        voxel_cache=None,
     ):
         B, _, N = drop_scores.shape
         hard_drop = torch.zeros_like(drop_scores, dtype=torch.bool)
@@ -337,14 +468,33 @@ class StructureRepairActuator(nn.Module):
         else:
             valid_all = selection_mask.squeeze(1) if selection_mask.ndim == 3 else selection_mask
             valid_all = valid_all.to(device=drop_scores.device, dtype=torch.bool)
+        voxel_cache = self._build_voxel_cache(voxel_coords) if voxel_cache is None else voxel_cache
         for b in range(B):
             valid = valid_all[b]
             if not bool(valid.any().item()):
                 continue
-            coords = voxel_coords[b].transpose(0, 1).contiguous()
-            valid_coords = coords[valid]
-            unique_coords, inverse = torch.unique(valid_coords, dim=0, sorted=True, return_inverse=True)
-            voxel_count = int(unique_coords.shape[0])
+            item = voxel_cache[b]
+            inverse_all = item["inverse"]
+            voxel_count_all = int(item["voxel_count"])
+            if voxel_count_all <= 1:
+                continue
+            score_values = drop_scores[b, 0].detach()
+            finite_valid = valid & torch.isfinite(score_values)
+            if not bool(finite_valid.any().item()):
+                continue
+            score_floor = torch.finfo(score_values.dtype).min
+            invalid_threshold = score_floor * 0.5
+            voxel_scores = score_values.new_full((voxel_count_all,), score_floor)
+            scatter_reduce = getattr(voxel_scores, "scatter_reduce_", None)
+            masked_scores = score_values.masked_fill(~finite_valid, score_floor)
+            if callable(scatter_reduce):
+                voxel_scores.scatter_reduce_(0, inverse_all, masked_scores, reduce="amax", include_self=True)
+            else:
+                for voxel_id in torch.unique(inverse_all[finite_valid], sorted=False):
+                    voxel_id_i = int(voxel_id.item())
+                    voxel_scores[voxel_id_i] = score_values[finite_valid & (inverse_all == voxel_id_i)].max()
+            valid_voxels = voxel_scores > invalid_threshold
+            voxel_count = int(valid_voxels.sum().item())
             if voxel_count <= 1:
                 continue
             if threshold_cap_mode:
@@ -360,16 +510,19 @@ class StructureRepairActuator(nn.Module):
                 drop_count = min(target_count, cap_count, voxel_count - 1)
             if drop_count <= 0:
                 continue
-            scores = drop_scores[b, 0, valid].detach()
-            selected_voxel_idx = self._top_voxel_indices_by_score(scores, inverse, voxel_count, drop_count)
+            candidate_scores = voxel_scores.masked_fill(~valid_voxels, score_floor)
+            selected_voxel_idx = torch.topk(
+                candidate_scores,
+                k=min(int(drop_count), int(voxel_count)),
+                largest=True,
+                sorted=False,
+            ).indices
             if threshold_cap_mode:
-                voxel_scores = self._voxel_max_scores(scores, inverse, voxel_count)
                 selected_scores = voxel_scores.index_select(0, selected_voxel_idx)
                 selected_voxel_idx = selected_voxel_idx[selected_scores >= float(hard_threshold)]
                 if selected_voxel_idx.numel() <= 0:
                     continue
-            selected_coords = unique_coords.index_select(0, selected_voxel_idx)
-            selected_points = self._coords_membership(coords, selected_coords)
+            selected_points = self._isin_voxel_ids(inverse_all, selected_voxel_idx)
             hard_drop[b, 0] = selected_points
         return hard_drop
 
@@ -666,17 +819,18 @@ class StructureRepairActuator(nn.Module):
         voxel_step = self._voxel_step(pts_xyz, coord_scale)
         voxel_norm = (voxel_step * math.sqrt(3.0)).clamp_min(1e-9)
         voxel_coords = self._voxel_coords(pts_xyz, voxel_step)
+        voxel_cache = self._build_voxel_cache(voxel_coords)
         neighbor_offsets = self.neighbor_offsets.to(device=pts_xyz.device, dtype=pts_xyz.dtype)
         neighbor_offsets_long = self.neighbor_offsets.to(device=pts_xyz.device, dtype=torch.long)
-        empty_target_mask = self._empty_neighbor_target_mask(voxel_coords)
+        empty_target_mask = self._empty_neighbor_target_mask(voxel_coords, voxel_cache=voxel_cache)
         B, _, N = pts_xyz.shape
         if selection_mask is None:
             selection_bool = torch.ones((B, N), device=pts_xyz.device, dtype=torch.bool)
         else:
             selection_bool = selection_mask.squeeze(1) if selection_mask.ndim == 3 else selection_mask
             selection_bool = selection_bool.to(device=pts_xyz.device, dtype=torch.bool)
-        voxel_point_counts = self._voxel_point_counts(voxel_coords).to(device=pts_xyz.device)
-        before_occupied_voxels = self._unique_voxel_count(voxel_coords, selection_bool)
+        voxel_point_counts = self._voxel_point_counts(voxel_coords, voxel_cache=voxel_cache).to(device=pts_xyz.device)
+        before_occupied_voxels = self._unique_voxel_count_from_cache(voxel_cache, selection_bool)
         if timing_enabled:
             _mark_runtime("setup")
 
@@ -718,7 +872,7 @@ class StructureRepairActuator(nn.Module):
             drop_prob = ((1.0 - drop_random_mix) * drop_prob + drop_random_mix * random_drop).clamp(0.0, 1.0)
         if not prune_enabled:
             drop_prob = torch.zeros_like(drop_prob)
-        drop_prob = self._voxel_mean_logits(drop_prob, voxel_coords).clamp(0.0, 1.0)
+        drop_prob = self._voxel_mean_logits(drop_prob, voxel_coords, voxel_cache=voxel_cache).clamp(0.0, 1.0)
         # 削除は点単位ではなくcodec量子化step上のleaf voxel単位で決める。
         # Octree occupancyはVoxelが1点でも残ると変わらないため、選択Voxel内の点をまとめて削除する。
         delete_candidate_mask = selection_bool.clone()
@@ -734,6 +888,7 @@ class StructureRepairActuator(nn.Module):
             max_drop_ratio=max_drop_ratio,
             selection_mask=delete_candidate_mask.unsqueeze(1),
             hard_threshold=float(getattr(self.args, "repair_drop_hard_threshold", 0.5)),
+            voxel_cache=voxel_cache,
         )
         hard_drop = hard_drop_mask.to(dtype=pts_xyz.dtype)
         drop_prob_st = hard_drop - drop_prob.detach() + drop_prob
@@ -773,11 +928,15 @@ class StructureRepairActuator(nn.Module):
         if sparsepcgc_context and bool(getattr(self.args, "sparsepcgc_move_existing_target_only", True)):
             require_empty_move = False
             prefer_occupied_move = True
-        dropped_target_mask = self._neighbor_target_membership_mask(voxel_coords, hard_drop_mask)
+        dropped_target_mask = self._neighbor_target_membership_mask(
+            voxel_coords,
+            hard_drop_mask,
+            voxel_cache=voxel_cache,
+        )
         move_target_valid = torch.ones_like(move_score)
         if not disp_enabled:
             move_score = torch.zeros_like(move_score)
-        move_score = self._voxel_mean_logits(move_score, voxel_coords).clamp(0.0, 1.0)
+        move_score = self._voxel_mean_logits(move_score, voxel_coords, voxel_cache=voxel_cache).clamp(0.0, 1.0)
         if require_empty_move:
             valid_move_points = empty_target_mask & (~dropped_target_mask)
         elif prefer_occupied_move:
@@ -807,13 +966,14 @@ class StructureRepairActuator(nn.Module):
             max_drop_ratio=move_target_ratio,
             selection_mask=move_candidate_mask.unsqueeze(1),
             hard_threshold=float(getattr(self.args, "repair_move_hard_threshold", 0.5)),
+            voxel_cache=voxel_cache,
         )
         hard_move = hard_move_mask.to(dtype=pts_xyz.dtype)
         move_mask = hard_move - move_score.detach() + move_score
         move_mask = move_mask * keep_prob
 
         move_logits = self.move_voxel_head(actuator_features)
-        move_logits = self._voxel_mean_logits(move_logits, voxel_coords)
+        move_logits = self._voxel_mean_logits(move_logits, voxel_coords, voxel_cache=voxel_cache)
         move_valid_target = valid_move_points.transpose(1, 2)
         no_valid_move = ~move_valid_target.any(dim=1, keepdim=True)
         safe_valid_move = torch.where(no_valid_move, torch.ones_like(move_valid_target), move_valid_target)
@@ -894,8 +1054,8 @@ class StructureRepairActuator(nn.Module):
             if self.training and add_score_noise > 0.0:
                 add_logit = add_logit + self._gumbel_like(add_logit) * add_score_noise
             add_voxel_logits = self.add_voxel_head(actuator_features)
-            add_logit = self._voxel_mean_logits(add_logit, voxel_coords)
-            add_voxel_logits = self._voxel_mean_logits(add_voxel_logits, voxel_coords)
+            add_logit = self._voxel_mean_logits(add_logit, voxel_coords, voxel_cache=voxel_cache)
+            add_voxel_logits = self._voxel_mean_logits(add_voxel_logits, voxel_coords, voxel_cache=voxel_cache)
             pair_logits = (add_voxel_logits + add_logit).permute(0, 2, 1).contiguous()
             if selection_mask is None:
                 base_valid = torch.ones((B, N), device=pts_xyz.device, dtype=torch.bool)
@@ -1015,7 +1175,7 @@ class StructureRepairActuator(nn.Module):
         final_voxel_coords = self._voxel_coords(pts_out, voxel_step)
         hard_keep_mask = final_w.detach() >= hardening_threshold
         after_occupied_voxels = self._unique_voxel_count(final_voxel_coords, hard_keep_mask)
-        delete_target_voxel_count_value = self._unique_voxel_count(voxel_coords, hard_drop_mask)
+        delete_target_voxel_count_value = self._unique_voxel_count_from_cache(voxel_cache, hard_drop_mask)
         delete_removed_point_count_value = int(hard_drop_mask.detach().sum().item())
         delete_emptied_voxel_count_value = self._selected_voxels_absent_count(
             voxel_coords,
@@ -1023,7 +1183,7 @@ class StructureRepairActuator(nn.Module):
             final_voxel_coords,
             hard_keep_mask,
         )
-        move_source_voxel_count_value = self._unique_voxel_count(voxel_coords, hard_move_mask)
+        move_source_voxel_count_value = self._unique_voxel_count_from_cache(voxel_cache, hard_move_mask)
         move_target_voxel_count_value = self._unique_voxel_count(move_target_voxel_coords, hard_move_mask)
         move_source_emptied_voxel_count_value = self._selected_voxels_absent_count(
             voxel_coords,
