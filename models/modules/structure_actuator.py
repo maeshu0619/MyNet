@@ -1143,6 +1143,12 @@ class StructureRepairActuator(nn.Module):
             "repair_add_amount_random_mix_start",
             "repair_add_amount_random_mix_end",
         )
+        add_ratio_floor_applied = False
+        add_ratio_floor = min(max(float(getattr(self.args, "repair_add_ratio_floor", 0.0)), 0.0), max_add_ratio_value)
+        if self.training and add_enabled and add_ratio_floor > 0.0:
+            learned_add_ratio_before_floor = learned_add_ratio
+            learned_add_ratio = torch.maximum(learned_add_ratio, learned_add_ratio.new_tensor(add_ratio_floor)).clamp(0.0, max_add_ratio_value)
+            add_ratio_floor_applied = bool((learned_add_ratio > learned_add_ratio_before_floor + 1e-12).detach().any().cpu().item())
         # hardなtop-k個数は整数なので、学習比率の値だけを候補数計算へ渡す。
         learned_add_ratio_value = float(learned_add_ratio.detach().mean().cpu()) if add_enabled else 0.0
         add_k, add_candidate_ratio = self._target_add_count(N, candidate_ratio_override=learned_add_ratio_value)
@@ -1371,6 +1377,11 @@ class StructureRepairActuator(nn.Module):
             + (move_ratio_soft - learned_move_ratio.mean()).pow(2)
             + (add_ratio - learned_add_ratio.mean()).pow(2)
         )
+        operation_ratio_vec = torch.stack([drop_ratio, move_ratio_soft, add_ratio]).clamp_min(0.0)
+        operation_ratio_prob = operation_ratio_vec / operation_ratio_vec.sum().clamp_min(1e-6)
+        operation_entropy = -(operation_ratio_prob * operation_ratio_prob.clamp_min(1e-6).log()).sum()
+        exploration_noise = max(float(drop_score_noise), float(move_score_noise), float(add_score_noise))
+        operation_temperature = float(getattr(self.args, "repair_priority_gate_tau", getattr(self.args, "repair_policy_temperature", 1.0)))
         loss = (
             edit_reg
             + float(getattr(self.args, "repair_ratio_weight", 0.1)) * ratio_loss
@@ -1404,9 +1415,16 @@ class StructureRepairActuator(nn.Module):
             "add_candidate_ratio": pts_xyz.new_tensor(float(add_candidate_ratio)).detach(),
             "add_candidate_count": pts_xyz.new_tensor(float(add_k)).detach(),
             "learned_drop_ratio": learned_drop_ratio.mean().detach(),
+            "learned_drop_ratio_std": learned_drop_ratio.detach().float().std(unbiased=False),
             "learned_add_ratio": learned_add_ratio.mean().detach(),
+            "learned_add_ratio_std": learned_add_ratio.detach().float().std(unbiased=False),
             "learned_move_ratio": learned_move_ratio.mean().detach(),
+            "learned_move_ratio_std": learned_move_ratio.detach().float().std(unbiased=False),
             "operation_amount_consistency_loss": operation_amount_consistency_loss.detach(),
+            "operation_entropy": operation_entropy.detach(),
+            "temperature": pts_xyz.new_tensor(float(operation_temperature)).detach(),
+            "exploration_noise": pts_xyz.new_tensor(float(exploration_noise)).detach(),
+            "operation_prob_floor_applied": pts_xyz.new_tensor(float(add_ratio_floor_applied)).detach(),
             "move_score_noise": pts_xyz.new_tensor(float(move_score_noise)).detach(),
             "sparsepcgc_add_experiment_enabled": pts_xyz.new_tensor(float(sparsepcgc_add_experiment_active)).detach(),
             "sparsepcgc_add_warmup": pts_xyz.new_tensor(float(self._sparsepcgc_add_warmup())).detach(),
@@ -1478,9 +1496,16 @@ class StructureRepairActuator(nn.Module):
             "add_candidate_ratio": float(add_candidate_ratio),
             "add_candidate_count": int(add_k),
             "learned_drop_ratio": learned_drop_ratio.mean(),
+            "learned_drop_ratio_std": learned_drop_ratio.float().std(unbiased=False),
             "learned_add_ratio": learned_add_ratio.mean(),
+            "learned_add_ratio_std": learned_add_ratio.float().std(unbiased=False),
             "learned_move_ratio": learned_move_ratio.mean(),
+            "learned_move_ratio_std": learned_move_ratio.float().std(unbiased=False),
             "operation_amount_consistency_loss": operation_amount_consistency_loss,
+            "operation_entropy": operation_entropy,
+            "temperature": float(operation_temperature),
+            "exploration_noise": float(exploration_noise),
+            "operation_prob_floor_applied": bool(add_ratio_floor_applied),
             "move_score_noise": float(move_score_noise),
             "sparsepcgc_add_experiment_enabled": bool(sparsepcgc_add_experiment_active),
             "sparsepcgc_add_warmup": float(self._sparsepcgc_add_warmup()),

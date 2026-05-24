@@ -4,6 +4,7 @@ import os
 import torch
 
 from .checkpointing import surrogate_sidecar_filename
+from .lr_control import apply_optimizer_lr_floor, optimizer_lrs_safe
 
 
 def _finite_float(value, default=None):
@@ -67,7 +68,7 @@ def _load_surrogate_state(loss, model_path):
     return True
 
 
-def _decay_optimizer_lrs(optimizer, factor):
+def _decay_optimizer_lrs(optimizer, factor, args=None, writer=None, global_step=None):
     if optimizer is None:
         return []
     factor = min(max(float(factor), 0.0), 1.0)
@@ -75,6 +76,16 @@ def _decay_optimizer_lrs(optimizer, factor):
     for group in optimizer.param_groups:
         group["lr"] = float(group.get("lr", 0.0)) * factor
         lrs.append(float(group["lr"]))
+    if args is not None:
+        apply_optimizer_lr_floor(
+            optimizer,
+            args,
+            label="main",
+            writer=writer,
+            global_step=global_step,
+            reason="actual_compression_guard",
+        )
+        lrs = optimizer_lrs_safe(optimizer)
     return lrs
 
 
@@ -180,15 +191,53 @@ def apply_actual_compression_guard(
         model.train()
         restored = True
 
-    new_lrs = _decay_optimizer_lrs(optimizer, float(getattr(args, "actual_guard_lr_decay", 0.5)))
+    global_step = int(getattr(args, "_global_train_step", 0))
+    old_lrs = optimizer_lrs_safe(optimizer)
+    decay_lr = bool(getattr(args, "actual_guard_decay_lr", False))
+    if decay_lr:
+        new_lrs = _decay_optimizer_lrs(
+            optimizer,
+            float(getattr(args, "actual_guard_lr_decay", 0.5)),
+            args=args,
+            writer=writer,
+            global_step=global_step,
+        )
+    else:
+        apply_optimizer_lr_floor(
+            optimizer,
+            args,
+            label="main",
+            writer=writer,
+            global_step=global_step,
+            reason="actual_guard_no_decay",
+        )
+        new_lrs = optimizer_lrs_safe(optimizer)
+    surrogate_floor_event = apply_optimizer_lr_floor(
+        getattr(loss, "surrogate_optimizer", None),
+        args,
+        label="surrogate",
+        writer=writer,
+        global_step=global_step,
+        reason="actual_compression_guard",
+    )
     guard_state["bad_count"] = 0
+    lr_floor_applied = any(after > before for before, after in zip(old_lrs, new_lrs)) if old_lrs and new_lrs else False
+    guard_action = "rollback" if restored else ("lr_decay" if decay_lr else "guard_no_lr_decay")
     event.update(
         {
-            "action": "rollback" if restored else "lr_decay",
+            "action": guard_action,
+            "guard_rollback": bool(restored),
+            "guard_lr_changed": bool(decay_lr and old_lrs != new_lrs),
+            "lr_floor_applied": bool(lr_floor_applied),
+            "rollback_reason": "fresh_actual_delta_worse_than_guard_tolerance",
             "restored": restored,
             "surrogate_restored": surrogate_restored,
             "restore_path": best_path,
+            "old_lrs": old_lrs,
             "new_lrs": new_lrs,
+            "surrogate_lrs": surrogate_floor_event.get("lr_after_floor", []),
+            "surrogate_lr_floor_applied": bool(surrogate_floor_event.get("lr_floor_applied", False)),
+            "actual_total_bit_percent_fresh": fresh_delta,
         }
     )
     if writer is not None and hasattr(writer, "write"):
@@ -196,6 +245,6 @@ def apply_actual_compression_guard(
             "ActualCompressionGuard: "
             f"{event['action']} episode={episode + 1}, fresh_actual_delta={fresh_delta:.6f}, "
             f"best={best_delta:.6f}, restored={restored}, surrogate_restored={surrogate_restored}, "
-            f"new_lrs={new_lrs}"
+            f"guard_lr_changed={event['guard_lr_changed']}, new_lrs={new_lrs}"
         )
     return event

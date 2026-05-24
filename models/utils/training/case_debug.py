@@ -6,7 +6,7 @@ from .metric_columns import CASE_DEBUG_COLUMNS
 from .scalar_utils import case_float, case_int
 
 def init_case_debug_csv(args, plot, writer):
-    if not bool(getattr(args, "save_good_bad_cases", False)):
+    if not (bool(getattr(args, "save_good_bad_cases", False)) or bool(getattr(args, "save_proxy_actual_bad_cases", True))):
         return None
     os.makedirs(plot.save_dir, exist_ok=True)
     path = os.path.join(plot.save_dir, f"{args.time}_good_bad_cases.csv")
@@ -45,13 +45,25 @@ def maybe_record_case_debug(
         case_type = "good"
     elif actual_delta >= float(getattr(args, "bad_case_delta_threshold", 20.0)):
         case_type = "bad"
+    proxy_threshold = max(float(getattr(args, "proxy_actual_bad_case_threshold", 0.0)), 0.0)
+    proxy_value = case_float(comp_debug.get("sparsepcgc_aux_value", comp_debug.get("sparsepcgc_aux_weighted", float("nan"))), float("nan"))
+    if bool(getattr(args, "save_proxy_actual_bad_cases", True)) and math.isfinite(proxy_value):
+        if proxy_value < -proxy_threshold and actual_delta > proxy_threshold:
+            case_type = "proxy_improves_actual_worsens"
+        elif proxy_value > proxy_threshold and actual_delta < -proxy_threshold:
+            case_type = "proxy_worsens_actual_improves"
     if case_type is None:
         return
     if int(case_debug_counts.get(case_type, 0)) >= int(getattr(args, "max_saved_cases", 64)):
         return
 
+    add_ratio = case_float(structure_debug.get("add_ratio", 0.0), 0.0)
+    prune_ratio = case_float(structure_debug.get("drop_ratio", structure_debug.get("hard_drop_ratio", 0.0)), 0.0)
+    adjust_ratio = case_float(structure_debug.get("move_ratio", structure_debug.get("hard_move_ratio", 0.0)), 0.0)
+    dominant_operation = max((("Add", add_ratio), ("Prune", prune_ratio), ("Adjust", adjust_ratio)), key=lambda item: item[1])[0]
     row = {
         "case_type": case_type,
+        "bad_case_type": case_type,
         "global_step": int(global_step),
         "episode": int(episode) + 1,
         "epoch": int(epoch) + 1,
@@ -89,6 +101,24 @@ def maybe_record_case_debug(
         "total_loss": case_float(L),
         "teacher_refresh": bool(comp_debug.get("teacher_refresh", False)),
         "teacher_target_age": case_int(comp_debug.get("teacher_target_age", 0)),
+        "selected_operation": dominant_operation,
+        "dominant_operation": dominant_operation,
+        "sparsepcgc_aux_value": proxy_value,
+        "point_delta": case_int(comp_debug.get("gen_points", 0)) - case_int(comp_debug.get("gt_points", 0)),
+        "node_delta": case_float(comp_debug.get("node_delta", 0.0), 0.0),
+        "single_delta": case_float(comp_debug.get("single_delta", 0.0), 0.0),
+        "lowprob_delta": case_float(comp_debug.get("lowprob_occupancy_ratio", 0.0), 0.0),
+        "occupancy_nll_delta": case_float(comp_debug.get("nll_delta", 0.0), 0.0),
+        "cause_score_node": case_float(comp_debug.get("heuristic_cause_score_node", comp_debug.get("soft_node_percent", 0.0)), 0.0),
+        "cause_score_single": case_float(comp_debug.get("heuristic_cause_score_single", comp_debug.get("soft_single_percent", 0.0)), 0.0),
+        "cause_score_lowprob": case_float(comp_debug.get("heuristic_cause_score_lowprob", comp_debug.get("lowprob_occupancy_ratio", 0.0)), 0.0),
+        "add_ratio": add_ratio,
+        "prune_ratio": prune_ratio,
+        "adjust_ratio": adjust_ratio,
+        "actual_improved": bool(actual_delta < 0.0),
+        "proxy_improved": bool(math.isfinite(proxy_value) and proxy_value < 0.0),
+        "cause_score_is_actual_teacher": False,
+        "cause_score_is_heuristic": True,
     }
     with open(case_debug_path, "a", newline="", encoding="utf-8") as f:
         csv.DictWriter(f, fieldnames=CASE_DEBUG_COLUMNS).writerow(row)

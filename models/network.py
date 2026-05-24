@@ -38,7 +38,7 @@ class Network(nn.Module):
         self.last_structure_debug = {} # 直近Forward時の構造診断デバッグ情報を保存する辞書の初期化
         self.last_encoder_debug = {} # 直近Forward時のEncoder関連デバッグ情報を保存する辞書を初期化
         self.last_runtime_timing = {} # 直近Forward時の実行時間計測結果を保存する辞書を初期化
-        self._configure_non_encoder_batchnorm() # Encoder以外の構造系モジュールに含まれるBatchNormの設定を変更する
+        # self._configure_non_encoder_batchnorm() # Encoder以外の構造系モジュールに含まれるBatchNormの設定を変更する
         
         """モジュールセットアップ"""
         self.encoder = PointTransformer(self.args) # 特徴抽出器
@@ -589,7 +589,7 @@ class Network(nn.Module):
 
         if keep_sparse_path: # Sparse Tensor側の点群を規準として構造解析を行うか否か
             """変数の初期化"""
-            print(f"Keep Sparse Path")
+            # self.writer.write(f"Keep Sparse Path")
             structure_feat_full_list = []
             subtree_scores_full_list = []
             policy_probs_full_list = []
@@ -695,7 +695,7 @@ class Network(nn.Module):
                 subtree_scores_means.append(subtree_scores_b.mean(dim=2))
                 policy_probs_means.append(policy_probs_b.mean(dim=2))
                 
-                """内部損失の計算"""
+                """raw auxiliary internal lossの計算"""
                 if compute_internal_losses is None:
                     compute_losses_b = self.training
                 else:
@@ -811,7 +811,7 @@ class Network(nn.Module):
             self._sync_if_cuda_tensor(pts_xyz)
             runtime_actuator_end = time.time()
 
-        """内部損失の計算"""
+        """scaled final internal lossの計算"""
         if compute_internal_losses is None:
             compute_internal_losses = self.training
         if compute_internal_losses:
@@ -878,9 +878,16 @@ class Network(nn.Module):
                     "add_candidate_ratio": float(actuator_stats.get("add_candidate_ratio", 0.0)),
                     # Prune/Add/Adjustの学習済み実行量をログへ渡し、固定比率への張り付きを確認できるようにする。
                     "learned_drop_ratio": float(actuator_stats.get("learned_drop_ratio", pts_xyz.new_zeros(())).detach().cpu()),
+                    "learned_drop_ratio_std": float(actuator_stats.get("learned_drop_ratio_std", pts_xyz.new_zeros(())).detach().cpu()),
                     "learned_add_ratio": float(actuator_stats.get("learned_add_ratio", pts_xyz.new_zeros(())).detach().cpu()),
+                    "learned_add_ratio_std": float(actuator_stats.get("learned_add_ratio_std", pts_xyz.new_zeros(())).detach().cpu()),
                     "learned_move_ratio": float(actuator_stats.get("learned_move_ratio", pts_xyz.new_zeros(())).detach().cpu()),
+                    "learned_move_ratio_std": float(actuator_stats.get("learned_move_ratio_std", pts_xyz.new_zeros(())).detach().cpu()),
                     "operation_amount_consistency_loss": float(actuator_stats.get("operation_amount_consistency_loss", pts_xyz.new_zeros(())).detach().cpu()),
+                    "operation_entropy": float(actuator_stats.get("operation_entropy", pts_xyz.new_zeros(())).detach().cpu()),
+                    "operation_prob_floor_applied": bool(actuator_stats.get("operation_prob_floor_applied", False)),
+                    "temperature": float(actuator_stats.get("temperature", 0.0)),
+                    "exploration_noise": float(actuator_stats.get("exploration_noise", 0.0)),
                     "sparsepcgc_add_experiment_enabled": bool(actuator_stats.get("sparsepcgc_add_experiment_enabled", False)),
                     "sparsepcgc_add_warmup": float(actuator_stats.get("sparsepcgc_add_warmup", 1.0)),
                         "add_score_noise": float(actuator_stats.get("add_score_noise", 0.0)),

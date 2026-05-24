@@ -199,6 +199,26 @@ class CompressionLossMixin:
             return debug
         debug["sparsepcgc_debug_collected"] = False
         debug["sparsepcgc_debug_time"] = 0.0
+        debug["sparsepcgc_condition_voxel_size"] = float(getattr(args, "sparsepcgc_voxel_size", getattr(args, "octree_voxel", 1e-3)))
+        debug["sparsepcgc_condition_pos_quantscale"] = int(getattr(args, "sparsepcgc_pos_quantscale", 1))
+        debug["sparsepcgc_condition_actual_quant_mode"] = "round_xyz_div_voxel_then_div_posquantscale"
+        debug["sparsepcgc_condition_proxy_quant_mode"] = "soft_features_gt_bbox_normalized"
+        debug["sparsepcgc_condition_rounding"] = "torch_round"
+        debug["sparsepcgc_condition_dedup"] = "torch_unique_quantized_coords"
+        debug["sparsepcgc_condition_teacher_scope"] = str(getattr(args, "_current_teacher_scope", ""))
+        def _bbox_text(tensor, reduce_name):
+            values = (tensor.amin(dim=(0, 2)) if reduce_name == "min" else tensor.amax(dim=(0, 2))).detach().float().cpu().tolist()
+            return ",".join(f"{float(value):.6g}" for value in values[:3])
+        debug["sparsepcgc_condition_gt_bbox_min"] = _bbox_text(gt_xyz[:, :3, :], "min")
+        debug["sparsepcgc_condition_gt_bbox_max"] = _bbox_text(gt_xyz[:, :3, :], "max")
+        debug["sparsepcgc_condition_gen_bbox_min"] = _bbox_text(gen_xyz[:, :3, :], "min")
+        debug["sparsepcgc_condition_gen_bbox_max"] = _bbox_text(gen_xyz[:, :3, :], "max")
+        debug["sparsepcgc_condition_local_min_offset"] = "subtree_local_min" if str(getattr(args, "_current_teacher_scope", "")) == "subtree_local" else "global_coords"
+        debug["sparsepcgc_condition_warning"] = (
+            "subtree_local_teacher_differs_from_actual_full_cloud_context"
+            if str(getattr(args, "_current_teacher_scope", "")) == "subtree_local"
+            else ""
+        )
         # SparsePCGCのhard統計はactive coordinate集合を実際に作るため重い。
         # 学習信号はsoft proxy側から流し、hard統計はログ/診断対象stepだけ計算する。
         if not bool(getattr(args, "_collect_sparsepcgc_debug", False)):

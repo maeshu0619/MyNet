@@ -386,6 +386,9 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--expansion', action='store_true', help='拡張データを使用するか')
     parser.add_argument('--gamma', default=0.5, type=float, help='学習率減衰の係数')
     parser.add_argument('--lr_decay_step', default=24, type=int, help='学習率を減衰させるステップ間隔')
+    parser.add_argument('--lr_scheduler_enabled', default=False, type=str2bool, help='TrueならEpoch単位のStepLRを使う。SparsePCGCではLR崩壊防止のため既定でFalse')
+    parser.add_argument('--min_main_lr', default=1e-5, type=float, help='main optimizerの学習率floor')
+    parser.add_argument('--min_surrogate_lr', default=1e-6, type=float, help='Surrogate optimizerの学習率floor')
     parser.add_argument('--max_files', default=30, type=int, help='読み込む最大ファイル数')
     parser.add_argument('--episodes', default=128, type=int, help='学習エピソード数')
     parser.add_argument('--lr', default=1e-3, type=float, help='学習率')
@@ -557,6 +560,10 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--sparsepcgc_density_proxy_weight', default=0.05, type=float, help='SparsePCGC補助loss内のactive density proxy項重み')
     parser.add_argument('--sparsepcgc_aux_reward_clip', default=50.0, type=float, help='SparsePCGC補助lossのpercent項clip幅。0で無効')
     parser.add_argument('--sparsepcgc_corr_window', default=100, type=int, help='SparsePCGC proxy-actual相関を計算する直近サンプル数')
+    parser.add_argument('--sparsepcgc_aux_gating', default=True, type=str2bool, help='proxy auxをbackpropする前にactual bitとのrolling一致度でgateする')
+    parser.add_argument('--sparsepcgc_aux_min_corr', default=0.30, type=float, help='proxy aux backpropを許可する最小rolling相関')
+    parser.add_argument('--sparsepcgc_aux_min_sign_match', default=0.50, type=float, help='proxy aux backpropを許可する最小rolling符号一致率')
+    parser.add_argument('--sparsepcgc_aux_gating_window', default=100, type=int, help='proxy aux gateに使うrollingサンプル数')
     parser.add_argument('--sparsepcgc_disable_add', default=False, type=str2bool, help='SparsePCGCでは新規active coordinate増加を避けるため追加操作を既定で止める')
     parser.add_argument('--surrogate_step', default=500, type=int, help='main network更新前にSurrogateだけをactual teacherへfitさせるstep数')
     parser.add_argument('--surrogate_pretrain_lr', default=1e-4, type=float, help='Surrogate pretrain中のlearning rate')
@@ -612,6 +619,8 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--surrogate_update_interval', default=1, type=int, help='通常学習中のSurrogate optimizer更新間隔')
     parser.add_argument('--surrogate_joint_lr_scale', default=0.1, type=float, help='pretrain後の通常学習中Surrogate LR倍率')
     parser.add_argument('--surrogate_update_on_teacher_refresh_only', default=False, type=str2bool, help='Trueならteacher refresh時だけSurrogateを更新し、replay更新を止める')
+    parser.add_argument('--surrogate_full_cloud_calib_interval', default=0, type=int, help='subtree学習中にfull-cloud actual teacher校正を入れる間隔。0で無効')
+    parser.add_argument('--surrogate_full_cloud_calib_max_samples', default=1, type=int, help='full-cloud校正で使う最大サンプル数の予約設定')
     parser.add_argument('--surrogate_realign_on_low_corr', default=False, type=str2bool, help='低相関時のSurrogate再整列を有効化する実験flag')
     parser.add_argument('--surrogate_realign_min_corr', default=0.3, type=float, help='Surrogate再整列を検討する相関しきい値')
     parser.add_argument('--surrogate_realign_steps', default=0, type=int, help='低相関時に追加するSurrogate再整列step数。0ならログのみ')
@@ -668,18 +677,24 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--actual_compression_guard', default=True, type=str2bool, help='episode平均のfresh actual圧縮損失が悪化し続けたらbestへ戻してLRを下げる')
     parser.add_argument('--actual_guard_patience', default=2, type=int, help='actual圧縮悪化を何episode連続で許容するか')
     parser.add_argument('--actual_guard_tolerance', default=0.25, type=float, help='best actual圧縮損失から何percentage pointの悪化まで許容するか')
+    parser.add_argument('--actual_guard_decay_lr', default=False, type=str2bool, help='ActualCompressionGuard発火時にLRも下げるか。StepLRとの二重低下を避けるため既定False')
     parser.add_argument('--actual_guard_lr_decay', default=0.5, type=float, help='actual guard発動時のoptimizer LR倍率')
     parser.add_argument('--actual_guard_min_fresh', default=1, type=int, help='actual guardを判定する最低fresh actual計測数')
     parser.add_argument('--actual_guard_restore_best', default=True, type=str2bool, help='actual guard発動時にbest episode checkpointへ戻す')
     parser.add_argument('--actual_guard_improvement_epsilon', default=1e-6, type=float, help='actual guardのbest更新に必要な最小改善幅')
     parser.add_argument('--max_train_steps', default=0, type=int, help='デバッグ用: 0より大きい場合、そのglobal step数でtrain loopを早期終了する')
     parser.add_argument('--save_good_bad_cases', default=False, type=str2bool, help='actual deltaが大きく改善/悪化したstepのdebug summaryをCSV保存する')
+    parser.add_argument('--save_proxy_actual_bad_cases', default=True, type=str2bool, help='proxy/cause scoreとactual bitの符号が逆のcaseをCSV保存する')
+    parser.add_argument('--proxy_actual_bad_case_threshold', default=0.0, type=float, help='proxy-actual逆方向caseを保存する最小絶対値しきい値')
     parser.add_argument('--good_case_delta_threshold', default=-5.0, type=float, help='good caseとして保存するactual compression delta[%%]の閾値')
     parser.add_argument('--bad_case_delta_threshold', default=20.0, type=float, help='bad caseとして保存するactual compression delta[%%]の閾値')
     parser.add_argument('--max_saved_cases', default=64, type=int, help='good/bad case debug summaryの最大保存件数')
     parser.add_argument('--save_case_pointclouds', default=False, type=str2bool, help='予約: Trueならgood/bad caseの点群保存も許可する（現状はsummary CSVのみ）')
     parser.add_argument('--save_compression_metric_csv', default=True, type=str2bool, help='actual/surrogate/proxy圧縮metricを分離したstep CSVを保存する')
     parser.add_argument('--save_operation_metric_csv', default=True, type=str2bool, help='Add/Prune/Adjustのsoft/hard/effective統計step CSVを保存する')
+    parser.add_argument('--operation_dead_grad_warn_threshold', default=1e-12, type=float, help='operation branch/amount勾配が死んだとみなすnormしきい値')
+    parser.add_argument('--operation_dead_grad_warn_patience', default=20, type=int, help='operation勾配が低い状態が何step続いたらwarningを出すか')
+    parser.add_argument('--repair_add_ratio_floor', default=0.0, type=float, help='Add操作が完全に死なないための弱いratio下限。0で無効')
     parser.add_argument('--save_checkpoint_metric_csv', default=True, type=str2bool, help='checkpoint判定に使うepisode metric CSVを保存する')
     parser.add_argument('--checkpoint_geom_gate', default=True, type=str2bool, help='actual-delta improved best保存時にgeometry gateを使う')
     parser.add_argument('--checkpoint_safety_gate', default=True, type=str2bool, help='actual-delta improved best保存時にrepair/node/single/operation safety gateを使う')
@@ -1333,6 +1348,9 @@ def parse_pugan_args(parser, file_day, file_time):
     args.log_step_time = bool(getattr(args, "log_step_time", True))
     args.log_gpu_memory = bool(getattr(args, "log_gpu_memory", True))
     args.profile_interval = max(int(getattr(args, "profile_interval", 100)), 1)
+    args.lr_scheduler_enabled = bool(getattr(args, "lr_scheduler_enabled", False))
+    args.min_main_lr = max(float(getattr(args, "min_main_lr", 1e-5)), 0.0)
+    args.min_surrogate_lr = max(float(getattr(args, "min_surrogate_lr", 1e-6)), 0.0)
     # SparsePCGC hard統計は重いため、既定ではprofile間隔と同じ頻度に制限する。
     args.sparsepcgc_hard_debug_interval = max(int(getattr(args, "sparsepcgc_hard_debug_interval", args.profile_interval)), 0)
     # 通常ログにhard統計を連動させるかをboolへ正規化する。
@@ -1344,16 +1362,22 @@ def parse_pugan_args(parser, file_day, file_time):
     args.actual_compression_guard = bool(getattr(args, "actual_compression_guard", True))
     args.actual_guard_patience = max(int(getattr(args, "actual_guard_patience", 2)), 1)
     args.actual_guard_tolerance = max(float(getattr(args, "actual_guard_tolerance", 0.25)), 0.0)
+    args.actual_guard_decay_lr = bool(getattr(args, "actual_guard_decay_lr", False))
     args.actual_guard_lr_decay = min(max(float(getattr(args, "actual_guard_lr_decay", 0.5)), 0.0), 1.0)
     args.actual_guard_min_fresh = max(int(getattr(args, "actual_guard_min_fresh", 1)), 1)
     args.actual_guard_restore_best = bool(getattr(args, "actual_guard_restore_best", True))
     args.actual_guard_improvement_epsilon = max(float(getattr(args, "actual_guard_improvement_epsilon", 1e-6)), 0.0)
     args.max_train_steps = max(int(getattr(args, "max_train_steps", 0)), 0)
     args.save_good_bad_cases = bool(getattr(args, "save_good_bad_cases", False))
+    args.save_proxy_actual_bad_cases = bool(getattr(args, "save_proxy_actual_bad_cases", True))
+    args.proxy_actual_bad_case_threshold = max(float(getattr(args, "proxy_actual_bad_case_threshold", 0.0)), 0.0)
     args.good_case_delta_threshold = float(getattr(args, "good_case_delta_threshold", -5.0))
     args.bad_case_delta_threshold = float(getattr(args, "bad_case_delta_threshold", 20.0))
     args.max_saved_cases = max(int(getattr(args, "max_saved_cases", 64)), 0)
     args.save_case_pointclouds = bool(getattr(args, "save_case_pointclouds", False))
+    args.operation_dead_grad_warn_threshold = max(float(getattr(args, "operation_dead_grad_warn_threshold", 1e-12)), 0.0)
+    args.operation_dead_grad_warn_patience = max(int(getattr(args, "operation_dead_grad_warn_patience", 20)), 1)
+    args.repair_add_ratio_floor = min(max(float(getattr(args, "repair_add_ratio_floor", 0.0)), 0.0), 0.05)
     args.skip_actual_codec = bool(getattr(args, "skip_actual_codec", True))
     args.codec_eval_interval = max(int(getattr(args, "codec_eval_interval", 0)), 0)
     args.profile_test = bool(getattr(args, "profile_test", True))
@@ -1389,7 +1413,13 @@ def parse_pugan_args(parser, file_day, file_time):
     args.sparsepcgc_density_proxy_weight = max(float(getattr(args, "sparsepcgc_density_proxy_weight", 0.05)), 0.0)
     args.sparsepcgc_aux_reward_clip = max(float(getattr(args, "sparsepcgc_aux_reward_clip", 50.0)), 0.0)
     args.sparsepcgc_corr_window = max(int(getattr(args, "sparsepcgc_corr_window", 100)), 2)
+    args.sparsepcgc_aux_gating = bool(getattr(args, "sparsepcgc_aux_gating", True))
+    args.sparsepcgc_aux_min_corr = float(getattr(args, "sparsepcgc_aux_min_corr", 0.30))
+    args.sparsepcgc_aux_min_sign_match = min(max(float(getattr(args, "sparsepcgc_aux_min_sign_match", 0.50)), 0.0), 1.0)
+    args.sparsepcgc_aux_gating_window = max(int(getattr(args, "sparsepcgc_aux_gating_window", 100)), 2)
     args.sparsepcgc_disable_add = bool(getattr(args, "sparsepcgc_disable_add", True))
+    args.surrogate_full_cloud_calib_interval = max(int(getattr(args, "surrogate_full_cloud_calib_interval", 0)), 0)
+    args.surrogate_full_cloud_calib_max_samples = max(int(getattr(args, "surrogate_full_cloud_calib_max_samples", 1)), 1)
     args.sparsepcgc_enable_add_experiment = bool(getattr(args, "sparsepcgc_enable_add_experiment", False))
     args.sparsepcgc_add_only_when_compression_primary = bool(
         getattr(args, "sparsepcgc_add_only_when_compression_primary", True)
@@ -1435,6 +1465,9 @@ def parse_pugan_args(parser, file_day, file_time):
         if not _cli_option_was_provided("--compression_surrogate_refresh_interval"):
             # Surrogate lossは毎Step使うが、実SparsePCGC教師の再計測は高コストなので既定では8Step間隔にする。
             args.compression_surrogate_refresh_interval = 1 if args.compression_loss_backend.endswith("_surrogate") else max(int(getattr(args, "compression_surrogate_refresh_interval", 0)), 50)
+        if not _cli_option_was_provided("--lr_scheduler_enabled"):
+            # ActualCompressionGuardとStepLRの二重LR低下を避けるため、SparsePCGC実験ではStepLRを既定で止める。
+            args.lr_scheduler_enabled = False
         if not _cli_option_was_provided("--compression_surrogate_reuse_last_target"):
             args.compression_surrogate_reuse_last_target = True
         if not _cli_option_was_provided("--train_subtree_anchor_on_min_points_miss"):
@@ -1448,11 +1481,17 @@ def parse_pugan_args(parser, file_day, file_time):
         if not _cli_option_was_provided("--compression_surrogate_aux_single_weight"):
             args.compression_surrogate_aux_single_weight = 0.0
         if not _cli_option_was_provided("--com_sparsepcgc"):
-            # SparsePCGCではactive coordinate/孤立voxel proxyを主目的へ入れ、Surrogateが未成熟でも圧縮方向の勾配を渡す。
+            # SparsePCGC proxyは値と相関検証用に計算するが、backwardへ混ぜるかはgatingで別途決める。
             args.com_sparsepcgc = max(float(getattr(args, "com_sparsepcgc", 0.0)), 0.75)
         if not _cli_option_was_provided("--sparsepcgc_aux_backprop"):
-            # SparsePCGC補助proxyをログだけでなくbackward対象にし、Prune/Adjustへ安定した勾配を流す。
-            args.sparsepcgc_aux_backprop = True
+            # actual bitと符号一致していないproxy勾配を混ぜないため、既定ではlog-onlyにする。
+            args.sparsepcgc_aux_backprop = False
+        if not _cli_option_was_provided("--surrogate_full_cloud_calib_interval"):
+            # subtree teacherとfull-cloud actualのズレを定期的に見られるよう、軽い校正anchorを入れる。
+            args.surrogate_full_cloud_calib_interval = 200 if args.compression_loss_backend.endswith("_surrogate") else 0
+        if not _cli_option_was_provided("--repair_add_ratio_floor"):
+            # SparsePCGCでAdd branchが完全に死ぬのを避けるため、0.1%だけ弱い探索下限を入れる。
+            args.repair_add_ratio_floor = 0.001
         if not _cli_option_was_provided("--actual_total_bit_objective_mix"):
             args.actual_total_bit_objective_mix = 0.75
         if not _cli_option_was_provided("--compression_boost_requires_surrogate_frozen"):

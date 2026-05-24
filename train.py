@@ -52,6 +52,7 @@ from models.utils.training.case_debug import *
 from models.utils.training.metric_csv import *
 from models.utils.training.actual_codec_status import *
 from models.utils.training.metric_rows import *
+from models.utils.training.lr_control import apply_optimizer_lr_floor, step_scheduler_with_floor, optimizer_lrs_safe
 from models.utils.training.episode_metrics import *
 from models.utils.training.checkpoint_metrics import *
 from models.utils.training.actual_compression_guard import apply_actual_compression_guard
@@ -99,6 +100,7 @@ def train(model, args, loss, writer, plot, notifier=None):
 
     """学習セットアップ"""
     optimizer, scheduler_steplr = build_optimizer_and_scheduler( model, args, writer) # モデルの重み更新に使うOptimizerと学習率を変えるStepLR schedduler
+    apply_optimizer_lr_floor(optimizer, args, label="main", writer=writer, global_step=0, reason="train_start") # main LRが開始時点からfloor未満なら下限値へ戻す
     amp_state = setup_amp( model, args, writer) # CUDA利用可否
     use_cuda = amp_state["use_cuda"] # GPU使用の有無
     use_amp = amp_state["use_amp"] # 自動混合精度で計算するか否か
@@ -114,6 +116,7 @@ def train(model, args, loss, writer, plot, notifier=None):
     run_surrogate_pretrain(model=model, args=args, loss=loss, seq_datasets=seq_datasets, loader_kwargs=loader_kwargs, metric_csv_paths=metric_csv_paths, ckpt_dir=ckpt_dir, writer=writer, plot=plot, use_cuda=use_cuda, use_amp=use_amp, amp_dtype=amp_dtype, for_better_path=for_better_path)
     post_pretrain_norm = surrogate_param_norm(loss) # Surrogateのパタラメータノルムを計算し、事前学習後に重みが拘引されたか、以上に大きくないかを確認
     surrogate_optimizer = getattr(loss, "surrogate_optimizer", None) # Lossオブジェクト内にあるSurrogate用のOptimizerを取得
+    apply_optimizer_lr_floor(surrogate_optimizer, args, label="surrogate", writer=writer, global_step=0, reason="after_surrogate_pretrain") # Surrogate LRが事前学習後にfloor未満なら下限値へ戻す
     surrogate_lrs = optimizer_lrs(surrogate_optimizer) # Surrogate用Optimizerの学習率一覧を取り出す
     pretrain_label = ( "start after surrogate pretrain" if int(getattr(args, "surrogate_step", 0)) > 0 else "start") # Surrogate事前学習を実行したか否かでログの表示名を変える
     writer.write( f"[Training] {pretrain_label} " f"surrogate_param_norm={case_float(post_pretrain_norm, float('nan')):.6f} " f"lr={surrogate_lrs[0] if surrogate_lrs else 'NA'}")
@@ -126,6 +129,7 @@ def train(model, args, loss, writer, plot, notifier=None):
     prev_stage = None
     global_train_step = 0
     global_epoch = 0
+    scheduler_step_count = 0
     for episode in range(args.episodes): # Episode開始
         writer.write(f"◆◆◆ Episode {episode + 1} / {args.episodes} ◆◆◆")
 
@@ -181,6 +185,8 @@ def train(model, args, loss, writer, plot, notifier=None):
 
                 """ログ用の変数セット"""
                 args._global_train_step = int(global_train_step) # 現在の累積Step番号を保存
+                args._current_sample_name = os.path.basename(str(file_path)) # teacher/debugログに点群ファイル名を残す
+                args._current_teacher_scope = "full_cloud" # このStepのteacherが全点群か局所subtreeかをLoss側へ伝える初期値
                 args._log_this_step = False
                 sparsepcgc_csv_debug = ( str(getattr(args, "compress", "")).strip().lower().replace("-", "").replace("_", "") == "sparsepcgc" and bool(getattr(args, "save_compression_metric_csv", True))) # Sparse PCGC専用ログ
                 operation_csv_debug = bool( getattr(args, "save_operation_metric_csv", getattr(args, "save_operation_metrics_csv", True))) # 点操作メトリクスCSVを保存するか判定し、点移動量や追加/削除などのDebug収集条件に使用
@@ -382,6 +388,8 @@ def train(model, args, loss, writer, plot, notifier=None):
                         args._log_this_step = bool(getattr(args, "verbose_step_logs", False) and detail_log_this_step) # このSubtree処理内で詳細ログを出すか否か決定
                         if is_anchor_step:
                             """全点群の場合"""
+                            args._current_teacher_scope = "full_cloud" # full-cloud anchorでは実圧縮teacherも全点群基準として記録する
+                            args._current_teacher_anchor_reason = str(anchor_reason) # full-cloudになった理由をteacherログへ渡す
                             writer.write("Running full cloud Anchor step.") # Anchor Stepであることをログに出す
                             autocast_ctx = torch.cuda.amp.autocast(dtype=amp_dtype, enabled=use_amp) if use_cuda else nullcontext() # CUDAかつAMP有効なら混合精度計算の文脈を作る
                             with autocast_ctx: # 全体点群をモデルに入力し、出力点群と各種補助損失・点編集重みを得る
@@ -439,6 +447,8 @@ def train(model, args, loss, writer, plot, notifier=None):
                             subtree_compression_term_sums = {} # Subtreeごとの圧縮損失内訳を累積する辞書
 
                             for subtree_key, point_idx in selected_groups: # 選択されたSubtreeを1つずつ取り出し、それぞれ日いて点群を切り出し、Forward、形状損失、圧縮損失を計算
+                                args._current_teacher_scope = "subtree_local" # Subtree stepではteacherが局所点群基準であることをLoss側へ渡す
+                                args._current_subtree_id = str(subtree_key) # bad caseやteacherログでsubtree識別子を保存する
                                 subtree_xyz = input_xyz.index_select(2, point_idx).contiguous() # 全体対入力点群から現在Subtreeに属する点だけを取り出す
                                 subtree_attr = None
                                 if input_attr_full is not None:
@@ -592,11 +602,6 @@ def train(model, args, loss, writer, plot, notifier=None):
                 """CSV"""
                 compression_metric_row = build_compression_metric_row( args, global_step=global_train_step, episode=episode, epoch=epoch, step=step, stage=current_stage, comp_debug=comp_debug, L_com=L_com) # 圧縮StepCSVに書き込む1行を作る
                 operation_metric_row = build_operation_metric_row( args, global_step=global_train_step, episode=episode, epoch=epoch, step=step, stage=current_stage, comp_debug=comp_debug, structure_debug=structure_debug, edit_stats=train_edit_stats) # 点操作StepCSVに書き込む1行を作る
-                append_csv_row( metric_csv_paths.get("compression_step"), COMPRESSION_METRIC_COLUMNS, compression_metric_row) # 圧縮メトリクスのStep単位CSV1行追記
-                accumulate_compression_episode(episode_compression_sums, compression_metric_row) # Step単位の圧縮メトリクスをEpisode累積器へ加算する
-                append_csv_row( metric_csv_paths.get("operation_step"), OPERATION_METRIC_COLUMNS, operation_metric_row) # 点操作メトリクスのStep単位CSVへ1行追記
-                accumulate_operation_episode(episode_operation_sums, operation_metric_row) # Step単位の点操作メトリクスをEpisode累積器へ加算
-                maybe_record_case_debug( args, writer, case_debug_path, case_debug_counts, global_step=global_train_step, episode=episode, epoch=epoch, step=step, file_path=file_path, comp_debug=comp_debug, structure_debug=structure_debug, edit_stats=train_edit_stats, L=L, L_geom=L_geom, L_com=L_com, L_actuator=L_actuator) # 圧縮改善が良いケース・悪いケースを条件に応じてCase Debag CSVへ保存
 
                 """ログ"""
                 if log_this_step:
@@ -643,7 +648,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                     if grad_clip > 0.0:
                         torch.nn.utils.clip_grad_norm_( [p for p in model.parameters() if p.requires_grad], max_norm=grad_clip) # 学習対象パラメータの勾配ノルムをGrad Clip以下に制限
                     if bool(getattr(args, "debug_grad_flow", False)):
-                        log_grad_flow(args, writer, model, step + 1, num_steps) # 各層・各モジュールに勾配が届いているか否かの判定ログ
+                        log_grad_flow(args, writer, model, step + 1, num_steps, global_step=global_train_step) # 各層・各モジュールに勾配が届いているか否かの判定ログ
                     scaler.step(optimizer) # Optimizer更新
                     optimizer_state = scaler._per_optimizer_states[id(optimizer)] # このOptimizerに対するGradScaler内部状態を取得
                     found_inf = 0.0
@@ -675,7 +680,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                     grad_clip = float(getattr(args, "train_grad_clip", 0.0)) # 勾配クリップの上限値取得
                     if grad_clip > 0.0:
                         torch.nn.utils.clip_grad_norm_( [p for p in model.parameters() if p.requires_grad], max_norm=grad_clip) # 勾配爆発抑制
-                    log_grad_flow(args, writer, model, step + 1, num_steps) # 各モジュールの勾配状態をログに出す
+                    log_grad_flow(args, writer, model, step + 1, num_steps, global_step=global_train_step) # 各モジュールの勾配状態をログに出す
                     optimizer.step() # モデルパラメータの更新
                     step_completed = True # 更新フラグをTrueにする
                     consecutive_amp_skips = 0 # AMP loss scale連続Skip回数を0に戻す
@@ -685,6 +690,14 @@ def train(model, args, loss, writer, plot, notifier=None):
                     sync_for_timing(use_cuda)
                     timing_step_end = time.time()
                 epoch_has_optimizer_step = epoch_has_optimizer_step or step_completed # このEpoch内で一回でも更新が成功したかを記録
+                if skip_optimizer_reason is not None or not total_loss_finite:
+                    args._last_grad_flow = {} # backwardしていないskip stepでは前stepの勾配値をCSVへ持ち越さない
+                operation_metric_row = attach_grad_flow_to_operation_row(operation_metric_row, args) # backward後に得られた各操作headの勾配normをOperation CSV行へ反映する
+                append_csv_row( metric_csv_paths.get("compression_step"), COMPRESSION_METRIC_COLUMNS, compression_metric_row) # 圧縮メトリクスのStep単位CSV1行追記
+                accumulate_compression_episode(episode_compression_sums, compression_metric_row) # Step単位の圧縮メトリクスをEpisode累積器へ加算する
+                append_csv_row( metric_csv_paths.get("operation_step"), OPERATION_METRIC_COLUMNS, operation_metric_row) # 点操作メトリクスのStep単位CSVへ1行追記
+                accumulate_operation_episode(episode_operation_sums, operation_metric_row) # Step単位の点操作メトリクスをEpisode累積器へ加算
+                maybe_record_case_debug( args, writer, case_debug_path, case_debug_counts, global_step=global_train_step, episode=episode, epoch=epoch, step=step, file_path=file_path, comp_debug=comp_debug, structure_debug=structure_debug, edit_stats=train_edit_stats, L=L, L_geom=L_geom, L_com=L_com, L_actuator=L_actuator) # 圧縮改善が良いケース・悪いケースを条件に応じてCase Debag CSVへ保存
 
                 """損失ログの記録"""
                 if epoch_metric_sums is None:
@@ -735,14 +748,16 @@ def train(model, args, loss, writer, plot, notifier=None):
                     return
 
             """lr scheduler"""
-            lr_before_scheduler = [float(group.get("lr", 0.0)) for group in optimizer.param_groups] # Schedulerを進める前の各Optimizer Patameter Groupの学習率を取得
             if epoch_has_optimizer_step:
-                scheduler_steplr.step() # Epoch内で少なくとも1回は重み更新できた場合に、StepLP Schedulerを進める
+                scheduler_event = step_scheduler_with_floor( scheduler_steplr, optimizer, args, writer=writer, global_epoch=global_epoch + 1, global_step=global_train_step) # StepLRを進める場合でもLR floorを必ず適用する
+                if scheduler_event.get("scheduler_stepped"):
+                    scheduler_step_count += 1
+                scheduler_event["scheduler_step_count"] = scheduler_step_count
+                scheduler_event["current_lr_main"] = optimizer_lrs_safe(optimizer)
+                scheduler_event["current_lr_surrogate"] = optimizer_lrs_safe(getattr(loss, "surrogate_optimizer", None))
+                log_for_better_event( for_better_path, "scheduler_lr_step", **scheduler_event)
             else:
                 writer.write("No successful optimizer step in this epoch; lr_scheduler.step() was skipped.")
-            lr_after_scheduler = [float(group.get("lr", 0.0)) for group in optimizer.param_groups] # Scheduler処理後の各Parameter Groupの学習率を取得
-            if lr_after_scheduler != lr_before_scheduler: # 学習率が変わったら、ログに記録
-                log_for_better_event( for_better_path, "scheduler_lr_step", global_epoch=global_epoch + 1, lr_before=lr_before_scheduler, lr_after=lr_after_scheduler)
 
             """ログの記録"""
             if epoch_metric_sums is not None: # このEpoch内でStep損失が1回以上累積されているか判定
@@ -784,6 +799,11 @@ def train(model, args, loss, writer, plot, notifier=None):
         best_loss, model_path, best_trackers = save_episode_checkpoint( model=model, ckpt_dir=ckpt_dir, plot=plot, writer=writer, episode=episode, best_loss=best_loss, args=args, stage=current_stage, checkpoint_metrics=checkpoint_metrics, best_trackers=best_trackers, loss=loss)
         guard_event = apply_actual_compression_guard( args=args, model=model, loss=loss, optimizer=optimizer, writer=writer, guard_state=actual_guard_state, checkpoint_metrics=checkpoint_metrics, ckpt_dir=ckpt_dir, episode=episode)
         if guard_event:
+            guard_event["global_step"] = global_train_step
+            guard_event["current_lr_main"] = optimizer_lrs_safe(optimizer)
+            guard_event["current_lr_surrogate"] = optimizer_lrs_safe(getattr(loss, "surrogate_optimizer", None))
+            guard_event["L_total"] = scalar_value(L) if "L" in locals() else None
+            guard_event["L_com"] = scalar_value(L_com) if "L_com" in locals() else None
             log_for_better_event( for_better_path, "actual_compression_guard", episode=episode, stage=current_stage, **guard_event)
         log_for_better_episode( for_better_path, args=args, episode=episode, stage=current_stage, checkpoint_metrics=checkpoint_metrics, compression_episode_metrics=compression_episode_metrics, operation_episode_metrics=operation_episode_metrics, best_trackers=best_trackers, model_path=model_path)
         if notifier is not None:

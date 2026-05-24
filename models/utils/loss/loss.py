@@ -67,7 +67,7 @@ class Loss(
         ).to(device)
         self.surrogate_optimizer = torch.optim.Adam( # Surrogat Network専用のAdam Optimizerを作成
             self.compression_surrogate.parameters(),
-            lr=float(getattr(args, "compression_surrogate_lr", 1e-3)),
+            lr=max(float(getattr(args, "compression_surrogate_lr", 1e-3)), float(getattr(args, "min_surrogate_lr", 1e-6))),
             weight_decay=float(getattr(args, "compression_surrogate_weight_decay", 1e-5)),
         )
         for param in self.compression_surrogate.parameters(): # Surrogat Networkの各Parameterを順番に取り出す

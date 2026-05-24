@@ -230,6 +230,10 @@ def should_use_full_cloud_anchor(args, global_step: int = 0, cache_key: Optional
     if interval > 0 and ((step + 1) % interval) == 0:
         return True, "interval"
 
+    calib_interval = max(int(getattr(args, "surrogate_full_cloud_calib_interval", 0)), 0)
+    if calib_interval > 0 and ((step + 1) % calib_interval) == 0:
+        return True, "surrogate_full_cloud_calib"
+
     prob = float(getattr(args, "train_subtree_full_cloud_prob", 0.0))
     if prob <= 0.0:
         return False, "subtree"
