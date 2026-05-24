@@ -20,7 +20,8 @@ from .metric_columns import (
     OPERATION_EPISODE_METRIC_COLUMNS, 
     CHECKPOINT_METRIC_COLUMNS, 
     CHECKPOINT_AVG_KEYS, 
-    SURROGATE_PRETRAIN_COLUMNS
+    SURROGATE_PRETRAIN_COLUMNS,
+    LOSS_GRAD_PROBE_COLUMNS,
     )
 
 def init_csv_file(path, columns, writer, label):
@@ -47,6 +48,7 @@ def init_metric_csvs(args, plot, writer):
         "operation_episode": None,
         "checkpoint_episode": None,
         "surrogate_pretrain_step": None,
+        "loss_grad_probe": None,
     }
     os.makedirs(plot.save_dir, exist_ok=True)
     if bool(getattr(args, "save_compression_metric_csv", True)):
@@ -71,4 +73,8 @@ def init_metric_csvs(args, plot, writer):
         path = os.path.join(plot.save_dir, f"{args.time}_surrogate_pretrain_metrics_step.csv")
         init_csv_file(path, SURROGATE_PRETRAIN_COLUMNS, writer, "SurrogatePretrainMetricCSV")
         paths["surrogate_pretrain_step"] = path
+    if bool(getattr(args, "loss_grad_probe_enabled", False)):
+        path = os.path.join(plot.save_dir, f"{args.time}_loss_grad_probe.csv")
+        init_csv_file(path, LOSS_GRAD_PROBE_COLUMNS, writer, "LossGradProbeCSV")
+        paths["loss_grad_probe"] = path
     return paths

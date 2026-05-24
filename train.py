@@ -50,6 +50,7 @@ from models.utils.training.sparsepcgc_controls import *
 from models.utils.training.compression_primary_loss import *
 from models.utils.training.case_debug import *
 from models.utils.training.metric_csv import *
+from models.utils.training.metric_columns import LOSS_GRAD_PROBE_COLUMNS
 from models.utils.training.actual_codec_status import *
 from models.utils.training.metric_rows import *
 from models.utils.training.lr_control import apply_optimizer_lr_floor, step_scheduler_with_floor, optimizer_lrs_safe
@@ -58,6 +59,7 @@ from models.utils.training.checkpoint_metrics import *
 from models.utils.training.actual_compression_guard import apply_actual_compression_guard
 from models.utils.training.for_better_logging import *
 from models.utils.training.train_flow import * # train loopのStage固定、Subtree入力、1Subtree選択、圧縮目的合成、Epoch窓選択を使う
+from models.utils.training.loss_grad_probe import build_loss_grad_probe_rows, summarize_loss_grad_probe_rows
 
 from models.utils.surrogate.pretrain import *
 
@@ -584,6 +586,14 @@ def train(model, args, loss, writer, plot, notifier=None):
                     loss.last_compression_debug = comp_debug # 統合後のcomp_debugをLossに保存
                 base_model = model.module if hasattr(model, "module") else model # DataParallelで包まれている場合は中身のモデルを取り出す
                 structure_debug = getattr(base_model, "last_structure_debug", {}) or {} # モデル内部で記録された構造解析・構造修復のDebug情報を取得
+                operation_entropy_value = finite_float_or_none(structure_debug.get("operation_entropy")) # 探索多様性の移動平均を出すために現在値を取り出す
+                if operation_entropy_value is not None:
+                    operation_entropy_history = list(getattr(args, "_operation_entropy_history", [])) # 直近の操作entropy履歴を取得する
+                    operation_entropy_history.append(float(operation_entropy_value)) # 現在Stepのentropyを履歴へ追加する
+                    operation_entropy_window = max(int(getattr(args, "lr_decay_actual_window", 100)), 2) # actual診断と同じ窓幅で探索の生存状況を見る
+                    operation_entropy_history = operation_entropy_history[-operation_entropy_window:] # 履歴が肥大化しないよう窓幅へ切る
+                    args._operation_entropy_history = operation_entropy_history # 次Step以降のために履歴を保持する
+                    comp_debug["operation_entropy_moving_avg"] = sum(operation_entropy_history) / float(max(len(operation_entropy_history), 1)) # 操作entropyの移動平均をCSVへ渡す
                 if train_edit_stats is None:
                     train_edit_stats = summarize_point_edits( input_xyz=input_xyz[:, :3, :], gen_pts=gen_pts, final_w=final_w, args=args) # 入力/出力点群を比較し、操作を計算
                 corr_debug = update_actual_correlation_debug(args, comp_debug, L_com, codec_actual_metric_pairs) # 圧縮推定値と実圧縮値の対応更新
@@ -624,6 +634,29 @@ def train(model, args, loss, writer, plot, notifier=None):
                 # backward_and_measure("com", args.w_com  * L_com,  model, optimizer, writer, args)
                 # backward_and_measure("attr", args.w_attr * L_attr, model, optimizer, writer, args)
                 # backward_and_measure("policy" , args.w_policy  * L_policy,  model, optimizer, writer, args)
+                loss_grad_probe_rows = build_loss_grad_probe_rows(
+                    args,
+                    model,
+                    [
+                        ("L_total", L),
+                        ("L_geom", L_geom),
+                        ("L_com", L_com),
+                        ("L_actuator", L_actuator),
+                        ("loss_nodes", loss_nodes),
+                        ("loss_single", loss_single),
+                        ("surrogate_loss_for_grad", terms.get("surrogate", None)),
+                        ("sparsepcgc_aux_objective", terms.get("sparsepcgc", None)),
+                    ],
+                    global_step=global_train_step,
+                    episode=episode,
+                    epoch=epoch,
+                    step=step,
+                    stage=current_stage,
+                )
+                if loss_grad_probe_rows:
+                    writer.write(summarize_loss_grad_probe_rows(loss_grad_probe_rows))
+                    for loss_grad_probe_row in loss_grad_probe_rows:
+                        append_csv_row(metric_csv_paths.get("loss_grad_probe"), LOSS_GRAD_PROBE_COLUMNS, loss_grad_probe_row)
 
                 """勾配を流す"""
                 step_completed = False # Optimizer更新が成功したかのフラグ
@@ -802,8 +835,10 @@ def train(model, args, loss, writer, plot, notifier=None):
             guard_event["global_step"] = global_train_step
             guard_event["current_lr_main"] = optimizer_lrs_safe(optimizer)
             guard_event["current_lr_surrogate"] = optimizer_lrs_safe(getattr(loss, "surrogate_optimizer", None))
-            guard_event["L_total"] = scalar_value(L) if "L" in locals() else None
-            guard_event["L_com"] = scalar_value(L_com) if "L_com" in locals() else None
+            guard_event["L_total"] =    (L) if "L" in locals() else None
+            guard_event["L_com"] = finite_float_or_none(L_com) if "L_com" in locals() else None
+            # guard_event["L_total"] = scalar_value(L) if "L" in locals() else None
+            # guard_event["L_com"] = scalar_value(L_com) if "L_com" in locals() else None
             log_for_better_event( for_better_path, "actual_compression_guard", episode=episode, stage=current_stage, **guard_event)
         log_for_better_episode( for_better_path, args=args, episode=episode, stage=current_stage, checkpoint_metrics=checkpoint_metrics, compression_episode_metrics=compression_episode_metrics, operation_episode_metrics=operation_episode_metrics, best_trackers=best_trackers, model_path=model_path)
         if notifier is not None:

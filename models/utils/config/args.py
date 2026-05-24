@@ -389,7 +389,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--lr_scheduler_enabled', default=False, type=str2bool, help='TrueならEpoch単位のStepLRを使う。SparsePCGCではLR崩壊防止のため既定でFalse')
     parser.add_argument('--min_main_lr', default=1e-5, type=float, help='main optimizerの学習率floor')
     parser.add_argument('--min_surrogate_lr', default=1e-6, type=float, help='Surrogate optimizerの学習率floor')
-    parser.add_argument('--max_files', default=30, type=int, help='読み込む最大ファイル数')
+    parser.add_argument('--max_files', default=1, type=int, help='読み込む最大ファイル数')
     parser.add_argument('--episodes', default=128, type=int, help='学習エピソード数')
     parser.add_argument('--lr', default=1e-3, type=float, help='学習率')
     parser.add_argument('--save_eval', default='loss', type=str, help='評価指標（lossまたはpsnr）')
@@ -540,6 +540,10 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--compression_surrogate_empty_cache_threshold_mb', default=12288.0, type=float, help='CUDA cache解放を開始するreserved memory閾値(MB、0なら毎回)')
     parser.add_argument('--compression_surrogate_target_scale', default=100.0, type=float, help='旧互換用。実圧縮教師百分率モードでは未使用')
     parser.add_argument('--compression_surrogate_pred_clip', default=100.0, type=float, help='サロゲートが予測する実圧縮bit差百分率のtanhクリップ（0で無効）')
+    parser.add_argument('--surrogate_target_clip_percent', default=-1.0, type=float, help='Surrogate教師percentのclamp幅。負値なら旧compression_surrogate_pred_clipを使い、0で無効')
+    parser.add_argument('--surrogate_pred_clip_percent', default=-1.0, type=float, help='Surrogate予測percentのtanh clip幅。負値なら旧compression_surrogate_pred_clipを使い、0で無効')
+    parser.add_argument('--surrogate_use_log_bit_ratio_target', default=False, type=str2bool, help='TrueならSurrogate教師をpercentではなくlog(after_bits/before_bits)のscaled値にする')
+    parser.add_argument('--surrogate_log_bit_ratio_scale', default=100.0, type=float, help='log bit ratio教師を1出力MLPへ入れる時の倍率')
     parser.add_argument('--compression_surrogate_occ_gain', default=1.0, type=float, help='Soft occupancy変換のゲイン')
     parser.add_argument('--compression_surrogate_bit_weight', default=4.0, type=float, help='サロゲート教師損失のbit重み')
     parser.add_argument('--compression_surrogate_node_weight', default=1.0, type=float, help='旧互換用。実圧縮教師百分率モードでは未使用')
@@ -694,6 +698,19 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--save_operation_metric_csv', default=True, type=str2bool, help='Add/Prune/Adjustのsoft/hard/effective統計step CSVを保存する')
     parser.add_argument('--operation_dead_grad_warn_threshold', default=1e-12, type=float, help='operation branch/amount勾配が死んだとみなすnormしきい値')
     parser.add_argument('--operation_dead_grad_warn_patience', default=20, type=int, help='operation勾配が低い状態が何step続いたらwarningを出すか')
+    parser.add_argument('--loss_grad_probe_enabled', default=False, type=str2bool, help='低頻度にloss別・module別autograd.grad診断CSVを出すか')
+    parser.add_argument('--loss_grad_probe_interval', default=50, type=int, help='loss別勾配probeを何global stepごとに実行するか')
+    parser.add_argument('--node_single_actual_gating', default=True, type=str2bool, help='node/single proxyがactual bitと低相関ならcompression primary内のweightを下げる')
+    parser.add_argument('--node_single_min_corr', default=0.10, type=float, help='node/single weightを維持するrolling相関の下限')
+    parser.add_argument('--node_single_min_sign_match', default=0.50, type=float, help='node/single weightを維持するrolling符号一致率の下限')
+    parser.add_argument('--node_single_gating_window', default=100, type=int, help='node/singleとactual bitのrolling相関窓')
+    parser.add_argument('--node_single_weight_floor', default=0.10, type=float, help='node/single gating時に残す最低weight倍率')
+    parser.add_argument('--single_delta_penalty_weight', default=0.0, type=float, help='single-child増加proxy penaltyのweight。既定0でlog-only')
+    parser.add_argument('--single_delta_penalty_backprop', default=False, type=str2bool, help='single_delta penaltyをbackpropへ入れるか')
+    parser.add_argument('--single_delta_penalty_min_corr', default=0.30, type=float, help='single_delta penalty backpropを許可するactual相関下限')
+    parser.add_argument('--lr_decay_requires_actual_improvement', default=False, type=str2bool, help='将来のLR decayをactual moving avg改善後だけ許可する診断flag')
+    parser.add_argument('--lr_decay_actual_window', default=100, type=int, help='actual moving avg診断の窓')
+    parser.add_argument('--lr_decay_actual_threshold', default=0.0, type=float, help='actual moving avgがこの値より下がれば改善とみなす')
     parser.add_argument('--repair_add_ratio_floor', default=0.0, type=float, help='Add操作が完全に死なないための弱いratio下限。0で無効')
     parser.add_argument('--save_checkpoint_metric_csv', default=True, type=str2bool, help='checkpoint判定に使うepisode metric CSVを保存する')
     parser.add_argument('--checkpoint_geom_gate', default=True, type=str2bool, help='actual-delta improved best保存時にgeometry gateを使う')
@@ -1417,6 +1434,23 @@ def parse_pugan_args(parser, file_day, file_time):
     args.sparsepcgc_aux_min_corr = float(getattr(args, "sparsepcgc_aux_min_corr", 0.30))
     args.sparsepcgc_aux_min_sign_match = min(max(float(getattr(args, "sparsepcgc_aux_min_sign_match", 0.50)), 0.0), 1.0)
     args.sparsepcgc_aux_gating_window = max(int(getattr(args, "sparsepcgc_aux_gating_window", 100)), 2)
+    args.loss_grad_probe_enabled = bool(getattr(args, "loss_grad_probe_enabled", False))
+    args.loss_grad_probe_interval = max(int(getattr(args, "loss_grad_probe_interval", 50)), 1)
+    args.node_single_actual_gating = bool(getattr(args, "node_single_actual_gating", True))
+    args.node_single_min_corr = float(getattr(args, "node_single_min_corr", 0.10))
+    args.node_single_min_sign_match = min(max(float(getattr(args, "node_single_min_sign_match", 0.50)), 0.0), 1.0)
+    args.node_single_gating_window = max(int(getattr(args, "node_single_gating_window", 100)), 2)
+    args.node_single_weight_floor = min(max(float(getattr(args, "node_single_weight_floor", 0.10)), 0.0), 1.0)
+    args.single_delta_penalty_weight = max(float(getattr(args, "single_delta_penalty_weight", 0.0)), 0.0)
+    args.single_delta_penalty_backprop = bool(getattr(args, "single_delta_penalty_backprop", False))
+    args.single_delta_penalty_min_corr = float(getattr(args, "single_delta_penalty_min_corr", 0.30))
+    args.lr_decay_requires_actual_improvement = bool(getattr(args, "lr_decay_requires_actual_improvement", False))
+    args.lr_decay_actual_window = max(int(getattr(args, "lr_decay_actual_window", 100)), 2)
+    args.lr_decay_actual_threshold = float(getattr(args, "lr_decay_actual_threshold", 0.0))
+    args.surrogate_target_clip_percent = float(getattr(args, "surrogate_target_clip_percent", -1.0))
+    args.surrogate_pred_clip_percent = float(getattr(args, "surrogate_pred_clip_percent", -1.0))
+    args.surrogate_use_log_bit_ratio_target = bool(getattr(args, "surrogate_use_log_bit_ratio_target", False))
+    args.surrogate_log_bit_ratio_scale = max(float(getattr(args, "surrogate_log_bit_ratio_scale", 100.0)), 1e-9)
     args.sparsepcgc_disable_add = bool(getattr(args, "sparsepcgc_disable_add", True))
     args.surrogate_full_cloud_calib_interval = max(int(getattr(args, "surrogate_full_cloud_calib_interval", 0)), 0)
     args.surrogate_full_cloud_calib_max_samples = max(int(getattr(args, "surrogate_full_cloud_calib_max_samples", 1)), 1)
@@ -1488,7 +1522,11 @@ def parse_pugan_args(parser, file_day, file_time):
             args.sparsepcgc_aux_backprop = False
         if not _cli_option_was_provided("--surrogate_full_cloud_calib_interval"):
             # subtree teacherとfull-cloud actualのズレを定期的に見られるよう、軽い校正anchorを入れる。
-            args.surrogate_full_cloud_calib_interval = 200 if args.compression_loss_backend.endswith("_surrogate") else 0
+            args.surrogate_full_cloud_calib_interval = 50 if args.compression_loss_backend.endswith("_surrogate") else 0
+        if not _cli_option_was_provided("--surrogate_target_clip_percent"):
+            args.surrogate_target_clip_percent = 0.0 if args.compression_loss_backend.endswith("_surrogate") else args.surrogate_target_clip_percent
+        if not _cli_option_was_provided("--surrogate_pred_clip_percent"):
+            args.surrogate_pred_clip_percent = 0.0 if args.compression_loss_backend.endswith("_surrogate") else args.surrogate_pred_clip_percent
         if not _cli_option_was_provided("--repair_add_ratio_floor"):
             # SparsePCGCでAdd branchが完全に死ぬのを避けるため、0.1%だけ弱い探索下限を入れる。
             args.repair_add_ratio_floor = 0.001
@@ -1621,6 +1659,10 @@ def parse_pugan_args(parser, file_day, file_time):
             args.debug_grad_flow = True
         if not _cli_option_was_provided("--debug_grad_flow_rate"):
             args.debug_grad_flow_rate = 8
+        if not _cli_option_was_provided("--loss_grad_probe_enabled"):
+            args.loss_grad_probe_enabled = True
+        if not _cli_option_was_provided("--loss_grad_probe_interval"):
+            args.loss_grad_probe_interval = 50
 
     actual_codec_surrogate_backend = args.compression_loss_backend.endswith("_surrogate")
     if actual_codec_surrogate_backend:

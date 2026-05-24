@@ -255,6 +255,8 @@ class CompressionLossMixin:
         entropy_ref = q_ref[2].abs().clamp_min(1e-6)
         density_gen = q_gen[4]
         density_ref = q_ref[4].abs().clamp_min(1e-6)
+        lowprob_gen = (active_gen * entropy_gen.clamp_min(0.0)).clamp_min(0.0)
+        lowprob_ref = (active_ref * q_ref[2].clamp_min(0.0)).clamp_min(0.0)
         active_term = 100.0 * (active_gen - active_ref) / active_ref
         single_term = 100.0 * (single_gen - single_ref) / single_ref
         entropy_term = 100.0 * (entropy_gen - q_ref[2]) / entropy_ref
@@ -277,6 +279,22 @@ class CompressionLossMixin:
             "single": single_term,
             "entropy": entropy_term,
             "density": density_term,
+            "occupancy_pattern_before": active_ref.detach(),
+            "occupancy_pattern_after": active_gen.detach(),
+            "occupancy_pattern_delta": (active_gen - active_ref).detach(),
+            "lowprob_occupancy_count_before": lowprob_ref.detach(),
+            "lowprob_occupancy_count_after": lowprob_gen.detach(),
+            "lowprob_occupancy_ratio": (lowprob_gen / active_gen.clamp_min(1e-6)).detach(),
+            "occupancy_entropy_before": q_ref[2].detach(),
+            "occupancy_entropy_after": entropy_gen.detach(),
+            "occupancy_entropy_delta": (entropy_gen - q_ref[2]).detach(),
+            "occupancy_nll_before": q_ref[2].detach(),
+            "occupancy_nll_after": entropy_gen.detach(),
+            "occupancy_nll_delta": (entropy_gen - q_ref[2]).detach(),
+            "single_child_chain_length_before": single_ref.detach(),
+            "single_child_chain_length_after": single_gen.detach(),
+            "sibling_occupancy_balance_before": density_ref.detach(),
+            "sibling_occupancy_balance_after": density_gen.detach(),
         }
 
     def _get_cached_actual_gt(self, cache_key):

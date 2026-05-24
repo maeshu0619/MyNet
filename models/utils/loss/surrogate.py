@@ -6,6 +6,20 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def resolve_surrogate_pred_clip(args):
+    clip = float(getattr(args, "surrogate_pred_clip_percent", -1.0))
+    if clip < 0.0:
+        clip = float(getattr(args, "compression_surrogate_pred_clip", 0.0))
+    return max(float(clip), 0.0)
+
+
+def resolve_surrogate_target_clip(args):
+    clip = float(getattr(args, "surrogate_target_clip_percent", -1.0))
+    if clip < 0.0:
+        clip = float(getattr(args, "compression_surrogate_pred_clip", 0.0))
+    return max(float(clip), 0.0)
+
+
 class _CompressionSurrogateNet(nn.Module):
     def __init__(self, in_dim, hidden_dim=128, pred_clip=2.0):
         super().__init__()
@@ -21,8 +35,11 @@ class _CompressionSurrogateNet(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
 
+    def forward_raw(self, x):
+        return self.net(x)
+
     def forward(self, x):
-        raw = self.net(x)
+        raw = self.forward_raw(x)
         if self.pred_clip > 0:
             return self.pred_clip * torch.tanh(raw / self.pred_clip)
         return raw
@@ -61,6 +78,87 @@ class SurrogateCompressionLossMixin:
             if torch.is_tensor(value) and not torch.isfinite(value).all():
                 return False
         return True
+
+    @staticmethod
+    def _safe_log_bit_ratio(before_bits, after_bits):
+        before_bits = float(before_bits)
+        after_bits = float(after_bits)
+        if not (math.isfinite(before_bits) and math.isfinite(after_bits)) or before_bits <= 0.0 or after_bits <= 0.0:
+            return float("nan")
+        return float(math.log(after_bits / before_bits))
+
+    def _prepare_surrogate_target(self, args, raw_percent, device, *, before_bits=None, after_bits=None):
+        raw_percent = float(raw_percent)
+        clip = resolve_surrogate_target_clip(args)
+        if clip > 0.0:
+            clamped_percent = min(max(raw_percent, -clip), clip)
+            clip_min = -clip
+            clip_max = clip
+        else:
+            clamped_percent = raw_percent
+            clip_min = float("nan")
+            clip_max = float("nan")
+        log_ratio = self._safe_log_bit_ratio(before_bits, after_bits)
+        log_scale = max(float(getattr(args, "surrogate_log_bit_ratio_scale", 100.0)), 1e-9)
+        use_log_ratio = bool(getattr(args, "surrogate_use_log_bit_ratio_target", False)) and math.isfinite(log_ratio)
+        train_value = log_ratio * log_scale if use_log_ratio else clamped_percent
+        target_mode = "log_bit_ratio_scaled" if use_log_ratio else ("percent_clamped" if clip > 0.0 else "percent_raw")
+        target = torch.tensor([[float(train_value)]], device=device, dtype=torch.float32)
+        return {
+            "target": target,
+            "raw_percent": float(raw_percent),
+            "clamped_percent": float(clamped_percent),
+            "train_value": float(train_value),
+            "target_clamped": abs(float(clamped_percent) - float(raw_percent)) > 1e-6,
+            "target_mode": target_mode,
+            "log_ratio": float(log_ratio),
+            "clip_min": float(clip_min),
+            "clip_max": float(clip_max),
+            "log_scale": float(log_scale),
+        }
+
+    def _surrogate_feature_names(self, args):
+        names = [
+            "log_input_points",
+            "log_weight_sum",
+            "weight_mean",
+            "weight_std",
+            "bbox_norm_mean_x",
+            "bbox_norm_mean_y",
+            "bbox_norm_mean_z",
+            "bbox_norm_std_x",
+            "bbox_norm_std_y",
+            "bbox_norm_std_z",
+            "bbox_volume_log",
+        ]
+        stat_names = ["log_node", "log_single", "occupancy_entropy_per_node", "log_mass", "node_density"]
+        for level in self.surrogate_levels:
+            names.extend([f"level{int(level)}_{name}" for name in stat_names])
+        names.extend([f"qlevel_{name}" for name in stat_names])
+        names.extend(["log_q_norm", "log_inv_q_norm", "q_level_norm", "codec_sparsepcgc", "codec_gpcc", "codec_draco"])
+        return names
+
+    def _update_teacher_gap_debug(self, args, cache_key, teacher_type, actual_percent, teacher_is_actual):
+        if not hasattr(self, "_teacher_gap_cache"):
+            self._teacher_gap_cache = {}
+        if not teacher_is_actual or not math.isfinite(float(actual_percent)):
+            return {"teacher_gap_percent": None, "teacher_gap_status": "not_actual_teacher"}
+        sample_key = str(cache_key or getattr(args, "_current_sample_name", "unknown"))
+        entry = self._teacher_gap_cache.setdefault(sample_key, {})
+        teacher_type = str(teacher_type)
+        if teacher_type == "full_cloud_actual":
+            previous = entry.get("subtree_local_actual")
+            entry["full_cloud_actual"] = float(actual_percent)
+            if previous is None:
+                return {"teacher_gap_percent": None, "teacher_gap_status": "no_previous_subtree_teacher"}
+            return {"teacher_gap_percent": float(actual_percent) - float(previous), "teacher_gap_status": "full_cloud_minus_last_subtree"}
+        if teacher_type == "subtree_local_actual":
+            previous = entry.get("full_cloud_actual")
+            entry["subtree_local_actual"] = float(actual_percent)
+            if previous is None:
+                return {"teacher_gap_percent": None, "teacher_gap_status": "no_previous_full_cloud_teacher"}
+            return {"teacher_gap_percent": float(actual_percent) - float(previous), "teacher_gap_status": "subtree_minus_last_full_cloud"}
+        return {"teacher_gap_percent": None, "teacher_gap_status": "unsupported_teacher_type"}
 
     def _log_surrogate_event(self, message):
         if self.writer is not None and hasattr(self.writer, "write"):
@@ -101,7 +199,7 @@ class SurrogateCompressionLossMixin:
         self.compression_surrogate = _CompressionSurrogateNet(
             in_dim=self.surrogate_feature_dim,
             hidden_dim=int(getattr(self.args, "compression_surrogate_hidden_dim", 128)),
-            pred_clip=float(getattr(self.args, "compression_surrogate_pred_clip", 2.0)),
+            pred_clip=resolve_surrogate_pred_clip(self.args),
         ).to(device)
         self.surrogate_optimizer = torch.optim.Adam(
             self.compression_surrogate.parameters(),
@@ -127,11 +225,13 @@ class SurrogateCompressionLossMixin:
 
     def _surrogate_target_from_actual(self, args, stats_gen, stats_ref, device):
         target_percent = self._relative_percent(float(stats_gen["bit"]), float(stats_ref["bit"]))
-        clip = float(getattr(args, "compression_surrogate_pred_clip", 0.0))
-        target = torch.tensor([[target_percent]], device=device, dtype=torch.float32)
-        if clip > 0:
-            target = target.clamp(min=-clip, max=clip)
-        return target
+        return self._prepare_surrogate_target(
+            args,
+            target_percent,
+            device,
+            before_bits=float(stats_ref.get("bit", float("nan"))),
+            after_bits=float(stats_gen.get("bit", float("nan"))),
+        )
 
     @staticmethod
     def _decode_keys(keys, grid):
@@ -764,6 +864,11 @@ class SurrogateCompressionLossMixin:
         target_percent_value = 0.0
         target_raw_percent_value = 0.0
         target_train_percent_value = 0.0
+        target_clamped_percent_value = 0.0
+        target_log_ratio_value = float("nan")
+        target_clip_min_value = float("nan")
+        target_clip_max_value = float("nan")
+        target_mode_value = "none"
         target_was_clamped = False
         target_scale = "none"
         target_teacher_source = "none"
@@ -800,11 +905,17 @@ class SurrogateCompressionLossMixin:
                 float(cached_gt["node"]),
                 ref_min=1.0,
             )
-            target = self._surrogate_target_from_actual(args, stats_gen, cached_gt, gen_xyz.device)
+            target_debug = self._surrogate_target_from_actual(args, stats_gen, cached_gt, gen_xyz.device)
+            target = target_debug["target"]
             target_raw_percent_value = float(actual_bit_percent)
-            target_train_percent_value = self._scalar(target.reshape(()))
-            target_was_clamped = abs(target_train_percent_value - target_raw_percent_value) > 1e-6
-            target_scale = "actual_bit_percent"
+            target_train_percent_value = float(target_debug["train_value"])
+            target_clamped_percent_value = float(target_debug["clamped_percent"])
+            target_log_ratio_value = float(target_debug["log_ratio"])
+            target_clip_min_value = float(target_debug["clip_min"])
+            target_clip_max_value = float(target_debug["clip_max"])
+            target_mode_value = str(target_debug["target_mode"])
+            target_was_clamped = bool(target_debug["target_clamped"])
+            target_scale = str(target_debug["target_mode"])
             target_teacher_source = "fresh_actual"
             warmup_steps = max(
                 int(getattr(args, "compression_surrogate_warmup_steps", getattr(args, "compression_surrogate_train_steps", 2))),
@@ -838,6 +949,11 @@ class SurrogateCompressionLossMixin:
                     "actual_single_percent": float(actual_single_percent),
                     "actual_node_percent": float(actual_node_percent),
                     "target_bit_percent": float(target_percent_value),
+                    "target_train_value": float(target_train_percent_value),
+                    "target_clamped_percent": float(target_clamped_percent_value),
+                    "target_log_ratio": float(target_log_ratio_value),
+                    "target_mode": str(target_mode_value),
+                    "target_clamped": bool(target_was_clamped),
                     "gt_points": int(cached_gt["point_count"]),
                     "gen_points": int(gen_points),
                     "gt_actual_bit": float(cached_gt["bit"]),
@@ -890,12 +1006,16 @@ class SurrogateCompressionLossMixin:
             target = local_proxy_target
             target_percent_value = self._scalar(local_proxy_target.reshape(()))
             target_raw_percent_value = float(target_percent_value)
-            clip = float(getattr(args, "compression_surrogate_pred_clip", 0.0))
-            if clip > 0.0:
-                target = target.clamp(min=-clip, max=clip)
-            target_train_percent_value = self._scalar(target.reshape(()))
-            target_was_clamped = abs(target_train_percent_value - target_raw_percent_value) > 1e-6
-            target_scale = "local_proxy_aux"
+            target_debug = self._prepare_surrogate_target(args, target_raw_percent_value, gen_xyz.device)
+            target = target_debug["target"]
+            target_train_percent_value = float(target_debug["train_value"])
+            target_clamped_percent_value = float(target_debug["clamped_percent"])
+            target_log_ratio_value = float(target_debug["log_ratio"])
+            target_clip_min_value = float(target_debug["clip_min"])
+            target_clip_max_value = float(target_debug["clip_max"])
+            target_mode_value = str(target_debug["target_mode"])
+            target_was_clamped = bool(target_debug["target_clamped"])
+            target_scale = f"local_proxy_aux_{target_mode_value}"
             target_teacher_source = "local_proxy"
             L_sur = self._train_compression_surrogate(args, x_soft, target)
             timing_cursor = _mark_timing("surrogate_fit", timing_cursor)
@@ -919,20 +1039,35 @@ class SurrogateCompressionLossMixin:
             if bool(getattr(args, "_surrogate_pretrain_active", False)) and not bool(
                 getattr(args, "surrogate_pretrain_skip_on_target_miss", False)
             ):
-                target = torch.tensor([[target_percent_value]], device=gen_xyz.device, dtype=torch.float32)
                 target_raw_percent_value = float(target_percent_value)
-                clip = float(getattr(args, "compression_surrogate_pred_clip", 0.0))
-                if clip > 0.0:
-                    target = target.clamp(min=-clip, max=clip)
-                target_train_percent_value = self._scalar(target.reshape(()))
-                target_was_clamped = abs(target_train_percent_value - target_raw_percent_value) > 1e-6
-                target_scale = "actual_bit_percent_cache"
+                target_debug = self._prepare_surrogate_target(
+                    args,
+                    target_raw_percent_value,
+                    gen_xyz.device,
+                    before_bits=float(target_entry.get("gt_actual_bit", float("nan"))),
+                    after_bits=float(target_entry.get("gen_actual_bit", float("nan"))),
+                )
+                target = target_debug["target"]
+                target_train_percent_value = float(target_debug["train_value"])
+                target_clamped_percent_value = float(target_debug["clamped_percent"])
+                target_log_ratio_value = float(target_debug["log_ratio"])
+                target_clip_min_value = float(target_debug["clip_min"])
+                target_clip_max_value = float(target_debug["clip_max"])
+                target_mode_value = str(target_debug["target_mode"])
+                target_was_clamped = bool(target_debug["target_clamped"])
+                target_scale = f"actual_bit_percent_cache_{target_mode_value}"
                 target_teacher_source = actual_value_source
                 L_sur = self._train_compression_surrogate(args, x_soft, target)
             else:
                 L_sur = x_soft.new_zeros(())
                 target_raw_percent_value = float(target_percent_value)
-                target_train_percent_value = float(target_percent_value)
+                target_train_percent_value = float(target_entry.get("target_train_value", target_percent_value))
+                target_clamped_percent_value = float(target_entry.get("target_clamped_percent", target_train_percent_value))
+                target_log_ratio_value = float(target_entry.get("target_log_ratio", float("nan")))
+                target_clip_min_value = -resolve_surrogate_target_clip(args) if resolve_surrogate_target_clip(args) > 0.0 else float("nan")
+                target_clip_max_value = resolve_surrogate_target_clip(args) if resolve_surrogate_target_clip(args) > 0.0 else float("nan")
+                target_mode_value = str(target_entry.get("target_mode", "actual_bit_percent_cache_no_update"))
+                target_was_clamped = bool(target_entry.get("target_clamped", abs(target_train_percent_value - target_raw_percent_value) > 1e-6))
                 target_scale = "actual_bit_percent_cache_no_update"
                 target_teacher_source = actual_value_source
             timing_cursor = _mark_timing("target_cache", timing_cursor)
@@ -973,23 +1108,33 @@ class SurrogateCompressionLossMixin:
         self.compression_surrogate.eval()
         self._set_surrogate_trainable(False)
         if inputs_finite:
+            pred_raw = self.compression_surrogate.forward_raw(x_soft) if hasattr(self.compression_surrogate, "forward_raw") else self.compression_surrogate(x_soft)
             pred = self.compression_surrogate(x_soft)
             if not self._all_finite(pred):
                 self._reset_compression_surrogate("non-finite prediction during inference")
+                pred_raw = self.compression_surrogate.forward_raw(x_soft) if hasattr(self.compression_surrogate, "forward_raw") else self.compression_surrogate(x_soft)
                 pred = self.compression_surrogate(x_soft)
             if not self._all_finite(pred):
                 self._log_surrogate_event("using zero prediction because inference stayed non-finite after reset.")
+                pred_raw = x_soft.new_zeros((x_soft.shape[0], 1), dtype=torch.float32)
                 pred = x_soft.new_zeros((x_soft.shape[0], 1), dtype=torch.float32)
         else:
+            pred_raw = x_soft.new_zeros((x_soft.shape[0], 1), dtype=torch.float32)
             pred = x_soft.new_zeros((x_soft.shape[0], 1), dtype=torch.float32)
         timing_cursor = _mark_timing("surrogate_predict", timing_cursor)
 
         surrogate_bit_percent = pred.reshape(-1).mean() if pred.numel() > 0 else x_soft.new_zeros(())
+        surrogate_raw_percent = pred_raw.reshape(-1).mean() if pred_raw.numel() > 0 else x_soft.new_zeros(())
         actual_bit_percent_t = gen_xyz.new_tensor(float(actual_bit_percent), dtype=torch.float32)
         pred_percent = surrogate_bit_percent.detach().reshape(())
+        pred_raw_percent = surrogate_raw_percent.detach().reshape(())
         target_percent = pred_percent.new_tensor(float(target_percent_value)).detach().reshape(())
         surrogate_signed_bit_error = pred_percent - target_percent
         surrogate_abs_bit_error = surrogate_signed_bit_error.abs()
+        train_target_t = pred_percent.new_tensor(float(target_train_percent_value)).reshape(())
+        raw_actual_t = pred_percent.new_tensor(float(target_raw_percent_value)).reshape(())
+        surrogate_loss_against_train_target = F.smooth_l1_loss(pred_percent.reshape(1), train_target_t.detach().reshape(1), reduction="mean")
+        surrogate_loss_against_raw_actual = F.smooth_l1_loss(pred_percent.reshape(1), raw_actual_t.detach().reshape(1), reduction="mean")
         teacher_is_actual_for_control = bool(actual_value_source in {"fresh_teacher", "target_cache", "stale_target"})
         auto_freeze_debug = self._update_surrogate_auto_freeze_state(
             args,
@@ -1128,7 +1273,19 @@ class SurrogateCompressionLossMixin:
             target_teacher_source = actual_value_source
         teacher_is_actual = bool(actual_value_source in {"fresh_teacher", "target_cache", "stale_target"})
         teacher_is_local_proxy = bool(actual_value_source == "local_proxy")
-        pred_clip_value = float(getattr(args, "compression_surrogate_pred_clip", 0.0))
+        pred_clip_value = resolve_surrogate_pred_clip(args)
+        pred_clipped = bool(abs(self._scalar(pred_raw_percent) - self._scalar(pred_percent)) > 1e-6)
+        pred_clip_min_value = -pred_clip_value if pred_clip_value > 0.0 else float("nan")
+        pred_clip_max_value = pred_clip_value if pred_clip_value > 0.0 else float("nan")
+        pred_ratio = 1.0 + self._scalar(pred_percent) / 100.0
+        if bool(getattr(args, "surrogate_use_log_bit_ratio_target", False)):
+            surrogate_pred_log_ratio = self._scalar(pred_percent) / max(float(getattr(args, "surrogate_log_bit_ratio_scale", 100.0)), 1e-9)
+        else:
+            surrogate_pred_log_ratio = math.log(max(pred_ratio, 1e-12)) if math.isfinite(pred_ratio) else float("nan")
+        teacher_type_label = "full_cloud_actual" if str(getattr(args, "_current_teacher_scope", "")) == "full_cloud" and teacher_is_actual else ("subtree_local_actual" if teacher_is_actual else str(actual_value_source))
+        teacher_gap_debug = self._update_teacher_gap_debug(args, cache_key, teacher_type_label, actual_bit_percent, teacher_is_actual)
+        replay_ratio = float(replay_full_cloud_count) / float(max(replay_sample_count, 1))
+        feature_names = self._surrogate_feature_names(args)
 
         self.last_compression_debug = {
             "metric": "actual_total_bit_percent",
@@ -1163,6 +1320,22 @@ class SurrogateCompressionLossMixin:
             "sparsepcgc_density_proxy_loss": self._scalar(sparse_terms["density"].detach()),
             "occupancy_entropy": self._scalar(sparse_terms["entropy"].detach()),
             "nll_delta": self._scalar(sparse_terms["entropy"].detach()),
+            "occupancy_pattern_before": self._scalar(sparse_terms.get("occupancy_pattern_before", sparse_aux_loss.new_tensor(float("nan")))),
+            "occupancy_pattern_after": self._scalar(sparse_terms.get("occupancy_pattern_after", sparse_aux_loss.new_tensor(float("nan")))),
+            "occupancy_pattern_delta": self._scalar(sparse_terms.get("occupancy_pattern_delta", sparse_aux_loss.new_tensor(float("nan")))),
+            "lowprob_occupancy_count_before": self._scalar(sparse_terms.get("lowprob_occupancy_count_before", sparse_aux_loss.new_tensor(float("nan")))),
+            "lowprob_occupancy_count_after": self._scalar(sparse_terms.get("lowprob_occupancy_count_after", sparse_aux_loss.new_tensor(float("nan")))),
+            "lowprob_occupancy_ratio": self._scalar(sparse_terms.get("lowprob_occupancy_ratio", sparse_aux_loss.new_tensor(float("nan")))),
+            "occupancy_entropy_before": self._scalar(sparse_terms.get("occupancy_entropy_before", sparse_aux_loss.new_tensor(float("nan")))),
+            "occupancy_entropy_after": self._scalar(sparse_terms.get("occupancy_entropy_after", sparse_aux_loss.new_tensor(float("nan")))),
+            "occupancy_entropy_delta": self._scalar(sparse_terms.get("occupancy_entropy_delta", sparse_aux_loss.new_tensor(float("nan")))),
+            "occupancy_nll_before": self._scalar(sparse_terms.get("occupancy_nll_before", sparse_aux_loss.new_tensor(float("nan")))),
+            "occupancy_nll_after": self._scalar(sparse_terms.get("occupancy_nll_after", sparse_aux_loss.new_tensor(float("nan")))),
+            "occupancy_nll_delta": self._scalar(sparse_terms.get("occupancy_nll_delta", sparse_aux_loss.new_tensor(float("nan")))),
+            "single_child_chain_length_before": self._scalar(sparse_terms.get("single_child_chain_length_before", sparse_aux_loss.new_tensor(float("nan")))),
+            "single_child_chain_length_after": self._scalar(sparse_terms.get("single_child_chain_length_after", sparse_aux_loss.new_tensor(float("nan")))),
+            "sibling_occupancy_balance_before": self._scalar(sparse_terms.get("sibling_occupancy_balance_before", sparse_aux_loss.new_tensor(float("nan")))),
+            "sibling_occupancy_balance_after": self._scalar(sparse_terms.get("sibling_occupancy_balance_after", sparse_aux_loss.new_tensor(float("nan")))),
             "bpp": float(actual_bpp_percent),
             "gt_points": int(cached_gt["point_count"]),
             "gen_points": gen_points,
@@ -1178,10 +1351,18 @@ class SurrogateCompressionLossMixin:
             ) if stats_gen is not None else int(target_entry.get("gen_unique_coord_count", gen_points)) if target_entry is not None else gen_points,
             "actual_total_bit_percent": self._scalar(actual_bit_percent_t),
             "actual_target": self._scalar(actual_bit_percent_t),
+            "actual_raw_percent": float(target_raw_percent_value),
+            "actual_clamped_percent": float(target_clamped_percent_value),
             "actual_forward_value": self._scalar(actual_bit_percent_t),
             "forward_display_value": self._scalar(main_loss.detach()),
             "final_L_com_value": self._scalar(L_com.detach()),
             "surrogate_pred": self._scalar(surrogate_bit_percent.detach()),
+            "surrogate_pred_raw_percent": self._scalar(pred_raw_percent),
+            "surrogate_pred_clipped_percent": self._scalar(pred_percent),
+            "surrogate_pred_log_ratio": float(surrogate_pred_log_ratio),
+            "pred_clipped": bool(pred_clipped),
+            "pred_clip_min": float(pred_clip_min_value),
+            "pred_clip_max": float(pred_clip_max_value),
             "surrogate_loss_for_grad": self._scalar((surrogate_weight * surrogate_loss_for_grad).detach()),
             "proxy_aux_for_grad": self._scalar(proxy_aux_for_grad.detach()),
             "grad_source": grad_source,
@@ -1200,6 +1381,16 @@ class SurrogateCompressionLossMixin:
             "surrogate_target_scale": target_scale,
             "surrogate_target_raw_bit": float(target_raw_percent_value),
             "surrogate_target_train_bit": float(target_train_percent_value),
+            "surrogate_train_target_percent": float(target_clamped_percent_value),
+            "surrogate_train_target_log_ratio": float(target_log_ratio_value),
+            "surrogate_train_target_value": float(target_train_percent_value),
+            "surrogate_target_mode": str(target_mode_value),
+            "target_clamp_min": float(target_clip_min_value),
+            "target_clamp_max": float(target_clip_max_value),
+            "raw_target_gap_percent": float(target_raw_percent_value) - self._scalar(pred_percent),
+            "raw_actual_vs_train_target_gap": float(target_raw_percent_value) - float(target_train_percent_value),
+            "surrogate_loss_against_raw_actual": self._scalar(surrogate_loss_against_raw_actual),
+            "surrogate_loss_against_train_target": self._scalar(surrogate_loss_against_train_target),
             "surrogate_target_clamped": bool(target_was_clamped),
             "target_clamped": bool(target_was_clamped),
             "target_clamp_rate": float(target_clamp_rate),
@@ -1248,11 +1439,18 @@ class SurrogateCompressionLossMixin:
             "teacher_stale": bool(teacher_stale),
             "teacher_skipped": bool(teacher_skipped),
             "teacher_mode": teacher_mode,
-            "teacher_type": "full_cloud_actual" if str(getattr(args, "_current_teacher_scope", "")) == "full_cloud" and teacher_is_actual else ("subtree_local_actual" if teacher_is_actual else str(actual_value_source)),
+            "teacher_type": teacher_type_label,
             "full_cloud_teacher_used": bool(str(getattr(args, "_current_teacher_scope", "")) == "full_cloud" and teacher_is_actual),
             "full_cloud_actual_percent": float(actual_bit_percent) if str(getattr(args, "_current_teacher_scope", "")) == "full_cloud" and teacher_is_actual else None,
             "subtree_teacher_percent": float(actual_bit_percent) if str(getattr(args, "_current_teacher_scope", "")) == "subtree_local" and teacher_is_actual else None,
-            "teacher_gap_percent": None,
+            "teacher_gap_percent": teacher_gap_debug.get("teacher_gap_percent"),
+            "teacher_gap_status": str(teacher_gap_debug.get("teacher_gap_status", "")),
+            "full_cloud_teacher_count": int(1 if teacher_type_label == "full_cloud_actual" else 0),
+            "subtree_teacher_count": int(1 if teacher_type_label == "subtree_local_actual" else 0),
+            "teacher_type_counts": str(teacher_type_label),
+            "full_cloud_replay_ratio": float(replay_ratio),
+            "full_cloud_calib_interval": int(getattr(args, "surrogate_full_cloud_calib_interval", 0)),
+            "full_cloud_calib_triggered": bool(str(getattr(args, "_current_teacher_anchor_reason", "")) == "surrogate_full_cloud_calib"),
             "teacher_anchor_reason": str(getattr(args, "_current_teacher_anchor_reason", "")),
             "subtree_id": str(getattr(args, "_current_subtree_id", "")),
             "sample_name": str(getattr(args, "_current_sample_name", "")),
@@ -1276,6 +1474,14 @@ class SurrogateCompressionLossMixin:
             "surrogate_pretrain_teacher_type": pretrain_teacher_type,
             "surrogate_pretrain_actual_scope": str(getattr(args, "_surrogate_pretrain_actual_scope", "")),
             "surrogate_pretrain_full_calibration": bool(getattr(args, "_surrogate_pretrain_full_calibration", False)),
+            "surrogate_input_feature_names": ",".join(feature_names),
+            "surrogate_input_feature_dim": int(x_soft.shape[1]),
+            "surrogate_uses_operation_features": False,
+            "surrogate_uses_codec_condition": True,
+            "surrogate_uses_quant_condition": True,
+            "surrogate_uses_occupancy_features": True,
+            "surrogate_uses_before_after_delta": False,
+            "surrogate_input_version": "soft_octree_global_v2",
             "inputs_finite": bool(inputs_finite),
             "before_bits": float(cached_gt["bit"]),
             "after_bits": float(gen_actual_bit),

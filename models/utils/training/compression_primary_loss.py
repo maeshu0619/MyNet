@@ -98,6 +98,19 @@ def build_compression_primary_loss(
     )
     P_actuator = relu_penalty(as_scalar_loss_tensor(L_actuator), getattr(args, "cp_tau_actuator", 0.0))
     P_op = relu_penalty(L_op, 0.0) if L_op is not None else zero
+    gating_debug = getattr(args, "_node_single_gating_debug", {}) or {}
+    node_weight_raw = float(getattr(args, "cp_lambda_nodes", 1.0))
+    single_weight_raw = float(getattr(args, "cp_lambda_single", 1.0))
+    node_weight_effective = node_weight_raw * float(gating_debug.get("node_scale", 1.0))
+    single_weight_effective = single_weight_raw * float(gating_debug.get("single_scale", 1.0))
+    single_delta_penalty = relu_penalty(L_single, 0.0) if L_single is not None else zero
+    single_delta_corr = getattr(args, "_last_single_delta_actual_corr", None)
+    single_delta_penalty_used = bool(
+        getattr(args, "single_delta_penalty_backprop", False)
+        and single_delta_corr is not None
+        and float(single_delta_corr) >= float(getattr(args, "single_delta_penalty_min_corr", 0.30))
+    )
+    single_delta_penalty_weight = float(getattr(args, "single_delta_penalty_weight", 0.0)) if single_delta_penalty_used else 0.0
 
     use_stage = bool(getattr(args, "cp_use_stage_factors", False))
     sf_com = float(stage_factors.get("com", 1.0)) if use_stage else 1.0
@@ -107,11 +120,12 @@ def build_compression_primary_loss(
     L = (
         sf_com * L_com_primary
         + sf_geom * float(getattr(args, "cp_lambda_geom", 1.0)) * P_geom
-        + sf_com * float(getattr(args, "cp_lambda_single", 1.0)) * P_single
-        + sf_com * float(getattr(args, "cp_lambda_nodes", 1.0)) * P_nodes
+        + sf_com * single_weight_effective * P_single
+        + sf_com * node_weight_effective * P_nodes
         + sf_com * float(getattr(args, "cp_lambda_sparsepcgc", 1.0)) * P_sparsepcgc
         + sf_repair * float(getattr(args, "cp_lambda_actuator", 0.1)) * P_actuator
         + sf_repair * float(getattr(args, "cp_lambda_op", 0.0)) * P_op
+        + sf_com * single_delta_penalty_weight * single_delta_penalty
     )
 
     debug = {
@@ -126,6 +140,14 @@ def build_compression_primary_loss(
         "cp_P_sparsepcgc": case_float(P_sparsepcgc, float("nan")),
         "cp_P_actuator": case_float(P_actuator, float("nan")),
         "cp_P_op": case_float(P_op, float("nan")),
+        "node_loss_weight_raw": float(node_weight_raw),
+        "node_loss_weight_effective": float(node_weight_effective),
+        "single_loss_weight_raw": float(single_weight_raw),
+        "single_loss_weight_effective": float(single_weight_effective),
+        "node_single_gating_reason": str(gating_debug.get("reason", "not_initialized")),
+        "single_delta_penalty": case_float(single_delta_penalty, float("nan")),
+        "single_delta_penalty_weight": float(single_delta_penalty_weight),
+        "single_delta_penalty_used_for_backprop": bool(single_delta_penalty_used),
         "cp_total": case_float(L, float("nan")),
         "cp_main_requires_grad": term_requires_grad(L_com_main),
         "cp_geom_requires_grad": term_requires_grad(L_geom),
@@ -158,6 +180,11 @@ def log_compression_primary_terms(writer, step, num_steps, cp_debug):
         f"P_sparsepcgc={float(cp_debug.get('cp_P_sparsepcgc', 0.0)):.6f}, "
         f"P_actuator={float(cp_debug.get('cp_P_actuator', 0.0)):.6f}, "
         f"P_op={float(cp_debug.get('cp_P_op', 0.0)):.6f}, "
+        f"node_w={float(cp_debug.get('node_loss_weight_effective', 0.0)):.6f}/"
+        f"{float(cp_debug.get('node_loss_weight_raw', 0.0)):.6f}, "
+        f"single_w={float(cp_debug.get('single_loss_weight_effective', 0.0)):.6f}/"
+        f"{float(cp_debug.get('single_loss_weight_raw', 0.0)):.6f}, "
+        f"single_delta_penalty={float(cp_debug.get('single_delta_penalty', 0.0)):.6f}, "
         f"total={float(cp_debug.get('cp_total', 0.0)):.6f}, "
         "requires_grad["
         f"main={bool(cp_debug.get('cp_main_requires_grad', False))}, "

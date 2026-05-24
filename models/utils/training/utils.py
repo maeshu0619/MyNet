@@ -592,7 +592,7 @@ def adapt_encoder_state_dict_for_sparse_input(model, encoder_state, writer=None)
 
 def module_grad_stats(module):
     if module is None:
-        return {"missing_module": True, "norm": 0.0, "max": 0.0, "mean": 0.0, "rms": 0.0, "active": 0, "none": 0, "finite": False}
+        return {"missing_module": True, "norm": 0.0, "max": 0.0, "mean": 0.0, "rms": 0.0, "active": 0, "none": 0, "finite": False, "param_count": 0, "status": "module_missing"}
     total_sq = 0.0
     total_abs = 0.0 # 勾配の平均絶対値を出すために絶対値合計を保持する
     total_numel = 0 # 勾配の平均/RMSを出すために要素数を数える
@@ -600,9 +600,11 @@ def module_grad_stats(module):
     active = 0
     missing = 0
     finite = True
+    param_count = 0
     for param in module.parameters():
         if not param.requires_grad:
             continue
+        param_count += 1
         grad = param.grad
         if grad is None:
             missing += 1
@@ -619,28 +621,49 @@ def module_grad_stats(module):
     norm = total_sq ** 0.5
     mean_abs = (total_abs / float(total_numel)) if total_numel > 0 else 0.0 # 平均絶対勾配を計算する
     rms = (total_sq / float(total_numel)) ** 0.5 if total_numel > 0 else 0.0 # RMS勾配を計算する
-    return {"missing_module": False, "norm": norm, "max": max_abs, "mean": mean_abs, "rms": rms, "active": active, "none": missing, "finite": finite}
+    if param_count <= 0:
+        status = "no_trainable_params"
+    elif not finite:
+        status = "nonfinite_grad"
+    elif active <= 0 and missing > 0:
+        status = "all_grad_none"
+    elif active <= 0:
+        status = "no_grad"
+    elif norm <= 0.0:
+        status = "zero_grad"
+    else:
+        status = "ok"
+    return {"missing_module": False, "norm": norm, "max": max_abs, "mean": mean_abs, "rms": rms, "active": active, "none": missing, "finite": finite, "param_count": param_count, "status": status}
 
 
 def module_grad_summary(module):
     stats = module_grad_stats(module)
-    if stats.get("missing_module"):
-        return "missing"
+    status = str(stats.get("status", "unknown"))
     norm = float(stats.get("norm", 0.0))
     max_abs = float(stats.get("max", 0.0))
     mean_abs = float(stats.get("mean", 0.0))
     rms = float(stats.get("rms", 0.0))
     active = int(stats.get("active", 0))
     missing = int(stats.get("none", 0))
+    param_count = int(stats.get("param_count", 0))
     finite = bool(stats.get("finite", False))
-    return f"norm={norm:.3e}, max={max_abs:.3e}, mean={mean_abs:.3e}, rms={rms:.3e}, active={active}, none={missing}, finite={finite}"
+    return f"status={status}, norm={norm:.3e}, max={max_abs:.3e}, mean={mean_abs:.3e}, rms={rms:.3e}, active={active}, none={missing}, params={param_count}, finite={finite}"
+
+
+def _first_existing_module(root, *names):
+    for name in names:
+        module = getattr(root, name, None)
+        if module is not None:
+            return module
+    return None
 
 
 def named_trainable_child_modules(base_model):
-    actuator = getattr(base_model, "disp_module", None)
+    actuator = _first_existing_module(base_model, "actuator", "disp_module")
     modules = [
-        ("cost_attr", getattr(base_model, "prun_module", None)),
-        ("repair_policy", getattr(base_model, "adding_module", None)),
+        ("encoder", getattr(base_model, "encoder", None)),
+        ("cost_attr", _first_existing_module(base_model, "cost_attributor", "prun_module")),
+        ("repair_policy", _first_existing_module(base_model, "policy_module", "adding_module")),
         ("actuator", actuator),
     ]
     if actuator is not None:
@@ -685,6 +708,8 @@ def capture_param_update_snapshots(args, model, step_idx, total_count):
     base_model = model.module if hasattr(model, "module") else model
     snapshots = {}
     for name, module in named_trainable_child_modules(base_model):
+        if name == "encoder" and bool(getattr(args, "encoder_0grad", True)):
+            continue
         snapshot = snapshot_module_parameters(module)
         if snapshot is None:
             continue
@@ -706,6 +731,9 @@ def log_param_updates(args, writer, model, snapshots, step_idx, total_count):
     base_model = model.module if hasattr(model, "module") else model
     parts = []
     for name, module in named_trainable_child_modules(base_model):
+        if name == "encoder" and bool(getattr(args, "encoder_0grad", True)):
+            parts.append("encoder(skipped_encoder_0grad)")
+            continue
         before = snapshots.get(name)
         params = trainable_parameters(module)
         if before is None or not params:
@@ -738,8 +766,7 @@ def log_param_updates(args, writer, model, snapshots, step_idx, total_count):
 def log_grad_flow(args, writer, model, step_idx, total_count, global_step=None):
     if not bool(getattr(args, "debug_grad_flow", False)):
         return
-    if not should_log_step(step_idx, total_count, getattr(args, "debug_grad_flow_rate", 1)):
-        return
+    should_write = should_log_step(step_idx, total_count, getattr(args, "debug_grad_flow_rate", 1))
     base_model = model.module if hasattr(model, "module") else model
     grad_map = {}
     parts = []
@@ -749,10 +776,15 @@ def log_grad_flow(args, writer, model, step_idx, total_count, global_step=None):
         grad_map[f"{name}_grad_max"] = float(stats.get("max", 0.0))
         grad_map[f"{name}_grad_mean"] = float(stats.get("mean", 0.0))
         grad_map[f"{name}_grad_rms"] = float(stats.get("rms", 0.0))
+        grad_map[f"{name}_grad_status"] = str(stats.get("status", "unknown"))
+        grad_map[f"{name}_grad_active_count"] = int(stats.get("active", 0))
+        grad_map[f"{name}_grad_none_count"] = int(stats.get("none", 0))
+        grad_map[f"{name}_grad_finite"] = bool(stats.get("finite", False))
         parts.append(f"{name}({module_grad_summary(module)})")
     args._last_grad_flow = grad_map
     step_text = int(global_step) + 1 if global_step is not None else step_idx
-    writer.write(f"GradFlow: global_step={step_text} | " + " | ".join(parts))
+    if should_write:
+        writer.write(f"GradFlow: global_step={step_text} | " + " | ".join(parts))
     threshold = max(float(getattr(args, "operation_dead_grad_warn_threshold", 1e-12)), 0.0)
     patience = max(int(getattr(args, "operation_dead_grad_warn_patience", 20)), 1)
     for key in ("add_branch_grad_norm", "add_amount_grad_norm"):
@@ -761,7 +793,7 @@ def log_grad_flow(args, writer, model, step_idx, total_count, global_step=None):
         streak = int(getattr(args, streak_key, 0))
         streak = streak + 1 if norm <= threshold else 0
         setattr(args, streak_key, streak)
-        if streak == patience:
+        if should_write and streak == patience:
             writer.write(f"GradFlowWarning: global_step={step_text}, {key}={norm:.3e} stayed <= {threshold:.3e} for {patience} logged checks.")
 
 

@@ -8,7 +8,7 @@ import torch
 from .compression import CompressionLossMixin
 from .geometry import GeometryLossMixin
 from .proxy import ProxyCompressionLossMixin
-from .surrogate import _CompressionSurrogateNet, SurrogateCompressionLossMixin
+from .surrogate import _CompressionSurrogateNet, SurrogateCompressionLossMixin, resolve_surrogate_pred_clip
 
 
 device = torch.device("cpu")
@@ -56,14 +56,14 @@ class Loss(
             teacher_device=str(getattr(args, "octattention_teacher_device", "auto")),
         )
         self.rate_proxy = SoftOctreeRateProxy(self.octree_cfgs).to(device) # Soft Octreeによる微分可能な圧縮率推定器
-        
+
         """Surrogate圧縮設定"""
         self.surrogate_levels = self._parse_surrogate_levels(args) # Surrogateが参照するOctree階層レベルを設定から解析
         self.surrogate_feature_dim = 22 + 5 * len(self.surrogate_levels) # Surrogateへ入力する特徴量次元の設定
         self.compression_surrogate = _CompressionSurrogateNet( # 実圧縮結果を近似するSurrogateNetworkの作成
             in_dim=self.surrogate_feature_dim,
             hidden_dim=int(getattr(args, "compression_surrogate_hidden_dim", 128)),
-            pred_clip=float(getattr(args, "compression_surrogate_pred_clip", 2.0)),
+            pred_clip=resolve_surrogate_pred_clip(args),
         ).to(device)
         self.surrogate_optimizer = torch.optim.Adam( # Surrogat Network専用のAdam Optimizerを作成
             self.compression_surrogate.parameters(),
@@ -72,7 +72,7 @@ class Loss(
         )
         for param in self.compression_surrogate.parameters(): # Surrogat Networkの各Parameterを順番に取り出す
             param.requires_grad_(False)
-            
+
         """キャッシュ設定"""
         self.gt_cache_enabled = bool(getattr(args, "cache_gt_loss", True)) # GT点群側の圧縮損失キャッシュを使うか否かを設定
         self.gt_cache_max_entries = max(int(getattr(args, "cache_max_entries", 64)), 0) # GTキャッシュの最大保存数

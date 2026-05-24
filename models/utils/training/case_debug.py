@@ -119,6 +119,10 @@ def maybe_record_case_debug(
         "proxy_improved": bool(math.isfinite(proxy_value) and proxy_value < 0.0),
         "cause_score_is_actual_teacher": False,
         "cause_score_is_heuristic": True,
+        "occupancy_pattern_delta": case_float(comp_debug.get("occupancy_pattern_delta", 0.0), 0.0),
+        "occupancy_entropy_delta": case_float(comp_debug.get("occupancy_entropy_delta", 0.0), 0.0),
+        "single_delta_penalty": case_float(comp_debug.get("single_delta_penalty", 0.0), 0.0),
+        "single_delta_actual_bad_case": bool(case_float(comp_debug.get("single_delta", 0.0), 0.0) > 0.0 and actual_delta > 0.0),
     }
     with open(case_debug_path, "a", newline="", encoding="utf-8") as f:
         csv.DictWriter(f, fieldnames=CASE_DEBUG_COLUMNS).writerow(row)
