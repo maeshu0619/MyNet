@@ -6,10 +6,15 @@ from cfgs.utils import str2bool
 
 pretrained_date = "20260519"
 pretrained_time = "144143"
+
+surrogate_date = "20260524"
+surrogate_time = "160021"
+
 # method_com = "OctAttention"
 method_com = "SparsePCGC"
 # method_com = "G-PCC"
 method_name = "Mine"
+
 model_name = "best"
 
 # dataname = "8i"
@@ -572,8 +577,10 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--surrogate_registry_enabled', default=True, type=str2bool, help='指定形式の共有Surrogate重みを保存/読込するか')
     parser.add_argument('--surrogate_pretrained_root', default=str((_DATA_ROOT / "pretrained_surrogate").resolve()), type=str, help='共有Surrogate重みの保存root')
     parser.add_argument('--surrogate_data', default='', type=str, help='共有Surrogate重みファイル名に使うデータ名。空ならdataname_dataset_name')
-    parser.add_argument('--surrogate_time', default='', type=str, help='共有Surrogate重みファイル名に使う時刻名。空ならtrainのtime')
-    parser.add_argument('--surrogate_registry_load_latest_if_missing', default=True, type=str2bool, help='指定時刻の共有Surrogateが無い場合に同一dataの最新Surrogateを読むか')
+    parser.add_argument('--surrogate_date', default=surrogate_date, type=str, help='読込対象Surrogate重みの日付。{surrogate_date}_{surrogate_time}.pthで探す')
+    parser.add_argument('--surrogate_time', default=surrogate_time, type=str, help='読込対象Surrogate重みの時刻。{surrogate_date}_{surrogate_time}.pthで探す')
+    parser.add_argument('--surrogate_registry_load_latest_if_missing', default=False, type=str2bool, help='指定Surrogateが無い場合に同一method内の最新Surrogateを読むか')
+    parser.add_argument('--surrogate_pretrain_legacy_cache_fallback', default=False, type=str2bool, help='指定Surrogateが無い場合に旧fingerprint cacheを読むか')
     parser.add_argument('--surrogate_pretrain_use_replay', default=True, type=str2bool, help='pretrain中のnon-refresh stepでreplay教師更新を使うか')
     parser.add_argument('--surrogate_pretrain_replay_batch_size', default=16, type=int, help='pretrain replay更新のbatch size')
     parser.add_argument('--surrogate_pretrain_replay_steps', default=4, type=int, help='pretrain中の1stepあたりreplay更新回数')
@@ -1132,11 +1139,10 @@ def parse_pugan_args(parser, file_day, file_time):
         args.surrogate_data = f"{getattr(args, 'dataname', 'data')}_{getattr(args, 'dataset_name', 'set')}" # 保存ファイル名用のデータ名を既定値で補完する
     else:
         args.surrogate_data = str(getattr(args, "surrogate_data", "")).strip() # 明示指定されたデータ名を使う
-    if not str(getattr(args, "surrogate_time", "")).strip():
-        args.surrogate_time = str(getattr(args, "time", "run")).strip() # 保存ファイル名用の時刻名をtrain run時刻で補完する
-    else:
-        args.surrogate_time = str(getattr(args, "surrogate_time", "")).strip() # 明示指定された時刻名を使う
-    args.surrogate_registry_load_latest_if_missing = bool(getattr(args, "surrogate_registry_load_latest_if_missing", True)) # 完全一致が無い時の最新Surrogate読込を有効化する
+    args.surrogate_date = str(getattr(args, "surrogate_date", surrogate_date)).strip() or str(getattr(args, "date", "run")).strip() # 読込対象Surrogateの日付を正規化する
+    args.surrogate_time = str(getattr(args, "surrogate_time", surrogate_time)).strip() or str(getattr(args, "time", "run")).strip() # 読込対象Surrogateの時刻を正規化する
+    args.surrogate_registry_load_latest_if_missing = bool(getattr(args, "surrogate_registry_load_latest_if_missing", False)) # 指定Surrogateが無い時の最新読込可否を設定する
+    args.surrogate_pretrain_legacy_cache_fallback = bool(getattr(args, "surrogate_pretrain_legacy_cache_fallback", False)) # 旧fingerprint cacheを読むかどうかを設定する
     args.surrogate_pretrain_use_replay = bool(getattr(args, "surrogate_pretrain_use_replay", True))
     args.surrogate_pretrain_replay_batch_size = max(
         int(getattr(args, "surrogate_pretrain_replay_batch_size", 16)),

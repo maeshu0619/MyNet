@@ -14,57 +14,61 @@ from .modules.structure_policy import POLICY_NAMES, StructureRepairPolicy
 
 
 class Network(nn.Module):
-    """Cause-decomposed octree structure repair network.
-
-    The old path was point pruning -> point adding -> point displacement.  This
-    implementation changes the object of learning to octree coding structure:
-    diagnose why a point/subtree is costly, select a repair primitive, then move
-    points minimally as an actuator.
+    """
+    ◆全体フロー
+    ・入力点群
+    ・PointTransformer：局所・大域特徴抽出
+    ・OctreeStructureAnalisis：Octree構造特徴を計算
+    ・CostAttributionModule：圧縮非効率の原因を推定
+    ・CauseDiagnosisAggregation：原因スコアをSubtree/Repai Unit単位に集約
+    ・StructureRepairPolicy：修復方策を選択
+    ・StructureRepairActuator：点操作を実行
     """
 
     def __init__(self, args, writer):
-        super().__init__()
+        """基本情報セットアップ"""
+        super().__init__() # 親クラスの初期化
         self.args = args
         self.writer = writer
-        self.args.encoder_input_dim = 1 if bool(getattr(self.args, "encoder_sparse_tensor", True)) else 3
-        self.encoder = PointTransformer(self.args)
+        self.args.encoder_input_dim = 1 if bool(getattr(self.args, "encoder_sparse_tensor", True)) else 3 # Encoderに入力する特徴次元を決めている。encoder_sparse_tensor=TrueならSparse Tensor用に1次元特徴
+        self.cache_enabled = False # 入力キャッシュの初期化
+        self.input_cache = {} # 入力キャッシュ用の辞書
+        self.expected_input_cache_entries = 0 # 想定されるキャッシュ数を初期化
+        self.debug_tensors = {} # デバッグ用のテンソルを保存
+        self.last_structure_debug = {} # 直近Forward時の構造診断デバッグ情報を保存する辞書の初期化
+        self.last_encoder_debug = {} # 直近Forward時のEncoder関連デバッグ情報を保存する辞書を初期化
+        self.last_runtime_timing = {} # 直近Forward時の実行時間計測結果を保存する辞書を初期化
+        self._configure_non_encoder_batchnorm() # Encoder以外の構造系モジュールに含まれるBatchNormの設定を変更する
+        
+        """モジュールセットアップ"""
+        self.encoder = PointTransformer(self.args) # 特徴抽出器
+        self.structure_analyzer = OctreeStructureAnalysis(self.args, self.writer) # Octree構造解析モジュールの作成
 
-        self.structure_analyzer = OctreeStructureAnalysis(self.args, self.writer)
-        fused_dim = int(getattr(self.args, "fused_feat_dim", getattr(self.args, "out_dim", 64)))
-        structure_dim = int(self.structure_analyzer.feature_dim)
-        hidden_dim = int(getattr(self.args, "structure_hidden_dim", 96))
+        """次元数セットアップ"""
+        fused_dim = int(getattr(self.args, "fused_feat_dim", getattr(self.args, "out_dim", 64))) # Encoderが出す統合特徴の次元数
+        structure_dim = int(self.structure_analyzer.feature_dim) # Octree構造解析モジュールが出す構造特徴の次元数
+        hidden_dim = int(getattr(self.args, "structure_hidden_dim", 96)) # 構造診断・方策選択モジュール内部の隠れ層次元
 
-        self.cost_attributor = CostAttributionModule(
-            in_channels=fused_dim + structure_dim,
-            hidden_dim=hidden_dim,
-        )
-        self.cause_aggregator = CauseDiagnosisAggregation(self.args)
-        self.policy_module = StructureRepairPolicy(
+        """モジュールセットアップ"""
+        self.cost_attributor = CostAttributionModule(in_channels=fused_dim + structure_dim, hidden_dim=hidden_dim) # 圧縮非効率の現認を推定するモジュールの作成
+        self.cause_aggregator = CauseDiagnosisAggregation(self.args) # 点単位・ノード単位の原因スコアを、SubtreeやRepai Unitに集約するモジュール
+        self.policy_module = StructureRepairPolicy( # 構造修復方策を選ぶモジュール
             in_channels=fused_dim + structure_dim + len(CAUSE_NAMES) + self.cause_aggregator.priority_dim,
             hidden_dim=hidden_dim,
             temperature=float(getattr(self.args, "repair_policy_temperature", 1.0)),
         )
-        self.actuator = StructureRepairActuator(
+        self.actuator = StructureRepairActuator( # 実際に点群に操作するモジュールの作成
             in_channels=structure_dim + len(CAUSE_NAMES) + len(POLICY_NAMES) + self.cause_aggregator.priority_dim,
             hidden_dim=int(getattr(self.args, "repair_actuator_hidden_dim", 64)),
             args=self.args,
         )
 
-        # Compatibility aliases used by training debug utilities.
-        self.prun_module = self.cost_attributor
-        self.adding_module = self.policy_module
-        self.disp_module = self.actuator
+        """旧モジュールセットアップ"""
+        # self.prun_module = self.cost_attributor
+        # self.adding_module = self.policy_module
+        # self.disp_module = self.actuator
 
-        self.cache_enabled = False
-        self.input_cache = {}
-        self.expected_input_cache_entries = 0
-        self.debug_tensors = {}
-        self.last_structure_debug = {}
-        self.last_encoder_debug = {}
-        self.last_runtime_timing = {}
-        self._configure_non_encoder_batchnorm()
-
-    def _configure_non_encoder_batchnorm(self):
+    def _configure_non_encoder_batchnorm(self): # Encoder以外のBatchNorm設定を調整するための補助関数
         if bool(getattr(self.args, "module_bn_use_running_stats", False)):
             return
         changed = 0
@@ -79,40 +83,40 @@ class Network(nn.Module):
         if changed > 0 and self.writer is not None and hasattr(self.writer, "write"):
             self.writer.write(f"Structure modules use per-batch BatchNorm stats ({changed} layers).")
 
-    def train(self, mode: bool = True):
+    def train(self, mode: bool = True): # Encoderを訓練対象から外すためにPyTorchのtrain()を上書き
         super().train(mode)
         if bool(getattr(self.args, "encoder_0grad", True)):
             self.encoder.eval()
         return self
 
-    # Cache hooks kept as no-ops because structure analysis depends on the
-    # current repair objective and is cheap compared with the old frozen path.
-    def input_cache_stats(self):
+    """キャッシュ関係の互換関数"""
+    def input_cache_stats(self): # 入力キャッシュの状態を返す関数
         return {"entries": 0, "bytes": 0, "max_entries": 0, "max_bytes": 0}
 
-    def set_expected_input_cache_entries(self, total_entries):
+    def set_expected_input_cache_entries(self, total_entries): # 想定されるキャッシュ件数を設定する関数
         self.expected_input_cache_entries = max(int(total_entries), 0)
 
-    def estimate_input_cache_capacity_entries(self):
+    def estimate_input_cache_capacity_entries(self): # 入力キャッシュに何件保存できるか見積もる関数
         return 0
 
-    def clear_input_cache(self):
+    def clear_input_cache(self): # 入力キャッシュを空にする関数
         self.input_cache.clear()
 
-    def disable_input_cache(self):
+    def disable_input_cache(self): # 入力キャッシュを無効化する関数
         self.cache_enabled = False
         self.clear_input_cache()
 
-    def warmup_frozen_input(self, pts_xyz, cache_key=None, coord_scale=None):
-        return None
+    # def warmup_frozen_input(self, pts_xyz, cache_key=None, coord_scale=None): # 旧実装で、固定入力特徴を事前計算してキャッシュするための関数
+    #     return None
 
-    def clear_discrete_policy_terms(self):
-        return None
+    # def clear_discrete_policy_terms(self): # 離散方策に関する一時的な損失項やログ情報を消すための関数
+    #     return None
 
-    def discrete_policy_loss(self, reward):
+    """補助関数"""
+    def discrete_policy_loss(self, reward): # 離散方策に対する方策勾配風の損失を返すための関数
         return reward.new_zeros(())
 
-    def _normalize_coord_scale(self, pts_xyz, coord_scale):
+    def _normalize_coord_scale(self, pts_xyz, coord_scale): # 座標スケールと点群テンソルに合わせた形に整える補助関数
         if coord_scale is None:
             return pts_xyz.new_ones((pts_xyz.shape[0], 1, 1))
         if torch.is_tensor(coord_scale):
@@ -122,22 +126,22 @@ class Network(nn.Module):
             return scale.clamp_min(1e-9)
         return pts_xyz.new_full((pts_xyz.shape[0], 1, 1), max(float(coord_scale), 1e-9))
 
-    def _should_collect_runtime_debug(self):
+    def _should_collect_runtime_debug(self): # このStepで構造デバッグ情報を集めるか否かの判定
         return bool(
             (getattr(self.args, "verbose_step_logs", False) and getattr(self.args, "_log_this_step", True))
             or getattr(self.args, "_collect_structure_debug", False)
         )
 
-    def _timing_enabled(self):
+    def _timing_enabled(self): # Forward内で処理時間を測定するか否かの判定
         return bool(getattr(self.args, "debug_timing", False))
 
     @staticmethod
-    def _sync_if_cuda_tensor(tensor):
+    def _sync_if_cuda_tensor(tensor): # 入力テンソルがCUDA上にある場合だけ、GPU処理を同期する関数
         if torch.is_tensor(tensor) and tensor.is_cuda:
             torch.cuda.synchronize(tensor.device)
 
     @staticmethod
-    def _first_occurrence_indices(inverse, num_unique):
+    def _first_occurrence_indices(inverse, num_unique): # Unique Voxelに対して、最初に出現した点のインデックスを1つずつ取り出す
         order = torch.argsort(inverse, stable=True)
         sorted_inverse = inverse.index_select(0, order)
         first_mask = torch.ones_like(sorted_inverse, dtype=torch.bool)
@@ -148,30 +152,31 @@ class Network(nn.Module):
             raise RuntimeError("Failed to recover one representative index per voxel.")
         return first_sorted_idx
 
-    def _voxel_downsample_single(self, pts_xyz, coord_scale):
-        num_points = int(pts_xyz.shape[-1])
-        max_points = max(int(getattr(self.args, "encoder_pre_downsample_max_points", 0)), 0)
-        cdist_cap = max(int(getattr(self.args, "encoder_cdist_max_points", 0)), 0)
+    """Encoder用関数"""
+    def _voxel_downsample_single(self, pts_xyz, coord_scale): # 1つの点群サンプルに対して、Voxel DownSamplingを行う関数
+        num_points = int(pts_xyz.shape[-1]) # 点数取得
+        max_points = max(int(getattr(self.args, "encoder_pre_downsample_max_points", 0)), 0) # Encoderに入力数最大点数
+        cdist_cap = max(int(getattr(self.args, "encoder_cdist_max_points", 0)), 0) # 距離計算を使う場合の最大点数制限を取得
         if KNN_BACKEND != "pointops_cuda" and cdist_cap > 0:
             max_points = min(max_points, cdist_cap) if max_points > 0 else cdist_cap
         if max_points <= 0 or num_points <= max_points:
             full_idx = torch.arange(num_points, device=pts_xyz.device, dtype=torch.long)
             return pts_xyz, full_idx, 0.0
 
-        scale = self._normalize_coord_scale(pts_xyz.unsqueeze(0), coord_scale).reshape(-1)[0]
-        base_voxel = (
+        scale = self._normalize_coord_scale(pts_xyz.unsqueeze(0), coord_scale).reshape(-1)[0] # 座標スケールの正規化
+        base_voxel = ( # 規準となるVoxelサイズの計算
             float(getattr(self.args, "encoder_pre_downsample_voxel_scale", 1.0))
             * float(getattr(self.args, "qs", 2.0))
             / max(float(scale.item()), 1e-9)
         )
-        mins = pts_xyz.amin(dim=1, keepdim=True)
-        span = (pts_xyz.amax(dim=1, keepdim=True) - mins).amax().clamp_min(1e-9)
-        voxel_size = max(base_voxel, float(span.item()) / max(float(max_points), 1.0) ** (1.0 / 3.0))
-        growth = max(float(getattr(self.args, "encoder_pre_downsample_growth", 1.5)), 1.05)
-        max_iters = max(int(getattr(self.args, "encoder_pre_downsample_max_iters", 8)), 1)
+        mins = pts_xyz.amin(dim=1, keepdim=True) # 各座標軸ごとの最小値
+        span = (pts_xyz.amax(dim=1, keepdim=True) - mins).amax().clamp_min(1e-9) # 点群全体の空間的な広がりの算出
+        voxel_size = max(base_voxel, float(span.item()) / max(float(max_points), 1.0) ** (1.0 / 3.0)) # 実際に使うVoxelサイズの決定
+        growth = max(float(getattr(self.args, "encoder_pre_downsample_growth", 1.5)), 1.05) # Voxelサイズを大きくしていく倍率の取得
+        max_iters = max(int(getattr(self.args, "encoder_pre_downsample_max_iters", 8)), 1) # Voxelサイズ調整を試す最大反復回数の取得
 
-        rep_idx = None
-        for _ in range(max_iters):
+        rep_idx = None # 各Voxelの代表点インデックスを保存する変数の初期化
+        for _ in range(max_iters): # Voxelサイズを調整しながらDownSamplingを行う
             coords = torch.floor((pts_xyz - mins) / max(voxel_size, 1e-9)).long().transpose(0, 1).contiguous()
             unique_coords, inverse = torch.unique(coords, dim=0, sorted=True, return_inverse=True)
             voxel_count = int(unique_coords.shape[0])
@@ -186,7 +191,7 @@ class Network(nn.Module):
         coarse_xyz = pts_xyz.index_select(1, rep_idx)
         return coarse_xyz, rep_idx, voxel_size
 
-    def _propagate_encoder_features(self, full_xyz, coarse_xyz, coarse_feat):
+    def _propagate_encoder_features(self, full_xyz, coarse_xyz, coarse_feat): # 粗い点群上で得た特徴を元の点群の各点へ伝播する関数
         if coarse_xyz.shape[-1] == full_xyz.shape[-1]:
             return coarse_feat
         method = str(getattr(self.args, "encoder_feature_propagation", "knn_inverse_distance")).strip().lower()
@@ -206,7 +211,7 @@ class Network(nn.Module):
         weight = inv_dist / inv_dist.sum(dim=-1, keepdim=True).clamp_min(1e-9)
         return (feat_knn * weight.unsqueeze(1)).sum(dim=-1)
 
-    def _propagate_batch_features(self, full_xyz, coarse_xyz, coarse_counts, coarse_feat):
+    def _propagate_batch_features(self, full_xyz, coarse_xyz, coarse_counts, coarse_feat): # バッチ単位で、粗い点群特徴を元点群へ伝播する関数
         if coarse_xyz.shape[-1] == full_xyz.shape[-1]:
             return coarse_feat
         propagated = []
@@ -219,7 +224,7 @@ class Network(nn.Module):
         return torch.cat(propagated, dim=0)
 
     @staticmethod
-    def _propagate_batch_features_by_index(coarse_feat, coarse_counts, full_to_coarse_idx):
+    def _propagate_batch_features_by_index(coarse_feat, coarse_counts, full_to_coarse_idx): # 粗い点群上の特徴を元点分側へ戻す関数
         if not full_to_coarse_idx:
             return None
         propagated = []
@@ -233,7 +238,7 @@ class Network(nn.Module):
             propagated.append(coarse_feat[b:b + 1, :, :coarse_count].index_select(2, idx))
         return torch.cat(propagated, dim=0)
 
-    def _encoder_sparse_qs_mode_and_pos(self):
+    def _encoder_sparse_qs_mode_and_pos(self): # Encoder用のSparse Tensorを作る時に、どの量子化スケール・量子化モード・位置量子化倍率を使うか決める関数
         compress_key = (
             str(getattr(self.args, "compress", ""))
             .strip()
@@ -250,7 +255,7 @@ class Network(nn.Module):
             return max(float(getattr(self.args, "gpcc_effective_qs", getattr(self.args, "qs", 2.0))), 1e-9), "floor_relative", 1
         return max(float(getattr(self.args, "qs", 2.0)), 1e-9), "floor_relative", 1
 
-    def _encode(self, pts_xyz, coord_scale=None):
+    def _encode(self, pts_xyz, coord_scale=None): # 入力点群をEncoderに通し、特徴量などを返す関数
         encoder_input = pts_xyz
         encoder_feat = None
         analysis_xyz = pts_xyz
@@ -422,7 +427,8 @@ class Network(nn.Module):
             "kept_sparse_after_encoder": keep_sparse_path,
         }
 
-    def _cause_weights(self, device, dtype):
+    """各モジュール用関数"""
+    def _cause_weights(self, device, dtype): # 減員推定損失で各現員カテゴリの重みをTensorとして作る関数
         return torch.tensor(
             [
                 float(getattr(self.args, "attr_node_weight", 1.0)),
@@ -439,7 +445,7 @@ class Network(nn.Module):
         )
 
     @staticmethod
-    def _normalize_point_mask(mask, batch_size, num_points, device):
+    def _normalize_point_mask(mask, batch_size, num_points, device): # 点単位のマスクをBool Tensorに整形
         if mask is None:
             return None
         if mask.ndim == 3 and mask.shape[1] == 1:
@@ -449,7 +455,7 @@ class Network(nn.Module):
         return mask.to(device=device, dtype=torch.bool)
 
     @staticmethod
-    def _masked_point_mean(values, point_mask):
+    def _masked_point_mean(values, point_mask): # 点毎の値について、マスク対象点だけの平均を算出
         if point_mask is None:
             return values.mean()
         if point_mask.ndim == 2:
@@ -459,7 +465,7 @@ class Network(nn.Module):
         return (values * mask).sum() / denom
 
     @staticmethod
-    def _argmax_count_dict(probs, names):
+    def _argmax_count_dict(probs, names): # 確率Tensorから各点の最大確率カテゴリを選び、カテゴリ名ごとの出現回数を辞書で返す関数
         if probs is None or int(probs.numel()) <= 0:
             return {name: 0 for name in names}
         labels = probs.detach().argmax(dim=1).reshape(-1)
@@ -469,7 +475,7 @@ class Network(nn.Module):
         }
 
     @staticmethod
-    def _operation_by_cause(cause_scores, policy_probs):
+    def _operation_by_cause(cause_scores, policy_probs): # 各現員カテゴリごとに、その原因が最大になった点だけを集め、その点群に対する平均方策確率から代表的な修復操作を推定する関数
         if cause_scores is None or policy_probs is None or int(cause_scores.numel()) <= 0:
             return {}
         cause_labels = cause_scores.detach().argmax(dim=1)
@@ -495,7 +501,19 @@ class Network(nn.Module):
             }
         return result
 
-    def _build_losses(self, cause_scores, cause_logits, policy_logits, policy_teacher, cause_targets, edit_loss, point_mask=None):
+    def _patch_meta(self, pts_xyz, repair_gate, out_label): # 出力点群に対応するメタ情報を作る関数
+        B, _, N = pts_xyz.shape
+        anchor_idx = torch.arange(N, device=pts_xyz.device, dtype=torch.long).view(1, N).expand(B, N)
+        valid_mask = torch.ones((B, N), device=pts_xyz.device, dtype=torch.bool)
+        return {
+            "anchor_idx_local": anchor_idx,
+            "output_valid_mask": valid_mask,
+            "out_label": out_label,
+            "repair_gate": repair_gate.squeeze(1),
+        }
+
+    """原因推定/方策選択/編集制約損失"""
+    def _build_losses(self, cause_scores, cause_logits, policy_logits, policy_teacher, cause_targets, edit_loss, point_mask=None): # 減員推定損失、方策選択損失、編集制約損失をそれぞれ計算する関数
         weights = self._cause_weights(cause_scores.device, cause_scores.dtype)
         attr_loss = self.cost_attributor.attribution_loss(
             cause_logits,
@@ -514,18 +532,8 @@ class Network(nn.Module):
         edit_loss = edit_loss * float(getattr(self.args, "loss_repair_scale", 1.0))
         return attr_loss, policy_loss, edit_loss
 
-    def _patch_meta(self, pts_xyz, repair_gate, out_label):
-        B, _, N = pts_xyz.shape
-        anchor_idx = torch.arange(N, device=pts_xyz.device, dtype=torch.long).view(1, N).expand(B, N)
-        valid_mask = torch.ones((B, N), device=pts_xyz.device, dtype=torch.bool)
-        return {
-            "anchor_idx_local": anchor_idx,
-            "output_valid_mask": valid_mask,
-            "out_label": out_label,
-            "repair_gate": repair_gate.squeeze(1),
-        }
-
-    def forward(
+    """Network"""
+    def forward( # Network全体の順伝播を行う関数
         self,
         pts_xyz,
         pts_attr,
@@ -537,12 +545,13 @@ class Network(nn.Module):
         subtree_ref=None,
         selected_subtree_keys=None,
     ):
-        if pts_xyz.ndim != 3 or pts_xyz.shape[1] != 3:
+        """セットアップ"""
+        if pts_xyz.ndim != 3 or pts_xyz.shape[1] != 3: # 入力点群の形状チェック
             raise ValueError("pts_xyz must have shape [B, 3, N]")
 
-        full_unit_keys = None
-        selection_mask = None
-        if subtree_ref is not None:
+        full_unit_keys = None # Subtree Key保存用の変数初期化
+        selection_mask = None # 選択されたSubtreeに属する点だけを示すマスクの初期化
+        if subtree_ref is not None: # Subtree参照情報が与えられているか確認
             full_unit_keys = assign_octree_subtree_keys(pts_xyz, subtree_ref)
             if selected_subtree_keys is not None:
                 selected_subtree_keys = selected_subtree_keys.to(device=pts_xyz.device, dtype=full_unit_keys.dtype).reshape(-1)
@@ -554,28 +563,33 @@ class Network(nn.Module):
                     device=pts_xyz.device,
                 )
 
-        timing_enabled = self._timing_enabled()
+        timing_enabled = self._timing_enabled() # 時間計測を行うか否か取得
         if timing_enabled:
             self._sync_if_cuda_tensor(pts_xyz)
             runtime_t0 = time.time()
-        encode_state = self._encode(pts_xyz, coord_scale=coord_scale)
+            
+        """Encoder"""
+        encode_state = self._encode(pts_xyz, coord_scale=coord_scale) # 入力点群を_encodeに渡して特徴抽出を行う
         if timing_enabled:
             self._sync_if_cuda_tensor(pts_xyz)
             runtime_encode_end = time.time()
-        fused_feat = encode_state["fused_feat"]
-        analysis_xyz = encode_state["analysis_xyz"]
-        analysis_counts = encode_state["analysis_counts"]
-        keep_sparse_path = encode_state["kept_sparse_after_encoder"]
-        analysis_unit_keys = assign_octree_subtree_keys(analysis_xyz, subtree_ref) if subtree_ref is not None else None
-        analysis_selection_mask = subtree_membership_mask(analysis_unit_keys, selected_subtree_keys) if analysis_unit_keys is not None and selected_subtree_keys is not None else None
+        fused_feat = encode_state["fused_feat"] # 統合抽出
+        analysis_xyz = encode_state["analysis_xyz"] # Octree構造解析に使う点群座標を取り出す
+        analysis_counts = encode_state["analysis_counts"] # analysis_xyzの有効点数をバッチごとに取り出す
+        keep_sparse_path = encode_state["kept_sparse_after_encoder"] # Encoder後もSparse Tensor側の点群を規準に処理するかどうかを取り出す
+        analysis_unit_keys = assign_octree_subtree_keys(analysis_xyz, subtree_ref) if subtree_ref is not None else None # 解析用点群に対してSubtree Keyを割り当てる
+        analysis_selection_mask = subtree_membership_mask(analysis_unit_keys, selected_subtree_keys) if analysis_unit_keys is not None and selected_subtree_keys is not None else None # 解析用点群に対して、選択されたSubtreeに属する点だけを示すマスクを作る
 
-        if timing_enabled:
+        if timing_enabled: # 時間計測が有効か否か
             self._sync_if_cuda_tensor(pts_xyz)
             runtime_structure_start = time.time()
             runtime_diagnosis_total = 0.0
             runtime_attribution_total = 0.0
             runtime_decision_total = 0.0
-        if keep_sparse_path:
+
+        if keep_sparse_path: # Sparse Tensor側の点群を規準として構造解析を行うか否か
+            """変数の初期化"""
+            print(f"Keep Sparse Path")
             structure_feat_full_list = []
             subtree_scores_full_list = []
             policy_probs_full_list = []
@@ -597,49 +611,58 @@ class Network(nn.Module):
             policy_logits = None
             cause_targets = None
             structure = None
-
-            for b in range(pts_xyz.shape[0]):
-                analysis_count = analysis_counts[b]
-                analysis_xyz_b = analysis_xyz[b:b + 1, :, :analysis_count]
-                fused_feat_b = fused_feat[b:b + 1, :, :analysis_count]
-                coord_scale_b = None if coord_scale is None else coord_scale[b:b + 1]
+            
+            for b in range(pts_xyz.shape[0]): # バッチ内の各点群サンプルを1つずつ処理
+                analysis_count = analysis_counts[b] # バッチb番目の解析用点群を取得
+                analysis_xyz_b = analysis_xyz[b:b + 1, :, :analysis_count] # 解析用点群だけを取り出す
+                fused_feat_b = fused_feat[b:b + 1, :, :analysis_count] # Encoder統合特徴だけを取り出す
+                coord_scale_b = None if coord_scale is None else coord_scale[b:b + 1] # 座標スケールだけを取り出す
 
                 if timing_enabled:
                     self._sync_if_cuda_tensor(pts_xyz)
                     runtime_diag_start = time.time()
-                structure_b = self.structure_analyzer(analysis_xyz_b, coord_scale=coord_scale_b)
+
+                """Octree構造解析器"""
+                structure_b = self.structure_analyzer(analysis_xyz_b, coord_scale=coord_scale_b) # 解析用点群に対して、Octree構造解析を行う
                 if timing_enabled:
                     self._sync_if_cuda_tensor(pts_xyz)
                     runtime_diag_end = time.time()
                     runtime_diagnosis_total += runtime_diag_end - runtime_diag_start
-                structure_feat_b = structure_b["features"].to(device=pts_xyz.device, dtype=fused_feat_b.dtype)
-                cause_targets_b = structure_b["cause_targets"].to(device=pts_xyz.device, dtype=fused_feat_b.dtype)
-                cause_input_b = torch.cat([fused_feat_b, structure_feat_b], dim=1)
+                structure_feat_b = structure_b["features"].to(device=pts_xyz.device, dtype=fused_feat_b.dtype) # 構造解析結果から構造特徴を取り出す
+                
+                """圧縮非効率原因推定器"""
+                cause_targets_b = structure_b["cause_targets"].to(device=pts_xyz.device, dtype=fused_feat_b.dtype) # 構造解析結果から原因教師を取り出し、DeviceとDtypeを合わせることで、原因推定損失の教師信号として扱う
+                cause_input_b = torch.cat([fused_feat_b, structure_feat_b], dim=1) # Encoder統合特徴と構造特徴をチャネル方向に結合
                 if timing_enabled:
                     self._sync_if_cuda_tensor(pts_xyz)
                     runtime_attr_start = time.time()
-                cause_scores_b, cause_logits_b = self.cost_attributor(cause_input_b)
+                cause_scores_b, cause_logits_b = self.cost_attributor(cause_input_b) # 各点の圧縮非効率原因スコアとlogitsを推定
                 if timing_enabled:
                     self._sync_if_cuda_tensor(pts_xyz)
                     runtime_attr_end = time.time()
                     runtime_attribution_total += runtime_attr_end - runtime_attr_start
                     runtime_decision_start = time.time()
-                aggregated_b = self.cause_aggregator(
+                    
+                """原因スコア集約器"""
+                aggregated_b = self.cause_aggregator( # 原因スコアを点単位からSubtree/Repair Unit単位へ集約する
                     pts_xyz=analysis_xyz_b,
                     cause_scores=cause_scores_b,
                     cause_targets=cause_targets_b,
                     unit_keys=None if analysis_unit_keys is None else analysis_unit_keys[b:b + 1, :analysis_count],
                 )
-                subtree_scores_b = aggregated_b["scores"]
-                subtree_targets_b = aggregated_b["targets"]
-                repair_priority_b = aggregated_b["priority"].to(device=pts_xyz.device, dtype=fused_feat_b.dtype)
-                policy_input_b = torch.cat([fused_feat_b, structure_feat_b, subtree_scores_b, repair_priority_b], dim=1)
-                policy_probs_b, policy_logits_b = self.policy_module(policy_input_b)
+                subtree_scores_b = aggregated_b["scores"] # Subtree原因スコア
+                subtree_targets_b = aggregated_b["targets"] # Subtree教師
+                repair_priority_b = aggregated_b["priority"].to(device=pts_xyz.device, dtype=fused_feat_b.dtype) # DeviceとDtypeを合わせる
+                
+                """方策選択器"""
+                policy_input_b = torch.cat([fused_feat_b, structure_feat_b, subtree_scores_b, repair_priority_b], dim=1) # 統合特徴、構造特徴、原因スコア、修復優先度をチャネル方向に結合
+                policy_probs_b, policy_logits_b = self.policy_module(policy_input_b) # 各点又は各Repai Unitに対して修復操作の確率をLogitsを出す
                 if timing_enabled:
                     self._sync_if_cuda_tensor(pts_xyz)
                     runtime_decision_end = time.time()
                     runtime_decision_total += runtime_decision_end - runtime_decision_start
 
+                """点操作前処理"""
                 full_xyz_b = pts_xyz[b:b + 1]
                 if analysis_xyz_b.shape[-1] == full_xyz_b.shape[-1]:
                     structure_feat_full_list.append(structure_feat_b)
@@ -667,9 +690,12 @@ class Network(nn.Module):
                     lowprob_proxy_full_list.append(self._propagate_encoder_features(full_xyz_b, analysis_xyz_b, lowprob_proxy_b))
                     quant_proxy_full_list.append(self._propagate_encoder_features(full_xyz_b, analysis_xyz_b, quant_proxy_b))
 
+                """平均値の保存"""
                 cause_scores_means.append(cause_scores_b.mean(dim=2))
                 subtree_scores_means.append(subtree_scores_b.mean(dim=2))
                 policy_probs_means.append(policy_probs_b.mean(dim=2))
+                
+                """内部損失の計算"""
                 if compute_internal_losses is None:
                     compute_losses_b = self.training
                 else:
@@ -692,11 +718,13 @@ class Network(nn.Module):
                         point_mask=analysis_mask_b,
                     ))
 
-            structure_feat_full = torch.cat(structure_feat_full_list, dim=0)
-            subtree_scores_full = torch.cat(subtree_scores_full_list, dim=0)
-            policy_probs_full = torch.cat(policy_probs_full_list, dim=0)
-            repair_priority_full = torch.cat(repair_priority_full_list, dim=0)
-            structure = {
+            """情報結合"""
+            structure_feat_full = torch.cat(structure_feat_full_list, dim=0) # サンプルごとに保存していた全点群側の構造特徴をバッチ次元で結合
+            subtree_scores_full = torch.cat(subtree_scores_full_list, dim=0) # サンプルごとに保存していた全点群側のSubtree原因スコアを、バッチ次元で結合
+            policy_probs_full = torch.cat(policy_probs_full_list, dim=0) # サンプルごとに保存していた全点群側の修復方策確率を、バッチ次元で結合
+            repair_priority_full = torch.cat(repair_priority_full_list, dim=0) # サンプルごとに保存していた全点群側の修復優先度を、バッチ次元で結合
+            
+            structure = { # Actuatorや診断値計算で使う構造情報の辞書設定
                 "features": structure_feat_full,
                 "snap_delta": torch.cat(snap_delta_full_list, dim=0),
                 "single_proxy_full": torch.cat(single_proxy_full_list, dim=0),
@@ -704,6 +732,7 @@ class Network(nn.Module):
                 "lowprob_proxy_full": torch.cat(lowprob_proxy_full_list, dim=0),
                 "quant_proxy_full": torch.cat(quant_proxy_full_list, dim=0),
             }
+
             cause_mean = torch.stack(cause_scores_means, dim=0).mean(dim=0).squeeze(0).detach().cpu()
             subtree_mean = torch.stack(subtree_scores_means, dim=0).mean(dim=0).squeeze(0).detach().cpu()
             policy_mean = torch.stack(policy_probs_means, dim=0).mean(dim=0).squeeze(0).detach().cpu()
@@ -765,8 +794,10 @@ class Network(nn.Module):
         if timing_enabled:
             self._sync_if_cuda_tensor(pts_xyz)
             runtime_structure_end = time.time()
-        actuator_input = torch.cat([structure_feat_full, subtree_scores_full, policy_probs_full, repair_priority_full], dim=1)
-        pts_out, final_w, edit_loss, actuator_stats = self.actuator(
+
+        """点操作実行"""
+        actuator_input = torch.cat([structure_feat_full, subtree_scores_full, policy_probs_full, repair_priority_full], dim=1) # 構造特徴、原因スコアなどをチャネル方向に結合
+        pts_out, final_w, edit_loss, actuator_stats = self.actuator( # 実際に点操作を行う
             pts_xyz=pts_xyz,
             structure=structure,
             cause_scores=subtree_scores_full,
@@ -780,6 +811,7 @@ class Network(nn.Module):
             self._sync_if_cuda_tensor(pts_xyz)
             runtime_actuator_end = time.time()
 
+        """内部損失の計算"""
         if compute_internal_losses is None:
             compute_internal_losses = self.training
         if compute_internal_losses:
@@ -806,17 +838,17 @@ class Network(nn.Module):
         out_label = pts_xyz.new_zeros((pts_xyz.shape[0], pts_xyz.shape[2]))
         repair_gate = actuator_stats["repair_gate"]
 
-        # Extra scalar diagnostics mapped onto the legacy return slots used by
-        # the training script and plots.
-        single_chain_score = self._masked_point_mean(structure["single_proxy_full"].pow(2), selection_mask)
-        lowprob_score = self._masked_point_mean(structure["lowprob_proxy_full"], selection_mask)
-        lowprob_ratio = self._masked_point_mean(
+        """問題スコアの算出"""
+        single_chain_score = self._masked_point_mean(structure["single_proxy_full"].pow(2), selection_mask) # single_proxy_fullを二乗し、選択マスクがある場合はその範囲だけで平均して、単一子ノードの強さを表すスカラー値を算出
+        lowprob_score = self._masked_point_mean(structure["lowprob_proxy_full"], selection_mask) # 低確率施入パターンのプロキシ値を、選択マスクがある場合はその範囲だけで平均して問題度を表すスカラー値にする
+        lowprob_ratio = self._masked_point_mean( # 低確率Occupancyと判定される点の割合を計算する処理を開始
             (structure["lowprob_proxy_full"] > 0.5).to(dtype=pts_xyz.dtype),
             selection_mask,
         )
-        node_score = self._masked_point_mean(structure["node_proxy_full"], selection_mask)
-        quant_score = self._masked_point_mean(structure["quant_proxy_full"], selection_mask)
-
+        node_score = self._masked_point_mean(structure["node_proxy_full"], selection_mask) # Octree Node数や局所Node構造の問題を表す変数で、Node系の構造問題スコアにする
+        quant_score = self._masked_point_mean(structure["quant_proxy_full"], selection_mask) # 量子化由来の問題を表す変数で、量子化の構造問題スコアにする
+        
+        """ログ"""
         if self._should_collect_runtime_debug():
             with torch.no_grad():
                 if not keep_sparse_path:

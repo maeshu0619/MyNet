@@ -475,8 +475,10 @@ def run_surrogate_pretrain(
 
     registry_loaded, registry_path = load_surrogate_registry_state(args, loss, writer) # 指定形式の共有Surrogate重みを最優先で読み込む
     cache_loaded, cache_path = (False, None) # fingerprint cache読込結果を初期化する
-    if not registry_loaded:
+    if not registry_loaded and bool(getattr(args, "surrogate_pretrain_legacy_cache_fallback", False)):
         cache_loaded, cache_path = _load_surrogate_pretrain_state(args, loss, seq_datasets, writer) # 共有重みが無い場合だけ既存fingerprint cacheを読む
+        if cache_loaded:
+            writer.write(f"Surrogate Model is found!! path={cache_path}, source=legacy_cache") # 旧cacheから読んだ場合も端的にログへ残す
     if steps <= 0:
         if registry_loaded or cache_loaded:
             _set_loaded_surrogate_joint_lr(args, loss, writer) # 事前学習なしでも読込済みSurrogateを本学習LRへ切り替える
