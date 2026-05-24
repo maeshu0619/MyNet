@@ -56,6 +56,7 @@ from models.utils.training.episode_metrics import *
 from models.utils.training.checkpoint_metrics import *
 from models.utils.training.actual_compression_guard import apply_actual_compression_guard
 from models.utils.training.for_better_logging import *
+from models.utils.training.train_flow import * # train loopのStage固定、Subtree入力、1Subtree選択、圧縮目的合成、Epoch窓選択を使う
 
 from models.utils.surrogate.pretrain import *
 
@@ -95,7 +96,7 @@ def train(model, args, loss, writer, plot, notifier=None):
     ckpt_dir = os.path.join(output_dir)
     if not os.path.exists(ckpt_dir):
         os.makedirs(ckpt_dir)
-    
+
     """学習セットアップ"""
     optimizer, scheduler_steplr = build_optimizer_and_scheduler( model, args, writer) # モデルの重み更新に使うOptimizerと学習率を変えるStepLR schedduler
     amp_state = setup_amp( model, args, writer) # CUDA利用可否
@@ -127,9 +128,9 @@ def train(model, args, loss, writer, plot, notifier=None):
     global_epoch = 0
     for episode in range(args.episodes): # Episode開始
         writer.write(f"◆◆◆ Episode {episode + 1} / {args.episodes} ◆◆◆")
-        
+
         """Stage変更"""
-        current_stage = resolve_training_stage_for_episode(args, episode) # 現在のEpisode番号から学習ステージを決め、形状重視、圧縮重視、Joint学習重視などの損失構成を切り替える
+        current_stage = resolve_compression_fixed_stage(args) # EpisodeでStageを切り替えず、圧縮損失が常に効くjoint Stageへ固定する
         args.training_stage = current_stage
         if current_stage != prev_stage: # 前EpisodeとStageが異なる場合
             stage_factors = stage_loss_factors(args) # 現在Stageでっ各損失をどの比率で扱うか取得する
@@ -137,7 +138,7 @@ def train(model, args, loss, writer, plot, notifier=None):
             writer.write( "Stage Loss Factors: " f"geom={stage_factors['geom']}, com={stage_factors['com']}, " f"attr={stage_factors['attr']}, policy={stage_factors['policy']}, repair={stage_factors['repair']}")
             log_for_better_event( for_better_path, "stage_switch", episode=episode + 1, stage=current_stage, stage_factors=stage_factors)
             prev_stage = current_stage
-            
+
         model.train()
 
         """変数の初期化"""
@@ -150,19 +151,20 @@ def train(model, args, loss, writer, plot, notifier=None):
             writer.write(f"⦿⦿⦿ Epoch {epoch + 1}/{num_seq} : {seq_dir} ⦿⦿⦿")
 
             """基本情報のセットアップ"""
-            loader = torch.utils.data.DataLoader(dataset, **loader_kwargs) # 現在のDatasetから点群ファイルを順に読み出す
-            num_steps = len(dataset)
+            active_dataset = apply_epoch_file_window(dataset, args, global_epoch) # Epochごとにmax_files件の窓を順番に進め、同じ先頭30件の反復を避ける
+            loader = torch.utils.data.DataLoader(active_dataset, **loader_kwargs) # 現在Epochの窓Datasetから点群ファイルを順に読み出す
+            num_steps = len(active_dataset)
             epoch_has_optimizer_step = False
             epoch_metric_sums = None
 
             for step, pts in enumerate(loader): # Step開始
                 """基本情報のセットアップ"""
                 st_step = time.time()
-                file_path = dataset.files[step]
+                file_path = active_dataset.files[step]
                 cache_key = make_step_cache_key(file_path, args) # ファイルパスと設定から一意なキーを作り、前処理結果、Codec結果、Patch情報などのキャッシュ参照に使う
                 raw_pts_num = int(pts.shape[1] if pts.dim() == 3 else pts.shape[0]) # 受け取ったデータの元点数を数え、点数比較やログに使用
                 subtree_mode = bool(getattr(args, "train_patch_subset_enable", False)) # Octree Subtreeの部分学修を行うか否かの判定
-                
+
                 """ログ判定"""
                 log_this_step = should_log_step(step + 1, num_steps, args.print_rate) # このStepで通常ログを出すか判定
                 profile_this_step = should_log_step(global_train_step + 1, max(int(getattr(args, "_total_train_steps_estimate", num_steps)), 1), int(getattr(args, "profile_interval", 100))) # Profileログを出すStepあ否かの判定
@@ -176,16 +178,16 @@ def train(model, args, loss, writer, plot, notifier=None):
                         and profile_this_step
                     )
                 )
-                
+
                 """ログ用の変数セット"""
                 args._global_train_step = int(global_train_step) # 現在の累積Step番号を保存
                 args._log_this_step = False
                 sparsepcgc_csv_debug = ( str(getattr(args, "compress", "")).strip().lower().replace("-", "").replace("_", "") == "sparsepcgc" and bool(getattr(args, "save_compression_metric_csv", True))) # Sparse PCGC専用ログ
                 operation_csv_debug = bool( getattr(args, "save_operation_metric_csv", getattr(args, "save_operation_metrics_csv", True))) # 点操作メトリクスCSVを保存するか判定し、点移動量や追加/削除などのDebug収集条件に使用
-                args._collect_sparsepcgc_debug = bool(log_this_step or profile_this_step or sparsepcgc_csv_debug)
+                args._collect_sparsepcgc_debug = bool(sparsepcgc_csv_debug and should_collect_sparsepcgc_hard_debug(args, log_this_step=log_this_step, profile_this_step=profile_this_step, global_step=global_train_step)) # SparsePCGCの重いhard統計は毎Stepではなく診断間隔だけ収集する
                 args._collect_structure_debug = bool( log_this_step or profile_this_step or operation_csv_debug or sparsepcgc_add_experiment_active(args))
                 detail_log_this_step = False
-                
+
                 """学習設定"""
                 if timing_enabled and use_cuda and torch.cuda.is_available(): # GPU計測のためのリセット
                     torch.cuda.reset_peak_memory_stats()
@@ -194,11 +196,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                     sync_for_timing(use_cuda) # GPUを使用している場合は、正確な時間計測のためにGPUの処理が完了するのを待つ
                     timing_data_start = time.time() # 時間計測開始
                 if subtree_mode: # Subtree部分学習モード
-                    input_pcd = pts if pts.dim() == 3 else pts.unsqueeze(0) # 形式変換
-                    input_pcd = downsample_input_batch(input_pcd, args, cache_key) # 点数が多すぎる場合に入力点群を間引き、GPUメモリ消費と計算時間を抑える
-                    if use_cuda:
-                        input_pcd = input_pcd.cuda(non_blocking=True) # 点群テンソルをGPUへ転送
-                    input_pcd = rearrange(input_pcd, 'b n c -> b c n').contiguous() # 形式変換
+                    input_pcd = prepare_subtree_input_pcd(pts, use_cuda) # 入力点群を間引かず全点のままSubtree分割用形式へ変換する
                     input_xyz = input_pcd[:, :3, :] # 座標情報のみ抽出
                 elif args.split2patch: # パッチ分割モード
                     input_pcd = pts if pts.dim() == 3 else pts.unsqueeze(0) # 形式変換
@@ -227,10 +225,8 @@ def train(model, args, loss, writer, plot, notifier=None):
                 stage_factors = stage_loss_factors(args) # 現在の学習Stageに応じた損失項の比率
                 if compression_primary_mode and not bool(getattr(args, "cp_use_stage_factors", False)):
                     stage_factors = {name: 1.0 for name in stage_factors} # 全Stage係数を全て1.0にする
-                # compute_compression = True if compression_primary_mode else stage_factors["com"] != 0.0 # このStepで圧縮損失を実際に計算するか決める
-                compute_compression = True
-                # refresh_actual_gen = not bool(getattr(args, "disable_actual_codec_during_train", False)) # 学習中に出力点群を実Codecに通して実圧縮結果を更新するか決める
-                refresh_actual_gen = True
+                compute_compression = True # StageやModeに関係なく毎Stepで圧縮損失を計算する
+                refresh_actual_gen = True # 実Codec/Surrogateの出力側更新を毎Step許可する
 
                 """変数の初期化と設定"""
                 subset_step = False # 部分学習か否か
@@ -257,10 +253,11 @@ def train(model, args, loss, writer, plot, notifier=None):
                     subset_enabled = True # 部分集合学習を有効にする
                     input_attr_full = input_pcd[:, 3:, :].contiguous() if input_pcd.shape[1] > 3 else None # 属性のとりだし
                     subtree_depth_meta = sample_train_subtree_depth( input_xyz, args, global_step=global_train_step, cache_key=cache_key) # Octree深度の決定
-                    requested_subtree_depth = int(subtree_depth_meta["depth"]) # 深度を整数で取り出す
+                    subtree_depth_meta, requested_subtree_depth = maybe_lower_subtree_depth_for_large_input( subtree_depth_meta, raw_pts_num, args) # 大点群時は点を捨てずにSubtree深度だけ1段階浅くする
+                    requested_subtree_depth = int(requested_subtree_depth) # 調整後のSubtree深度を整数で取り出す
                     min_subtree_points = max(int(getattr(args, "train_subtree_min_points", 1)), 1) # Subtreeとして採用する点数の最小点数
                     subtree_group_state = build_octree_subtree_groups_with_retry( input_xyz, args, requested_subtree_depth, min_subtree_points, allow_largest_fallback=True) # 入力点群から指定深度のOctree Subtree群を作る
-                    
+
                     """Subtree情報"""
                     subtree_ref = subtree_group_state["subtree_ref"] # Subtree参照情報の抽出
                     if subtree_ref is None:
@@ -273,7 +270,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                     all_subtree_keys = subtree_group_state["unique_keys"] # 入力点群内に存在する全Subtreeの識別Keyを取り出す
                     subtree_index_lists = subtree_group_state["index_lists"] # 各Subtree内の点インデックス
                     all_groups = subtree_group_state["all_groups"] # 全Subtreeに関して、情報を抜き出す
-                    
+
                     """Subtree決定"""
                     total_subtree_count = int(all_subtree_keys.numel()) # 入力点群から作られたSubtreeの総数を数える
                     eligible_groups = list(subtree_group_state.get("eligible_groups", [])) # 最小点数条件などを満たした学習候補Subtreeを取り出す
@@ -297,10 +294,11 @@ def train(model, args, loss, writer, plot, notifier=None):
                     selected_subtree_keys = candidate_subtree_keys # 初期状態では候補Subtreeを全て選択対象にする
                     if eligible_subtree_count > 0 and not is_anchor_step:
                         selected_subtree_keys = select_octree_subtree_keys(candidate_subtree_keys, global_train_step, args)
+                        selected_subtree_keys = select_single_subtree_key( candidate_subtree_keys, selected_subtree_keys, global_train_step, args, cache_key) # 1StepでForwardするSubtreeをランダムに1個へ絞る
                     selected_subtree_count = int(selected_subtree_keys.numel()) # 実際に選択されたSubtree数を数える
                     subset_step = (not is_anchor_step) and selected_subtree_count < eligible_subtree_count # 候補の一部だけを使ったStepか否かの判定
                     encoder_debug_chunks = [] if detail_log_this_step else None # 詳細ログ対象Stepなら、各Subtree Forward時のEncoder Debugを保存するリスト
-                    
+
                     """Selected Groupsの作成"""
                     selected_groups = None
                     if not is_anchor_step: # Anchorでないとき
@@ -319,7 +317,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                     else:
                         subtree_point_counts = [int(point_idx.numel()) for _, point_idx in selected_groups]
                         subtree_loss_scope = "subtree_output_vs_subtree_input"
-                        
+
                     """ログ"""
                     if log_this_step and bool(getattr(args, "train_patch_subset_log", True)):
                         if is_anchor_step:
@@ -361,7 +359,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                             f"loss_scope={loss_scope}"
                             f"{octree_stat_text}"
                         )
-                    
+
                     """損失項の初期化"""
                     L_geom = input_xyz.new_zeros(())
                     L_com = input_xyz.new_zeros(())
@@ -377,7 +375,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                     gen_xyz = None
                     final_w = None
                     out_label = None
-                    
+
                     """モデルの実行"""
                     prev_log_flag = getattr(args, "_log_this_step", False)
                     try:
@@ -389,11 +387,11 @@ def train(model, args, loss, writer, plot, notifier=None):
                             with autocast_ctx: # 全体点群をモデルに入力し、出力点群と各種補助損失・点編集重みを得る
                                 """モデルの実行"""
                                 gen_pts, L_attr, L_policy, L_actuator, final_w, Lp_out, La_fit, La_rep, out_label = model.forward(
-                                    input_xyz, 
-                                    input_attr_full, 
-                                    cache_key=cache_key, 
+                                    input_xyz,
+                                    input_attr_full,
+                                    cache_key=cache_key,
                                     return_attr_output=False,
-                                    subtree_ref=subtree_ref, 
+                                    subtree_ref=subtree_ref,
                                     selected_subtree_keys=None
                                     )
                             if final_w is not None and not torch.isfinite(final_w).all(): # final重みにNanやinfが混ざっていないか確認
@@ -412,17 +410,17 @@ def train(model, args, loss, writer, plot, notifier=None):
                             with autocast_ctx:
                                 """形状損失の計算"""
                                 L_geom = loss.get_geometry_loss( args, gen_pts=gen_xyz, gt_pts=input_xyz[:, :3, :], final_w=final_w_for_loss, out_label=out_label)
-                                
+
                                 """圧縮損失の計算"""
                                 if stage_factors["com"] != 0.0:
                                     compression_gen_xyz, noise_debug = prepare_compression_points( gen_xyz, args, model, collect_stats=bool(log_this_step or profile_this_step)) # 圧縮損失用の入力点群を作る
                                     L_com, loss_bit, loss_single, loss_nodes, _, _ = loss.get_compression_loss( # 圧縮損失の計算
-                                        args, 
-                                        gen_xyz=compression_gen_xyz, 
-                                        gt_xyz=input_xyz[:, :3, :], 
-                                        final_w=final_w_for_loss, 
-                                        cache_key=cache_key, 
-                                        refresh_actual_gen=refresh_actual_gen, 
+                                        args,
+                                        gen_xyz=compression_gen_xyz,
+                                        gt_xyz=input_xyz[:, :3, :],
+                                        final_w=final_w_for_loss,
+                                        cache_key=cache_key,
+                                        refresh_actual_gen=refresh_actual_gen,
                                         actual_gen_xyz=gen_xyz
                                         )
                                 else:
@@ -450,9 +448,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 with autocast_ctx:
                                     """モデルの実行"""
                                     gen_subtree_pts, L_attr_sub, L_policy_sub, L_actuator_sub, final_w_sub, Lp_out_sub, La_fit_sub, La_rep_sub, out_label_sub = model.forward(
-                                        subtree_xyz, 
-                                        subtree_attr, 
-                                        cache_key=subtree_cache_key, 
+                                        subtree_xyz,
+                                        subtree_attr,
+                                        cache_key=subtree_cache_key,
                                         return_attr_output=False
                                         )
 
@@ -478,12 +476,12 @@ def train(model, args, loss, writer, plot, notifier=None):
                                         compression_subtree_xyz, noise_debug_sub = prepare_compression_points( gen_subtree_xyz, args, model, collect_stats=bool(log_this_step or profile_this_step)) # Subtree出力を圧縮損失用に整える
                                         subtree_noise_debug_values.append(noise_debug_sub) # 現在Subtreeのノイズ情報を保持する
                                         L_com_sub, loss_bit_sub, loss_single_sub, loss_nodes_sub, _, _ = loss.get_compression_loss( # 損失計算
-                                            args, 
+                                            args,
                                             gen_xyz=compression_subtree_xyz,
-                                            gt_xyz=subtree_xyz[:, :3, :], 
-                                            final_w=final_w_sub_loss, 
-                                            cache_key=subtree_cache_key, 
-                                            refresh_actual_gen=refresh_actual_gen, 
+                                            gt_xyz=subtree_xyz[:, :3, :],
+                                            final_w=final_w_sub_loss,
+                                            cache_key=subtree_cache_key,
+                                            refresh_actual_gen=refresh_actual_gen,
                                             actual_gen_xyz=gen_subtree_xyz
                                             )
                                         accumulate_compression_terms( subtree_compression_term_sums, getattr(loss, "last_compression_terms", {}) or {}, 1.0 / num_selected) # 現在Subtreeで計算された圧縮損失内訳を1/Subtree数の重みをつけて、Step全体の圧縮損失内訳に累積する
@@ -493,7 +491,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                                         loss_bit_sub = zero
                                         loss_single_sub = zero
                                         loss_nodes_sub = zero
-                                
+
                                 """損失項の計算"""
                                 L_geom = L_geom + (L_geom_sub / num_selected)
                                 L_com = L_com + (L_com_sub / num_selected)
@@ -546,24 +544,14 @@ def train(model, args, loss, writer, plot, notifier=None):
 
                 """圧縮損失の合成"""
                 terms = getattr(loss, "last_compression_terms", {}) or {} # 直前の圧縮損失の内訳の取得
-                actual_total_bit_backend = uses_actual_total_bit_objective(args) # 圧縮目的をL_comの単一のビット数項にするか否か
-                if actual_total_bit_backend: # L_comをそのまま
-                    L_com_objective = float(getattr(args, "w_com", 1.0)) * L_com
-                else: # 内訳を重み付きで合成
-                    bit_term = terms.get("bit", L_com.new_zeros(()))
-                    single_term = terms.get("single", L_com.new_zeros(()))
-                    node_term = terms.get("node", L_com.new_zeros(()))
-                    bpn_term = terms.get("bpn", L_com.new_zeros(()))
-                    sparsepcgc_term = terms.get("sparsepcgc", L_com.new_zeros(()))
-                    lowprob_term = La_fit if torch.is_tensor(La_fit) else L_com.new_zeros(())
-                    L_com_objective = float(getattr(args, "w_com", 1.0)) * ( float(getattr(args, "com_bit", 0.0)) * bit_term + float(getattr(args, "com_sin", 0.0)) * single_term + float(getattr(args, "com_node", 0.0)) * node_term + float(getattr(args, "com_bpn", 0.0)) * bpn_term + float(getattr(args, "com_sparsepcgc", 0.0)) * sparsepcgc_term + float(getattr(args, "com_lowprob", 0.0)) * lowprob_term)
-                
+                L_com_objective = compose_train_compression_objective(args, terms, L_com, La_fit) # actual/surrogateではL_com直結と内訳合成を半々で混ぜる
+
                 """形状損失を合成"""
                 legacy_L_downstream = ( stage_factors["geom"] * args.w_geom * L_geom + stage_factors["com"] * L_com_objective) # 形状損失と圧縮損失の合成
-                
+
                 """属性/方策/操作損失を合成"""
                 legacy_L_total = ( legacy_L_downstream + stage_factors["attr"] * args.w_attr * L_attr + stage_factors["policy"] * args.w_policy * L_policy + stage_factors["repair"] * args.w_actuator * L_actuator)
-                
+
                 """損失の合成"""
                 L = legacy_L_total
                 L_downstream = legacy_L_downstream
@@ -600,7 +588,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                     skip_optimizer_reason = "actual_codec_fallback_to_proxy"
                     comp_debug["optimizer_skip_reason"] = skip_optimizer_reason
                     loss.last_compression_debug = comp_debug
-                    
+
                 """CSV"""
                 compression_metric_row = build_compression_metric_row( args, global_step=global_train_step, episode=episode, epoch=epoch, step=step, stage=current_stage, comp_debug=comp_debug, L_com=L_com) # 圧縮StepCSVに書き込む1行を作る
                 operation_metric_row = build_operation_metric_row( args, global_step=global_train_step, episode=episode, epoch=epoch, step=step, stage=current_stage, comp_debug=comp_debug, structure_debug=structure_debug, edit_stats=train_edit_stats) # 点操作StepCSVに書き込む1行を作る
@@ -625,9 +613,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                 if timing_enabled:
                     sync_for_timing(use_cuda)
                     timing_loss_end = time.time()
-                
+
                 """勾配確認"""
-                # backward_and_measure("geom", args.w_geom * L_geom, model, optimizer, writer, args)                
+                # backward_and_measure("geom", args.w_geom * L_geom, model, optimizer, writer, args)
                 # backward_and_measure("com", args.w_com  * L_com,  model, optimizer, writer, args)
                 # backward_and_measure("attr", args.w_attr * L_attr, model, optimizer, writer, args)
                 # backward_and_measure("policy" , args.w_policy  * L_policy,  model, optimizer, writer, args)
@@ -640,8 +628,10 @@ def train(model, args, loss, writer, plot, notifier=None):
                 if total_loss_finite: # 総損失がInfでないとき、更新前パラメータを記録
                     param_update_snapshots = capture_param_update_snapshots( args, model, step + 1, num_steps)
                 if skip_optimizer_reason is not None: # Optimizer更新を止める必要があるか否かの判定
+                    writer.write( f"Skip Optimizing!!! reason={skip_optimizer_reason}; " f"episode={episode + 1}, epoch={epoch + 1}, step={step + 1}/{num_steps}") # Skip理由と位置を同じ行に出す
                     writer.write( "Skipped optimizer step because actual codec teacher fell back to proxy at " f"episode={episode + 1}, epoch={epoch + 1}, step={step + 1}/{num_steps}; " "this prevents proxy-only updates from replacing real-compression imitation.")
                 elif not total_loss_finite:
+                    writer.write( f"Skip Optimizing!!! reason=non_finite_total_loss; " f"episode={episode + 1}, epoch={epoch + 1}, step={step + 1}/{num_steps}, L={float(L.detach().float().mean().cpu()) if torch.is_tensor(L) else float('nan'):.6g}") # 非有限Lossの理由と値を同じ行に出す
                     writer.write( f"Skipped optimizer step due to non-finite total loss at " f"episode={episode + 1}, epoch={epoch + 1}, step={step + 1}/{num_steps}.")
                 elif amp_scaler_enabled: # AMP用の逆伝播・更新処理へ進む
                     """AMP更新/勾配"""
@@ -667,6 +657,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                     if step_completed: # 成功した場合の処理
                         consecutive_amp_skips = 0
                     else:
+                        writer.write( f"Skip Optimizing!!! reason=amp_found_inf_or_scale_drop; " f"found_inf={found_inf:.6g}, scale_before={scale_before:.6g}, scale_after={scale_after:.6g}, " f"episode={episode + 1}, epoch={epoch + 1}, step={step + 1}/{num_steps}") # AMP skipの理由とscale状態を同じ行に出す
                         consecutive_amp_skips += 1 # Skipの連続回数を1回増やす
                         if consecutive_amp_skips >= amp_overflow_patience: # AMP Overflowが設定回数以上連続したかの判定
                             consecutive_amp_skips = 0
@@ -694,14 +685,18 @@ def train(model, args, loss, writer, plot, notifier=None):
                     sync_for_timing(use_cuda)
                     timing_step_end = time.time()
                 epoch_has_optimizer_step = epoch_has_optimizer_step or step_completed # このEpoch内で一回でも更新が成功したかを記録
-                
+
                 """損失ログの記録"""
                 if epoch_metric_sums is None:
                     epoch_metric_sums = new_metric_sums(L.device, plot.num_loss) # Epoch内で初めのStepなら損失累積器を作る
-                add_metric_sums( epoch_metric_sums, [ L, L_geom, L_com, L_attr, L_policy, loss_single, loss_nodes, Lp_out, La_fit, La_rep, L_actuator, *surrogate_plot_metrics(loss)], L.device) # 現在Stepの損失値をEpoch累積器へ加算
+                surrogate_compression_metric = surrogate_compression_plot_metric(loss, L_com, L.device) # Surrogate予測の(Mine-GT)*100/GTを通常plotへ渡す
+                actual_compression_metric = actual_compression_plot_metric(loss, L.device) # 実codecで測った(Mine-GT)*100/GTを通常plotへ渡す
+                surrogate_metrics = surrogate_plot_metrics(loss) # Surrogate教師学習の誤差系列を通常plotへ渡す
+                metric_values = [ L, L_geom, surrogate_compression_metric, actual_compression_metric, L_attr, L_policy, loss_single, loss_nodes, Lp_out, La_fit, La_rep, L_actuator, *surrogate_metrics] # plot列順にStep損失をまとめる
+                add_metric_sums( epoch_metric_sums, metric_values, L.device) # 現在Stepの損失値をEpoch累積器へ加算
                 if episode_metric_sums is None:
                     episode_metric_sums = new_metric_sums(L.device, plot.num_loss) # Episode内で初めのEpochなら損失累積器を作る
-                step_metric_values = [ L, L_geom, L_com, L_attr, L_policy, loss_single, loss_nodes, Lp_out, La_fit, La_rep, L_actuator, *surrogate_plot_metrics(loss)] # 記録対象
+                step_metric_values = metric_values # Step/Episode/Checkpointで同じ列順のmetricを使う
                 add_metric_sums(episode_metric_sums, step_metric_values, L.device) # 現在Stepの損失一覧
                 accumulate_checkpoint_metrics( episode_checkpoint_sums, compression_metric_row, operation_metric_row, step_metric_values) # ChackPoint判定用メトリクス
                 if train_edit_stats is None:
@@ -819,7 +814,7 @@ if __name__ == '__main__':
             torch.set_float32_matmul_precision("high")
         except AttributeError:
             pass
-    
+
     # ログのセットアップ
     writer = Writing( args, file_day, file_time, filename="MyNetwork_train", flush_every=args.log_flush_every, sync_every=args.log_sync_every, log_root=args.log_root)
     writer.write(f"SetupTiming: writer_init={time.time() - setup_t0:.3f}s")

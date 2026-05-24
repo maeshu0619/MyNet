@@ -1,6 +1,7 @@
 import math
 import os
 import time
+import hashlib
 from contextlib import nullcontext
 import torch
 from ..training.correlation import format_corr
@@ -21,8 +22,146 @@ from ..training.for_better_logging import (
     log_for_better_pretrain_complete,
     log_for_better_pretrain_step,
 )
+from ..training.train_flow import apply_epoch_file_window
+from .checkpoint import (
+    _tensor_tree_to_cpu,
+    load_surrogate_registry_state,
+    save_surrogate_registry_state,
+)
 from ..pointcloud.utils_repkpu import *
 from ..pointcloud.octree_subtree import *
+
+
+def _surrogate_pretrain_dataset_fingerprint(args, loss, seq_datasets):
+    # データセット構成とcodec条件から、Surrogate事前学習state用の安定した識別子を作る。
+    h = hashlib.sha1()
+    keys = [
+        "compression_loss_backend",
+        "compress",
+        "sparsepcgc_mode",
+        "sparsepcgc_voxel_size",
+        "sparsepcgc_pos_quantscale",
+        "sparsepcgc_match_qs",
+        "qs",
+        "compression_surrogate_levels",
+        "compression_surrogate_hidden_dim",
+        "compression_surrogate_pred_clip",
+        "surrogate_pretrain_mode",
+        "surrogate_pretrain_subtree_teacher_type",
+        "surrogate_pretrain_subtree_depth_percent_min",
+        "surrogate_pretrain_subtree_depth_percent_max",
+    ]
+    for key in keys:
+        # codecや特徴次元が変わったstateを誤って読むのを避けるため、主要argsをhashへ入れる。
+        h.update(f"{key}={getattr(args, key, None)}\n".encode("utf-8"))
+    h.update(f"feature_dim={int(getattr(loss, 'surrogate_feature_dim', 0) or 0)}\n".encode("utf-8"))
+    h.update(f"levels={list(getattr(loss, 'surrogate_levels', []) or [])}\n".encode("utf-8"))
+    for seq_dir, dataset in seq_datasets:
+        files = list(getattr(dataset, "all_files", getattr(dataset, "files", [])))
+        # ファイル内容は読まず、順序・件数・パスだけでデータセット種類を識別する。
+        h.update(f"seq={seq_dir}|count={len(files)}\n".encode("utf-8"))
+        for path in files:
+            h.update(f"{os.path.normpath(str(path))}\n".encode("utf-8"))
+    return h.hexdigest()[:24]
+
+
+def _surrogate_pretrain_cache_path(args, loss, seq_datasets):
+    # データセット別Surrogate stateの保存先ファイルパスを組み立てる。
+    cache_dir = str(getattr(args, "surrogate_pretrain_cache_dir", "")).strip()
+    if not cache_dir:
+        return None
+    fingerprint = _surrogate_pretrain_dataset_fingerprint(args, loss, seq_datasets)
+    backend = str(getattr(args, "compression_loss_backend", "surrogate")).strip().lower()
+    compress = str(getattr(args, "compress", "codec")).strip().lower().replace("-", "").replace(" ", "")
+    filename = f"{backend}_{compress}_{fingerprint}.pth"
+    return os.path.join(cache_dir, filename)
+
+
+def _surrogate_pretrain_payload(loss, surrogate_optimizer, completed_steps, fresh_actual_count, last_corr, last_sign_match, final_param_norm, early_stop_reason):
+    # Surrogate本体とOptimizerを一緒に保存し、次回の事前学習/本学習へ同じ状態を復元する。
+    return {
+        "compression_surrogate": _tensor_tree_to_cpu(loss.compression_surrogate.state_dict()),
+        "compression_surrogate_state_dict": _tensor_tree_to_cpu(loss.compression_surrogate.state_dict()),
+        "surrogate_optimizer_state_dict": None if surrogate_optimizer is None else _tensor_tree_to_cpu(surrogate_optimizer.state_dict()),
+        "surrogate_step": int(getattr(loss, "_surrogate_step", 0)),
+        "surrogate_feature_dim": int(getattr(loss, "surrogate_feature_dim", 0) or 0),
+        "surrogate_levels": list(getattr(loss, "surrogate_levels", []) or []),
+        "completed_steps": int(completed_steps),
+        "fresh_actual_count": int(fresh_actual_count),
+        "corr": last_corr,
+        "sign_match": last_sign_match,
+        "surrogate_param_norm": final_param_norm,
+        "early_stop_reason": early_stop_reason,
+    }
+
+
+def _load_surrogate_pretrain_state(args, loss, seq_datasets, writer):
+    # 保存済みSurrogate stateが現在の特徴次元と一致する場合だけ読み込む。
+    if not bool(getattr(args, "surrogate_pretrain_resume", True)):
+        return False, None
+    if bool(getattr(args, "surrogate_pretrain_force_retrain", False)):
+        return False, None
+    path = _surrogate_pretrain_cache_path(args, loss, seq_datasets)
+    if path is None or not os.path.exists(path):
+        return False, path
+    try:
+        # cache破損時はtrain全体を止めず、通常の事前学習へフォールバックする。
+        payload = torch.load(path, map_location="cpu")
+    except Exception as exc:
+        writer.write(f"SurrogatePretrainCache load failed: {type(exc).__name__}: {exc}")
+        return False, path
+    feature_dim = int(payload.get("surrogate_feature_dim", -1))
+    levels = list(payload.get("surrogate_levels", []) or [])
+    if feature_dim != int(getattr(loss, "surrogate_feature_dim", 0) or 0) or levels != list(getattr(loss, "surrogate_levels", []) or []):
+        writer.write(f"SurrogatePretrainCache skipped: incompatible state at {path}")
+        return False, path
+    surrogate = getattr(loss, "compression_surrogate", None)
+    if surrogate is None:
+        return False, path
+    state = payload.get("compression_surrogate_state_dict") or payload.get("compression_surrogate")
+    if not isinstance(state, dict):
+        return False, path
+    surrogate.load_state_dict(state, strict=False)
+    optimizer = getattr(loss, "surrogate_optimizer", None)
+    opt_state = payload.get("surrogate_optimizer_state_dict")
+    if optimizer is not None and isinstance(opt_state, dict):
+        optimizer.load_state_dict(opt_state)
+    if "surrogate_step" in payload:
+        loss._surrogate_step = int(payload.get("surrogate_step") or 0)
+    writer.write(
+        "SurrogatePretrainCache loaded: "
+        f"path={path}, surrogate_step={int(getattr(loss, '_surrogate_step', 0))}, "
+        f"completed_steps={int(payload.get('completed_steps', 0))}, "
+        f"fresh_actual_count={int(payload.get('fresh_actual_count', 0))}"
+    )
+    return True, path
+
+
+def _save_surrogate_pretrain_cache(args, loss, seq_datasets, payload, writer):
+    # 現在のSurrogate stateをデータセット別cacheへ保存し、次回train開始時に再利用できるようにする。
+    path = _surrogate_pretrain_cache_path(args, loss, seq_datasets)
+    if path is None:
+        return None
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    torch.save(payload, path)
+    writer.write(f"SurrogatePretrainCache saved: {path}")
+    return path
+
+
+def _set_loaded_surrogate_joint_lr(args, loss, writer):
+    # cache読込だけで事前学習を省略する場合も、本学習用のSurrogate LRへ切り替える。
+    optimizer = getattr(loss, "surrogate_optimizer", None)
+    if optimizer is None:
+        return []
+    joint_lr = max(float(getattr(args, "compression_surrogate_lr", 1e-3)), 0.0) * max(
+        float(getattr(args, "surrogate_joint_lr_scale", 0.1)),
+        0.0,
+    )
+    lrs = [joint_lr for _ in optimizer.param_groups]
+    set_optimizer_lrs(optimizer, lrs)
+    writer.write(f"SurrogatePretrainCacheJointLR: {','.join(f'{lr:.6g}' for lr in lrs)}")
+    return lrs
+
 
 def surrogate_param_norm(loss):
     surrogate = getattr(loss, "compression_surrogate", None)
@@ -326,8 +465,6 @@ def run_surrogate_pretrain(
 ):
     print(f"Surrogate pretrain step: {int(getattr(args, 'surrogate_step', 0))}")
     steps = max(int(getattr(args, "surrogate_step", 0)), 0)
-    if steps <= 0:
-        return
     backend = str(getattr(args, "compression_loss_backend", "proxy")).strip().lower()
     if not backend.endswith("_surrogate"):
         writer.write(f"SurrogatePretrain skipped: backend={backend} is not a surrogate backend.")
@@ -335,6 +472,31 @@ def run_surrogate_pretrain(
     pretrain_mode = str(getattr(args, "surrogate_pretrain_mode", "full")).strip().lower()
     if pretrain_mode not in {"full", "subtree", "hybrid"}:
         raise ValueError("--surrogate_pretrain_mode must be one of: full, subtree, hybrid")
+
+    registry_loaded, registry_path = load_surrogate_registry_state(args, loss, writer) # 指定形式の共有Surrogate重みを最優先で読み込む
+    cache_loaded, cache_path = (False, None) # fingerprint cache読込結果を初期化する
+    if not registry_loaded:
+        cache_loaded, cache_path = _load_surrogate_pretrain_state(args, loss, seq_datasets, writer) # 共有重みが無い場合だけ既存fingerprint cacheを読む
+    if steps <= 0:
+        if registry_loaded or cache_loaded:
+            _set_loaded_surrogate_joint_lr(args, loss, writer) # 事前学習なしでも読込済みSurrogateを本学習LRへ切り替える
+            if cache_loaded and not registry_loaded:
+                save_surrogate_registry_state( args, loss, writer, metric_name="loaded_cache_surrogate", metric_value=0.0, source="cache_migration_without_pretrain") # 既存fingerprint cacheを指定形式の共有Surrogateへ移行保存する
+            log_for_better_event( for_better_path, "surrogate_pretrain_cache_loaded_without_pretrain", state_path=registry_path if registry_loaded else cache_path, skip_pretrain=True, surrogate_param_norm=surrogate_param_norm(loss)) # 読込済みでpretrainを行わない条件を記録する
+        return
+    if (registry_loaded or cache_loaded) and bool(getattr(args, "surrogate_pretrain_skip_if_loaded", False)):
+        surrogate_lrs = _set_loaded_surrogate_joint_lr(args, loss, writer)
+        if cache_loaded and not registry_loaded:
+            save_surrogate_registry_state( args, loss, writer, metric_name="loaded_cache_surrogate", metric_value=0.0, source="cache_migration_skip_pretrain") # 既存fingerprint cacheを指定形式の共有Surrogateへ移行保存する
+        log_for_better_event(
+            for_better_path,
+            "surrogate_pretrain_cache_loaded",
+            state_path=registry_path if registry_loaded else cache_path,
+            skip_pretrain=True,
+            surrogate_param_norm=surrogate_param_norm(loss),
+            surrogate_lrs=surrogate_lrs,
+        )
+        return
 
     refresh_interval = max(int(getattr(args, "surrogate_pretrain_actual_refresh_interval", 10)), 0)
     replay_enabled = bool(getattr(args, "surrogate_pretrain_use_replay", True))
@@ -451,6 +613,7 @@ def run_surrogate_pretrain(
     early_stop_hits = 0
     early_stop_reason = None
     eta_warned = False
+    pretrain_global_epoch = 0 # 本学習と同じmax_files窓を使うための事前学習epoch番号
     log_interval = max(int(getattr(args, "surrogate_pretrain_log_interval", 10)), 1)
     print_interval = max(int(getattr(args, "surrogate_pretrain_print_interval", log_interval)), 1)
     pretrain_start_time = time.perf_counter()
@@ -486,7 +649,8 @@ def run_surrogate_pretrain(
         while completed_steps < steps and early_stop_reason is None:
             progressed = False
             for _seq_dir, dataset in seq_datasets:
-                loader = torch.utils.data.DataLoader(dataset, **loader_kwargs)
+                active_dataset = apply_epoch_file_window(dataset, args, pretrain_global_epoch) # 本学習と同じmax_files窓で事前学習データを選ぶ
+                loader = torch.utils.data.DataLoader(active_dataset, **loader_kwargs) # 窓選択後のDatasetをDataLoaderへ渡す
                 data_wait_t0 = time.perf_counter()
                 for local_step, pts in enumerate(loader):
                     surrogate_st = time.time()
@@ -497,7 +661,7 @@ def run_surrogate_pretrain(
                     step_zero = int(completed_steps)
                     step_number = step_zero + 1
                     step_t0 = data_wait_t0
-                    file_path = dataset.files[local_step]
+                    file_path = active_dataset.files[local_step] # 本学習と同じ窓内のファイルパスをcache keyへ使う
                     base_cache_key = f"surrogate_pretrain|{make_step_cache_key(file_path, args)}"
                     cache_key = base_cache_key
                     args._global_train_step = step_zero
@@ -890,6 +1054,7 @@ def run_surrogate_pretrain(
                     data_wait_t0 = time.perf_counter()
                 if completed_steps >= steps or early_stop_reason is not None:
                     break
+                pretrain_global_epoch += 1 # 次のseq epochでは本学習と同じようにmax_files窓を進める
             if not progressed:
                 writer.write("SurrogatePretrain stopped early: no training samples were available.")
                 break
@@ -899,12 +1064,13 @@ def run_surrogate_pretrain(
         corr_ok = min_corr < 0.0 or (last_corr is not None and last_corr >= min_corr)
         sign_ok = min_sign < 0.0 or (last_sign_match is not None and last_sign_match >= min_sign)
         final_param_norm = surrogate_param_norm(loss)
+        final_mean_abs_error = mean_finite(abs_error_history) # 事前学習後Surrogateの代表誤差を保存判定用に保持する
         writer.write(
             "SurrogatePretrainSummary: "
             f"mode={pretrain_mode}, completed_steps={completed_steps}, fresh_actual_count={fresh_actual_count}, "
             f"corr={format_corr(last_corr, len(corr_pairs.get('surrogate_actual', [])))}, "
             f"sign_match={case_float(last_sign_match, float('nan')):.6f}, "
-            f"mean_abs_error={case_float(mean_finite(abs_error_history), float('nan')):.6f}, "
+            f"mean_abs_error={case_float(final_mean_abs_error, float('nan')):.6f}, "
             f"corr_ok={bool(corr_ok)}, sign_match_ok={bool(sign_ok)}, "
             f"early_stop={early_stop_reason or 'none'}, "
             f"surrogate_param_norm={case_float(final_param_norm, float('nan')):.6f}"
@@ -922,7 +1088,7 @@ def run_surrogate_pretrain(
             fresh_actual_count=fresh_actual_count,
             corr=last_corr,
             sign_match=last_sign_match,
-            mean_abs_error=mean_finite(abs_error_history),
+            mean_abs_error=final_mean_abs_error,
             early_stop_reason=early_stop_reason or "none",
             surrogate_param_norm=final_param_norm,
             surrogate_lr=optimizer_lrs(surrogate_optimizer),
@@ -932,24 +1098,20 @@ def run_surrogate_pretrain(
             writer.write(f"Saved surrogate pretrain plot/csv: {plot.save_dir}")
         if bool(getattr(args, "surrogate_pretrain_checkpoint", True)):
             path = os.path.join(ckpt_dir, "surrogate_pretrain.pth")
-            torch.save(
-                {
-                    "compression_surrogate": loss.compression_surrogate.state_dict(),
-                    "compression_surrogate_state_dict": loss.compression_surrogate.state_dict(),
-                    "surrogate_optimizer_state_dict": None if surrogate_optimizer is None else surrogate_optimizer.state_dict(),
-                    "surrogate_step": int(getattr(loss, "_surrogate_step", 0)),
-                    "surrogate_feature_dim": int(getattr(loss, "surrogate_feature_dim", 0) or 0),
-                    "surrogate_levels": list(getattr(loss, "surrogate_levels", []) or []),
-                    "completed_steps": completed_steps,
-                    "fresh_actual_count": fresh_actual_count,
-                    "corr": last_corr,
-                    "sign_match": last_sign_match,
-                    "surrogate_param_norm": final_param_norm,
-                    "early_stop_reason": early_stop_reason,
-                },
-                path,
+            payload = _surrogate_pretrain_payload(
+                loss,
+                surrogate_optimizer,
+                completed_steps,
+                fresh_actual_count,
+                last_corr,
+                last_sign_match,
+                final_param_norm,
+                early_stop_reason,
             )
+            torch.save(payload, path)
             writer.write(f"SurrogatePretrainCheckpoint: {path}")
+            _save_surrogate_pretrain_cache(args, loss, seq_datasets, payload, writer)
+        save_surrogate_registry_state( args, loss, writer, metric_name="surrogate_pretrain_mean_abs_error", metric_value=case_float(final_mean_abs_error, float("inf")), source="pretrain_complete", extra={"completed_steps": int(completed_steps), "fresh_actual_count": int(fresh_actual_count), "corr": last_corr, "sign_match": last_sign_match}) # 指定形式の共有Surrogate重みへも保存する
     finally:
         for param, old_state in param_states:
             param.requires_grad_(old_state)

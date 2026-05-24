@@ -187,6 +187,7 @@ class PlyDirDataset(torch.utils.data.Dataset):
             if not path.endswith(".ply"):
                 raise ValueError(f"Input file is not a .ply file: {path}")
             self.files = [path]
+            self.all_files = list(self.files) # Epoch窓選択で単一ファイルも同じ形式で扱えるよう全候補を保存する
 
         # ディレクトリの場合
         elif os.path.isdir(path):
@@ -197,6 +198,7 @@ class PlyDirDataset(torch.utils.data.Dataset):
             ]
             if len(self.files) == 0:
                 raise ValueError(f"No .ply files found in directory: {path}")
+            self.all_files = list(self.files) # train時に先頭max_files固定ではなく全ファイルを順番に巡回するため元一覧を保持する
             self.files = self.files[:max_files]
 
         else:

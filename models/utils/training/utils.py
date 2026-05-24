@@ -212,6 +212,24 @@ def surrogate_plot_metrics(loss_obj):
     ]
 
 
+def actual_compression_plot_metric(loss_obj, device):
+    comp_debug = getattr(loss_obj, "last_compression_debug", {}) or {} # 直近Stepの圧縮debug辞書を取り出す
+    if "surrogate_teacher_is_actual" in comp_debug and not bool(comp_debug.get("surrogate_teacher_is_actual", False)): # local_proxyなど実codecでない教師は除外する
+        return None # 実圧縮ではない値をactual_compressionグラフへ混ぜない
+    actual_value = comp_debug.get("actual_total_bit_percent", None) # 実codecで測った(Mine-GT)*100/GTを取り出す
+    if actual_value is None:
+        return None # 実圧縮値が無いStepはplot集計から除外する
+    return metric_tensor(actual_value, device) # plot/CSVに渡せるscalar tensorへ正規化する
+
+
+def surrogate_compression_plot_metric(loss_obj, fallback_value, device):
+    comp_debug = getattr(loss_obj, "last_compression_debug", {}) or {} # 直近Stepの圧縮debug辞書を取り出す
+    surrogate_value = comp_debug.get("surrogate_pred_bit", comp_debug.get("rate_proxy_delta", None)) # Surrogateが予測した(Mine-GT)*100/GTを取り出す
+    if surrogate_value is None:
+        surrogate_value = fallback_value # Surrogate値が無いbackendでは従来のL_com表示へ戻す
+    return metric_tensor(surrogate_value, device) # plot/CSVに渡せるscalar tensorへ正規化する
+
+
 def format_metric_summary(prefix, metric_keys, values):
     parts = []
     for key, value in zip(metric_keys, values):
@@ -576,6 +594,8 @@ def module_grad_summary(module):
     if module is None:
         return "missing"
     total_sq = 0.0
+    total_abs = 0.0 # 勾配の平均絶対値を出すために絶対値合計を保持する
+    total_numel = 0 # 勾配の平均/RMSを出すために要素数を数える
     max_abs = 0.0
     active = 0
     missing = 0
@@ -590,11 +610,16 @@ def module_grad_summary(module):
         grad_det = grad.detach()
         finite = finite and bool(torch.isfinite(grad_det).all().item())
         grad_float = grad_det.float()
+        grad_abs = grad_float.abs() # 勾配の絶対値統計を計算する
         total_sq += float(grad_float.pow(2).sum().detach().cpu())
-        max_abs = max(max_abs, float(grad_float.abs().max().detach().cpu()))
+        total_abs += float(grad_abs.sum().detach().cpu()) # モジュール全体の平均絶対勾配用に加算する
+        total_numel += int(grad_float.numel()) # モジュール全体の勾配要素数を加算する
+        max_abs = max(max_abs, float(grad_abs.max().detach().cpu()))
         active += 1
     norm = total_sq ** 0.5
-    return f"norm={norm:.3e}, max={max_abs:.3e}, active={active}, none={missing}, finite={finite}"
+    mean_abs = (total_abs / float(total_numel)) if total_numel > 0 else 0.0 # 平均絶対勾配を計算する
+    rms = (total_sq / float(total_numel)) ** 0.5 if total_numel > 0 else 0.0 # RMS勾配を計算する
+    return f"norm={norm:.3e}, max={max_abs:.3e}, mean={mean_abs:.3e}, rms={rms:.3e}, active={active}, none={missing}, finite={finite}"
 
 
 def named_trainable_child_modules(base_model):
@@ -608,9 +633,12 @@ def named_trainable_child_modules(base_model):
         modules.extend(
             [
                 ("delete_branch", getattr(actuator, "drop_head", None)),
+                ("delete_amount", getattr(actuator, "drop_amount_head", None)),
                 ("add_branch", getattr(actuator, "add_head", None)),
+                ("add_amount", getattr(actuator, "add_amount_head", None)),
                 ("add_target_branch", getattr(actuator, "add_voxel_head", None)),
                 ("move_branch", getattr(actuator, "move_voxel_head", None)),
+                ("move_amount", getattr(actuator, "move_amount_head", None)),
             ]
         )
     return modules

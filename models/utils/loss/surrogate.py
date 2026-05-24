@@ -496,8 +496,8 @@ class SurrogateCompressionLossMixin:
         batch = min(max(int(getattr(args, "compression_surrogate_replay_batch", 8)), 1), len(replay))
         start = int(getattr(self, "_surrogate_call_count", 0)) % len(replay)
         indices = [(start + offset) % len(replay) for offset in range(batch)]
-        x = torch.stack([replay[idx][0] for idx in indices], dim=0).to(device=device, dtype=torch.float32)
-        y = torch.stack([replay[idx][1] for idx in indices], dim=0).to(device=device, dtype=torch.float32)
+        x = torch.stack([replay[idx][0] for idx in indices], dim=0).to(device=device, dtype=torch.float32, non_blocking=True) # CPU保存Replayを学習時だけGPUへ転送する
+        y = torch.stack([replay[idx][1] for idx in indices], dim=0).to(device=device, dtype=torch.float32, non_blocking=True) # Replay教師targetを学習時だけGPUへ転送する
         return x, y
 
     def _train_surrogate_replay(self, args, device):
@@ -515,7 +515,9 @@ class SurrogateCompressionLossMixin:
             return None
         self._last_surrogate_replay_sample_count = int(x_replay.shape[0])
         self._last_surrogate_replay_steps = int(replay_steps)
-        return self._train_compression_surrogate(args, x_replay, y_replay, train_steps=replay_steps)
+        replay_loss = self._train_compression_surrogate(args, x_replay, y_replay, train_steps=replay_steps) # Replay minibatchでSurrogateを追加更新する
+        del x_replay, y_replay # Replay minibatchのGPU参照をStep内で解放する
+        return replay_loss # Replay学習損失を呼び出し元へ返す
 
     @staticmethod
     def _surrogate_cache_stats_from_entry(entry):
@@ -623,6 +625,14 @@ class SurrogateCompressionLossMixin:
 
         self.compression_surrogate.eval()
         self._set_surrogate_trainable(False)
+        self.surrogate_optimizer.zero_grad(set_to_none=True) # Surrogate更新後にgrad bufferをNone化してGPU保持を減らす
+        cleanup_cuda_cache = bool(getattr(args, "compression_surrogate_empty_cache_after_update", True)) and x_soft.is_cuda # CUDA cache解放を行うか判定する
+        if cleanup_cuda_cache and torch.cuda.is_available(): # CUDAが使える場合だけreserved memoryを確認する
+            threshold_mb = float(getattr(args, "compression_surrogate_empty_cache_threshold_mb", 12288.0)) # cache解放のreserved memory閾値を取得する
+            reserved_mb = float(torch.cuda.memory_reserved(x_soft.device)) / (1024.0 * 1024.0) # 現在のreserved memoryをMB単位で測る
+            cleanup_cuda_cache = bool(threshold_mb <= 0.0 or reserved_mb >= threshold_mb) # 閾値超過時だけempty_cacheを走らせる
+        if cleanup_cuda_cache: # GPU cache解放が必要ならallocator cacheを返す
+            torch.cuda.empty_cache() # 精度を変えずにnvidia-smi上の一時的な確保量を下げる
         self._surrogate_step += train_steps
         return last_loss
 

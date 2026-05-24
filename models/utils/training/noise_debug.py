@@ -35,6 +35,9 @@ def merge_noise_debug_values(values):
 
 
 def prepare_compression_points(clean_xyz, args, model, collect_stats):
+    # argsで出力点群ノイズが無効ならcleanな点群をそのまま圧縮損失へ渡す。
+    if bool(getattr(args, "disable_output_noise", True)):
+        return clean_xyz, empty_noise_debug()
     # 編集後・量子化前だけに一様ノイズを入れる。
     # 形状lossにはclean_xyzを使い、rate/structure lossにはノイズ付き点群を使う。
     return add_uniform_quantization_noise(

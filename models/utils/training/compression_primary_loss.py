@@ -1,6 +1,8 @@
 import torch
 
 from .scalar_utils import case_float
+from .train_flow import compose_train_compression_main
+from .utils import uses_actual_total_bit_objective
 
 def as_scalar_loss_tensor(value):
     if not torch.is_tensor(value):
@@ -68,6 +70,11 @@ def build_compression_primary_loss(
     # compression_primaryの学習信号はsurrogate/proxy/soft auxのtensorだけから作る。
     # debugやCSVの.item()済み値はcheckpoint/log/teacher用であり、backward対象にしない。
     main_source, L_com_main = select_compression_primary_main(terms, L_com)
+    if uses_actual_total_bit_objective(args):
+        # actual/surrogate系ではL_com直結と圧縮内訳を半々で混ぜた主目的にする。
+        L_com_main = compose_train_compression_main(args, terms, L_com_main, zero_like_loss(L_com_main))
+        # Debugで混合主目的を使ったことを追えるようにsource名へ印を付ける。
+        main_source = f"{main_source}+mixed_terms"
     warmup_steps = int(getattr(args, "compression_primary_warmup_steps", 0))
     if warmup_steps > 0:
         warmup = min(1.0, float(int(global_train_step) + 1) / float(warmup_steps))

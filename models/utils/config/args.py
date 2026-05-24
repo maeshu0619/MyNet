@@ -247,7 +247,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--add_color', default='Red', type=str, help='追加点の色')
     parser.add_argument('--add_th', default=0.5, type=float, help='追加判定のしきい値')
     parser.add_argument('--target_add_ratio', default=0.003, type=float, help='目標とする追加割合')
-    parser.add_argument('--max_add_ratio', default=0.01, type=float, help='追加割合の最大値')
+    parser.add_argument('--max_add_ratio', default=0.50, type=float, help='追加割合の最大値')
     parser.add_argument('--add_oct_weight', default=1.0, type=float, help='Octreeグリッドへのスナップの重み')
     parser.add_argument('--lambda_sparse', default=1e-3, type=float, help='スパース性の正則化係数')
     # Displacement Module
@@ -285,10 +285,11 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--max_repair_qstep', default=0.20, type=float, help='構造修復で許す最大移動距離を量子化step比で指定する下限')
     parser.add_argument('--repair_snap_strength', default=0.20, type=float, help='Octree格子中心へ寄せる強さ')
     parser.add_argument('--target_repair_ratio', default=0.15, type=float, help='修復対象点の目標割合')
+    parser.add_argument('--max_repair_ratio', default=1.00, type=float, help='操作量学習時に候補として残す修復対象点の最大割合')
     parser.add_argument('--repair_ratio_weight', default=8.0, type=float, help='修復割合制御損失の重み')
     parser.add_argument('--repair_shape_guard_weight', default=0.5, type=float, help='形状保持原因が強い点を動かしすぎない正則化')
     parser.add_argument('--target_drop_ratio', default=0.02, type=float, help='点削除ゲートの目標割合')
-    parser.add_argument('--max_drop_ratio', default=0.05, type=float, help='点削除ゲートの上限割合')
+    parser.add_argument('--max_drop_ratio', default=0.50, type=float, help='点削除ゲートの上限割合')
     parser.add_argument('--repair_delete_max_points_per_voxel', default=8, type=int, help='削除候補にするleaf voxel内の最大点数(0なら無制限)')
     parser.add_argument('--repair_move_max_points_per_voxel', default=8, type=int, help='move source候補にするleaf voxel内の最大点数(0なら無制限)')
     parser.add_argument('--repair_drop_ratio_weight', default=4.0, type=float, help='点削除割合制御損失の重み')
@@ -305,6 +306,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--repair_move_source_prior_weight', default=0.35, type=float, help='原因診断scoreからmove source候補を起こす補助重み')
     parser.add_argument('--repair_selection_mode', default='target', type=str, help='修復操作のhard選択方式(target/threshold_cap)。threshold_capでは目標割合を強制せず上限として扱う')
     parser.add_argument('--repair_move_hard_threshold', default=0.5, type=float, help='threshold_cap時に移動をhard化する最小score')
+    parser.add_argument('--max_move_ratio', default=1.00, type=float, help='Adjustの学習済み実行割合の上限')
     parser.add_argument('--repair_drop_hard_threshold', default=0.5, type=float, help='threshold_cap時に削除をhard化する最小score')
     parser.add_argument('--repair_add_hard_threshold', default=0.5, type=float, help='threshold_cap時に追加をhard化する最小score')
     parser.add_argument('--repair_quant_guard_weight', default=1.0, type=float, help='量子化ボクセル上で無効な移動/追加を抑える正則化')
@@ -318,6 +320,17 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--repair_add_score_noise_end', default=0.0, type=float, help='探索終了後に追加位置logitへ入れるGumbelノイズ量')
     parser.add_argument('--repair_add_weight_random_mix_start', default=0.0, type=float, help='探索初期に追加点final_wへ混ぜるランダム重み割合')
     parser.add_argument('--repair_add_weight_random_mix_end', default=0.0, type=float, help='探索終了後に追加点final_wへ混ぜるランダム重み割合')
+    parser.add_argument('--repair_learn_operation_amounts', default=True, type=str2bool, help='Add/Adjustの実行量を固定比率ではなくActuator特徴から学習する')
+    parser.add_argument('--repair_operation_amount_bias_scale', default=2.0, type=float, help='学習されたAdd/Adjust実行量を位置logitへ反映する強さ')
+    parser.add_argument('--repair_operation_amount_consistency_weight', default=1.0, type=float, help='学習済み操作割合と実soft操作率を一致させる補助損失重み')
+    parser.add_argument('--repair_drop_amount_random_mix_start', default=0.35, type=float, help='探索初期にPrune実行量へ混ぜるランダム割合')
+    parser.add_argument('--repair_drop_amount_random_mix_end', default=0.0, type=float, help='探索終了後にPrune実行量へ混ぜるランダム割合')
+    parser.add_argument('--repair_add_amount_random_mix_start', default=0.35, type=float, help='探索初期にAdd実行量へ混ぜるランダム割合')
+    parser.add_argument('--repair_add_amount_random_mix_end', default=0.0, type=float, help='探索終了後にAdd実行量へ混ぜるランダム割合')
+    parser.add_argument('--repair_move_amount_random_mix_start', default=0.35, type=float, help='探索初期にAdjust実行量へ混ぜるランダム割合')
+    parser.add_argument('--repair_move_amount_random_mix_end', default=0.0, type=float, help='探索終了後にAdjust実行量へ混ぜるランダム割合')
+    parser.add_argument('--repair_move_score_noise_start', default=0.0, type=float, help='探索初期にAdjust source scoreへ入れる正規ノイズ量')
+    parser.add_argument('--repair_move_score_noise_end', default=0.0, type=float, help='探索終了後にAdjust source scoreへ入れる正規ノイズ量')
     parser.add_argument('--repair_drop_score_noise_start', default=0.0, type=float, help='探索初期に削除logitへ入れる正規ノイズ量')
     parser.add_argument('--repair_drop_score_noise_end', default=0.0, type=float, help='探索終了後に削除logitへ入れる正規ノイズ量')
     parser.add_argument('--repair_drop_random_mix_start', default=0.0, type=float, help='探索初期に削除確率へ混ぜるランダム削除マスク割合')
@@ -415,6 +428,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--com_sin',    default=1, type=float, help='proxy backend で single-child 差(%%)項へ掛ける重み')
     parser.add_argument('--com_node',   default=4, type=float, help='proxy backend で node 数差(%%)項へ掛ける重み')
     parser.add_argument('--com_bpn',    default=0.25, type=float, help='proxy backend で bits-per-node 差(%%)項へ掛ける重み')
+    parser.add_argument('--actual_total_bit_objective_mix', default=0.5, type=float, help='actual/surrogate backendでL_com直結と内訳合成を混ぜる比率')
     parser.add_argument('--com_sparsepcgc', default=0.0, type=float, help='SparsePCGC補助proxy項へ掛ける重み。主objectiveには既定で混ぜない')
     parser.add_argument('--com_lowprob', default=1, type=float, help='proxy backend で low-probability occupancy 項へ掛ける重み')
     parser.add_argument('--com_ent',   default=2, type=float, help='旧 proxyOctreeCompression 経路のエントロピー項重み（現行構造修復lossでは未使用）')
@@ -500,7 +514,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--compression_surrogate_weight_decay', default=1e-5, type=float, help='圧縮サロゲートのweight decay')
     parser.add_argument('--compression_surrogate_train_steps', default=2, type=int, help='教師更新時にサロゲートを教師bitに合わせて更新する回数')
     parser.add_argument('--compression_surrogate_warmup_steps', default=2, type=int, help='実ネットワーク更新前に行うSurrogate専用学習回数')
-    parser.add_argument('--compression_surrogate_refresh_interval', default=8, type=int, help='何train stepごとに実圧縮教師を再計測するか(0なら初回以外は再計測しない)')
+    parser.add_argument('--compression_surrogate_refresh_interval', default=1, type=int, help='何train stepごとに実圧縮教師を再計測するか(0なら初回以外は再計測しない)')
     parser.add_argument('--compression_surrogate_reuse_last_target', default=True, type=str2bool, help='同一train step内でのみ直近の実圧縮教師targetを再利用するか')
     parser.add_argument('--compression_surrogate_target_cache_entries', default=256, type=int, help='Surrogate教師targetのLRUキャッシュ数（生成側targetは同一train step内のみ有効）')
     parser.add_argument('--compression_surrogate_replay_steps', default=1, type=int, help='実圧縮を呼ばないstepでもreplay教師でSurrogateを更新する回数')
@@ -514,6 +528,8 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--compression_octree_stat_depth', default=0, type=int, help='実圧縮debug用Octree統計の深さ(0なら点群から推定)')
     parser.add_argument('--compression_octree_stat_force', default=True, type=str2bool, help='圧縮器が返すnode/singleが0でも点群からOctree統計を補完する')
     parser.add_argument('--compression_surrogate_grad_clip', default=10.0, type=float, help='圧縮サロゲートの勾配クリップ')
+    parser.add_argument('--compression_surrogate_empty_cache_after_update', default=True, type=str2bool, help='Surrogate更新直後にCUDA cacheを解放してGPU使用量の山を抑える')
+    parser.add_argument('--compression_surrogate_empty_cache_threshold_mb', default=12288.0, type=float, help='CUDA cache解放を開始するreserved memory閾値(MB、0なら毎回)')
     parser.add_argument('--compression_surrogate_target_scale', default=100.0, type=float, help='旧互換用。実圧縮教師百分率モードでは未使用')
     parser.add_argument('--compression_surrogate_pred_clip', default=100.0, type=float, help='サロゲートが予測する実圧縮bit差百分率のtanhクリップ（0で無効）')
     parser.add_argument('--compression_surrogate_occ_gain', default=1.0, type=float, help='Soft occupancy変換のゲイン')
@@ -549,6 +565,15 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--surrogate_pretrain_log_interval', default=10, type=int, help='Surrogate pretrainログ出力間隔')
     parser.add_argument('--surrogate_pretrain_print_interval', default=1, type=int, help='Surrogate pretrain進捗ログ出力間隔')
     parser.add_argument('--surrogate_pretrain_checkpoint', default=True, type=str2bool, help='Surrogate pretrain後にSurrogate stateを保存するか')
+    parser.add_argument('--surrogate_pretrain_resume', default=True, type=str2bool, help='データセット別に保存済みのSurrogate事前学習stateを読み込むか')
+    parser.add_argument('--surrogate_pretrain_skip_if_loaded', default=False, type=str2bool, help='保存済みSurrogateを読めた場合に事前学習を省略するか')
+    parser.add_argument('--surrogate_pretrain_force_retrain', default=False, type=str2bool, help='保存済みSurrogateを無視して事前学習をやり直すか')
+    parser.add_argument('--surrogate_pretrain_cache_dir', default=str((_LOG_ROOT / "surrogate_pretrain_cache").resolve()), type=str, help='データセット別Surrogate事前学習stateの保存先')
+    parser.add_argument('--surrogate_registry_enabled', default=True, type=str2bool, help='指定形式の共有Surrogate重みを保存/読込するか')
+    parser.add_argument('--surrogate_pretrained_root', default=str((_DATA_ROOT / "pretrained_surrogate").resolve()), type=str, help='共有Surrogate重みの保存root')
+    parser.add_argument('--surrogate_data', default='', type=str, help='共有Surrogate重みファイル名に使うデータ名。空ならdataname_dataset_name')
+    parser.add_argument('--surrogate_time', default='', type=str, help='共有Surrogate重みファイル名に使う時刻名。空ならtrainのtime')
+    parser.add_argument('--surrogate_registry_load_latest_if_missing', default=True, type=str2bool, help='指定時刻の共有Surrogateが無い場合に同一dataの最新Surrogateを読むか')
     parser.add_argument('--surrogate_pretrain_use_replay', default=True, type=str2bool, help='pretrain中のnon-refresh stepでreplay教師更新を使うか')
     parser.add_argument('--surrogate_pretrain_replay_batch_size', default=16, type=int, help='pretrain replay更新のbatch size')
     parser.add_argument('--surrogate_pretrain_replay_steps', default=4, type=int, help='pretrain中の1stepあたりreplay更新回数')
@@ -600,7 +625,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--sparsepcgc_enable_add_experiment', default=False, type=str2bool, help='SparsePCGCでもAddを実験的に許可する。defaultは必ずFalse')
     parser.add_argument('--sparsepcgc_add_only_when_compression_primary', default=True, type=str2bool, help='SparsePCGC Add実験をcompression_primary時だけ許可するか')
     parser.add_argument('--sparsepcgc_add_target_ratio', default=0.005, type=float, help='SparsePCGC Add実験のtarget add ratio')
-    parser.add_argument('--sparsepcgc_add_max_ratio', default=0.10, type=float, help='SparsePCGC Add実験のmax add ratio')
+    parser.add_argument('--sparsepcgc_add_max_ratio', default=0.50, type=float, help='SparsePCGC Add実験のmax add ratio')
     parser.add_argument('--sparsepcgc_add_warmup_steps', default=0, type=int, help='SparsePCGC Add実験のratio warmup step数')
     parser.add_argument('--sparsepcgc_add_use_candidate_score', default=True, type=str2bool, help='SparsePCGC Add実験で既存candidate scoreを使うか')
     parser.add_argument('--sparsepcgc_add_log_candidates', default=True, type=str2bool, help='SparsePCGC Add候補/scoreログを出すか')
@@ -618,7 +643,8 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--proxy_mass_to_occ_gain', default=1.0, type=float, help='質量→占有変換のスケール')
     parser.add_argument('--octattention_teacher_device', default='auto', type=str, help='OctAttention teacherの実行先(auto/cuda/cpu/balanced)')
     parser.add_argument('--compression_rate_metric', default='total_bits', type=str, help='圧縮率損失の基準(total_bits/bits_per_point/bits_per_input_point)')
-    parser.add_argument('--use_uniform_noise', default=True, type=str2bool, help='train時のみ編集後・量子化前に加法的一様ノイズを入れるか')
+    parser.add_argument('--disable_output_noise', default=True, type=str2bool, help='Trueなら出力点群へ圧縮損失用ノイズを加えずclean点群のまま使う')
+    parser.add_argument('--use_uniform_noise', default=False, type=str2bool, help='train時のみ編集後・量子化前に加法的一様ノイズを入れるか')
     parser.add_argument('--noise_delta', default=1.0, type=float, help='一様ノイズ幅delta。u~Uniform(-delta/2,delta/2)。0以下ならcodec固有量子化幅へフォールバック')
     parser.add_argument('--log_step_time', default=True, type=str2bool, help='一定間隔でtrain/testの処理時間をログ出力するか')
     parser.add_argument('--log_gpu_memory', default=True, type=str2bool, help='一定間隔でGPUメモリ使用量をログ出力するか')
@@ -770,6 +796,8 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--debug_grad_flow_rate', default=1, type=int, help='勾配ログの出力間隔')
     parser.add_argument('--train_grad_clip', default=0.0, type=float, help='学習時の勾配クリップ値（0で無効）')
     parser.add_argument('--debug_timing', default=False, type=str2bool, help='ステップ内の時間内訳をログ出力するか')
+    parser.add_argument('--sparsepcgc_hard_debug_interval', default=0, type=int, help='SparsePCGCの重いhard統計を何Stepごとに収集するか(0で無効)')
+    parser.add_argument('--sparsepcgc_hard_debug_on_log', default=False, type=str2bool, help='Trueなら通常Stepログ時にもSparsePCGC hard統計を収集する')
     parser.add_argument('--mail_notify', default=False, type=str2bool, help='学習イベントをメール通知するか')
     parser.add_argument('--mail_to', default='maeshu0619@gmail.com', type=str, help='通知メールの宛先')
     parser.add_argument('--mail_from', default='maeshu0619@gmail.com', type=str, help='通知メールの送信元')
@@ -1070,6 +1098,8 @@ def parse_pugan_args(parser, file_day, file_time):
         int(getattr(args, "compression_surrogate_replay_entries", 0)),
         0,
     )
+    args.compression_surrogate_empty_cache_after_update = bool(getattr(args, "compression_surrogate_empty_cache_after_update", True)) # Surrogate更新後のCUDA cache解放を有効化する
+    args.compression_surrogate_empty_cache_threshold_mb = max(float(getattr(args, "compression_surrogate_empty_cache_threshold_mb", 12288.0)), 0.0) # CUDA cache解放を始めるreserved memory閾値を正規化する
     args.surrogate_step = max(int(getattr(args, "surrogate_step", 0)), 0)
     args.surrogate_pretrain_lr = max(float(getattr(args, "surrogate_pretrain_lr", 1e-4)), 0.0)
     args.surrogate_pretrain_actual_refresh_interval = max(
@@ -1091,6 +1121,22 @@ def parse_pugan_args(parser, file_day, file_time):
     args.surrogate_pretrain_log_interval = max(int(getattr(args, "surrogate_pretrain_log_interval", 10)), 1)
     args.surrogate_pretrain_print_interval = max(int(getattr(args, "surrogate_pretrain_print_interval", 1)), 1)
     args.surrogate_pretrain_checkpoint = bool(getattr(args, "surrogate_pretrain_checkpoint", True))
+    # データセット別Surrogate stateを再利用し、SparsePCGC teacherを毎回ゼロから回す負担を避ける。
+    args.surrogate_pretrain_resume = bool(getattr(args, "surrogate_pretrain_resume", True))
+    args.surrogate_pretrain_skip_if_loaded = bool(getattr(args, "surrogate_pretrain_skip_if_loaded", False))
+    args.surrogate_pretrain_force_retrain = bool(getattr(args, "surrogate_pretrain_force_retrain", False))
+    args.surrogate_pretrain_cache_dir = str(getattr(args, "surrogate_pretrain_cache_dir", "")).strip()
+    args.surrogate_registry_enabled = bool(getattr(args, "surrogate_registry_enabled", True)) # 共有Surrogate重みの保存/読込を有効化する
+    args.surrogate_pretrained_root = str(getattr(args, "surrogate_pretrained_root", str((_DATA_ROOT / "pretrained_surrogate").resolve()))).strip() # 共有Surrogate rootを文字列化する
+    if not str(getattr(args, "surrogate_data", "")).strip():
+        args.surrogate_data = f"{getattr(args, 'dataname', 'data')}_{getattr(args, 'dataset_name', 'set')}" # 保存ファイル名用のデータ名を既定値で補完する
+    else:
+        args.surrogate_data = str(getattr(args, "surrogate_data", "")).strip() # 明示指定されたデータ名を使う
+    if not str(getattr(args, "surrogate_time", "")).strip():
+        args.surrogate_time = str(getattr(args, "time", "run")).strip() # 保存ファイル名用の時刻名をtrain run時刻で補完する
+    else:
+        args.surrogate_time = str(getattr(args, "surrogate_time", "")).strip() # 明示指定された時刻名を使う
+    args.surrogate_registry_load_latest_if_missing = bool(getattr(args, "surrogate_registry_load_latest_if_missing", True)) # 完全一致が無い時の最新Surrogate読込を有効化する
     args.surrogate_pretrain_use_replay = bool(getattr(args, "surrogate_pretrain_use_replay", True))
     args.surrogate_pretrain_replay_batch_size = max(
         int(getattr(args, "surrogate_pretrain_replay_batch_size", 16)),
@@ -1252,11 +1298,39 @@ def parse_pugan_args(parser, file_day, file_time):
     ).strip().lower()
     if args.compression_surrogate_forward_mode not in {"surrogate", "teacher_ste"}:
         raise ValueError("--compression_surrogate_forward_mode must be surrogate or teacher_ste")
-    args.use_uniform_noise = bool(getattr(args, "use_uniform_noise", True))
+    # 出力ノイズを明示的に無効化し、cleanな出力点群を圧縮損失へ渡す既定にする。
+    args.disable_output_noise = bool(getattr(args, "disable_output_noise", True))
+    # disable_output_noise=Trueなら既存の一様ノイズflagも強制的に無効化する。
+    args.use_uniform_noise = bool(getattr(args, "use_uniform_noise", False)) and not args.disable_output_noise
+    # actual/surrogate圧縮目的で実bit直結項と内訳項を混ぜる比率を0-1へ収める。
+    args.actual_total_bit_objective_mix = min(max(float(getattr(args, "actual_total_bit_objective_mix", 0.5)), 0.0), 1.0)
+    # Add/Adjustの実行量をActuator特徴から学習するかをboolへ正規化する。
+    args.repair_learn_operation_amounts = bool(getattr(args, "repair_learn_operation_amounts", True))
+    # 学習された操作量を位置logitへ戻す強さを非負値へ正規化する。
+    args.repair_operation_amount_bias_scale = max(float(getattr(args, "repair_operation_amount_bias_scale", 2.0)), 0.0)
+    # 学習済み操作割合と実soft操作率を結ぶ補助損失の強さを非負値へ収める。
+    args.repair_operation_amount_consistency_weight = max(
+        float(getattr(args, "repair_operation_amount_consistency_weight", 1.0)),
+        0.0,
+    )
+    # 学習初期のPrune/Add/Adjust実行量探索率を0-1へ収める。
+    args.repair_drop_amount_random_mix_start = min(max(float(getattr(args, "repair_drop_amount_random_mix_start", 0.35)), 0.0), 1.0)
+    args.repair_drop_amount_random_mix_end = min(max(float(getattr(args, "repair_drop_amount_random_mix_end", 0.0)), 0.0), 1.0)
+    args.repair_add_amount_random_mix_start = min(max(float(getattr(args, "repair_add_amount_random_mix_start", 0.35)), 0.0), 1.0)
+    args.repair_add_amount_random_mix_end = min(max(float(getattr(args, "repair_add_amount_random_mix_end", 0.0)), 0.0), 1.0)
+    args.repair_move_amount_random_mix_start = min(max(float(getattr(args, "repair_move_amount_random_mix_start", 0.35)), 0.0), 1.0)
+    args.repair_move_amount_random_mix_end = min(max(float(getattr(args, "repair_move_amount_random_mix_end", 0.0)), 0.0), 1.0)
+    # Adjust source scoreへ入れる探索ノイズ量を非負値へ正規化する。
+    args.repair_move_score_noise_start = max(float(getattr(args, "repair_move_score_noise_start", 0.0)), 0.0)
+    args.repair_move_score_noise_end = max(float(getattr(args, "repair_move_score_noise_end", 0.0)), 0.0)
     args.noise_delta = float(getattr(args, "noise_delta", 1.0))
     args.log_step_time = bool(getattr(args, "log_step_time", True))
     args.log_gpu_memory = bool(getattr(args, "log_gpu_memory", True))
     args.profile_interval = max(int(getattr(args, "profile_interval", 100)), 1)
+    # SparsePCGC hard統計は重いため、既定ではprofile間隔と同じ頻度に制限する。
+    args.sparsepcgc_hard_debug_interval = max(int(getattr(args, "sparsepcgc_hard_debug_interval", args.profile_interval)), 0)
+    # 通常ログにhard統計を連動させるかをboolへ正規化する。
+    args.sparsepcgc_hard_debug_on_log = bool(getattr(args, "sparsepcgc_hard_debug_on_log", False))
     args.actual_eval_interval = max(int(getattr(args, "actual_eval_interval", 1000)), 0)
     args.disable_actual_codec_during_train = bool(getattr(args, "disable_actual_codec_during_train", False))
     args.actual_codec_fallback_to_proxy_on_error = bool(getattr(args, "actual_codec_fallback_to_proxy_on_error", True))
@@ -1338,10 +1412,23 @@ def parse_pugan_args(parser, file_day, file_time):
     if sparsepcgc_backend:
         if not _cli_option_was_provided("--surrogate_step"):
             args.surrogate_step = max(int(getattr(args, "surrogate_step", 0)), 2000)
+        if args.compression_loss_backend.endswith("_surrogate") and not _cli_option_was_provided("--disable_actual_codec_during_train"):
+            # SparsePCGC surrogateは実SparsePCGC bit教師が必要なので、既定ではactual teacherを止めない。
+            args.disable_actual_codec_during_train = False
+        if args.compression_loss_backend.endswith("_surrogate") and not _cli_option_was_provided("--surrogate_update_on_teacher_refresh_only"):
+            # replay更新も許可し、teacher refresh以外のStepでもSurrogateを継続fitさせる。
+            args.surrogate_update_on_teacher_refresh_only = False
+        if args.compression_loss_backend.endswith("_surrogate") and not _cli_option_was_provided("--compression_surrogate_replay_steps"):
+            # fresh teacherがないStepでもreplay教師で模倣学習を進める。
+            args.compression_surrogate_replay_steps = max(int(getattr(args, "compression_surrogate_replay_steps", 0)), 2)
+        if args.compression_loss_backend.endswith("_surrogate") and not _cli_option_was_provided("--surrogate_pretrain_actual_refresh_interval"):
+            # 事前学習中はSparsePCGC teacherを毎Step更新し、ゼロ/ stale教師だけの学習を避ける。
+            args.surrogate_pretrain_actual_refresh_interval = 1
         if not _cli_option_was_provided("--compression_surrogate_forward_mode"):
             args.compression_surrogate_forward_mode = "teacher_ste"
         if not _cli_option_was_provided("--compression_surrogate_refresh_interval"):
-            args.compression_surrogate_refresh_interval = max(int(getattr(args, "compression_surrogate_refresh_interval", 0)), 50)
+            # Surrogate lossは毎Step使うが、実SparsePCGC教師の再計測は高コストなので既定では8Step間隔にする。
+            args.compression_surrogate_refresh_interval = 1 if args.compression_loss_backend.endswith("_surrogate") else max(int(getattr(args, "compression_surrogate_refresh_interval", 0)), 50)
         if not _cli_option_was_provided("--compression_surrogate_reuse_last_target"):
             args.compression_surrogate_reuse_last_target = True
         if not _cli_option_was_provided("--train_subtree_anchor_on_min_points_miss"):
@@ -1355,7 +1442,21 @@ def parse_pugan_args(parser, file_day, file_time):
         if not _cli_option_was_provided("--compression_surrogate_aux_single_weight"):
             args.compression_surrogate_aux_single_weight = 0.0
         if not _cli_option_was_provided("--com_sparsepcgc"):
-            args.com_sparsepcgc = 0.0
+            # SparsePCGCではactive coordinate/孤立voxel proxyを主目的へ入れ、Surrogateが未成熟でも圧縮方向の勾配を渡す。
+            args.com_sparsepcgc = max(float(getattr(args, "com_sparsepcgc", 0.0)), 0.75)
+        if not _cli_option_was_provided("--sparsepcgc_aux_backprop"):
+            # SparsePCGC補助proxyをログだけでなくbackward対象にし、Prune/Adjustへ安定した勾配を流す。
+            args.sparsepcgc_aux_backprop = True
+        if not _cli_option_was_provided("--actual_total_bit_objective_mix"):
+            args.actual_total_bit_objective_mix = 0.75
+        if not _cli_option_was_provided("--compression_boost_requires_surrogate_frozen"):
+            args.compression_boost_requires_surrogate_frozen = False
+        if not _cli_option_was_provided("--compression_bad_step_penalty_scale"):
+            args.compression_bad_step_penalty_scale = 2.0
+        if not _cli_option_was_provided("--compression_good_step_boost_scale"):
+            args.compression_good_step_boost_scale = 2.0
+        if not _cli_option_was_provided("--compression_good_step_prefreeze_scale"):
+            args.compression_good_step_prefreeze_scale = 1.5
         if not _cli_option_was_provided("--sparsepcgc_active_coord_weight"):
             args.sparsepcgc_active_coord_weight = max(float(getattr(args, "sparsepcgc_active_coord_weight", 0.60)), 1.00)
         if not _cli_option_was_provided("--sparsepcgc_isolated_proxy_weight"):
@@ -1366,6 +1467,10 @@ def parse_pugan_args(parser, file_day, file_time):
             args.compression_surrogate_levels = "2,4,6,8,10"
         if not _cli_option_was_provided("--octree_diag_levels"):
             args.octree_diag_levels = "2,4,6,8,10,12"
+        if not _cli_option_was_provided("--sparsepcgc_add_target_ratio"):
+            args.sparsepcgc_add_target_ratio = min(float(getattr(args, "sparsepcgc_add_target_ratio", 0.005)), 0.003)
+        if not _cli_option_was_provided("--sparsepcgc_add_max_ratio"):
+            args.sparsepcgc_add_max_ratio = max(float(getattr(args, "sparsepcgc_add_max_ratio", 0.50)), 0.50) # Addの探索上限を0〜50%へ広げる
         add_experiment_active = bool(args.sparsepcgc_enable_add_experiment) and (
             (not bool(args.sparsepcgc_add_only_when_compression_primary))
             or str(getattr(args, "loss_mode", "legacy_total")).strip().lower() == "compression_primary"
@@ -1385,17 +1490,26 @@ def parse_pugan_args(parser, file_day, file_time):
             )
         if not _cli_option_was_provided("--max_add_ratio"):
             args.max_add_ratio = (
-                min(float(args.sparsepcgc_add_max_ratio), 0.10)
+                min(float(args.sparsepcgc_add_max_ratio), 0.50)
                 if add_experiment_active
                 else 0.0 if args.sparsepcgc_disable_add else min(
                     max(float(getattr(args, "max_add_ratio", 0.0)), float(args.sparsepcgc_add_max_ratio)),
-                    0.10,
+                    0.50,
                 )
             )
         if not _cli_option_was_provided("--target_drop_ratio"):
-            args.target_drop_ratio = max(float(getattr(args, "target_drop_ratio", 0.0)), 0.03)
+            args.target_drop_ratio = max(float(getattr(args, "target_drop_ratio", 0.0)), 0.05)
         if not _cli_option_was_provided("--max_drop_ratio"):
-            args.max_drop_ratio = max(float(getattr(args, "max_drop_ratio", 0.0)), 0.08)
+            args.max_drop_ratio = max(float(getattr(args, "max_drop_ratio", 0.0)), 0.50) # Pruneの探索上限を0〜50%へ広げる
+        if not _cli_option_was_provided("--max_repair_ratio"):
+            args.max_repair_ratio = max(float(getattr(args, "max_repair_ratio", 0.0)), 1.00) # Adjustのsource候補上限を0〜100%へ広げる
+        if not _cli_option_was_provided("--max_move_ratio"):
+            args.max_move_ratio = max(float(getattr(args, "max_move_ratio", 0.0)), 1.00) # Adjustの実行量上限を0〜100%へ広げる
+        if not _cli_option_was_provided("--repair_operation_amount_consistency_weight"):
+            args.repair_operation_amount_consistency_weight = max(
+                float(getattr(args, "repair_operation_amount_consistency_weight", 1.0)),
+                2.0,
+            )
         if not _cli_option_was_provided("--repair_add_ratio_weight"):
             args.repair_add_ratio_weight = max(float(getattr(args, "repair_add_ratio_weight", 4.0)), 8.0)
         if not _cli_option_was_provided("--repair_add_keep_weight"):
@@ -1403,7 +1517,7 @@ def parse_pugan_args(parser, file_day, file_time):
         if not _cli_option_was_provided("--repair_add_weight_mode"):
             args.repair_add_weight_mode = "hard"
         if not _cli_option_was_provided("--repair_exploration_fraction"):
-            args.repair_exploration_fraction = 0.15
+            args.repair_exploration_fraction = 0.35
         if not _cli_option_was_provided("--repair_add_candidate_ratio_start"):
             args.repair_add_candidate_ratio_start = 0.10
         if not _cli_option_was_provided("--repair_add_candidate_ratio_end"):
@@ -1416,6 +1530,22 @@ def parse_pugan_args(parser, file_day, file_time):
             args.repair_add_weight_random_mix_start = 0.0 if args.sparsepcgc_disable_add else 0.10
         if not _cli_option_was_provided("--repair_add_weight_random_mix_end"):
             args.repair_add_weight_random_mix_end = 0.0
+        if not _cli_option_was_provided("--repair_drop_amount_random_mix_start"):
+            args.repair_drop_amount_random_mix_start = 0.75
+        if not _cli_option_was_provided("--repair_drop_amount_random_mix_end"):
+            args.repair_drop_amount_random_mix_end = 0.0
+        if not _cli_option_was_provided("--repair_add_amount_random_mix_start"):
+            args.repair_add_amount_random_mix_start = 0.65
+        if not _cli_option_was_provided("--repair_add_amount_random_mix_end"):
+            args.repair_add_amount_random_mix_end = 0.0
+        if not _cli_option_was_provided("--repair_move_amount_random_mix_start"):
+            args.repair_move_amount_random_mix_start = 0.75
+        if not _cli_option_was_provided("--repair_move_amount_random_mix_end"):
+            args.repair_move_amount_random_mix_end = 0.0
+        if not _cli_option_was_provided("--repair_move_score_noise_start"):
+            args.repair_move_score_noise_start = 0.50
+        if not _cli_option_was_provided("--repair_move_score_noise_end"):
+            args.repair_move_score_noise_end = 0.0
         if not _cli_option_was_provided("--repair_drop_score_noise_start"):
             args.repair_drop_score_noise_start = 1.0
         if not _cli_option_was_provided("--repair_drop_score_noise_end"):
@@ -1449,7 +1579,8 @@ def parse_pugan_args(parser, file_day, file_time):
 
     actual_codec_surrogate_backend = args.compression_loss_backend.endswith("_surrogate")
     if actual_codec_surrogate_backend:
-        if not _cli_option_was_provided("--disable_actual_codec_during_train"):
+        if (not sparsepcgc_backend) and not _cli_option_was_provided("--disable_actual_codec_during_train"):
+            # SparsePCGC以外のsurrogateは従来通り重いactual teacherを既定で抑制する。
             args.disable_actual_codec_during_train = True
         if bool(getattr(args, "disable_actual_codec_during_train", False)):
             if not _cli_option_was_provided("--compression_surrogate_replay_steps"):
@@ -1623,6 +1754,10 @@ def parse_pugan_args(parser, file_day, file_time):
             raise ValueError(f"{label} upper value must be > 0 (got {values})")
     args.train_subtree_depth_percent_start = sorted(args.train_subtree_depth_percent_start)
     args.train_subtree_depth_percent_end = sorted(args.train_subtree_depth_percent_end)
+    if not _cli_option_was_provided("--surrogate_pretrain_subtree_depth_percent_min"):
+        args.surrogate_pretrain_subtree_depth_percent_min = float(min(args.train_subtree_depth_percent_start + args.train_subtree_depth_percent_end)) # Surrogate事前学習の最小深さ割合を本学習レンジへ揃える
+    if not _cli_option_was_provided("--surrogate_pretrain_subtree_depth_percent_max"):
+        args.surrogate_pretrain_subtree_depth_percent_max = float(max(args.train_subtree_depth_percent_start + args.train_subtree_depth_percent_end)) # Surrogate事前学習の最大深さ割合を本学習レンジへ揃える
     args._train_subtree_depth_cli_override = bool(
         _cli_option_was_provided("--train_subtree_level")
         or _cli_option_was_provided("--train_subtree_level_min")
@@ -1632,9 +1767,12 @@ def parse_pugan_args(parser, file_day, file_time):
     args.train_subtree_min_points = max(int(getattr(args, "train_subtree_min_points", 1)), 1)
     args.train_subtree_stat_log_limit = max(int(getattr(args, "train_subtree_stat_log_limit", 16)), 0)
     args.target_add_ratio = min(max(float(getattr(args, "target_add_ratio", 0.0)), 0.0), 0.95)
-    args.max_add_ratio = min(max(float(getattr(args, "max_add_ratio", args.target_add_ratio)), args.target_add_ratio), 0.95)
+    args.max_add_ratio = min(max(float(getattr(args, "max_add_ratio", args.target_add_ratio)), args.target_add_ratio), 1.0)
     args.target_drop_ratio = min(max(float(getattr(args, "target_drop_ratio", 0.0)), 0.0), 0.95)
-    args.max_drop_ratio = min(max(float(getattr(args, "max_drop_ratio", args.target_drop_ratio)), args.target_drop_ratio), 0.95)
+    args.max_drop_ratio = min(max(float(getattr(args, "max_drop_ratio", args.target_drop_ratio)), args.target_drop_ratio), 1.0)
+    args.target_repair_ratio = min(max(float(getattr(args, "target_repair_ratio", 0.0)), 0.0), 0.95)
+    args.max_repair_ratio = min(max(float(getattr(args, "max_repair_ratio", args.target_repair_ratio)), args.target_repair_ratio), 1.0)
+    args.max_move_ratio = min(max(float(getattr(args, "max_move_ratio", args.target_repair_ratio)), args.target_repair_ratio), 1.0)
     args.repair_delete_max_points_per_voxel = max(int(getattr(args, "repair_delete_max_points_per_voxel", 8)), 0)
     args.repair_move_max_points_per_voxel = max(int(getattr(args, "repair_move_max_points_per_voxel", 8)), 0)
     args.add_noop_keep_threshold = min(max(float(getattr(args, "add_noop_keep_threshold", 0.5)), 0.0), 1.0)

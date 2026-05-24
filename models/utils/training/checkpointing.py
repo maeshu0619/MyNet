@@ -4,6 +4,8 @@ import math
 import os
 import torch
 
+from ..surrogate.checkpoint import maybe_save_best_surrogate_registry, surrogate_state_payload
+
 
 def _finite_float(value, default=None):
     if torch.is_tensor(value):
@@ -31,17 +33,10 @@ def _save_surrogate_state(loss, ckpt_dir, filename):
     surrogate = getattr(loss, "compression_surrogate", None)
     if surrogate is None:
         return None
-    optimizer = getattr(loss, "surrogate_optimizer", None)
     loss_args = getattr(loss, "args", None)
-    payload = {
-        "compression_surrogate_state_dict": surrogate.state_dict(),
-        "surrogate_optimizer_state_dict": None if optimizer is None else optimizer.state_dict(),
-        "surrogate_step": int(getattr(loss, "_surrogate_step", 0)),
-        "surrogate_feature_dim": int(getattr(loss, "surrogate_feature_dim", 0) or 0),
-        "surrogate_levels": list(getattr(loss, "surrogate_levels", []) or []),
-        "compression_loss_backend": None if loss_args is None else getattr(loss_args, "compression_loss_backend", None),
-        "compress": None if loss_args is None else getattr(loss_args, "compress", None),
-    }
+    payload = surrogate_state_payload(loss_args if loss_args is not None else object(), loss, source=f"checkpoint_sidecar:{filename}") # 通常Checkpoint横にもCPU化済みSurrogate stateを保存する
+    if payload is None:
+        return None
     path = os.path.join(ckpt_dir, surrogate_sidecar_filename(filename))
     torch.save(payload, path)
     return path
@@ -65,6 +60,8 @@ def _ensure_best_trackers(best_trackers, best_loss):
     best_trackers.setdefault("has_actual_candidate", False)
     best_trackers.setdefault("has_actual_improved", False)
     best_trackers.setdefault("best_pth_source", None)
+    best_trackers.setdefault("surrogate_best_metric", float("inf"))
+    best_trackers.setdefault("surrogate_best_metric_name", None)
     return best_trackers
 
 
@@ -207,6 +204,12 @@ def save_episode_checkpoint(
             not_updated_reasons.append("fallback_not_allowed")
     if not checkpoint_updates and not not_updated_reasons:
         not_updated_reasons.append("actual_not_improved" if actual_backend else "loss_not_improved")
+    surrogate_abs_error = _finite_float(checkpoint_metrics.get("surrogate_abs_bit_error"), None) # Surrogate保存判定用の平均abs errorを取り出す
+    surrogate_registry_path = None # 共有Surrogate保存先を初期化する
+    if loss is not None and surrogate_abs_error is not None:
+        surrogate_registry_path = maybe_save_best_surrogate_registry( args, loss, best_trackers, writer, metric_name="surrogate_abs_bit_error", metric_value=surrogate_abs_error, source=f"episode_{episode + 1}") # Surrogateが改善した場合だけ指定形式の共有重みを保存する
+        if surrogate_registry_path is not None:
+            checkpoint_updates.append("surrogate_registry_best") # CheckpointSummaryにSurrogate保存更新を表示する
 
     writer.write(
         "CheckpointSummary: "
@@ -216,6 +219,7 @@ def save_episode_checkpoint(
         f"fresh_count={fresh_count}, "
         f"geom_ok={geometry_ok}, safety_ok={safety_ok}, "
         f"best_pth_source={best_trackers.get('best_pth_source')}, "
+        f"surrogate_best={_format_metric(best_trackers.get('surrogate_best_metric'))}, "
         f"updates={','.join(dict.fromkeys(checkpoint_updates)) or 'none'}, "
         f"not_updated_reasons={','.join(dict.fromkeys(not_updated_reasons)) or 'none'}"
     )

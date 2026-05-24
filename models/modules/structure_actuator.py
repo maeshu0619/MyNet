@@ -57,12 +57,21 @@ class StructureRepairActuator(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv1d(hidden_dim, len(neighbor_offsets), 1),
         )
+        # Pruneの実行量をActuator特徴から推定し、削除割合も学習対象にする。
+        self.drop_amount_head = nn.Conv1d(in_channels, 1, 1)
+        # Addの実行量をActuator特徴から推定し、固定比率に張り付かないようにする。
+        self.add_amount_head = nn.Conv1d(in_channels, 1, 1)
+        # Adjustの実行量をActuator特徴から推定し、source選択数も学習対象にする。
+        self.move_amount_head = nn.Conv1d(in_channels, 1, 1)
         nn.init.zeros_(self.move_voxel_head[-1].weight)
         nn.init.zeros_(self.move_voxel_head[-1].bias)
         nn.init.zeros_(self.drop_head[-1].weight)
         nn.init.zeros_(self.add_head[-1].weight)
         nn.init.zeros_(self.add_voxel_head[-1].weight)
         nn.init.zeros_(self.add_voxel_head[-1].bias)
+        nn.init.zeros_(self.drop_amount_head.weight)
+        nn.init.zeros_(self.add_amount_head.weight)
+        nn.init.zeros_(self.move_amount_head.weight)
         target_repair_ratio = float(
             getattr(self.args, "target_repair_ratio", getattr(self.args, "target_disp_ratio", 0.20))
         )
@@ -74,6 +83,9 @@ class StructureRepairActuator(nn.Module):
         target_add_ratio = min(max(float(getattr(self.args, "target_add_ratio", 0.01)), 1e-4), 0.95)
         init_add_bias = math.log(target_add_ratio / max(1.0 - target_add_ratio, 1e-6))
         nn.init.constant_(self.add_head[-1].bias, init_add_bias)
+        nn.init.constant_(self.drop_amount_head.bias, 0.0)
+        nn.init.constant_(self.add_amount_head.bias, 0.0)
+        nn.init.constant_(self.move_amount_head.bias, 0.0)
         self.debug_tensors = {}
 
     def _effective_qs(self):
@@ -657,6 +669,35 @@ class StructureRepairActuator(nn.Module):
         phase = self._exploration_phase()
         return start + (end - start) * phase
 
+    @staticmethod
+    def _safe_logit(prob):
+        # 0/1付近の確率を安全にlogitへ戻し、比率biasや探索ノイズをlogit空間で足す。
+        prob = prob.clamp(1e-4, 1.0 - 1e-4)
+        return torch.log(prob / (1.0 - prob))
+
+    def _learned_operation_ratio(self, actuator_features, head, max_ratio, random_mix_start, random_mix_end):
+        # 全点特徴を集約して、このStepでAdd/Adjustする割合を学習可能なTensorとして作る。
+        if max_ratio <= 0.0:
+            return actuator_features.new_zeros((actuator_features.shape[0], 1, 1))
+        pooled = actuator_features.mean(dim=2, keepdim=True)
+        if bool(getattr(self.args, "repair_learn_operation_amounts", True)):
+            ratio = torch.sigmoid(head(pooled)) * float(max_ratio)
+        else:
+            ratio = pooled.new_full((pooled.shape[0], 1, 1), float(max_ratio))
+        # 学習初期だけランダム比率を混ぜ、Add/Adjust量の探索範囲を広げる。
+        random_mix = min(max(self._annealed_value(random_mix_start, random_mix_end), 0.0), 1.0)
+        if self.training and random_mix > 0.0:
+            random_ratio = torch.rand_like(ratio) * float(max_ratio)
+            ratio = (1.0 - random_mix) * ratio + random_mix * random_ratio
+        return ratio.clamp(0.0, float(max_ratio))
+
+    def _ratio_bias(self, ratio, max_ratio):
+        # 学習した操作量を位置scoreへ戻し、何個選ぶかとどこを選ぶかの勾配をつなぐ。
+        if max_ratio <= 0.0:
+            return ratio.new_zeros(ratio.shape)
+        normalized = (ratio / float(max_ratio)).clamp(1e-4, 1.0 - 1e-4)
+        return self._safe_logit(normalized) * float(getattr(self.args, "repair_operation_amount_bias_scale", 2.0))
+
     def _max_add_ratio(self):
         target_ratio = self._target_add_ratio_value()
         if self._sparsepcgc_add_experiment_active():
@@ -697,16 +738,19 @@ class StructureRepairActuator(nn.Module):
             return str(getattr(self.args, "loss_mode", "legacy_total")).strip().lower() == "compression_primary"
         return True
 
-    def _target_add_count(self, point_count):
+    def _target_add_count(self, point_count, candidate_ratio_override=None):
         if point_count <= 0 or not self._add_enabled():
             return 0, 0.0
         max_ratio = self._max_add_ratio()
         if max_ratio <= 0.0:
             return 0, 0.0
-        start = float(getattr(self.args, "repair_add_candidate_ratio_start", 0.0)) or max_ratio
-        end = float(getattr(self.args, "repair_add_candidate_ratio_end", 0.0)) or max_ratio
-        phase = self._exploration_phase()
-        candidate_ratio = start + (end - start) * phase
+        if candidate_ratio_override is None:
+            start = float(getattr(self.args, "repair_add_candidate_ratio_start", 0.0)) or max_ratio
+            end = float(getattr(self.args, "repair_add_candidate_ratio_end", 0.0)) or max_ratio
+            phase = self._exploration_phase()
+            candidate_ratio = start + (end - start) * phase
+        else:
+            candidate_ratio = float(candidate_ratio_override)
         candidate_ratio = min(max(candidate_ratio, 0.0), max_ratio)
         max_add_points = int(math.ceil(max_ratio * float(point_count))) if max_ratio > 0.0 else 0
         add_points = int(math.ceil(candidate_ratio * float(point_count))) if candidate_ratio > 0.0 else 0
@@ -829,11 +873,15 @@ class StructureRepairActuator(nn.Module):
         target_ratio = float(getattr(self.args, "target_repair_ratio", getattr(self.args, "target_disp_ratio", 0.20)))
         if not operation_enabled:
             target_ratio = 0.0
+        max_repair_ratio = max(float(getattr(self.args, "max_repair_ratio", target_ratio)), target_ratio)
+        if not operation_enabled:
+            max_repair_ratio = 0.0
+        gate_cap_ratio = max_repair_ratio if bool(getattr(self.args, "repair_learn_operation_amounts", True)) else target_ratio
         if bool(getattr(self.args, "repair_priority_gate", True)) and repair_priority is not None:
             priority = repair_priority.to(device=pts_xyz.device, dtype=pts_xyz.dtype).clamp(0.0, 1.0)
             priority_gate = self._priority_topk_gate(
                 priority,
-                target_ratio=max(target_ratio, 1e-4),
+                target_ratio=max(gate_cap_ratio, 1e-4),
                 tau=float(getattr(self.args, "repair_priority_gate_tau", 0.08)),
             )
             repair_gate = base_repair_gate * priority_gate
@@ -841,7 +889,8 @@ class StructureRepairActuator(nn.Module):
             repair_gate = base_repair_gate
         if bool(getattr(self.args, "repair_gate_mean_cap", True)):
             gate_mean = self._masked_mean(repair_gate, selection_mask).detach().clamp_min(1e-6)
-            gate_scale = (target_ratio / gate_mean).clamp_max(1.0)
+            # 操作量を学習する場合は固定targetではなく広めの候補上限でrepair候補を残す。
+            gate_scale = (gate_cap_ratio / gate_mean).clamp_max(1.0)
             repair_gate = repair_gate * gate_scale
 
         node_score = cause_scores[:, 0:1, :]
@@ -894,6 +943,16 @@ class StructureRepairActuator(nn.Module):
         max_drop_ratio = max(float(getattr(self.args, "max_drop_ratio", max(target_drop_ratio, 0.01))), target_drop_ratio)
         if not prune_enabled:
             max_drop_ratio = 0.0
+        # Pruneする割合を特徴から学習し、固定target_drop_ratioだけに依存しない削除数にする。
+        learned_drop_ratio = self._learned_operation_ratio(
+            actuator_features,
+            self.drop_amount_head,
+            max_drop_ratio if prune_enabled else 0.0,
+            "repair_drop_amount_random_mix_start",
+            "repair_drop_amount_random_mix_end",
+        )
+        # hard削除数は整数なので、学習比率の値だけを使ってVoxel選択数へ変換する。
+        learned_drop_ratio_value = float(learned_drop_ratio.detach().mean().cpu()) if prune_enabled else 0.0
         delete_prior = torch.sigmoid(delete_prior.clamp(-8.0, 8.0))
         drop_score_noise = max(
             self._annealed_value("repair_drop_score_noise_start", "repair_drop_score_noise_end"),
@@ -904,6 +963,9 @@ class StructureRepairActuator(nn.Module):
             learned_drop_logit = learned_drop_logit + torch.randn_like(learned_drop_logit) * drop_score_noise
         learned_drop = torch.sigmoid(learned_drop_logit)
         drop_prob = (repair_gate * delete_prior * learned_drop).clamp(0.0, 1.0)
+        if prune_enabled and max_drop_ratio > 0.0:
+            # 学習したPrune量を削除scoreへ反映し、量と位置を同じlogit上で調整する。
+            drop_prob = torch.sigmoid(self._safe_logit(drop_prob) + self._ratio_bias(learned_drop_ratio, max_drop_ratio))
         drop_random_mix = min(
             max(self._annealed_value("repair_drop_random_mix_start", "repair_drop_random_mix_end"), 0.0),
             1.0,
@@ -925,8 +987,8 @@ class StructureRepairActuator(nn.Module):
         hard_drop_mask = self._hard_voxel_drop_mask(
             voxel_coords,
             drop_prob,
-            target_drop_ratio=target_drop_ratio,
-            max_drop_ratio=max_drop_ratio,
+            target_drop_ratio=learned_drop_ratio_value,
+            max_drop_ratio=learned_drop_ratio_value,
             selection_mask=delete_candidate_mask.unsqueeze(1),
             hard_threshold=float(getattr(self.args, "repair_drop_hard_threshold", 0.5)),
             voxel_cache=voxel_cache,
@@ -961,7 +1023,17 @@ class StructureRepairActuator(nn.Module):
             if selection_mask is not None:
                 source_prior = source_prior * selection_mask.to(device=pts_xyz.device, dtype=pts_xyz.dtype)
             move_score = torch.maximum(move_score, source_prior * (1.0 - hard_drop))
-        move_target_ratio = target_ratio if disp_enabled else 0.0
+        max_move_ratio = max(float(getattr(self.args, "max_move_ratio", target_ratio)), target_ratio) if disp_enabled else 0.0
+        # Adjustする割合を特徴から学習し、固定target_ratioだけに依存しないsource数にする。
+        learned_move_ratio = self._learned_operation_ratio(
+            actuator_features,
+            self.move_amount_head,
+            max_move_ratio,
+            "repair_move_amount_random_mix_start",
+            "repair_move_amount_random_mix_end",
+        )
+        # hard選択個数は整数なので、学習比率の値だけを使って選択数へ変換する。
+        move_target_ratio = float(learned_move_ratio.detach().mean().cpu()) if disp_enabled else 0.0
         require_empty_move = bool(getattr(self.args, "repair_move_require_empty_target", True))
         prefer_occupied_move = bool(getattr(self.args, "repair_move_prefer_occupied_target", False)) and not require_empty_move
         # SparsePCGCではtargetを新規empty voxelにするとactive coordinateが増えやすい。
@@ -977,6 +1049,16 @@ class StructureRepairActuator(nn.Module):
         move_target_valid = torch.ones_like(move_score)
         if not disp_enabled:
             move_score = torch.zeros_like(move_score)
+        elif max_move_ratio > 0.0:
+            # 学習したAdjust量をsource scoreへ反映し、量と位置を同じlogit上で調整する。
+            move_score = torch.sigmoid(self._safe_logit(move_score) + self._ratio_bias(learned_move_ratio, max_move_ratio))
+        move_score_noise = max(
+            self._annealed_value("repair_move_score_noise_start", "repair_move_score_noise_end"),
+            0.0,
+        )
+        if self.training and disp_enabled and move_score_noise > 0.0:
+            # 学習初期のsource探索を広げるため、Adjust scoreへannealされるノイズを入れる。
+            move_score = torch.sigmoid(self._safe_logit(move_score) + torch.randn_like(move_score) * move_score_noise)
         move_score = self._voxel_mean_logits(move_score, voxel_coords, voxel_cache=voxel_cache).clamp(0.0, 1.0)
         if require_empty_move:
             valid_move_points = empty_target_mask & (~dropped_target_mask)
@@ -1052,7 +1134,18 @@ class StructureRepairActuator(nn.Module):
             _mark_runtime("adjust_move")
 
         final_w = keep_prob
-        add_k, add_candidate_ratio = self._target_add_count(N)
+        max_add_ratio_value = self._max_add_ratio()
+        # Addする割合を特徴から学習し、固定10%のような張り付きから外す。
+        learned_add_ratio = self._learned_operation_ratio(
+            actuator_features,
+            self.add_amount_head,
+            max_add_ratio_value if add_enabled else 0.0,
+            "repair_add_amount_random_mix_start",
+            "repair_add_amount_random_mix_end",
+        )
+        # hardなtop-k個数は整数なので、学習比率の値だけを候補数計算へ渡す。
+        learned_add_ratio_value = float(learned_add_ratio.detach().mean().cpu()) if add_enabled else 0.0
+        add_k, add_candidate_ratio = self._target_add_count(N, candidate_ratio_override=learned_add_ratio_value)
         add_ratio = pts_xyz.new_zeros(())
         add_ratio_loss = pts_xyz.new_zeros(())
         add_shape_guard = pts_xyz.new_zeros(())
@@ -1091,7 +1184,8 @@ class StructureRepairActuator(nn.Module):
             )
             if sparsepcgc_add_experiment_active and not bool(getattr(self.args, "sparsepcgc_add_use_candidate_score", True)):
                 add_prior = torch.zeros_like(add_prior)
-            add_logit = learned_add_logit + add_prior
+            # Add量の学習結果を位置logitに足し、どのVoxelへ追加するかの勾配も残す。
+            add_logit = learned_add_logit + add_prior + self._ratio_bias(learned_add_ratio, max_add_ratio_value)
             if self.training and add_score_noise > 0.0:
                 add_logit = add_logit + self._gumbel_like(add_logit) * add_score_noise
             add_voxel_logits = self.add_voxel_head(actuator_features)
@@ -1257,18 +1351,26 @@ class StructureRepairActuator(nn.Module):
 
         repair_gate_mean = self._masked_mean(repair_gate, selection_mask)
         if threshold_cap_mode:
-            ratio_loss = torch.relu(repair_gate_mean - target_ratio) ** 2
+            ratio_loss = torch.relu(repair_gate_mean - gate_cap_ratio) ** 2
         else:
             ratio_loss = (repair_gate_mean - target_ratio) ** 2
         shape_guard = self._masked_mean(repair_gate * shape_score, selection_mask)
         drop_ratio = self._masked_mean(drop_prob, selection_mask)
-        if threshold_cap_mode:
-            drop_ratio_loss = drop_ratio.new_zeros(())
+        if threshold_cap_mode or bool(getattr(self.args, "repair_learn_operation_amounts", True)):
+            # 操作量を学習する場合は固定削除率へ引っ張らず、静的上限だけを守る。
+            drop_ratio_loss = torch.relu(drop_ratio - drop_ratio.new_tensor(float(max_drop_ratio))) ** 2
         else:
             drop_ratio_loss = (drop_ratio - target_drop_ratio) ** 2
         drop_cap_loss = torch.relu(drop_ratio - max_drop_ratio) ** 2
         drop_shape_guard = self._masked_mean(drop_prob * shape_score, selection_mask)
         local_edit_guard = self._masked_mean((drop_prob + move_mask).clamp(0.0, 1.0) * shape_score, selection_mask)
+        move_ratio_soft = self._masked_mean(move_mask, selection_mask)
+        # 各操作量headが実際のsoft操作率を追えるようにし、量headにも安定した勾配を渡す。
+        operation_amount_consistency_loss = (
+            (drop_ratio - learned_drop_ratio.mean()).pow(2)
+            + (move_ratio_soft - learned_move_ratio.mean()).pow(2)
+            + (add_ratio - learned_add_ratio.mean()).pow(2)
+        )
         loss = (
             edit_reg
             + float(getattr(self.args, "repair_ratio_weight", 0.1)) * ratio_loss
@@ -1283,6 +1385,7 @@ class StructureRepairActuator(nn.Module):
             + float(getattr(self.args, "repair_add_min_offset_weight", 0.5)) * add_min_offset_loss
             + float(getattr(self.args, "repair_quant_guard_weight", 1.0)) * (quant_move_conflict_loss + quant_add_guard)
             + float(getattr(self.args, "repair_local_guard_weight", 0.25)) * local_edit_guard
+            + float(getattr(self.args, "repair_operation_amount_consistency_weight", 1.0)) * operation_amount_consistency_loss
         )
         if timing_enabled:
             _mark_runtime("postprocess")
@@ -1300,6 +1403,11 @@ class StructureRepairActuator(nn.Module):
             "add_priority_max": add_priority.max().detach() if add_priority.numel() > 0 else pts_xyz.new_zeros(()).detach(),
             "add_candidate_ratio": pts_xyz.new_tensor(float(add_candidate_ratio)).detach(),
             "add_candidate_count": pts_xyz.new_tensor(float(add_k)).detach(),
+            "learned_drop_ratio": learned_drop_ratio.mean().detach(),
+            "learned_add_ratio": learned_add_ratio.mean().detach(),
+            "learned_move_ratio": learned_move_ratio.mean().detach(),
+            "operation_amount_consistency_loss": operation_amount_consistency_loss.detach(),
+            "move_score_noise": pts_xyz.new_tensor(float(move_score_noise)).detach(),
             "sparsepcgc_add_experiment_enabled": pts_xyz.new_tensor(float(sparsepcgc_add_experiment_active)).detach(),
             "sparsepcgc_add_warmup": pts_xyz.new_tensor(float(self._sparsepcgc_add_warmup())).detach(),
             "add_score_noise": pts_xyz.new_tensor(float(add_score_noise)).detach(),
@@ -1369,6 +1477,11 @@ class StructureRepairActuator(nn.Module):
             "add_effective_count": add_effective_count_value,
             "add_candidate_ratio": float(add_candidate_ratio),
             "add_candidate_count": int(add_k),
+            "learned_drop_ratio": learned_drop_ratio.mean(),
+            "learned_add_ratio": learned_add_ratio.mean(),
+            "learned_move_ratio": learned_move_ratio.mean(),
+            "operation_amount_consistency_loss": operation_amount_consistency_loss,
+            "move_score_noise": float(move_score_noise),
             "sparsepcgc_add_experiment_enabled": bool(sparsepcgc_add_experiment_active),
             "sparsepcgc_add_warmup": float(self._sparsepcgc_add_warmup()),
             "add_score_noise": float(add_score_noise),

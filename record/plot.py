@@ -1,7 +1,8 @@
 """
 loss: 全損失
 geom: 幾何損失
- compression: 実圧縮 total-bit 差百分率
+compression: Surrogateが予測したtotal-bit差百分率
+actual_compression: 実codecで測ったtotal-bit差百分率
 attr: 原因分解損失
 policy: 修復ポリシー損失
 single: single-child 指標の変化率
@@ -48,7 +49,7 @@ class PlotMaker():
         else:
             log_root = os.path.abspath(os.path.expanduser(str(log_root)))
         self.save_dir = os.path.join(log_root, self.args.date, f"MyNetwork_train/{args.compress}")
-        self.num_loss = 14
+        self.num_loss = 15 # 実圧縮percent列を追加したmetric総数
         self.x_len = 10
         self.y_len = 4
         self.step_loss_his = [[] for _ in range(self.num_loss)]
@@ -83,7 +84,7 @@ class PlotMaker():
         self.filename_step = f"{args.time}_step"
         self.filename_epo = f"{args.time}_epo"
         self.filename_epi = f"{args.time}_epi"
-        self.title_group = [[0, 1, 10], [2, 5, 6], [11, 12, 13], [3, 7], [4, 8, 9]]
+        self.title_group = [[0, 1, 11], [2, 3, 6, 7], [12, 13, 14], [4, 8], [5, 9, 10]] # 実圧縮とSurrogate圧縮を同じ圧縮グループに並べる
         self.group_title = [
             "other", 
             "compression", 
@@ -95,6 +96,7 @@ class PlotMaker():
             "", 
             "_geom", 
             "_com", 
+            "_actual_com", # 実codecで測った圧縮差百分率の個別plot名
             "_attr",
             "_policy",
             "_single", 
@@ -110,7 +112,8 @@ class PlotMaker():
         self.title = [
             "Loss", 
             "Loss of Geometry", 
-            "Compression Objective / Delta (100*(Mine-GT)/GT)",
+            "Surrogate Predicted Delta (100*(Mine-GT)/GT)",
+            "Actual Codec Delta (100*(Mine-GT)/GT)", # 実圧縮の同一式percentを描画する
             "Loss of Octree Cost Attribution",
             "Loss of Structure Repair Policy",
             "Loss of Single Child Nodes", 
@@ -127,6 +130,7 @@ class PlotMaker():
             "loss",
             "geom",
             "compression",
+            "actual_compression", # 実codecで測った(Mine-GT)*100/GTをCSVへ保存する
             "attr",
             "policy",
             "single",
