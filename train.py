@@ -109,7 +109,66 @@ def _safe_scalar_for_grad_log(value):
             return None
         return float(value.detach().float().mean().cpu())
     except Exception:
-        return None
+            return None
+
+
+def _format_soft_proxy_debug(args):
+    merged = {}
+    for attr_name in ("_soft_proxy_geom_debug", "_soft_proxy_com_debug"):
+        value = getattr(args, attr_name, None)
+        if isinstance(value, dict):
+            merged.update(value)
+    if not merged:
+        return ""
+    parts = []
+    for key in (
+        "soft_proxy_geom_requires_grad",
+        "soft_proxy_com_requires_grad",
+        "soft_proxy_prune_geom_requires_grad",
+        "soft_proxy_prune_com_requires_grad",
+        "drop_prob_requires_grad",
+        "keep_prob_requires_grad",
+        "drop_logit_mean",
+        "drop_logit_min",
+        "drop_logit_max",
+        "drop_prob_mean",
+        "drop_prob_min",
+        "drop_prob_max",
+        "drop_prob_proxy_mean",
+        "drop_prob_proxy_min",
+        "drop_prob_proxy_max",
+        "keep_prob_mean",
+        "keep_prob_min",
+        "keep_prob_max",
+        "drop_entropy",
+        "selected_drop_count_hard",
+        "soft_drop_mass",
+        "prune_soft_geom_value",
+        "prune_soft_rate_value",
+        "prune_soft_node_value",
+        "prune_soft_single_value",
+        "prune_soft_bit_value",
+    ):
+        if key not in merged:
+            continue
+        value = merged[key]
+        if isinstance(value, bool):
+            parts.append(f"{key}={value}")
+        elif value is None:
+            parts.append(f"{key}=None")
+        else:
+            try:
+                parts.append(f"{key}={float(value):.6g}")
+            except Exception:
+                parts.append(f"{key}={value}")
+    return ", ".join(parts)
+
+
+def _discrete_loss_mode_value(args):
+    # parse_pugan_args が正規化する正式名を使う。旧 typo 名が残る実験設定だけ後方互換で読む。
+    return str(
+        getattr(args, "discrete_loss_mode", getattr(args, "discretelossmode", "hard"))
+    ).strip().lower()
 
 
 def _step_grad_group_specs():
@@ -235,6 +294,9 @@ def build_step_grad_rows(
     """
     enabled = bool(getattr(args, "step_grad_log", True))
     if not enabled:
+        return []
+
+    if bool(getattr(args, "step_grad_first_step_only", True)) and int(global_step) != 0:
         return []
 
     interval = max(int(getattr(args, "step_grad_log_interval", 1)), 1)
@@ -522,6 +584,18 @@ def train(model, args, loss, writer, plot, notifier=None):
     case_debug_path = init_case_debug_csv(args, plot, writer) # 圧縮効率が良い/悪いケースを後から分析するためのCSVの初期化
     case_debug_counts = {"good": 0, "bad": 0}
     metric_csv_paths = init_metric_csvs(args, plot, writer) # 圧縮メトリクス/点操作メトリクス/ChackPoint判定値などの書き込み
+    # 各損失項が各モジュール・点操作へ流す勾配量を記録するCSV
+    step_grad_dir = getattr(plot, "save_dir", None) or getattr(args, "out_path", ".")
+    metric_csv_paths["step_grad"] = os.path.join(step_grad_dir, f"{args.time}_MyNetwork_step_grad.csv")
+    if bool(getattr(args, "step_grad_log", True)):
+        init_csv_file(metric_csv_paths["step_grad"], STEP_GRAD_COLUMNS, writer, "StepGradCSV")
+        writer.write(
+            "StepGradCSVMode: "
+            f"first_step_only={bool(getattr(args, 'step_grad_first_step_only', True))}, "
+            f"interval={int(getattr(args, 'step_grad_log_interval', 1))}"
+        )
+    else:
+        writer.write(f"StepGradCSV: disabled path={metric_csv_paths['step_grad']}")
 
     """原因診断のためのログ"""
     for_better_path = init_for_better_logger(args, plot, writer) # 改善・改悪要因を記録する詳細分析ログ
@@ -888,7 +962,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                             gen_xyz = gen_pts[:, :3, :]
                             train_edit_stats = summarize_point_edits( input_xyz=input_xyz[:, :3, :], gen_pts=gen_pts, final_w=final_w, args=args) # 入力点群と出力点群を比較し、各操作の編集統計を計算
                             final_w_for_loss = None
-                            if str(getattr(args, "discretelossmode", "hard")).strip().lower() != "hard":
+                            if _discrete_loss_mode_value(args) != "hard":
                                 final_w_for_loss = final_w
                             autocast_ctx = torch.cuda.amp.autocast(dtype=amp_dtype, enabled=use_amp) if use_cuda else nullcontext() # 形状損失と圧縮損失の計算もAMP文脈で行うための設定を作る
                             with autocast_ctx:
@@ -1002,7 +1076,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 subtree_edit_stats = summarize_point_edits( input_xyz=subtree_xyz[:, :3, :], gen_pts=gen_subtree_pts, final_w=final_w_sub, args=args) # Subtree入力とSubtree出力を比較し、操作などを計算する
                                 add_point_edit_sums(subtree_edit_sums, subtree_edit_stats) # 現在Subtreeの編集統計を、Step全体の編集統計に累積する
                                 final_w_sub_loss = None
-                                if str(getattr(args, "discretelossmode", "hard")).strip().lower() != "hard":
+                                if _discrete_loss_mode_value(args) != "hard":
                                     final_w_sub_loss = final_w_sub
 
                                 """損失計算"""
@@ -1066,7 +1140,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                 autocast_ctx = torch.cuda.amp.autocast(dtype=amp_dtype, enabled=use_amp) if use_cuda else nullcontext() # Loss計算用のAMPコンテキストを作る
                 with autocast_ctx:
                     final_w_for_loss = None # Lossに渡す点操作重みの初期化
-                    if str(getattr(args, "discretelossmode", "hard")).strip().lower() != "hard": # 離散損失モードがHard以外か判定する
+                    if _discrete_loss_mode_value(args) != "hard": # 離散損失モードがHard以外か判定する
                         final_w_for_loss = final_w
                     if timing_enabled:
                         sync_for_timing(use_cuda)
@@ -1102,8 +1176,14 @@ def train(model, args, loss, writer, plot, notifier=None):
                 if compression_primary_mode: # 圧縮優先の場合、圧縮損失を重視した損失を再計算
                     L, L_com_objective, cp_debug = build_compression_primary_loss( args, terms=terms, L_com=L_com, L_geom=L_geom, L_actuator=L_actuator, global_train_step=global_train_step, stage_factors=stage_factors)
                     L_downstream = L_com_objective
+                    L = (
+                        L
+                        + stage_factors["attr"] * args.w_attr * L_attr
+                        + stage_factors["policy"] * args.w_policy * L_policy
+                        + stage_factors["repair"] * args.w_actuator * L_actuator
+                    )
                     L_discrete_policy = L.new_zeros(())
-                elif str(getattr(args, "discretelossmode", "hard")).strip().lower() == "hard":
+                elif _discrete_loss_mode_value(args) == "hard":
                     policy_loss_fn = getattr(model, "discrete_policy_loss", None) # モデルが保持しているHard離散方策用の損失関数を取得する
                     if callable(policy_loss_fn):
                         L_discrete_policy = policy_loss_fn(L_downstream.detach())
@@ -1189,6 +1269,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                     before_node, after_node, before_single, after_single = log_compression_train_debug( writer, step, num_steps, args, comp_debug, loss, L_com)
                     log_codec_actual_correlation( writer, step, num_steps, args, comp_debug, codec_actual_metric_pairs, before_node, after_node, before_single, after_single)
                     log_sparsepcgc_train_debug( writer, step, num_steps, args, comp_debug, sparsepcgc_proxy_actual_pairs)
+                    soft_proxy_debug_text = _format_soft_proxy_debug(args)
+                    if soft_proxy_debug_text:
+                        writer.write(f"SoftProxyGradDebug: {soft_proxy_debug_text}")
                     if structure_debug:
                         log_structure_debug( writer, structure_debug, step, num_steps)
                         write_structure_decision_debug( writer, f"StructureDecision step={step + 1}/{num_steps}", structure_debug)
@@ -1197,33 +1280,50 @@ def train(model, args, loss, writer, plot, notifier=None):
                     timing_loss_end = time.time()
 
                 """勾配確認"""
-                # backward_and_measure("geom", args.w_geom * L_geom, model, optimizer, writer, args)
-                # backward_and_measure("com", args.w_com  * L_com,  model, optimizer, writer, args)
-                # backward_and_measure("attr", args.w_attr * L_attr, model, optimizer, writer, args)
-                # backward_and_measure("policy" , args.w_policy  * L_policy,  model, optimizer, writer, args)
-                loss_grad_probe_rows = build_loss_grad_probe_rows(
+                step_grad_loss_items = [
+                    ("L_total", L),
+                    ("L_downstream", L_downstream),
+                    ("L_geom", L_geom),
+                    ("L_com", L_com),
+                    ("L_com_objective", L_com_objective),
+                    ("L_attr", L_attr),
+                    ("L_policy", L_policy),
+                    ("L_actuator", L_actuator),
+                    ("loss_bit", loss_bit),
+                    ("loss_nodes", loss_nodes),
+                    ("loss_single", loss_single),
+                    ("surrogate_loss_for_grad", terms.get("surrogate", None)),
+                ]
+                if torch.is_tensor(La_fit) and La_fit.requires_grad:
+                    step_grad_loss_items.append(("La_fit", La_fit))
+                sparsepcgc_aux_term = terms.get("sparsepcgc", None)
+                if torch.is_tensor(sparsepcgc_aux_term) and sparsepcgc_aux_term.requires_grad:
+                    step_grad_loss_items.append(("sparsepcgc_aux_objective", sparsepcgc_aux_term))
+                step_grad_rows = build_step_grad_rows(
                     args,
                     model,
-                    [
-                        ("L_total", L),
-                        ("L_geom", L_geom),
-                        ("L_com", L_com),
-                        ("L_actuator", L_actuator),
-                        ("loss_nodes", loss_nodes),
-                        ("loss_single", loss_single),
-                        ("surrogate_loss_for_grad", terms.get("surrogate", None)),
-                        ("sparsepcgc_aux_objective", terms.get("sparsepcgc", None)),
-                    ],
+                    step_grad_loss_items,
                     global_step=global_train_step,
                     episode=episode,
                     epoch=epoch,
                     step=step,
                     stage=current_stage,
                 )
-                if loss_grad_probe_rows:
-                    writer.write(summarize_loss_grad_probe_rows(loss_grad_probe_rows))
-                    for loss_grad_probe_row in loss_grad_probe_rows:
-                        append_csv_row(metric_csv_paths.get("loss_grad_probe"), LOSS_GRAD_PROBE_COLUMNS, loss_grad_probe_row)
+
+                if step_grad_rows:
+                    append_count = 0
+                    for step_grad_row in step_grad_rows:
+                        append_csv_row(
+                            metric_csv_paths.get("step_grad"),
+                            STEP_GRAD_COLUMNS,
+                            step_grad_row,
+                        )
+                        append_count += 1
+                    writer.write(
+                        "StepGradProbe: "
+                        f"rows={append_count}, "
+                        f"path={metric_csv_paths.get('step_grad')}"
+                    )
 
                 """勾配を流す"""
                 step_completed = False # Optimizer更新が成功したかのフラグ

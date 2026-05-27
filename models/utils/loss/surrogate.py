@@ -431,6 +431,59 @@ class SurrogateCompressionLossMixin:
         single_percent = 100.0 * (gen_single - ref_single) / ref_single.abs().clamp_min(1e-6)
         return node_percent, single_percent
 
+    @staticmethod
+    def _as_proxy_scalar(value, reference):
+        if not torch.is_tensor(value):
+            return reference.new_zeros(())
+        value = value.to(device=reference.device, dtype=reference.dtype)
+        return value.reshape(()) if value.numel() == 1 else value.mean()
+
+    @staticmethod
+    def _proxy_debug_scalar(value):
+        if not torch.is_tensor(value):
+            return None
+        try:
+            return float(value.detach().float().mean().cpu())
+        except Exception:
+            return None
+
+    @staticmethod
+    def _proxy_debug_requires_grad(value):
+        return bool(torch.is_tensor(value) and value.requires_grad)
+
+    def _actuator_soft_rate_proxy(self, args, reference):
+        terms = getattr(args, "_last_actuator_soft_terms", {}) or {}
+        if not isinstance(terms, dict):
+            return reference.new_zeros(())
+
+        add_proxy = (
+            self._as_proxy_scalar(terms.get("add_ratio"), reference)
+            + self._as_proxy_scalar(terms.get("learned_add_ratio"), reference)
+            + self._as_proxy_scalar(terms.get("add_prob_mean"), reference)
+            + 0.1 * self._as_proxy_scalar(terms.get("add_direction_ce"), reference)
+        )
+        prune_proxy = (
+            2.0 * self._as_proxy_scalar(terms.get("drop_prob"), reference)
+            + 2.0 * self._as_proxy_scalar(terms.get("drop_prob_proxy"), reference)
+            + 2.0 * self._as_proxy_scalar(terms.get("learned_drop_prob"), reference)
+            + self._as_proxy_scalar(terms.get("learned_drop_ratio"), reference)
+            + 5.0 * self._as_proxy_scalar(terms.get("prune_soft_rate"), reference)
+            + 2.0 * self._as_proxy_scalar(terms.get("prune_soft_node"), reference)
+            + 2.0 * self._as_proxy_scalar(terms.get("prune_soft_single"), reference)
+            + 3.0 * self._as_proxy_scalar(terms.get("prune_soft_bit"), reference)
+        )
+        move_proxy = (
+            self._as_proxy_scalar(terms.get("move_score_mean"), reference)
+            + self._as_proxy_scalar(terms.get("learned_move_ratio"), reference)
+            + 0.1 * self._as_proxy_scalar(terms.get("move_direction_ce"), reference)
+        )
+        proxy = (
+            float(getattr(args, "compression_soft_rate_add_weight", 2.0)) * add_proxy
+            + float(getattr(args, "compression_soft_rate_prune_weight", 10.0)) * prune_proxy
+            + float(getattr(args, "compression_soft_rate_move_weight", 0.5)) * move_proxy
+        )
+        return torch.nan_to_num(proxy, nan=0.0, posinf=0.0, neginf=0.0)
+
     def _set_surrogate_trainable(self, trainable):
         for param in self.compression_surrogate.parameters():
             param.requires_grad_(trainable)
@@ -1173,9 +1226,86 @@ class SurrogateCompressionLossMixin:
         )
         loss_single = soft_single_percent.to(device=gen_xyz.device, dtype=torch.float32)
         loss_nodes = soft_node_percent.to(device=gen_xyz.device, dtype=torch.float32)
+        actuator_rate_proxy = self._actuator_soft_rate_proxy(args, loss_nodes)
+        actuator_terms = getattr(args, "_last_actuator_soft_terms", {}) or {}
+        prune_soft_rate = self._as_proxy_scalar(actuator_terms.get("prune_soft_rate"), loss_nodes)
+        prune_soft_node = self._as_proxy_scalar(actuator_terms.get("prune_soft_node"), loss_nodes)
+        prune_soft_single = self._as_proxy_scalar(actuator_terms.get("prune_soft_single"), loss_nodes)
+        prune_soft_bit = self._as_proxy_scalar(actuator_terms.get("prune_soft_bit"), loss_nodes)
+        prune_com_proxy = torch.nan_to_num(
+            prune_soft_rate + 0.50 * prune_soft_node + 0.50 * prune_soft_single + prune_soft_bit,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        if actuator_rate_proxy.requires_grad:
+            loss_nodes = loss_nodes + float(getattr(args, "compression_soft_node_actuator_grad_weight", 10.0)) * (
+                actuator_rate_proxy - actuator_rate_proxy.detach()
+            )
+            loss_single = loss_single + float(getattr(args, "compression_soft_single_actuator_grad_weight", 5.0)) * (
+                actuator_rate_proxy - actuator_rate_proxy.detach()
+            )
+        if prune_com_proxy.requires_grad:
+            loss_nodes = loss_nodes + float(getattr(args, "compression_soft_prune_node_grad_weight", 25.0)) * (
+                prune_soft_node - prune_soft_node.detach()
+            )
+            loss_single = loss_single + float(getattr(args, "compression_soft_prune_single_grad_weight", 20.0)) * (
+                prune_soft_single - prune_soft_single.detach()
+            )
+        loss_bit_proxy = surrogate_bit_percent
+        if actuator_rate_proxy.requires_grad:
+            loss_bit_proxy = loss_bit_proxy + float(getattr(args, "compression_soft_bit_actuator_grad_weight", 10.0)) * (
+                actuator_rate_proxy - actuator_rate_proxy.detach()
+            )
+        if prune_com_proxy.requires_grad:
+            loss_bit_proxy = loss_bit_proxy + float(getattr(args, "compression_soft_prune_bit_grad_weight", 30.0)) * (
+                prune_soft_bit - prune_soft_bit.detach()
+            )
+        if final_w is None:
+            effective_point_count = gen_xyz.new_tensor(float(gen_xyz.shape[-1]), dtype=torch.float32)
+        else:
+            point_w = final_w.to(device=gen_xyz.device, dtype=torch.float32)
+            if point_w.ndim == 3:
+                point_w = point_w.squeeze(1)
+            effective_point_count = point_w.clamp(0.0, 1.0).sum(dim=1).mean()
+        ref_point_count = gen_xyz.new_tensor(float(max(int(gt_xyz.shape[-1]), 1)), dtype=torch.float32)
+        soft_point_percent = 100.0 * (effective_point_count - ref_point_count) / ref_point_count.abs().clamp_min(1.0)
+        soft_rate_proxy_for_grad = (
+            float(getattr(args, "compression_soft_rate_point_weight", 0.25)) * soft_point_percent
+            + float(getattr(args, "compression_soft_rate_node_weight", 0.10)) * loss_nodes
+            + float(getattr(args, "compression_soft_rate_single_weight", 0.05)) * loss_single
+            + float(getattr(args, "compression_soft_rate_sparsepcgc_weight", 0.05)) * sparse_terms["loss"].to(device=gen_xyz.device, dtype=torch.float32)
+            + actuator_rate_proxy
+        )
+        soft_rate_proxy_for_grad = torch.nan_to_num(
+            soft_rate_proxy_for_grad,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        soft_rate_proxy_grad_weight = max(
+            float(getattr(args, "compression_soft_rate_proxy_grad_weight", 0.05)),
+            0.0,
+        )
+        soft_rate_proxy_ste = (
+            soft_rate_proxy_grad_weight
+            * (soft_rate_proxy_for_grad - soft_rate_proxy_for_grad.detach())
+            if inputs_finite and soft_rate_proxy_grad_weight > 0.0
+            else gen_xyz.new_zeros(())
+        )
+        prune_rate_proxy_grad_weight = max(
+            float(getattr(args, "compression_soft_prune_rate_proxy_grad_weight", 10.0)),
+            0.0,
+        )
+        soft_prune_rate_ste = (
+            prune_rate_proxy_grad_weight * (prune_com_proxy - prune_com_proxy.detach())
+            if inputs_finite and prune_com_proxy.requires_grad and prune_rate_proxy_grad_weight > 0.0
+            else gen_xyz.new_zeros(())
+        )
         forward_mode = str(getattr(args, "compression_surrogate_forward_mode", "teacher_ste")).strip().lower()
         surrogate_weight = self._surrogate_weight(args) * float(main_grad_scale)
-        surrogate_loss_for_grad = surrogate_bit_percent if inputs_finite else gen_xyz.new_zeros(())
+        surrogate_loss_for_grad = loss_bit_proxy if inputs_finite else gen_xyz.new_zeros(())
+        surrogate_loss_for_grad_weighted = surrogate_weight * surrogate_loss_for_grad
         if forward_mode == "teacher_ste":
             surrogate_loss = surrogate_bit_percent if inputs_finite else None
             if surrogate_loss is None:
@@ -1184,6 +1314,49 @@ class SurrogateCompressionLossMixin:
                 main_loss = actual_bit_percent_t + surrogate_weight * (surrogate_loss - surrogate_loss.detach())
         else:
             main_loss = (float(main_grad_scale) * surrogate_bit_percent) if inputs_finite else actual_bit_percent_t
+        main_loss = main_loss + soft_rate_proxy_ste + soft_prune_rate_ste
+        surrogate_loss_for_grad_weighted = surrogate_loss_for_grad_weighted + (
+            soft_rate_proxy_grad_weight * soft_rate_proxy_for_grad
+            if inputs_finite and soft_rate_proxy_grad_weight > 0.0
+            else gen_xyz.new_zeros(())
+        )
+        surrogate_loss_for_grad_weighted = surrogate_loss_for_grad_weighted + (
+            prune_rate_proxy_grad_weight * prune_com_proxy
+            if inputs_finite and prune_com_proxy.requires_grad and prune_rate_proxy_grad_weight > 0.0
+            else gen_xyz.new_zeros(())
+        )
+        try:
+            setattr(
+                args,
+                "_soft_proxy_com_debug",
+                {
+                    "soft_proxy_com_requires_grad": self._proxy_debug_requires_grad(soft_rate_proxy_for_grad),
+                    "soft_proxy_prune_com_requires_grad": self._proxy_debug_requires_grad(prune_com_proxy),
+                    "drop_prob_requires_grad": self._proxy_debug_requires_grad(actuator_terms.get("drop_prob")),
+                    "keep_prob_requires_grad": self._proxy_debug_requires_grad(actuator_terms.get("keep_prob")),
+                    "drop_prob_mean": self._proxy_debug_scalar(actuator_terms.get("drop_prob_mean")),
+                    "drop_prob_min": self._proxy_debug_scalar(actuator_terms.get("drop_prob_min")),
+                    "drop_prob_max": self._proxy_debug_scalar(actuator_terms.get("drop_prob_max")),
+                    "drop_prob_proxy_mean": self._proxy_debug_scalar(actuator_terms.get("drop_prob_proxy_mean")),
+                    "drop_prob_proxy_min": self._proxy_debug_scalar(actuator_terms.get("drop_prob_proxy_min")),
+                    "drop_prob_proxy_max": self._proxy_debug_scalar(actuator_terms.get("drop_prob_proxy_max")),
+                    "keep_prob_mean": self._proxy_debug_scalar(actuator_terms.get("keep_prob_mean")),
+                    "keep_prob_min": self._proxy_debug_scalar(actuator_terms.get("keep_prob_min")),
+                    "keep_prob_max": self._proxy_debug_scalar(actuator_terms.get("keep_prob_max")),
+                    "drop_logit_mean": self._proxy_debug_scalar(actuator_terms.get("drop_logit_mean")),
+                    "drop_logit_min": self._proxy_debug_scalar(actuator_terms.get("drop_logit_min")),
+                    "drop_logit_max": self._proxy_debug_scalar(actuator_terms.get("drop_logit_max")),
+                    "drop_entropy": self._proxy_debug_scalar(actuator_terms.get("drop_entropy")),
+                    "selected_drop_count_hard": self._proxy_debug_scalar(actuator_terms.get("selected_drop_count_hard")),
+                    "soft_drop_mass": self._proxy_debug_scalar(actuator_terms.get("soft_drop_mass")),
+                    "prune_soft_rate_value": self._proxy_debug_scalar(prune_soft_rate),
+                    "prune_soft_node_value": self._proxy_debug_scalar(prune_soft_node),
+                    "prune_soft_single_value": self._proxy_debug_scalar(prune_soft_single),
+                    "prune_soft_bit_value": self._proxy_debug_scalar(prune_soft_bit),
+                },
+            )
+        except Exception:
+            pass
         aux_loss = aux_node_weight * loss_nodes + aux_single_weight * loss_single
         aux_objective = aux_loss if bool(getattr(args, "compression_surrogate_aux_in_objective", False)) else aux_loss.new_zeros(())
         sparsepcgc_aux_weight = float(getattr(args, "com_sparsepcgc", 0.0))
@@ -1233,16 +1406,17 @@ class SurrogateCompressionLossMixin:
         backend_label = self._surrogate_backend_label(args, teacher_codec)
         self._store_compression_terms(
             main=main_loss,
-            bit=surrogate_bit_percent,
+            bit=loss_bit_proxy,
             node=loss_nodes,
             single=loss_single,
             bpn=gen_xyz.new_zeros(()),
             objective=L_com,
             forward=L_com,
             hard=actual_bit_percent_t,
-            surrogate=surrogate_bit_percent,
+            surrogate=surrogate_loss_for_grad_weighted,
             aux=aux_loss,
             sparsepcgc=sparse_aux_term,
+            op=soft_rate_proxy_for_grad,
             backend=backend_label,
         )
 
@@ -1326,6 +1500,9 @@ class SurrogateCompressionLossMixin:
             "compression_objective": self._scalar(L_com),
             "compression_main_loss": self._scalar(main_loss),
             "compression_aux_loss": self._scalar(aux_loss),
+            "compression_soft_rate_proxy_for_grad": self._scalar(soft_rate_proxy_for_grad.detach()),
+            "compression_soft_rate_proxy_grad_weight": float(soft_rate_proxy_grad_weight),
+            "compression_soft_point_percent": self._scalar(soft_point_percent.detach()),
             "compression_aux_in_objective": bool(getattr(args, "compression_surrogate_aux_in_objective", False)),
             "compression_main_grad_scale": float(main_grad_scale),
             "compression_main_grad_scale_reason": str(main_grad_scale_reason),
@@ -1395,7 +1572,7 @@ class SurrogateCompressionLossMixin:
             "pred_clipped": bool(pred_clipped),
             "pred_clip_min": float(pred_clip_min_value),
             "pred_clip_max": float(pred_clip_max_value),
-            "surrogate_loss_for_grad": self._scalar((surrogate_weight * surrogate_loss_for_grad).detach()),
+            "surrogate_loss_for_grad": self._scalar(surrogate_loss_for_grad_weighted.detach()),
             "proxy_aux_for_grad": self._scalar(proxy_aux_for_grad.detach()),
             "grad_source": grad_source,
             "actual_value_is_fresh": bool(teacher_refreshed),
@@ -1558,9 +1735,9 @@ class SurrogateCompressionLossMixin:
         self._log_compression_grad_probe(args, backend_label, L_com, gen_xyz)
         return (
             L_com,
-            surrogate_bit_percent.detach(),
-            loss_single.detach(),
-            loss_nodes.detach(),
+            loss_bit_proxy,
+            loss_single,
+            loss_nodes,
             cached_gt,
             {
                 "bit": float(cached_gt["bit"]),

@@ -20,6 +20,70 @@ class GeometryLossMixin:
             return torch.cuda.amp.autocast(enabled=False)
         return nullcontext()
 
+    @staticmethod
+    def _as_geometry_scalar(value, reference):
+        if not torch.is_tensor(value):
+            return reference.new_zeros(())
+        value = value.to(device=reference.device, dtype=reference.dtype)
+        return value.reshape(()) if value.numel() == 1 else value.mean()
+
+    @staticmethod
+    def _debug_scalar(value):
+        if not torch.is_tensor(value):
+            return None
+        try:
+            return float(value.detach().float().mean().cpu())
+        except Exception:
+            return None
+
+    @staticmethod
+    def _debug_requires_grad(value):
+        return bool(torch.is_tensor(value) and value.requires_grad)
+
+    def _soft_actuator_geometry_proxy(self, args, reference):
+        if getattr(args, "trainORtest", "train") != "train":
+            return reference.new_zeros(())
+        terms = getattr(args, "_last_actuator_soft_terms", {}) or {}
+        if not isinstance(terms, dict):
+            return reference.new_zeros(())
+
+        add_proxy = (
+            self._as_geometry_scalar(terms.get("add_shape_guard"), reference)
+            + 0.1 * self._as_geometry_scalar(terms.get("add_direction_ce"), reference)
+            + 0.1 * self._as_geometry_scalar(terms.get("add_prob_mean"), reference)
+        )
+        prune_soft_geom = self._as_geometry_scalar(terms.get("prune_soft_geom"), reference)
+        prune_proxy = prune_soft_geom + 0.1 * self._as_geometry_scalar(terms.get("drop_shape_guard"), reference)
+        move_proxy = 0.1 * self._as_geometry_scalar(terms.get("move_direction_ce"), reference)
+        proxy = (
+            float(getattr(args, "geometry_soft_add_proxy_weight", 1e-3)) * add_proxy
+            + float(getattr(args, "geometry_soft_prune_proxy_weight", 1.0)) * prune_proxy
+            + float(getattr(args, "geometry_soft_move_proxy_weight", 1e-3)) * move_proxy
+        )
+        proxy = torch.nan_to_num(proxy, nan=0.0, posinf=0.0, neginf=0.0)
+        try:
+            setattr(
+                args,
+                "_soft_proxy_geom_debug",
+                {
+                    "soft_proxy_geom_requires_grad": self._debug_requires_grad(proxy),
+                    "soft_proxy_prune_geom_requires_grad": self._debug_requires_grad(prune_proxy),
+                    "drop_prob_requires_grad": self._debug_requires_grad(terms.get("drop_prob")),
+                    "keep_prob_requires_grad": self._debug_requires_grad(terms.get("keep_prob")),
+                    "drop_prob_mean": self._debug_scalar(terms.get("drop_prob_mean")),
+                    "drop_prob_min": self._debug_scalar(terms.get("drop_prob_min")),
+                    "drop_prob_max": self._debug_scalar(terms.get("drop_prob_max")),
+                    "drop_prob_proxy_mean": self._debug_scalar(terms.get("drop_prob_proxy_mean")),
+                    "drop_prob_proxy_min": self._debug_scalar(terms.get("drop_prob_proxy_min")),
+                    "drop_prob_proxy_max": self._debug_scalar(terms.get("drop_prob_proxy_max")),
+                    "keep_prob_mean": self._debug_scalar(terms.get("keep_prob")),
+                    "prune_soft_geom_value": self._debug_scalar(prune_proxy),
+                },
+            )
+        except Exception:
+            pass
+        return proxy
+
     def get_geometry_loss(self, args, gen_pts, gt_pts, final_w=None, out_label=None):
         use_torch_d2 = args.trainORtest == "train"
         audit_enabled = self._should_verbose_step(args) or args.trainORtest != "train"
@@ -150,5 +214,9 @@ class GeometryLossMixin:
                     f"D2PSNR:{self._scalar(L_d2_psnr):.4f}, "
                     f"L_d2_term:{self._scalar(L_d2_term):.4f}"
                 )
+
+        soft_proxy = self._soft_actuator_geometry_proxy(args, L_geom)
+        if torch.is_tensor(soft_proxy) and soft_proxy.requires_grad:
+            L_geom = L_geom + (soft_proxy - soft_proxy.detach())
 
         return L_geom

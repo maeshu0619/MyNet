@@ -10,7 +10,14 @@ except ImportError:
     import warnings
     import os
     from torch.utils.cpp_extension import load
-    warnings.warn("Unable to load pointops_cuda cpp extension.")
+    allow_build = os.environ.get("MYNET_POINTOPS_ALLOW_BUILD", "0").strip().lower() in {"1", "true", "yes"}
+    if not allow_build:
+        warnings.warn(
+            "Unable to load pointops_cuda cpp extension; skipping JIT build because "
+            "MYNET_POINTOPS_ALLOW_BUILD is not enabled."
+        )
+        raise
+    warnings.warn("Unable to load pointops_cuda cpp extension; attempting JIT build.")
     pointops_cuda_src = os.path.join(os.path.dirname(__file__), "../src")
     pointops_cuda = load('pointops_cuda', [
         pointops_cuda_src + '/pointops_api.cpp',

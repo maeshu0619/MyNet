@@ -38,6 +38,7 @@ class Network(nn.Module):
         self.debug_tensors = {} # デバッグ用のテンソルを保存
         self.last_structure_debug = {} # 直近Forward時の構造診断デバッグ情報を保存する辞書の初期化
         self.last_encoder_debug = {} # 直近Forward時のEncoder関連デバッグ情報を保存する辞書を初期化
+        self.last_actuator_soft_terms = {} # 直近Forward時の微分可能な点操作proxyを保存する辞書
         self.last_runtime_timing = {} # 直近Forward時の実行時間計測結果を保存する辞書を初期化
         # self._configure_non_encoder_batchnorm() # Encoder以外の構造系モジュールに含まれるBatchNormの設定を変更する
         
@@ -830,6 +831,59 @@ class Network(nn.Module):
             coord_scale=coord_scale,
             selection_mask=selection_mask,
         )
+        soft_term_keys = (
+            "add_prob_mean",
+            "add_ratio",
+            "add_shape_guard",
+            "add_direction_ce",
+            "learned_add_ratio",
+            "drop_prob",
+            "drop_prob_direct",
+            "drop_prob_proxy",
+            "drop_logit",
+            "drop_shape_guard",
+            "learned_drop_prob",
+            "learned_drop_ratio",
+            "drop_prob_mean",
+            "drop_prob_min",
+            "drop_prob_max",
+            "drop_prob_direct_mean",
+            "drop_prob_direct_min",
+            "drop_prob_direct_max",
+            "drop_prob_proxy_mean",
+            "drop_prob_proxy_min",
+            "drop_prob_proxy_max",
+            "drop_logit_mean",
+            "drop_logit_min",
+            "drop_logit_max",
+            "keep_prob_mean",
+            "keep_prob_min",
+            "keep_prob_max",
+            "drop_entropy",
+            "soft_drop_mass",
+            "selected_drop_count_hard",
+            "prune_soft_geom",
+            "prune_soft_rate",
+            "prune_soft_node",
+            "prune_soft_single",
+            "prune_soft_bit",
+            "drop_direct_target_loss",
+            "keep_prob",
+            "move_score_mean",
+            "move_direction_ce",
+            "learned_move_ratio",
+            "soft_activity_loss",
+        )
+        self.last_actuator_soft_terms = {
+            key: value
+            for key in soft_term_keys
+            for value in (actuator_stats.get(key, None),)
+            if torch.is_tensor(value)
+        }
+        try:
+            setattr(self.args, "_last_actuator_soft_terms", self.last_actuator_soft_terms)
+        except Exception:
+            pass
         if timing_enabled:
             self._sync_if_cuda_tensor(pts_xyz)
             runtime_actuator_end = time.time()

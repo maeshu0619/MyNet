@@ -1016,10 +1016,14 @@ class StructureRepairActuator(nn.Module):
         if self.training and drop_score_noise > 0.0:
             learned_drop_logit = learned_drop_logit + torch.randn_like(learned_drop_logit) * drop_score_noise
         learned_drop = torch.sigmoid(learned_drop_logit)
+        learned_drop_prob = learned_drop.mean()
+        drop_proxy_tau = max(float(getattr(self.args, "repair_drop_soft_proxy_tau", 8.0)), 1e-6)
+        drop_prob_proxy = torch.sigmoid(learned_drop_logit / drop_proxy_tau)
         drop_prob = (repair_gate * delete_prior * learned_drop).clamp(0.0, 1.0)
         if prune_enabled and max_drop_ratio > 0.0:
             # 学習したPrune量を削除scoreへ反映し、量と位置を同じlogit上で調整する。
             drop_prob = torch.sigmoid(self._safe_logit(drop_prob) + self._ratio_bias(learned_drop_ratio, max_drop_ratio))
+        drop_prob_direct = drop_prob
         drop_random_mix = min(
             max(self._annealed_value("repair_drop_random_mix_start", "repair_drop_random_mix_end"), 0.0),
             1.0,
@@ -1029,6 +1033,8 @@ class StructureRepairActuator(nn.Module):
             drop_prob = ((1.0 - drop_random_mix) * drop_prob + drop_random_mix * random_drop).clamp(0.0, 1.0)
         if not prune_enabled:
             drop_prob = torch.zeros_like(drop_prob)
+            drop_prob_direct = torch.zeros_like(drop_prob_direct)
+            drop_prob_proxy = torch.zeros_like(drop_prob_proxy)
         drop_prob = self._voxel_mean_logits(drop_prob, voxel_coords, voxel_cache=voxel_cache).clamp(0.0, 1.0)
         # 削除は点単位ではなくcodec量子化step上のleaf voxel単位で決める。
         # Octree occupancyはVoxelが1点でも残ると変わらないため、選択Voxel内の点をまとめて削除する。
@@ -1169,6 +1175,16 @@ class StructureRepairActuator(nn.Module):
         move_logits = move_logits.masked_fill(~safe_valid_move, mask_value)
 
         move_probs = torch.softmax(move_logits, dim=1)
+        offset_norm = torch.linalg.norm(neighbor_offsets, dim=1).to(device=pts_xyz.device, dtype=move_logits.dtype)
+        move_dir_target_logits = (-offset_norm.view(1, -1, 1)).expand_as(move_logits)
+        move_dir_target_logits = move_dir_target_logits.masked_fill(~safe_valid_move, mask_value)
+        move_dir_target = torch.softmax(move_dir_target_logits, dim=1).detach()
+        move_direction_ce_per_point = -(
+            move_dir_target * torch.log_softmax(move_logits, dim=1)
+        ).sum(dim=1, keepdim=True)
+        move_direction_ce = (
+            move_direction_ce_per_point * has_valid_move_target.to(dtype=move_direction_ce_per_point.dtype)
+        ).sum() / has_valid_move_target.sum().clamp_min(1.0)
         move_idx = move_probs.detach().argmax(dim=1, keepdim=True)
         hard_move_dir = torch.zeros_like(move_probs)
         hard_move_dir.scatter_(1, move_idx, 1.0)
@@ -1279,6 +1295,7 @@ class StructureRepairActuator(nn.Module):
         added_keep_loss = pts_xyz.new_zeros(())
         add_min_offset_loss = pts_xyz.new_zeros(())
         quant_add_guard = pts_xyz.new_zeros(())
+        add_direction_ce = pts_xyz.new_zeros(())
         add_prob = pts_xyz.new_zeros((B, 1, N))
         add_priority = add_prob
         add_count_value = 0
@@ -1329,6 +1346,17 @@ class StructureRepairActuator(nn.Module):
             # 追加は空Voxelを選んで、そのVoxel中心に点を置く。
             # 既存occupied voxelへ追加してもoccupancyが変わらず、Octree rateの改善信号が弱くなるため。
             valid_pair = empty_target_mask & base_valid.unsqueeze(2)
+            add_dir_logits = add_voxel_logits.permute(0, 2, 1).contiguous().masked_fill(~valid_pair, mask_value)
+            add_dir_target_logits = (-offset_norm.to(dtype=add_dir_logits.dtype).view(1, 1, -1)).expand_as(add_dir_logits)
+            add_dir_target_logits = add_dir_target_logits.masked_fill(~valid_pair, mask_value)
+            add_dir_target = torch.softmax(add_dir_target_logits, dim=2).detach()
+            add_direction_ce_per_point = -(
+                add_dir_target * torch.log_softmax(add_dir_logits, dim=2)
+            ).sum(dim=2, keepdim=True)
+            add_valid_point = valid_pair.any(dim=2, keepdim=True).to(dtype=add_direction_ce_per_point.dtype)
+            add_direction_ce = (
+                add_direction_ce_per_point * add_valid_point
+            ).sum() / add_valid_point.sum().clamp_min(1.0)
             valid_counts = valid_pair.reshape(B, -1).sum(dim=1)
             effective_add_k = min(int(add_k), int(valid_counts.min().detach().cpu().item()))
             if effective_add_k > 0:
@@ -1341,8 +1369,16 @@ class StructureRepairActuator(nn.Module):
                     largest=True,
                     sorted=False,
                 )
-                pair_priority_flat = torch.sigmoid(pair_scores.clamp(-8.0, 8.0))
-                selected_pair_strength = torch.gather(pair_priority_flat, 1, top_pair_idx)
+                selected_pair_logits = torch.gather(pair_scores, 1, top_pair_idx)
+                add_strength_tau = max(float(getattr(self.args, "repair_add_strength_tau", 1.0)), 1e-6)
+                top_threshold = top_pair_values.min(dim=1, keepdim=True).values.detach()
+                selected_pair_strength = torch.sigmoid((selected_pair_logits - top_threshold) / add_strength_tau)
+                selected_pair_strength = torch.nan_to_num(
+                    selected_pair_strength,
+                    nan=0.0,
+                    posinf=1.0,
+                    neginf=0.0,
+                )
                 add_base_idx = torch.div(top_pair_idx, neighbor_offsets.shape[0], rounding_mode="floor")
                 add_dir_idx = top_pair_idx.remainder(neighbor_offsets.shape[0])
                 idx_expand_xyz = add_base_idx.unsqueeze(1).expand(-1, 3, -1)
@@ -1369,7 +1405,7 @@ class StructureRepairActuator(nn.Module):
                 hard_add_pair.scatter_(1, top_pair_idx, hard_top_add)
 
                 tau = max(float(getattr(self.args, "add_soft_match_tau", 0.05)), 1e-6)
-                threshold = top_pair_values.min(dim=1, keepdim=True).values.detach()
+                threshold = top_threshold
                 soft_add_pair = torch.sigmoid((pair_scores - threshold) / tau)
                 soft_add_pair = soft_add_pair * valid_pair.reshape(B, -1).to(dtype=soft_add_pair.dtype)
                 hard_ratio = hard_add_pair.mean(dim=1, keepdim=True)
@@ -1522,6 +1558,50 @@ class StructureRepairActuator(nn.Module):
             drop_ratio_loss = (drop_ratio - target_drop_ratio) ** 2
         drop_cap_loss = torch.relu(drop_ratio - max_drop_ratio) ** 2
         drop_shape_guard = self._masked_mean(drop_prob * shape_score, selection_mask)
+        prune_drop_signal = (0.25 * drop_prob_direct + 0.75 * drop_prob_proxy).clamp(0.0, 1.0)
+        prune_keep_signal = (1.0 - prune_drop_signal).clamp(0.0, 1.0)
+        leaf_delete_gain = (
+            voxel_point_counts <= float(max(delete_max_points, 1))
+        ).to(device=pts_xyz.device, dtype=pts_xyz.dtype)
+        prune_geom_importance = (
+            0.50
+            + 2.00 * shape_score
+            + 0.75 * preserve
+            + 0.25 * (1.0 - local_outlier_score.clamp(0.0, 1.0))
+        ).detach().clamp(0.0, 4.0)
+        prune_rate_importance = (
+            0.50
+            + 1.00 * p_comp
+            + 0.75 * p_chain
+            + 0.50 * p_sibling
+            + 0.50 * node_score
+            + 0.75 * single_score
+            + 0.50 * quant_score
+            + 0.50 * sparse_score
+            + 0.25 * lowprob_score
+            + 0.50 * local_outlier_score
+            + 0.75 * leaf_delete_gain
+        ).detach().clamp(0.0, 6.0)
+        prune_node_importance = (0.50 + 1.50 * node_score + 0.75 * leaf_delete_gain).detach().clamp(0.0, 4.0)
+        prune_single_importance = (0.50 + 2.00 * single_score + 0.75 * p_chain + 0.50 * p_sibling).detach().clamp(0.0, 4.0)
+        prune_bit_importance = (
+            prune_rate_importance + 0.50 * prune_node_importance + 0.25 * prune_single_importance
+        ).detach().clamp(0.0, 8.0)
+        prune_soft_geom = self._masked_mean(prune_drop_signal * prune_geom_importance, selection_mask)
+        prune_soft_rate = self._masked_mean(prune_keep_signal * prune_rate_importance, selection_mask)
+        prune_soft_node = self._masked_mean(prune_keep_signal * prune_node_importance, selection_mask)
+        prune_soft_single = self._masked_mean(prune_keep_signal * prune_single_importance, selection_mask)
+        prune_soft_bit = self._masked_mean(prune_keep_signal * prune_bit_importance, selection_mask)
+        drop_prob_direct_mean = self._masked_mean(drop_prob_direct, selection_mask)
+        drop_prob_proxy_mean = self._masked_mean(drop_prob_proxy, selection_mask)
+        drop_direct_target = drop_prob_proxy_mean.new_tensor(float(target_drop_ratio))
+        drop_direct_target_loss = (drop_prob_proxy_mean - drop_direct_target).pow(2)
+        drop_entropy_point = -(
+            drop_prob_proxy.clamp(1e-6, 1.0 - 1e-6) * drop_prob_proxy.clamp(1e-6, 1.0).log()
+            + (1.0 - drop_prob_proxy).clamp(1e-6, 1.0) * (1.0 - drop_prob_proxy).clamp(1e-6, 1.0).log()
+        )
+        drop_entropy = self._masked_mean(drop_entropy_point, selection_mask)
+        soft_drop_mass = drop_prob_proxy.sum()
         local_edit_guard = self._masked_mean((drop_prob + move_mask).clamp(0.0, 1.0) * shape_score, selection_mask)
         move_ratio_soft = self._masked_mean(move_mask, selection_mask)
         # 各操作量headが実際のsoft操作率を追えるようにし、量headにも安定した勾配を渡す。
@@ -1533,6 +1613,16 @@ class StructureRepairActuator(nn.Module):
         operation_ratio_vec = torch.stack([drop_ratio, move_ratio_soft, add_ratio]).clamp_min(0.0)
         operation_ratio_prob = operation_ratio_vec / operation_ratio_vec.sum().clamp_min(1e-6)
         operation_entropy = -(operation_ratio_prob * operation_ratio_prob.clamp_min(1e-6).log()).sum()
+        soft_activity_loss = (
+            drop_prob.mean()
+            + learned_drop_prob
+            + drop_prob_proxy.mean()
+            + move_score.mean()
+            + add_prob.mean()
+            + learned_drop_ratio.mean()
+            + learned_move_ratio.mean()
+            + learned_add_ratio.mean()
+        )
         exploration_noise = max(float(drop_score_noise), float(move_score_noise), float(add_score_noise))
         operation_temperature = float(getattr(self.args, "repair_priority_gate_tau", getattr(self.args, "repair_policy_temperature", 1.0)))
         loss = (
@@ -1541,6 +1631,8 @@ class StructureRepairActuator(nn.Module):
             + float(getattr(self.args, "repair_shape_guard_weight", 0.05)) * shape_guard
             + float(getattr(self.args, "repair_drop_ratio_weight", 1.0)) * (drop_ratio_loss + drop_cap_loss)
             + float(getattr(self.args, "repair_drop_shape_guard_weight", 0.5)) * drop_shape_guard
+            + float(getattr(self.args, "repair_drop_direct_target_weight", 5.0)) * drop_direct_target_loss
+            + float(getattr(self.args, "repair_drop_entropy_weight", 0.01)) * drop_entropy
             + float(getattr(self.args, "repair_add_ratio_weight", 4.0)) * add_ratio_loss
             + float(getattr(self.args, "repair_add_shape_guard_weight", 0.5)) * add_shape_guard
             + float(getattr(self.args, "repair_add_offset_weight", 0.25)) * add_offset_reg
@@ -1552,6 +1644,9 @@ class StructureRepairActuator(nn.Module):
             + float(getattr(self.args, "sparsepcgc_target_duplicate_penalty_weight", 0.0)) * target_duplicate_voxel_loss
             + float(getattr(self.args, "repair_local_guard_weight", 0.25)) * local_edit_guard
             + float(getattr(self.args, "repair_operation_amount_consistency_weight", 1.0)) * operation_amount_consistency_loss
+            + float(getattr(self.args, "repair_soft_activity_weight", 1e-3)) * soft_activity_loss
+            + float(getattr(self.args, "repair_move_direction_ce_weight", 1e-3)) * move_direction_ce
+            + float(getattr(self.args, "repair_add_direction_ce_weight", 1e-3)) * add_direction_ce
         )
         if timing_enabled:
             _mark_runtime("postprocess")
@@ -1570,6 +1665,29 @@ class StructureRepairActuator(nn.Module):
             "add_candidate_ratio": pts_xyz.new_tensor(float(add_candidate_ratio)).detach(),
             "add_candidate_count": pts_xyz.new_tensor(float(add_k)).detach(),
             "learned_drop_ratio": learned_drop_ratio.mean().detach(),
+            "learned_drop_prob": learned_drop_prob.detach(),
+            "drop_prob_mean": drop_prob.mean().detach(),
+            "drop_prob_min": drop_prob.amin().detach() if drop_prob.numel() > 0 else pts_xyz.new_zeros(()).detach(),
+            "drop_prob_max": drop_prob.amax().detach() if drop_prob.numel() > 0 else pts_xyz.new_zeros(()).detach(),
+            "drop_prob_direct_mean": drop_prob_direct.mean().detach(),
+            "drop_prob_direct_min": drop_prob_direct.amin().detach() if drop_prob_direct.numel() > 0 else pts_xyz.new_zeros(()).detach(),
+            "drop_prob_direct_max": drop_prob_direct.amax().detach() if drop_prob_direct.numel() > 0 else pts_xyz.new_zeros(()).detach(),
+            "drop_prob_proxy_mean": drop_prob_proxy.mean().detach(),
+            "drop_prob_proxy_min": drop_prob_proxy.amin().detach() if drop_prob_proxy.numel() > 0 else pts_xyz.new_zeros(()).detach(),
+            "drop_prob_proxy_max": drop_prob_proxy.amax().detach() if drop_prob_proxy.numel() > 0 else pts_xyz.new_zeros(()).detach(),
+            "drop_logit_mean": learned_drop_logit.mean().detach(),
+            "drop_logit_min": learned_drop_logit.amin().detach() if learned_drop_logit.numel() > 0 else pts_xyz.new_zeros(()).detach(),
+            "drop_logit_max": learned_drop_logit.amax().detach() if learned_drop_logit.numel() > 0 else pts_xyz.new_zeros(()).detach(),
+            "keep_prob_mean": keep_prob.mean().detach(),
+            "keep_prob_min": keep_prob.amin().detach() if keep_prob.numel() > 0 else pts_xyz.new_zeros(()).detach(),
+            "keep_prob_max": keep_prob.amax().detach() if keep_prob.numel() > 0 else pts_xyz.new_zeros(()).detach(),
+            "drop_entropy": drop_entropy.detach(),
+            "soft_drop_mass": soft_drop_mass.detach(),
+            "prune_soft_geom": prune_soft_geom.detach(),
+            "prune_soft_rate": prune_soft_rate.detach(),
+            "prune_soft_node": prune_soft_node.detach(),
+            "prune_soft_single": prune_soft_single.detach(),
+            "prune_soft_bit": prune_soft_bit.detach(),
             "learned_drop_ratio_std": learned_drop_ratio.detach().float().std(unbiased=False),
             "learned_add_ratio": learned_add_ratio.mean().detach(),
             "learned_add_ratio_std": learned_add_ratio.detach().float().std(unbiased=False),
@@ -1577,6 +1695,9 @@ class StructureRepairActuator(nn.Module):
             "learned_move_ratio_std": learned_move_ratio.detach().float().std(unbiased=False),
             "operation_amount_consistency_loss": operation_amount_consistency_loss.detach(),
             "operation_entropy": operation_entropy.detach(),
+            "soft_activity_loss": soft_activity_loss.detach(),
+            "move_direction_ce": move_direction_ce.detach(),
+            "add_direction_ce": add_direction_ce.detach(),
             "temperature": pts_xyz.new_tensor(float(operation_temperature)).detach(),
             "exploration_noise": pts_xyz.new_tensor(float(exploration_noise)).detach(),
             "operation_prob_floor_applied": pts_xyz.new_tensor(float(add_ratio_floor_applied)).detach(),
@@ -1663,6 +1784,9 @@ class StructureRepairActuator(nn.Module):
             "repair_gate": repair_gate,
             "drop_prob": drop_prob,
             "keep_prob": keep_prob,
+            "drop_prob_direct": drop_prob_direct,
+            "drop_prob_proxy": drop_prob_proxy,
+            "drop_logit": learned_drop_logit,
                 "add_prob": add_prob,
                 "add_priority": add_priority,
                 "add_ratio": add_ratio,
@@ -1675,6 +1799,31 @@ class StructureRepairActuator(nn.Module):
             "add_candidate_ratio": float(add_candidate_ratio),
             "add_candidate_count": int(add_k),
             "learned_drop_ratio": learned_drop_ratio.mean(),
+            "learned_drop_prob": learned_drop_prob,
+            "drop_prob_mean": drop_prob.mean(),
+            "drop_prob_min": drop_prob.amin() if drop_prob.numel() > 0 else pts_xyz.new_zeros(()),
+            "drop_prob_max": drop_prob.amax() if drop_prob.numel() > 0 else pts_xyz.new_zeros(()),
+            "drop_prob_direct_mean": drop_prob_direct.mean(),
+            "drop_prob_direct_min": drop_prob_direct.amin() if drop_prob_direct.numel() > 0 else pts_xyz.new_zeros(()),
+            "drop_prob_direct_max": drop_prob_direct.amax() if drop_prob_direct.numel() > 0 else pts_xyz.new_zeros(()),
+            "drop_prob_proxy_mean": drop_prob_proxy.mean(),
+            "drop_prob_proxy_min": drop_prob_proxy.amin() if drop_prob_proxy.numel() > 0 else pts_xyz.new_zeros(()),
+            "drop_prob_proxy_max": drop_prob_proxy.amax() if drop_prob_proxy.numel() > 0 else pts_xyz.new_zeros(()),
+            "drop_logit_mean": learned_drop_logit.mean(),
+            "drop_logit_min": learned_drop_logit.amin() if learned_drop_logit.numel() > 0 else pts_xyz.new_zeros(()),
+            "drop_logit_max": learned_drop_logit.amax() if learned_drop_logit.numel() > 0 else pts_xyz.new_zeros(()),
+            "keep_prob_mean": keep_prob.mean(),
+            "keep_prob_min": keep_prob.amin() if keep_prob.numel() > 0 else pts_xyz.new_zeros(()),
+            "keep_prob_max": keep_prob.amax() if keep_prob.numel() > 0 else pts_xyz.new_zeros(()),
+            "drop_entropy": drop_entropy,
+            "soft_drop_mass": soft_drop_mass,
+            "selected_drop_count_hard": pts_xyz.new_tensor(float(hard_drop_count_value)),
+            "prune_soft_geom": prune_soft_geom,
+            "prune_soft_rate": prune_soft_rate,
+            "prune_soft_node": prune_soft_node,
+            "prune_soft_single": prune_soft_single,
+            "prune_soft_bit": prune_soft_bit,
+            "drop_direct_target_loss": drop_direct_target_loss,
             "learned_drop_ratio_std": learned_drop_ratio.float().std(unbiased=False),
             "learned_add_ratio": learned_add_ratio.mean(),
             "learned_add_ratio_std": learned_add_ratio.float().std(unbiased=False),
@@ -1682,6 +1831,9 @@ class StructureRepairActuator(nn.Module):
             "learned_move_ratio_std": learned_move_ratio.float().std(unbiased=False),
             "operation_amount_consistency_loss": operation_amount_consistency_loss,
             "operation_entropy": operation_entropy,
+            "soft_activity_loss": soft_activity_loss,
+            "move_direction_ce": move_direction_ce,
+            "add_direction_ce": add_direction_ce,
             "temperature": float(operation_temperature),
             "exploration_noise": float(exploration_noise),
             "operation_prob_floor_applied": bool(add_ratio_floor_applied),
