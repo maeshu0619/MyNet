@@ -283,22 +283,207 @@ class OctreeStructureAnalysis(nn.Module):
             )
         return summary
 
-    def forward(self, pts_xyz, final_w=None, coord_scale=None):
+    @staticmethod
+    def _tree_tensor(tree, key, device, dtype=None):
+        if tree is None or key not in tree:
+            return None
+        value = tree.get(key)
+        if torch.is_tensor(value):
+            out = value.detach().to(device=device)
+        else:
+            out = torch.as_tensor(value, device=device)
+        if dtype is not None:
+            out = out.to(dtype=dtype)
+        return out
+
+    @staticmethod
+    def _fit_point_rows(values, point_count: int):
+        if values is None:
+            return None
+        values = values.reshape(-1, values.shape[-1])
+        current = int(values.shape[0])
+        if current == point_count:
+            return values
+        if current <= 0:
+            return values.new_zeros((point_count, values.shape[-1]))
+        if current > point_count:
+            return values[:point_count]
+        pad = values[-1:].expand(point_count - current, -1)
+        return torch.cat([values, pad], dim=0)
+
+    @staticmethod
+    def _popcount_codes(codes, dtype):
+        codes = codes.to(dtype=torch.long).reshape(-1)
+        counts = torch.zeros_like(codes, dtype=dtype)
+        for child in range(8):
+            counts = counts + (((codes >> child) & 1).to(dtype=dtype))
+        return counts
+
+    def _neighbor_occupancy_from_global_coords(self, coords):
+        if coords.numel() == 0:
+            return coords.new_zeros((0,), dtype=torch.float32)
+        coords = coords.to(dtype=torch.long)
+        unique_coords = torch.unique(coords, dim=0, sorted=True)
+        offsets = self.neighbor_offsets.to(device=coords.device, dtype=torch.long)
+        targets = coords[:, None, :] + offsets.view(1, -1, 3)
+        occupied = self._coords_membership(targets.reshape(-1, 3), unique_coords).view(coords.shape[0], -1)
+        return occupied.to(dtype=torch.float32).mean(dim=1)
+
+    def _quantized_voxel_stats_from_tree(self, pts_xyz, global_coords, qs_override, snap_delta_norm):
+        B, _, N = pts_xyz.shape
+        stats = []
+        for b in range(B):
+            coords_b = self._fit_point_rows(global_coords[b], N).to(device=pts_xyz.device, dtype=torch.long)
+            unique_coords, inverse = torch.unique(coords_b, dim=0, sorted=True, return_inverse=True)
+            voxel_count = int(unique_coords.shape[0])
+            if voxel_count <= 0:
+                stats.append(pts_xyz.new_zeros((4, N)))
+                continue
+            counts = torch.bincount(inverse, minlength=voxel_count).to(device=pts_xyz.device, dtype=pts_xyz.dtype)
+            point_counts = counts.index_select(0, inverse).clamp_min(1.0)
+            merge_pressure = ((point_counts - 1.0) / point_counts).view(1, N)
+            density = self._normalize_pointwise(point_counts.view(1, 1, N)).view(1, N).clamp(0.0, 4.0) / 4.0
+            neighbor_occ = self._neighbor_occupancy_from_global_coords(coords_b).to(device=pts_xyz.device, dtype=pts_xyz.dtype).view(1, N)
+            neighbor_empty = 1.0 - neighbor_occ
+            quant_residual = (
+                torch.linalg.norm(snap_delta_norm[b], dim=0, keepdim=True) / (3.0 ** 0.5)
+            ).clamp(0.0, 1.0)
+            stats.append(torch.cat([merge_pressure, density, neighbor_empty, quant_residual], dim=0))
+        return torch.stack(stats, dim=0).to(dtype=pts_xyz.dtype)
+
+    def _point_feature_voxel_key(self, pts_xyz, qs_override):
+        B, _, N = pts_xyz.shape
+        keys = []
+        for b in range(B):
+            qs_b = qs_override[b].to(device=pts_xyz.device, dtype=pts_xyz.dtype).clamp_min(1e-9)
+            offset = pts_xyz[b].amin(dim=1, keepdim=True)
+            coords = torch.round((pts_xyz[b] - offset) / qs_b).to(dtype=torch.long).transpose(0, 1).contiguous()
+            if coords.numel() <= 0:
+                keys.append(torch.empty((0,), device=pts_xyz.device, dtype=torch.long))
+                continue
+            span = (coords.amax(dim=0) - coords.amin(dim=0) + 1).clamp_min(1)
+            shifted = coords - coords.amin(dim=0, keepdim=True)
+            keys.append(shifted[:, 0] * span[1] * span[2] + shifted[:, 1] * span[2] + shifted[:, 2])
+        return torch.stack(keys, dim=0) if keys else torch.empty((B, N), device=pts_xyz.device, dtype=torch.long)
+
+    def _prebuilt_octree_context(self, pts_xyz, subtree_tree=None, full_octree_context=None):
+        if subtree_tree is None:
+            return None
+        B, _, N = pts_xyz.shape
+        if B != 1:
+            return None
+        device = pts_xyz.device
+        dtype = pts_xyz.dtype
+        coords = self._tree_tensor(subtree_tree, "global_voxel_coords", device, dtype=torch.long)
+        if coords is None or coords.numel() <= 0:
+            return None
+        coords = self._fit_point_rows(coords, N)
+        parent_coords = torch.div(coords, 2, rounding_mode="floor")
+        unique_parents, inverse = torch.unique(parent_coords, dim=0, sorted=True, return_inverse=True)
+        child_index = ((coords[:, 0] & 1) * 4 + (coords[:, 1] & 1) * 2 + (coords[:, 2] & 1)).to(torch.long)
+        occupancy = torch.zeros((unique_parents.shape[0], 8), device=device, dtype=torch.bool)
+        occupancy[inverse, child_index] = True
+        child_counts = occupancy.sum(dim=1).to(dtype=dtype).clamp_min(1.0)
+        point_child_counts = child_counts.index_select(0, inverse).view(1, 1, N)
+        row_exist = pts_xyz.new_ones((1, 1, N))
+        mean_occ = (point_child_counts / 8.0).clamp(0.0, 1.0)
+        single_proxy = (point_child_counts <= 1.0).to(dtype=dtype)
+        self_occ = pts_xyz.new_ones((1, 1, N))
+        bit_entropy = (torch.log2(point_child_counts).view(1, 1, N) / 3.0).clamp(0.0, 1.0)
+        sibling_occ = ((point_child_counts - 1.0) / 7.0).clamp(0.0, 1.0)
+        neighbor_occ = self._neighbor_occupancy_from_global_coords(coords).to(device=device, dtype=dtype).view(1, 1, N)
+        child_id = (child_index.to(dtype=dtype).view(1, 1, N) / 7.0).clamp(0.0, 1.0)
+
+        context_codes = []
+        if full_octree_context is not None:
+            ancestor = self._tree_tensor(full_octree_context, "ancestor_occupancy_codes", device, dtype=torch.long)
+            sibling = self._tree_tensor(full_octree_context, "sibling_occupancy_codes", device, dtype=torch.long)
+            parent_code = full_octree_context.get("parent_occupancy_code", None)
+            if ancestor is not None and ancestor.numel() > 0:
+                context_codes.append(ancestor)
+            if sibling is not None and sibling.numel() > 0:
+                context_codes.append(sibling)
+            if parent_code is not None:
+                context_codes.append(torch.as_tensor([int(parent_code)], device=device, dtype=torch.long))
+        if context_codes:
+            codes = torch.cat([item.reshape(-1) for item in context_codes], dim=0)
+            context_occ = (self._popcount_codes(codes, dtype=dtype).mean() / 8.0).clamp(0.0, 1.0)
+            mean_occ = (0.75 * mean_occ + 0.25 * context_occ).clamp(0.0, 1.0)
+            sibling_occ = (0.75 * sibling_occ + 0.25 * context_occ).clamp(0.0, 1.0)
+
+        oct_ctx = torch.cat(
+            [row_exist, mean_occ, single_proxy, self_occ, bit_entropy, sibling_occ, neighbor_occ, child_id],
+            dim=1,
+        )
+        return oct_ctx
+
+    def _prebuilt_level_debug(self, subtree_tree):
+        if subtree_tree is None or not self._should_collect_level_debug():
+            return None
+        codes = subtree_tree.get("occupancy_codes")
+        depths = subtree_tree.get("node_depths")
+        if codes is None or depths is None:
+            return None
+        codes = torch.as_tensor(codes, dtype=torch.long)
+        depths = torch.as_tensor(depths, dtype=torch.long)
+        if codes.numel() <= 0:
+            return None
+        summary = []
+        for level in self.diag_levels:
+            mask = depths == int(level)
+            if not bool(mask.any().item()):
+                continue
+            child_counts = self._popcount_codes(codes[mask], dtype=torch.float32)
+            summary.append(
+                {
+                    "level": int(level),
+                    "occupied_mean": float(child_counts.sum().item()),
+                    "parents_mean": float(child_counts.numel()),
+                    "single_mean": float((child_counts == 1).sum().item()),
+                    "single_ratio_mean": float((child_counts == 1).to(torch.float32).mean().item()),
+                    "mean_children_mean": float(child_counts.mean().item()),
+                    "std_children_mean": float(child_counts.std(unbiased=False).item()),
+                    "grid_fill_mean": 0.0,
+                }
+            )
+        return summary
+
+    def forward(
+        self,
+        pts_xyz,
+        final_w=None,
+        coord_scale=None,
+        subtree_tree=None,
+        full_octree_context=None,
+        octree_input_mode="auto",
+    ):
         if pts_xyz.ndim != 3 or pts_xyz.shape[1] != 3:
             raise ValueError("pts_xyz must have shape [B, 3, N]")
 
         input_dtype = pts_xyz.dtype
         work_xyz = pts_xyz.float() if pts_xyz.dtype in (torch.float16, torch.bfloat16) else pts_xyz
         qs_override = self._qs_override(work_xyz, coord_scale)
+        requested_mode = str(octree_input_mode or "auto").strip().lower()
+        prebuilt_ctx = self._prebuilt_octree_context(
+            work_xyz,
+            subtree_tree=subtree_tree,
+            full_octree_context=full_octree_context,
+        )
 
         with torch.no_grad():
-            oct_ctx = self.proxy_octree_ctx.build_point_context(
-                pts_xyz=work_xyz,
-                ctx_level=self.ctx_level,
-                final_w=final_w,
-                qs_override=qs_override,
-            )
-            level_debug = self._aggregate_level_debug(work_xyz, qs_override)
+            if prebuilt_ctx is not None:
+                oct_ctx = prebuilt_ctx
+                level_debug = self._prebuilt_level_debug(subtree_tree)
+                effective_octree_input_mode = "prebuilt_subtree_tree"
+            else:
+                oct_ctx = self.proxy_octree_ctx.build_point_context(
+                    pts_xyz=work_xyz,
+                    ctx_level=self.ctx_level,
+                    final_w=final_w,
+                    qs_override=qs_override,
+                )
+                level_debug = self._aggregate_level_debug(work_xyz, qs_override)
+                effective_octree_input_mode = "local_recomputed"
         oct_ctx = self._safe_context(oct_ctx.to(dtype=work_xyz.dtype), 8)
 
         row_exist = oct_ctx[:, 0:1, :]
@@ -311,8 +496,17 @@ class OctreeStructureAnalysis(nn.Module):
         child_id = oct_ctx[:, 7:8, :]
 
         phase, snap_delta, snap_delta_norm = self._grid_phase(work_xyz, qs_override)
+        point_feature_voxel_key = self._point_feature_voxel_key(work_xyz, qs_override)
         geo_stats = self._local_geometry_stats(work_xyz)
-        quant_stats = self._quantized_voxel_stats(work_xyz, qs_override, snap_delta_norm)
+        tree_coords = None
+        if prebuilt_ctx is not None:
+            raw_tree_coords = self._tree_tensor(subtree_tree, "global_voxel_coords", work_xyz.device, dtype=torch.long)
+            if raw_tree_coords is not None:
+                tree_coords = raw_tree_coords.view(1, -1, 3)
+        if tree_coords is not None:
+            quant_stats = self._quantized_voxel_stats_from_tree(work_xyz, tree_coords, qs_override, snap_delta_norm)
+        else:
+            quant_stats = self._quantized_voxel_stats(work_xyz, qs_override, snap_delta_norm)
         local_density = geo_stats[:, 0:1, :]
         local_curvature = geo_stats[:, 1:2, :]
         local_anisotropy = geo_stats[:, 2:3, :]
@@ -413,4 +607,12 @@ class OctreeStructureAnalysis(nn.Module):
             "occupancy_nll_proxy": occupancy_nll.to(dtype=input_dtype),
             "shape_proxy": shape_proxy.to(dtype=input_dtype),
             "level_debug": level_debug,
+            "octree_input_mode": effective_octree_input_mode,
+            "octree_input_mode_requested": requested_mode,
+            "structural_voxel_mode": "global_context" if prebuilt_ctx is not None else "local_recomputed",
+            "point_feature_voxel_mode": "local_xyz",
+            "structural_voxel_key": self._tree_tensor(subtree_tree, "global_morton_keys", pts_xyz.device, dtype=torch.long)
+            if prebuilt_ctx is not None
+            else None,
+            "point_feature_voxel_key": point_feature_voxel_key,
         }

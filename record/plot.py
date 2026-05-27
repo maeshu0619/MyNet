@@ -67,6 +67,95 @@ class PlotMaker():
         self.epi_edit_x_his = []
         self._reset_edit_running("epo")
         self._reset_edit_running("epi")
+        self.occupancy_keys = [
+            "predicted_occupancy_entropy_delta",
+            "actual_occupancy_entropy_delta",
+            "predicted_occupancy_nll_delta",
+            "actual_occupancy_nll_delta",
+            "predicted_occupancy_pattern_delta",
+            "actual_occupancy_pattern_delta",
+            "predicted_lowprob_occupancy_ratio",
+            "actual_lowprob_occupancy_ratio_after",
+            "actual_occupancy_predictability_after",
+        ]
+        self.occupancy_titles = {
+            "predicted_occupancy_entropy_delta": "Predicted Occupancy Entropy Delta",
+            "actual_occupancy_entropy_delta": "Actual Occupancy Entropy Delta",
+            "predicted_occupancy_nll_delta": "Predicted Occupancy NLL Delta",
+            "actual_occupancy_nll_delta": "Actual Occupancy NLL Delta",
+            "predicted_occupancy_pattern_delta": "Predicted Occupancy Pattern Delta",
+            "actual_occupancy_pattern_delta": "Actual Occupancy Pattern Delta",
+            "predicted_lowprob_occupancy_ratio": "Predicted Low-Probability Occupancy Ratio",
+            "actual_lowprob_occupancy_ratio_after": "Actual Low-Probability Occupancy Ratio",
+            "actual_occupancy_predictability_after": "Actual Occupancy Predictability",
+        }
+        self.occupancy_plot_groups = [
+            (
+                "Occupancy Entropy Delta",
+                [
+                    ("Predicted", "predicted_occupancy_entropy_delta", "tab:blue"),
+                    ("Actual", "actual_occupancy_entropy_delta", "tab:orange"),
+                ],
+            ),
+            (
+                "Occupancy NLL Delta",
+                [
+                    ("Predicted", "predicted_occupancy_nll_delta", "tab:blue"),
+                    ("Actual", "actual_occupancy_nll_delta", "tab:orange"),
+                ],
+            ),
+            (
+                "Occupancy Pattern Delta",
+                [
+                    ("Predicted", "predicted_occupancy_pattern_delta", "tab:blue"),
+                    ("Actual", "actual_occupancy_pattern_delta", "tab:orange"),
+                ],
+            ),
+            (
+                "Low-Probability Occupancy Ratio",
+                [
+                    ("Predicted", "predicted_lowprob_occupancy_ratio", "tab:blue"),
+                    ("Actual", "actual_lowprob_occupancy_ratio_after", "tab:orange"),
+                ],
+            ),
+            (
+                "Actual Occupancy Predictability",
+                [
+                    ("Actual", "actual_occupancy_predictability_after", "tab:green"),
+                ],
+            ),
+        ]
+        self.step_occupancy_his = [[] for _ in self.occupancy_keys]
+        self.epo_occupancy_his = [[] for _ in self.occupancy_keys]
+        self.epi_occupancy_his = [[] for _ in self.occupancy_keys]
+        self.step_occupancy_x_his = []
+        self.epo_occupancy_x_his = []
+        self.epi_occupancy_x_his = []
+        self._reset_occupancy_running("epo")
+        self._reset_occupancy_running("epi")
+        self.voxel_collision_keys = [
+            "voxel_collision_input_gt_point_reduction_rate",
+            "voxel_collision_model_output_raw_point_reduction_rate",
+            "voxel_collision_compression_input_point_reduction_rate",
+        ]
+        self.voxel_collision_titles = {
+            "voxel_collision_input_gt_point_reduction_rate": "GT",
+            "voxel_collision_model_output_raw_point_reduction_rate": "Mine",
+            "voxel_collision_compression_input_point_reduction_rate": "Mine Codec Input",
+        }
+        self.voxel_collision_colors = {
+            "voxel_collision_input_gt_point_reduction_rate": "tab:orange",
+            "voxel_collision_model_output_raw_point_reduction_rate": "tab:blue",
+            "voxel_collision_compression_input_point_reduction_rate": "tab:green",
+        }
+        self.step_voxel_collision_his = [[] for _ in self.voxel_collision_keys]
+        self.epo_voxel_collision_his = [[] for _ in self.voxel_collision_keys]
+        self.epi_voxel_collision_his = [[] for _ in self.voxel_collision_keys]
+        self.step_voxel_collision_x_his = []
+        self.epo_voxel_collision_x_his = []
+        self.epi_voxel_collision_x_his = []
+        self._reset_voxel_collision_running("epo")
+        self._reset_voxel_collision_running("epi")
         self.epo_loss = [0 for _ in range(self.num_loss)]
         self.epi_loss = [0 for _ in range(self.num_loss)]
         self.epo_count = [0 for _ in range(self.num_loss)]
@@ -178,6 +267,60 @@ class PlotMaker():
             self._edit_epi_steps = int(value)
         else:
             raise ValueError(f"Unknown edit running mode: {mode}")
+
+    def _reset_occupancy_running(self, mode):
+        if mode == "epo":
+            self._occupancy_epo_sums = [0.0 for _ in self.occupancy_keys]
+            self._occupancy_epo_counts = [0 for _ in self.occupancy_keys]
+            self._occupancy_epo_steps = 0
+        elif mode == "epi":
+            self._occupancy_epi_sums = [0.0 for _ in self.occupancy_keys]
+            self._occupancy_epi_counts = [0 for _ in self.occupancy_keys]
+            self._occupancy_epi_steps = 0
+        else:
+            raise ValueError(f"Unknown occupancy running mode: {mode}")
+
+    def _occupancy_running_state(self, mode):
+        if mode == "epo":
+            return self._occupancy_epo_sums, self._occupancy_epo_counts, self._occupancy_epo_steps
+        if mode == "epi":
+            return self._occupancy_epi_sums, self._occupancy_epi_counts, self._occupancy_epi_steps
+        raise ValueError(f"Unknown occupancy running mode: {mode}")
+
+    def _set_occupancy_running_step_count(self, mode, value):
+        if mode == "epo":
+            self._occupancy_epo_steps = int(value)
+        elif mode == "epi":
+            self._occupancy_epi_steps = int(value)
+        else:
+            raise ValueError(f"Unknown occupancy running mode: {mode}")
+
+    def _reset_voxel_collision_running(self, mode):
+        if mode == "epo":
+            self._voxel_collision_epo_sums = [0.0 for _ in self.voxel_collision_keys]
+            self._voxel_collision_epo_counts = [0 for _ in self.voxel_collision_keys]
+            self._voxel_collision_epo_steps = 0
+        elif mode == "epi":
+            self._voxel_collision_epi_sums = [0.0 for _ in self.voxel_collision_keys]
+            self._voxel_collision_epi_counts = [0 for _ in self.voxel_collision_keys]
+            self._voxel_collision_epi_steps = 0
+        else:
+            raise ValueError(f"Unknown voxel collision running mode: {mode}")
+
+    def _voxel_collision_running_state(self, mode):
+        if mode == "epo":
+            return self._voxel_collision_epo_sums, self._voxel_collision_epo_counts, self._voxel_collision_epo_steps
+        if mode == "epi":
+            return self._voxel_collision_epi_sums, self._voxel_collision_epi_counts, self._voxel_collision_epi_steps
+        raise ValueError(f"Unknown voxel collision running mode: {mode}")
+
+    def _set_voxel_collision_running_step_count(self, mode, value):
+        if mode == "epo":
+            self._voxel_collision_epo_steps = int(value)
+        elif mode == "epi":
+            self._voxel_collision_epi_steps = int(value)
+        else:
+            raise ValueError(f"Unknown voxel collision running mode: {mode}")
 
     def _reset_plot_running(self, mode):
         if mode == "epo":
@@ -447,6 +590,159 @@ class PlotMaker():
             return info
         raise ValueError(f"Unknown point edit mode: {mode}")
 
+    def _normalize_occupancy_values(self, row):
+        row = row or {}
+        values = []
+        for key in self.occupancy_keys:
+            values.append(self._metric_float(row.get(key)))
+        return values
+
+    def _append_occupancy_history_entry(self, x_history, occupancy_history, x_value, values):
+        x_history.append(int(x_value))
+        for idx, value in enumerate(values):
+            occupancy_history[idx].append(self._metric_float(value))
+
+    def _accumulate_occupancy_running(self, mode, values):
+        sums, counts, step_count = self._occupancy_running_state(mode)
+        has_any_value = False
+        for idx, value in enumerate(values):
+            if value is None:
+                continue
+            sums[idx] += float(value)
+            counts[idx] += 1
+            has_any_value = True
+        if has_any_value:
+            self._set_occupancy_running_step_count(mode, step_count + 1)
+
+    def record_occupancy_metrics(self, mode, x_value, row=None):
+        info = {
+            "mode": mode,
+            "x_value": int(x_value),
+            "recorded": True,
+            "skipped": False,
+            "plot_values": None,
+        }
+        if mode == "step":
+            values = self._normalize_occupancy_values(row)
+            info["plot_values"] = values
+            self._append_occupancy_history_entry(self.step_occupancy_x_his, self.step_occupancy_his, x_value, values)
+            self._accumulate_occupancy_running("epo", values)
+            self._accumulate_occupancy_running("epi", values)
+            return info
+        if mode == "epo":
+            sums, counts, accepted_steps = self._occupancy_running_state("epo")
+            values = [
+                (sum_value / float(count_value)) if count_value > 0 else None
+                for sum_value, count_value in zip(sums, counts)
+            ]
+            self._reset_occupancy_running("epo")
+            info["plot_values"] = values
+            info["accepted_steps"] = accepted_steps
+            if accepted_steps <= 0:
+                info.update({"recorded": False, "skipped": True, "reason": "no_occupancy_steps"})
+                return info
+            self._append_occupancy_history_entry(self.epo_occupancy_x_his, self.epo_occupancy_his, x_value, values)
+            return info
+        if mode == "epi":
+            sums, counts, accepted_steps = self._occupancy_running_state("epi")
+            values = [
+                (sum_value / float(count_value)) if count_value > 0 else None
+                for sum_value, count_value in zip(sums, counts)
+            ]
+            self._reset_occupancy_running("epi")
+            info["plot_values"] = values
+            info["accepted_steps"] = accepted_steps
+            if accepted_steps <= 0:
+                info.update({"recorded": False, "skipped": True, "reason": "no_occupancy_steps"})
+                return info
+            self._append_occupancy_history_entry(self.epi_occupancy_x_his, self.epi_occupancy_his, x_value, values)
+            return info
+        raise ValueError(f"Unknown occupancy mode: {mode}")
+
+    def _normalize_voxel_collision_values(self, row):
+        row = row or {}
+        values = []
+        for key in self.voxel_collision_keys:
+            value = self._metric_float(row.get(key))
+            if value is None:
+                stage = key.replace("voxel_collision_", "").replace("_point_reduction_rate", "")
+                alias_key = f"voxel_{stage}_point_reduction_rate"
+                value = self._metric_float(row.get(alias_key))
+            if value is None:
+                stage = key.replace("voxel_collision_", "").replace("_point_reduction_rate", "")
+                for prefix in (f"voxel_collision_{stage}", f"voxel_{stage}"):
+                    raw_count = self._metric_float(row.get(f"{prefix}_finite_point_count"))
+                    if raw_count is None:
+                        raw_count = self._metric_float(row.get(f"{prefix}_raw_point_count"))
+                    unique_count = self._metric_float(row.get(f"{prefix}_unique_voxel_count"))
+                    if raw_count is not None and unique_count is not None:
+                        value = 1.0 - float(unique_count) / max(float(raw_count), 1.0)
+                        break
+            values.append(value)
+        return values
+
+    def _append_voxel_collision_history_entry(self, x_history, voxel_collision_history, x_value, values):
+        x_history.append(int(x_value))
+        for idx, value in enumerate(values):
+            voxel_collision_history[idx].append(self._metric_float(value))
+
+    def _accumulate_voxel_collision_running(self, mode, values):
+        sums, counts, step_count = self._voxel_collision_running_state(mode)
+        has_any_value = False
+        for idx, value in enumerate(values):
+            if value is None:
+                continue
+            sums[idx] += float(value)
+            counts[idx] += 1
+            has_any_value = True
+        if has_any_value:
+            self._set_voxel_collision_running_step_count(mode, step_count + 1)
+
+    def record_voxel_collision_metrics(self, mode, x_value, row=None):
+        info = {
+            "mode": mode,
+            "x_value": int(x_value),
+            "recorded": True,
+            "skipped": False,
+            "plot_values": None,
+        }
+        if mode == "step":
+            values = self._normalize_voxel_collision_values(row)
+            info["plot_values"] = values
+            self._append_voxel_collision_history_entry(self.step_voxel_collision_x_his, self.step_voxel_collision_his, x_value, values)
+            self._accumulate_voxel_collision_running("epo", values)
+            self._accumulate_voxel_collision_running("epi", values)
+            return info
+        if mode == "epo":
+            sums, counts, accepted_steps = self._voxel_collision_running_state("epo")
+            values = [
+                (sum_value / float(count_value)) if count_value > 0 else None
+                for sum_value, count_value in zip(sums, counts)
+            ]
+            self._reset_voxel_collision_running("epo")
+            info["plot_values"] = values
+            info["accepted_steps"] = accepted_steps
+            if accepted_steps <= 0:
+                info.update({"recorded": False, "skipped": True, "reason": "no_voxel_collision_steps"})
+                return info
+            self._append_voxel_collision_history_entry(self.epo_voxel_collision_x_his, self.epo_voxel_collision_his, x_value, values)
+            return info
+        if mode == "epi":
+            sums, counts, accepted_steps = self._voxel_collision_running_state("epi")
+            values = [
+                (sum_value / float(count_value)) if count_value > 0 else None
+                for sum_value, count_value in zip(sums, counts)
+            ]
+            self._reset_voxel_collision_running("epi")
+            info["plot_values"] = values
+            info["accepted_steps"] = accepted_steps
+            if accepted_steps <= 0:
+                info.update({"recorded": False, "skipped": True, "reason": "no_voxel_collision_steps"})
+                return info
+            self._append_voxel_collision_history_entry(self.epi_voxel_collision_x_his, self.epi_voxel_collision_his, x_value, values)
+            return info
+        raise ValueError(f"Unknown voxel collision mode: {mode}")
+
     @staticmethod
     def _metric_float(value):
         if hasattr(value, "detach"):
@@ -512,6 +808,36 @@ class PlotMaker():
                         row.append("")
                 f.write(",".join(row) + "\n")
 
+    def _write_occupancy_csv(self, occupancy_history, x_history, filename_front, x_label):
+        os.makedirs(self.save_dir, exist_ok=True)
+        save_path = os.path.join(self.save_dir, f"{filename_front}_occupancy_metrics.csv")
+        with open(save_path, "w", encoding="utf-8") as f:
+            f.write(f"{x_label}," + ",".join(self.occupancy_keys) + "\n")
+            for step in range(len(x_history)):
+                row = [str(int(x_history[step]))]
+                for metric in occupancy_history:
+                    if step < len(metric):
+                        value = self._metric_float(metric[step])
+                        row.append("" if value is None else f"{value:.10g}")
+                    else:
+                        row.append("")
+                f.write(",".join(row) + "\n")
+
+    def _write_voxel_collision_csv(self, voxel_collision_history, x_history, filename_front, x_label):
+        os.makedirs(self.save_dir, exist_ok=True)
+        save_path = os.path.join(self.save_dir, f"{filename_front}_voxel_collision_metrics.csv")
+        with open(save_path, "w", encoding="utf-8") as f:
+            f.write(f"{x_label}," + ",".join(self.voxel_collision_keys) + "\n")
+            for step in range(len(x_history)):
+                row = [str(int(x_history[step]))]
+                for metric in voxel_collision_history:
+                    if step < len(metric):
+                        value = self._metric_float(metric[step])
+                        row.append("" if value is None else f"{value:.10g}")
+                    else:
+                        row.append("")
+                f.write(",".join(row) + "\n")
+
     def _plot_single_axis(self, ax, epochs, values, loss_idx, xl):
         values = self._plot_values(values)
         epochs, values = self._downsample_series(epochs, values)
@@ -526,6 +852,40 @@ class PlotMaker():
         ax.grid(True, alpha=0.35)
         if len(epochs) >= 2:
             ax.set_xlim(min(epochs), max(epochs))
+            try:
+                from matplotlib.ticker import MaxNLocator
+                ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+            except Exception:
+                pass
+
+    def _plot_compression_compare_axis(self, ax, loss_history, x_history, xl):
+        key_to_index = {key: index for index, key in enumerate(self.metric_keys)}
+        surrogate_idx = key_to_index.get("compression")
+        actual_idx = key_to_index.get("actual_compression")
+        if surrogate_idx is None or actual_idx is None:
+            return
+        plotted = False
+        series = [
+            ("Surrogate", loss_history[surrogate_idx], "tab:blue"),
+            ("Actual", loss_history[actual_idx], "tab:orange"),
+        ]
+        for label, values, color in series:
+            plot_values = self._plot_values(values)
+            plot_x, plot_values = self._downsample_series(list(x_history), plot_values)
+            if any(math.isfinite(value) for value in plot_values):
+                ax.plot(plot_x, plot_values, marker="o", linewidth=2, markersize=3, color=color, label=label)
+                plotted = True
+        if not plotted:
+            ax.text(0.5, 0.5, "no compression data", ha="center", va="center", transform=ax.transAxes, alpha=0.7)
+        ax.axhline(0.0, color="black", linewidth=0.7, alpha=0.4)
+        ax.set_xlabel(xl)
+        ax.set_ylabel("Delta [%]")
+        ax.set_title("Surrogate vs Actual Compression Delta")
+        if plotted:
+            ax.legend(loc="best")
+        ax.grid(True, alpha=0.35)
+        if len(x_history) >= 2:
+            ax.set_xlim(min(x_history), max(x_history))
             try:
                 from matplotlib.ticker import MaxNLocator
                 ax.xaxis.set_major_locator(MaxNLocator(integer=True))
@@ -564,12 +924,20 @@ class PlotMaker():
             if save_dir_full != "":
                 os.makedirs(save_dir_full, exist_ok=True)
 
-            fig, axes = plot_mod.subplots(len(group), 1, figsize=(self.x_len, self.y_len * len(group)))
+            is_compression_group = self.group_title[group_idx] == "compression"
+            axis_count = len(group) + (1 if is_compression_group else 0)
+            fig, axes = plot_mod.subplots(axis_count, 1, figsize=(self.x_len, self.y_len * axis_count))
 
-            if len(group) == 1:
+            if axis_count == 1:
                 axes = [axes]
 
-            for ax, loss_idx in zip(axes, group):
+            axis_offset = 0
+            if is_compression_group:
+                # Surrogateと実codecの圧縮差を同じ軸に重ね、圧縮グループの先頭で確認できるようにする。
+                self._plot_compression_compare_axis(axes[0], loss_history, x_history, xl)
+                axis_offset = 1
+
+            for ax, loss_idx in zip(axes[axis_offset:], group):
                 epochs = list(x_history)
                 self._plot_single_axis(ax, epochs, loss_history[loss_idx], loss_idx, xl)
 
@@ -648,6 +1016,166 @@ class PlotMaker():
             ax.grid(True, alpha=0.35)
             if len(x_history) >= 2:
                 ax.set_xlim(min(x_history), max(x_history))
+                try:
+                    from matplotlib.ticker import MaxNLocator
+                    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+                except Exception:
+                    pass
+        fig.tight_layout(h_pad=2.0)
+        plot_mod.savefig(save_path, dpi=140)
+        plot_mod.close(fig)
+
+
+    def plot_voxel_collision_curve(self, epoORepi):
+        if epoORepi == "step":
+            voxel_collision_history = self.step_voxel_collision_his
+            x_history = self.step_voxel_collision_x_his
+            filename_front = self.filename_step
+            xl = "Train Step"
+            x_label = "step"
+        elif epoORepi == "epo":
+            voxel_collision_history = self.epo_voxel_collision_his
+            x_history = self.epo_voxel_collision_x_his
+            filename_front = self.filename_epo
+            xl = "Epoch"
+            x_label = "epoch"
+        else:
+            voxel_collision_history = self.epi_voxel_collision_his
+            x_history = self.epi_voxel_collision_x_his
+            filename_front = self.filename_epi
+            xl = "Episode"
+            x_label = "episode"
+
+        os.makedirs(self.save_dir, exist_ok=True)
+        self._write_voxel_collision_csv(voxel_collision_history, x_history, filename_front, x_label)
+        plot_mod = _get_pyplot()
+        if plot_mod is None:
+            return
+
+        save_path = os.path.join(self.save_dir, f"{filename_front}_voxel_collision.png")
+        fig, ax = plot_mod.subplots(1, 1, figsize=(self.x_len, self.y_len))
+        plotted = False
+        x_values = list(x_history)
+        for key, values in zip(self.voxel_collision_keys, voxel_collision_history):
+            plot_values = self._plot_values(values)
+            plot_x, plot_values = self._downsample_series(x_values, plot_values)
+            if any(math.isfinite(value) for value in plot_values):
+                ax.plot(
+                    plot_x,
+                    plot_values,
+                    marker="o",
+                    linewidth=2,
+                    markersize=3,
+                    color=self.voxel_collision_colors.get(key),
+                    label=self.voxel_collision_titles.get(key, key),
+                )
+                plotted = True
+        if not plotted:
+            ax.text(0.5, 0.5, "no voxel collision data", ha="center", va="center", transform=ax.transAxes, alpha=0.7)
+        ax.axhline(0.0, color="black", linewidth=0.7, alpha=0.4)
+        ax.set_xlabel(xl)
+        ax.set_ylabel("Point Reduction Rate")
+        ax.set_title("SparsePCGC Quantized Voxel Collapse Rate")
+        if plotted:
+            ax.legend(loc="best")
+        ax.grid(True, alpha=0.35)
+        if len(x_values) >= 2:
+            ax.set_xlim(min(x_values), max(x_values))
+            try:
+                from matplotlib.ticker import MaxNLocator
+                ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+            except Exception:
+                pass
+        fig.tight_layout()
+        plot_mod.savefig(save_path, dpi=140)
+        plot_mod.close(fig)
+
+
+    def plot_occupancy_curve(self, epoORepi):
+        if epoORepi == "step":
+            occupancy_history = self.step_occupancy_his
+            x_history = self.step_occupancy_x_his
+            filename_front = self.filename_step
+            xl = "Train Step"
+            x_label = "step"
+        elif epoORepi == "epo":
+            occupancy_history = self.epo_occupancy_his
+            x_history = self.epo_occupancy_x_his
+            filename_front = self.filename_epo
+            xl = "Epoch"
+            x_label = "epoch"
+        else:
+            occupancy_history = self.epi_occupancy_his
+            x_history = self.epi_occupancy_x_his
+            filename_front = self.filename_epi
+            xl = "Episode"
+            x_label = "episode"
+
+        os.makedirs(self.save_dir, exist_ok=True)
+        self._write_occupancy_csv(occupancy_history, x_history, filename_front, x_label)
+        plot_mod = _get_pyplot()
+        if plot_mod is None:
+            return
+
+        save_path = os.path.join(self.save_dir, f"{filename_front}_occupancy.png")
+        key_to_history = {
+            key: occupancy_history[index]
+            for index, key in enumerate(self.occupancy_keys)
+        }
+        plot_groups = [
+            group
+            for group in self.occupancy_plot_groups
+            if any(key in key_to_history for _, key, _ in group[1])
+        ]
+        if not plot_groups:
+            plot_groups = [
+                (
+                    self.occupancy_titles.get(key, key),
+                    [(self.occupancy_titles.get(key, key), key, "tab:blue")],
+                )
+                for key in self.occupancy_keys
+            ]
+        fig, axes = plot_mod.subplots(
+            len(plot_groups),
+            1,
+            figsize=(self.x_len, max(self.y_len * len(plot_groups), self.y_len)),
+            sharex=False,
+        )
+        if len(plot_groups) == 1:
+            axes = [axes]
+        x_values = list(x_history)
+        for ax, (title, series_list) in zip(axes, plot_groups):
+            plotted = False
+            plot_x_ref = []
+            for label, key, color in series_list:
+                values = key_to_history.get(key)
+                if values is None:
+                    continue
+                plot_values = self._plot_values(values)
+                plot_x, plot_values = self._downsample_series(x_values, plot_values)
+                plot_x_ref = plot_x
+                if any(math.isfinite(value) for value in plot_values):
+                    ax.plot(
+                        plot_x,
+                        plot_values,
+                        marker="o",
+                        linewidth=2,
+                        markersize=3,
+                        color=color,
+                        label=label,
+                    )
+                    plotted = True
+            if not plotted:
+                ax.text(0.5, 0.5, "no occupancy data", ha="center", va="center", transform=ax.transAxes, alpha=0.7)
+            ax.axhline(0.0, color="black", linewidth=0.7, alpha=0.4)
+            ax.set_xlabel(xl)
+            ax.set_ylabel(title)
+            ax.set_title(title)
+            if plotted and len(series_list) > 1:
+                ax.legend(loc="best")
+            ax.grid(True, alpha=0.35)
+            if len(plot_x_ref) >= 2:
+                ax.set_xlim(min(plot_x_ref), max(plot_x_ref))
                 try:
                     from matplotlib.ticker import MaxNLocator
                     ax.xaxis.set_major_locator(MaxNLocator(integer=True))

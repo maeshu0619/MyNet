@@ -148,6 +148,60 @@ class StructureRepairActuator(nn.Module):
     def _voxel_coords(pts_xyz, voxel_step):
         return torch.round(pts_xyz / voxel_step.clamp_min(1e-9)).to(torch.long)
 
+    def _sparsepcgc_voxel_size(self, pts_xyz, coord_scale):
+        voxel_size = max(float(getattr(self.args, "sparsepcgc_voxel_size", 1.0)), 1e-9)
+        if coord_scale is None:
+            return pts_xyz.new_full((pts_xyz.shape[0], 1, 1), voxel_size)
+        if torch.is_tensor(coord_scale):
+            scale = coord_scale.to(device=pts_xyz.device, dtype=pts_xyz.dtype).reshape(-1, 1, 1)
+            if scale.shape[0] == 1 and pts_xyz.shape[0] > 1:
+                scale = scale.expand(pts_xyz.shape[0], -1, -1)
+            return voxel_size / scale.clamp_min(1e-9)
+        return pts_xyz.new_full((pts_xyz.shape[0], 1, 1), voxel_size / max(float(coord_scale), 1e-9))
+
+    def _sparsepcgc_quantized_coords(self, pts_xyz, coord_scale, fallback_voxel_step=None):
+        compress_key = (
+            str(getattr(self.args, "compress", ""))
+            .strip()
+            .lower()
+            .replace("-", "")
+            .replace("_", "")
+            .replace(" ", "")
+        )
+        if compress_key != "sparsepcgc":
+            step = fallback_voxel_step if fallback_voxel_step is not None else self._voxel_step(pts_xyz, coord_scale)
+            return self._voxel_coords(pts_xyz, step)
+        voxel_size = self._sparsepcgc_voxel_size(pts_xyz, coord_scale)
+        coords = torch.round(pts_xyz / voxel_size.clamp_min(1e-9))
+        pos_q = max(float(getattr(self.args, "sparsepcgc_pos_quantscale", 1)), 1.0)
+        if pos_q > 1.0:
+            coords = torch.round(coords / pos_q)
+        return coords.to(torch.long)
+
+    @classmethod
+    def _coords_membership_mask(cls, query_coords, reference_coords):
+        B, _, N = query_coords.shape
+        out = torch.zeros((B, N), device=query_coords.device, dtype=torch.bool)
+        for b in range(B):
+            query = query_coords[b].transpose(0, 1).contiguous()
+            reference = reference_coords[b].transpose(0, 1).contiguous()
+            out[b] = cls._coords_membership(query, reference)
+        return out
+
+    def _first_unique_selected_mask(self, target_coords, selected_mask):
+        if selected_mask.ndim == 3:
+            selected_mask = selected_mask.squeeze(1)
+        selected_mask = selected_mask.to(device=target_coords.device, dtype=torch.bool)
+        keep = torch.zeros_like(selected_mask, dtype=torch.bool)
+        for b in range(target_coords.shape[0]):
+            selected_idx = selected_mask[b].nonzero(as_tuple=False).flatten()
+            if selected_idx.numel() == 0:
+                continue
+            coords_b = target_coords[b : b + 1].index_select(2, selected_idx)
+            keep_b = self._first_unique_coord_mask(coords_b).squeeze(0)
+            keep[b, selected_idx[keep_b]] = True
+        return keep
+
     @staticmethod
     def _coord_keys(coords, mins, spans):
         shifted = coords - mins.view(1, 3)
@@ -1036,11 +1090,21 @@ class StructureRepairActuator(nn.Module):
         move_target_ratio = float(learned_move_ratio.detach().mean().cpu()) if disp_enabled else 0.0
         require_empty_move = bool(getattr(self.args, "repair_move_require_empty_target", True))
         prefer_occupied_move = bool(getattr(self.args, "repair_move_prefer_occupied_target", False)) and not require_empty_move
-        # SparsePCGCではtargetを新規empty voxelにするとactive coordinateが増えやすい。
-        # 既存occupied targetへのmergeを優先し、sourceが空になる操作だけがactive削減へ効くようにする。
-        if sparsepcgc_context and bool(getattr(self.args, "sparsepcgc_move_existing_target_only", True)):
+        sparse_empty_guard = bool(
+            sparsepcgc_context and getattr(self.args, "enable_sparsepcgc_empty_target_guard", False)
+        )
+        # Legacy SparsePCGC tuning could prefer occupied targets for merge-like
+        # behavior, but the empty-target guard is the stronger operation
+        # invariant when enabled.
+        if sparsepcgc_context and bool(getattr(self.args, "sparsepcgc_move_existing_target_only", True)) and not sparse_empty_guard:
             require_empty_move = False
             prefer_occupied_move = True
+        elif sparse_empty_guard:
+            # The SparsePCGC empty-target guard is the stronger invariant: if it is
+            # enabled, Adjust is only allowed to move an occupied source voxel into
+            # an empty target voxel, avoiding the old occupied-target preference.
+            require_empty_move = True
+            prefer_occupied_move = False
         dropped_target_mask = self._neighbor_target_membership_mask(
             voxel_coords,
             hard_drop_mask,
@@ -1118,6 +1182,61 @@ class StructureRepairActuator(nn.Module):
         )
         selected_offsets = torch.einsum("bkn,kc->bcn", move_dir, neighbor_offsets)
         target_centers = (voxel_coords.to(dtype=pts_xyz.dtype) + selected_offsets) * voxel_step
+        source_sparsepcgc_coords = self._sparsepcgc_quantized_coords(
+            pts_xyz,
+            coord_scale,
+            fallback_voxel_step=voxel_step,
+        )
+        target_sparsepcgc_coords = self._sparsepcgc_quantized_coords(
+            target_centers,
+            coord_scale,
+            fallback_voxel_step=voxel_step,
+        )
+        target_existing_occupied_mask = self._coords_membership_mask(
+            target_sparsepcgc_coords,
+            source_sparsepcgc_coords,
+        )
+        raw_hard_move_bool = hard_move_mask.squeeze(1).detach().to(dtype=torch.bool)
+        target_first_unique_raw_mask = self._first_unique_selected_mask(
+            target_sparsepcgc_coords,
+            raw_hard_move_bool,
+        )
+        target_duplicate_reject_mask = raw_hard_move_bool & (~target_first_unique_raw_mask)
+        raw_move_mask_for_penalty = move_mask
+        empty_target_violation_loss = self._masked_mean(
+            raw_move_mask_for_penalty * target_existing_occupied_mask.unsqueeze(1).to(dtype=pts_xyz.dtype),
+            selection_mask,
+        )
+        target_duplicate_voxel_loss = self._masked_mean(
+            raw_move_mask_for_penalty * target_duplicate_reject_mask.unsqueeze(1).to(dtype=pts_xyz.dtype),
+            selection_mask,
+        )
+        empty_target_guard_enabled = bool(
+            sparsepcgc_context and getattr(self.args, "enable_sparsepcgc_empty_target_guard", False)
+        )
+        target_duplicate_guard_enabled = bool(
+            sparsepcgc_context and getattr(self.args, "enable_sparsepcgc_target_duplicate_guard", False)
+        )
+        move_allowed_bool = raw_hard_move_bool.clone()
+        empty_guard_reject_bool = torch.zeros_like(raw_hard_move_bool, dtype=torch.bool)
+        duplicate_guard_reject_bool = torch.zeros_like(raw_hard_move_bool, dtype=torch.bool)
+        if empty_target_guard_enabled:
+            # 既存occupied voxelへ入る移動は、点数潰れ診断用にpreserveへ戻す。
+            empty_guard_reject_bool = move_allowed_bool & target_existing_occupied_mask
+            move_allowed_bool = move_allowed_bool & (~target_existing_occupied_mask)
+        if target_duplicate_guard_enabled:
+            # 同じtarget voxelに複数sourceが集まる場合は、最初の1点だけ移動を許可する。
+            target_first_unique_guard_mask = self._first_unique_selected_mask(
+                target_sparsepcgc_coords,
+                move_allowed_bool,
+            )
+            duplicate_guard_reject_bool = move_allowed_bool & (~target_first_unique_guard_mask)
+            move_allowed_bool = move_allowed_bool & target_first_unique_guard_mask
+        guard_rejected_bool = raw_hard_move_bool & (~move_allowed_bool)
+        if empty_target_guard_enabled or target_duplicate_guard_enabled:
+            hard_move_mask = move_allowed_bool.unsqueeze(1)
+            hard_move = hard_move_mask.to(dtype=pts_xyz.dtype)
+            move_mask = move_mask * move_allowed_bool.unsqueeze(1).to(dtype=move_mask.dtype)
         primitive_delta = target_centers - pts_xyz
         delta = move_mask * primitive_delta
         pts_out = pts_xyz + delta
@@ -1346,6 +1465,40 @@ class StructureRepairActuator(nn.Module):
         moved_different_voxel_count_value = int(moved_different_voxel_mask.detach().sum().item())
         hard_drop_count_value = int(hard_drop.detach().sum().item())
         hard_move_count_value = int(hard_move.detach().sum().item())
+        raw_hard_move_count_value = int(raw_hard_move_bool.detach().sum().item())
+        adjusted_point_rate_value = float(hard_move_count_value) / max(float(B * N), 1.0)
+        sparsepcgc_source_unique_voxel_count_value = self._unique_voxel_count(
+            source_sparsepcgc_coords,
+            hard_move_mask,
+        )
+        sparsepcgc_target_unique_voxel_count_value = self._unique_voxel_count(
+            target_sparsepcgc_coords,
+            hard_move_mask,
+        )
+        sparsepcgc_target_duplicate_voxel_count_value = max(
+            int(hard_move_count_value) - int(sparsepcgc_target_unique_voxel_count_value),
+            0,
+        )
+        sparsepcgc_target_duplicate_rate_value = (
+            float(sparsepcgc_target_duplicate_voxel_count_value) / max(float(hard_move_count_value), 1.0)
+        )
+        final_move_bool = hard_move_mask.squeeze(1).detach().to(dtype=torch.bool)
+        target_existing_occupied_count_value = int(
+            (final_move_bool & target_existing_occupied_mask).detach().sum().item()
+        )
+        target_empty_voxel_count_value = max(
+            int(hard_move_count_value) - int(target_existing_occupied_count_value),
+            0,
+        )
+        target_existing_occupied_rate_value = (
+            float(target_existing_occupied_count_value) / max(float(hard_move_count_value), 1.0)
+        )
+        target_empty_voxel_rate_value = (
+            float(target_empty_voxel_count_value) / max(float(hard_move_count_value), 1.0)
+        )
+        empty_guard_rejected_count_value = int(empty_guard_reject_bool.detach().sum().item())
+        target_duplicate_guard_rejected_count_value = int(duplicate_guard_reject_bool.detach().sum().item())
+        sparsepcgc_guard_rejected_count_value = int(guard_rejected_bool.detach().sum().item())
         preserve_hard = (~hard_drop_mask) & (~hard_move_mask)
         preserve_ratio = preserve_hard.to(dtype=pts_xyz.dtype).mean()
 
@@ -1395,6 +1548,8 @@ class StructureRepairActuator(nn.Module):
             + float(getattr(self.args, "repair_add_keep_weight", 1.0)) * added_keep_loss
             + float(getattr(self.args, "repair_add_min_offset_weight", 0.5)) * add_min_offset_loss
             + float(getattr(self.args, "repair_quant_guard_weight", 1.0)) * (quant_move_conflict_loss + quant_add_guard)
+            + float(getattr(self.args, "sparsepcgc_empty_target_penalty_weight", 0.0)) * empty_target_violation_loss
+            + float(getattr(self.args, "sparsepcgc_target_duplicate_penalty_weight", 0.0)) * target_duplicate_voxel_loss
             + float(getattr(self.args, "repair_local_guard_weight", 0.25)) * local_edit_guard
             + float(getattr(self.args, "repair_operation_amount_consistency_weight", 1.0)) * operation_amount_consistency_loss
         )
@@ -1451,6 +1606,30 @@ class StructureRepairActuator(nn.Module):
                 "hard_move_count": pts_xyz.new_tensor(float(hard_move_count_value)).detach(),
                 "move_score_mean": move_score.mean().detach(),
                 "move_source_prior_mean": move_source_prior.mean().detach(),
+            "adjusted_point_count": pts_xyz.new_tensor(float(hard_move_count_value)).detach(),
+            "adjusted_point_rate": pts_xyz.new_tensor(float(adjusted_point_rate_value)).detach(),
+            "raw_hard_move_count_before_sparsepcgc_guard": pts_xyz.new_tensor(float(raw_hard_move_count_value)).detach(),
+            "source_unique_voxel_count": pts_xyz.new_tensor(float(sparsepcgc_source_unique_voxel_count_value)).detach(),
+            "target_unique_voxel_count": pts_xyz.new_tensor(float(sparsepcgc_target_unique_voxel_count_value)).detach(),
+            "target_duplicate_voxel_count": pts_xyz.new_tensor(float(sparsepcgc_target_duplicate_voxel_count_value)).detach(),
+            "target_voxel_duplicate_rate": pts_xyz.new_tensor(float(sparsepcgc_target_duplicate_rate_value)).detach(),
+            "target_existing_occupied_count": pts_xyz.new_tensor(float(target_existing_occupied_count_value)).detach(),
+            "target_existing_occupied_rate": pts_xyz.new_tensor(float(target_existing_occupied_rate_value)).detach(),
+            "target_empty_voxel_count": pts_xyz.new_tensor(float(target_empty_voxel_count_value)).detach(),
+            "target_empty_voxel_rate": pts_xyz.new_tensor(float(target_empty_voxel_rate_value)).detach(),
+            "empty_target_violation_loss": empty_target_violation_loss.detach(),
+            "target_duplicate_voxel_loss": target_duplicate_voxel_loss.detach(),
+            "enable_sparsepcgc_empty_target_guard": pts_xyz.new_tensor(float(empty_target_guard_enabled)).detach(),
+            "enable_sparsepcgc_target_duplicate_guard": pts_xyz.new_tensor(float(target_duplicate_guard_enabled)).detach(),
+            "sparsepcgc_empty_target_guard_rejected_count": pts_xyz.new_tensor(float(empty_guard_rejected_count_value)).detach(),
+            "sparsepcgc_target_duplicate_guard_rejected_count": pts_xyz.new_tensor(float(target_duplicate_guard_rejected_count_value)).detach(),
+            "sparsepcgc_guard_rejected_count": pts_xyz.new_tensor(float(sparsepcgc_guard_rejected_count_value)).detach(),
+            "sparsepcgc_move_existing_target_only": pts_xyz.new_tensor(float(getattr(self.args, "sparsepcgc_move_existing_target_only", False))).detach(),
+            "repair_move_require_empty_target": pts_xyz.new_tensor(float(getattr(self.args, "repair_move_require_empty_target", True))).detach(),
+            "repair_move_require_empty_target_effective": pts_xyz.new_tensor(float(require_empty_move)).detach(),
+            "repair_move_max_points_per_voxel": pts_xyz.new_tensor(float(getattr(self.args, "repair_move_max_points_per_voxel", 8))).detach(),
+            "max_move_ratio": pts_xyz.new_tensor(float(max_move_ratio)).detach(),
+            "repair_move_hard_threshold": pts_xyz.new_tensor(float(getattr(self.args, "repair_move_hard_threshold", 0.5))).detach(),
             "move_target_valid_ratio": move_target_valid.mean().detach(),
             "before_occupied_voxel_count": pts_xyz.new_tensor(float(before_occupied_voxels)).detach(),
             "after_occupied_voxel_count": pts_xyz.new_tensor(float(after_occupied_voxels)).detach(),
@@ -1527,6 +1706,30 @@ class StructureRepairActuator(nn.Module):
                 "hard_move_count": hard_move_count_value,
                 "move_score_mean": move_score.mean(),
                 "move_source_prior_mean": move_source_prior.mean(),
+            "adjusted_point_count": hard_move_count_value,
+            "adjusted_point_rate": adjusted_point_rate_value,
+            "raw_hard_move_count_before_sparsepcgc_guard": raw_hard_move_count_value,
+            "source_unique_voxel_count": sparsepcgc_source_unique_voxel_count_value,
+            "target_unique_voxel_count": sparsepcgc_target_unique_voxel_count_value,
+            "target_duplicate_voxel_count": sparsepcgc_target_duplicate_voxel_count_value,
+            "target_voxel_duplicate_rate": sparsepcgc_target_duplicate_rate_value,
+            "target_existing_occupied_count": target_existing_occupied_count_value,
+            "target_existing_occupied_rate": target_existing_occupied_rate_value,
+            "target_empty_voxel_count": target_empty_voxel_count_value,
+            "target_empty_voxel_rate": target_empty_voxel_rate_value,
+            "empty_target_violation_loss": empty_target_violation_loss,
+            "target_duplicate_voxel_loss": target_duplicate_voxel_loss,
+            "enable_sparsepcgc_empty_target_guard": empty_target_guard_enabled,
+            "enable_sparsepcgc_target_duplicate_guard": target_duplicate_guard_enabled,
+            "sparsepcgc_empty_target_guard_rejected_count": empty_guard_rejected_count_value,
+            "sparsepcgc_target_duplicate_guard_rejected_count": target_duplicate_guard_rejected_count_value,
+            "sparsepcgc_guard_rejected_count": sparsepcgc_guard_rejected_count_value,
+            "sparsepcgc_move_existing_target_only": bool(getattr(self.args, "sparsepcgc_move_existing_target_only", False)),
+            "repair_move_require_empty_target": bool(getattr(self.args, "repair_move_require_empty_target", True)),
+            "repair_move_require_empty_target_effective": bool(require_empty_move),
+            "repair_move_max_points_per_voxel": int(getattr(self.args, "repair_move_max_points_per_voxel", 8)),
+            "max_move_ratio": float(max_move_ratio),
+            "repair_move_hard_threshold": float(getattr(self.args, "repair_move_hard_threshold", 0.5)),
             "move_target_valid_ratio": move_target_valid.mean(),
             "moved_delta_mean": moved_delta_mean,
             "before_occupied_voxel_count": before_occupied_voxels,

@@ -544,6 +544,9 @@ class Network(nn.Module):
         compute_internal_losses=None,
         subtree_ref=None,
         selected_subtree_keys=None,
+        subtree_tree=None,
+        full_octree_context=None,
+        octree_input_mode="auto",
     ):
         """セットアップ"""
         if pts_xyz.ndim != 3 or pts_xyz.shape[1] != 3: # 入力点群の形状チェック
@@ -623,7 +626,13 @@ class Network(nn.Module):
                     runtime_diag_start = time.time()
 
                 """Octree構造解析器"""
-                structure_b = self.structure_analyzer(analysis_xyz_b, coord_scale=coord_scale_b) # 解析用点群に対して、Octree構造解析を行う
+                structure_b = self.structure_analyzer(
+                    analysis_xyz_b,
+                    coord_scale=coord_scale_b,
+                    subtree_tree=subtree_tree if b == 0 else None,
+                    full_octree_context=full_octree_context if b == 0 else None,
+                    octree_input_mode=octree_input_mode,
+                ) # 解析用点群に対して、Octree構造解析を行う
                 if timing_enabled:
                     self._sync_if_cuda_tensor(pts_xyz)
                     runtime_diag_end = time.time()
@@ -731,6 +740,13 @@ class Network(nn.Module):
                 "node_proxy_full": torch.cat(node_proxy_full_list, dim=0),
                 "lowprob_proxy_full": torch.cat(lowprob_proxy_full_list, dim=0),
                 "quant_proxy_full": torch.cat(quant_proxy_full_list, dim=0),
+                "level_debug": structure_b.get("level_debug") if structure_b is not None else None,
+                "octree_input_mode": structure_b.get("octree_input_mode", "local_recomputed") if structure_b is not None else "local_recomputed",
+                "octree_input_mode_requested": structure_b.get("octree_input_mode_requested", octree_input_mode) if structure_b is not None else octree_input_mode,
+                "structural_voxel_mode": structure_b.get("structural_voxel_mode", "local_recomputed") if structure_b is not None else "local_recomputed",
+                "point_feature_voxel_mode": structure_b.get("point_feature_voxel_mode", "local_xyz") if structure_b is not None else "local_xyz",
+                "structural_voxel_key": structure_b.get("structural_voxel_key") if structure_b is not None else None,
+                "point_feature_voxel_key": structure_b.get("point_feature_voxel_key") if structure_b is not None else None,
             }
 
             cause_mean = torch.stack(cause_scores_means, dim=0).mean(dim=0).squeeze(0).detach().cpu()
@@ -747,7 +763,13 @@ class Network(nn.Module):
             if timing_enabled:
                 self._sync_if_cuda_tensor(pts_xyz)
                 runtime_diag_start = time.time()
-            structure = self.structure_analyzer(analysis_xyz, coord_scale=coord_scale)
+            structure = self.structure_analyzer(
+                analysis_xyz,
+                coord_scale=coord_scale,
+                subtree_tree=subtree_tree,
+                full_octree_context=full_octree_context,
+                octree_input_mode=octree_input_mode,
+            )
             if timing_enabled:
                 self._sync_if_cuda_tensor(pts_xyz)
                 runtime_diag_end = time.time()
@@ -926,6 +948,30 @@ class Network(nn.Module):
                     "add_actual_point_count": int(actuator_stats.get("add_actual_point_count", 0)),
                     "move_source_voxel_count": int(actuator_stats.get("move_source_voxel_count", 0)),
                     "move_target_voxel_count": int(actuator_stats.get("move_target_voxel_count", 0)),
+                    "adjusted_point_count": int(actuator_stats.get("adjusted_point_count", actuator_stats.get("hard_move_count", 0))),
+                    "adjusted_point_rate": float(actuator_stats.get("adjusted_point_rate", pts_xyz.new_zeros(())).detach().cpu()) if torch.is_tensor(actuator_stats.get("adjusted_point_rate", None)) else float(actuator_stats.get("adjusted_point_rate", 0.0)),
+                    "raw_hard_move_count_before_sparsepcgc_guard": int(actuator_stats.get("raw_hard_move_count_before_sparsepcgc_guard", actuator_stats.get("hard_move_count", 0))),
+                    "source_unique_voxel_count": int(actuator_stats.get("source_unique_voxel_count", 0)),
+                    "target_unique_voxel_count": int(actuator_stats.get("target_unique_voxel_count", 0)),
+                    "target_duplicate_voxel_count": int(actuator_stats.get("target_duplicate_voxel_count", 0)),
+                    "target_voxel_duplicate_rate": float(actuator_stats.get("target_voxel_duplicate_rate", pts_xyz.new_zeros(())).detach().cpu()) if torch.is_tensor(actuator_stats.get("target_voxel_duplicate_rate", None)) else float(actuator_stats.get("target_voxel_duplicate_rate", 0.0)),
+                    "target_existing_occupied_count": int(actuator_stats.get("target_existing_occupied_count", 0)),
+                    "target_existing_occupied_rate": float(actuator_stats.get("target_existing_occupied_rate", pts_xyz.new_zeros(())).detach().cpu()) if torch.is_tensor(actuator_stats.get("target_existing_occupied_rate", None)) else float(actuator_stats.get("target_existing_occupied_rate", 0.0)),
+                    "target_empty_voxel_count": int(actuator_stats.get("target_empty_voxel_count", 0)),
+                    "target_empty_voxel_rate": float(actuator_stats.get("target_empty_voxel_rate", pts_xyz.new_zeros(())).detach().cpu()) if torch.is_tensor(actuator_stats.get("target_empty_voxel_rate", None)) else float(actuator_stats.get("target_empty_voxel_rate", 0.0)),
+                    "empty_target_violation_loss": float(actuator_stats.get("empty_target_violation_loss", pts_xyz.new_zeros(())).detach().cpu()),
+                    "target_duplicate_voxel_loss": float(actuator_stats.get("target_duplicate_voxel_loss", pts_xyz.new_zeros(())).detach().cpu()),
+                    "enable_sparsepcgc_empty_target_guard": bool(actuator_stats.get("enable_sparsepcgc_empty_target_guard", False)),
+                    "enable_sparsepcgc_target_duplicate_guard": bool(actuator_stats.get("enable_sparsepcgc_target_duplicate_guard", False)),
+                    "sparsepcgc_empty_target_guard_rejected_count": int(actuator_stats.get("sparsepcgc_empty_target_guard_rejected_count", 0)),
+                    "sparsepcgc_target_duplicate_guard_rejected_count": int(actuator_stats.get("sparsepcgc_target_duplicate_guard_rejected_count", 0)),
+                    "sparsepcgc_guard_rejected_count": int(actuator_stats.get("sparsepcgc_guard_rejected_count", 0)),
+                    "sparsepcgc_move_existing_target_only": bool(actuator_stats.get("sparsepcgc_move_existing_target_only", False)),
+                    "repair_move_require_empty_target": bool(actuator_stats.get("repair_move_require_empty_target", True)),
+                    "repair_move_require_empty_target_effective": bool(actuator_stats.get("repair_move_require_empty_target_effective", True)),
+                    "repair_move_max_points_per_voxel": int(actuator_stats.get("repair_move_max_points_per_voxel", 0)),
+                    "max_move_ratio": float(actuator_stats.get("max_move_ratio", 0.0)),
+                    "repair_move_hard_threshold": float(actuator_stats.get("repair_move_hard_threshold", 0.0)),
                     "moved_different_voxel_count": int(actuator_stats.get("moved_different_voxel_count", 0)),
                     "same_voxel_adjust_count": int(actuator_stats.get("same_voxel_adjust_count", 0)),
                     "preserve_ratio": float(actuator_stats.get("preserve_ratio", pts_xyz.new_zeros(())).detach().cpu()),
@@ -955,6 +1001,27 @@ class Network(nn.Module):
                     "node_score": float(node_score.detach().cpu()),
                     "policy_diversity": int(active_policy_count),
                     "octree_level_debug": structure.get("level_debug"),
+                    "use_subtree_tree": bool(subtree_tree is not None),
+                    "use_full_octree_context": bool(full_octree_context is not None),
+                    "octree_input_mode": str(structure.get("octree_input_mode", "local_recomputed")),
+                    "octree_input_mode_requested": str(structure.get("octree_input_mode_requested", octree_input_mode)),
+                    "structural_voxel_mode": str(structure.get("structural_voxel_mode", "local_recomputed")),
+                    "point_feature_voxel_mode": str(structure.get("point_feature_voxel_mode", "local_xyz")),
+                    "structural_voxel_key_available": bool(structure.get("structural_voxel_key") is not None),
+                    "point_feature_voxel_key_available": bool(structure.get("point_feature_voxel_key") is not None),
+                    "selected_subtree_key": str((subtree_tree or {}).get("subtree_key", "")),
+                    "selected_subtree_path": str((subtree_tree or {}).get("subtree_path", "")),
+                    "root_to_subtree_path": " > ".join((full_octree_context or {}).get("root_to_subtree_path", [])),
+                    "global_offset": str((subtree_tree or full_octree_context or {}).get("global_offset", "")),
+                    "local_offset": "encoder_or_point_feature_local_xyz",
+                    "global_depth": int((subtree_tree or full_octree_context or {}).get("global_depth", 0) or 0),
+                    "local_depth": int(getattr(self.structure_analyzer, "max_depth", 0)),
+                    "parent_occupancy_code": int((full_octree_context or {}).get("parent_occupancy_code", 0) or 0),
+                    "sibling_count": int(len((full_octree_context or {}).get("sibling_paths", []))),
+                    "enable_sparsepcgc_exact_occupancy_teacher": bool(getattr(self.args, "enable_sparsepcgc_exact_occupancy_teacher", False)),
+                    "sparsepcgc_exact_teacher_mode": str(getattr(self.args, "_current_exact_teacher_mode", getattr(self.args, "sparsepcgc_exact_teacher_mode", "auto"))),
+                    "exact_teacher_uses_full_context": bool(getattr(self.args, "_current_exact_teacher_uses_full_context", False)),
+                    "exact_teacher_fallback_reason": str(getattr(self.args, "_current_exact_teacher_fallback_reason", "")),
                 }
         else:
             self.last_structure_debug = {}

@@ -20,6 +20,12 @@ def hard_octree_occupancy_stats(pts_3n, qs=1.0, max_depth=0, quant_mode="round",
             "max_depth": 0,
             "single_ratio": 0.0,
             "mean_children": 0.0,
+            "occupancy_pattern_count": 0,
+            "occupancy_entropy": 0.0,
+            "occupancy_nll": 0.0,
+            "lowprob_occupancy_count": 0.0,
+            "lowprob_occupancy_ratio": 0.0,
+            "occupancy_predictability": 0.0,
         }
 
     qs = max(float(qs), 1e-9)
@@ -43,6 +49,12 @@ def hard_octree_occupancy_stats(pts_3n, qs=1.0, max_depth=0, quant_mode="round",
             "max_depth": 0,
             "single_ratio": 0.0,
             "mean_children": 0.0,
+            "occupancy_pattern_count": 0,
+            "occupancy_entropy": 0.0,
+            "occupancy_nll": 0.0,
+            "lowprob_occupancy_count": 0.0,
+            "lowprob_occupancy_ratio": 0.0,
+            "occupancy_predictability": 0.0,
         }
 
     max_coord = int(coords.max().detach().cpu()) if coords.numel() > 0 else 0
@@ -56,6 +68,8 @@ def hard_octree_occupancy_stats(pts_3n, qs=1.0, max_depth=0, quant_mode="round",
     single_child_count = 0
     child_count_sum = 0.0
     parent_count_sum = 0
+    pattern_hist = torch.zeros((256,), device=current.device, dtype=torch.float64)
+    pattern_weights = (2 ** torch.arange(8, device=current.device, dtype=torch.long)).view(1, 8)
     for _level in range(depth, 0, -1):
         if current.numel() == 0:
             break
@@ -71,7 +85,23 @@ def hard_octree_occupancy_stats(pts_3n, qs=1.0, max_depth=0, quant_mode="round",
         single_child_count += int((child_counts == 1).sum().detach().cpu())
         child_count_sum += float(child_counts.to(torch.float32).sum().detach().cpu())
         parent_count_sum += parent_count
+        patterns = (occupancy.to(torch.long) * pattern_weights).sum(dim=1)
+        pattern_hist += torch.bincount(patterns, minlength=256).to(torch.float64)
         current = unique_parents
+
+    observed_patterns = pattern_hist[pattern_hist > 0]
+    if observed_patterns.numel() > 0:
+        probs = observed_patterns / observed_patterns.sum().clamp_min(1.0)
+        occupancy_entropy = float((-(probs * torch.log2(probs.clamp_min(1e-12))).sum()).detach().cpu())
+        lowprob_mask = probs < (1.0 / 16.0)
+        lowprob_count = float(observed_patterns[lowprob_mask].sum().detach().cpu())
+        occupancy_pattern_count = int(observed_patterns.numel())
+    else:
+        occupancy_entropy = 0.0
+        lowprob_count = 0.0
+        occupancy_pattern_count = 0
+    lowprob_ratio = lowprob_count / max(float(node_count), 1.0)
+    occupancy_predictability = max(0.0, min(1.0, 1.0 - occupancy_entropy / 8.0))
 
     return {
         "point_count": int(pts.shape[-1]),
@@ -81,4 +111,10 @@ def hard_octree_occupancy_stats(pts_3n, qs=1.0, max_depth=0, quant_mode="round",
         "max_depth": int(depth),
         "single_ratio": float(single_child_count) / max(float(node_count), 1.0),
         "mean_children": float(child_count_sum) / max(float(parent_count_sum), 1.0),
+        "occupancy_pattern_count": int(occupancy_pattern_count),
+        "occupancy_entropy": float(occupancy_entropy),
+        "occupancy_nll": float(occupancy_entropy),
+        "lowprob_occupancy_count": float(lowprob_count),
+        "lowprob_occupancy_ratio": float(lowprob_ratio),
+        "occupancy_predictability": float(occupancy_predictability),
     }

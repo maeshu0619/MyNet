@@ -14,7 +14,12 @@ from torch.utils.data import DataLoader
 from models.network import Network
 from models.utils.config.args import parse_pugan_args
 from models.utils.data.dataset import PlyDirDataset, clear_ply_cache
-from models.utils.io.utils_ply import write_ply
+from models.utils.io.utils_ply import read_ply, write_ply
+from models.utils.pointcloud.voxel_collision import (
+    compute_voxel_collision_stats_batch,
+    flatten_voxel_collision_stats,
+    format_voxel_collision_summary,
+)
 from models.utils.pointcloud.utils_repkpu import rearrange
 from models.utils.testing.utils import (
     _adapt_encoder_state_dict_for_sparse_input,
@@ -74,6 +79,70 @@ def _sparsepcgc_unique_count(points_3n, args):
     return int(torch.unique(coords, dim=0).shape[0])
 
 
+_VOXEL_TEST_STAGES = ("input_gt", "model_output_raw", "saved_pre_write", "saved_ply")
+_VOXEL_TEST_METRICS = (
+    "raw_point_count",
+    "finite_point_count",
+    "unique_voxel_count",
+    "duplicate_point_count",
+    "duplicate_rate",
+    "max_points_per_voxel",
+    "point_reduction_rate",
+)
+
+
+def _voxel_collision_test_fields():
+    fields = []
+    for stage in _VOXEL_TEST_STAGES:
+        for metric in _VOXEL_TEST_METRICS:
+            fields.append(f"voxel_{stage}_{metric}")
+    return fields
+
+
+def _should_log_voxel_collision(args, step):
+    if not bool(getattr(args, "enable_voxel_collision_log", False)):
+        return False
+    interval = max(int(getattr(args, "voxel_collision_log_interval", 100)), 1)
+    return ((int(step) + 1) % interval) == 0
+
+
+def _read_saved_ply_xyz(path):
+    if not path or not os.path.exists(path):
+        return None
+    data = read_ply(path)
+    xyz = np.vstack((data["x"], data["y"], data["z"])).astype(np.float32)
+    return torch.from_numpy(xyz).unsqueeze(0)
+
+
+def _collect_test_voxel_collision_stats(args, writer, step, stage_tensors):
+    if not _should_log_voxel_collision(args, step):
+        return {}
+    voxel_size = float(getattr(args, "sparsepcgc_voxel_size", getattr(args, "octree_voxel", 1.0)))
+    pos_q = int(getattr(args, "sparsepcgc_pos_quantscale", 1))
+    max_points = int(getattr(args, "voxel_collision_max_points", 300000))
+    first_only = bool(getattr(args, "voxel_collision_log_first_batch_only", True))
+    flat = {}
+    for stage in _VOXEL_TEST_STAGES:
+        tensor = stage_tensors.get(stage)
+        if tensor is None:
+            writer.write(f"VoxelCollisionUnavailable[{stage}]: stage tensor is not available in test.py")
+            continue
+        with torch.no_grad():
+            stats = compute_voxel_collision_stats_batch(
+                tensor.detach(),
+                voxel_size,
+                pos_q,
+                max_points=max_points,
+                first_batch_only=first_only,
+            )
+        flat.update(flatten_voxel_collision_stats(f"voxel_{stage}", stats))
+        writer.write(format_voxel_collision_summary(stage, stats))
+        note = str(stats.get("sampling_note", ""))
+        if note:
+            writer.write(f"VoxelCollisionSampling[{stage}]: {note}")
+    return flat
+
+
 def _csv_fields():
     return [
         "sample_id",
@@ -95,7 +164,7 @@ def _csv_fields():
         "model_forward_total_time",
         "total_inference_time",
         "save_time",
-    ]
+    ] + _voxel_collision_test_fields()
 
 
 def _emit_table(title, headers, rows, writer):
@@ -464,6 +533,12 @@ def test(model, args, writer):
             output_path = _save_output_points(args, step, input_path, gen_pts)
             save_time = time.perf_counter() - save_start
             total_inference_time = time.perf_counter() - sample_start
+            saved_ply_xyz = None
+            if output_path and bool(getattr(args, "enable_voxel_collision_log", False)):
+                try:
+                    saved_ply_xyz = _read_saved_ply_xyz(output_path)
+                except Exception as exc:
+                    writer.write(f"VoxelCollisionUnavailable[saved_ply]: failed to read saved PLY: {exc}")
 
             input_points = int(input_pcd.shape[-1])
             output_points = int(gen_pts.shape[-1])
@@ -492,7 +567,20 @@ def test(model, args, writer):
                 "total_inference_time": total_inference_time,
                 "save_time": save_time,
             }
-            csv_writer.writerow(row)
+            row.update(
+                _collect_test_voxel_collision_stats(
+                    args,
+                    writer,
+                    step,
+                    {
+                        "input_gt": input_pcd[:, :3, :],
+                        "model_output_raw": pre_harden_gen_pts[:, :3, :],
+                        "saved_pre_write": gen_pts[:, :3, :],
+                        "saved_ply": saved_ply_xyz,
+                    },
+                )
+            )
+            csv_writer.writerow({key: row.get(key, None) for key in _csv_fields()})
             handle.flush()
             rows.append({key: row[key] for key in row})
 

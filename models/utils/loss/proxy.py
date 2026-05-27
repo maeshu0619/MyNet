@@ -74,16 +74,40 @@ class ProxyCompressionLossMixin:
         cache_key=None,
         run_grad_probe=True,
         actual_gen_xyz=None,
+        subtree_tree=None,
+        full_octree_context=None,
+        octree_input_mode="auto",
     ):
         self._ensure_rate_proxy_device(gen_xyz.device)
+        uses_subtree_tree = subtree_tree is not None
+        uses_full_context = full_octree_context is not None
+        requested_mode = str(octree_input_mode or "auto").strip().lower()
+        if uses_subtree_tree:
+            proxy_input_mode = "prebuilt_subtree_tree"
+            fallback_reason = ""
+        elif requested_mode == "full_cloud":
+            proxy_input_mode = "full_cloud"
+            fallback_reason = ""
+        else:
+            proxy_input_mode = "local_recomputed"
+            fallback_reason = "missing_subtree_tree"
         cached_gt = self._get_cached_gt(cache_key, gen_xyz.device)
         if cached_gt is None:
-            self.warmup_gt_cache(gt_xyz, cache_key=cache_key)
+            self.warmup_gt_cache(
+                gt_xyz,
+                cache_key=cache_key,
+                subtree_tree=subtree_tree,
+                full_octree_context=full_octree_context,
+                octree_input_mode=octree_input_mode,
+            )
             cached_gt = self._get_cached_gt(cache_key, gen_xyz.device)
         if cached_gt is None:
             with self._compression_autocast_ctx(gen_xyz.device):
                 out_gt, bit_gt, stats_gt = self.rate_proxy.forward_hard_only(
                     gen_xyz=gt_xyz.to(torch.float32),
+                    subtree_tree=subtree_tree,
+                    full_octree_context=full_octree_context,
+                    octree_input_mode=octree_input_mode,
                 )
             cached_gt = {
                 "rate_gt": self._scalar(out_gt["rate_total"]),
@@ -110,12 +134,18 @@ class ProxyCompressionLossMixin:
                 out_gen, out_surrogate, stats_gen = self.rate_proxy.forward_ste_hard_pair(
                     gen_xyz=gen_xyz.to(torch.float32),
                     final_w=final_w.to(torch.float32),
+                    subtree_tree=subtree_tree,
+                    full_octree_context=full_octree_context,
+                    octree_input_mode=octree_input_mode,
                 )
         else:
             with self._compression_autocast_ctx(gen_xyz.device):
                 out_gen, _, stats_gen = self.rate_proxy(
                     gen_xyz=gen_xyz.to(torch.float32),
                     final_w=final_w.to(torch.float32) if use_weighted_forward else None,
+                    subtree_tree=subtree_tree,
+                    full_octree_context=full_octree_context,
+                    octree_input_mode=octree_input_mode,
                 )
 
         L_com_forward, L_bit_forward, L_nodes_forward, L_single_forward = self._compression_terms_from_proxy(
@@ -218,6 +248,18 @@ class ProxyCompressionLossMixin:
             "sparsepcgc_isolated_proxy_loss": self._scalar(sparse_terms["single"].detach()),
             "sparsepcgc_entropy_proxy_loss": self._scalar(sparse_terms["entropy"].detach()),
             "sparsepcgc_density_proxy_loss": self._scalar(sparse_terms["density"].detach()),
+            "compression_proxy_input_mode": proxy_input_mode,
+            "compression_proxy_uses_subtree_tree": bool(uses_subtree_tree),
+            "compression_proxy_uses_full_context": bool(uses_full_context),
+            "rate_proxy_source": proxy_input_mode,
+            "L_com_source": proxy_input_mode,
+            "loss_nodes_source": proxy_input_mode,
+            "loss_single_source": proxy_input_mode,
+            "compression_proxy_fallback_reason": fallback_reason,
+            "prebuilt_node_count_used": self._scalar(stats_gen.get("prebuilt_node_count", 0.0)),
+            "prebuilt_single_child_count_used": self._scalar(stats_gen.get("prebuilt_single_child_count", 0.0)),
+            "rate_proxy_node_count_used": self._scalar(stats_gen.get("node", 0.0)),
+            "loss_nodes_node_count_used": self._scalar(stats_gen.get("node", 0.0)),
         }
         debug_gen_xyz = gen_xyz if actual_gen_xyz is None else actual_gen_xyz
         self._maybe_update_sparsepcgc_debug(

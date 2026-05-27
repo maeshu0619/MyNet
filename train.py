@@ -29,6 +29,11 @@ from record.plot import PlotMaker
 from models.utils.pointcloud.utils_repkpu import *
 from models.utils.pointcloud.octree_subtree import *
 from models.utils.pointcloud.quant_noise import add_uniform_quantization_noise, resolve_uniform_noise_delta
+from models.utils.pointcloud.voxel_collision import (
+    compute_voxel_collision_stats_batch,
+    flatten_voxel_collision_stats,
+    format_voxel_collision_summary,
+)
 from models.utils.data.dataset import *
 from models.utils.patching.patch import *
 from models.utils.compression.octree_stats import hard_octree_occupancy_stats
@@ -62,6 +67,135 @@ from models.utils.training.train_flow import * # train loopのStage固定、Subt
 from models.utils.training.loss_grad_probe import build_loss_grad_probe_rows, summarize_loss_grad_probe_rows
 
 from models.utils.surrogate.pretrain import *
+
+
+def _voxel_collision_stage_set(args):
+    raw = str(getattr(args, "voxel_collision_log_stages", "input_gt,model_output_raw,compression_input"))
+    return {item.strip() for item in raw.split(",") if item.strip()}
+
+
+def _should_log_voxel_collision(args, global_step):
+    if not bool(getattr(args, "enable_voxel_collision_log", False)):
+        return False
+    interval = max(int(getattr(args, "voxel_collision_log_interval", 100)), 1)
+    return ((int(global_step) + 1) % interval) == 0
+
+
+def _collect_train_voxel_collision_stats(args, writer, global_step, stage_tensors):
+    if not _should_log_voxel_collision(args, global_step):
+        return {}
+    stages = _voxel_collision_stage_set(args)
+    voxel_size = float(getattr(args, "sparsepcgc_voxel_size", getattr(args, "octree_voxel", 1.0)))
+    pos_q = int(getattr(args, "sparsepcgc_pos_quantscale", 1))
+    max_points = int(getattr(args, "voxel_collision_max_points", 300000))
+    first_only = bool(getattr(args, "voxel_collision_log_first_batch_only", True))
+    flat = {}
+    for stage in sorted(stages):
+        tensor = stage_tensors.get(stage)
+        if tensor is None:
+            if hasattr(writer, "write"):
+                writer.write(f"VoxelCollisionUnavailable[{stage}]: stage tensor is not available in train.py")
+            continue
+        with torch.no_grad():
+            stats = compute_voxel_collision_stats_batch(
+                tensor.detach(),
+                voxel_size,
+                pos_q,
+                max_points=max_points,
+                first_batch_only=first_only,
+            )
+        flat.update(flatten_voxel_collision_stats(f"voxel_collision_{stage}", stats))
+        if hasattr(writer, "write"):
+            writer.write(format_voxel_collision_summary(stage, stats))
+            note = str(stats.get("sampling_note", ""))
+            if note:
+                writer.write(f"VoxelCollisionSampling[{stage}]: {note}")
+    return flat
+
+def load_more_training_checkpoint(model, args, writer):
+    # more_training=False の場合は、追加学習用checkpointを読まない
+    if not bool(getattr(args, "more_training", False)):
+        writer.write("MoreTraining: disabled. Start training from current initialized model.")
+        return model
+
+    ckpt_path = str(getattr(args, "more_training_ckpt", "")).strip()
+
+    # more_training=True なのに読み込み先が空なら停止する
+    if not ckpt_path:
+        raise ValueError("MoreTraining: args.more_training_ckpt is empty, but args.more_training=True.")
+
+    # 誤った初期値で学習を始めないため、存在しない場合は停止する
+    if not os.path.isfile(ckpt_path):
+        raise FileNotFoundError(f"MoreTraining: checkpoint file not found: {ckpt_path}")
+
+    writer.write("========== MoreTraining Resume ==========")
+    writer.write(f"MoreTraining: enabled=True")
+    writer.write(f"MoreTraining: load_model_path={ckpt_path}")
+    writer.write(f"MoreTraining: pretrained_date={getattr(args, 'pretrained_date', '')}")
+    writer.write(f"MoreTraining: pretrained_time={getattr(args, 'pretrained_time', '')}")
+    writer.write(f"MoreTraining: compress={getattr(args, 'compress', '')}")
+    writer.write(f"MoreTraining: method_com={getattr(args, 'method_com', 'not_in_args')}")
+
+    # CPUへ読み込むことで、GPUメモリの一時使用量を抑える
+    checkpoint = torch.load(ckpt_path, map_location="cpu")
+
+    # checkpointの保存形式に合わせてstate_dictを取り出す
+    if isinstance(checkpoint, dict):
+        if "model_state_dict" in checkpoint:
+            state_dict = checkpoint["model_state_dict"]
+            checkpoint_format = "model_state_dict"
+        elif "state_dict" in checkpoint:
+            state_dict = checkpoint["state_dict"]
+            checkpoint_format = "state_dict"
+        elif "model" in checkpoint:
+            state_dict = checkpoint["model"]
+            checkpoint_format = "model"
+        elif "net" in checkpoint:
+            state_dict = checkpoint["net"]
+            checkpoint_format = "net"
+        else:
+            # save_episode_checkpoint が model.state_dict() を直接保存している場合を想定する
+            state_dict = checkpoint
+            checkpoint_format = "raw_state_dict"
+    else:
+        raise TypeError(f"MoreTraining: unsupported checkpoint type: {type(checkpoint).__name__}")
+
+    # DataParallelで保存された場合の module. 接頭辞を除去する
+    cleaned_state_dict = {}
+    for key, value in state_dict.items():
+        key_text = str(key)
+        new_key = key_text[7:] if key_text.startswith("module.") else key_text
+        cleaned_state_dict[new_key] = value
+
+    incompatible = model.load_state_dict(cleaned_state_dict, strict=False)
+
+    missing_keys = list(getattr(incompatible, "missing_keys", []))
+    unexpected_keys = list(getattr(incompatible, "unexpected_keys", []))
+
+    writer.write(f"MoreTraining: checkpoint_format={checkpoint_format}")
+    writer.write(f"MoreTraining: loaded_parameter_keys={len(cleaned_state_dict)}")
+    writer.write(f"MoreTraining: missing_keys_count={len(missing_keys)}")
+    writer.write(f"MoreTraining: unexpected_keys_count={len(unexpected_keys)}")
+
+    if missing_keys:
+        writer.write("MoreTraining: missing_keys_detail=" + ", ".join(missing_keys[:50]))
+        if len(missing_keys) > 50:
+            writer.write(f"MoreTraining: missing_keys_detail_truncated=True total={len(missing_keys)}")
+
+    if unexpected_keys:
+        writer.write("MoreTraining: unexpected_keys_detail=" + ", ".join(unexpected_keys[:50]))
+        if len(unexpected_keys) > 50:
+            writer.write(f"MoreTraining: unexpected_keys_detail_truncated=True total={len(unexpected_keys)}")
+
+    writer.write("MoreTraining: model parameters loaded. Training will continue from this checkpoint.")
+    writer.write("=========================================")
+
+    args._more_training_loaded = True
+    args._more_training_ckpt_path = ckpt_path
+    args._more_training_missing_keys = len(missing_keys)
+    args._more_training_unexpected_keys = len(unexpected_keys)
+
+    return model
 
 def train(model, args, loss, writer, plot, notifier=None):
     """==========================================================="""
@@ -242,9 +376,13 @@ def train(model, args, loss, writer, plot, notifier=None):
                 is_anchor_step = True # 初期状態では全体点ん群を使うAnchor Stepとする
                 compression_cache_key = cache_key # キャッシュキーの初期化
                 compression_gt_pts = input_xyz # 圧縮損失で比較する教師側点群を入力点群にする
+                compression_gen_xyz = None # 圧縮Lossへ渡した出力点群をVoxel衝突ログで参照する
                 train_edit_stats = None # 点操作を見計算状態にする
                 noise_debug = empty_noise_debug() # 圧縮損失用に量子化前の点群に加えるノイズのデバッグ情報を初期化
                 subtree_depth_meta = {} # 深度などの情報保存
+                subtree_trees = {} # 事前構築したSubtree内部OctreeをCPU側で保持する
+                full_octree_contexts = {} # full-cloud Octree内でのSubtree文脈をCPU側で保持する
+                group_meta = {} # 追加Octreeメタ情報を既存group_stateと分離して保持する
                 total_subtree_count = 0 # Subtree総数を0で初期化
                 eligible_subtree_count = 0 # 学習対象候補として残ったSubtreeの初期化
                 actual_eligible_subtree_count = 0 # 条件を満たしたSubtreeを初期化
@@ -270,6 +408,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                     subtree_ref = subtree_group_state["subtree_ref"] # Subtree参照情報の抽出
                     if subtree_ref is None:
                         raise RuntimeError("Subtree mode did not find any valid octree subtree.")
+                    subtree_trees = dict(subtree_group_state.get("subtree_trees", {}) or {}) # 追加フィールドだけを参照し、既存形式は変えない
+                    full_octree_contexts = dict(subtree_group_state.get("full_octree_contexts", {}) or {}) # full-cloud上の親・兄弟・祖先文脈
+                    group_meta = dict(subtree_group_state.get("group_meta", {}) or {}) # ログ用の軽量メタ情報
                     subtree_depth_meta = dict(subtree_depth_meta) # 深度メタ情報変換
                     subtree_depth_meta["requested_depth"] = int(requested_subtree_depth) # 要求された深度情報の保存
                     subtree_depth_meta["depth"] = int(subtree_group_state.get("depth", requested_subtree_depth)) # 実際に採用された深度情報の保存
@@ -392,6 +533,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                             """全点群の場合"""
                             args._current_teacher_scope = "full_cloud" # full-cloud anchorでは実圧縮teacherも全点群基準として記録する
                             args._current_teacher_anchor_reason = str(anchor_reason) # full-cloudになった理由をteacherログへ渡す
+                            args._current_exact_teacher_mode = "full_cloud" # exact occupancy teacherは全点群基準で走らせる
+                            args._current_exact_teacher_uses_full_context = False # 全点群はSubtree文脈を使わない
+                            args._current_exact_teacher_fallback_reason = "" # full-cloudではfallback理由なし
                             writer.write("Running full cloud Anchor step.") # Anchor Stepであることをログに出す
                             autocast_ctx = torch.cuda.amp.autocast(dtype=amp_dtype, enabled=use_amp) if use_cuda else nullcontext() # CUDAかつAMP有効なら混合精度計算の文脈を作る
                             with autocast_ctx: # 全体点群をモデルに入力し、出力点群と各種補助損失・点編集重みを得る
@@ -402,7 +546,10 @@ def train(model, args, loss, writer, plot, notifier=None):
                                     cache_key=cache_key,
                                     return_attr_output=False,
                                     subtree_ref=subtree_ref,
-                                    selected_subtree_keys=None
+                                    selected_subtree_keys=None,
+                                    subtree_tree=None,
+                                    full_octree_context=None,
+                                    octree_input_mode="full_cloud",
                                     )
                             if final_w is not None and not torch.isfinite(final_w).all(): # final重みにNanやinfが混ざっていないか確認
                                 writer.write( "Warning: final_w contains NaN/Inf. " "It will be sanitized before point-edit summary and losses.")
@@ -428,11 +575,14 @@ def train(model, args, loss, writer, plot, notifier=None):
                                         args,
                                         gen_xyz=compression_gen_xyz,
                                         gt_xyz=input_xyz[:, :3, :],
-                                        final_w=final_w_for_loss,
-                                        cache_key=cache_key,
-                                        refresh_actual_gen=refresh_actual_gen,
-                                        actual_gen_xyz=gen_xyz
-                                        )
+                                            final_w=final_w_for_loss,
+                                            cache_key=cache_key,
+                                            refresh_actual_gen=refresh_actual_gen,
+                                            actual_gen_xyz=gen_xyz,
+                                            subtree_tree=None,
+                                            full_octree_context=None,
+                                            octree_input_mode="full_cloud",
+                                            )
                                 else:
                                     writer.write("!!! Skipping compression loss calculation due to stage factor setting. !!!")
                                     zero = input_xyz.new_zeros(())
@@ -451,11 +601,58 @@ def train(model, args, loss, writer, plot, notifier=None):
                             for subtree_key, point_idx in selected_groups: # 選択されたSubtreeを1つずつ取り出し、それぞれ日いて点群を切り出し、Forward、形状損失、圧縮損失を計算
                                 args._current_teacher_scope = "subtree_local" # Subtree stepではteacherが局所点群基準であることをLoss側へ渡す
                                 args._current_subtree_id = str(subtree_key) # bad caseやteacherログでsubtree識別子を保存する
+                                subtree_key_int = int(subtree_key) # 追加メタ辞書参照用にPython intへ揃える
+                                subtree_tree = subtree_trees.get(subtree_key_int) # 事前構築Subtree Octreeを取得する
+                                full_octree_context = full_octree_contexts.get(subtree_key_int) # full-cloud上のSubtree文脈を取得する
+                                subtree_group_meta = group_meta.get(subtree_key_int, {}) or {} # ログ用メタ
+                                use_subtree_tree = subtree_tree is not None # 構造評価に事前構築木を使えるか
+                                use_full_octree_context = full_octree_context is not None # 大域文脈を使えるか
+                                octree_input_mode = "prebuilt_subtree_tree" if use_subtree_tree else "local_recomputed" # 明示的な入力モード
+                                args._current_exact_teacher_mode = "global_subtree" if (use_subtree_tree and use_full_octree_context) else "local_subtree" # teacherの意味を分離する
+                                args._current_exact_teacher_uses_full_context = bool(use_subtree_tree and use_full_octree_context) # full文脈の使用可否
+                                args._current_exact_teacher_fallback_reason = "" if (use_subtree_tree and use_full_octree_context) else "missing_prebuilt_subtree_tree_or_full_octree_context" # fallback理由
                                 subtree_xyz = input_xyz.index_select(2, point_idx).contiguous() # 全体対入力点群から現在Subtreeに属する点だけを取り出す
                                 subtree_attr = None
                                 if input_attr_full is not None:
                                     subtree_attr = input_attr_full.index_select(2, point_idx).contiguous() # 属性を取り出す
                                 subtree_cache_key = ( f"{cache_key}|subtree_depth={int(subtree_ref['depth'][0].item())}|subtree_key={subtree_key}")
+                                if log_this_step:
+                                    selected_path = subtree_group_meta.get("subtree_path", None)
+                                    root_path = full_octree_context.get("root_to_subtree_path", None) if isinstance(full_octree_context, dict) else None
+                                    parent_occ = full_octree_context.get("parent_occupancy_code", None) if isinstance(full_octree_context, dict) else None
+                                    sibling_ids = full_octree_context.get("sibling_node_ids", []) if isinstance(full_octree_context, dict) else []
+                                    global_offset = subtree_group_meta.get("global_offset", None)
+                                    local_offset = subtree_xyz[:, :3, :].detach().amin(dim=2).reshape(-1).tolist()
+                                    global_depth = subtree_group_meta.get("global_depth", None)
+                                    local_depth = int(subtree_group_meta.get("local_depth", subtree_depth_meta.get("depth", 0)))
+                                    writer.write(
+                                        "SubtreeOctreeInput: "
+                                        f"use_subtree_tree={bool(use_subtree_tree)}, "
+                                        f"use_full_octree_context={bool(use_full_octree_context)}, "
+                                        f"octree_input_mode={octree_input_mode}, "
+                                        f"structural_voxel_mode={'global_context' if use_subtree_tree else 'local_recomputed'}, "
+                                        f"point_feature_voxel_mode=local_xyz, "
+                                        f"selected_subtree_key={subtree_key_int}, "
+                                        f"selected_subtree_path={selected_path}, "
+                                        f"root_to_subtree_path={root_path}, "
+                                        f"global_offset={global_offset}, "
+                                        f"local_offset={local_offset}, "
+                                        f"global_depth={global_depth}, "
+                                        f"local_depth={local_depth}, "
+                                        f"parent_occupancy_code={parent_occ}, "
+                                        f"sibling_count={len(sibling_ids) if hasattr(sibling_ids, '__len__') else 0}, "
+                                        f"enable_sparsepcgc_exact_occupancy_teacher={bool(getattr(args, 'enable_sparsepcgc_exact_occupancy_teacher', False))}, "
+                                        f"sparsepcgc_exact_teacher_mode={args._current_exact_teacher_mode}, "
+                                        f"exact_teacher_uses_full_context={bool(args._current_exact_teacher_uses_full_context)}, "
+                                        f"exact_teacher_fallback_reason={args._current_exact_teacher_fallback_reason}"
+                                    )
+                                    if not use_subtree_tree or not use_full_octree_context:
+                                        writer.write(
+                                            "SubtreeOctreeContextFallback: "
+                                            f"subtree_key={subtree_key_int}, "
+                                            f"octree_input_mode=local_recomputed, "
+                                            f"reason={args._current_exact_teacher_fallback_reason}"
+                                        )
                                 autocast_ctx = torch.cuda.amp.autocast(dtype=amp_dtype, enabled=use_amp) if use_cuda else nullcontext() # Subtree Forward用のAMP文脈を作る
                                 with autocast_ctx:
                                     """モデルの実行"""
@@ -463,7 +660,10 @@ def train(model, args, loss, writer, plot, notifier=None):
                                         subtree_xyz,
                                         subtree_attr,
                                         cache_key=subtree_cache_key,
-                                        return_attr_output=False
+                                        return_attr_output=False,
+                                        subtree_tree=subtree_tree,
+                                        full_octree_context=full_octree_context,
+                                        octree_input_mode=octree_input_mode,
                                         )
 
                                 """詳細のログ"""
@@ -494,7 +694,10 @@ def train(model, args, loss, writer, plot, notifier=None):
                                             final_w=final_w_sub_loss,
                                             cache_key=subtree_cache_key,
                                             refresh_actual_gen=refresh_actual_gen,
-                                            actual_gen_xyz=gen_subtree_xyz
+                                            actual_gen_xyz=gen_subtree_xyz,
+                                            subtree_tree=subtree_tree,
+                                            full_octree_context=full_octree_context,
+                                            octree_input_mode=octree_input_mode,
                                             )
                                         accumulate_compression_terms( subtree_compression_term_sums, getattr(loss, "last_compression_terms", {}) or {}, 1.0 / num_selected) # 現在Subtreeで計算された圧縮損失内訳を1/Subtree数の重みをつけて、Step全体の圧縮損失内訳に累積する
                                     else:
@@ -586,6 +789,30 @@ def train(model, args, loss, writer, plot, notifier=None):
                     loss.last_compression_debug = comp_debug # 統合後のcomp_debugをLossに保存
                 base_model = model.module if hasattr(model, "module") else model # DataParallelで包まれている場合は中身のモデルを取り出す
                 structure_debug = getattr(base_model, "last_structure_debug", {}) or {} # モデル内部で記録された構造解析・構造修復のDebug情報を取得
+                for debug_key in ( # 圧縮CSVからも構造入力モードを追えるように必要項目だけを転記する
+                    "use_subtree_tree",
+                    "use_full_octree_context",
+                    "octree_input_mode",
+                    "structural_voxel_mode",
+                    "point_feature_voxel_mode",
+                    "structural_voxel_key_available",
+                    "point_feature_voxel_key_available",
+                    "selected_subtree_key",
+                    "selected_subtree_path",
+                    "root_to_subtree_path",
+                    "global_offset",
+                    "local_offset",
+                    "global_depth",
+                    "local_depth",
+                    "parent_occupancy_code",
+                    "sibling_count",
+                    "enable_sparsepcgc_exact_occupancy_teacher",
+                    "sparsepcgc_exact_teacher_mode",
+                    "exact_teacher_uses_full_context",
+                    "exact_teacher_fallback_reason",
+                ):
+                    if debug_key in structure_debug and debug_key not in comp_debug:
+                        comp_debug[debug_key] = structure_debug.get(debug_key)
                 operation_entropy_value = finite_float_or_none(structure_debug.get("operation_entropy")) # 探索多様性の移動平均を出すために現在値を取り出す
                 if operation_entropy_value is not None:
                     operation_entropy_history = list(getattr(args, "_operation_entropy_history", [])) # 直近の操作entropy履歴を取得する
@@ -596,6 +823,19 @@ def train(model, args, loss, writer, plot, notifier=None):
                     comp_debug["operation_entropy_moving_avg"] = sum(operation_entropy_history) / float(max(len(operation_entropy_history), 1)) # 操作entropyの移動平均をCSVへ渡す
                 if train_edit_stats is None:
                     train_edit_stats = summarize_point_edits( input_xyz=input_xyz[:, :3, :], gen_pts=gen_pts, final_w=final_w, args=args) # 入力/出力点群を比較し、操作を計算
+                voxel_collision_debug = _collect_train_voxel_collision_stats(
+                    args,
+                    writer,
+                    global_train_step,
+                    {
+                        "input_gt": input_xyz[:, :3, :],
+                        "model_output_raw": gen_xyz,
+                        "compression_input": compression_gen_xyz,
+                    },
+                )
+                if voxel_collision_debug:
+                    comp_debug.update(voxel_collision_debug)
+                    loss.last_compression_debug = comp_debug
                 corr_debug = update_actual_correlation_debug(args, comp_debug, L_com, codec_actual_metric_pairs) # 圧縮推定値と実圧縮値の対応更新
                 if corr_debug: # 相関診断結果が得られたら
                     comp_debug.update(corr_debug) # 診断情報の追加
@@ -748,6 +988,8 @@ def train(model, args, loss, writer, plot, notifier=None):
                 if train_edit_stats is None:
                     train_edit_stats = summarize_point_edits( input_xyz=input_xyz[:, :3, :], gen_pts=gen_pts, final_w=final_w, args=args) # 点操作情報を計算
                 plot.record_point_edits("step", global_train_step + 1, train_edit_stats) # 点操作統計をCSVに記録
+                plot.record_occupancy_metrics("step", global_train_step + 1, compression_metric_row) # 占有pattern/probability proxyと実hard octree統計をCSVに記録
+                plot.record_voxel_collision_metrics("step", global_train_step + 1, compression_metric_row) # SparsePCGC量子化後の点潰れ率をCSV/plotへ記録
                 plot_step_info = plot.record_metrics("step", global_train_step + 1, step_metric_values) # Step単位の損失値をCSVに保存
                 if plot_step_info.get("skipped", False):
                     threshold_text = f"{plot_step_info.get('threshold', float('nan')):.6g}"
@@ -800,12 +1042,18 @@ def train(model, args, loss, writer, plot, notifier=None):
                 log_plot_skip_epoch( writer, plot_epoch_info, global_epoch) # Epoch単位の平均損失をCSVに記録
                 writer.write(format_metric_summary("EpochAvg", plot.metric_keys, epoch_avgs))
             epoch_edit_info = plot.record_point_edits("epo", global_epoch + 1) # Epoch内で記録されたStep単位の点編集統計を集計
+            plot.record_occupancy_metrics("epo", global_epoch + 1) # Epoch内で記録された占有pattern/probability統計を集計
+            plot.record_voxel_collision_metrics("epo", global_epoch + 1) # Epoch内のSparsePCGC量子化点潰れ率を集計
             log_epoch_point_edit_average( writer, epoch_edit_info, global_epoch) # Epoch単位の点ん操作統計をログに記録
             global_epoch += 1
             plot.plot_loss_curve("step")
             plot.plot_loss_curve("epo")
             plot.plot_point_edit_curve("step")
             plot.plot_point_edit_curve("epo")
+            plot.plot_occupancy_curve("step")
+            plot.plot_occupancy_curve("epo")
+            plot.plot_voxel_collision_curve("step")
+            plot.plot_voxel_collision_curve("epo")
             writer.write(f"Saved step/epoch plots/csv: {plot.save_dir}")
             writer.flush()
         if episode_metric_sums is not None:
@@ -816,9 +1064,13 @@ def train(model, args, loss, writer, plot, notifier=None):
             plot.epi_avg = [None for _ in range(plot.num_loss)]
         writer.write(format_metric_summary("EpisodeAvg", plot.metric_keys, plot.epi_avg))
         episode_edit_info = plot.record_point_edits("epi", episode + 1)
+        plot.record_occupancy_metrics("epi", episode + 1)
+        plot.record_voxel_collision_metrics("epi", episode + 1)
         log_episode_point_edit_average( writer, episode_edit_info, episode)
         plot.plot_loss_curve("epi")
         plot.plot_point_edit_curve("epi")
+        plot.plot_occupancy_curve("epi")
+        plot.plot_voxel_collision_curve("epi")
         writer.write(f"Saved episode plots/csv: {plot.save_dir}")
         writer.flush()
         checkpoint_metrics = finalize_checkpoint_metrics( args, current_stage, episode, plot, episode_checkpoint_sums, checkpoint_gate_refs)
@@ -895,6 +1147,11 @@ if __name__ == '__main__':
         p.requires_grad = False
     writer.write("RepKPU encoder loaded: repkpu_model/ckpt-best.pth")
     writer.write(f"SetupTiming: encoder_ckpt_load={time.time() - setup_ckpt_t0:.3f}s")
+
+    # more_training=Trueなら、追加学習用checkpointからモデル全体のパラメータを読み込む
+    setup_more_training_t0 = time.time()
+    model = load_more_training_checkpoint(model, args, writer)
+    writer.write(f"SetupTiming: more_training_ckpt_load={time.time() - setup_more_training_t0:.3f}s")
 
     if args.cpu is False and torch.cuda.is_available():
         setup_cuda_t0 = time.time()

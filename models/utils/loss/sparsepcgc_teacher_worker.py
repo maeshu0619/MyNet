@@ -146,7 +146,16 @@ def main() -> int:
             input_file = Path(str(request["input_file"])).expanduser().resolve()
             output_dir = Path(str(request["output_dir"])).expanduser().resolve()
             with contextlib.redirect_stdout(sys.stderr):
-                result = encoder.encode_one(input_file, output_dir)
+                result = encoder.encode_one(
+                    input_file,
+                    output_dir,
+                    occupancy_debug=bool(request.get("occupancy_debug", False)),
+                    occupancy_low_prob_threshold=float(request.get("occupancy_low_prob_threshold", 0.1)),
+                    exact_occupancy=bool(request.get("exact_occupancy", False)),
+                    exact_teacher_mode=str(request.get("exact_teacher_mode", "auto")),
+                    exact_teacher_uses_full_context=bool(request.get("exact_teacher_uses_full_context", False)),
+                    exact_teacher_fallback_reason=str(request.get("exact_teacher_fallback_reason", "")),
+                )
             _emit({"status": "ok", "request_id": request_id, "result": result})
         except Exception as exc:
             _emit(

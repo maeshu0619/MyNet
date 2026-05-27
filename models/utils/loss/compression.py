@@ -295,6 +295,14 @@ class CompressionLossMixin:
             "single_child_chain_length_after": single_gen.detach(),
             "sibling_occupancy_balance_before": density_ref.detach(),
             "sibling_occupancy_balance_after": density_gen.detach(),
+            "octree_pattern_entropy_before": q_ref[2].detach(),
+            "octree_pattern_entropy_after": entropy_gen.detach(),
+            "octree_pattern_entropy_delta": (entropy_gen - q_ref[2]).detach(),
+            "octree_pattern_nll_before": q_ref[2].detach(),
+            "octree_pattern_nll_after": entropy_gen.detach(),
+            "octree_pattern_nll_delta": (entropy_gen - q_ref[2]).detach(),
+            "octree_pattern_lowprob_ratio": (lowprob_gen / active_gen.clamp_min(1e-6)).detach(),
+            "occupancy_proxy_definition": "mynet_soft_octree_aux_not_sparsepcgc_candidate_probability",
         }
 
     def _get_cached_actual_gt(self, cache_key):
@@ -417,7 +425,59 @@ class CompressionLossMixin:
         total_unique_coord = sum(int(s.get("unique_coord_count", s.get("point_count", 0))) for s in stats_list)
         max_octree_depth = max((int(s.get("octree_depth", 0)) for s in stats_list), default=0)
         total_leaf = sum(int(s.get("octree_leaf_count", s.get("point_count", 0))) for s in stats_list)
-        return {
+        total_occupancy_patterns = sum(int(s.get("octree_occupancy_pattern_count", 0)) for s in stats_list)
+        total_lowprob_occupancy = sum(float(s.get("octree_lowprob_occupancy_count", 0.0)) for s in stats_list)
+        octree_node_denom = max(float(total_octree_node), 1.0)
+        sparse_candidate_count = sum(int(s.get("sparsepcgc_candidate_count", 0)) for s in stats_list)
+        sparse_occupied_count = sum(int(s.get("sparsepcgc_occupied_candidate_count", 0)) for s in stats_list)
+        sparse_estimated_bits = sum(float(s.get("sparsepcgc_estimated_occupancy_bits", 0.0)) for s in stats_list)
+        sparse_prob_true_low_count = sum(float(s.get("sparsepcgc_prob_true_low_count", 0.0)) for s in stats_list)
+        sparse_occupied_low_count = sum(float(s.get("sparsepcgc_occupied_low_prob_count", 0.0)) for s in stats_list)
+        sparse_debug_available = any(bool(s.get("sparsepcgc_occupancy_debug_available", False)) for s in stats_list)
+        sparse_threshold_values = [
+            float(s.get("sparsepcgc_low_prob_threshold", 0.0))
+            for s in stats_list
+            if "sparsepcgc_low_prob_threshold" in s
+        ]
+        exact_candidate_count = sum(int(s.get("sparsepcgc_exact_candidate_count", 0)) for s in stats_list)
+        exact_occupied_count = sum(int(s.get("sparsepcgc_exact_occupied_count", 0)) for s in stats_list)
+        exact_estimated_bits = sum(float(s.get("sparsepcgc_exact_estimated_bits", 0.0)) for s in stats_list)
+        exact_bce_bits = sum(float(s.get("sparsepcgc_exact_bce_bits", 0.0)) for s in stats_list)
+        exact_actual_bits = sum(float(s.get("sparsepcgc_exact_actual_bitstream_bits", 0.0)) for s in stats_list)
+        exact_impl_bits = sum(float(s.get("exact_bits_impl", 0.0)) for s in stats_list)
+        exact_sparsepcgc_bits = sum(float(s.get("exact_bits_sparsepcgc_estimate_bitrate", 0.0)) for s in stats_list)
+        exact_enabled = any("sparsepcgc_exact_estimated_bits" in s for s in stats_list)
+        exact_last = next((s for s in reversed(stats_list) if "sparsepcgc_exact_estimated_bits" in s), {})
+
+        def _weighted_octree_stat(key):
+            weighted = 0.0
+            for item in stats_list:
+                weight = float(item.get("octree_node", item.get("node", 0.0)))
+                weighted += float(item.get(key, 0.0)) * weight
+            return weighted / octree_node_denom
+
+        occupancy_entropy = _weighted_octree_stat("octree_occupancy_entropy")
+        occupancy_nll = _weighted_octree_stat("octree_occupancy_nll")
+        lowprob_ratio = total_lowprob_occupancy / octree_node_denom
+        occupancy_predictability = max(0.0, min(1.0, 1.0 - occupancy_entropy / 8.0))
+
+        def _weighted_sparsepcgc_stat(key):
+            denom = max(float(sparse_candidate_count), 1.0)
+            weighted = 0.0
+            for item in stats_list:
+                weight = float(item.get("sparsepcgc_candidate_count", 0.0))
+                weighted += float(item.get(key, 0.0)) * weight
+            return weighted / denom
+
+        def _weighted_exact_stat(key):
+            denom = max(float(exact_candidate_count), 1.0)
+            weighted = 0.0
+            for item in stats_list:
+                weight = float(item.get("sparsepcgc_exact_candidate_count", 0.0))
+                weighted += float(item.get(key, 0.0)) * weight
+            return weighted / denom
+
+        result = {
             "bit": float(total_bit),
             "bpp": float(total_bit) / max(float(total_points), 1.0),
             "bpn": float(total_bit) / max(float(total_node), 1.0),
@@ -429,10 +489,64 @@ class CompressionLossMixin:
             "octree_leaf_count": int(total_leaf),
             "encode_time": float(total_encode_time),
             "unique_coord_count": int(total_unique_coord),
+            "octree_occupancy_pattern_count": int(total_occupancy_patterns),
+            "octree_occupancy_entropy": float(occupancy_entropy),
+            "octree_occupancy_nll": float(occupancy_nll),
+            "octree_lowprob_occupancy_count": float(total_lowprob_occupancy),
+            "octree_lowprob_occupancy_ratio": float(lowprob_ratio),
+            "octree_occupancy_predictability": float(occupancy_predictability),
+            "sparsepcgc_occupancy_debug_available": bool(sparse_debug_available),
+            "sparsepcgc_candidate_count": int(sparse_candidate_count),
+            "sparsepcgc_occupied_candidate_count": int(sparse_occupied_count),
+            "sparsepcgc_actual_occupancy_label_ratio": float(sparse_occupied_count) / max(float(sparse_candidate_count), 1.0),
+            "sparsepcgc_pred_prob_entropy": float(_weighted_sparsepcgc_stat("sparsepcgc_pred_prob_entropy")),
+            "sparsepcgc_pred_occupancy_nll": float(_weighted_sparsepcgc_stat("sparsepcgc_pred_occupancy_nll")),
+            "sparsepcgc_estimated_occupancy_bits": float(sparse_estimated_bits),
+            "sparsepcgc_estimated_occupancy_bpp": float(sparse_estimated_bits) / max(float(total_points), 1.0),
+            "sparsepcgc_prob_true_mean": float(_weighted_sparsepcgc_stat("sparsepcgc_prob_true_mean")),
+            "sparsepcgc_prob_true_low_count": float(sparse_prob_true_low_count),
+            "sparsepcgc_prob_true_low_ratio": float(sparse_prob_true_low_count) / max(float(sparse_candidate_count), 1.0),
+            "sparsepcgc_occupied_low_prob_count": float(sparse_occupied_low_count),
+            "sparsepcgc_occupied_low_prob_ratio": float(sparse_occupied_low_count) / max(float(sparse_occupied_count), 1.0),
+            "sparsepcgc_low_prob_threshold": float(sparse_threshold_values[-1]) if sparse_threshold_values else float(getattr(args, "sparsepcgc_occupancy_low_prob_threshold", 0.1)),
             "point_count": int(total_points),
             "codec": str(getattr(encoder, "codec_name", "octattention")),
             "per_batch": stats_list,
         }
+        if exact_enabled:
+            exact_bits_abs_diff = abs(float(exact_impl_bits) - float(exact_sparsepcgc_bits))
+            exact_bits_rel_diff = exact_bits_abs_diff / max(abs(float(exact_sparsepcgc_bits)), 1e-6)
+            exact_actual_gap = float(exact_estimated_bits) - float(exact_actual_bits)
+            exact_actual_gap_percent = exact_actual_gap / max(float(exact_actual_bits), 1e-6) * 100.0
+            result.update(
+                {
+                    "sparsepcgc_exact_candidate_count": int(exact_candidate_count),
+                    "sparsepcgc_exact_occupied_count": int(exact_occupied_count),
+                    "sparsepcgc_exact_occupancy_label_ratio": float(exact_occupied_count) / max(float(exact_candidate_count), 1.0),
+                    "sparsepcgc_exact_prob_mean": float(_weighted_exact_stat("sparsepcgc_exact_prob_mean")),
+                    "sparsepcgc_exact_prob_entropy": float(_weighted_exact_stat("sparsepcgc_exact_prob_entropy")),
+                    "sparsepcgc_exact_prob_true_mean": float(_weighted_exact_stat("sparsepcgc_exact_prob_true_mean")),
+                    "sparsepcgc_exact_occupancy_nll": float(_weighted_exact_stat("sparsepcgc_exact_occupancy_nll")),
+                    "sparsepcgc_exact_estimated_bits": float(exact_estimated_bits),
+                    "sparsepcgc_exact_estimated_bpp": float(exact_estimated_bits) / max(float(total_points), 1.0),
+                    "sparsepcgc_exact_low_prob_ratio": float(_weighted_exact_stat("sparsepcgc_exact_low_prob_ratio")),
+                    "sparsepcgc_exact_bce_bits": float(exact_bce_bits),
+                    "sparsepcgc_exact_actual_bitstream_bits": float(exact_actual_bits),
+                    "sparsepcgc_exact_teacher_mode": str(exact_last.get("sparsepcgc_exact_teacher_mode", "")),
+                    "exact_teacher_uses_full_context": bool(exact_last.get("exact_teacher_uses_full_context", False)),
+                    "exact_teacher_fallback_reason": str(exact_last.get("exact_teacher_fallback_reason", "")),
+                    "exact_teacher_candidate_source": str(exact_last.get("exact_teacher_candidate_source", "")),
+                    "exact_teacher_label_source": str(exact_last.get("exact_teacher_label_source", "")),
+                    "exact_bits_impl": float(exact_impl_bits),
+                    "exact_bits_sparsepcgc_estimate_bitrate": float(exact_sparsepcgc_bits),
+                    "exact_bits_abs_diff": float(exact_bits_abs_diff),
+                    "exact_bits_rel_diff": float(exact_bits_rel_diff),
+                    "exact_bits_match": bool(exact_bits_abs_diff <= max(1e-5, abs(float(exact_sparsepcgc_bits)) * 1e-6)),
+                    "exact_estimated_vs_actual_bit_gap": float(exact_actual_gap),
+                    "exact_estimated_vs_actual_bit_gap_percent": float(exact_actual_gap_percent),
+                }
+            )
+        return result
 
     def _actual_octree_stat_qs(self, args, codec_name):
         codec_key = str(codec_name).strip().lower()
@@ -473,12 +587,157 @@ class CompressionLossMixin:
         stats["octree_leaf_count"] = int(aux["leaf_count"])
         stats["octree_single_ratio"] = float(aux["single_ratio"])
         stats["octree_mean_children"] = float(aux["mean_children"])
+        stats["octree_occupancy_pattern_count"] = int(aux["occupancy_pattern_count"])
+        stats["octree_occupancy_entropy"] = float(aux["occupancy_entropy"])
+        stats["octree_occupancy_nll"] = float(aux["occupancy_nll"])
+        stats["octree_lowprob_occupancy_count"] = float(aux["lowprob_occupancy_count"])
+        stats["octree_lowprob_occupancy_ratio"] = float(aux["lowprob_occupancy_ratio"])
+        stats["octree_occupancy_predictability"] = float(aux["occupancy_predictability"])
         if float(stats.get("node", 0.0)) <= 0.0 or codec_name in {"sparsepcgc", "gpcc", "draco"}:
             stats["node"] = aux_node
         if float(stats.get("single", 0.0)) <= 0.0 or codec_name in {"sparsepcgc", "gpcc", "draco"}:
             stats["single"] = aux_single
         stats["bpn"] = float(stats.get("bit", 0.0)) / max(float(stats.get("node", 0.0)), 1.0)
         return stats
+
+    @staticmethod
+    def _actual_occupancy_debug_from_stats(before_stats, after_stats):
+        def _float(stats, key, default=0.0):
+            try:
+                return float(stats.get(key, default))
+            except (TypeError, ValueError):
+                return float(default)
+
+        def _int(stats, key, default=0):
+            try:
+                return int(stats.get(key, default))
+            except (TypeError, ValueError):
+                return int(default)
+
+        before_pattern = _int(before_stats, "octree_occupancy_pattern_count")
+        after_pattern = _int(after_stats, "octree_occupancy_pattern_count")
+        before_entropy = _float(before_stats, "octree_occupancy_entropy")
+        after_entropy = _float(after_stats, "octree_occupancy_entropy")
+        before_nll = _float(before_stats, "octree_occupancy_nll", before_entropy)
+        after_nll = _float(after_stats, "octree_occupancy_nll", after_entropy)
+        before_lowprob_count = _float(before_stats, "octree_lowprob_occupancy_count")
+        after_lowprob_count = _float(after_stats, "octree_lowprob_occupancy_count")
+        before_lowprob_ratio = _float(before_stats, "octree_lowprob_occupancy_ratio")
+        after_lowprob_ratio = _float(after_stats, "octree_lowprob_occupancy_ratio")
+        before_predictability = _float(before_stats, "octree_occupancy_predictability")
+        after_predictability = _float(after_stats, "octree_occupancy_predictability")
+        debug = {
+            "occupancy_proxy_definition": "myNet hard/proxy octree occupancy statistics, not SparsePCGC candidate occupancy",
+            "actual_occupancy_definition": "actual codec input hard-octree occupancy statistics from quantized coordinates",
+            "predicted_occupancy_definition": "SparsePCGC exact values use sigmoid(out_cls.F) only in sparsepcgc_exact_* logs",
+            "actual_occupancy_pattern_before": before_pattern,
+            "actual_occupancy_pattern_after": after_pattern,
+            "actual_occupancy_pattern_delta": after_pattern - before_pattern,
+            "actual_occupancy_entropy_before": before_entropy,
+            "actual_occupancy_entropy_after": after_entropy,
+            "actual_occupancy_entropy_delta": after_entropy - before_entropy,
+            "actual_occupancy_nll_before": before_nll,
+            "actual_occupancy_nll_after": after_nll,
+            "actual_occupancy_nll_delta": after_nll - before_nll,
+            "actual_lowprob_occupancy_count_before": before_lowprob_count,
+            "actual_lowprob_occupancy_count_after": after_lowprob_count,
+            "actual_lowprob_occupancy_count_delta": after_lowprob_count - before_lowprob_count,
+            "actual_lowprob_occupancy_ratio_before": before_lowprob_ratio,
+            "actual_lowprob_occupancy_ratio_after": after_lowprob_ratio,
+            "actual_lowprob_occupancy_ratio_delta": after_lowprob_ratio - before_lowprob_ratio,
+            "actual_occupancy_predictability_before": before_predictability,
+            "actual_occupancy_predictability_after": after_predictability,
+            "actual_occupancy_predictability_delta": after_predictability - before_predictability,
+        }
+        if bool(before_stats.get("sparsepcgc_occupancy_debug_available", False)) or bool(
+            after_stats.get("sparsepcgc_occupancy_debug_available", False)
+        ):
+            sparse_float_keys = [
+                "sparsepcgc_actual_occupancy_label_ratio",
+                "sparsepcgc_pred_prob_entropy",
+                "sparsepcgc_pred_occupancy_nll",
+                "sparsepcgc_estimated_occupancy_bits",
+                "sparsepcgc_estimated_occupancy_bpp",
+                "sparsepcgc_prob_true_mean",
+                "sparsepcgc_prob_true_low_count",
+                "sparsepcgc_prob_true_low_ratio",
+                "sparsepcgc_occupied_low_prob_count",
+                "sparsepcgc_occupied_low_prob_ratio",
+            ]
+            sparse_int_keys = [
+                "sparsepcgc_candidate_count",
+                "sparsepcgc_occupied_candidate_count",
+            ]
+            for key in sparse_float_keys:
+                before_value = _float(before_stats, key, float("nan"))
+                after_value = _float(after_stats, key, float("nan"))
+                debug[f"{key}_before"] = before_value
+                debug[f"{key}_after"] = after_value
+                debug[f"{key}_delta"] = after_value - before_value
+                debug[key] = after_value
+            for key in sparse_int_keys:
+                before_value = _int(before_stats, key, 0)
+                after_value = _int(after_stats, key, 0)
+                debug[f"{key}_before"] = before_value
+                debug[f"{key}_after"] = after_value
+                debug[f"{key}_delta"] = after_value - before_value
+                debug[key] = after_value
+            debug["sparsepcgc_occupancy_debug_available"] = True
+            debug["sparsepcgc_low_prob_threshold"] = _float(
+                after_stats,
+                "sparsepcgc_low_prob_threshold",
+                _float(before_stats, "sparsepcgc_low_prob_threshold", 0.1),
+            )
+        if "sparsepcgc_exact_estimated_bits" in before_stats or "sparsepcgc_exact_estimated_bits" in after_stats:
+            exact_float_keys = [
+                "sparsepcgc_exact_occupancy_label_ratio",
+                "sparsepcgc_exact_prob_mean",
+                "sparsepcgc_exact_prob_entropy",
+                "sparsepcgc_exact_prob_true_mean",
+                "sparsepcgc_exact_occupancy_nll",
+                "sparsepcgc_exact_estimated_bits",
+                "sparsepcgc_exact_estimated_bpp",
+                "sparsepcgc_exact_low_prob_ratio",
+                "sparsepcgc_exact_bce_bits",
+                "sparsepcgc_exact_actual_bitstream_bits",
+                "exact_bits_impl",
+                "exact_bits_sparsepcgc_estimate_bitrate",
+                "exact_bits_abs_diff",
+                "exact_bits_rel_diff",
+                "exact_estimated_vs_actual_bit_gap",
+                "exact_estimated_vs_actual_bit_gap_percent",
+            ]
+            exact_int_keys = [
+                "sparsepcgc_exact_candidate_count",
+                "sparsepcgc_exact_occupied_count",
+            ]
+            for key in exact_float_keys:
+                before_value = _float(before_stats, key, float("nan"))
+                after_value = _float(after_stats, key, float("nan"))
+                debug[f"{key}_before"] = before_value
+                debug[f"{key}_after"] = after_value
+                debug[f"{key}_delta"] = after_value - before_value
+                debug[key] = after_value
+            for key in exact_int_keys:
+                before_value = _int(before_stats, key, 0)
+                after_value = _int(after_stats, key, 0)
+                debug[f"{key}_before"] = before_value
+                debug[f"{key}_after"] = after_value
+                debug[f"{key}_delta"] = after_value - before_value
+                debug[key] = after_value
+            debug["exact_bits_match"] = bool(after_stats.get("exact_bits_match", False))
+            for key in (
+                "sparsepcgc_exact_teacher_mode",
+                "exact_teacher_uses_full_context",
+                "exact_teacher_fallback_reason",
+                "exact_teacher_candidate_source",
+                "exact_teacher_label_source",
+            ):
+                debug[key] = after_stats.get(key, before_stats.get(key, ""))
+            debug["sparsepcgc_exact_occupancy_nll_delta"] = debug.get("sparsepcgc_exact_occupancy_nll_delta", float("nan"))
+            debug["sparsepcgc_exact_estimated_bits_delta"] = debug.get("sparsepcgc_exact_estimated_bits_delta", float("nan"))
+            debug["sparsepcgc_exact_bpp_delta"] = debug.get("sparsepcgc_exact_estimated_bpp_delta", float("nan"))
+        return debug
 
     def _log_compression_grad_probe(self, args, label, L_com, gen_xyz):
         if not bool(getattr(args, "compression_grad_probe", True)):
@@ -535,6 +794,9 @@ class CompressionLossMixin:
         cache_key=None,
         use_proxy_surrogate=False,
         actual_gen_xyz=None,
+        subtree_tree=None,
+        full_octree_context=None,
+        octree_input_mode="auto",
     ):
         actual_xyz = gen_xyz if actual_gen_xyz is None else actual_gen_xyz
         cached_gt = self._get_cached_actual_gt(cache_key)
@@ -564,6 +826,9 @@ class CompressionLossMixin:
                 cache_key=cache_key,
                 run_grad_probe=False,
                 actual_gen_xyz=actual_xyz,
+                subtree_tree=subtree_tree,
+                full_octree_context=full_octree_context,
+                octree_input_mode=octree_input_mode,
             )
             proxy_terms = dict(getattr(self, "last_compression_terms", {}) or {})
             proxy_bit = proxy_terms.get("bit")
@@ -583,6 +848,33 @@ class CompressionLossMixin:
         loss_nodes = gen_xyz.new_tensor(
             self._relative_percent(float(stats_gen["node"]), float(cached_gt["node"]), ref_min=1.0)
         )
+        exact_available = "sparsepcgc_exact_estimated_bits" in stats_gen and "sparsepcgc_exact_estimated_bits" in cached_gt
+        exact_nll_delta = float("nan")
+        exact_bits_delta = float("nan")
+        exact_bpp_delta = float("nan")
+        exact_loss = gen_xyz.new_zeros(())
+        if exact_available:
+            exact_nll_delta = float(stats_gen.get("sparsepcgc_exact_occupancy_nll", 0.0)) - float(
+                cached_gt.get("sparsepcgc_exact_occupancy_nll", 0.0)
+            )
+            exact_bits_delta = self._relative_percent(
+                float(stats_gen.get("sparsepcgc_exact_estimated_bits", 0.0)),
+                float(cached_gt.get("sparsepcgc_exact_estimated_bits", 0.0)),
+                ref_min=1.0,
+            )
+            exact_bpp_delta = self._relative_percent(
+                float(stats_gen.get("sparsepcgc_exact_estimated_bpp", 0.0)),
+                float(cached_gt.get("sparsepcgc_exact_estimated_bpp", 0.0)),
+                ref_min=1e-9,
+            )
+        if exact_available and bool(getattr(args, "enable_sparsepcgc_exact_occupancy_loss", False)):
+            exact_loss = exact_loss + gen_xyz.new_tensor(
+                float(getattr(args, "sparsepcgc_exact_occupancy_loss_weight", 0.0)) * exact_nll_delta
+            )
+            exact_loss = exact_loss + gen_xyz.new_tensor(
+                float(getattr(args, "sparsepcgc_exact_bits_loss_weight", 0.0)) * exact_bits_delta
+            )
+            L_com = L_com + exact_loss
         self._store_compression_terms(
             main=L_com,
             bit=L_com_hard,
@@ -590,6 +882,7 @@ class CompressionLossMixin:
             node=gen_xyz.new_zeros(()),
             bpn=gen_xyz.new_zeros(()),
             objective=L_com,
+            sparsepcgc_exact=exact_loss,
             backend=backend_label,
         )
         self.last_compression_debug = {
@@ -599,6 +892,8 @@ class CompressionLossMixin:
             "bpp": self._relative_percent(float(stats_gen["bpp"]), float(cached_gt["bpp"])),
             "gt_points": int(cached_gt["point_count"]),
             "gen_points": int(stats_gen["point_count"]),
+            "gt_unique_coord_count": int(cached_gt.get("unique_coord_count", cached_gt.get("point_count", 0))),
+            "gen_unique_coord_count": int(stats_gen.get("unique_coord_count", stats_gen.get("point_count", 0))),
             "gt_actual_bit": gt_bit,
             "gen_actual_bit": gen_bit,
             "actual_total_bit_percent": loss_bit_percent,
@@ -610,7 +905,32 @@ class CompressionLossMixin:
             "node_delta": float(stats_gen["node"]) - float(cached_gt["node"]),
             "single_delta": float(stats_gen["single"]) - float(cached_gt["single"]),
             "proxy_surrogate": proxy_debug,
+            "sparsepcgc_exact_occupancy_nll_delta": exact_nll_delta,
+            "sparsepcgc_exact_estimated_bits_delta": exact_bits_delta,
+            "sparsepcgc_exact_bpp_delta": exact_bpp_delta,
+            "sparsepcgc_exact_loss_candidate": self._scalar(exact_loss),
+            "sparsepcgc_exact_loss_enabled": bool(
+                exact_available and getattr(args, "enable_sparsepcgc_exact_occupancy_loss", False)
+            ),
         }
+        if codec_name == "sparsepcgc":
+            proxy_bit_percent = float(proxy_debug["loss_bit"]) if proxy_debug is not None else float("nan")
+            self.last_compression_debug.update(
+                {
+                    "actual_sparsepcgc_bit": gen_bit,
+                    "actual_sparsepcgc_gt_bit": gt_bit,
+                    "actual_sparsepcgc_bit_delta": gen_bit - gt_bit,
+                    "proxy_sparsepcgc_bit": proxy_bit_percent,
+                    "proxy_sparsepcgc_bit_percent": proxy_bit_percent,
+                    "proxy_actual_bit_gap": float("nan"),
+                    "proxy_actual_bit_gap_percent": proxy_bit_percent - loss_bit_percent if proxy_debug is not None else float("nan"),
+                    "estimated_occupancy_bits": float(stats_gen.get("sparsepcgc_estimated_occupancy_bits", float("nan"))),
+                    "mean_prob_true": float(stats_gen.get("sparsepcgc_prob_true_mean", float("nan"))),
+                    "low_prob_true_count": float(stats_gen.get("sparsepcgc_prob_true_low_count", float("nan"))),
+                    "low_prob_true_ratio": float(stats_gen.get("sparsepcgc_prob_true_low_ratio", float("nan"))),
+                }
+            )
+        self.last_compression_debug.update(self._actual_occupancy_debug_from_stats(cached_gt, stats_gen))
         self._maybe_update_sparsepcgc_debug(
             args,
             self.last_compression_debug,
@@ -654,6 +974,9 @@ class CompressionLossMixin:
         cache_key=None,
         refresh_actual_gen=True,
         actual_gen_xyz=None,
+        subtree_tree=None,
+        full_octree_context=None,
+        octree_input_mode="auto",
     ):
         self._store_compression_terms()
         backend = self._compression_loss_backend(args)
@@ -680,6 +1003,9 @@ class CompressionLossMixin:
                     cache_key=cache_key,
                     run_grad_probe=True,
                     actual_gen_xyz=actual_gen_xyz,
+                    subtree_tree=subtree_tree,
+                    full_octree_context=full_octree_context,
+                    octree_input_mode=octree_input_mode,
                 )
             self.last_compression_debug["actual_codec_disabled_during_train"] = True
             self.last_compression_debug["requested_backend"] = backend
@@ -713,6 +1039,9 @@ class CompressionLossMixin:
                     cache_key=cache_key,
                     run_grad_probe=True,
                     actual_gen_xyz=actual_gen_xyz,
+                    subtree_tree=subtree_tree,
+                    full_octree_context=full_octree_context,
+                    octree_input_mode=octree_input_mode,
                 )
                 self.last_compression_debug["actual_codec_skipped_by_interval"] = True
                 self.last_compression_debug["requested_backend"] = backend
@@ -748,6 +1077,9 @@ class CompressionLossMixin:
                     cache_key=cache_key,
                     run_grad_probe=True,
                     actual_gen_xyz=actual_gen_xyz,
+                    subtree_tree=subtree_tree,
+                    full_octree_context=full_octree_context,
+                    octree_input_mode=octree_input_mode,
                 )
                 self.last_compression_debug["actual_codec_error"] = error_text[:1000]
                 self.last_compression_debug["actual_codec_fallback_to_proxy"] = True
@@ -762,6 +1094,9 @@ class CompressionLossMixin:
                 cache_key=cache_key,
                 use_proxy_surrogate=False,
                 actual_gen_xyz=actual_gen_xyz,
+                subtree_tree=subtree_tree,
+                full_octree_context=full_octree_context,
+                octree_input_mode=octree_input_mode,
             )
         if backend in {"octattention_actual_ste", "actual_octattention_ste", "real_octattention_ste", "sparsepcgc_actual_ste", "gpcc_actual_ste", "draco_actual_ste"}:
             return self._get_compression_loss_actual_codec(
@@ -772,6 +1107,9 @@ class CompressionLossMixin:
                 cache_key=cache_key,
                 use_proxy_surrogate=True,
                 actual_gen_xyz=actual_gen_xyz,
+                subtree_tree=subtree_tree,
+                full_octree_context=full_octree_context,
+                octree_input_mode=octree_input_mode,
             )
         if backend != "proxy":
             raise ValueError(
@@ -790,4 +1128,7 @@ class CompressionLossMixin:
             cache_key=cache_key,
             run_grad_probe=True,
             actual_gen_xyz=actual_gen_xyz,
+            subtree_tree=subtree_tree,
+            full_octree_context=full_octree_context,
+            octree_input_mode=octree_input_mode,
         )

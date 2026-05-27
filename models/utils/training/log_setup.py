@@ -207,6 +207,15 @@ def log_codec_setup(writer, args):
             f"surrogate_effective_qs={float(getattr(args, 'sparsepcgc_effective_qs', 0.0))}, "
             f"surrogate_levels={getattr(args, 'compression_surrogate_levels', '4,6,8')}"
         )
+        writer.write(
+            "SparsePCGC Exact Occupancy Teacher: "
+            f"enabled={bool(getattr(args, 'enable_sparsepcgc_exact_occupancy_teacher', False))}, "
+            f"interval={int(getattr(args, 'sparsepcgc_exact_occupancy_interval', 1))}, "
+            f"mode={getattr(args, 'sparsepcgc_exact_teacher_mode', 'auto')}, "
+            f"loss_enabled={bool(getattr(args, 'enable_sparsepcgc_exact_occupancy_loss', False))}, "
+            f"nll_weight={float(getattr(args, 'sparsepcgc_exact_occupancy_loss_weight', 0.0))}, "
+            f"bits_weight={float(getattr(args, 'sparsepcgc_exact_bits_loss_weight', 0.0))}"
+        )
 
     if compression_backend.startswith("gpcc"):
         writer.write(

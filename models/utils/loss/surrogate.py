@@ -14,10 +14,32 @@ def resolve_surrogate_pred_clip(args):
 
 
 def resolve_surrogate_target_clip(args):
-    clip = float(getattr(args, "surrogate_target_clip_percent", -1.0))
-    if clip < 0.0:
-        clip = float(getattr(args, "compression_surrogate_pred_clip", 0.0))
+    # Target clipping changes the teacher value itself.  Keep the actual codec
+    # percent raw unless the caller explicitly opts in.
+    clip = float(getattr(args, "surrogate_target_clip_percent", 0.0))
     return max(float(clip), 0.0)
+
+
+ACTUAL_OCCUPANCY_DEBUG_KEYS = (
+    "actual_occupancy_pattern_before",
+    "actual_occupancy_pattern_after",
+    "actual_occupancy_pattern_delta",
+    "actual_occupancy_entropy_before",
+    "actual_occupancy_entropy_after",
+    "actual_occupancy_entropy_delta",
+    "actual_occupancy_nll_before",
+    "actual_occupancy_nll_after",
+    "actual_occupancy_nll_delta",
+    "actual_lowprob_occupancy_count_before",
+    "actual_lowprob_occupancy_count_after",
+    "actual_lowprob_occupancy_count_delta",
+    "actual_lowprob_occupancy_ratio_before",
+    "actual_lowprob_occupancy_ratio_after",
+    "actual_lowprob_occupancy_ratio_delta",
+    "actual_occupancy_predictability_before",
+    "actual_occupancy_predictability_after",
+    "actual_occupancy_predictability_delta",
+)
 
 
 class _CompressionSurrogateNet(nn.Module):
@@ -976,6 +998,7 @@ class SurrogateCompressionLossMixin:
                     "gen_octree_node": float(stats_gen.get("octree_node", stats_gen["node"])),
                     "gt_octree_depth": int(cached_gt.get("octree_depth", 0)),
                     "gen_octree_depth": int(stats_gen.get("octree_depth", 0)),
+                    **self._actual_occupancy_debug_from_stats(cached_gt, stats_gen),
                     "global_step": int(current_step),
                     "surrogate_step": int(getattr(self, "_surrogate_step", 0)),
                 },
@@ -1286,6 +1309,15 @@ class SurrogateCompressionLossMixin:
         teacher_gap_debug = self._update_teacher_gap_debug(args, cache_key, teacher_type_label, actual_bit_percent, teacher_is_actual)
         replay_ratio = float(replay_full_cloud_count) / float(max(replay_sample_count, 1))
         feature_names = self._surrogate_feature_names(args)
+        if teacher_refreshed and stats_gen is not None:
+            actual_occupancy_debug = self._actual_occupancy_debug_from_stats(cached_gt, stats_gen)
+        elif target_entry is not None:
+            actual_occupancy_debug = {
+                key: target_entry.get(key, float("nan"))
+                for key in ACTUAL_OCCUPANCY_DEBUG_KEYS
+            }
+        else:
+            actual_occupancy_debug = {}
 
         self.last_compression_debug = {
             "metric": "actual_total_bit_percent",
@@ -1494,6 +1526,7 @@ class SurrogateCompressionLossMixin:
             "gen_octree_depth": gen_octree_depth_value,
             "timing": {key: round(float(value), 6) for key, value in timing.items()},
         }
+        self.last_compression_debug.update(actual_occupancy_debug)
         debug_gen_xyz = gen_xyz if actual_gen_xyz is None else actual_gen_xyz
         self._maybe_update_sparsepcgc_debug(
             args,

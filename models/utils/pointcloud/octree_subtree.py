@@ -371,6 +371,261 @@ def build_subtree_index_map(unit_keys: torch.Tensor):
     return unique_keys, index_lists
 
 
+def _cpu_long(value):
+    return torch.as_tensor(value, dtype=torch.long, device="cpu")
+
+
+def _decode_subtree_key(subtree_key: int, depth: int):
+    grid = 1 << max(int(depth), 1)
+    key = int(subtree_key)
+    x = key % grid
+    y = (key // grid) % grid
+    z = key // (grid * grid)
+    return torch.tensor([x, y, z], dtype=torch.long)
+
+
+def _path_from_cell(cell_xyz, depth: int):
+    depth = max(int(depth), 1)
+    cell = _cpu_long(cell_xyz).reshape(3)
+    path = []
+    for bit_pos in range(depth - 1, -1, -1):
+        child = int(((cell[0] >> bit_pos) & 1) * 4 + ((cell[1] >> bit_pos) & 1) * 2 + ((cell[2] >> bit_pos) & 1))
+        path.append(child)
+    return tuple(path)
+
+
+def _path_to_text(path):
+    if not path:
+        return "root"
+    return "/".join(f"{int(child)}:{int(child):03b}" for child in path)
+
+
+def _cell_from_path(path):
+    xyz = torch.zeros((3,), dtype=torch.long)
+    for child in path:
+        child = int(child)
+        xyz = xyz * 2
+        xyz[0] += (child >> 2) & 1
+        xyz[1] += (child >> 1) & 1
+        xyz[2] += child & 1
+    return xyz
+
+
+def _occupancy_code(children):
+    code = 0
+    for child in children:
+        code |= 1 << int(child)
+    return int(code)
+
+
+def _morton_keys(coords, depth: int):
+    coords = _cpu_long(coords).reshape(-1, 3)
+    depth = max(int(depth), 1)
+    keys = torch.zeros((coords.shape[0],), dtype=torch.long)
+    for bit_pos in range(depth):
+        shift = depth - 1 - bit_pos
+        child = ((coords[:, 0] >> shift) & 1) * 4 + ((coords[:, 1] >> shift) & 1) * 2 + ((coords[:, 2] >> shift) & 1)
+        keys = keys * 8 + child
+    return keys
+
+
+def _global_node_id(path, global_depth: int):
+    depth = len(path)
+    if depth <= 0:
+        morton = 0
+    else:
+        morton = int(_morton_keys(_cell_from_path(path).view(1, 3), depth)[0].item())
+    # 深さを上位側に混ぜ、同じMorton値でも階層が違えば別ノードとして扱う。
+    return int(depth) * int(1 << (3 * max(int(global_depth), 1))) + morton
+
+
+def _path_from_morton_code(code: int, depth: int):
+    path = []
+    code = int(code)
+    for bit_pos in range(max(int(depth), 0) - 1, -1, -1):
+        path.append((code >> (3 * bit_pos)) & 7)
+    return tuple(path)
+
+
+def _child_map_from_coords(global_coords, global_depth: int):
+    coords = _cpu_long(global_coords).reshape(-1, 3)
+    global_depth = max(int(global_depth), 1)
+    child_map = {}
+    if coords.numel() == 0:
+        return child_map
+    coords = torch.unique(coords, dim=0, sorted=True)
+    prefix_codes = torch.zeros((coords.shape[0],), dtype=torch.long)
+    for level in range(global_depth):
+        bit_pos = global_depth - 1 - level
+        child = ((coords[:, 0] >> bit_pos) & 1) * 4 + ((coords[:, 1] >> bit_pos) & 1) * 2 + ((coords[:, 2] >> bit_pos) & 1)
+        pairs = torch.unique(torch.stack([prefix_codes, child.to(torch.long)], dim=1), dim=0, sorted=True)
+        for prefix_code, child_id in pairs.tolist():
+            prefix = _path_from_morton_code(prefix_code, level)
+            child_map.setdefault(prefix, set()).add(int(child_id))
+        prefix_codes = prefix_codes * 8 + child.to(torch.long)
+    return child_map
+
+
+def _node_geometry_from_path(path, global_depth: int):
+    depth = len(path)
+    cell = _cell_from_path(path)
+    remaining = max(int(global_depth) - int(depth), 0)
+    span = 1 << remaining
+    origin = cell * span
+    bbox_min = origin.clone()
+    bbox_max = origin + span - 1
+    return origin, bbox_min, bbox_max
+
+
+def _build_single_subtree_tree(subtree_key, point_idx, subtree_ref, global_coords, global_depth: int):
+    depth = int(subtree_ref["depth"][0].detach().cpu().item())
+    global_depth = max(int(global_depth), depth)
+    qs = float(subtree_ref.get("qs", 1.0))
+    offset = subtree_ref["offset"][0].detach().to("cpu", dtype=torch.float32)
+    cell = _decode_subtree_key(int(subtree_key), depth)
+    path = _path_from_cell(cell, depth)
+    point_idx_cpu = point_idx.detach().to("cpu", dtype=torch.long)
+    selected_coords = global_coords.index_select(0, point_idx_cpu)
+    child_map = _child_map_from_coords(selected_coords, global_depth)
+    node_paths = [
+        node_path
+        for node_path in child_map.keys()
+        if len(node_path) >= depth and node_path[:depth] == path
+    ]
+    node_paths = sorted(node_paths, key=lambda item: (len(item), item))
+    path_to_idx = {node_path: idx for idx, node_path in enumerate(node_paths)}
+
+    child_masks = torch.zeros((len(node_paths), 8), dtype=torch.bool)
+    child_indices = torch.full((len(node_paths), 8), -1, dtype=torch.long)
+    parent_indices = torch.full((len(node_paths),), -1, dtype=torch.long)
+    occupancy_codes = torch.zeros((len(node_paths),), dtype=torch.long)
+    node_depths = torch.zeros((len(node_paths),), dtype=torch.long)
+    node_origins = torch.zeros((len(node_paths), 3), dtype=torch.long)
+    node_bbox_min = torch.zeros((len(node_paths), 3), dtype=torch.long)
+    node_bbox_max = torch.zeros((len(node_paths), 3), dtype=torch.long)
+    global_node_ids = torch.zeros((len(node_paths),), dtype=torch.long)
+
+    for idx, node_path in enumerate(node_paths):
+        children = sorted(child_map.get(node_path, set()))
+        occupancy_codes[idx] = _occupancy_code(children)
+        node_depths[idx] = len(node_path)
+        global_node_ids[idx] = _global_node_id(node_path, global_depth)
+        origin, bbox_min, bbox_max = _node_geometry_from_path(node_path, global_depth)
+        node_origins[idx] = origin
+        node_bbox_min[idx] = bbox_min
+        node_bbox_max[idx] = bbox_max
+        if node_path[:-1] in path_to_idx:
+            parent_indices[idx] = path_to_idx[node_path[:-1]]
+        for child in children:
+            child_masks[idx, int(child)] = True
+            child_path = node_path + (int(child),)
+            if child_path in path_to_idx:
+                child_indices[idx, int(child)] = path_to_idx[child_path]
+
+    subtree_origin, subtree_bbox_min, subtree_bbox_max = _node_geometry_from_path(path, global_depth)
+    return {
+        "subtree_key": int(subtree_key),
+        "subtree_depth": int(depth),
+        "subtree_path": _path_to_text(path),
+        "subtree_depth_in_full_octree": int(depth),
+        "remaining_depth_to_leaf": int(max(global_depth - depth, 0)),
+        "global_offset": offset,
+        "global_qs": float(qs),
+        "global_depth": int(global_depth),
+        "subtree_global_origin": subtree_origin,
+        "subtree_global_bbox_min": subtree_bbox_min,
+        "subtree_global_bbox_max": subtree_bbox_max,
+        "node_ids": torch.arange(len(node_paths), dtype=torch.long),
+        "global_node_ids": global_node_ids,
+        "node_depths": node_depths,
+        "node_origins": node_origins,
+        "node_bbox_min": node_bbox_min,
+        "node_bbox_max": node_bbox_max,
+        "parent_indices": parent_indices,
+        "child_indices": child_indices,
+        "child_masks": child_masks,
+        "occupancy_codes": occupancy_codes,
+        "leaf_point_indices": point_idx_cpu,
+        "global_voxel_coords": selected_coords,
+        "global_morton_keys": _morton_keys(selected_coords, global_depth),
+    }
+
+
+def _build_single_full_octree_context(subtree_key, subtree_ref, full_child_map, global_depth: int):
+    depth = int(subtree_ref["depth"][0].detach().cpu().item())
+    global_depth = max(int(global_depth), depth)
+    qs = float(subtree_ref.get("qs", 1.0))
+    offset = subtree_ref["offset"][0].detach().to("cpu", dtype=torch.float32)
+    cell = _decode_subtree_key(int(subtree_key), depth)
+    path = _path_from_cell(cell, depth)
+    parent_path = path[:-1]
+    selected_child = path[-1] if path else 0
+    parent_children = sorted(full_child_map.get(parent_path, set()))
+    sibling_paths = [parent_path + (child,) for child in parent_children if int(child) != int(selected_child)]
+    sibling_codes = [_occupancy_code(full_child_map.get(sibling_path, set())) for sibling_path in sibling_paths]
+    sibling_masks = []
+    for code in sibling_codes:
+        sibling_masks.append([(int(code) >> child) & 1 for child in range(8)])
+    subtree_origin, subtree_bbox_min, subtree_bbox_max = _node_geometry_from_path(path, global_depth)
+    ancestor_paths = [path[:level] for level in range(0, len(path))]
+    ancestor_codes = [_occupancy_code(full_child_map.get(item, set())) for item in ancestor_paths]
+    return {
+        "root_to_subtree_path": [_path_to_text(path[:level]) for level in range(0, len(path) + 1)],
+        "ancestor_node_ids": torch.tensor([_global_node_id(item, global_depth) for item in ancestor_paths], dtype=torch.long),
+        "ancestor_paths": [_path_to_text(item) for item in ancestor_paths],
+        "ancestor_occupancy_codes": torch.tensor(ancestor_codes, dtype=torch.long),
+        "parent_node_id": int(_global_node_id(parent_path, global_depth)),
+        "parent_path": _path_to_text(parent_path),
+        "parent_occupancy_code": int(_occupancy_code(parent_children)),
+        "sibling_node_ids": torch.tensor([_global_node_id(item, global_depth) for item in sibling_paths], dtype=torch.long),
+        "sibling_paths": [_path_to_text(item) for item in sibling_paths],
+        "sibling_occupancy_codes": torch.tensor(sibling_codes, dtype=torch.long),
+        "sibling_child_masks": torch.tensor(sibling_masks, dtype=torch.bool) if sibling_masks else torch.zeros((0, 8), dtype=torch.bool),
+        "selected_subtree_key": int(subtree_key),
+        "selected_subtree_path": _path_to_text(path),
+        "selected_subtree_global_bbox_min": subtree_bbox_min,
+        "selected_subtree_global_bbox_max": subtree_bbox_max,
+        "global_offset": offset,
+        "global_qs": float(qs),
+        "global_depth": int(global_depth),
+    }
+
+
+def _build_group_octree_metadata(pts_xyz, subtree_ref, all_groups):
+    if subtree_ref is None or not all_groups:
+        return {}, {}, {}
+    if pts_xyz.ndim != 3 or pts_xyz.shape[0] != 1:
+        return {}, {}, {}
+    qs = max(float(subtree_ref.get("qs", 1.0)), 1e-9)
+    offset = subtree_ref["offset"][0].to(device=pts_xyz.device, dtype=torch.float32)
+    global_depth = int(subtree_ref["max_level"][0].detach().cpu().item())
+    pts_b = torch.nan_to_num(pts_xyz[0].detach().to(torch.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    global_coords = torch.round((pts_b - offset.view(3, 1)) / qs).to(torch.long).transpose(0, 1).contiguous().detach().to("cpu")
+    global_coords = global_coords.clamp_min(0)
+    full_child_map = _child_map_from_coords(global_coords, global_depth)
+    subtree_trees = {}
+    full_octree_contexts = {}
+    group_meta = {}
+    for subtree_key, point_idx in all_groups:
+        key = int(subtree_key)
+        tree = _build_single_subtree_tree(key, point_idx, subtree_ref, global_coords, global_depth)
+        context = _build_single_full_octree_context(key, subtree_ref, full_child_map, global_depth)
+        subtree_trees[key] = tree
+        full_octree_contexts[key] = context
+        group_meta[key] = {
+            "subtree_key": key,
+            "subtree_path": tree["subtree_path"],
+            "point_count": int(point_idx.numel()),
+            "node_count": int(tree["occupancy_codes"].numel()),
+            "single_child_count": int((tree["child_masks"].sum(dim=1) == 1).sum().item()),
+            "global_depth": int(global_depth),
+            "global_offset": tree["global_offset"].tolist() if hasattr(tree["global_offset"], "tolist") else tree["global_offset"],
+            "subtree_depth": int(tree["subtree_depth"]),
+            "local_depth": int(tree["subtree_depth"]),
+        }
+    return subtree_trees, full_octree_contexts, group_meta
+
+
 def build_octree_subtree_groups_with_retry(
     pts_xyz: torch.Tensor,
     args,
@@ -399,6 +654,11 @@ def build_octree_subtree_groups_with_retry(
         ]
 
         if all_groups:
+            subtree_trees, full_octree_contexts, group_meta = _build_group_octree_metadata(
+                pts_xyz,
+                subtree_ref,
+                all_groups,
+            )
             largest_group = max(all_groups, key=lambda item: int(item[1].numel()))
             fallback_points = int(fallback["groups"][0][1].numel()) if fallback is not None else -1
             if fallback is None or int(largest_group[1].numel()) > fallback_points:
@@ -415,9 +675,17 @@ def build_octree_subtree_groups_with_retry(
                     "requested_depth": int(requested_depth),
                     "selection_reason": "min_points_miss_fallback_largest",
                     "total_subtree_count": int(unique_keys.numel()),
+                    "subtree_trees": subtree_trees,
+                    "full_octree_contexts": full_octree_contexts,
+                    "group_meta": group_meta,
                 }
 
         if eligible_groups:
+            subtree_trees, full_octree_contexts, group_meta = _build_group_octree_metadata(
+                pts_xyz,
+                subtree_ref,
+                all_groups,
+            )
             return {
                 "subtree_ref": subtree_ref,
                 "unique_keys": unique_keys,
@@ -431,6 +699,9 @@ def build_octree_subtree_groups_with_retry(
                 "requested_depth": int(requested_depth),
                 "selection_reason": "depth_retry" if int(depth) != int(requested_depth) else "none",
                 "total_subtree_count": int(unique_keys.numel()),
+                "subtree_trees": subtree_trees,
+                "full_octree_contexts": full_octree_contexts,
+                "group_meta": group_meta,
             }
         retry_count += 1
 
@@ -453,6 +724,9 @@ def build_octree_subtree_groups_with_retry(
         "requested_depth": int(requested_depth),
         "selection_reason": "no_valid_subtree",
         "total_subtree_count": 0,
+        "subtree_trees": {},
+        "full_octree_contexts": {},
+        "group_meta": {},
     }
 
 

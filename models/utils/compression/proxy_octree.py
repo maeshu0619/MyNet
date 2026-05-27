@@ -179,6 +179,9 @@ class SoftOctreeRateProxy(nn.Module):
         self,
         gen_xyz: torch.Tensor,
         final_w: Optional[torch.Tensor] = None,
+        subtree_tree=None,
+        full_octree_context=None,
+        octree_input_mode: str = "auto",
     ):
         if gen_xyz.ndim != 3 or gen_xyz.shape[1] != 3:
             raise ValueError("gen_xyz must have shape [B, 3, N]")
@@ -190,6 +193,8 @@ class SoftOctreeRateProxy(nn.Module):
         device = gen_xyz.device
         dtype = gen_xyz.dtype
         point_w = self._normalize_point_weights(final_w, B, N, device, dtype)
+        tree_items = self._batch_tree_items(subtree_tree, B)
+        context_items = self._batch_tree_items(full_octree_context, B)
 
         rate_total = gen_xyz.new_zeros(())
         node_count = gen_xyz.new_zeros(())
@@ -204,7 +209,14 @@ class SoftOctreeRateProxy(nn.Module):
         for b in range(B):
             pts_b = gen_xyz[b]
             w_b = point_w[b]
-            bits_b, node_b, single_b, hard_bits_b, hard_node_b, hard_single_b, soft_bits_b, soft_node_b, soft_single_b = self._prepare_single_octattention_eval(pts_b, w_b)
+            anchor = self._prebuilt_anchor(tree_items[b], context_items[b], pts_b.device, pts_b.dtype)
+            bits_b, node_b, single_b, hard_bits_b, hard_node_b, hard_single_b, soft_bits_b, soft_node_b, soft_single_b = self._prepare_single_octattention_eval(
+                pts_b,
+                w_b,
+                qs_value=anchor.get("qs_value"),
+                offset_np=anchor.get("offset_np"),
+                max_level_override=anchor.get("global_depth"),
+            )
             rate_total = rate_total + bits_b
             node_count = node_count + node_b
             single_child_count = single_child_count + single_b
@@ -238,6 +250,8 @@ class SoftOctreeRateProxy(nn.Module):
             "soft_bit": soft_rate_total.detach(),
             "soft_single": soft_single_child_count.detach(),
             "soft_node": soft_node_count.detach(),
+            "prebuilt_node_count": self._batch_prebuilt_node_count(tree_items, gen_xyz),
+            "prebuilt_single_child_count": self._batch_prebuilt_single_child_count(tree_items, gen_xyz),
         }
 
         return (
@@ -263,6 +277,9 @@ class SoftOctreeRateProxy(nn.Module):
         self,
         gen_xyz: torch.Tensor,
         final_w: torch.Tensor,
+        subtree_tree=None,
+        full_octree_context=None,
+        octree_input_mode: str = "auto",
     ):
         """
         Compute hard-valued OctAttention terms and the weighted STE surrogate
@@ -278,6 +295,8 @@ class SoftOctreeRateProxy(nn.Module):
         device = gen_xyz.device
         dtype = gen_xyz.dtype
         ste_w = self._normalize_point_weights(final_w, B, N, device, dtype)
+        tree_items = self._batch_tree_items(subtree_tree, B)
+        context_items = self._batch_tree_items(full_octree_context, B)
         hard_w = (ste_w.detach() >= 0.5).to(dtype=dtype)
         for b in range(B):
             if not bool(hard_w[b].any().item()):
@@ -294,7 +313,14 @@ class SoftOctreeRateProxy(nn.Module):
         surrogate_single_child_count = gen_xyz.new_zeros(())
 
         for b in range(B):
-            prepared = self._prepare_single_hard_octattention_eval(gen_xyz[b], hard_w[b])
+            anchor = self._prebuilt_anchor(tree_items[b], context_items[b], gen_xyz.device, dtype)
+            prepared = self._prepare_single_hard_octattention_eval(
+                gen_xyz[b],
+                hard_w[b],
+                qs_value=anchor.get("qs_value"),
+                offset_np=anchor.get("offset_np"),
+                max_level_override=anchor.get("global_depth"),
+            )
             if prepared is None:
                 continue
             safe_pts, valid, offset_np, max_level, oct_seq_np, teacher_log2, hard_bits, hard_node, hard_single = prepared
@@ -351,6 +377,8 @@ class SoftOctreeRateProxy(nn.Module):
             "soft_bit": surrogate_rate_total.detach(),
             "soft_single": surrogate_single_child_count.detach(),
             "soft_node": surrogate_node_count.detach(),
+            "prebuilt_node_count": self._batch_prebuilt_node_count(tree_items, gen_xyz),
+            "prebuilt_single_child_count": self._batch_prebuilt_single_child_count(tree_items, gen_xyz),
         }
 
         out_forward = {
@@ -374,7 +402,7 @@ class SoftOctreeRateProxy(nn.Module):
         }
         return out_forward, out_surrogate, stats
 
-    def forward_hard_only(self, gen_xyz: torch.Tensor):
+    def forward_hard_only(self, gen_xyz: torch.Tensor, subtree_tree=None, full_octree_context=None, octree_input_mode: str = "auto"):
         if gen_xyz.ndim != 3 or gen_xyz.shape[1] != 3:
             raise ValueError("gen_xyz must have shape [B, 3, N]")
         if gen_xyz.dtype in (torch.float16, torch.bfloat16):
@@ -384,13 +412,22 @@ class SoftOctreeRateProxy(nn.Module):
         device = gen_xyz.device
         dtype = gen_xyz.dtype
         point_w = self._normalize_point_weights(None, B, N, device, dtype)
+        tree_items = self._batch_tree_items(subtree_tree, B)
+        context_items = self._batch_tree_items(full_octree_context, B)
 
         rate_total = gen_xyz.new_zeros(())
         node_count = gen_xyz.new_zeros(())
         single_child_count = gen_xyz.new_zeros(())
 
         for b in range(B):
-            prepared = self._prepare_single_hard_octattention_eval(gen_xyz[b], point_w[b])
+            anchor = self._prebuilt_anchor(tree_items[b], context_items[b], gen_xyz.device, dtype)
+            prepared = self._prepare_single_hard_octattention_eval(
+                gen_xyz[b],
+                point_w[b],
+                qs_value=anchor.get("qs_value"),
+                offset_np=anchor.get("offset_np"),
+                max_level_override=anchor.get("global_depth"),
+            )
             if prepared is None:
                 continue
             _, _, _, _, _, _, hard_bits, hard_node, hard_single = prepared
@@ -415,6 +452,8 @@ class SoftOctreeRateProxy(nn.Module):
             "soft_bit": rate_total.detach(),
             "soft_single": single_child_count.detach(),
             "soft_node": node_count.detach(),
+            "prebuilt_node_count": self._batch_prebuilt_node_count(tree_items, gen_xyz),
+            "prebuilt_single_child_count": self._batch_prebuilt_single_child_count(tree_items, gen_xyz),
         }
 
         out = {
@@ -430,8 +469,21 @@ class SoftOctreeRateProxy(nn.Module):
         }
         return out, rate_total, stats
 
-    def _prepare_single_octattention_eval(self, pts_xyz: torch.Tensor, point_w: torch.Tensor, qs_value: Optional[float] = None):
-        prepared = self._prepare_single_hard_octattention_eval(pts_xyz, point_w, qs_value=qs_value)
+    def _prepare_single_octattention_eval(
+        self,
+        pts_xyz: torch.Tensor,
+        point_w: torch.Tensor,
+        qs_value: Optional[float] = None,
+        offset_np=None,
+        max_level_override: Optional[int] = None,
+    ):
+        prepared = self._prepare_single_hard_octattention_eval(
+            pts_xyz,
+            point_w,
+            qs_value=qs_value,
+            offset_np=offset_np,
+            max_level_override=max_level_override,
+        )
         if prepared is None:
             zero = pts_xyz.new_zeros(())
             return zero, zero, zero, zero, zero, zero, zero, zero, zero
@@ -451,7 +503,14 @@ class SoftOctreeRateProxy(nn.Module):
         single = hard_single + (soft_single - soft_single.detach())
         return bits, node, single, hard_bits.detach(), hard_node.detach(), hard_single.detach(), soft_bits, soft_node, soft_single
 
-    def _prepare_single_hard_octattention_eval(self, pts_xyz: torch.Tensor, point_w: torch.Tensor, qs_value: Optional[float] = None):
+    def _prepare_single_hard_octattention_eval(
+        self,
+        pts_xyz: torch.Tensor,
+        point_w: torch.Tensor,
+        qs_value: Optional[float] = None,
+        offset_np=None,
+        max_level_override: Optional[int] = None,
+    ):
         finite_pts = torch.isfinite(pts_xyz).all(dim=0)
         finite_w = torch.isfinite(point_w)
         valid = finite_pts & finite_w & (point_w.detach() > 0.0)
@@ -464,6 +523,8 @@ class SoftOctreeRateProxy(nn.Module):
             safe_pts,
             valid,
             qs_value=qs_value,
+            offset_np=offset_np,
+            max_level_override=max_level_override,
         )
         if max_level < 1:
             return None
@@ -670,6 +731,65 @@ class SoftOctreeRateProxy(nn.Module):
         return torch.full((B,), max(float(qs_override), float(self.cfg.eps)), device=device, dtype=dtype)
 
     @staticmethod
+    def _batch_tree_items(value, B: int):
+        if value is None:
+            return [None for _ in range(B)]
+        if isinstance(value, (list, tuple)):
+            items = list(value)
+            if len(items) == B:
+                return items
+            if len(items) == 1:
+                return items * B
+            return (items + [None for _ in range(B)])[:B]
+        return [value if b == 0 else None for b in range(B)]
+
+    @staticmethod
+    def _tree_value(tree, key, default=None):
+        if not isinstance(tree, dict):
+            return default
+        return tree.get(key, default)
+
+    def _prebuilt_anchor(self, subtree_tree, full_octree_context, device, dtype):
+        source = subtree_tree if isinstance(subtree_tree, dict) else full_octree_context
+        if not isinstance(source, dict):
+            return {}
+        offset = self._tree_value(source, "global_offset", None)
+        qs_value = self._tree_value(source, "global_qs", None)
+        global_depth = self._tree_value(source, "global_depth", None)
+        anchor = {}
+        if offset is not None:
+            offset_t = torch.as_tensor(offset, device=device, dtype=dtype).reshape(-1)
+            if offset_t.numel() >= 3:
+                anchor["offset_np"] = offset_t[:3].detach().cpu().numpy().astype(np.float64, copy=False)
+        if qs_value is not None:
+            anchor["qs_value"] = max(float(qs_value), float(self.cfg.eps))
+        if global_depth is not None:
+            anchor["global_depth"] = max(int(global_depth), 1)
+        return anchor
+
+    def _batch_prebuilt_node_count(self, tree_items, like_tensor):
+        vals = []
+        for tree in tree_items:
+            codes = self._tree_value(tree, "occupancy_codes", None)
+            vals.append(float(torch.as_tensor(codes).numel()) if codes is not None else 0.0)
+        return like_tensor.new_tensor(sum(vals) / max(len(vals), 1))
+
+    def _batch_prebuilt_single_child_count(self, tree_items, like_tensor):
+        vals = []
+        for tree in tree_items:
+            codes = self._tree_value(tree, "occupancy_codes", None)
+            if codes is None:
+                vals.append(0.0)
+                continue
+            code_t = torch.as_tensor(codes, dtype=torch.long).reshape(-1)
+            if code_t.numel() <= 0:
+                vals.append(0.0)
+                continue
+            bits = ((code_t.unsqueeze(1) >> torch.arange(8, dtype=torch.long).unsqueeze(0)) & 1).sum(dim=1)
+            vals.append(float((bits == 1).sum().item()))
+        return like_tensor.new_tensor(sum(vals) / max(len(vals), 1))
+
+    @staticmethod
     def _child_octant_ids(coords: np.ndarray) -> np.ndarray:
         bits = coords & 1
         return bits[:, 0] * 4 + bits[:, 1] * 2 + bits[:, 2]
@@ -685,7 +805,7 @@ class SoftOctreeRateProxy(nn.Module):
         return groups
 
     @staticmethod
-    def _build_octattention_sequence_from_qpts(qpts: np.ndarray):
+    def _build_octattention_sequence_from_qpts(qpts: np.ndarray, max_level_override: Optional[int] = None):
         if qpts.ndim != 2 or qpts.shape[1] != 3:
             raise ValueError(f"qpts must have shape [N, 3], got {qpts.shape}")
         if qpts.shape[0] < 2:
@@ -695,6 +815,8 @@ class SoftOctreeRateProxy(nn.Module):
         max_coord = int(qpts.max())
         max_level = int(math.ceil(math.log2(max(max_coord + 1, 1))))
         max_level = max(max_level, 1)
+        if max_level_override is not None:
+            max_level = max(int(max_level_override), 1)
 
         node_codes = []
         node_levels = []
@@ -776,6 +898,8 @@ class SoftOctreeRateProxy(nn.Module):
         pts_xyz: torch.Tensor,
         valid_mask: Optional[torch.Tensor] = None,
         qs_value: Optional[float] = None,
+        offset_np=None,
+        max_level_override: Optional[int] = None,
     ):
         if valid_mask is not None:
             if valid_mask.ndim != 1 or valid_mask.shape[0] != pts_xyz.shape[1]:
@@ -787,7 +911,7 @@ class SoftOctreeRateProxy(nn.Module):
         else:
             pts_np = pts_xyz.detach().transpose(0, 1).contiguous().cpu().numpy().astype(np.float64, copy=False)
 
-        offset_np = pts_np.min(axis=0)
+        offset_np = pts_np.min(axis=0) if offset_np is None else np.asarray(offset_np, dtype=np.float64).reshape(3)
         qs = max(float(self.cfg.eps), float(self.cfg.qs) if qs_value is None else float(qs_value))
         qpts = np.round((pts_np - offset_np[None, :]) / qs).astype(np.int64)
         qpts = np.unique(qpts, axis=0)
@@ -795,7 +919,16 @@ class SoftOctreeRateProxy(nn.Module):
             empty_seq = np.zeros((0, 1, 6), dtype=np.int64)
             return empty_seq, offset_np, 0
 
-        oct_seq_np, max_level = self._build_octattention_sequence_from_qpts(qpts)
+        if max_level_override is not None:
+            max_level_override = max(int(max_level_override), 1)
+            grid = 1 << max_level_override
+            qpts = np.clip(qpts, 0, grid - 1)
+            qpts = np.unique(qpts, axis=0)
+
+        oct_seq_np, max_level = self._build_octattention_sequence_from_qpts(
+            qpts,
+            max_level_override=max_level_override,
+        )
         if self.cfg.max_depth > 0 and max_level > self.cfg.max_depth:
             keep = oct_seq_np[:, -1, 1] <= self.cfg.max_depth
             oct_seq_np = oct_seq_np[keep]

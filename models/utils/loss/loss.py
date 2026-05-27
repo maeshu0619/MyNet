@@ -152,7 +152,7 @@ class Loss(
             return torch.cuda.amp.autocast(enabled=False)
         return nullcontext()
 
-    def warmup_gt_cache(self, gt_xyz, cache_key=None): # GT点群の圧縮Proxy結果を事前に計算してキャッシュする
+    def warmup_gt_cache(self, gt_xyz, cache_key=None, subtree_tree=None, full_octree_context=None, octree_input_mode="auto"): # GT点群の圧縮Proxy結果を事前に計算してキャッシュする
         if not self.gt_cache_enabled or not cache_key:
             return
         device = gt_xyz.device
@@ -163,6 +163,9 @@ class Loss(
         with self._compression_autocast_ctx(device):
             out_gt, bit_gt, stats_gt = self.rate_proxy.forward_hard_only(
                 gen_xyz=gt_xyz.to(torch.float32),
+                subtree_tree=subtree_tree,
+                full_octree_context=full_octree_context,
+                octree_input_mode=octree_input_mode,
             )
         cache_entry = {
             "rate_gt": self._scalar(out_gt["rate_total"]),
@@ -175,7 +178,7 @@ class Loss(
         self._store_cached_gt(cache_key, cache_entry)
 
     """全体損失の計算"""
-    def get_loss(self, args, gen_pts, gt_pts, final_w, out_label, cache_key=None): # GT/Mine点群から、幾何/圧縮損失を計算する
+    def get_loss(self, args, gen_pts, gt_pts, final_w, out_label, cache_key=None, subtree_tree=None, full_octree_context=None, octree_input_mode="auto"): # GT/Mine点群から、幾何/圧縮損失を計算する
         gt_xyz = gt_pts[:, :3, :]
         gen_xyz = gen_pts[:, :3, :]
         L_com, loss_bit, loss_single, loss_nodes, cached_gt, stats_gt = self.get_compression_loss( # 圧縮損失計算
@@ -184,6 +187,9 @@ class Loss(
             gt_xyz=gt_xyz,
             final_w=final_w,
             cache_key=cache_key,
+            subtree_tree=subtree_tree,
+            full_octree_context=full_octree_context,
+            octree_input_mode=octree_input_mode,
         )
         L_geom = self.get_geometry_loss( # 幾何圧縮計算
             args,

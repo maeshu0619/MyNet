@@ -543,6 +543,15 @@ class _SparsePCGCActualEncoder:
         if not ok:
             raise RuntimeError(f"Failed to write SparsePCGC teacher PLY: {path}")
 
+    def _exact_occupancy_enabled_this_step(self):
+        if not bool(getattr(self.args, "enable_sparsepcgc_exact_occupancy_teacher", False)):
+            return False
+        interval = int(getattr(self.args, "sparsepcgc_exact_occupancy_interval", 1))
+        if interval <= 0:
+            return False
+        step = int(getattr(self.args, "_global_train_step", 0)) + 1
+        return interval <= 1 or (step % interval) == 0
+
     def encode_bits(self, pts_3n):
         self._lazy_init()
         encode_t0 = time.time()
@@ -553,10 +562,32 @@ class _SparsePCGCActualEncoder:
             self._write_ply(ply_path, pts_3n)
 
             self._request_id += 1
+            exact_occupancy = bool(self._exact_occupancy_enabled_this_step())
+            exact_teacher_mode = str(
+                getattr(
+                    self.args,
+                    "_current_exact_teacher_mode",
+                    getattr(self.args, "sparsepcgc_exact_teacher_mode", "auto"),
+                )
+            )
             request = {
                 "request_id": self._request_id,
                 "input_file": ply_path,
                 "output_dir": output_dir,
+                "occupancy_debug": bool(
+                    getattr(self.args, "enable_sparsepcgc_occupancy_debug", False) or exact_occupancy
+                ),
+                "occupancy_low_prob_threshold": float(
+                    getattr(self.args, "sparsepcgc_occupancy_low_prob_threshold", 0.1)
+                ),
+                "exact_occupancy": bool(exact_occupancy),
+                "exact_teacher_mode": exact_teacher_mode,
+                "exact_teacher_uses_full_context": bool(
+                    getattr(self.args, "_current_exact_teacher_uses_full_context", False)
+                ),
+                "exact_teacher_fallback_reason": str(
+                    getattr(self.args, "_current_exact_teacher_fallback_reason", "")
+                ),
             }
             self._proc.stdin.write(json.dumps(request, sort_keys=True) + "\n")
             self._proc.stdin.flush()
@@ -574,7 +605,7 @@ class _SparsePCGCActualEncoder:
             point_count = int(result.get("point_count", result.get("num_points_raw", pts_3n.shape[-1])))
             node = float(result.get("node_count", result.get("node", 0.0)))
             single = float(result.get("single_child_count", result.get("single", 0.0)))
-            return {
+            stats = {
                 "bit": bit,
                 "bpp": bit / max(float(point_count), 1.0),
                 "bpn": bit / max(float(node), 1.0),
@@ -585,6 +616,11 @@ class _SparsePCGCActualEncoder:
                 "mode": str(getattr(self.args, "sparsepcgc_mode", "dense_lossless")),
                 "encode_time": float(time.time() - encode_t0),
             }
+            for key, value in result.items():
+                key_text = str(key)
+                if key_text.startswith("sparsepcgc_") or key_text.startswith("exact_"):
+                    stats[str(key)] = value
+            return stats
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
