@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from contextlib import nullcontext
-
+from ..utils.pointcloud.utils_repkpu import get_knn_pts
 from ..utils.compression.proxy_octree import ProxyOctreeConfig, SoftOctreeRateProxy
 
 
@@ -120,17 +120,27 @@ class OctreeStructureAnalysis(nn.Module):
         autocast_ctx = torch.cuda.amp.autocast(enabled=False) if pts_xyz.is_cuda else nullcontext()
         with autocast_ctx:
             pts_work = pts_xyz.to(torch.float32)
-            pts = pts_work.transpose(1, 2).contiguous()
-            dist = torch.cdist(pts, pts)
             k = min(self.k_geo + 1, N)
             if k <= 1:
                 return pts_xyz.new_zeros((B, 3, N))
-            knn_idx = torch.topk(dist, k=k, largest=False, dim=-1).indices[:, :, 1:]
-            gather_idx = knn_idx.unsqueeze(-1).expand(-1, -1, -1, 3)
-            pts_expand = pts.unsqueeze(1).expand(B, N, N, 3)
-            knn = torch.gather(pts_expand, 2, gather_idx)
-            center = pts.unsqueeze(2)
-            diff = knn - center
+
+            # get_knn_pts は pointops CUDA が使える場合はCUDA KNNを使う
+            knn_all = get_knn_pts(
+                k,
+                pts_work,
+                pts_work,
+                return_idx=False,
+            )  # [B, 3, N, k]
+
+            # 先頭は自分自身である想定なので除外
+            if knn_all.shape[-1] > 1:
+                knn_all = knn_all[..., 1:]
+            else:
+                return pts_xyz.new_zeros((B, 3, N))
+
+            center = pts_work.unsqueeze(-1)  # [B, 3, N, 1]
+            diff_ch = knn_all - center       # [B, 3, N, k-1]
+            diff = diff_ch.permute(0, 2, 3, 1).contiguous()  # [B, N, k-1, 3]
             mean_dist = torch.linalg.norm(diff, dim=-1).mean(dim=-1, keepdim=True).transpose(1, 2)
             density = self._normalize_pointwise(1.0 / mean_dist.clamp_min(1e-6)).clamp(0.0, 4.0) / 4.0
             cov = torch.matmul(diff.transpose(-1, -2), diff) / max(float(k - 1), 1.0)

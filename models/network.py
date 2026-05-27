@@ -3,7 +3,8 @@ import torch.nn as nn
 import time
 
 from .encoder.point_trans import PointTransformer
-from .utils.pointcloud.utils_repkpu import KNN_BACKEND, get_knn_pts, index_points
+from .utils.pointcloud import utils_repkpu
+from .utils.pointcloud.utils_repkpu import get_knn_pts, index_points
 from .utils.pointcloud.octree_subtree import assign_octree_subtree_keys, subtree_membership_mask
 from .utils.pointcloud.sparse_tensor import build_sparse_point_tensor_single
 from .modules.cause_aggregation import CauseDiagnosisAggregation
@@ -157,7 +158,7 @@ class Network(nn.Module):
         num_points = int(pts_xyz.shape[-1]) # 点数取得
         max_points = max(int(getattr(self.args, "encoder_pre_downsample_max_points", 0)), 0) # Encoderに入力数最大点数
         cdist_cap = max(int(getattr(self.args, "encoder_cdist_max_points", 0)), 0) # 距離計算を使う場合の最大点数制限を取得
-        if KNN_BACKEND != "pointops_cuda" and cdist_cap > 0:
+        if utils_repkpu.KNN_BACKEND != "pointops_cuda" and cdist_cap > 0:
             max_points = min(max_points, cdist_cap) if max_points > 0 else cdist_cap
         if max_points <= 0 or num_points <= max_points:
             full_idx = torch.arange(num_points, device=pts_xyz.device, dtype=torch.long)
@@ -274,7 +275,7 @@ class Network(nn.Module):
             sparse_qs, sparse_quant_mode, sparse_pos_q = self._encoder_sparse_qs_mode_and_pos()
             encoder_max_points = int(getattr(self.args, "encoder_pre_downsample_max_points", 0))
             cdist_cap = max(int(getattr(self.args, "encoder_cdist_max_points", 0)), 0)
-            if KNN_BACKEND != "pointops_cuda" and cdist_cap > 0:
+            if utils_repkpu.KNN_BACKEND != "pointops_cuda" and cdist_cap > 0:
                 encoder_max_points = min(encoder_max_points, cdist_cap) if encoder_max_points > 0 else cdist_cap
             for b in range(pts_xyz.shape[0]):
                 sparse_tensor = build_sparse_point_tensor_single(

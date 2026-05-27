@@ -1,71 +1,35 @@
 import torch
-
+from models.utils.pointcloud.utils_repkpu import get_knn_pts
 
 def three_nn(xyz1: torch.Tensor, xyz2: torch.Tensor):
-    """
-    xyz1 : [B, 3, M]  unknown points
-    xyz2 : [B, 3, N]  known points
-
-    return:
-        dist : [B, M, 3]
-        idx  : [B, M, 3]
-    """
-
-    # [B, M, 3] -> [B, M, 1, 3]
-    xyz1_expand = xyz1.transpose(1, 2).unsqueeze(2)
-    # [B, N, 3] -> [B, 1, N, 3]
-    xyz2_expand = xyz2.transpose(1, 2).unsqueeze(1)
-
-    # pairwise squared distance: [B, M, N]
-    dist2 = torch.sum((xyz1_expand - xyz2_expand) ** 2, dim=-1)
-
-    # top-3 nearest neighbors
-    dist2, idx = torch.topk(dist2, k=3, dim=-1, largest=False, sorted=False)
-
-    # sqrt to match original TF behavior
-    dist = torch.sqrt(dist2)
-
-    return dist, idx
+    return three_nn_fp(xyz1, xyz2)
 
 # utils_pointnet.py の three_nn を書き換える
 
 def three_nn_fp(xyz1, xyz2):
     """
-    xyz1: [B, 3, M]  (query)
-    xyz2: [B, 3, N]  (source)
+    xyz1: [B, 3, M]  query
+    xyz2: [B, 3, N]  source
+    return:
+        dist: [B, M, 3]
+        idx : [B, M, 3]
     """
+    knn_pts, idx = get_knn_pts(
+        3,
+        xyz2,
+        xyz1,
+        return_idx=True,
+    )  # knn_pts: [B, 3, M, 3], idx: [B, M, 3]
 
-    B, _, M = xyz1.shape
-    _, _, N = xyz2.shape
-
-    xyz1 = xyz1.transpose(1, 2)  # [B, M, 3]
-    xyz2 = xyz2.transpose(1, 2)  # [B, N, 3]
-
-    # 距離行列計算（展開しない）
-    dist = torch.cdist(xyz1, xyz2, p=2)  # [B, M, N]
-
-    # 上位3近傍取得
-    dist, idx = torch.topk(dist, 3, dim=-1, largest=False, sorted=False)
+    dist = torch.linalg.norm(
+        xyz1.unsqueeze(-1) - knn_pts,
+        dim=1,
+    )  # [B, M, 3]
 
     return dist, idx
 
 def three_nn_chunked(xyz1, xyz2, chunk=2048):
-
-    B, _, M = xyz1.shape
-    xyz1 = xyz1.transpose(1, 2)
-    xyz2 = xyz2.transpose(1, 2)
-
-    dists = []
-    idxs = []
-
-    for i in range(0, M, chunk):
-        xyz1_part = xyz1[:, i:i+chunk, :]
-        dist_part = torch.cdist(xyz1_part, xyz2)
-        dist_k, idx_k = torch.topk(dist_part, 3, dim=-1, largest=False)
-        dists.append(dist_k)
-        idxs.append(idx_k)
-
-    return torch.cat(dists, 1), torch.cat(idxs, 1)
+    return three_nn_fp(xyz1, xyz2)
 
 def three_interpolate(points: torch.Tensor,
                       idx: torch.Tensor,

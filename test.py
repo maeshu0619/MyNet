@@ -21,6 +21,8 @@ from models.utils.pointcloud.voxel_collision import (
     format_voxel_collision_summary,
 )
 from models.utils.pointcloud.utils_repkpu import rearrange
+from models.utils.pointcloud.utils_repkpu import configure_knn_backend
+import models.network as network_module
 from models.utils.testing.utils import (
     _adapt_encoder_state_dict_for_sparse_input,
     _adapt_model_state_dict_for_sparse_input,
@@ -651,6 +653,8 @@ if __name__ == "__main__":
         sync_every=args.log_sync_every,
         log_root=args.log_root,
     )
+    runtime_knn_backend = configure_knn_backend(args, writer=writer)
+    network_module.KNN_BACKEND = runtime_knn_backend
     writer.write(f"Date of Testing: {file_day}-{file_time}")
     writer.write(f"Checkpoint Path: {args.ckpt}")
     writer.write(f"Profile CSV: {args.output_log}")

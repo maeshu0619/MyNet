@@ -256,6 +256,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--encoder_raw_downsample_factor', default=10.0, type=float, help='Sparse Tensor化後にEncoderへ入れるため何倍ダウンサンプリングするか（10なら点数を約1/10にする）')
     parser.add_argument('--encoder_pre_downsample_max_points', default=8192, type=int, help='Encoderへ入れる最大点数')
     parser.add_argument('--encoder_cdist_max_points', default=4096, type=int, help='pointops CUDAが使えずtorch.cdist KNNへ落ちた時のEncoder最大点数（0なら無効）')
+    parser.add_argument('--allow_slow_knn_fallback', default=False, type=str2bool, help='pointops CUDAが使えない時に低速なtorch.cdist fallbackで継続するか')
     parser.add_argument('--encoder_pre_downsample_voxel_scale', default=1.0, type=float, help='qs由来のvoxelサイズの倍率')
     parser.add_argument('--encoder_pre_downsample_growth', default=1.5, type=float, help='voxel数が多すぎるときにvoxelサイズを拡大する倍率')
     parser.add_argument('--encoder_pre_downsample_max_iters', default=8, type=int, help='voxelサイズ調整の最大反復回数')
@@ -668,6 +669,8 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--compression_good_step_prefreeze_scale', default=1.15, type=float, help='Surrogate freeze前でも十分fitした実bit改善stepだけに使う控えめな勾配倍率')
     parser.add_argument('--compression_good_step_prefreeze_max_train_loss', default=4.0, type=float, help='prefreeze改善step倍率を許可するSurrogate train loss上限')
     parser.add_argument('--compression_good_step_extra_surrogate_steps', default=4, type=int, help='実bit改善stepをSurrogateへ追加fitするstep数')
+    parser.add_argument('--loss_grad_probe_enabled', default=False, type=str2bool, help='損失項ごとのmodule/操作別勾配CSVを出力するか')
+    parser.add_argument('--loss_grad_probe_interval', default=1, type=int, help='損失項ごとの勾配CSVを何stepごとに出すか')
     parser.add_argument('--compression_bad_step_penalty_scale', default=1.25, type=float, help='実bit悪化stepの主圧縮勾配倍率')
     parser.add_argument('--compression_boost_requires_surrogate_frozen', default=True, type=str2bool, help='good/bad勾配倍率をSurrogate frozen後だけ有効にする')
     parser.add_argument('--compression_boost_max_abs_error', default=1.0, type=float, help='good/bad勾配倍率を許可するSurrogate abs error上限')
@@ -1341,6 +1344,8 @@ def parse_pugan_args(parser, file_day, file_time):
         float(getattr(args, "surrogate_pretrain_max_wall_time_sec", 0.0)),
         0.0,
     )
+    args.loss_grad_probe_enabled = bool(getattr(args, "loss_grad_probe_enabled", False))
+    args.loss_grad_probe_interval = max(int(getattr(args, "loss_grad_probe_interval", 1)), 0)
     args.surrogate_update_during_training = bool(getattr(args, "surrogate_update_during_training", True))
     args.surrogate_update_interval = max(int(getattr(args, "surrogate_update_interval", 1)), 1)
     args.surrogate_joint_lr_scale = max(float(getattr(args, "surrogate_joint_lr_scale", 0.1)), 0.0)
@@ -1781,6 +1786,7 @@ def parse_pugan_args(parser, file_day, file_time):
             f"(got {args.encoder_feature_propagation})"
         )
     args.encoder_feature_propagation_k = max(int(args.encoder_feature_propagation_k), 1)
+    args.allow_slow_knn_fallback = bool(getattr(args, "allow_slow_knn_fallback", False))
 
     args.patch_parallel_mode = str(args.patch_parallel_mode).strip().lower()
     if args.patch_parallel_mode not in {"auto", "fixed", "all"}:

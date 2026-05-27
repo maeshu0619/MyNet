@@ -4,12 +4,17 @@ import logging
 import os
 import sys
 import importlib.util
+import traceback
 try:
     from einops import rearrange
 except ModuleNotFoundError:
     from models.utils.misc.einops_compat import rearrange
 pointops = None
 KNN_BACKEND = "chunked_torch_cdist"
+POINTOPS_AVAILABLE = False
+POINTOPS_IMPORT_ERROR = ""
+POINTOPS_IMPORT_TRACEBACK = ""
+_ALLOW_SLOW_KNN_FALLBACK = True
 _POINTOPS_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "pointops"))
 _POINTOPS_SRC = os.path.join(_POINTOPS_ROOT, "src")
 _POINTOPS_LEGACY_SRC = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../..", "pointops", "src"))
@@ -18,28 +23,30 @@ for _path in (_POINTOPS_SRC, _POINTOPS_LEGACY_SRC):
         sys.path.append(_path)
 _use_pointops = os.environ.get("MYNET_USE_POINTOPS_CUDA", "auto").strip().lower()
 _allow_pointops_build = os.environ.get("MYNET_POINTOPS_ALLOW_BUILD", "0").strip().lower() in {"1", "true", "yes"}
-if _use_pointops in {"1", "true", "yes", "auto"} and importlib.util.find_spec("pointops_cuda") is not None:
+if _use_pointops in {"1", "true", "yes", "auto"}:
     try:
-        import pointops_cuda  # noqa: F401
-        from models.pointops.functions import pointops
+        # pointops.py 側で pointops_cuda が無ければ JIT build が走る
+        from models.pointops.functions import pointops as _pointops_module
+
+        pointops = _pointops_module
         KNN_BACKEND = "pointops_cuda"
+        POINTOPS_AVAILABLE = True
+        POINTOPS_IMPORT_ERROR = ""
+        POINTOPS_IMPORT_TRACEBACK = ""
     except Exception as exc:
-        if _allow_pointops_build:
-            try:
-                from models.pointops.functions import pointops
-                KNN_BACKEND = "pointops_cuda"
-            except Exception as build_exc:
-                pointops = None
-                KNN_BACKEND = "chunked_torch_cdist"
-                logging.warning("pointops CUDA extension unavailable; falling back to torch implementations: %s", build_exc)
-        else:
-            pointops = None
-            KNN_BACKEND = "chunked_torch_cdist"
-            logging.warning(
-                "pointops CUDA extension was found but could not be loaded; falling back to torch cdist. "
-                "Set MYNET_POINTOPS_ALLOW_BUILD=1 to allow an import-time rebuild. Error: %s",
-                exc,
-            )
+        pointops = None
+        KNN_BACKEND = "chunked_torch_cdist"
+        POINTOPS_AVAILABLE = False
+        POINTOPS_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
+        POINTOPS_IMPORT_TRACEBACK = traceback.format_exc()
+        logging.warning(
+            "pointops CUDA extension could not be loaded; falling back to torch cdist. "
+            "Traceback:\n%s",
+            POINTOPS_IMPORT_TRACEBACK,
+        )
+else:
+    POINTOPS_IMPORT_ERROR = "pointops disabled by MYNET_USE_POINTOPS_CUDA"
+    POINTOPS_IMPORT_TRACEBACK = POINTOPS_IMPORT_ERROR
 import numpy as np
 import random
 try:
@@ -62,6 +69,61 @@ try:
 except Exception as exc:
     chamfer_dist = None
     logging.warning("Chamfer3D extension unavailable in utils_repkpu: %s", exc)
+
+
+def pointops_diagnostics():
+    return {
+        "pointops_available": bool(POINTOPS_AVAILABLE),
+        "knn_backend": str(KNN_BACKEND),
+        "pointops_import_error": str(POINTOPS_IMPORT_ERROR),
+        "pointops_import_traceback": str(POINTOPS_IMPORT_TRACEBACK),
+        "python_executable": sys.executable,
+        "torch_version": str(torch.__version__),
+        "torch_cuda_version": str(torch.version.cuda),
+        "torch_cuda_available": bool(torch.cuda.is_available()),
+    }
+
+
+def configure_knn_backend(args=None, writer=None):
+    global _ALLOW_SLOW_KNN_FALLBACK
+    allow_slow = bool(getattr(args, "allow_slow_knn_fallback", True)) if args is not None else True
+    _ALLOW_SLOW_KNN_FALLBACK = bool(allow_slow)
+    if args is not None:
+        setattr(args, "pointops_available", bool(POINTOPS_AVAILABLE))
+        setattr(args, "knn_backend", str(KNN_BACKEND))
+        setattr(args, "pointops_import_error", str(POINTOPS_IMPORT_ERROR))
+    diag = pointops_diagnostics()
+    msg = (
+        "KNNBackend: "
+        f"pointops_available={diag['pointops_available']}, "
+        f"knn_backend={diag['knn_backend']}, "
+        f"allow_slow_knn_fallback={bool(allow_slow)}, "
+        f"torch={diag['torch_version']}, torch_cuda={diag['torch_cuda_version']}, "
+        f"cuda_available={diag['torch_cuda_available']}"
+    )
+    if writer is not None and hasattr(writer, "write"):
+        writer.write(msg)
+        if not bool(POINTOPS_AVAILABLE):
+            writer.write("PointopsImportError: " + str(POINTOPS_IMPORT_ERROR))
+            writer.write("PointopsImportTraceback:\n" + str(POINTOPS_IMPORT_TRACEBACK))
+    else:
+        logging.warning(msg)
+    if not bool(POINTOPS_AVAILABLE) and not bool(allow_slow):
+        raise RuntimeError(
+            "pointops CUDA extension is unavailable and --allow_slow_knn_fallback=False. "
+            "Fix/rebuild pointops_cuda instead of silently using chunked_torch_cdist. "
+            f"Import error: {POINTOPS_IMPORT_ERROR}"
+        )
+    return str(KNN_BACKEND)
+
+
+def _raise_if_slow_knn_fallback(op_name):
+    if pointops is None and not bool(_ALLOW_SLOW_KNN_FALLBACK):
+        raise RuntimeError(
+            f"{op_name} would use slow chunked_torch_cdist fallback while "
+            "--allow_slow_knn_fallback=False. pointops_cuda import error: "
+            f"{POINTOPS_IMPORT_ERROR}"
+        )
 
 def print_gpu_mem(tag):
     allocated = torch.cuda.memory_allocated() / 1024**2
@@ -169,6 +231,7 @@ def FPS(pts, fps_pts_num):
     if pointops is not None and pts_trans.is_cuda:
         sample_idx = pointops.furthestsampling(pts_trans, fps_pts_num).long()
     else:
+        _raise_if_slow_knn_fallback("FPS")
         B, N, _ = pts_trans.shape
         sample_idx = torch.zeros((B, fps_pts_num), device=pts.device, dtype=torch.long)
         dist = pts_trans.new_full((B, N), float("inf"))
@@ -204,6 +267,7 @@ def get_knn_pts(k, pts, center_pts, return_idx=False):
         with torch.no_grad():
             knn_idx = pointops.knnquery_heap(k_eff, pts_trans, center_pts_trans).long()
     else:
+        _raise_if_slow_knn_fallback("get_knn_pts")
         # Avoid materializing [B, M, N] for full clouds.  The chunk size is
         # chosen by an element budget, so memory is bounded even when N is large.
         max_elems = int(os.environ.get("MYNET_KNN_MAX_ELEMS", 16 * 1024 * 1024))

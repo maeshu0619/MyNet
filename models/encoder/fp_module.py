@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
-from ..utils.pointcloud.utils_pointnet import three_nn_fp, three_nn_chunked, three_interpolate
+from ..utils.pointcloud.utils_pointnet import three_interpolate
+from ..utils.pointcloud.utils_repkpu import get_knn_pts
 
 
 class FeaturePropagationExtended(nn.Module):
@@ -71,29 +72,20 @@ class FeaturePropagationExtended(nn.Module):
         # -------------------------------------------------
         # 2. parentと全点の距離（ここは M×N だが Mは追加点のみ）
         # -------------------------------------------------
-        dist_parent = torch.cdist(
-            parent_pts.transpose(1,2),   # [B,M,3]
-            pts_xyz.transpose(1,2)       # [B,N,3]
-        )  # [B,M,N]
-
-        _, neighbor_idx = torch.topk(
-            dist_parent,
+        # parent_pts をquery、pts_xyzを参照点としてkNNを取る
+        neighbor_pts_ch, neighbor_idx = get_knn_pts(
             k,
-            dim=-1,
-            largest=False,
-            sorted=False
-        )  # [B,M,k]
+            pts_xyz,
+            parent_pts,
+            return_idx=True,
+        )
 
         # -------------------------------------------------
         # 3. そのk点の座標取得
         # -------------------------------------------------
-        pts_xyz_t = pts_xyz.transpose(1,2)  # [B,N,3]
 
-        neighbor_pts = torch.gather(
-            pts_xyz_t,
-            1,
-            neighbor_idx.unsqueeze(-1).expand(-1, -1, -1, 3)
-        )  # [B,M,k,3]
+        # get_knn_ptsの出力は [B, 3, M, k] なので [B, M, k, 3] へ変換
+        neighbor_pts = neighbor_pts_ch.permute(0, 2, 3, 1).contiguous()
 
         # -------------------------------------------------
         # 4. new pointとの距離計算

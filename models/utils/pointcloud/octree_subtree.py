@@ -1,5 +1,6 @@
 import math
 import hashlib
+import time
 from typing import Dict, Optional
 
 import torch
@@ -625,6 +626,16 @@ def _build_group_octree_metadata(pts_xyz, subtree_ref, all_groups):
         }
     return subtree_trees, full_octree_contexts, group_meta
 
+def build_selected_group_octree_metadata(pts_xyz, subtree_ref, selected_groups):
+    """
+    選択済みSubtreeだけに対して subtree_tree / full_octree_context / group_meta を作る。
+    all_groups全体ではなく、train.pyで確定した selected_groups だけを渡すこと。
+    """
+    return _build_group_octree_metadata(
+        pts_xyz,
+        subtree_ref,
+        selected_groups,
+    )
 
 def build_octree_subtree_groups_with_retry(
     pts_xyz: torch.Tensor,
@@ -654,11 +665,6 @@ def build_octree_subtree_groups_with_retry(
         ]
 
         if all_groups:
-            subtree_trees, full_octree_contexts, group_meta = _build_group_octree_metadata(
-                pts_xyz,
-                subtree_ref,
-                all_groups,
-            )
             largest_group = max(all_groups, key=lambda item: int(item[1].numel()))
             fallback_points = int(fallback["groups"][0][1].numel()) if fallback is not None else -1
             if fallback is None or int(largest_group[1].numel()) > fallback_points:
@@ -675,17 +681,15 @@ def build_octree_subtree_groups_with_retry(
                     "requested_depth": int(requested_depth),
                     "selection_reason": "min_points_miss_fallback_largest",
                     "total_subtree_count": int(unique_keys.numel()),
-                    "subtree_trees": subtree_trees,
-                    "full_octree_contexts": full_octree_contexts,
-                    "group_meta": group_meta,
+
+                    # metadataはここでは作らない
+                    # 実際に選ばれたSubtreeだけtrain.py側で作る
+                    "subtree_trees": {},
+                    "full_octree_contexts": {},
+                    "group_meta": {},
                 }
 
         if eligible_groups:
-            subtree_trees, full_octree_contexts, group_meta = _build_group_octree_metadata(
-                pts_xyz,
-                subtree_ref,
-                all_groups,
-            )
             return {
                 "subtree_ref": subtree_ref,
                 "unique_keys": unique_keys,
@@ -699,9 +703,12 @@ def build_octree_subtree_groups_with_retry(
                 "requested_depth": int(requested_depth),
                 "selection_reason": "depth_retry" if int(depth) != int(requested_depth) else "none",
                 "total_subtree_count": int(unique_keys.numel()),
-                "subtree_trees": subtree_trees,
-                "full_octree_contexts": full_octree_contexts,
-                "group_meta": group_meta,
+
+                # metadataはここでは作らない
+                # 実際に選ばれたSubtreeだけtrain.py側で作る
+                "subtree_trees": {},
+                "full_octree_contexts": {},
+                "group_meta": {},
             }
         retry_count += 1
 

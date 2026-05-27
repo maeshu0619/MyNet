@@ -22,6 +22,7 @@ import datetime
 from contextlib import nullcontext
 
 from models.network import Network
+import models.network as network_module
 from models.utils.loss.loss import Loss
 from models.utils.notify.mail_notify import TrainingMailNotifier
 from record.write import Writing
@@ -67,6 +68,306 @@ from models.utils.training.train_flow import * # train loopのStage固定、Subt
 from models.utils.training.loss_grad_probe import build_loss_grad_probe_rows, summarize_loss_grad_probe_rows
 
 from models.utils.surrogate.pretrain import *
+
+STEP_GRAD_COLUMNS = [
+    "global_step",
+    "episode",
+    "epoch",
+    "step",
+    "stage",
+    "loss_name",
+    "loss_value",
+    "target_group",
+    "matched_param_count",
+    "used_param_count",
+    "none_grad_param_count",
+    "grad_element_count",
+    "grad_l2",
+    "grad_abs_mean",
+    "grad_abs_max",
+    "grad_signed_mean",
+    "param_name_sample",
+]
+
+
+def _unwrap_train_model(model):
+    # DataParallelで包まれている場合は中身のモデルを取り出す
+    return model.module if hasattr(model, "module") else model
+
+
+def _safe_scalar_for_grad_log(value):
+    # CSV保存用にTensor/数値をfloatへ変換する
+    if value is None:
+        return None
+    if not torch.is_tensor(value):
+        try:
+            return float(value)
+        except Exception:
+            return None
+    try:
+        if value.numel() == 0:
+            return None
+        return float(value.detach().float().mean().cpu())
+    except Exception:
+        return None
+
+
+def _step_grad_group_specs():
+    # 名前に基づいて、モジュール別・点操作別の勾配集計対象を定義する
+    # actuator_all と add/prune/adjust は重複してよい
+    # つまり「actuator全体」と「各点操作head」の両方を見る
+    return [
+        ("all_trainable", []),
+
+        ("encoder", ["encoder."]),
+        ("structure_analyzer", ["structure_analyzer."]),
+        ("cost_attributor", ["cost_attributor."]),
+        ("cause_aggregator", ["cause_aggregator."]),
+        ("policy_module", ["policy_module."]),
+        ("actuator_all", ["actuator."]),
+
+        # 追加系
+        ("op_add", [
+            "actuator.add",
+            ".add_",
+            "add_",
+            "adding",
+            "insert",
+        ]),
+
+        # 削除系
+        ("op_prune_delete_drop", [
+            "actuator.prune",
+            "actuator.delete",
+            "actuator.drop",
+            ".prune_",
+            ".delete_",
+            ".drop_",
+            "prun",
+            "keep",
+        ]),
+
+        # 調整・移動系
+        ("op_adjust_move", [
+            "actuator.adjust",
+            "actuator.move",
+            "actuator.disp",
+            "actuator.delta",
+            ".adjust_",
+            ".move_",
+            ".disp_",
+            ".delta_",
+        ]),
+    ]
+
+
+def _match_param_names(named_params, keywords):
+    # keywordsが空なら全学習可能パラメータを返す
+    if not keywords:
+        return [(name, param) for name, param in named_params]
+
+    lowered_keywords = [str(key).lower() for key in keywords]
+    matched = []
+    for name, param in named_params:
+        name_l = str(name).lower()
+        if any(key in name_l for key in lowered_keywords):
+            matched.append((name, param))
+    return matched
+
+
+def _grad_stats_from_named_grads(group_named_params, grad_by_name):
+    grads = []
+    none_count = 0
+    elem_count = 0
+
+    for name, _param in group_named_params:
+        grad = grad_by_name.get(name, None)
+        if grad is None:
+            none_count += 1
+            continue
+        if not torch.is_tensor(grad):
+            none_count += 1
+            continue
+        grad_det = grad.detach().float()
+        if grad_det.numel() == 0:
+            none_count += 1
+            continue
+        grads.append(grad_det.reshape(-1))
+        elem_count += int(grad_det.numel())
+
+    if not grads:
+        return {
+            "used_param_count": 0,
+            "none_grad_param_count": int(none_count),
+            "grad_element_count": 0,
+            "grad_l2": 0.0,
+            "grad_abs_mean": 0.0,
+            "grad_abs_max": 0.0,
+            "grad_signed_mean": 0.0,
+        }
+
+    flat = torch.cat(grads, dim=0)
+    return {
+        "used_param_count": int(len(grads)),
+        "none_grad_param_count": int(none_count),
+        "grad_element_count": int(elem_count),
+        "grad_l2": float(torch.linalg.norm(flat, ord=2).detach().cpu()),
+        "grad_abs_mean": float(flat.abs().mean().detach().cpu()),
+        "grad_abs_max": float(flat.abs().max().detach().cpu()),
+        "grad_signed_mean": float(flat.mean().detach().cpu()),
+    }
+
+
+def build_step_grad_rows(
+    args,
+    model,
+    loss_items,
+    *,
+    global_step,
+    episode,
+    epoch,
+    step,
+    stage,
+):
+    """
+    各損失項が各モジュール・点操作系パラメータへ流す勾配量をCSV行として作る。
+    torch.autograd.gradを使うため、通常の .grad は汚さない。
+    """
+    enabled = bool(getattr(args, "step_grad_log", True))
+    if not enabled:
+        return []
+
+    interval = max(int(getattr(args, "step_grad_log_interval", 1)), 1)
+    if (int(global_step) + 1) % interval != 0:
+        return []
+
+    base_model = _unwrap_train_model(model)
+    named_params = [
+        (name, param)
+        for name, param in base_model.named_parameters()
+        if param.requires_grad
+    ]
+
+    if not named_params:
+        return []
+
+    all_param_names = [name for name, _ in named_params]
+    all_params = [param for _, param in named_params]
+    group_specs = _step_grad_group_specs()
+
+    rows = []
+
+    for loss_name, loss_value in loss_items:
+        if loss_value is None:
+            continue
+        if not torch.is_tensor(loss_value):
+            continue
+        if not loss_value.requires_grad:
+            # detach済み・実Codec値・ログ専用値などはここに入る
+            rows.append({
+                "global_step": int(global_step),
+                "episode": int(episode),
+                "epoch": int(epoch),
+                "step": int(step),
+                "stage": str(stage),
+                "loss_name": str(loss_name),
+                "loss_value": _safe_scalar_for_grad_log(loss_value),
+                "target_group": "no_grad_graph",
+                "matched_param_count": 0,
+                "used_param_count": 0,
+                "none_grad_param_count": 0,
+                "grad_element_count": 0,
+                "grad_l2": 0.0,
+                "grad_abs_mean": 0.0,
+                "grad_abs_max": 0.0,
+                "grad_signed_mean": 0.0,
+                "param_name_sample": "",
+            })
+            continue
+
+        if not torch.isfinite(loss_value.detach()).all().item():
+            rows.append({
+                "global_step": int(global_step),
+                "episode": int(episode),
+                "epoch": int(epoch),
+                "step": int(step),
+                "stage": str(stage),
+                "loss_name": str(loss_name),
+                "loss_value": _safe_scalar_for_grad_log(loss_value),
+                "target_group": "non_finite_loss",
+                "matched_param_count": 0,
+                "used_param_count": 0,
+                "none_grad_param_count": 0,
+                "grad_element_count": 0,
+                "grad_l2": 0.0,
+                "grad_abs_mean": 0.0,
+                "grad_abs_max": 0.0,
+                "grad_signed_mean": 0.0,
+                "param_name_sample": "",
+            })
+            continue
+
+        try:
+            grads = torch.autograd.grad(
+                loss_value,
+                all_params,
+                retain_graph=True,
+                create_graph=False,
+                allow_unused=True,
+            )
+        except RuntimeError as exc:
+            rows.append({
+                "global_step": int(global_step),
+                "episode": int(episode),
+                "epoch": int(epoch),
+                "step": int(step),
+                "stage": str(stage),
+                "loss_name": str(loss_name),
+                "loss_value": _safe_scalar_for_grad_log(loss_value),
+                "target_group": "autograd_error",
+                "matched_param_count": 0,
+                "used_param_count": 0,
+                "none_grad_param_count": 0,
+                "grad_element_count": 0,
+                "grad_l2": 0.0,
+                "grad_abs_mean": 0.0,
+                "grad_abs_max": 0.0,
+                "grad_signed_mean": 0.0,
+                "param_name_sample": f"{type(exc).__name__}: {str(exc)[:160]}",
+            })
+            continue
+
+        grad_by_name = {
+            name: grad
+            for name, grad in zip(all_param_names, grads)
+        }
+
+        for group_name, keywords in group_specs:
+            group_named_params = _match_param_names(named_params, keywords)
+            stats = _grad_stats_from_named_grads(group_named_params, grad_by_name)
+            sample_names = [name for name, _ in group_named_params[:5]]
+
+            rows.append({
+                "global_step": int(global_step),
+                "episode": int(episode),
+                "epoch": int(epoch),
+                "step": int(step),
+                "stage": str(stage),
+                "loss_name": str(loss_name),
+                "loss_value": _safe_scalar_for_grad_log(loss_value),
+                "target_group": str(group_name),
+                "matched_param_count": int(len(group_named_params)),
+                "used_param_count": int(stats["used_param_count"]),
+                "none_grad_param_count": int(stats["none_grad_param_count"]),
+                "grad_element_count": int(stats["grad_element_count"]),
+                "grad_l2": float(stats["grad_l2"]),
+                "grad_abs_mean": float(stats["grad_abs_mean"]),
+                "grad_abs_max": float(stats["grad_abs_max"]),
+                "grad_signed_mean": float(stats["grad_signed_mean"]),
+                "param_name_sample": "|".join(sample_names),
+            })
+
+    return rows
 
 
 def _voxel_collision_stage_set(args):
@@ -299,6 +600,7 @@ def train(model, args, loss, writer, plot, notifier=None):
 
             for step, pts in enumerate(loader): # Step開始
                 """基本情報のセットアップ"""
+                t1 = time.time()
                 st_step = time.time()
                 file_path = active_dataset.files[step]
                 cache_key = make_step_cache_key(file_path, args) # ファイルパスと設定から一意なキーを作り、前処理結果、Codec結果、Patch情報などのキャッシュ参照に使う
@@ -391,9 +693,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                 subtree_point_counts = [int(input_xyz.shape[-1])] # Subtree点数分布の初期値として、全体点群の点数をリストで保存
                 anchor_reason = "not_subtree_mode"
                 subtree_loss_scope = "full_cloud"
-
+                
                 """Subtree分割学習"""
-                if subtree_mode:
+                if subtree_mode:                    
                     """Subtree分割学習のセットアップ"""
                     optimizer.zero_grad(set_to_none=True) # 残った勾配の削除
                     subset_enabled = True # 部分集合学習を有効にする
@@ -403,14 +705,16 @@ def train(model, args, loss, writer, plot, notifier=None):
                     requested_subtree_depth = int(requested_subtree_depth) # 調整後のSubtree深度を整数で取り出す
                     min_subtree_points = max(int(getattr(args, "train_subtree_min_points", 1)), 1) # Subtreeとして採用する点数の最小点数
                     subtree_group_state = build_octree_subtree_groups_with_retry( input_xyz, args, requested_subtree_depth, min_subtree_points, allow_largest_fallback=True) # 入力点群から指定深度のOctree Subtree群を作る
-
                     """Subtree情報"""
                     subtree_ref = subtree_group_state["subtree_ref"] # Subtree参照情報の抽出
                     if subtree_ref is None:
                         raise RuntimeError("Subtree mode did not find any valid octree subtree.")
-                    subtree_trees = dict(subtree_group_state.get("subtree_trees", {}) or {}) # 追加フィールドだけを参照し、既存形式は変えない
-                    full_octree_contexts = dict(subtree_group_state.get("full_octree_contexts", {}) or {}) # full-cloud上の親・兄弟・祖先文脈
-                    group_meta = dict(subtree_group_state.get("group_meta", {}) or {}) # ログ用の軽量メタ情報
+                    # subtree_trees = dict(subtree_group_state.get("subtree_trees", {}) or {}) # 追加フィールドだけを参照し、既存形式は変えない
+                    # full_octree_contexts = dict(subtree_group_state.get("full_octree_contexts", {}) or {}) # full-cloud上の親・兄弟・祖先文脈
+                    # group_meta = dict(subtree_group_state.get("group_meta", {}) or {}) # ログ用の軽量メタ情報
+                    subtree_trees = {}
+                    full_octree_contexts = {}
+                    group_meta = {}
                     subtree_depth_meta = dict(subtree_depth_meta) # 深度メタ情報変換
                     subtree_depth_meta["requested_depth"] = int(requested_subtree_depth) # 要求された深度情報の保存
                     subtree_depth_meta["depth"] = int(subtree_group_state.get("depth", requested_subtree_depth)) # 実際に採用された深度情報の保存
@@ -466,6 +770,29 @@ def train(model, args, loss, writer, plot, notifier=None):
                     else:
                         subtree_point_counts = [int(point_idx.numel()) for _, point_idx in selected_groups]
                         subtree_loss_scope = "subtree_output_vs_subtree_input"
+                    # ============================================================
+                    # 選択済みSubtreeだけmetadataを構築する
+                    # これにより、同一階層の全Subtreeに対するtree/context構築を避ける
+                    # ============================================================
+                    if not is_anchor_step:
+                        metadata_t0 = time.time()
+                        subtree_trees, full_octree_contexts, group_meta = build_selected_group_octree_metadata(
+                            input_xyz,
+                            subtree_ref,
+                            selected_groups,
+                        )
+                        metadata_t1 = time.time()
+                        # print(
+                        #     f"Selected Subtree Metadata: {metadata_t1 - metadata_t0:.2f} sec "
+                        #     f"selected_groups={len(selected_groups)}, "
+                        #     f"subtree_trees={len(subtree_trees)}, "
+                        #     f"full_octree_contexts={len(full_octree_contexts)}, "
+                        #     f"group_meta={len(group_meta)}"
+                        # )
+                    else:
+                        subtree_trees = {}
+                        full_octree_contexts = {}
+                        group_meta = {}
 
                     """ログ"""
                     if log_this_step and bool(getattr(args, "train_patch_subset_log", True)):
@@ -1125,6 +1452,9 @@ if __name__ == '__main__':
     # ログのセットアップ
     writer = Writing( args, file_day, file_time, filename="MyNetwork_train", flush_every=args.log_flush_every, sync_every=args.log_sync_every, log_root=args.log_root)
     writer.write(f"SetupTiming: writer_init={time.time() - setup_t0:.3f}s")
+    runtime_knn_backend = configure_knn_backend(args, writer=writer)
+    globals()["KNN_BACKEND"] = runtime_knn_backend
+    network_module.KNN_BACKEND = runtime_knn_backend
     setup_plot_t0 = time.time()
     plot = PlotMaker(args)
     writer.write(f"SetupTiming: plot_init={time.time() - setup_plot_t0:.3f}s")

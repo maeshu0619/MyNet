@@ -71,6 +71,7 @@ LOSS_GRAD_PROBE_COLUMNS = [
     "stage",
     "loss_name",
     "module_name",
+    "operation_name",
     "loss_value",
     "loss_requires_grad",
     "grad_norm",

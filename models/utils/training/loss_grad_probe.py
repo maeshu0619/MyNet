@@ -73,6 +73,17 @@ def build_loss_grad_probe_rows(args, model, loss_items, *, global_step, episode,
     base_model = model.module if hasattr(model, "module") else model
     modules = list(named_trainable_child_modules(base_model))
     rows = []
+    operation_map = {
+        "delete_branch": "delete",
+        "delete_amount": "delete",
+        "add_branch": "add",
+        "add_amount": "add",
+        "add_target_branch": "add",
+        "move_branch": "move_adjust",
+        "move_amount": "move_adjust",
+        "repair_policy": "policy",
+        "actuator": "all_operations",
+    }
     for loss_name, raw_loss in loss_items:
         loss_value = _scalar_loss(raw_loss)
         loss_finite = bool(loss_value is not None and torch.isfinite(loss_value.detach()).all().item())
@@ -87,6 +98,7 @@ def build_loss_grad_probe_rows(args, model, loss_items, *, global_step, episode,
                 "stage": str(stage),
                 "loss_name": str(loss_name),
                 "module_name": str(module_name),
+                "operation_name": str(operation_map.get(str(module_name), str(module_name))),
                 "loss_value": None if loss_value is None else float(loss_value.detach().float().mean().cpu()),
                 "loss_requires_grad": bool(loss_requires_grad),
                 "grad_norm": 0.0,

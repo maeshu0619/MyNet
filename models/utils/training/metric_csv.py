@@ -74,7 +74,7 @@ def init_metric_csvs(args, plot, writer):
         init_csv_file(path, SURROGATE_PRETRAIN_COLUMNS, writer, "SurrogatePretrainMetricCSV")
         paths["surrogate_pretrain_step"] = path
     if bool(getattr(args, "loss_grad_probe_enabled", False)):
-        path = os.path.join(plot.save_dir, f"{args.time}_loss_grad_probe.csv")
-        init_csv_file(path, LOSS_GRAD_PROBE_COLUMNS, writer, "LossGradProbeCSV")
+        path = os.path.join(plot.save_dir, f"{args.time}_step_grad.csv")
+        init_csv_file(path, LOSS_GRAD_PROBE_COLUMNS, writer, "StepGradCSV")
         paths["loss_grad_probe"] = path
     return paths
