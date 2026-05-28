@@ -9,8 +9,8 @@ from cfgs.utils import str2bool
 pretrained_date = "20260524" 
 pretrained_time = "230456"
 
-surrogate_date = "20260526"
-surrogate_time = "170528"
+surrogate_date = "20260528"
+surrogate_time = "1950555"
 
 model_date = "20260524"
 model_time = "230456"
@@ -232,6 +232,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--time', default=f'{file_time}', type=str, help='時刻')
     parser.add_argument('--input_dir', default=str(_DATA_ROOT / "ground"), type=str, help='入力点群データのフォルダパス')
     parser.add_argument('--cpu', action='store_true', help='GPUを使わずCPUで学習するかどうか')
+    parser.add_argument('--print_actuator_hard_soft_compare', action='store_true', help='Actuatorのhard/soft出力の統計を取る比較モード')
     parser.add_argument('--print_rate', default=1, type=int, help='ログ出力頻度（1なら毎ステップ、0なら最初と最後のみ）')
     parser.add_argument('--dataname', default=dataname, type=str, help='データセットの名称')
     parser.add_argument('--dataset_name', default=dataset_name, type=str, help='データセット内シーケンスの名称')
@@ -371,6 +372,9 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--repair_priority_gate_tau', default=0.08, type=float, help='修復優先度ゲートの温度')
     parser.add_argument('--repair_gate_mean_cap', default=True, type=str2bool, help='修復対象割合の平均がtarget_repair_ratioを超えないように再スケールするか')
     parser.add_argument('--repair_unit_level', default=5, type=int, help='原因集約で使う粗いOctree/subtree単位の深さ')
+    parser.add_argument('--allow_local_repair_unit_recompute', default=False, type=str2bool, help='unit_keysが無い場合にCauseDiagnosisAggregation内で局所Repair Unitを再計算するか')
+    parser.add_argument('--allow_local_octree_recompute', default=False, type=str2bool, help='prebuilt_subtree_tree以外のdebug用途でOctreeStructureAnalysisの局所Octree再計算を許可するか')
+    parser.add_argument('--forbid_local_voxel_recompute', default=False, type=str2bool, help='StructureRepairActuatorでoctree_context無しの局所Voxel再計算を禁止するか')
     parser.add_argument('--structure_geo_k', default=8, type=int, help='構造解析に使う局所幾何kNN数')
     parser.add_argument('--structure_geo_max_points', default=2048, type=int, help='局所幾何統計を厳密計算する最大点数（超過時はOctree特徴を優先）')
     parser.add_argument('--octree_diag_levels', default='4,6,8,10,12', type=str, help='Octree階層ごとの診断ログを出すレベル')
@@ -1997,6 +2001,9 @@ def parse_pugan_args(parser, file_day, file_time):
     args.repair_drop_score_noise_end = max(float(getattr(args, "repair_drop_score_noise_end", 0.0)), 0.0)
     args.repair_drop_random_mix_start = min(max(float(getattr(args, "repair_drop_random_mix_start", 0.0)), 0.0), 1.0)
     args.repair_drop_random_mix_end = min(max(float(getattr(args, "repair_drop_random_mix_end", 0.0)), 0.0), 1.0)
+    args.allow_local_repair_unit_recompute = bool(getattr(args, "allow_local_repair_unit_recompute", False))
+    args.allow_local_octree_recompute = bool(getattr(args, "allow_local_octree_recompute", False))
+    args.forbid_local_voxel_recompute = bool(getattr(args, "forbid_local_voxel_recompute", False))
     args.ckpt = _resolve_repo_or_cwd_path(args.ckpt)
     args.octattention_ckpt = _resolve_repo_or_cwd_path(args.octattention_ckpt)
     args.sparsepcgc_root = _resolve_repo_or_cwd_path(args.sparsepcgc_root)

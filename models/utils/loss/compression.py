@@ -167,10 +167,97 @@ class CompressionLossMixin:
         stats["mean_neighbors"] = float(sum(neighbor_vals) / max(len(neighbor_vals), 1))
         return stats
 
+    def _sparsepcgc_hard_stats_from_voxel_state(self, args, voxel_state):
+        # Actuatorが作ったfinal_voxel_coords/final_voxel_weightsからSparsePCGC用hard統計を作る。
+        stats = {
+            "points": 0,
+            "active": 0,
+            "duplicates": 0,
+            "isolated": 0,
+            "sparse_density": 0.0,
+            "local_density_var": 0.0,
+            "mean_neighbors": 0.0,
+        }
+
+        if not isinstance(voxel_state, dict):
+            return stats
+
+        coords = voxel_state.get("final_voxel_coords", None)
+        weights = voxel_state.get("final_voxel_weights", None)
+        if coords is None or not torch.is_tensor(coords):
+            return stats
+
+        if coords.ndim != 3:
+            return stats
+
+        # [B, 3, N] に揃える。
+        if coords.shape[1] != 3 and coords.shape[-1] == 3:
+            coords = coords.permute(0, 2, 1).contiguous()
+
+        if weights is not None and torch.is_tensor(weights):
+            if weights.ndim == 3:
+                weights = weights.squeeze(1)
+            elif weights.ndim != 2:
+                weights = weights.reshape(coords.shape[0], -1)
+            weights = weights.to(device=coords.device, dtype=torch.float32)
+        else:
+            weights = None
+
+        density_vals = []
+        neighbor_vals = []
+        sparse_density_vals = []
+
+        with torch.no_grad():
+            for b in range(coords.shape[0]):
+                coords_b = coords[b].transpose(0, 1).contiguous().to(torch.long)
+
+                if weights is not None:
+                    w_b = weights[b].reshape(-1)
+                    if w_b.numel() > coords_b.shape[0]:
+                        w_b = w_b[:coords_b.shape[0]]
+                    elif w_b.numel() < coords_b.shape[0]:
+                        pad = w_b.new_ones(coords_b.shape[0] - w_b.numel())
+                        w_b = torch.cat([w_b, pad], dim=0)
+                    keep = self._effective_keep_mask_from_weights(w_b, args)
+                    coords_b = coords_b[keep]
+
+                point_count = int(coords_b.shape[0])
+                if point_count <= 0:
+                    sparse_density_vals.append(0.0)
+                    density_vals.append(0.0)
+                    neighbor_vals.append(0.0)
+                    continue
+
+                unique_coords, inverse = torch.unique(coords_b, dim=0, sorted=True, return_inverse=True)
+                active = int(unique_coords.shape[0])
+                counts = torch.bincount(inverse, minlength=active).to(torch.float32)
+                isolated, mean_neighbors = self._sparsepcgc_isolated_count(unique_coords)
+
+                stats["points"] += point_count
+                stats["active"] += active
+                stats["duplicates"] += int(point_count - active)
+                stats["isolated"] += int(isolated)
+                sparse_density_vals.append(float(active) / max(float(point_count), 1.0))
+                density_vals.append(float(counts.var(unbiased=False).item()) if counts.numel() > 1 else 0.0)
+                neighbor_vals.append(float(mean_neighbors))
+
+        stats["sparse_density"] = float(sum(sparse_density_vals) / max(len(sparse_density_vals), 1))
+        stats["local_density_var"] = float(sum(density_vals) / max(len(density_vals), 1))
+        stats["mean_neighbors"] = float(sum(neighbor_vals) / max(len(neighbor_vals), 1))
+        return stats
+
     def _sparsepcgc_debug_metrics(self, args, gen_xyz, gt_xyz, final_w=None):
         before = self._sparsepcgc_hard_stats_batch(args, gt_xyz, final_w=None)
-        after = self._sparsepcgc_hard_stats_batch(args, gen_xyz, final_w=final_w)
+
+        voxel_state = self._get_actuator_voxel_state(args, gen_xyz.device)
+        if voxel_state is not None:
+            after = self._sparsepcgc_hard_stats_from_voxel_state(args, voxel_state)
+            uses_actuator_voxel_state = True
+        else:
+            after = self._sparsepcgc_hard_stats_batch(args, gen_xyz, final_w=final_w)
+            uses_actuator_voxel_state = False
         return {
+            "sparsepcgc_debug_uses_actuator_voxel_state": bool(uses_actuator_voxel_state),
             "sparsepcgc_before_active_coords": int(before["active"]),
             "sparsepcgc_after_active_coords": int(after["active"]),
             "sparsepcgc_active_coord_delta": int(after["active"] - before["active"]),
@@ -236,6 +323,8 @@ class CompressionLossMixin:
         if not self._is_sparsepcgc_context(args):
             zero = gen_xyz.new_zeros(())
             return {"loss": zero, "active": zero, "single": zero, "entropy": zero, "density": zero}
+        voxel_state = self._get_actuator_voxel_state(args, gen_xyz.device)
+        aux_uses_actuator_voxel_state = voxel_state is not None
         if x_gen is None:
             x_gen = self._build_soft_compression_features(args, gen_xyz, gt_xyz, final_w)
         if x_ref is None:
@@ -303,6 +392,12 @@ class CompressionLossMixin:
             "octree_pattern_nll_delta": (entropy_gen - q_ref[2]).detach(),
             "octree_pattern_lowprob_ratio": (lowprob_gen / active_gen.clamp_min(1e-6)).detach(),
             "occupancy_proxy_definition": "mynet_soft_octree_aux_not_sparsepcgc_candidate_probability",
+            "sparsepcgc_aux_uses_actuator_voxel_state": gen_xyz.new_tensor(
+                float(aux_uses_actuator_voxel_state)
+            ).detach(),
+            "sparsepcgc_aux_final_voxel_recomputed_from_pts_out": gen_xyz.new_tensor(
+                float(bool(voxel_state.get("final_voxel_recomputed_from_pts_out", True))) if voxel_state is not None else 1.0
+            ).detach(),
         }
 
     def _get_cached_actual_gt(self, cache_key):
@@ -912,6 +1007,9 @@ class CompressionLossMixin:
             "sparsepcgc_exact_loss_enabled": bool(
                 exact_available and getattr(args, "enable_sparsepcgc_exact_occupancy_loss", False)
             ),
+            "actuator_voxel_state_available": bool(
+                self._get_actuator_voxel_state(args, gen_xyz.device) is not None
+            ),
         }
         if codec_name == "sparsepcgc":
             proxy_bit_percent = float(proxy_debug["loss_bit"]) if proxy_debug is not None else float("nan")
@@ -964,6 +1062,24 @@ class CompressionLossMixin:
             "node": float(cached_gt["node"]),
         }
         return L_com, loss_bit, loss_single, loss_nodes, cached_gt, stats_gt
+    
+    def _get_actuator_voxel_state(self, args, device=None):
+        # Networkが保存したActuator後のVoxel状態を安全に取得する。
+        voxel_state = getattr(args, "_last_actuator_voxel_state", None)
+        if not isinstance(voxel_state, dict):
+            return None
+
+        final_coords = voxel_state.get("final_voxel_coords", None)
+        if final_coords is None or not torch.is_tensor(final_coords):
+            return None
+
+        out = dict(voxel_state)
+        if device is not None:
+            for key in ("initial_voxel_coords", "final_voxel_coords", "final_voxel_weights", "voxel_step", "voxel_offset"):
+                value = out.get(key, None)
+                if torch.is_tensor(value):
+                    out[key] = value.to(device=device, non_blocking=True)
+        return out
 
     def get_compression_loss(
         self,
@@ -979,6 +1095,9 @@ class CompressionLossMixin:
         octree_input_mode="auto",
     ):
         self._store_compression_terms()
+        requested_mode = str(octree_input_mode or "auto").strip().lower()
+        if requested_mode == "prebuilt_subtree_tree" and subtree_tree is None:
+            raise ValueError("octree_input_mode=prebuilt_subtree_tree requires subtree_tree in get_compression_loss().")
         backend = self._compression_loss_backend(args)
         surrogate_backends = {"octattention_surrogate", "sparsepcgc_surrogate", "gpcc_surrogate", "draco_surrogate", "surrogate", "soft_surrogate"}
         if backend != "proxy" and self._actual_codec_disabled_for_train(args):
@@ -993,6 +1112,9 @@ class CompressionLossMixin:
                     cache_key=cache_key,
                     refresh_actual_gen=False,
                     actual_gen_xyz=actual_gen_xyz,
+                    subtree_tree=subtree_tree,
+                    full_octree_context=full_octree_context,
+                    octree_input_mode=octree_input_mode,
                 )
             else:
                 L_com, loss_bit, loss_single, loss_nodes, cached_gt, stats_gt = self._get_compression_loss_proxy(
@@ -1057,6 +1179,9 @@ class CompressionLossMixin:
                     cache_key=cache_key,
                     refresh_actual_gen=refresh_actual_gen,
                     actual_gen_xyz=actual_gen_xyz,
+                    subtree_tree=subtree_tree,
+                    full_octree_context=full_octree_context,
+                    octree_input_mode=octree_input_mode,
                 )
             except Exception as exc:
                 if not bool(getattr(args, "actual_codec_fallback_to_proxy_on_error", True)):

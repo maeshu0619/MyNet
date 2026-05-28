@@ -427,6 +427,12 @@ class OctreeStructureAnalysis(nn.Module):
         )
         return oct_ctx
 
+    @staticmethod
+    def _missing_prebuilt_keys(subtree_tree, required_keys):
+        if not isinstance(subtree_tree, dict):
+            return list(required_keys)
+        return [key for key in required_keys if key not in subtree_tree or subtree_tree.get(key) is None]
+
     def _prebuilt_level_debug(self, subtree_tree):
         if subtree_tree is None or not self._should_collect_level_debug():
             return None
@@ -474,11 +480,40 @@ class OctreeStructureAnalysis(nn.Module):
         work_xyz = pts_xyz.float() if pts_xyz.dtype in (torch.float16, torch.bfloat16) else pts_xyz
         qs_override = self._qs_override(work_xyz, coord_scale)
         requested_mode = str(octree_input_mode or "auto").strip().lower()
+        if requested_mode == "auto" and subtree_tree is None:
+            requested_mode = "full_cloud"
+        prebuilt_required = requested_mode == "prebuilt_subtree_tree"
+        required_prebuilt_keys = (
+            "global_voxel_coords",
+            "occupancy_codes",
+            "node_depths",
+            "global_morton_keys",
+        )
+        missing_prebuilt = self._missing_prebuilt_keys(subtree_tree, required_prebuilt_keys)
+        if prebuilt_required and missing_prebuilt:
+            raise ValueError(
+                "octree_input_mode=prebuilt_subtree_tree requires subtree_tree metadata keys: "
+                + ", ".join(required_prebuilt_keys)
+                + f"; missing: {', '.join(missing_prebuilt)}"
+            )
         prebuilt_ctx = self._prebuilt_octree_context(
             work_xyz,
             subtree_tree=subtree_tree,
             full_octree_context=full_octree_context,
         )
+        if prebuilt_required and prebuilt_ctx is None:
+            raise ValueError("octree_input_mode=prebuilt_subtree_tree could not build a prebuilt octree context.")
+        if prebuilt_ctx is None and requested_mode not in {"auto", "full_cloud", "local_recomputed", "debug_local_recomputed"}:
+            raise ValueError(f"Unsupported octree_input_mode without prebuilt metadata: {octree_input_mode}")
+        if (
+            prebuilt_ctx is None
+            and requested_mode not in {"full_cloud", "debug_local_recomputed"}
+            and not bool(getattr(self.args, "allow_local_octree_recompute", False))
+        ):
+            raise ValueError(
+                "Local Octree recompute is disabled. Use octree_input_mode=full_cloud/debug_local_recomputed "
+                "or provide prebuilt subtree_tree metadata."
+            )
 
         with torch.no_grad():
             if prebuilt_ctx is not None:
@@ -506,7 +541,7 @@ class OctreeStructureAnalysis(nn.Module):
         child_id = oct_ctx[:, 7:8, :]
 
         phase, snap_delta, snap_delta_norm = self._grid_phase(work_xyz, qs_override)
-        point_feature_voxel_key = self._point_feature_voxel_key(work_xyz, qs_override)
+        point_feature_voxel_key = None
         geo_stats = self._local_geometry_stats(work_xyz)
         tree_coords = None
         if prebuilt_ctx is not None:
@@ -515,8 +550,14 @@ class OctreeStructureAnalysis(nn.Module):
                 tree_coords = raw_tree_coords.view(1, -1, 3)
         if tree_coords is not None:
             quant_stats = self._quantized_voxel_stats_from_tree(work_xyz, tree_coords, qs_override, snap_delta_norm)
+            point_feature_voxel_key = self._tree_tensor(subtree_tree, "global_morton_keys", pts_xyz.device, dtype=torch.long)
+            if point_feature_voxel_key is not None:
+                point_feature_voxel_key = self._fit_point_rows(point_feature_voxel_key.reshape(-1, 1), pts_xyz.shape[-1]).reshape(1, -1)
         else:
+            if prebuilt_required:
+                raise ValueError("prebuilt_subtree_tree mode requires _quantized_voxel_stats_from_tree().")
             quant_stats = self._quantized_voxel_stats(work_xyz, qs_override, snap_delta_norm)
+            point_feature_voxel_key = self._point_feature_voxel_key(work_xyz, qs_override)
         local_density = geo_stats[:, 0:1, :]
         local_curvature = geo_stats[:, 1:2, :]
         local_anisotropy = geo_stats[:, 2:3, :]
@@ -620,7 +661,8 @@ class OctreeStructureAnalysis(nn.Module):
             "octree_input_mode": effective_octree_input_mode,
             "octree_input_mode_requested": requested_mode,
             "structural_voxel_mode": "global_context" if prebuilt_ctx is not None else "local_recomputed",
-            "point_feature_voxel_mode": "local_xyz",
+            "point_feature_voxel_mode": "global_context" if prebuilt_ctx is not None else "local_xyz",
+            "local_recomputed": prebuilt_ctx is None,
             "structural_voxel_key": self._tree_tensor(subtree_tree, "global_morton_keys", pts_xyz.device, dtype=torch.long)
             if prebuilt_ctx is not None
             else None,

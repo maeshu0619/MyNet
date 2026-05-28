@@ -478,7 +478,7 @@ def _node_geometry_from_path(path, global_depth: int):
     return origin, bbox_min, bbox_max
 
 
-def _build_single_subtree_tree(subtree_key, point_idx, subtree_ref, global_coords, global_depth: int):
+def _build_single_subtree_tree(subtree_key, point_idx, subtree_ref, global_coords, global_depth: int, repair_unit_level=None):
     depth = int(subtree_ref["depth"][0].detach().cpu().item())
     global_depth = max(int(global_depth), depth)
     qs = float(subtree_ref.get("qs", 1.0))
@@ -505,6 +505,7 @@ def _build_single_subtree_tree(subtree_key, point_idx, subtree_ref, global_coord
     node_bbox_min = torch.zeros((len(node_paths), 3), dtype=torch.long)
     node_bbox_max = torch.zeros((len(node_paths), 3), dtype=torch.long)
     global_node_ids = torch.zeros((len(node_paths),), dtype=torch.long)
+    parent_node_ids = torch.full((len(node_paths),), -1, dtype=torch.long)
 
     for idx, node_path in enumerate(node_paths):
         children = sorted(child_map.get(node_path, set()))
@@ -517,6 +518,7 @@ def _build_single_subtree_tree(subtree_key, point_idx, subtree_ref, global_coord
         node_bbox_max[idx] = bbox_max
         if node_path[:-1] in path_to_idx:
             parent_indices[idx] = path_to_idx[node_path[:-1]]
+            parent_node_ids[idx] = _global_node_id(node_path[:-1], global_depth)
         for child in children:
             child_masks[idx, int(child)] = True
             child_path = node_path + (int(child),)
@@ -524,6 +526,21 @@ def _build_single_subtree_tree(subtree_key, point_idx, subtree_ref, global_coord
                 child_indices[idx, int(child)] = path_to_idx[child_path]
 
     subtree_origin, subtree_bbox_min, subtree_bbox_max = _node_geometry_from_path(path, global_depth)
+    point_paths = [_path_from_cell(coord, global_depth) for coord in selected_coords.reshape(-1, 3)]
+    point_node_ids = torch.tensor(
+        [_global_node_id(point_path, global_depth) for point_path in point_paths],
+        dtype=torch.long,
+    )
+    point_subtree_keys = torch.full((selected_coords.shape[0],), int(subtree_key), dtype=torch.long)
+    if repair_unit_level is None:
+        repair_unit_depth = depth
+    else:
+        repair_unit_depth = int(repair_unit_level)
+    repair_unit_depth = max(int(depth), min(int(repair_unit_depth), int(global_depth)))
+    repair_unit_keys = torch.tensor(
+        [_global_node_id(point_path[:repair_unit_depth], global_depth) for point_path in point_paths],
+        dtype=torch.long,
+    )
     return {
         "subtree_key": int(subtree_key),
         "subtree_depth": int(depth),
@@ -543,12 +560,16 @@ def _build_single_subtree_tree(subtree_key, point_idx, subtree_ref, global_coord
         "node_bbox_min": node_bbox_min,
         "node_bbox_max": node_bbox_max,
         "parent_indices": parent_indices,
+        "parent_node_ids": parent_node_ids,
         "child_indices": child_indices,
         "child_masks": child_masks,
         "occupancy_codes": occupancy_codes,
         "leaf_point_indices": point_idx_cpu,
         "global_voxel_coords": selected_coords,
         "global_morton_keys": _morton_keys(selected_coords, global_depth),
+        "point_node_ids": point_node_ids,
+        "point_subtree_keys": point_subtree_keys,
+        "repair_unit_keys": repair_unit_keys,
     }
 
 
@@ -592,7 +613,7 @@ def _build_single_full_octree_context(subtree_key, subtree_ref, full_child_map, 
     }
 
 
-def _build_group_octree_metadata(pts_xyz, subtree_ref, all_groups):
+def _build_group_octree_metadata(pts_xyz, subtree_ref, all_groups, args=None):
     if subtree_ref is None or not all_groups:
         return {}, {}, {}
     if pts_xyz.ndim != 3 or pts_xyz.shape[0] != 1:
@@ -604,12 +625,20 @@ def _build_group_octree_metadata(pts_xyz, subtree_ref, all_groups):
     global_coords = torch.round((pts_b - offset.view(3, 1)) / qs).to(torch.long).transpose(0, 1).contiguous().detach().to("cpu")
     global_coords = global_coords.clamp_min(0)
     full_child_map = _child_map_from_coords(global_coords, global_depth)
+    repair_unit_level = int(getattr(args, "repair_unit_level", int(subtree_ref["depth"][0].detach().cpu().item()))) if args is not None else None
     subtree_trees = {}
     full_octree_contexts = {}
     group_meta = {}
     for subtree_key, point_idx in all_groups:
         key = int(subtree_key)
-        tree = _build_single_subtree_tree(key, point_idx, subtree_ref, global_coords, global_depth)
+        tree = _build_single_subtree_tree(
+            key,
+            point_idx,
+            subtree_ref,
+            global_coords,
+            global_depth,
+            repair_unit_level=repair_unit_level,
+        )
         context = _build_single_full_octree_context(key, subtree_ref, full_child_map, global_depth)
         subtree_trees[key] = tree
         full_octree_contexts[key] = context
@@ -626,7 +655,7 @@ def _build_group_octree_metadata(pts_xyz, subtree_ref, all_groups):
         }
     return subtree_trees, full_octree_contexts, group_meta
 
-def build_selected_group_octree_metadata(pts_xyz, subtree_ref, selected_groups):
+def build_selected_group_octree_metadata(pts_xyz, subtree_ref, selected_groups, args=None):
     """
     選択済みSubtreeだけに対して subtree_tree / full_octree_context / group_meta を作る。
     all_groups全体ではなく、train.pyで確定した selected_groups だけを渡すこと。
@@ -635,6 +664,7 @@ def build_selected_group_octree_metadata(pts_xyz, subtree_ref, selected_groups):
         pts_xyz,
         subtree_ref,
         selected_groups,
+        args=args,
     )
 
 def build_octree_subtree_groups_with_retry(

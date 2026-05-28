@@ -867,6 +867,9 @@ class SurrogateCompressionLossMixin:
         cache_key=None,
         refresh_actual_gen=True,
         actual_gen_xyz=None,
+        subtree_tree=None,
+        full_octree_context=None,
+        octree_input_mode="auto",
     ):
         timing_enabled = bool(getattr(args, "debug_timing", False) or getattr(args, "_surrogate_pretrain_timing_enabled", False))
         timing = {}
@@ -889,6 +892,29 @@ class SurrogateCompressionLossMixin:
         else:
             timing_cursor = 0.0
         self._surrogate_call_count = int(getattr(self, "_surrogate_call_count", 0)) + 1
+        requested_octree_mode = str(octree_input_mode or "auto").strip().lower()
+        uses_subtree_tree = isinstance(subtree_tree, dict)
+        if requested_octree_mode == "prebuilt_subtree_tree" and not uses_subtree_tree:
+            raise ValueError("octree_input_mode=prebuilt_subtree_tree requires subtree_tree in surrogate compression loss.")
+        prebuilt_codes = subtree_tree.get("occupancy_codes", None) if uses_subtree_tree else None
+        if prebuilt_codes is not None:
+            prebuilt_code_t = torch.as_tensor(prebuilt_codes, dtype=torch.long)
+            prebuilt_node_count = float(prebuilt_code_t.numel())
+            if prebuilt_code_t.numel() > 0:
+                child_counts = (
+                    (
+                        prebuilt_code_t.reshape(-1, 1)
+                        >> torch.arange(8, dtype=torch.long, device=prebuilt_code_t.device).view(1, -1)
+                    )
+                    & 1
+                ).sum(dim=1)
+                prebuilt_single_count = float((child_counts == 1).sum().item())
+            else:
+                prebuilt_single_count = 0.0
+        else:
+            prebuilt_node_count = 0.0
+            prebuilt_single_count = 0.0
+        compression_proxy_input_mode = "prebuilt_subtree_tree" if uses_subtree_tree else ("full_cloud" if requested_octree_mode == "full_cloud" else "local_recomputed")
         x_soft = self._build_soft_compression_features(args, gen_xyz, gt_xyz, final_w)
         timing_cursor = _mark_timing("feature_gen", timing_cursor)
         aux_node_weight = float(getattr(args, "compression_surrogate_aux_node_weight", 0.0))
@@ -1506,6 +1532,12 @@ class SurrogateCompressionLossMixin:
             "compression_aux_in_objective": bool(getattr(args, "compression_surrogate_aux_in_objective", False)),
             "compression_main_grad_scale": float(main_grad_scale),
             "compression_main_grad_scale_reason": str(main_grad_scale_reason),
+            "compression_proxy_input_mode": compression_proxy_input_mode,
+            "compression_proxy_uses_subtree_tree": bool(uses_subtree_tree),
+            "compression_proxy_uses_full_context": bool(isinstance(full_octree_context, dict)),
+            "compression_proxy_fallback_reason": "" if uses_subtree_tree or requested_octree_mode == "full_cloud" else "missing_subtree_tree",
+            "prebuilt_node_count_used": float(prebuilt_node_count),
+            "prebuilt_single_child_count_used": float(prebuilt_single_count),
             "sparsepcgc_aux_loss": self._scalar(sparse_terms["loss"].detach()),
             "sparsepcgc_aux_value": self._scalar(sparse_aux_loss.detach()),
             "sparsepcgc_aux_raw": self._scalar(sparse_aux_raw.detach()),

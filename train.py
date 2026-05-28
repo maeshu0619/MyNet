@@ -172,12 +172,15 @@ def _discrete_loss_mode_value(args):
 
 
 def _step_grad_group_specs():
-    # 名前に基づいて、モジュール別・点操作別の勾配集計対象を定義する
-    # actuator_all と add/prune/adjust は重複してよい
-    # つまり「actuator全体」と「各点操作head」の両方を見る
+    # 名前に基づいて、モジュール別・点操作別・head別の勾配集計対象を定義する。
+    # actuator_all と op_* と head別グループは重複してよい。
+    # 目的は「操作全体」「どこに」「どのくらい」を分けて確認することである。
     return [
         ("all_trainable", []),
 
+        # ============================================================
+        # モジュール単位
+        # ============================================================
         ("encoder", ["encoder."]),
         ("structure_analyzer", ["structure_analyzer."]),
         ("cost_attributor", ["cost_attributor."]),
@@ -185,37 +188,75 @@ def _step_grad_group_specs():
         ("policy_module", ["policy_module."]),
         ("actuator_all", ["actuator."]),
 
-        # 追加系
+        # ============================================================
+        # 操作単位：従来ログとの互換性を残す
+        # ============================================================
         ("op_add", [
-            "actuator.add",
-            ".add_",
-            "add_",
-            "adding",
-            "insert",
+            "actuator.add_head.",
+            "actuator.add_voxel_head.",
+            "actuator.add_amount_head.",
         ]),
-
-        # 削除系
         ("op_prune_delete_drop", [
-            "actuator.prune",
-            "actuator.delete",
-            "actuator.drop",
-            ".prune_",
-            ".delete_",
-            ".drop_",
-            "prun",
-            "keep",
+            "actuator.drop_head.",
+            "actuator.drop_amount_head.",
+        ]),
+        ("op_adjust_move", [
+            "actuator.move_voxel_head.",
+            "actuator.move_amount_head.",
         ]),
 
-        # 調整・移動系
-        ("op_adjust_move", [
-            "actuator.adjust",
-            "actuator.move",
-            "actuator.disp",
-            "actuator.delta",
-            ".adjust_",
-            ".move_",
-            ".disp_",
-            ".delta_",
+        # ============================================================
+        # 削除 Prune/Delete
+        # ============================================================
+        # どこを削除するか：削除位置scoreを出すhead
+        ("prune_where_drop_head", [
+            "actuator.drop_head.",
+        ]),
+
+        # どのくらい削除するか：削除割合を出すhead
+        ("prune_amount_head", [
+            "actuator.drop_amount_head.",
+        ]),
+
+        # ============================================================
+        # 追加 Add
+        # ============================================================
+        # どの点を追加元候補にするか：add scoreを出すhead
+        ("add_where_score_head", [
+            "actuator.add_head.",
+        ]),
+
+        # どの近傍Voxelへ追加するか：追加方向を出すhead
+        ("add_where_direction_head", [
+            "actuator.add_voxel_head.",
+        ]),
+
+        # どのくらい追加するか：追加割合を出すhead
+        ("add_amount_head", [
+            "actuator.add_amount_head.",
+        ]),
+
+        # ============================================================
+        # 調整 Adjust/Move
+        # ============================================================
+        # どの方向へ動かすか：26近傍方向logitを出すhead
+        ("move_where_direction_head", [
+            "actuator.move_voxel_head.",
+        ]),
+
+        # どのくらい動かすか：移動割合を出すhead
+        ("move_amount_head", [
+            "actuator.move_amount_head.",
+        ]),
+
+        # ============================================================
+        # 注意：現在のActuatorには「どの点をMove元にするか」専用headはない
+        # move source選択は policy_probs / cause_scores / repair_gate / move_score から作られる。
+        # そのため、source位置選択への勾配は policy_module や cost_attributor 側にも分散する。
+        # ============================================================
+        ("move_source_policy_related", [
+            "policy_module.",
+            "cost_attributor.",
         ]),
     ]
 
@@ -854,6 +895,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                             input_xyz,
                             subtree_ref,
                             selected_groups,
+                            args=args,
                         )
                         metadata_t1 = time.time()
                         # print(
@@ -1009,7 +1051,12 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 use_subtree_tree = subtree_tree is not None # 構造評価に事前構築木を使えるか
                                 use_full_octree_context = full_octree_context is not None # 大域文脈を使えるか
                                 octree_input_mode = "prebuilt_subtree_tree" if use_subtree_tree else "local_recomputed" # 明示的な入力モード
-                                args._current_exact_teacher_mode = "global_subtree" if (use_subtree_tree and use_full_octree_context) else "local_subtree" # teacherの意味を分離する
+                                args._current_exact_teacher_mode = (
+                                    "subtree_with_global_context"
+                                    if (use_subtree_tree and use_full_octree_context)
+                                    else "local_subtree"
+                                )
+                                # args._current_exact_teacher_mode = "global_subtree" if (use_subtree_tree and use_full_octree_context) else "local_subtree" # teacherの意味を分離する
                                 args._current_exact_teacher_uses_full_context = bool(use_subtree_tree and use_full_octree_context) # full文脈の使用可否
                                 args._current_exact_teacher_fallback_reason = "" if (use_subtree_tree and use_full_octree_context) else "missing_prebuilt_subtree_tree_or_full_octree_context" # fallback理由
                                 subtree_xyz = input_xyz.index_select(2, point_idx).contiguous() # 全体対入力点群から現在Subtreeに属する点だけを取り出す
@@ -1032,7 +1079,8 @@ def train(model, args, loss, writer, plot, notifier=None):
                                         f"use_full_octree_context={bool(use_full_octree_context)}, "
                                         f"octree_input_mode={octree_input_mode}, "
                                         f"structural_voxel_mode={'global_context' if use_subtree_tree else 'local_recomputed'}, "
-                                        f"point_feature_voxel_mode=local_xyz, "
+                                        f"point_feature_voxel_mode={'global_context' if use_subtree_tree else 'local_xyz'}, "
+                                        f"local_recomputed={bool(not use_subtree_tree)}, "
                                         f"selected_subtree_key={subtree_key_int}, "
                                         f"selected_subtree_path={selected_path}, "
                                         f"root_to_subtree_path={root_path}, "
@@ -1217,6 +1265,16 @@ def train(model, args, loss, writer, plot, notifier=None):
                     "sparsepcgc_exact_teacher_mode",
                     "exact_teacher_uses_full_context",
                     "exact_teacher_fallback_reason",
+                    "actuator_voxel_mode",
+                    "actuator_local_recomputed",
+                    "actuator_full_octree_context_available",
+                    "actuator_parent_occupancy_code",
+                    "actuator_sibling_count",
+                    "actuator_ancestor_count",
+                    "actuator_full_context_bonus_mean",
+                    "before_occupied_voxel_count",
+                    "after_occupied_voxel_count",
+                    "occupied_voxel_delta",
                 ):
                     if debug_key in structure_debug and debug_key not in comp_debug:
                         comp_debug[debug_key] = structure_debug.get(debug_key)

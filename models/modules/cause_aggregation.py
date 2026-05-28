@@ -42,9 +42,18 @@ class CauseDiagnosisAggregation(nn.Module):
         return gathered, priority
 
     def forward(self, pts_xyz, cause_scores, cause_targets, unit_keys=None):
+        unit_mode = "prebuilt"
         if unit_keys is None:
+            if not bool(getattr(self.args, "allow_local_repair_unit_recompute", False)):
+                raise ValueError(
+                    "CauseDiagnosisAggregation requires prebuilt unit_keys. "
+                    "Set allow_local_repair_unit_recompute=True only for debug/local fallback runs."
+                )
             keys = self._unit_keys(pts_xyz.detach())
+            unit_mode = "local_recomputed"
         else:
+            if unit_keys.ndim == 1:
+                unit_keys = unit_keys.view(1, -1)
             if unit_keys.ndim == 3 and unit_keys.shape[1] == 1:
                 unit_keys = unit_keys.squeeze(1)
             if unit_keys.ndim != 2 or unit_keys.shape[0] != pts_xyz.shape[0] or unit_keys.shape[1] != pts_xyz.shape[2]:
@@ -66,4 +75,6 @@ class CauseDiagnosisAggregation(nn.Module):
             "targets": torch.stack(agg_targets, dim=0),
             "priority": torch.stack(priorities, dim=0),
             "unit_keys": keys,
+            "unit_mode": unit_mode,
+            "local_recomputed": unit_mode == "local_recomputed",
         }

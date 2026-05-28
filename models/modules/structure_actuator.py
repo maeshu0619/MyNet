@@ -4,7 +4,6 @@ import time
 import torch
 import torch.nn as nn
 
-
 class StructureRepairActuator(nn.Module):
     """Apply small geometry-preserving movements that realize repair policies.
 
@@ -87,6 +86,69 @@ class StructureRepairActuator(nn.Module):
         nn.init.constant_(self.add_amount_head.bias, 0.0)
         nn.init.constant_(self.move_amount_head.bias, 0.0)
         self.debug_tensors = {}
+
+    def _child_slot_target_mask(self, voxel_coords, octree_context):
+        # 1. octree_cubtree.pyで作った厳密maskがあればそれを使う
+        if isinstance(octree_context, dict):
+            mask = octree_context.get("point_valid_empty_child_mask", None)
+            if mask is not None:
+                if not torch.is_tensor(mask):
+                    mask = torch.as_tensor(mask)
+                mask = mask.to(device=voxel_coords.device, dtype=torch.bool)
+                if mask.ndim == 2:
+                    mask = mask.unsqueeze(0)
+                if mask.ndim == 3 and mask.shape[1] == self.neighbor_offsets.shape[0] and mask.shape[2] == voxel_coords.shape[2]:
+                    mask = mask.permute(0, 2, 1).contiguous()
+                if mask.shape[0] == 1 and voxel_coords.shape[0] > 1:
+                    mask = mask.expand(voxel_coords.shape[0], -1, -1)
+                if mask.ndim == 3 and mask.shape[0] == voxel_coords.shape[0] and mask.shape[1] == voxel_coords.shape[2]:
+                    return mask
+
+        # 2. なければ簡易版として、voxel座標/2による同一parent制約を使う
+        B, _, N = voxel_coords.shape
+        offsets = self.neighbor_offsets.to(device=voxel_coords.device, dtype=torch.long)
+        K = int(offsets.shape[0])
+
+        current = voxel_coords.transpose(1, 2).contiguous()
+        targets = current[:, :, None, :] + offsets.view(1, 1, K, 3)
+
+        current_parent = torch.div(current, 2, rounding_mode="floor")
+        target_parent = torch.div(targets, 2, rounding_mode="floor")
+        same_parent_mask = (target_parent == current_parent[:, :, None, :]).all(dim=-1)
+
+        return same_parent_mask
+
+    def _context_voxel_step_and_offset(self, pts_xyz, coord_scale, octree_context):
+        # 初期Octree/Subtreeメタデータがある場合は、そのglobal_qs/global_offsetを優先する。
+        # これにより、Network入力前に作ったVoxel座標系をActuator内でも維持する。
+        if isinstance(octree_context, dict):
+            if "global_qs" in octree_context:
+                qs_value = float(octree_context.get("global_qs", self._effective_qs()))
+            else:
+                qs_value = float(self._effective_qs())
+
+            if "global_offset" in octree_context:
+                offset = octree_context["global_offset"]
+                if not torch.is_tensor(offset):
+                    offset = torch.as_tensor(offset)
+                offset = offset.to(device=pts_xyz.device, dtype=pts_xyz.dtype).reshape(1, 3, 1)
+                if offset.shape[0] == 1 and pts_xyz.shape[0] > 1:
+                    offset = offset.expand(pts_xyz.shape[0], -1, -1)
+            else:
+                offset = pts_xyz.new_zeros((pts_xyz.shape[0], 3, 1))
+
+            step = pts_xyz.new_full((pts_xyz.shape[0], 1, 1), max(qs_value, 1e-9))
+            return step, offset, True
+
+        # fallback時だけ従来のvoxel_stepを使う。
+        step = self._voxel_step(pts_xyz, coord_scale)
+        offset = pts_xyz.new_zeros((pts_xyz.shape[0], 3, 1))
+        return step, offset, False
+
+
+    def _voxel_centers_from_global_coords(self, voxel_coords, voxel_step, voxel_offset, dtype):
+        # global voxel座標を、同じglobal_offset/global_qsに基づいて点座標へ戻す。
+        return voxel_offset.to(dtype=dtype) + voxel_coords.to(dtype=dtype) * voxel_step.to(dtype=dtype)
 
     def _effective_qs(self):
         compress_key = (
@@ -856,6 +918,8 @@ class StructureRepairActuator(nn.Module):
         repair_priority=None,
         coord_scale=None,
         selection_mask=None,
+        octree_context=None,
+        full_octree_context=None,
     ):
         timing_enabled = bool(getattr(self.args, "debug_timing", False))
         runtime_timing = {}
@@ -960,21 +1024,121 @@ class StructureRepairActuator(nn.Module):
             local_outlier_score = cause_scores[:, 5:6, :] if cause_scores.shape[1] > 5 else preserve.new_zeros(preserve.shape)
         shape_score = cause_scores[:, -1:, :]
 
-        voxel_step = self._voxel_step(pts_xyz, coord_scale)
+        full_context_available = isinstance(full_octree_context, dict) and bool(full_octree_context)
+
+        actuator_parent_occupancy_code = 0
+        actuator_sibling_count = 0
+        actuator_ancestor_count = 0
+        full_context_bonus = preserve.new_zeros(preserve.shape)
+
+        if full_context_available:
+            actuator_parent_occupancy_code = int(full_octree_context.get("parent_occupancy_code", 0) or 0)
+
+            sibling_ids = full_octree_context.get("sibling_node_ids", None)
+            if sibling_ids is None:
+                sibling_ids = full_octree_context.get("sibling_paths", [])
+            actuator_sibling_count = len(sibling_ids) if hasattr(sibling_ids, "__len__") else 0
+
+            ancestor_ids = full_octree_context.get("ancestor_node_ids", [])
+            actuator_ancestor_count = len(ancestor_ids) if hasattr(ancestor_ids, "__len__") else 0
+
+            # 親・兄弟・祖先文脈が存在するSubtreeほど、構造操作候補として少しだけ強める。
+            # まずは小さい補正に留め、既存policyを壊さない。
+            context_strength = min(
+                (float(actuator_sibling_count) + 0.5 * float(actuator_ancestor_count)) / 8.0,
+                1.0,
+            )
+            full_context_bonus = preserve.new_full(preserve.shape, context_strength)
+
+        # 初期Octree/Subtreeのglobal voxel座標系を優先して使う。
+        voxel_step, voxel_offset, uses_context_voxel_frame = self._context_voxel_step_and_offset(
+            pts_xyz,
+            coord_scale,
+            octree_context,
+        )
         voxel_norm = (voxel_step * math.sqrt(3.0)).clamp_min(1e-9)
-        voxel_coords = self._voxel_coords(pts_xyz, voxel_step)
+
+        context_voxel_coords = None
+        if isinstance(octree_context, dict) and octree_context.get("global_voxel_coords", None) is not None:
+            context_voxel_coords = octree_context["global_voxel_coords"]
+            if not torch.is_tensor(context_voxel_coords):
+                context_voxel_coords = torch.as_tensor(context_voxel_coords)
+            context_voxel_coords = context_voxel_coords.to(device=pts_xyz.device, dtype=torch.long)
+
+            if context_voxel_coords.ndim == 2 and context_voxel_coords.shape[-1] == 3:
+                context_voxel_coords = context_voxel_coords.transpose(0, 1).unsqueeze(0)
+            elif context_voxel_coords.ndim == 3 and context_voxel_coords.shape[-1] == 3:
+                context_voxel_coords = context_voxel_coords.permute(0, 2, 1).contiguous()
+
+            if context_voxel_coords.ndim != 3 or context_voxel_coords.shape[1] != 3:
+                raise ValueError("octree_context['global_voxel_coords'] must have shape [N, 3], [B, N, 3], or [B, 3, N].")
+
+            if context_voxel_coords.shape[0] == 1 and pts_xyz.shape[0] > 1:
+                context_voxel_coords = context_voxel_coords.expand(pts_xyz.shape[0], -1, -1)
+
+            if context_voxel_coords.shape[0] != pts_xyz.shape[0]:
+                raise ValueError("octree_context global_voxel_coords batch size does not match pts_xyz.")
+
+            if int(context_voxel_coords.shape[2]) != int(pts_xyz.shape[2]):
+                raise ValueError(
+                    "octree_context['global_voxel_coords'] point count must match pts_xyz. "
+                    "Do not pad/truncate global voxel coords because it breaks the initial Octree/Voxel correspondence."
+                )
+
+        if context_voxel_coords is not None:
+            # Network入力前に作った初期Octree/Voxel座標をそのまま使う。
+            voxel_coords = context_voxel_coords.contiguous()
+            actuator_voxel_mode = "prebuilt_global_voxel_coords"
+            actuator_local_recomputed = False
+        else:
+            if bool(getattr(self.args, "forbid_local_voxel_recompute", False)):
+                raise ValueError(
+                    "StructureRepairActuator requires octree_context['global_voxel_coords'] when "
+                    "forbid_local_voxel_recompute=True."
+                )
+            # prebuilt voxelがない場合だけfallbackとして再Voxel化する。
+            voxel_coords = self._voxel_coords(pts_xyz - voxel_offset, voxel_step)
+            actuator_voxel_mode = "local_recomputed"
+            actuator_local_recomputed = True
+
+        point_parent_node_ids = None
+        point_child_slots = None
+        point_valid_empty_child_mask = None
+
+        if isinstance(octree_context, dict):
+            point_parent_node_ids = octree_context.get("point_parent_node_ids", None)
+            point_child_slots = octree_context.get("point_child_slots", None)
+            point_valid_empty_child_mask = octree_context.get("point_valid_empty_child_mask", None)
+        # ここから先はprebuilt/localどちらでも共通で必要である。
         voxel_cache = self._build_voxel_cache(voxel_coords)
         neighbor_offsets = self.neighbor_offsets.to(device=pts_xyz.device, dtype=pts_xyz.dtype)
         neighbor_offsets_long = self.neighbor_offsets.to(device=pts_xyz.device, dtype=torch.long)
+
         empty_target_mask = self._empty_neighbor_target_mask(voxel_coords, voxel_cache=voxel_cache)
+
+        child_slot_mask = self._child_slot_target_mask(voxel_coords, octree_context)
+        if child_slot_mask is not None:
+            empty_target_mask = empty_target_mask & child_slot_mask
+            actuator_target_mode = "octree_child_slot_masked"
+        else:
+            actuator_target_mode = "neighbor_empty_voxel"
+
+        child_slot_candidate_ratio = None
+        if child_slot_mask is not None:
+            child_slot_candidate_ratio = child_slot_mask.to(dtype=pts_xyz.dtype).mean()
+        else:
+            child_slot_candidate_ratio = pts_xyz.new_zeros(())
+
         B, _, N = pts_xyz.shape
         if selection_mask is None:
             selection_bool = torch.ones((B, N), device=pts_xyz.device, dtype=torch.bool)
         else:
             selection_bool = selection_mask.squeeze(1) if selection_mask.ndim == 3 else selection_mask
             selection_bool = selection_bool.to(device=pts_xyz.device, dtype=torch.bool)
+
         voxel_point_counts = self._voxel_point_counts(voxel_coords, voxel_cache=voxel_cache).to(device=pts_xyz.device)
         before_occupied_voxels = self._unique_voxel_count_from_cache(voxel_cache, selection_bool)
+
         if timing_enabled:
             _mark_runtime("setup")
 
@@ -993,6 +1157,8 @@ class StructureRepairActuator(nn.Module):
             - 0.85 * preserve
             - 0.75 * shape_score
         )
+        if full_context_available:
+            delete_prior = delete_prior + 0.05 * full_context_bonus
         target_drop_ratio = float(getattr(self.args, "target_drop_ratio", 0.01)) if prune_enabled else 0.0
         max_drop_ratio = max(float(getattr(self.args, "max_drop_ratio", max(target_drop_ratio, 0.01))), target_drop_ratio)
         if not prune_enabled:
@@ -1072,6 +1238,8 @@ class StructureRepairActuator(nn.Module):
                 - 0.65 * shape_score
             ).clamp(-8.0, 8.0)
         )
+        if full_context_available:
+            move_source_prior = (move_source_prior + 0.05 * full_context_bonus).clamp(0.0, 1.0)
         prior_weight = float(getattr(self.args, "repair_move_source_prior_weight", 0.35))
         if sparsepcgc_context:
             prior_weight = max(
@@ -1197,17 +1365,22 @@ class StructureRepairActuator(nn.Module):
             selection_mask,
         )
         selected_offsets = torch.einsum("bkn,kc->bcn", move_dir, neighbor_offsets)
-        target_centers = (voxel_coords.to(dtype=pts_xyz.dtype) + selected_offsets) * voxel_step
-        source_sparsepcgc_coords = self._sparsepcgc_quantized_coords(
-            pts_xyz,
-            coord_scale,
-            fallback_voxel_step=voxel_step,
+
+        # soft方向用の連続target voxel座標
+        target_voxels_soft = voxel_coords.to(dtype=pts_xyz.dtype) + selected_offsets
+
+        # 点座標へ戻すときも、初期Octree/Voxelのglobal offset/global qsを使う。
+        target_centers = self._voxel_centers_from_global_coords(
+            target_voxels_soft,
+            voxel_step,
+            voxel_offset,
+            dtype=pts_xyz.dtype,
         )
-        target_sparsepcgc_coords = self._sparsepcgc_quantized_coords(
-            target_centers,
-            coord_scale,
-            fallback_voxel_step=voxel_step,
-        )
+        move_idx_flat = move_idx.squeeze(1)
+        selected_offsets_long = neighbor_offsets_long.index_select(0, move_idx_flat.reshape(-1))
+        selected_offsets_long = selected_offsets_long.view(B, N, 3).transpose(1, 2).contiguous()
+        source_sparsepcgc_coords = voxel_coords
+        target_sparsepcgc_coords = voxel_coords + selected_offsets_long
         target_existing_occupied_mask = self._coords_membership_mask(
             target_sparsepcgc_coords,
             source_sparsepcgc_coords,
@@ -1256,10 +1429,12 @@ class StructureRepairActuator(nn.Module):
         primitive_delta = target_centers - pts_xyz
         delta = move_mask * primitive_delta
         pts_out = pts_xyz + delta
-        move_idx_flat = move_idx.squeeze(1)
-        selected_offsets_long = neighbor_offsets_long.index_select(0, move_idx_flat.reshape(-1))
-        selected_offsets_long = selected_offsets_long.view(B, N, 3).transpose(1, 2).contiguous()
         move_target_voxel_coords = voxel_coords + selected_offsets_long
+        final_voxel_coords = torch.where(
+            hard_move_mask.to(device=voxel_coords.device, dtype=torch.bool).expand_as(voxel_coords),
+            move_target_voxel_coords,
+            voxel_coords,
+        )
         same_voxel_move_mask = (
             hard_move_mask.squeeze(1)
             & (move_target_voxel_coords == voxel_coords).all(dim=1)
@@ -1324,6 +1499,8 @@ class StructureRepairActuator(nn.Module):
                 - 0.45 * local_outlier_score
                 - 0.65 * shape_score
             )
+            if full_context_available:
+                add_prior = add_prior + 0.05 * full_context_bonus
             if sparsepcgc_add_experiment_active and not bool(getattr(self.args, "sparsepcgc_add_use_candidate_score", True)):
                 add_prior = torch.zeros_like(add_prior)
             # Add量の学習結果を位置logitに足し、どのVoxelへ追加するかの勾配も残す。
@@ -1419,7 +1596,13 @@ class StructureRepairActuator(nn.Module):
 
                 selected_base_voxels = selected_base_voxels_long.to(dtype=pts_xyz.dtype)
                 selected_offsets_add = selected_offsets_add_long.to(dtype=pts_xyz.dtype)
-                added_pts = selected_add_voxels_long.to(dtype=pts_xyz.dtype) * voxel_step
+                # 追加先Voxelを、初期Octree/Voxelのglobal座標系から点座標へ戻す。
+                added_pts = self._voxel_centers_from_global_coords(
+                    selected_add_voxels_long,
+                    voxel_step,
+                    voxel_offset,
+                    dtype=pts_xyz.dtype,
+                )
                 added_base = torch.gather(pts_out, 2, idx_expand_xyz)
                 added_delta = added_pts - added_base
                 selected_add_strength = torch.gather(pair_priority.reshape(B, -1), 1, top_pair_idx).unsqueeze(1)
@@ -1432,6 +1615,7 @@ class StructureRepairActuator(nn.Module):
 
                 pts_out = torch.cat([pts_out, added_pts], dim=2)
                 final_w = torch.cat([final_w, added_w], dim=2)
+                final_voxel_coords = torch.cat([final_voxel_coords, selected_add_voxels_long], dim=2)
 
                 add_ratio = added_w.sum() / max(float(B * N), 1.0)
                 target_add_ratio = pts_xyz.new_tensor(self._target_add_ratio_value() if add_enabled else 0.0)
@@ -1468,7 +1652,6 @@ class StructureRepairActuator(nn.Module):
         hardening_threshold = float(
             getattr(self.args, "operation_count_drop_threshold", getattr(self.args, "test_drop_threshold", 0.5))
         )
-        final_voxel_coords = self._voxel_coords(pts_out, voxel_step)
         hard_keep_mask = final_w.detach() >= hardening_threshold
         after_occupied_voxels = self._unique_voxel_count(final_voxel_coords, hard_keep_mask)
         delete_target_voxel_count_value = self._unique_voxel_count_from_cache(voxel_cache, hard_drop_mask)
@@ -1655,8 +1838,107 @@ class StructureRepairActuator(nn.Module):
         else:
             self.last_runtime_timing = {}
 
+        # Actuatorのhard/soft出力の統計を取る比較モード。学習中の挙動確認や、学習比率headの効果確認に。
+        if bool(getattr(self.args, "print_actuator_hard_soft_compare", False)):
+            with torch.no_grad():
+                def _mf(x):
+                    if torch.is_tensor(x):
+                        return float(x.detach().float().mean().cpu())
+                    return float(x)
+
+                def _sf(x):
+                    if torch.is_tensor(x):
+                        return float(x.detach().float().sum().cpu())
+                    return float(x)
+
+                def _corr(a, b):
+                    a = a.detach().float().reshape(-1)
+                    b = b.detach().float().reshape(-1)
+                    if a.numel() <= 1 or b.numel() <= 1:
+                        return 0.0
+                    a = a - a.mean()
+                    b = b - b.mean()
+                    denom = a.norm() * b.norm()
+                    if float(denom.cpu()) <= 1e-12:
+                        return 0.0
+                    return float((a * b).sum().div(denom).cpu())
+
+                drop_hard_mean = _mf(hard_drop)
+                drop_soft_mean = _mf(drop_prob)
+                drop_proxy_mean = _mf(drop_prob_proxy)
+                drop_direct_mean = _mf(drop_prob_direct)
+                drop_abs_diff = _mf((hard_drop - drop_prob).abs())
+                drop_corr = _corr(hard_drop, drop_prob)
+
+                move_hard_mean = _mf(hard_move)
+                move_soft_mean = _mf(move_score)
+                move_mask_mean = _mf(move_mask)
+                move_abs_diff = _mf((hard_move - move_score).abs())
+                move_corr = _corr(hard_move, move_score)
+
+                move_dir_conf = _mf(move_probs.max(dim=1, keepdim=True).values)
+                move_dir_entropy = _mf(
+                    -(move_probs.clamp_min(1e-8).log() * move_probs).sum(dim=1, keepdim=True)
+                )
+
+                add_soft_mean = _mf(add_prob)
+                add_soft_sum = _sf(add_prob)
+                final_w_mean = _mf(final_w)
+                final_w_min = float(final_w.detach().float().amin().cpu()) if final_w.numel() > 0 else 0.0
+                final_w_max = float(final_w.detach().float().amax().cpu()) if final_w.numel() > 0 else 0.0
+
+                print(
+                    "[ActuatorHardSoftCompare] "
+                    f"drop_soft_mean={drop_soft_mean:.6f}, "
+                    f"drop_hard_mean={drop_hard_mean:.6f}, "
+                    f"drop_abs_diff={drop_abs_diff:.6f}, "
+                    f"drop_corr={drop_corr:.6f}, "
+                    f"drop_proxy_mean={drop_proxy_mean:.6f}, "
+                    f"drop_direct_mean={drop_direct_mean:.6f}, "
+                    f"hard_drop_count={hard_drop_count_value}, "
+                    f"delete_target_voxel_count={delete_target_voxel_count_value}, "
+                    f"delete_emptied_voxel_count={delete_emptied_voxel_count_value}, "
+                    f"move_soft_mean={move_soft_mean:.6f}, "
+                    f"move_hard_mean={move_hard_mean:.6f}, "
+                    f"move_mask_mean={move_mask_mean:.6f}, "
+                    f"move_abs_diff={move_abs_diff:.6f}, "
+                    f"move_corr={move_corr:.6f}, "
+                    f"hard_move_count={hard_move_count_value}, "
+                    f"raw_hard_move_count={raw_hard_move_count_value}, "
+                    f"move_dir_conf={move_dir_conf:.6f}, "
+                    f"move_dir_entropy={move_dir_entropy:.6f}, "
+                    f"add_soft_mean={add_soft_mean:.6f}, "
+                    f"add_soft_sum={add_soft_sum:.6f}, "
+                    f"add_count={add_count_value}, "
+                    f"add_effective_count={add_effective_count_value}, "
+                    f"add_target_voxel_count={add_target_voxel_count_value}, "
+                    f"learned_drop_ratio={_mf(learned_drop_ratio):.6f}, "
+                    f"learned_move_ratio={_mf(learned_move_ratio):.6f}, "
+                    f"learned_add_ratio={_mf(learned_add_ratio):.6f}, "
+                    f"final_w_mean={final_w_mean:.6f}, "
+                    f"final_w_min={final_w_min:.6f}, "
+                    f"final_w_max={final_w_max:.6f}, "
+                    f"before_voxels={before_occupied_voxels}, "
+                    f"after_voxels={after_occupied_voxels}, "
+                    f"occupied_voxel_delta={after_occupied_voxels - before_occupied_voxels}, "
+                    f"actuator_voxel_mode={actuator_voxel_mode}, "
+                    f"local_recomputed={bool(actuator_local_recomputed)}, "
+                    f"uses_context_voxel_frame={bool(uses_context_voxel_frame)}, "
+                    f"final_voxel_update_mode=state_update_from_initial_voxels, "
+                    f"final_voxel_recomputed_from_pts_out=False, "
+                    f"initial_voxel_point_count={int(voxel_coords.shape[2])}, "
+                    f"final_voxel_point_count={int(final_voxel_coords.shape[2])}, "
+                    f"final_voxel_added_slots={int(final_voxel_coords.shape[2] - voxel_coords.shape[2])}"
+                )
+
         self.debug_tensors = {
-                "repair_gate": repair_gate.mean().detach(),
+            "full_octree_context_available": pts_xyz.new_tensor(float(full_context_available)).detach(),
+            "actuator_parent_occupancy_code": pts_xyz.new_tensor(float(actuator_parent_occupancy_code)).detach(),
+            "actuator_sibling_count": pts_xyz.new_tensor(float(actuator_sibling_count)).detach(),
+            "actuator_ancestor_count": pts_xyz.new_tensor(float(actuator_ancestor_count)).detach(),
+            "full_context_bonus_mean": full_context_bonus.mean().detach(),
+            "child_slot_candidate_ratio": child_slot_candidate_ratio.detach(),
+            "repair_gate": repair_gate.mean().detach(),
             "add_ratio": add_ratio.detach(),
             "add_prob_mean": add_prob.mean().detach(),
             "add_prob_max": add_prob.max().detach() if add_prob.numel() > 0 else pts_xyz.new_zeros(()).detach(),
@@ -1714,6 +1996,8 @@ class StructureRepairActuator(nn.Module):
             "actuator_strength": pts_xyz.new_tensor(float(actuator_strength)).detach(),
             "force_joint_actuator": pts_xyz.new_tensor(float(force_joint_actuator)).detach(),
             "threshold_cap_mode": pts_xyz.new_tensor(float(threshold_cap_mode)).detach(),
+            "actuator_voxel_mode": actuator_voxel_mode,
+            "local_recomputed": pts_xyz.new_tensor(float(actuator_local_recomputed)).detach(),
             "add_drop_conflict_loss": add_drop_conflict_loss.detach(),
             "added_keep_loss": added_keep_loss.detach(),
             "add_min_offset_loss": add_min_offset_loss.detach(),
@@ -1723,10 +2007,10 @@ class StructureRepairActuator(nn.Module):
             "quant_score_mean": quant_score.mean().detach(),
             "delta_norm": delta_norm.mean().detach(),
             "moved_delta_mean": moved_delta_mean.detach(),
-                "move_ratio": hard_move.mean().detach(),
-                "hard_move_count": pts_xyz.new_tensor(float(hard_move_count_value)).detach(),
-                "move_score_mean": move_score.mean().detach(),
-                "move_source_prior_mean": move_source_prior.mean().detach(),
+            "move_ratio": hard_move.mean().detach(),
+            "hard_move_count": pts_xyz.new_tensor(float(hard_move_count_value)).detach(),
+            "move_score_mean": move_score.mean().detach(),
+            "move_source_prior_mean": move_source_prior.mean().detach(),
             "adjusted_point_count": pts_xyz.new_tensor(float(hard_move_count_value)).detach(),
             "adjusted_point_rate": pts_xyz.new_tensor(float(adjusted_point_rate_value)).detach(),
             "raw_hard_move_count_before_sparsepcgc_guard": pts_xyz.new_tensor(float(raw_hard_move_count_value)).detach(),
@@ -1757,10 +2041,10 @@ class StructureRepairActuator(nn.Module):
             "occupied_voxel_delta": pts_xyz.new_tensor(float(after_occupied_voxels - before_occupied_voxels)).detach(),
             "delete_target_voxel_count": pts_xyz.new_tensor(float(delete_target_voxel_count_value)).detach(),
             "delete_emptied_voxel_count": pts_xyz.new_tensor(float(delete_emptied_voxel_count_value)).detach(),
-                "delete_removed_point_count": pts_xyz.new_tensor(float(delete_removed_point_count_value)).detach(),
-                "hard_drop_ratio": hard_drop.mean().detach(),
-                "hard_drop_count": pts_xyz.new_tensor(float(hard_drop_count_value)).detach(),
-                "add_target_voxel_count": pts_xyz.new_tensor(float(add_target_voxel_count_value)).detach(),
+            "delete_removed_point_count": pts_xyz.new_tensor(float(delete_removed_point_count_value)).detach(),
+            "hard_drop_ratio": hard_drop.mean().detach(),
+            "hard_drop_count": pts_xyz.new_tensor(float(hard_drop_count_value)).detach(),
+            "add_target_voxel_count": pts_xyz.new_tensor(float(add_target_voxel_count_value)).detach(),
             "add_actual_point_count": pts_xyz.new_tensor(float(add_effective_count_value)).detach(),
             "move_source_voxel_count": pts_xyz.new_tensor(float(move_source_voxel_count_value)).detach(),
             "move_target_voxel_count": pts_xyz.new_tensor(float(move_target_voxel_count_value)).detach(),
@@ -1779,22 +2063,24 @@ class StructureRepairActuator(nn.Module):
             "policy_context_mean": p_context.mean().detach(),
             "policy_comp_mean": p_comp.mean().detach(),
             "policy_outlier_mean": p_outlier.mean().detach(),
+            "actuator_target_mode": actuator_target_mode, 
         }
         return pts_out, final_w, loss, {
+            "child_slot_candidate_ratio": child_slot_candidate_ratio,
             "repair_gate": repair_gate,
             "drop_prob": drop_prob,
             "keep_prob": keep_prob,
             "drop_prob_direct": drop_prob_direct,
             "drop_prob_proxy": drop_prob_proxy,
             "drop_logit": learned_drop_logit,
-                "add_prob": add_prob,
-                "add_priority": add_priority,
-                "add_ratio": add_ratio,
-                "add_prob_mean": add_prob.mean(),
-                "add_prob_max": add_prob.max() if add_prob.numel() > 0 else pts_xyz.new_zeros(()),
-                "add_priority_mean": add_priority.mean(),
-                "add_priority_max": add_priority.max() if add_priority.numel() > 0 else pts_xyz.new_zeros(()),
-                "add_count": add_count_value,
+            "add_prob": add_prob,
+            "add_priority": add_priority,
+            "add_ratio": add_ratio,
+            "add_prob_mean": add_prob.mean(),
+            "add_prob_max": add_prob.max() if add_prob.numel() > 0 else pts_xyz.new_zeros(()),
+            "add_priority_mean": add_priority.mean(),
+            "add_priority_max": add_priority.max() if add_priority.numel() > 0 else pts_xyz.new_zeros(()),
+            "add_count": add_count_value,
             "add_effective_count": add_effective_count_value,
             "add_candidate_ratio": float(add_candidate_ratio),
             "add_candidate_count": int(add_k),
@@ -1835,6 +2121,8 @@ class StructureRepairActuator(nn.Module):
             "move_direction_ce": move_direction_ce,
             "add_direction_ce": add_direction_ce,
             "temperature": float(operation_temperature),
+            "actuator_voxel_mode": actuator_voxel_mode,
+            "local_recomputed": bool(actuator_local_recomputed),
             "exploration_noise": float(exploration_noise),
             "operation_prob_floor_applied": bool(add_ratio_floor_applied),
             "move_score_noise": float(move_score_noise),
@@ -1854,10 +2142,10 @@ class StructureRepairActuator(nn.Module):
             "threshold_cap_mode": bool(threshold_cap_mode),
             "delta": delta,
             "primitive_delta": primitive_delta,
-                "move_ratio": hard_move.mean(),
-                "hard_move_count": hard_move_count_value,
-                "move_score_mean": move_score.mean(),
-                "move_source_prior_mean": move_source_prior.mean(),
+            "move_ratio": hard_move.mean(),
+            "hard_move_count": hard_move_count_value,
+            "move_score_mean": move_score.mean(),
+            "move_source_prior_mean": move_source_prior.mean(),
             "adjusted_point_count": hard_move_count_value,
             "adjusted_point_rate": adjusted_point_rate_value,
             "raw_hard_move_count_before_sparsepcgc_guard": raw_hard_move_count_value,
@@ -1889,10 +2177,10 @@ class StructureRepairActuator(nn.Module):
             "occupied_voxel_delta": after_occupied_voxels - before_occupied_voxels,
             "delete_target_voxel_count": delete_target_voxel_count_value,
             "delete_emptied_voxel_count": delete_emptied_voxel_count_value,
-                "delete_removed_point_count": delete_removed_point_count_value,
-                "hard_drop_ratio": hard_drop.mean(),
-                "hard_drop_count": hard_drop_count_value,
-                "add_target_voxel_count": add_target_voxel_count_value,
+            "delete_removed_point_count": delete_removed_point_count_value,
+            "hard_drop_ratio": hard_drop.mean(),
+            "hard_drop_count": hard_drop_count_value,
+            "add_target_voxel_count": add_target_voxel_count_value,
             "add_actual_point_count": add_effective_count_value,
             "move_source_voxel_count": move_source_voxel_count_value,
             "move_target_voxel_count": move_target_voxel_count_value,
@@ -1917,4 +2205,26 @@ class StructureRepairActuator(nn.Module):
             "quant_move_conflict_loss": quant_move_conflict_loss,
             "quant_add_guard": quant_add_guard,
             "local_edit_guard": local_edit_guard,
+            "point_parent_node_ids": point_parent_node_ids,
+            "initial_voxel_coords": voxel_coords,
+            "final_voxel_coords": final_voxel_coords,
+            "final_voxel_weights": final_w,
+            "voxel_step": voxel_step,
+            "voxel_offset": voxel_offset,
+            "final_voxel_update_mode": "state_update_from_initial_voxels",
+            "final_voxel_recomputed_from_pts_out": False,
+            "point_child_slots": point_child_slots,
+            "point_valid_empty_child_mask": point_valid_empty_child_mask,
+            "initial_voxel_coords": voxel_coords,
+            "final_voxel_coords": final_voxel_coords,
+            "final_voxel_weights": final_w,
+            "voxel_step": voxel_step,
+            "voxel_offset": voxel_offset,
+            "final_voxel_update_mode": "state_update_from_initial_voxels",
+            "final_voxel_recomputed_from_pts_out": False,
+            "full_octree_context_available": bool(full_context_available),
+            "actuator_parent_occupancy_code": int(actuator_parent_occupancy_code),
+            "actuator_sibling_count": int(actuator_sibling_count),
+            "actuator_ancestor_count": int(actuator_ancestor_count),
+            "full_context_bonus_mean": full_context_bonus.mean(),
         }

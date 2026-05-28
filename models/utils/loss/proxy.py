@@ -82,6 +82,8 @@ class ProxyCompressionLossMixin:
         uses_subtree_tree = subtree_tree is not None
         uses_full_context = full_octree_context is not None
         requested_mode = str(octree_input_mode or "auto").strip().lower()
+        if requested_mode == "prebuilt_subtree_tree" and not uses_subtree_tree:
+            raise ValueError("octree_input_mode=prebuilt_subtree_tree requires subtree_tree in compression proxy loss.")
         if uses_subtree_tree:
             proxy_input_mode = "prebuilt_subtree_tree"
             fallback_reason = ""
@@ -165,6 +167,8 @@ class ProxyCompressionLossMixin:
         sparse_terms = self._sparsepcgc_aux_feature_terms(args, gen_xyz, gt_xyz, final_w)
         L_sparse_objective = sparse_terms["loss"]
         L_com = L_com + L_sparse_objective
+        sparse_aux_uses_voxel_state = sparse_terms.get("sparsepcgc_aux_uses_actuator_voxel_state", None)
+        sparse_aux_recomputed = sparse_terms.get("sparsepcgc_aux_final_voxel_recomputed_from_pts_out", None)
         if use_ste_hard:
             L_com_surrogate, L_bit_surrogate, L_nodes_surrogate, L_single_surrogate = self._compression_terms_from_proxy(
                 out_surrogate,
@@ -260,6 +264,12 @@ class ProxyCompressionLossMixin:
             "prebuilt_single_child_count_used": self._scalar(stats_gen.get("prebuilt_single_child_count", 0.0)),
             "rate_proxy_node_count_used": self._scalar(stats_gen.get("node", 0.0)),
             "loss_nodes_node_count_used": self._scalar(stats_gen.get("node", 0.0)),
+            "sparsepcgc_aux_uses_actuator_voxel_state": bool(
+                float(sparse_aux_uses_voxel_state.detach().cpu()) > 0.5
+            ) if torch.is_tensor(sparse_aux_uses_voxel_state) else False,
+            "sparsepcgc_aux_final_voxel_recomputed_from_pts_out": bool(
+                float(sparse_aux_recomputed.detach().cpu()) > 0.5
+            ) if torch.is_tensor(sparse_aux_recomputed) else True,
         }
         debug_gen_xyz = gen_xyz if actual_gen_xyz is None else actual_gen_xyz
         self._maybe_update_sparsepcgc_debug(

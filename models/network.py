@@ -457,6 +457,45 @@ class Network(nn.Module):
         return mask.to(device=device, dtype=torch.bool)
 
     @staticmethod
+    def _fit_point_key_rows(keys, batch_size, num_points, device):
+        if keys is None:
+            return None
+        keys = keys.to(device=device, dtype=torch.long)
+        if keys.ndim == 1:
+            keys = keys.view(1, -1)
+        elif keys.ndim == 3 and keys.shape[1] == 1:
+            keys = keys.squeeze(1)
+        if keys.ndim != 2:
+            return None
+        if keys.shape[0] == 1 and batch_size > 1:
+            keys = keys.expand(batch_size, -1)
+        if keys.shape[0] != batch_size:
+            return None
+        current = int(keys.shape[1])
+        if current == num_points:
+            return keys
+        if current <= 0:
+            return torch.zeros((batch_size, num_points), device=device, dtype=torch.long)
+        if current > num_points:
+            return keys[:, :num_points]
+        pad = keys[:, -1:].expand(batch_size, num_points - current)
+        return torch.cat([keys, pad], dim=1)
+
+    def _tree_point_keys(self, subtree_tree, key_names, batch_size, num_points, device):
+        if not isinstance(subtree_tree, dict):
+            return None
+        for key_name in key_names:
+            value = subtree_tree.get(key_name, None)
+            if value is None:
+                continue
+            if not torch.is_tensor(value):
+                value = torch.as_tensor(value)
+            fitted = self._fit_point_key_rows(value, batch_size, num_points, device)
+            if fitted is not None:
+                return fitted
+        return None
+
+    @staticmethod
     def _masked_point_mean(values, point_mask): # 点毎の値について、マスク対象点だけの平均を算出
         if point_mask is None:
             return values.mean()
@@ -554,9 +593,36 @@ class Network(nn.Module):
         if pts_xyz.ndim != 3 or pts_xyz.shape[1] != 3: # 入力点群の形状チェック
             raise ValueError("pts_xyz must have shape [B, 3, N]")
 
+        prebuilt_subtree_mode = subtree_tree is not None
         full_unit_keys = None # Subtree Key保存用の変数初期化
         selection_mask = None # 選択されたSubtreeに属する点だけを示すマスクの初期化
-        if subtree_ref is not None: # Subtree参照情報が与えられているか確認
+        prebuilt_repair_unit_keys = self._tree_point_keys(
+            subtree_tree,
+            ("repair_unit_keys", "point_node_ids"),
+            pts_xyz.shape[0],
+            pts_xyz.shape[2],
+            pts_xyz.device,
+        )
+        prebuilt_subtree_keys = self._tree_point_keys(
+            subtree_tree,
+            ("point_subtree_keys",),
+            pts_xyz.shape[0],
+            pts_xyz.shape[2],
+            pts_xyz.device,
+        )
+        if prebuilt_subtree_mode:
+            full_unit_keys = prebuilt_repair_unit_keys
+            if full_unit_keys is None:
+                raise ValueError("subtree_tree must provide repair_unit_keys or point_node_ids for Network prebuilt subtree mode.")
+            if selected_subtree_keys is not None and prebuilt_subtree_keys is not None:
+                selected_subtree_keys = selected_subtree_keys.to(device=pts_xyz.device, dtype=prebuilt_subtree_keys.dtype).reshape(-1)
+                selection_mask = self._normalize_point_mask(
+                    subtree_membership_mask(prebuilt_subtree_keys, selected_subtree_keys),
+                    batch_size=pts_xyz.shape[0],
+                    num_points=pts_xyz.shape[2],
+                    device=pts_xyz.device,
+                )
+        elif subtree_ref is not None: # Subtree参照情報が与えられているか確認
             full_unit_keys = assign_octree_subtree_keys(pts_xyz, subtree_ref)
             if selected_subtree_keys is not None:
                 selected_subtree_keys = selected_subtree_keys.to(device=pts_xyz.device, dtype=full_unit_keys.dtype).reshape(-1)
@@ -582,8 +648,25 @@ class Network(nn.Module):
         analysis_xyz = encode_state["analysis_xyz"] # Octree構造解析に使う点群座標を取り出す
         analysis_counts = encode_state["analysis_counts"] # analysis_xyzの有効点数をバッチごとに取り出す
         keep_sparse_path = encode_state["kept_sparse_after_encoder"] # Encoder後もSparse Tensor側の点群を規準に処理するかどうかを取り出す
-        analysis_unit_keys = assign_octree_subtree_keys(analysis_xyz, subtree_ref) if subtree_ref is not None else None # 解析用点群に対してSubtree Keyを割り当てる
-        analysis_selection_mask = subtree_membership_mask(analysis_unit_keys, selected_subtree_keys) if analysis_unit_keys is not None and selected_subtree_keys is not None else None # 解析用点群に対して、選択されたSubtreeに属する点だけを示すマスクを作る
+        if prebuilt_subtree_mode:
+            analysis_unit_keys = self._tree_point_keys(
+                subtree_tree,
+                ("repair_unit_keys", "point_node_ids"),
+                analysis_xyz.shape[0],
+                analysis_xyz.shape[2],
+                analysis_xyz.device,
+            )
+            analysis_subtree_keys = self._tree_point_keys(
+                subtree_tree,
+                ("point_subtree_keys",),
+                analysis_xyz.shape[0],
+                analysis_xyz.shape[2],
+                analysis_xyz.device,
+            )
+        else:
+            analysis_unit_keys = assign_octree_subtree_keys(analysis_xyz, subtree_ref) if subtree_ref is not None else None # 解析用点群に対してSubtree Keyを割り当てる
+            analysis_subtree_keys = analysis_unit_keys
+        analysis_selection_mask = subtree_membership_mask(analysis_subtree_keys, selected_subtree_keys) if analysis_subtree_keys is not None and selected_subtree_keys is not None else None # 解析用点群に対して、選択されたSubtreeに属する点だけを示すマスクを作る
 
         if timing_enabled: # 時間計測が有効か否か
             self._sync_if_cuda_tensor(pts_xyz)
@@ -607,6 +690,7 @@ class Network(nn.Module):
             cause_scores_means = []
             subtree_scores_means = []
             policy_probs_means = []
+            aggregation_unit_modes = []
             loss_attr_terms = []
             loss_policy_terms = []
             cause_scores = None
@@ -655,12 +739,18 @@ class Network(nn.Module):
                     runtime_decision_start = time.time()
                     
                 """原因スコア集約器"""
+                unit_keys_b = None if analysis_unit_keys is None else analysis_unit_keys[b:b + 1, :analysis_count]
+                if unit_keys_b is None:
+                    unit_keys_b = structure_b.get("structural_voxel_key", None)
+                    if unit_keys_b is None:
+                        unit_keys_b = structure_b.get("point_feature_voxel_key", None)
                 aggregated_b = self.cause_aggregator( # 原因スコアを点単位からSubtree/Repair Unit単位へ集約する
                     pts_xyz=analysis_xyz_b,
                     cause_scores=cause_scores_b,
                     cause_targets=cause_targets_b,
-                    unit_keys=None if analysis_unit_keys is None else analysis_unit_keys[b:b + 1, :analysis_count],
+                    unit_keys=unit_keys_b,
                 )
+                aggregation_unit_modes.append(str(aggregated_b.get("unit_mode", "unknown")))
                 subtree_scores_b = aggregated_b["scores"] # Subtree原因スコア
                 subtree_targets_b = aggregated_b["targets"] # Subtree教師
                 repair_priority_b = aggregated_b["priority"].to(device=pts_xyz.device, dtype=fused_feat_b.dtype) # DeviceとDtypeを合わせる
@@ -793,8 +883,13 @@ class Network(nn.Module):
                 pts_xyz=analysis_xyz,
                 cause_scores=cause_scores,
                 cause_targets=cause_targets,
-                unit_keys=full_unit_keys,
+                unit_keys=full_unit_keys
+                if full_unit_keys is not None
+                else structure.get("structural_voxel_key", None)
+                if structure.get("structural_voxel_key", None) is not None
+                else structure.get("point_feature_voxel_key", None),
             )
+            aggregation_unit_modes = [str(aggregated.get("unit_mode", "unknown"))]
             subtree_scores = aggregated["scores"]
             subtree_targets = aggregated["targets"]
             repair_priority = aggregated["priority"].to(device=pts_xyz.device, dtype=fused_feat.dtype)
@@ -830,7 +925,33 @@ class Network(nn.Module):
             repair_priority=repair_priority_full,
             coord_scale=coord_scale,
             selection_mask=selection_mask,
+            octree_context=subtree_tree,
+            full_octree_context=full_octree_context,
         )
+        actuator_local_value = actuator_stats.get("local_recomputed", False)
+        if torch.is_tensor(actuator_local_value):
+            actuator_local_recomputed = bool(float(actuator_local_value.detach().float().mean().cpu()) > 0.5)
+        else:
+            actuator_local_recomputed = bool(actuator_local_value)
+        cause_aggregation_unit_mode = ",".join(sorted(set(aggregation_unit_modes))) if aggregation_unit_modes else "unknown"
+        forward_local_recomputed = bool(
+            structure.get("local_recomputed", False)
+            or actuator_local_recomputed
+            or "local_recomputed" in cause_aggregation_unit_mode
+        )
+        if str(octree_input_mode or "auto").strip().lower() == "prebuilt_subtree_tree" and forward_local_recomputed:
+            raise RuntimeError("prebuilt_subtree_tree forward used a local_recomputed path.")
+        if self._should_collect_runtime_debug() and self.writer is not None and hasattr(self.writer, "write"):
+            self.writer.write(
+                "NetworkStructureMode: "
+                f"octree_input_mode={structure.get('octree_input_mode', octree_input_mode)}, "
+                f"use_subtree_tree={bool(subtree_tree is not None)}, "
+                f"use_full_octree_context={bool(full_octree_context is not None)}, "
+                f"structural_voxel_mode={structure.get('structural_voxel_mode', 'unknown')}, "
+                f"actuator_voxel_mode={actuator_stats.get('actuator_voxel_mode', 'unknown')}, "
+                f"cause_aggregation_unit_mode={cause_aggregation_unit_mode}, "
+                f"local_recomputed={forward_local_recomputed}"
+            )
         soft_term_keys = (
             "add_prob_mean",
             "add_ratio",
@@ -884,6 +1005,66 @@ class Network(nn.Module):
             setattr(self.args, "_last_actuator_soft_terms", self.last_actuator_soft_terms)
         except Exception:
             pass
+        # Actuatorが内部で更新したVoxel状態を、Loss / Proxy / SparsePCGC補助損失側から参照できるように保存する。
+        actuator_voxel_state = {
+            key: actuator_stats.get(key, None)
+            for key in (
+                "initial_voxel_coords",
+                "final_voxel_coords",
+                "final_voxel_weights",
+                "voxel_step",
+                "voxel_offset",
+            )
+            if actuator_stats.get(key, None) is not None
+        }
+
+        actuator_voxel_state["final_voxel_update_mode"] = actuator_stats.get(
+            "final_voxel_update_mode",
+            "unknown",
+        )
+        actuator_voxel_state["final_voxel_recomputed_from_pts_out"] = bool(
+            actuator_stats.get("final_voxel_recomputed_from_pts_out", True)
+        )
+        actuator_voxel_state["actuator_voxel_mode"] = actuator_stats.get(
+            "actuator_voxel_mode",
+            "unknown",
+        )
+
+        self.last_actuator_voxel_state = actuator_voxel_state
+        try:
+            setattr(self.args, "_last_actuator_voxel_state", self.last_actuator_voxel_state)
+        except Exception:
+            pass
+        
+        actuator_voxel_state = {
+            key: actuator_stats.get(key, None)
+            for key in (
+                "initial_voxel_coords",
+                "final_voxel_coords",
+                "final_voxel_weights",
+                "voxel_step",
+                "voxel_offset",
+            )
+            if actuator_stats.get(key, None) is not None
+        }
+        actuator_voxel_state["final_voxel_update_mode"] = actuator_stats.get(
+            "final_voxel_update_mode",
+            "unknown",
+        )
+        actuator_voxel_state["final_voxel_recomputed_from_pts_out"] = bool(
+            actuator_stats.get("final_voxel_recomputed_from_pts_out", True)
+        )
+        actuator_voxel_state["actuator_voxel_mode"] = actuator_stats.get(
+            "actuator_voxel_mode",
+            "unknown",
+        )
+
+        self.last_actuator_voxel_state = actuator_voxel_state
+        try:
+            setattr(self.args, "_last_actuator_voxel_state", self.last_actuator_voxel_state)
+        except Exception:
+            pass
+
         if timing_enabled:
             self._sync_if_cuda_tensor(pts_xyz)
             runtime_actuator_end = time.time()
@@ -940,7 +1121,29 @@ class Network(nn.Module):
                 cause_argmax_counts = self._argmax_count_dict(debug_cause_scores, CAUSE_NAMES)
                 policy_argmax_counts = self._argmax_count_dict(debug_policy_probs, POLICY_NAMES)
                 active_policy_count = sum(1 for value in policy_argmax_counts.values() if value > 0)
+                structure_local_recomputed = bool(structure.get("local_recomputed", False))
                 self.last_structure_debug = {
+                    "actuator_full_octree_context_available": bool(actuator_stats.get("full_octree_context_available", False)),
+                    "actuator_parent_occupancy_code": int(actuator_stats.get("actuator_parent_occupancy_code", 0)),
+                    "actuator_sibling_count": int(actuator_stats.get("actuator_sibling_count", 0)),
+                    "actuator_ancestor_count": int(actuator_stats.get("actuator_ancestor_count", 0)),
+                    "actuator_full_context_bonus_mean": float(
+                        actuator_stats.get("full_context_bonus_mean", pts_xyz.new_zeros(())).detach().cpu()
+                    )
+                    if torch.is_tensor(actuator_stats.get("full_context_bonus_mean", None))
+                    else float(actuator_stats.get("full_context_bonus_mean", 0.0)),
+                    "octree_input_mode": str(structure.get("octree_input_mode", octree_input_mode)),
+                    "use_subtree_tree": bool(subtree_tree is not None),
+                    "use_full_octree_context": bool(full_octree_context is not None),
+                    "structural_voxel_mode": str(structure.get("structural_voxel_mode", "unknown")),
+                    "actuator_voxel_mode": str(actuator_stats.get("actuator_voxel_mode", "unknown")),
+                    "cause_aggregation_unit_mode": cause_aggregation_unit_mode,
+                    "local_recomputed": bool(structure_local_recomputed or actuator_local_recomputed or "local_recomputed" in cause_aggregation_unit_mode),
+                    "structure_local_recomputed": structure_local_recomputed,
+                    "actuator_local_recomputed": actuator_local_recomputed,
+                    "prebuilt_metadata_used": bool(subtree_tree is not None and not structure_local_recomputed and not actuator_local_recomputed),
+                    "prebuilt_fallback": bool((subtree_tree is not None) and (structure_local_recomputed or actuator_local_recomputed or "local_recomputed" in cause_aggregation_unit_mode)),
+                    "repair_unit_keys_used": bool("prebuilt" in cause_aggregation_unit_mode and full_unit_keys is not None),
                     "loss_attr": float(loss_attr.detach().cpu()),
                     "loss_policy": float(loss_policy.detach().cpu()),
                     "loss_repair": float(loss_repair.detach().cpu()),
