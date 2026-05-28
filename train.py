@@ -816,7 +816,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                     subset_enabled = True # 部分集合学習を有効にする
                     input_attr_full = input_pcd[:, 3:, :].contiguous() if input_pcd.shape[1] > 3 else None # 属性のとりだし
                     subtree_depth_meta = sample_train_subtree_depth( input_xyz, args, global_step=global_train_step, cache_key=cache_key) # Octree深度の決定
-                    subtree_depth_meta, requested_subtree_depth = maybe_lower_subtree_depth_for_large_input( subtree_depth_meta, raw_pts_num, args) # 大点群時は点を捨てずにSubtree深度だけ1段階浅くする
+                    subtree_depth_meta, requested_subtree_depth = maybe_raise_subtree_depth_for_large_input( subtree_depth_meta, raw_pts_num, args) # 大点群時は点を捨てずにSubtree深度だけ1段階浅くする
                     requested_subtree_depth = int(requested_subtree_depth) # 調整後のSubtree深度を整数で取り出す
                     min_subtree_points = max(int(getattr(args, "train_subtree_min_points", 1)), 1) # Subtreeとして採用する点数の最小点数
                     subtree_group_state = build_octree_subtree_groups_with_retry( input_xyz, args, requested_subtree_depth, min_subtree_points, allow_largest_fallback=True) # 入力点群から指定深度のOctree Subtree群を作る
@@ -1211,7 +1211,10 @@ def train(model, args, loss, writer, plot, notifier=None):
                 L_com_objective = compose_train_compression_objective(args, terms, L_com, La_fit) # actual/surrogateではL_com直結と内訳合成を半々で混ぜる
 
                 """形状損失を合成"""
-                legacy_L_downstream = ( stage_factors["geom"] * args.w_geom * L_geom + stage_factors["com"] * L_com_objective) # 形状損失と圧縮損失の合成
+                legacy_L_downstream = (
+                    stage_factors["geom"] * args.w_geom * L_geom
+                    + stage_factors["com"] * float(getattr(args, "w_com", 10.0)) * L_com_objective
+                ) # 形状損失と圧縮損失の合成
 
                 """属性/方策/操作損失を合成"""
                 legacy_L_total = ( legacy_L_downstream + stage_factors["attr"] * args.w_attr * L_attr + stage_factors["policy"] * args.w_policy * L_policy + stage_factors["repair"] * args.w_actuator * L_actuator)
@@ -1222,6 +1225,8 @@ def train(model, args, loss, writer, plot, notifier=None):
                 L_discrete_policy = L.new_zeros(())
                 cp_debug = {} # compression primaryモード用のdebug情報を空辞書で初期化
                 if compression_primary_mode: # 圧縮優先の場合、圧縮損失を重視した損失を再計算
+                    L_com_objective = float(getattr(args, "w_com", 10.0)) * L_com_objective
+                    L_downstream = L_com_objective
                     L, L_com_objective, cp_debug = build_compression_primary_loss( args, terms=terms, L_com=L_com, L_geom=L_geom, L_actuator=L_actuator, global_train_step=global_train_step, stage_factors=stage_factors)
                     L_downstream = L_com_objective
                     L = (
@@ -1275,6 +1280,10 @@ def train(model, args, loss, writer, plot, notifier=None):
                     "before_occupied_voxel_count",
                     "after_occupied_voxel_count",
                     "occupied_voxel_delta",
+                    "actuator_voxel_state_saved",
+                    "actuator_final_voxel_state_available",
+                    "final_voxel_update_mode",
+                    "final_voxel_recomputed_from_pts_out",
                 ):
                     if debug_key in structure_debug and debug_key not in comp_debug:
                         comp_debug[debug_key] = structure_debug.get(debug_key)

@@ -593,6 +593,12 @@ class Network(nn.Module):
         if pts_xyz.ndim != 3 or pts_xyz.shape[1] != 3: # 入力点群の形状チェック
             raise ValueError("pts_xyz must have shape [B, 3, N]")
 
+        self.last_actuator_voxel_state = None
+        try:
+            setattr(self.args, "_last_actuator_voxel_state", None)
+        except Exception:
+            pass
+
         prebuilt_subtree_mode = subtree_tree is not None
         full_unit_keys = None # Subtree Key保存用の変数初期化
         selection_mask = None # 選択されたSubtreeに属する点だけを示すマスクの初期化
@@ -928,6 +934,40 @@ class Network(nn.Module):
             octree_context=subtree_tree,
             full_octree_context=full_octree_context,
         )
+        # Actuatorが内部で更新したVoxel状態をLoss / compression.py 側から読めるように保存する。
+        actuator_voxel_state = {
+            key: actuator_stats.get(key, None)
+            for key in (
+                "initial_voxel_coords",
+                "final_voxel_coords",
+                "final_voxel_weights",
+                "voxel_step",
+                "voxel_offset",
+            )
+            if actuator_stats.get(key, None) is not None
+        }
+
+        actuator_voxel_state["final_voxel_update_mode"] = actuator_stats.get(
+            "final_voxel_update_mode",
+            "unknown",
+        )
+        actuator_voxel_state["final_voxel_recomputed_from_pts_out"] = bool(
+            actuator_stats.get("final_voxel_recomputed_from_pts_out", True)
+        )
+        actuator_voxel_state["actuator_voxel_mode"] = actuator_stats.get(
+            "actuator_voxel_mode",
+            "unknown",
+        )
+        actuator_voxel_state["actuator_local_recomputed"] = bool(
+            actuator_stats.get("local_recomputed", actuator_stats.get("actuator_local_recomputed", True))
+        )
+
+        self.last_actuator_voxel_state = actuator_voxel_state
+        try:
+            setattr(self.args, "_last_actuator_voxel_state", self.last_actuator_voxel_state)
+        except Exception:
+            pass
+
         actuator_local_value = actuator_stats.get("local_recomputed", False)
         if torch.is_tensor(actuator_local_value):
             actuator_local_recomputed = bool(float(actuator_local_value.detach().float().mean().cpu()) > 0.5)
@@ -1005,65 +1045,6 @@ class Network(nn.Module):
             setattr(self.args, "_last_actuator_soft_terms", self.last_actuator_soft_terms)
         except Exception:
             pass
-        # Actuatorが内部で更新したVoxel状態を、Loss / Proxy / SparsePCGC補助損失側から参照できるように保存する。
-        actuator_voxel_state = {
-            key: actuator_stats.get(key, None)
-            for key in (
-                "initial_voxel_coords",
-                "final_voxel_coords",
-                "final_voxel_weights",
-                "voxel_step",
-                "voxel_offset",
-            )
-            if actuator_stats.get(key, None) is not None
-        }
-
-        actuator_voxel_state["final_voxel_update_mode"] = actuator_stats.get(
-            "final_voxel_update_mode",
-            "unknown",
-        )
-        actuator_voxel_state["final_voxel_recomputed_from_pts_out"] = bool(
-            actuator_stats.get("final_voxel_recomputed_from_pts_out", True)
-        )
-        actuator_voxel_state["actuator_voxel_mode"] = actuator_stats.get(
-            "actuator_voxel_mode",
-            "unknown",
-        )
-
-        self.last_actuator_voxel_state = actuator_voxel_state
-        try:
-            setattr(self.args, "_last_actuator_voxel_state", self.last_actuator_voxel_state)
-        except Exception:
-            pass
-        
-        actuator_voxel_state = {
-            key: actuator_stats.get(key, None)
-            for key in (
-                "initial_voxel_coords",
-                "final_voxel_coords",
-                "final_voxel_weights",
-                "voxel_step",
-                "voxel_offset",
-            )
-            if actuator_stats.get(key, None) is not None
-        }
-        actuator_voxel_state["final_voxel_update_mode"] = actuator_stats.get(
-            "final_voxel_update_mode",
-            "unknown",
-        )
-        actuator_voxel_state["final_voxel_recomputed_from_pts_out"] = bool(
-            actuator_stats.get("final_voxel_recomputed_from_pts_out", True)
-        )
-        actuator_voxel_state["actuator_voxel_mode"] = actuator_stats.get(
-            "actuator_voxel_mode",
-            "unknown",
-        )
-
-        self.last_actuator_voxel_state = actuator_voxel_state
-        try:
-            setattr(self.args, "_last_actuator_voxel_state", self.last_actuator_voxel_state)
-        except Exception:
-            pass
 
         if timing_enabled:
             self._sync_if_cuda_tensor(pts_xyz)
@@ -1123,6 +1104,20 @@ class Network(nn.Module):
                 active_policy_count = sum(1 for value in policy_argmax_counts.values() if value > 0)
                 structure_local_recomputed = bool(structure.get("local_recomputed", False))
                 self.last_structure_debug = {
+                    "actuator_voxel_state_saved": bool(
+                        isinstance(getattr(self.args, "_last_actuator_voxel_state", None), dict)
+                    ),
+                    "actuator_final_voxel_state_available": bool(
+                        isinstance(getattr(self.args, "_last_actuator_voxel_state", None), dict)
+                        and getattr(self.args, "_last_actuator_voxel_state", {}).get("final_voxel_coords", None) is not None
+                    ),
+                    "final_voxel_update_mode": actuator_stats.get(
+                        "final_voxel_update_mode",
+                        "unknown",
+                    ),
+                    "final_voxel_recomputed_from_pts_out": bool(
+                        actuator_stats.get("final_voxel_recomputed_from_pts_out", True)
+                    ),
                     "actuator_full_octree_context_available": bool(actuator_stats.get("full_octree_context_available", False)),
                     "actuator_parent_occupancy_code": int(actuator_stats.get("actuator_parent_occupancy_code", 0)),
                     "actuator_sibling_count": int(actuator_stats.get("actuator_sibling_count", 0)),

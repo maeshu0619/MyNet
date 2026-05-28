@@ -9,8 +9,8 @@ from cfgs.utils import str2bool
 pretrained_date = "20260524" 
 pretrained_time = "230456"
 
-surrogate_date = "20260528"
-surrogate_time = "1950555"
+surrogate_date = "20260524"
+surrogate_time = "230456"
 
 model_date = "20260524"
 model_time = "230456"
@@ -238,6 +238,19 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--dataset_name', default=dataset_name, type=str, help='データセット内シーケンスの名称')
     parser.add_argument('--more_training', default=True, type=str2bool, help='学習済みモデルの途中から訓練を再開するか否か')
 
+    parser.add_argument(
+        '--repair_operation_amount_logit_weight',
+        default=1e-4,
+        type=float,
+        help='amount head の raw logit を目標操作割合のlogitへ寄せる補助損失重み',
+    )
+    parser.add_argument(
+        '--repair_operation_amount_logit_scale',
+        default=6.0,
+        type=float,
+        help='amount ratio計算時のlogit制限スケール。sigmoid飽和を抑える',
+    )
+
     """ネットワーク条件"""
     # Network
     parser.add_argument('--encoder_0grad', default=True, type=str2bool, help='Encoderを学習対象にするかどうか')
@@ -299,6 +312,8 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--disp_mag_bias', default=-1.0, type=float, help='移動量の初期バイアス')
     parser.add_argument('--disp_gate_bias', default=0.0, type=float, help='ゲートの初期バイアス')
     parser.add_argument('--disp_soft_match_tau', default=0.05, type=float, help='soft top-kの温度パラメータ')
+
+
     # Analyzer
     parser.add_argument('--octree_qlevel', type=int, default=12,help='Octree量子化レベル')
     parser.add_argument('--octree_ctx_level', type=int, default=5,help='Octreeコンテキストの深さ')
@@ -462,10 +477,10 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--cp_log_grad_terms', default=True, type=str2bool, help='compression_primaryの各loss項のrequires_grad/finiteをログするか')
     parser.add_argument('--w_geom',     default=10**4, type=float, help='幾何損失ブロック全体の重み')
     parser.add_argument('--geom_d2_weight', default=0.2, type=float, help='loss_type=cd+d2 のときの D2PSNR 報酬項の重み')
-    parser.add_argument('--w_com',      default=20, type=float, help='圧縮損失ブロック全体の重み（actual/surrogate backendでは total-bit 差[%%] に直接掛かる）')
+    parser.add_argument('--w_com',      default=10, type=float, help='圧縮損失ブロック全体の重み（actual/surrogate backendでは total-bit 差[%%] に直接掛かる）')
     parser.add_argument('--w_attr',     default=1, type=float, help='原因分解損失ブロック全体の重み')
     parser.add_argument('--w_policy',   default=1, type=float, help='構造修復ポリシー損失ブロック全体の重み')
-    parser.add_argument('--w_actuator', default=1, type=float, help='構造修復アクチュエータ正則化損失ブロック全体の重み')
+    parser.add_argument('--w_actuator', default=0.05, type=float, help='構造修復アクチュエータ正則化損失ブロック全体の重み')
     parser.add_argument('--w_prun',     default=None, type=float, help='旧名: --w_attr の後方互換alias')
     parser.add_argument('--w_add',      default=None, type=float, help='旧名: --w_policy の後方互換alias')
     parser.add_argument('--w_dis',      default=None, type=float, help='旧名: --w_actuator の後方互換alias')
@@ -911,6 +926,17 @@ def parse_pugan_args(parser, file_day, file_time):
             args.more_training_ckpt = str(Path(os.path.expanduser(args.more_training_ckpt)).resolve())
     else:
         args.more_training_ckpt = ""
+
+    args.repair_operation_amount_logit_weight = max(
+        float(getattr(args, "repair_operation_amount_logit_weight", 0.05)),
+        0.0,
+    )
+    args.repair_operation_amount_logit_scale = max(
+        float(getattr(args, "repair_operation_amount_logit_scale", 6.0)),
+        1e-6,
+    )
+    args.w_com = max(float(getattr(args, "w_com", 10.0)), 0.0)
+    
 
     args._add_cli_provided = _cli_option_was_provided("--add")
     args._use_amp_cli_provided = _cli_option_was_provided("--use_amp")
@@ -1419,6 +1445,7 @@ def parse_pugan_args(parser, file_day, file_time):
         float(getattr(args, "repair_operation_amount_consistency_weight", 1.0)),
         0.0,
     )
+    
     # 学習初期のPrune/Add/Adjust実行量探索率を0-1へ収める。
     args.repair_drop_amount_random_mix_start = min(max(float(getattr(args, "repair_drop_amount_random_mix_start", 0.35)), 0.0), 1.0)
     args.repair_drop_amount_random_mix_end = min(max(float(getattr(args, "repair_drop_amount_random_mix_end", 0.0)), 0.0), 1.0)

@@ -169,6 +169,10 @@ class ProxyCompressionLossMixin:
         L_com = L_com + L_sparse_objective
         sparse_aux_uses_voxel_state = sparse_terms.get("sparsepcgc_aux_uses_actuator_voxel_state", None)
         sparse_aux_recomputed = sparse_terms.get("sparsepcgc_aux_final_voxel_recomputed_from_pts_out", None)
+        sparse_aux_hard_value_uses_voxel_state = sparse_terms.get(
+            "sparsepcgc_aux_hard_value_uses_actuator_voxel_state",
+            None,
+        )
         if use_ste_hard:
             L_com_surrogate, L_bit_surrogate, L_nodes_surrogate, L_single_surrogate = self._compression_terms_from_proxy(
                 out_surrogate,
@@ -224,6 +228,27 @@ class ProxyCompressionLossMixin:
             float(rate_gt) / self._positive_count(gt_point_count),
         )
         self.last_compression_debug = {
+            "sparsepcgc_aux_hard_value_uses_actuator_voxel_state": bool(
+                float(sparse_aux_hard_value_uses_voxel_state.detach().cpu()) > 0.5
+            ) if torch.is_tensor(sparse_aux_hard_value_uses_voxel_state) else False,
+            "sparsepcgc_aux_hard_value_active_before": self._scalar(
+                sparse_terms.get("sparsepcgc_aux_hard_value_active_before", gen_xyz.new_zeros(())).detach()
+            ),
+            "sparsepcgc_aux_hard_value_active_after": self._scalar(
+                sparse_terms.get("sparsepcgc_aux_hard_value_active_after", gen_xyz.new_zeros(())).detach()
+            ),
+            "sparsepcgc_aux_hard_value_isolated_before": self._scalar(
+                sparse_terms.get("sparsepcgc_aux_hard_value_isolated_before", gen_xyz.new_zeros(())).detach()
+            ),
+            "sparsepcgc_aux_hard_value_isolated_after": self._scalar(
+                sparse_terms.get("sparsepcgc_aux_hard_value_isolated_after", gen_xyz.new_zeros(())).detach()
+            ),
+            "sparsepcgc_aux_hard_value_density_before": self._scalar(
+                sparse_terms.get("sparsepcgc_aux_hard_value_density_before", gen_xyz.new_zeros(())).detach()
+            ),
+            "sparsepcgc_aux_hard_value_density_after": self._scalar(
+                sparse_terms.get("sparsepcgc_aux_hard_value_density_after", gen_xyz.new_zeros(())).detach()
+            ),
             "metric": self._compression_rate_metric(args),
             "total_bit": self._scalar(loss_total_bit),
             "compression_objective": self._scalar(L_com.detach()),

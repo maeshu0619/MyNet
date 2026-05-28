@@ -350,12 +350,53 @@ class CompressionLossMixin:
         single_term = 100.0 * (single_gen - single_ref) / single_ref
         entropy_term = 100.0 * (entropy_gen - q_ref[2]) / entropy_ref
         density_term = 100.0 * (density_gen - q_ref[4]) / density_ref
+        aux_hard_value_uses_actuator_voxel_state = False
+        hard_terms = None
+
         clip = float(getattr(args, "sparsepcgc_aux_reward_clip", 50.0))
+
+        # まずsoft側をclipする。
+        # このsoft値はbackward勾配を担うため、後段clampで勾配を潰さないようにする。
         if clip > 0.0:
-            active_term = active_term.clamp(-clip, clip)
-            single_term = single_term.clamp(-clip, clip)
+            active_soft_term = active_term.clamp(-clip, clip)
+            single_soft_term = single_term.clamp(-clip, clip)
             entropy_term = entropy_term.clamp(-clip, clip)
-            density_term = density_term.clamp(-clip, clip)
+            density_soft_term = density_term.clamp(-clip, clip)
+        else:
+            active_soft_term = active_term
+            single_soft_term = single_term
+            density_soft_term = density_term
+
+        if voxel_state is not None and bool(getattr(args, "sparsepcgc_aux_use_actuator_hard_value", True)):
+            hard_terms = self._sparsepcgc_aux_hard_terms_from_voxel_state(
+                args,
+                voxel_state=voxel_state,
+                gen_xyz=gen_xyz,
+                gt_xyz=gt_xyz,
+            )
+
+            # hard側もforward値として同じ範囲にclipする。
+            if clip > 0.0:
+                active_hard_term = hard_terms["active"].clamp(-clip, clip)
+                single_hard_term = hard_terms["single"].clamp(-clip, clip)
+                density_hard_term = hard_terms["density"].clamp(-clip, clip)
+            else:
+                active_hard_term = hard_terms["active"]
+                single_hard_term = hard_terms["single"]
+                density_hard_term = hard_terms["density"]
+
+            # Forward値はActuator後hard voxel統計。
+            # Backward勾配はsoft feature近似から借りる。
+            active_term = active_hard_term + (active_soft_term - active_soft_term.detach())
+            single_term = single_hard_term + (single_soft_term - single_soft_term.detach())
+            density_term = density_hard_term + (density_soft_term - density_soft_term.detach())
+
+            # entropy_termはfinal_voxel_coordsだけでは定義しにくいためsoft近似のまま残す。
+            aux_hard_value_uses_actuator_voxel_state = True
+        else:
+            active_term = active_soft_term
+            single_term = single_soft_term
+            density_term = density_soft_term
         loss = (
             float(getattr(args, "sparsepcgc_active_coord_weight", 0.60)) * active_term
             + float(getattr(args, "sparsepcgc_isolated_proxy_weight", 0.25)) * single_term
@@ -398,6 +439,39 @@ class CompressionLossMixin:
             "sparsepcgc_aux_final_voxel_recomputed_from_pts_out": gen_xyz.new_tensor(
                 float(bool(voxel_state.get("final_voxel_recomputed_from_pts_out", True))) if voxel_state is not None else 1.0
             ).detach(),
+            "sparsepcgc_aux_hard_value_uses_actuator_voxel_state": gen_xyz.new_tensor(
+                float(aux_hard_value_uses_actuator_voxel_state)
+            ).detach(),
+            "sparsepcgc_aux_hard_value_active_before": (
+                hard_terms["before_active"].detach()
+                if hard_terms is not None
+                else active_ref.detach()
+            ),
+            "sparsepcgc_aux_hard_value_active_after": (
+                hard_terms["after_active"].detach()
+                if hard_terms is not None
+                else active_gen.detach()
+            ),
+            "sparsepcgc_aux_hard_value_isolated_before": (
+                hard_terms["before_isolated"].detach()
+                if hard_terms is not None
+                else single_ref.detach()
+            ),
+            "sparsepcgc_aux_hard_value_isolated_after": (
+                hard_terms["after_isolated"].detach()
+                if hard_terms is not None
+                else single_gen.detach()
+            ),
+            "sparsepcgc_aux_hard_value_density_before": (
+                hard_terms["before_density"].detach()
+                if hard_terms is not None
+                else density_ref.detach()
+            ),
+            "sparsepcgc_aux_hard_value_density_after": (
+                hard_terms["after_density"].detach()
+                if hard_terms is not None
+                else density_gen.detach()
+            ),
         }
 
     def _get_cached_actual_gt(self, cache_key):
@@ -879,6 +953,55 @@ class CompressionLossMixin:
             and str(getattr(args, "trainORtest", "train")).strip().lower() == "train"
             and not bool(getattr(args, "_surrogate_pretrain_active", False))
         )
+    
+    def _sparsepcgc_aux_hard_terms_from_voxel_state(self, args, voxel_state, gen_xyz, gt_xyz):
+        # Actuator後のfinal_voxel_coordsからSparsePCGC aux用のhard統計を作る。
+        # これはforward値の基準に使う。Hard統計なので、この値自体には勾配を期待しない。
+        before = self._sparsepcgc_hard_stats_batch(args, gt_xyz, final_w=None)
+        after = self._sparsepcgc_hard_stats_from_voxel_state(args, voxel_state)
+
+        device = gen_xyz.device
+        dtype = gen_xyz.dtype
+
+        active_ref_raw = float(before.get("active", 0))
+        isolated_ref_raw = float(before.get("isolated", 0))
+        density_ref_raw = float(before.get("local_density_var", 0.0))
+
+        active_after = float(after.get("active", 0))
+        isolated_after = float(after.get("isolated", 0))
+        density_after = float(after.get("local_density_var", 0.0))
+
+        active_denom = max(abs(active_ref_raw), 1.0)
+        isolated_denom = max(abs(isolated_ref_raw), 1.0)
+        density_denom = max(abs(density_ref_raw), 1e-6)
+
+        active_term = torch.tensor(
+            100.0 * (active_after - active_ref_raw) / active_denom,
+            device=device,
+            dtype=dtype,
+        )
+        single_term = torch.tensor(
+            100.0 * (isolated_after - isolated_ref_raw) / isolated_denom,
+            device=device,
+            dtype=dtype,
+        )
+        density_term = torch.tensor(
+            100.0 * (density_after - density_ref_raw) / density_denom,
+            device=device,
+            dtype=dtype,
+        )
+
+        return {
+            "active": active_term,
+            "single": single_term,
+            "density": density_term,
+            "before_active": torch.tensor(float(before.get("active", 0)), device=device, dtype=dtype),
+            "after_active": torch.tensor(float(after.get("active", 0)), device=device, dtype=dtype),
+            "before_isolated": torch.tensor(float(before.get("isolated", 0)), device=device, dtype=dtype),
+            "after_isolated": torch.tensor(float(after.get("isolated", 0)), device=device, dtype=dtype),
+            "before_density": torch.tensor(float(before.get("local_density_var", 0.0)), device=device, dtype=dtype),
+            "after_density": torch.tensor(float(after.get("local_density_var", 0.0)), device=device, dtype=dtype),
+        }
 
     def _get_compression_loss_actual_codec(
         self,

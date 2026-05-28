@@ -68,9 +68,9 @@ class StructureRepairActuator(nn.Module):
         nn.init.zeros_(self.add_head[-1].weight)
         nn.init.zeros_(self.add_voxel_head[-1].weight)
         nn.init.zeros_(self.add_voxel_head[-1].bias)
-        nn.init.zeros_(self.drop_amount_head.weight)
-        nn.init.zeros_(self.add_amount_head.weight)
-        nn.init.zeros_(self.move_amount_head.weight)
+        nn.init.normal_(self.drop_amount_head.weight, mean=0.0, std=1e-3)
+        nn.init.normal_(self.add_amount_head.weight, mean=0.0, std=1e-3)
+        nn.init.normal_(self.move_amount_head.weight, mean=0.0, std=1e-3)
         target_repair_ratio = float(
             getattr(self.args, "target_repair_ratio", getattr(self.args, "target_disp_ratio", 0.20))
         )
@@ -792,19 +792,36 @@ class StructureRepairActuator(nn.Module):
         return torch.log(prob / (1.0 - prob))
 
     def _learned_operation_ratio(self, actuator_features, head, max_ratio, random_mix_start, random_mix_end):
-        # 全点特徴を集約して、このStepでAdd/Adjustする割合を学習可能なTensorとして作る。
+        # 全点特徴を集約して、このStepでAdd/Adjust/Pruneする割合を作る。
+        # repair_learn_operation_amounts=False の場合でも、
+        # amount_head への勾配確認用に gradient-only 経路を残す。
         if max_ratio <= 0.0:
             return actuator_features.new_zeros((actuator_features.shape[0], 1, 1))
+
         pooled = actuator_features.mean(dim=2, keepdim=True)
+
+        # まず必ず amount head を通す。
+        # raw logit を軽く正規化し、sigmoid 飽和による amount_head 勾配消失を抑える。
+        raw_logit = head(pooled)
+        ratio_logit_scale = max(float(getattr(self.args, "repair_operation_amount_logit_scale", 6.0)), 1e-6)
+        bounded_logit = ratio_logit_scale * torch.tanh(raw_logit / ratio_logit_scale)
+        learned_ratio = torch.sigmoid(bounded_logit) * float(max_ratio)
+
         if bool(getattr(self.args, "repair_learn_operation_amounts", True)):
-            ratio = torch.sigmoid(head(pooled)) * float(max_ratio)
+            ratio = learned_ratio
         else:
-            ratio = pooled.new_full((pooled.shape[0], 1, 1), float(max_ratio))
+            # forward値は固定比率に近いままにし、backwardだけ learned_ratio へ流す。
+            # これにより、固定操作量モードでも amount_head の勾配が完全には切れない。
+            fixed_ratio = pooled.new_full((pooled.shape[0], 1, 1), float(max_ratio))
+            eps = float(getattr(self.args, "repair_amount_fixed_mode_grad_eps", 1e-3))
+            ratio = fixed_ratio + eps * (learned_ratio - learned_ratio.detach())
+
         # 学習初期だけランダム比率を混ぜ、Add/Adjust量の探索範囲を広げる。
         random_mix = min(max(self._annealed_value(random_mix_start, random_mix_end), 0.0), 1.0)
         if self.training and random_mix > 0.0:
             random_ratio = torch.rand_like(ratio) * float(max_ratio)
             ratio = (1.0 - random_mix) * ratio + random_mix * random_ratio
+
         return ratio.clamp(0.0, float(max_ratio))
 
     def _ratio_bias(self, ratio, max_ratio):
@@ -907,6 +924,24 @@ class StructureRepairActuator(nn.Module):
         if bool(all_invalid.any().item()):
             masked = torch.where(all_invalid[:, None], add_scores, masked)
         return masked
+
+    def _operation_amount_logit(self, actuator_features, head):
+        # amount head の raw logit を返す。
+        # ratio化後の sigmoid が飽和しても、logit側には直接勾配を残す。
+        pooled = actuator_features.mean(dim=2, keepdim=True)
+        return head(pooled)
+
+    def _target_ratio_logit(self, target_ratio, max_ratio, like_tensor):
+        # target_ratio / max_ratio を logit 空間へ写像する。
+        # ratio損失だけでは sigmoid 飽和時に勾配が消えるため、
+        # amount head の raw logit を直接目標へ寄せる補助教師として使う。
+        max_ratio = max(float(max_ratio), 1e-9)
+        target_prob = target_ratio / max_ratio
+        if not torch.is_tensor(target_prob):
+            target_prob = like_tensor.new_tensor(float(target_prob))
+        target_prob = target_prob.to(device=like_tensor.device, dtype=like_tensor.dtype)
+        target_prob = target_prob.clamp(1e-4, 1.0 - 1e-4)
+        return torch.log(target_prob / (1.0 - target_prob))
 
     def forward(
         self,
@@ -1061,6 +1096,19 @@ class StructureRepairActuator(nn.Module):
         context_voxel_coords = None
         if isinstance(octree_context, dict) and octree_context.get("global_voxel_coords", None) is not None:
             context_voxel_coords = octree_context["global_voxel_coords"]
+            if not (
+                isinstance(octree_context, dict)
+                and octree_context.get("global_voxel_coords", None) is not None
+            ):
+                if bool(getattr(self.args, "warn_missing_input_voxel", True)):
+                    global_step = getattr(self.args, "_global_train_step", "NA")
+                    sample_name = getattr(self.args, "_current_sample_name", "NA")
+                    print(
+                        f"[Warning] Voxel is NOT found! "
+                        f"Network input prebuilt Octree/Voxel was not passed to Actuator. "
+                        f"global_step={global_step}, sample={sample_name}, "
+                        f"fallback=local_recomputed"
+                    )
             if not torch.is_tensor(context_voxel_coords):
                 context_voxel_coords = torch.as_tensor(context_voxel_coords)
             context_voxel_coords = context_voxel_coords.to(device=pts_xyz.device, dtype=torch.long)
@@ -1171,6 +1219,23 @@ class StructureRepairActuator(nn.Module):
             "repair_drop_amount_random_mix_start",
             "repair_drop_amount_random_mix_end",
         )
+        # Prune量head用のSoft/Hard比較値を初期化する。
+        # PruneはVoxel単位で行うため、量の比較も点数ではなくVoxel数基準で行う。
+        drop_ratio_soft = pts_xyz.new_zeros(())
+        drop_ratio_hard = pts_xyz.new_zeros(())
+        drop_ratio_soft_batch = pts_xyz.new_zeros((B, 1, 1))
+        drop_ratio_hard_batch = pts_xyz.new_zeros((B, 1, 1))
+
+        drop_amount_supervision_loss = pts_xyz.new_zeros(())
+        drop_amount_soft_consistency_loss = pts_xyz.new_zeros(())
+
+        soft_drop_budget = pts_xyz.new_zeros((B, 1, 1))
+        valid_delete_voxel_count = pts_xyz.new_ones((B, 1, 1))
+
+        soft_drop_sum = pts_xyz.new_zeros(())
+        hard_drop_sum = pts_xyz.new_zeros(())
+        soft_drop_voxel_sum = pts_xyz.new_zeros(())
+        hard_drop_voxel_sum = pts_xyz.new_zeros(())
         # hard削除数は整数なので、学習比率の値だけを使ってVoxel選択数へ変換する。
         learned_drop_ratio_value = float(learned_drop_ratio.detach().mean().cpu()) if prune_enabled else 0.0
         delete_prior = torch.sigmoid(delete_prior.clamp(-8.0, 8.0))
@@ -1202,6 +1267,7 @@ class StructureRepairActuator(nn.Module):
             drop_prob_direct = torch.zeros_like(drop_prob_direct)
             drop_prob_proxy = torch.zeros_like(drop_prob_proxy)
         drop_prob = self._voxel_mean_logits(drop_prob, voxel_coords, voxel_cache=voxel_cache).clamp(0.0, 1.0)
+        drop_prob_raw_for_amount = drop_prob
         # 削除は点単位ではなくcodec量子化step上のleaf voxel単位で決める。
         # Octree occupancyはVoxelが1点でも残ると変わらないため、選択Voxel内の点をまとめて削除する。
         delete_candidate_mask = selection_bool.clone()
@@ -1210,6 +1276,50 @@ class StructureRepairActuator(nn.Module):
             delete_candidate_mask = delete_candidate_mask & (
                 voxel_point_counts.squeeze(1) <= float(delete_max_points)
             )
+        # Soft削除候補をHard削除候補と同じ候補集合に制限する。
+        # PruneはVoxel単位で削除するため、Soft側もVoxel単位の量として正規化する。
+        delete_candidate_weight = delete_candidate_mask.unsqueeze(1).to(dtype=drop_prob.dtype)
+
+        # voxel_point_counts は同一Voxel内の全点に同じ点数が入っている。
+        # 1 / voxel_point_counts を掛けてsumすると、点数ではなくVoxel数として数えられる。
+        voxel_count_weight = voxel_point_counts.to(device=drop_prob.device, dtype=drop_prob.dtype).clamp_min(1.0)
+        delete_candidate_voxel_weight = delete_candidate_weight / voxel_count_weight
+
+        # Soft削除score。
+        # drop_prob_raw_for_amount はVoxel平均後なので、同一Voxel内では同じ値になる。
+        soft_drop_prob_raw = drop_prob_raw_for_amount * delete_candidate_weight
+
+        # learned_drop_ratio をTensorのまま使い、削除候補Voxel数に対するSoft削除予算を作る。
+        # ここをdetach / float / itemにしないことが重要である。
+        learned_drop_ratio_for_budget = learned_drop_ratio.reshape(B, 1, 1).clamp(
+            0.0,
+            float(max_drop_ratio),
+        )
+
+        # 有効な削除候補Voxel数。
+        # 点数ではなくVoxel数基準で数える。
+        valid_delete_voxel_count = delete_candidate_voxel_weight.sum(dim=2, keepdim=True).clamp_min(1.0)
+
+        # Soft削除予算。
+        # 例：削除候補Voxelが1000個、learned_drop_ratio=0.1なら、100 voxel分を削除するSoft予算になる。
+        soft_drop_budget = learned_drop_ratio_for_budget * valid_delete_voxel_count
+        soft_drop_budget = torch.minimum(soft_drop_budget, valid_delete_voxel_count)
+
+        # raw softのVoxel質量をdetachして正規化係数にする。
+        # 分母をdetachすることで、総量方向の勾配を主に learned_drop_ratio / drop_amount_head に返す。
+        soft_drop_raw_voxel_sum_det = (
+            soft_drop_prob_raw.detach() * delete_candidate_voxel_weight
+        ).sum(dim=2, keepdim=True).clamp_min(1e-12)
+
+        # Soft削除量を learned_drop_ratio が決めるVoxel予算に合わせる。
+        # これにより「どのくらい削除するか」がVoxel数基準で学習対象になる。
+        soft_drop_prob = soft_drop_prob_raw * (soft_drop_budget / soft_drop_raw_voxel_sum_det)
+
+        # Hard比較・guard・STE用には0〜1に収めた値を使う。
+        # soft_drop_prob本体は予算正規化で1を超える場合があるため、
+        # Hardの0/1削除と比較する主指標には使わない。
+        # clamp後でも、1未満の範囲ではdrop_head / drop_amount_headへ勾配は流れる。
+        soft_drop_prob_for_guard = soft_drop_prob.clamp(0.0, 1.0)
         hard_drop_mask = self._hard_voxel_drop_mask(
             voxel_coords,
             drop_prob,
@@ -1220,8 +1330,54 @@ class StructureRepairActuator(nn.Module):
             voxel_cache=voxel_cache,
         )
         hard_drop = hard_drop_mask.to(dtype=pts_xyz.dtype)
-        drop_prob_st = hard_drop - drop_prob.detach() + drop_prob
+
+        # Hard forward + Soft backward のSTE。
+        # forwardではVoxel単位のhard_drop、backwardではsoft_drop_probを使う。
+        # これにより drop_head には「どこを削除するか」、
+        # drop_amount_head には「どのくらい削除するか」の勾配が戻る。
+        drop_prob_st = hard_drop - soft_drop_prob_for_guard.detach() + soft_drop_prob_for_guard
+
         keep_prob = (1.0 - drop_prob_st).clamp(0.0, 1.0)
+
+        # Soft/Hard削除量の監視値。
+        # point sum は実際に何点消えるかの確認用。
+        soft_drop_sum = soft_drop_prob_for_guard.detach().sum()
+        hard_drop_sum = hard_drop.detach().sum()
+
+        # voxel sum は、何Voxel分を削除するかの確認用。
+        # Hardは0/1なので、比較対象のSoftも0〜1に収めた値を使う。
+        # soft_drop_prob本体は予算正規化で1を超える場合があり、
+        # そのまま使うとdrop_ratio_softだけが過大になる。
+        soft_drop_voxel_mass_per_batch = (
+            soft_drop_prob_for_guard * delete_candidate_voxel_weight
+        ).sum(dim=2, keepdim=True)
+
+        hard_drop_voxel_mass_per_batch = (
+            hard_drop.detach() * delete_candidate_voxel_weight
+        ).sum(dim=2, keepdim=True)
+
+        soft_drop_voxel_sum = soft_drop_voxel_mass_per_batch.detach().sum()
+        hard_drop_voxel_sum = hard_drop_voxel_mass_per_batch.detach().sum()
+
+        # learned_drop_ratio は「削除候補Voxelのうち何割を削除するか」を表すため、
+        # drop_ratio_soft / drop_ratio_hard もVoxel数基準で計算する。
+        drop_ratio_soft_batch = soft_drop_voxel_mass_per_batch / valid_delete_voxel_count
+        drop_ratio_hard_batch = hard_drop_voxel_mass_per_batch / valid_delete_voxel_count
+
+        drop_ratio_soft = drop_ratio_soft_batch.mean()
+        drop_ratio_hard = drop_ratio_hard_batch.mean()
+
+        # drop_amount_head 専用の量一致損失。
+        # Hard削除量は教師値としてdetachし、learned_drop_ratio側だけに勾配を流す。
+        drop_amount_supervision_loss = (
+            drop_ratio_hard_batch.detach() - learned_drop_ratio
+        ).pow(2).mean()
+
+        # Soft削除量と learned_drop_ratio の整合性も補助的に見る。
+        drop_amount_soft_consistency_loss = (
+            drop_ratio_soft_batch.detach() - learned_drop_ratio
+        ).pow(2).mean()
+
         if timing_enabled:
             _mark_runtime("delete")
 
@@ -1260,6 +1416,27 @@ class StructureRepairActuator(nn.Module):
             "repair_move_amount_random_mix_start",
             "repair_move_amount_random_mix_end",
         )
+        # Adjust量head用のSoft/Hard比較値を初期化する。
+        # Adjustはsource voxel単位で行うため、量の比較もVoxel数基準で行う。
+        move_ratio_soft = pts_xyz.new_zeros(())
+        move_ratio_hard = pts_xyz.new_zeros(())
+        move_ratio_soft_batch = pts_xyz.new_zeros((B, 1, 1))
+        move_ratio_hard_batch = pts_xyz.new_zeros((B, 1, 1))
+
+        move_amount_supervision_loss = pts_xyz.new_zeros(())
+        move_amount_soft_consistency_loss = pts_xyz.new_zeros(())
+
+        soft_move_budget = pts_xyz.new_zeros((B, 1, 1))
+        valid_move_source_voxel_count = pts_xyz.new_ones((B, 1, 1))
+
+        soft_move_score = pts_xyz.new_zeros((B, 1, N))
+        soft_move_score_for_guard = pts_xyz.new_zeros((B, 1, N))
+        move_candidate_voxel_weight = pts_xyz.new_zeros((B, 1, N))
+
+        soft_move_sum = pts_xyz.new_zeros(())
+        hard_move_sum = pts_xyz.new_zeros(())
+        soft_move_voxel_sum = pts_xyz.new_zeros(())
+        hard_move_voxel_sum = pts_xyz.new_zeros(())
         # hard選択個数は整数なので、学習比率の値だけを使って選択数へ変換する。
         move_target_ratio = float(learned_move_ratio.detach().mean().cpu()) if disp_enabled else 0.0
         require_empty_move = bool(getattr(self.args, "repair_move_require_empty_target", True))
@@ -1320,18 +1497,62 @@ class StructureRepairActuator(nn.Module):
                 voxel_point_counts.squeeze(1) <= float(move_max_points)
             )
         move_candidate_mask = move_candidate_mask & has_valid_move_target.squeeze(1).to(dtype=torch.bool)
-        hard_move_mask = self._hard_voxel_drop_mask(
-            voxel_coords,
-            move_score,
-            target_drop_ratio=move_target_ratio,
-            max_drop_ratio=move_target_ratio,
-            selection_mask=move_candidate_mask.unsqueeze(1),
-            hard_threshold=float(getattr(self.args, "repair_move_hard_threshold", 0.5)),
-            voxel_cache=voxel_cache,
+        # Soft移動候補をHard移動候補と同じ候補集合に制限する。
+        # Adjustはsource voxel単位で行うため、Soft側もVoxel単位の量として正規化する。
+        move_candidate_weight = move_candidate_mask.unsqueeze(1).to(dtype=move_score.dtype)
+
+        # voxel_point_counts は同一Voxel内の全点に同じ点数が入っている。
+        # 1 / voxel_point_counts を掛けてsumすると、点数ではなくVoxel数として数えられる。
+        move_voxel_count_weight = voxel_point_counts.to(
+            device=move_score.device,
+            dtype=move_score.dtype,
+        ).clamp_min(1.0)
+
+        move_candidate_voxel_weight = move_candidate_weight / move_voxel_count_weight
+
+        # Soft移動score。
+        # move_score はVoxel平均後なので、同一Voxel内では同じ値になる。
+        soft_move_score_raw = move_score * move_candidate_weight
+
+        # learned_move_ratio をTensorのまま使い、移動候補Voxel数に対するSoft移動予算を作る。
+        # ここをdetach / float / itemにしないことが重要である。
+        learned_move_ratio_for_budget = learned_move_ratio.reshape(B, 1, 1).clamp(
+            0.0,
+            float(max_move_ratio),
         )
+
+        # 有効な移動候補source voxel数。
+        valid_move_source_voxel_count = move_candidate_voxel_weight.sum(
+            dim=2,
+            keepdim=True,
+        ).clamp_min(1.0)
+
+        # Soft移動予算。
+        # 例：移動候補Voxelが1000個、learned_move_ratio=0.1なら、100 voxel分をMoveするSoft予算になる。
+        soft_move_budget = learned_move_ratio_for_budget * valid_move_source_voxel_count
+        soft_move_budget = torch.minimum(soft_move_budget, valid_move_source_voxel_count)
+
+        # raw softのVoxel質量をdetachして正規化係数にする。
+        # 分母をdetachすることで、総量方向の勾配を主に learned_move_ratio / move_amount_head に返す。
+        soft_move_raw_voxel_sum_det = (
+            soft_move_score_raw.detach() * move_candidate_voxel_weight
+        ).sum(dim=2, keepdim=True).clamp_min(1e-12)
+
+        # Soft移動量を learned_move_ratio が決めるVoxel予算に合わせる。
+        # これにより「どのくらいAdjustするか」がVoxel数基準で学習対象になる。
+        soft_move_score = soft_move_score_raw * (soft_move_budget / soft_move_raw_voxel_sum_det)
+
+        # ============================================================
+        # Hard Moveは、方向guardを計算した後で作る。
+        # ここでは一旦ゼロで初期化する。
+        # guard前候補でHardを作ると、Soft側のguard後予算とズレる。
+        # ============================================================
+        hard_move_mask = torch.zeros((B, 1, N), device=pts_xyz.device, dtype=torch.bool)
         hard_move = hard_move_mask.to(dtype=pts_xyz.dtype)
-        move_mask = hard_move - move_score.detach() + move_score
-        move_mask = move_mask * keep_prob
+        raw_hard_move_bool = torch.zeros((B, N), device=pts_xyz.device, dtype=torch.bool)
+
+        move_mask = hard_move
+        move_mask_for_guard = move_mask
 
         move_logits = self.move_voxel_head(actuator_features)
         move_logits = self._voxel_mean_logits(move_logits, voxel_coords, voxel_cache=voxel_cache)
@@ -1360,8 +1581,9 @@ class StructureRepairActuator(nn.Module):
         move_selected_valid = (
             move_dir * move_valid_target.to(dtype=move_dir.dtype)
         ).sum(dim=1, keepdim=True)
+        # conflict系のguardは0〜1に収めたMove強度で計算する。
         quant_move_conflict_loss = self._masked_mean(
-            move_mask * (1.0 - move_selected_valid).clamp(0.0, 1.0),
+            move_mask_for_guard * (1.0 - move_selected_valid).clamp(0.0, 1.0),
             selection_mask,
         )
         selected_offsets = torch.einsum("bkn,kc->bcn", move_dir, neighbor_offsets)
@@ -1385,47 +1607,166 @@ class StructureRepairActuator(nn.Module):
             target_sparsepcgc_coords,
             source_sparsepcgc_coords,
         )
-        raw_hard_move_bool = hard_move_mask.squeeze(1).detach().to(dtype=torch.bool)
+        # ============================================================
+        # Adjust Hard/Softを同じguard後候補集合で作る
+        # ============================================================
+
+        # まず、guard前Hardをデバッグ用に作る。
+        # これは実行には使わず、raw_hard_move_countのログ専用である。
+        raw_hard_move_mask = self._hard_voxel_drop_mask(
+            voxel_coords,
+            move_score,
+            target_drop_ratio=move_target_ratio,
+            max_drop_ratio=move_target_ratio,
+            selection_mask=move_candidate_mask.unsqueeze(1),
+            hard_threshold=float(getattr(self.args, "repair_move_hard_threshold", 0.5)),
+            voxel_cache=voxel_cache,
+        )
+        raw_hard_move_bool = raw_hard_move_mask.squeeze(1).detach().to(dtype=torch.bool)
+
+        # target重複の確認用。
         target_first_unique_raw_mask = self._first_unique_selected_mask(
             target_sparsepcgc_coords,
             raw_hard_move_bool,
         )
         target_duplicate_reject_mask = raw_hard_move_bool & (~target_first_unique_raw_mask)
-        raw_move_mask_for_penalty = move_mask
+
+        # penalty計算用には、guard前Softを使う。
+        raw_move_mask_for_penalty = soft_move_score_for_guard
+
         empty_target_violation_loss = self._masked_mean(
-            raw_move_mask_for_penalty * target_existing_occupied_mask.unsqueeze(1).to(dtype=pts_xyz.dtype),
+            raw_move_mask_for_penalty
+            * target_existing_occupied_mask.unsqueeze(1).to(dtype=pts_xyz.dtype),
             selection_mask,
         )
         target_duplicate_voxel_loss = self._masked_mean(
-            raw_move_mask_for_penalty * target_duplicate_reject_mask.unsqueeze(1).to(dtype=pts_xyz.dtype),
+            raw_move_mask_for_penalty
+            * target_duplicate_reject_mask.unsqueeze(1).to(dtype=pts_xyz.dtype),
             selection_mask,
         )
+
         empty_target_guard_enabled = bool(
             sparsepcgc_context and getattr(self.args, "enable_sparsepcgc_empty_target_guard", False)
         )
         target_duplicate_guard_enabled = bool(
             sparsepcgc_context and getattr(self.args, "enable_sparsepcgc_target_duplicate_guard", False)
         )
-        move_allowed_bool = raw_hard_move_bool.clone()
+
+        # ------------------------------------------------------------
+        # ここでHard/Soft共通のguard後候補集合を作る。
+        # ------------------------------------------------------------
+        guarded_move_candidate_mask = move_candidate_mask.clone()
+
         empty_guard_reject_bool = torch.zeros_like(raw_hard_move_bool, dtype=torch.bool)
         duplicate_guard_reject_bool = torch.zeros_like(raw_hard_move_bool, dtype=torch.bool)
+
         if empty_target_guard_enabled:
-            # 既存occupied voxelへ入る移動は、点数潰れ診断用にpreserveへ戻す。
-            empty_guard_reject_bool = move_allowed_bool & target_existing_occupied_mask
-            move_allowed_bool = move_allowed_bool & (~target_existing_occupied_mask)
+            empty_guard_reject_bool = guarded_move_candidate_mask & target_existing_occupied_mask
+            guarded_move_candidate_mask = guarded_move_candidate_mask & (~target_existing_occupied_mask)
+
         if target_duplicate_guard_enabled:
-            # 同じtarget voxelに複数sourceが集まる場合は、最初の1点だけ移動を許可する。
-            target_first_unique_guard_mask = self._first_unique_selected_mask(
+            # Soft/Hard共通で、同じtarget voxelへ向かう候補は1つに絞る。
+            target_first_unique_candidate_mask = self._first_unique_selected_mask(
                 target_sparsepcgc_coords,
-                move_allowed_bool,
+                guarded_move_candidate_mask,
             )
-            duplicate_guard_reject_bool = move_allowed_bool & (~target_first_unique_guard_mask)
-            move_allowed_bool = move_allowed_bool & target_first_unique_guard_mask
-        guard_rejected_bool = raw_hard_move_bool & (~move_allowed_bool)
-        if empty_target_guard_enabled or target_duplicate_guard_enabled:
-            hard_move_mask = move_allowed_bool.unsqueeze(1)
-            hard_move = hard_move_mask.to(dtype=pts_xyz.dtype)
-            move_mask = move_mask * move_allowed_bool.unsqueeze(1).to(dtype=move_mask.dtype)
+            duplicate_guard_reject_bool = guarded_move_candidate_mask & (~target_first_unique_candidate_mask)
+            guarded_move_candidate_mask = guarded_move_candidate_mask & target_first_unique_candidate_mask
+
+        # guardで落ちた候補のログ用。
+        guard_rejected_bool = move_candidate_mask & (~guarded_move_candidate_mask)
+
+        # ------------------------------------------------------------
+        # Hard Moveをguard後候補から作り直す。
+        # これが最重要である。
+        # ------------------------------------------------------------
+        valid_move_source_voxel_count_effective = (
+            move_candidate_voxel_weight
+            * guarded_move_candidate_mask.unsqueeze(1).to(dtype=move_candidate_voxel_weight.dtype)
+        ).sum(dim=2, keepdim=True).clamp_min(1.0)
+
+        hard_move_mask = self._hard_voxel_drop_mask(
+            voxel_coords,
+            move_score,
+            target_drop_ratio=move_target_ratio,
+            max_drop_ratio=move_target_ratio,
+            selection_mask=guarded_move_candidate_mask.unsqueeze(1),
+            hard_threshold=float(getattr(self.args, "repair_move_hard_threshold", 0.5)),
+            voxel_cache=voxel_cache,
+        )
+        hard_move = hard_move_mask.to(dtype=pts_xyz.dtype)
+
+        # ------------------------------------------------------------
+        # Soft Moveも同じguard後候補から作る。
+        # ------------------------------------------------------------
+        move_allowed_weight = guarded_move_candidate_mask.unsqueeze(1).to(dtype=soft_move_score.dtype)
+
+        soft_move_score_effective_raw = soft_move_score * move_allowed_weight
+
+        soft_move_budget_effective = learned_move_ratio_for_budget * valid_move_source_voxel_count_effective
+        soft_move_budget_effective = torch.minimum(
+            soft_move_budget_effective,
+            valid_move_source_voxel_count_effective,
+        )
+
+        soft_move_effective_voxel_sum_det = (
+            soft_move_score_effective_raw.detach() * move_candidate_voxel_weight
+        ).sum(dim=2, keepdim=True).clamp_min(1e-12)
+
+        soft_move_score_effective = soft_move_score_effective_raw * (
+            soft_move_budget_effective / soft_move_effective_voxel_sum_det
+        )
+
+        # ------------------------------------------------------------
+        # Adjust = source Soft Prune + target Soft Add
+        # ------------------------------------------------------------
+        move_source_soft_delete = soft_move_score_effective.clamp(0.0, 1.0)
+        move_source_soft_keep = (1.0 - move_source_soft_delete).clamp(0.0, 1.0)
+        move_target_soft_add = move_source_soft_delete
+
+        # ------------------------------------------------------------
+        # Hard forward + Soft backward
+        # forwardはguard後Hard、backwardはguard後Soft。
+        # ------------------------------------------------------------
+        move_mask = hard_move - soft_move_score_effective.detach() + soft_move_score_effective
+
+        # Pruneで削除された点はAdjustしない。
+        move_mask = move_mask * keep_prob
+
+        soft_move_score_for_guard = soft_move_score_effective.clamp(0.0, 1.0)
+        move_mask_for_guard = move_mask.clamp(0.0, 1.0)
+
+        # ------------------------------------------------------------
+        # Soft/Hard量の統計をguard後基準で再計算する。
+        # ------------------------------------------------------------
+        soft_move_sum = soft_move_score_for_guard.detach().sum()
+        hard_move_sum = hard_move.detach().sum()
+
+        soft_move_voxel_mass_per_batch = (
+            soft_move_score_effective * move_candidate_voxel_weight
+        ).sum(dim=2, keepdim=True)
+
+        hard_move_voxel_mass_per_batch = (
+            hard_move.detach() * move_candidate_voxel_weight
+        ).sum(dim=2, keepdim=True)
+
+        soft_move_voxel_sum = soft_move_voxel_mass_per_batch.detach().sum()
+        hard_move_voxel_sum = hard_move_voxel_mass_per_batch.detach().sum()
+
+        move_ratio_soft_batch = soft_move_voxel_mass_per_batch / valid_move_source_voxel_count_effective
+        move_ratio_hard_batch = hard_move_voxel_mass_per_batch / valid_move_source_voxel_count_effective
+
+        move_ratio_soft = move_ratio_soft_batch.mean()
+        move_ratio_hard = move_ratio_hard_batch.mean()
+
+        move_amount_supervision_loss = (
+            move_ratio_hard_batch.detach() - learned_move_ratio
+        ).pow(2).mean()
+
+        move_amount_soft_consistency_loss = (
+            move_ratio_soft_batch.detach() - learned_move_ratio
+        ).pow(2).mean()
+
         primitive_delta = target_centers - pts_xyz
         delta = move_mask * primitive_delta
         pts_out = pts_xyz + delta
@@ -1440,10 +1781,17 @@ class StructureRepairActuator(nn.Module):
             & (move_target_voxel_coords == voxel_coords).all(dim=1)
         )
         moved_different_voxel_mask = hard_move_mask.squeeze(1) & (~same_voxel_move_mask)
+        # Actuator内部のVoxel状態を更新する。
+        # pts_outから再Voxel化せず、初期Voxelに対するMove結果として保持する。
+        final_voxel_coords_state = torch.where(
+            hard_move_mask.to(device=voxel_coords.device, dtype=torch.bool).expand_as(voxel_coords),
+            move_target_voxel_coords,
+            voxel_coords,
+        )
         if timing_enabled:
             _mark_runtime("adjust_move")
 
-        final_w = keep_prob
+        final_w = keep_prob * move_source_soft_keep
         max_add_ratio_value = self._max_add_ratio()
         # Addする割合を特徴から学習し、固定10%のような張り付きから外す。
         learned_add_ratio = self._learned_operation_ratio(
@@ -1473,9 +1821,27 @@ class StructureRepairActuator(nn.Module):
         add_direction_ce = pts_xyz.new_zeros(())
         add_prob = pts_xyz.new_zeros((B, 1, N))
         add_priority = add_prob
+        K_add = int(neighbor_offsets.shape[0])
+
+        add_ratio_soft = pts_xyz.new_zeros(())
+        add_ratio_hard = pts_xyz.new_zeros(())
+        add_amount_supervision_loss = pts_xyz.new_zeros(())
+        add_amount_soft_consistency_loss = pts_xyz.new_zeros(())
+
+        soft_add_budget = pts_xyz.new_zeros((B, 1))
+        soft_add_pair = pts_xyz.new_zeros((B, N * K_add))
+        hard_add_pair = pts_xyz.new_zeros((B, N * K_add))
         add_count_value = 0
         add_effective_count_value = 0
         add_target_voxel_count_value = 0
+        # ============================================================
+        # Addをtarget voxel単位で扱うためのSoft/Hard状態。
+        # 既存のadd_probはsource点単位に畳まれるため、Add量の主指標には使わない。
+        # ============================================================
+        add_target_soft_add = pts_xyz.new_zeros((B, 1, 0))
+        add_target_hard_add = pts_xyz.new_zeros((B, 1, 0))
+        add_target_add_st = pts_xyz.new_zeros((B, 1, 0))
+        add_target_voxel_coords = voxel_coords.new_empty((B, 3, 0))
         add_score_noise = max(
             self._annealed_value("repair_add_score_noise_start", "repair_add_score_noise_end"),
             0.0,
@@ -1523,9 +1889,69 @@ class StructureRepairActuator(nn.Module):
             # 追加は空Voxelを選んで、そのVoxel中心に点を置く。
             # 既存occupied voxelへ追加してもoccupancyが変わらず、Octree rateの改善信号が弱くなるため。
             valid_pair = empty_target_mask & base_valid.unsqueeze(2)
-            add_dir_logits = add_voxel_logits.permute(0, 2, 1).contiguous().masked_fill(~valid_pair, mask_value)
-            add_dir_target_logits = (-offset_norm.to(dtype=add_dir_logits.dtype).view(1, 1, -1)).expand_as(add_dir_logits)
-            add_dir_target_logits = add_dir_target_logits.masked_fill(~valid_pair, mask_value)
+            candidate_base_voxels_long = voxel_coords.transpose(1, 2).contiguous().unsqueeze(2)  # [B, N, 1, 3]
+            candidate_offsets_long = neighbor_offsets_long.view(1, 1, -1, 3)                    # [1, 1, K, 3]
+            candidate_target_voxels_long = candidate_base_voxels_long + candidate_offsets_long  # [B, N, K, 3]
+
+            candidate_target_voxels_flat = (
+                candidate_target_voxels_long
+                .reshape(B, -1, 3)
+                .transpose(1, 2)
+                .contiguous()
+            )  # [B, 3, N*K]
+
+            unique_target_pair_mask = (
+                self._first_unique_coord_mask(candidate_target_voxels_flat)
+                .view(B, N, -1)
+            )
+
+            valid_pair = valid_pair & unique_target_pair_mask
+
+            # ============================================================
+            # Addは必ず「現在のHard状態で空のtarget voxel」だけを候補にする。
+            # empty_target_maskは初期voxel_coords基準なので、
+            # Prune/Adjust後のfinal_voxel_coords_stateに対しても空であるか確認する。
+            # ============================================================
+            add_hardening_threshold = float(
+                getattr(
+                    self.args,
+                    "operation_count_drop_threshold",
+                    getattr(self.args, "test_drop_threshold", 0.5),
+                )
+            )
+            current_keep_for_add = final_w.detach().squeeze(1) >= add_hardening_threshold
+
+            current_empty_target_pair_mask = torch.zeros_like(valid_pair, dtype=torch.bool)
+            for b in range(B):
+                current_occ_coords = final_voxel_coords_state[b].transpose(0, 1).contiguous()
+                current_occ_coords = current_occ_coords[current_keep_for_add[b]]
+
+                candidate_targets_b = candidate_target_voxels_long[b].reshape(-1, 3).contiguous()
+
+                if current_occ_coords.numel() == 0:
+                    current_empty_target_pair_mask[b] = True
+                else:
+                    occupied_now = self._coords_membership(
+                        candidate_targets_b,
+                        current_occ_coords,
+                    ).view(N, K_add)
+                    current_empty_target_pair_mask[b] = ~occupied_now
+
+            valid_pair = valid_pair & current_empty_target_pair_mask
+
+            # AMP/float16環境では、float32の最小値(-3e38)をhalf Tensorへ入れるとoverflowする。
+            # そのため、masked_fillに使う負値は、必ず対象Tensor自身のdtypeから作る。
+            add_dir_logits = add_voxel_logits.permute(0, 2, 1).contiguous()
+            add_dir_mask_value = torch.finfo(add_dir_logits.dtype).min
+            add_dir_logits = add_dir_logits.masked_fill(~valid_pair, add_dir_mask_value)
+
+            add_dir_target_logits = (
+                -offset_norm.to(dtype=add_dir_logits.dtype).view(1, 1, -1)
+            ).expand_as(add_dir_logits)
+            add_dir_target_logits = add_dir_target_logits.masked_fill(
+                ~valid_pair,
+                add_dir_mask_value,
+            )
             add_dir_target = torch.softmax(add_dir_target_logits, dim=2).detach()
             add_direction_ce_per_point = -(
                 add_dir_target * torch.log_softmax(add_dir_logits, dim=2)
@@ -1537,8 +1963,8 @@ class StructureRepairActuator(nn.Module):
             valid_counts = valid_pair.reshape(B, -1).sum(dim=1)
             effective_add_k = min(int(add_k), int(valid_counts.min().detach().cpu().item()))
             if effective_add_k > 0:
-                mask_value = torch.finfo(pair_logits.dtype).min
-                pair_scores = pair_logits.masked_fill(~valid_pair, mask_value).reshape(B, -1)
+                pair_mask_value = torch.finfo(pair_logits.dtype).min
+                pair_scores = pair_logits.masked_fill(~valid_pair, pair_mask_value).reshape(B, -1)
                 top_pair_values, top_pair_idx = torch.topk(
                     pair_scores.detach(),
                     k=effective_add_k,
@@ -1583,14 +2009,49 @@ class StructureRepairActuator(nn.Module):
 
                 tau = max(float(getattr(self.args, "add_soft_match_tau", 0.05)), 1e-6)
                 threshold = top_threshold
-                soft_add_pair = torch.sigmoid((pair_scores - threshold) / tau)
-                soft_add_pair = soft_add_pair * valid_pair.reshape(B, -1).to(dtype=soft_add_pair.dtype)
-                hard_ratio = hard_add_pair.mean(dim=1, keepdim=True)
-                soft_mean = soft_add_pair.mean(dim=1, keepdim=True).detach().clamp_min(1e-12)
-                soft_add_pair = (soft_add_pair * (hard_ratio / soft_mean)).clamp(0.0, 1.0)
+
+                valid_pair_flat = valid_pair.reshape(B, -1).to(dtype=pair_scores.dtype)
+
+                # pairごとのSoft追加確率。
+                # これは「どのVoxelへ追加するか」のSoft表現であり、add_head / add_voxel_headへ勾配を返す。
+                soft_add_pair_raw = torch.sigmoid((pair_scores - threshold) / tau)
+                soft_add_pair_raw = soft_add_pair_raw * valid_pair_flat
+
+                # add_amount_head が出した learned_add_ratio をTensorのまま使い、
+                # このStepで全体のうち何割をAddするかのSoft予算にする。
+                learned_add_ratio_for_budget = learned_add_ratio.reshape(B, 1).clamp(
+                    0.0,
+                    float(max_add_ratio_value),
+                )
+
+                # N点に対する追加数のSoft予算。
+                # 例：N=29066, learned_add_ratio=0.0115 なら約334点分のSoft予算。
+                soft_add_budget = learned_add_ratio_for_budget * float(N)
+
+                # 有効候補数を超えないようにする。
+                valid_pair_count = valid_pair_flat.sum(dim=1, keepdim=True).clamp_min(1.0)
+                soft_add_budget = torch.minimum(soft_add_budget, valid_pair_count)
+
+                # raw Soft値の合計をdetachして正規化係数にする。
+                # 分母をdetachすることで、Soft総量の主な勾配を learned_add_ratio に返す。
+                soft_add_raw_sum_det = soft_add_pair_raw.detach().sum(dim=1, keepdim=True).clamp_min(1e-12)
+
+                # Soft追加量を learned_add_ratio が決める予算に合わせる。
+                # これにより add_amount_head が「どのくらい追加するか」を学習対象にできる。
+                soft_add_pair = soft_add_pair_raw * (soft_add_budget / soft_add_raw_sum_det)
+                soft_add_pair = soft_add_pair.clamp(0.0, 1.0)
+
+                # ============================================================
+                # pair全体のSTEは補助的なsource側可視化にだけ使う。
+                # Addの実操作量は、後でtop-k selected target voxel単位で作る。
+                # ============================================================
                 add_pair_st = hard_add_pair - soft_add_pair.detach() + soft_add_pair
-                add_pair_st = add_pair_st.view(B, N, -1)
-                add_prob = add_pair_st.sum(dim=2, keepdim=True).transpose(1, 2).clamp(0.0, 1.0)
+                add_pair_st_view = add_pair_st.view(B, N, -1)
+
+                # add_probはsource点単位に畳まれるため、Add量の主指標にはしない。
+                # shape guard / quant guard用の補助信号としてだけ使う。
+                add_prob = add_pair_st_view.sum(dim=2, keepdim=True).transpose(1, 2).clamp(0.0, 1.0)
+
                 pair_priority = torch.sigmoid(pair_logits.clamp(-8.0, 8.0))
                 add_priority = pair_priority.max(dim=2, keepdim=True).values.transpose(1, 2)
 
@@ -1605,25 +2066,81 @@ class StructureRepairActuator(nn.Module):
                 )
                 added_base = torch.gather(pts_out, 2, idx_expand_xyz)
                 added_delta = added_pts - added_base
-                selected_add_strength = torch.gather(pair_priority.reshape(B, -1), 1, top_pair_idx).unsqueeze(1)
-                selected_hard_add = torch.gather(hard_add_pair, 1, top_pair_idx).unsqueeze(1)
-                add_weight_mode = str(getattr(self.args, "repair_add_weight_mode", "hard")).strip().lower()
-                if add_weight_mode == "soft":
-                    added_w = selected_add_strength * selected_hard_add.detach()
-                else:
-                    added_w = selected_hard_add - selected_add_strength.detach() + selected_add_strength
+                selected_add_strength = torch.gather(
+                    pair_priority.reshape(B, -1),
+                    1,
+                    top_pair_idx,
+                ).unsqueeze(1)
+
+                selected_hard_add = torch.gather(
+                    hard_add_pair,
+                    1,
+                    top_pair_idx,
+                ).unsqueeze(1)
+
+                # Soft追加量をtop-kで選ばれたtarget voxel候補に対応させる。
+                # ここには learned_add_ratio / add_head / add_voxel_head への勾配が含まれる。
+                selected_soft_add = torch.gather(
+                    soft_add_pair,
+                    1,
+                    top_pair_idx,
+                ).unsqueeze(1)
+
+                # ============================================================
+                # Addをtarget voxel単位のHard/Soft近似として定義する。
+                # forwardではHardなtarget voxel追加、
+                # backwardではSoftなtarget voxel追加量を使う。
+                # ============================================================
+                add_target_soft_add = selected_soft_add.clamp(0.0, 1.0)
+                add_target_hard_add = selected_hard_add.to(dtype=add_target_soft_add.dtype)
+
+                add_target_add_st = (
+                    add_target_hard_add
+                    - add_target_soft_add.detach()
+                    + add_target_soft_add
+                )
+
+                # 追加先target voxel座標もtarget単位で保持する。
+                add_target_voxel_coords = selected_add_voxels_long
+
+                # final_wへ入れる追加点の重みはtarget voxel単位STEを使う。
+                added_w = add_target_add_st
 
                 pts_out = torch.cat([pts_out, added_pts], dim=2)
                 final_w = torch.cat([final_w, added_w], dim=2)
+                final_voxel_coords_state = torch.cat(
+                    [final_voxel_coords_state, selected_add_voxels_long],
+                    dim=2,
+                )
                 final_voxel_coords = torch.cat([final_voxel_coords, selected_add_voxels_long], dim=2)
 
-                add_ratio = added_w.sum() / max(float(B * N), 1.0)
+                # Soft上の追加率。
+                # Addはtarget voxel単位で扱うため、selected target voxelのSoft量を使う。
+                add_ratio_soft = add_target_soft_add.sum() / max(float(B * N), 1.0)
+
+                # Hard上の実追加率。
+                # 実際に追加したtarget voxel数を使う。
+                add_ratio_hard = add_target_hard_add.detach().sum() / max(float(B * N), 1.0)
+
+                # 既存の add_ratio は損失用としてSoft側に寄せる。
+                add_ratio = add_ratio_soft
                 target_add_ratio = pts_xyz.new_tensor(self._target_add_ratio_value() if add_enabled else 0.0)
                 if threshold_cap_mode:
                     max_add_ratio_t = pts_xyz.new_tensor(self._max_add_ratio())
                     add_ratio_loss = torch.relu(add_ratio - max_add_ratio_t).pow(2)
                 else:
                     add_ratio_loss = (add_ratio - target_add_ratio).pow(2)
+                # add_amount_head 専用の量一致損失。
+                # Hard実行量は教師値としてdetachし、learned_add_ratio側だけに勾配を流す。
+                add_amount_supervision_loss = (
+                    add_ratio_hard.detach() - learned_add_ratio.mean()
+                ).pow(2)
+
+                # Soft追加量と learned_add_ratio の整合性も見る。
+                # soft_add_pair は learned_add_ratio から作られるため、この項は補助的に小さく使う。
+                add_amount_soft_consistency_loss = (
+                    add_ratio_soft.detach() - learned_add_ratio.mean()
+                ).pow(2)
                 add_shape_guard = self._masked_mean(add_prob * shape_score, selection_mask)
                 quant_add_guard = self._masked_mean(
                     add_prob * (quant_score + sparse_score).clamp(0.0, 1.0),
@@ -1635,16 +2152,24 @@ class StructureRepairActuator(nn.Module):
                     (1.0 - selected_add_strength).pow(2) * selected_hard_add_det
                 ).sum() / selected_hard_add_det.sum().clamp_min(1.0)
                 added_delta_norm = torch.linalg.norm(added_delta, dim=1, keepdim=True) / voxel_norm.clamp_min(1e-12)
-                add_offset_reg = (added_delta_norm.pow(2) * added_w.detach()).sum() / added_w.detach().sum().clamp_min(1.0)
+                add_offset_reg = (
+                    added_delta_norm.pow(2) * add_target_add_st.detach()
+                ).sum() / add_target_add_st.detach().sum().clamp_min(1.0)
                 add_min_offset_loss = add_prob.new_zeros(())
-                add_count_value = int(selected_hard_add.detach().sum().item())
+                add_count_value = int(add_target_hard_add.detach().sum().item())
                 hardening_threshold = float(
-                    getattr(self.args, "operation_count_drop_threshold", getattr(self.args, "test_drop_threshold", 0.5))
+                    getattr(
+                        self.args,
+                        "operation_count_drop_threshold",
+                        getattr(self.args, "test_drop_threshold", 0.5),
+                    )
                 )
-                add_effective_count_value = int((added_w.detach() >= hardening_threshold).sum().item())
+                add_effective_count_value = int(
+                    (add_target_add_st.detach() >= hardening_threshold).sum().item()
+                )
                 add_target_voxel_count_value = self._unique_voxel_count(
-                    selected_add_voxels_long,
-                    (selected_hard_add.detach() >= hardening_threshold),
+                    add_target_voxel_coords,
+                    (add_target_hard_add.detach() >= hardening_threshold),
                 )
         if timing_enabled:
             _mark_runtime("add")
@@ -1733,14 +2258,16 @@ class StructureRepairActuator(nn.Module):
         else:
             ratio_loss = (repair_gate_mean - target_ratio) ** 2
         shape_guard = self._masked_mean(repair_gate * shape_score, selection_mask)
-        drop_ratio = self._masked_mean(drop_prob, selection_mask)
+        drop_ratio = drop_ratio_soft
         if threshold_cap_mode or bool(getattr(self.args, "repair_learn_operation_amounts", True)):
             # 操作量を学習する場合は固定削除率へ引っ張らず、静的上限だけを守る。
             drop_ratio_loss = torch.relu(drop_ratio - drop_ratio.new_tensor(float(max_drop_ratio))) ** 2
         else:
             drop_ratio_loss = (drop_ratio - target_drop_ratio) ** 2
         drop_cap_loss = torch.relu(drop_ratio - max_drop_ratio) ** 2
-        drop_shape_guard = self._masked_mean(drop_prob * shape_score, selection_mask)
+        # shape guardは0〜1に収めたSoft削除強度で計算する。
+        # STE本体のsoft_drop_probは量勾配用、guardは過大値を避けるためsoft_drop_prob_for_guardを使う。
+        drop_shape_guard = self._masked_mean(soft_drop_prob_for_guard * shape_score, selection_mask)
         prune_drop_signal = (0.25 * drop_prob_direct + 0.75 * drop_prob_proxy).clamp(0.0, 1.0)
         prune_keep_signal = (1.0 - prune_drop_signal).clamp(0.0, 1.0)
         leaf_delete_gain = (
@@ -1785,8 +2312,123 @@ class StructureRepairActuator(nn.Module):
         )
         drop_entropy = self._masked_mean(drop_entropy_point, selection_mask)
         soft_drop_mass = drop_prob_proxy.sum()
-        local_edit_guard = self._masked_mean((drop_prob + move_mask).clamp(0.0, 1.0) * shape_score, selection_mask)
-        move_ratio_soft = self._masked_mean(move_mask, selection_mask)
+        # Local guardは0〜1に収めたSoft削除強度とMove強度を使う。
+        local_edit_guard = self._masked_mean(
+            (soft_drop_prob_for_guard + move_mask_for_guard).clamp(0.0, 1.0) * shape_score,
+            selection_mask,
+        )
+        # ============================================================
+        # amount head へ確実に勾配を返すための直接量損失
+        # Hard/Soft操作量がdetachや正規化で勾配を失っても、
+        # learned_*_ratio 自体を目標操作量へ近づける経路を残す。
+        # ============================================================
+        drop_amount_target = learned_drop_ratio.new_tensor(
+            float(getattr(self.args, "target_drop_ratio", 0.01)) if prune_enabled else 0.0
+        ).clamp(0.0, float(max_drop_ratio))
+
+        move_amount_target = learned_move_ratio.new_tensor(
+            float(getattr(self.args, "target_move_ratio", getattr(self.args, "target_repair_ratio", getattr(self.args, "target_disp_ratio", 0.20)))) if disp_enabled else 0.0
+        ).clamp(0.0, float(max_move_ratio))
+
+        add_amount_target = learned_add_ratio.new_tensor(
+            float(self._target_add_ratio_value()) if add_enabled else 0.0
+        ).clamp(0.0, float(max_add_ratio_value))
+
+        # ============================================================
+        # amount head raw logit への直接補助損失
+        # ratio経由の損失は sigmoid 飽和時に amount_head 勾配が0になり得る。
+        # そのため、既存のSoft/Hard/STE経路は維持したまま、
+        # raw logitを目標ratioのlogitへ寄せる補助経路を追加する。
+        # ============================================================
+        drop_amount_logit = self._operation_amount_logit(
+            actuator_features,
+            self.drop_amount_head,
+        ).mean()
+
+        add_amount_logit = self._operation_amount_logit(
+            actuator_features,
+            self.add_amount_head,
+        ).mean()
+
+        move_amount_logit = self._operation_amount_logit(
+            actuator_features,
+            self.move_amount_head,
+        ).mean()
+
+        drop_amount_target_logit = self._target_ratio_logit(
+            drop_amount_target.detach(),
+            max_drop_ratio,
+            learned_drop_ratio,
+        )
+
+        add_amount_target_logit = self._target_ratio_logit(
+            add_amount_target.detach(),
+            max_add_ratio_value,
+            learned_add_ratio,
+        )
+
+        move_amount_target_logit = self._target_ratio_logit(
+            move_amount_target.detach(),
+            max_move_ratio,
+            learned_move_ratio,
+        )
+
+        operation_amount_logit_loss = (
+            (drop_amount_logit - drop_amount_target_logit.detach()).pow(2)
+            + (add_amount_logit - add_amount_target_logit.detach()).pow(2)
+            + (move_amount_logit - move_amount_target_logit.detach()).pow(2)
+        )
+
+        operation_amount_direct_loss = (
+            (learned_drop_ratio.mean() - drop_amount_target).pow(2)
+            + (learned_move_ratio.mean() - move_amount_target).pow(2)
+            + (learned_add_ratio.mean() - add_amount_target).pow(2)
+        )
+        if not hasattr(self, "_printed_amount_debug"):
+            print(
+                "[AmountDebug]",
+                "learn_amounts=", bool(getattr(self.args, "repair_learn_operation_amounts", True)),
+                "drop_req=", bool(learned_drop_ratio.requires_grad),
+                "move_req=", bool(learned_move_ratio.requires_grad),
+                "add_req=", bool(learned_add_ratio.requires_grad),
+                "direct_loss_req=", bool(operation_amount_direct_loss.requires_grad),
+                "direct_loss=", float(operation_amount_direct_loss.detach().cpu()),
+            )
+            self._printed_amount_debug = True
+        if not hasattr(self, "_printed_amount_grad_debug"):
+            amount_params = [
+                self.drop_amount_head.weight,
+                self.drop_amount_head.bias,
+                self.add_amount_head.weight,
+                self.add_amount_head.bias,
+                self.move_amount_head.weight,
+                self.move_amount_head.bias,
+            ]
+
+            amount_grads = torch.autograd.grad(
+                operation_amount_direct_loss,
+                amount_params,
+                retain_graph=True,
+                create_graph=False,
+                allow_unused=True,
+            )
+
+            def _grad_norm(g):
+                if g is None:
+                    return None
+                return float(g.detach().float().norm().cpu())
+
+            print(
+                "[AmountGradDebug:direct_loss]",
+                "drop_w=", _grad_norm(amount_grads[0]),
+                "drop_b=", _grad_norm(amount_grads[1]),
+                "add_w=", _grad_norm(amount_grads[2]),
+                "add_b=", _grad_norm(amount_grads[3]),
+                "move_w=", _grad_norm(amount_grads[4]),
+                "move_b=", _grad_norm(amount_grads[5]),
+            )
+
+            self._printed_amount_grad_debug = True
         # 各操作量headが実際のsoft操作率を追えるようにし、量headにも安定した勾配を渡す。
         operation_amount_consistency_loss = (
             (drop_ratio - learned_drop_ratio.mean()).pow(2)
@@ -1827,10 +2469,54 @@ class StructureRepairActuator(nn.Module):
             + float(getattr(self.args, "sparsepcgc_target_duplicate_penalty_weight", 0.0)) * target_duplicate_voxel_loss
             + float(getattr(self.args, "repair_local_guard_weight", 0.25)) * local_edit_guard
             + float(getattr(self.args, "repair_operation_amount_consistency_weight", 1.0)) * operation_amount_consistency_loss
+            + float(getattr(self.args, "repair_operation_amount_direct_weight", 10.0)) * operation_amount_direct_loss
+            + float(getattr(self.args, "repair_operation_amount_logit_weight", 0.05)) * operation_amount_logit_loss
             + float(getattr(self.args, "repair_soft_activity_weight", 1e-3)) * soft_activity_loss
             + float(getattr(self.args, "repair_move_direction_ce_weight", 1e-3)) * move_direction_ce
             + float(getattr(self.args, "repair_add_direction_ce_weight", 1e-3)) * add_direction_ce
+            # 量headを学習させるための専用損失。
+            # Hard実行量は教師、learned_*_ratio側は学習対象として扱う。
+            + float(getattr(self.args, "repair_drop_amount_supervision_weight", 1.0)) * drop_amount_supervision_loss
+            + float(getattr(self.args, "repair_drop_amount_soft_consistency_weight", 0.1)) * drop_amount_soft_consistency_loss
+            + float(getattr(self.args, "repair_move_amount_supervision_weight", 1.0)) * move_amount_supervision_loss
+            + float(getattr(self.args, "repair_move_amount_soft_consistency_weight", 0.1)) * move_amount_soft_consistency_loss
+            + float(getattr(self.args, "repair_add_amount_supervision_weight", 1.0)) * add_amount_supervision_loss
+            + float(getattr(self.args, "repair_add_amount_soft_consistency_weight", 0.1)) * add_amount_soft_consistency_loss
         )
+        if not hasattr(self, "_printed_amount_grad_debug_loss"):
+            amount_params = [
+                self.drop_amount_head.weight,
+                self.drop_amount_head.bias,
+                self.add_amount_head.weight,
+                self.add_amount_head.bias,
+                self.move_amount_head.weight,
+                self.move_amount_head.bias,
+            ]
+
+            amount_grads = torch.autograd.grad(
+                loss,
+                amount_params,
+                retain_graph=True,
+                create_graph=False,
+                allow_unused=True,
+            )
+
+            def _grad_norm(g):
+                if g is None:
+                    return None
+                return float(g.detach().float().norm().cpu())
+
+            print(
+                "[AmountGradDebug:actuator_loss]",
+                "drop_w=", _grad_norm(amount_grads[0]),
+                "drop_b=", _grad_norm(amount_grads[1]),
+                "add_w=", _grad_norm(amount_grads[2]),
+                "add_b=", _grad_norm(amount_grads[3]),
+                "move_w=", _grad_norm(amount_grads[4]),
+                "move_b=", _grad_norm(amount_grads[5]),
+            )
+
+            self._printed_amount_grad_debug_loss = True
         if timing_enabled:
             _mark_runtime("postprocess")
             runtime_timing["total"] = float(time.perf_counter() - runtime_start)
@@ -1864,45 +2550,180 @@ class StructureRepairActuator(nn.Module):
                     return float((a * b).sum().div(denom).cpu())
 
                 drop_hard_mean = _mf(hard_drop)
-                drop_soft_mean = _mf(drop_prob)
+
+                # 最終的なSoft削除量はsoft_drop_probだが、表示用平均は0〜1に収めた値を見る。
+                # drop_prob は位置score寄り、soft_drop_prob_for_guard は量headで予算化された削除強度である。
+                drop_soft_mean = _mf(soft_drop_prob_for_guard)
+                drop_score_soft_mean = _mf(drop_prob)
+
                 drop_proxy_mean = _mf(drop_prob_proxy)
                 drop_direct_mean = _mf(drop_prob_direct)
-                drop_abs_diff = _mf((hard_drop - drop_prob).abs())
-                drop_corr = _corr(hard_drop, drop_prob)
 
+                drop_abs_diff = _mf((hard_drop - soft_drop_prob_for_guard).abs())
+                drop_corr = _corr(hard_drop, soft_drop_prob_for_guard)
+
+                drop_ratio_soft_value = _mf(drop_ratio_soft)
+                drop_ratio_hard_value = _mf(drop_ratio_hard)
+
+                # 点数基準の差。
+                drop_amount_abs_diff = abs(_sf(soft_drop_prob_for_guard) - _sf(hard_drop))
+
+                # Voxel数基準の差。
+                drop_amount_voxel_abs_diff = abs(_sf(soft_drop_voxel_mass_per_batch) - _sf(hard_drop_voxel_mass_per_batch))
+                drop_amount_ratio_abs_diff = abs(drop_ratio_soft_value - drop_ratio_hard_value)
+
+                soft_drop_budget_mean = _mf(soft_drop_budget)
+
+                # 点数基準のsum。
+                soft_drop_sum_value = _sf(soft_drop_prob_for_guard)
+                hard_drop_sum_value = _sf(hard_drop)
+
+                # Voxel数基準のsum。
+                soft_drop_voxel_sum_value = _sf(soft_drop_voxel_mass_per_batch)
+                hard_drop_voxel_sum_value = _sf(hard_drop_voxel_mass_per_batch)
+
+                valid_delete_voxel_count_value = _sf(valid_delete_voxel_count)
+
+                # move_score は位置score寄り、soft_move_score_for_guard は量headで予算化されたMove強度である。
+                move_score_soft_mean = _mf(move_score)
+                move_soft_mean = _mf(soft_move_score_for_guard)
                 move_hard_mean = _mf(hard_move)
-                move_soft_mean = _mf(move_score)
-                move_mask_mean = _mf(move_mask)
-                move_abs_diff = _mf((hard_move - move_score).abs())
-                move_corr = _corr(hard_move, move_score)
+                move_mask_mean = _mf(move_mask_for_guard)
+
+                move_abs_diff = _mf((hard_move - soft_move_score_for_guard).abs())
+                move_corr = _corr(hard_move, soft_move_score_for_guard)
+
+                move_ratio_soft_value = _mf(move_ratio_soft)
+                move_ratio_hard_value = _mf(move_ratio_hard)
+
+                # 点数基準の差。
+                move_amount_abs_diff = abs(_sf(soft_move_score_for_guard) - _sf(hard_move))
+
+                # Voxel数基準の差。
+                move_amount_voxel_abs_diff = abs(
+                    _sf(soft_move_voxel_mass_per_batch) - _sf(hard_move_voxel_mass_per_batch)
+                )
+                move_amount_ratio_abs_diff = abs(move_ratio_soft_value - move_ratio_hard_value)
+
+                soft_move_budget_mean = _mf(soft_move_budget)
+
+                # 点数基準のsum。
+                soft_move_sum_value = _sf(soft_move_score_for_guard)
+                hard_move_sum_value = _sf(hard_move)
+
+                # Voxel数基準のsum。
+                soft_move_voxel_sum_value = _sf(soft_move_voxel_mass_per_batch)
+                hard_move_voxel_sum_value = _sf(hard_move_voxel_mass_per_batch)
+
+                valid_move_source_voxel_count_value = _sf(valid_move_source_voxel_count)
+                valid_move_source_voxel_count_effective_value = _sf(valid_move_source_voxel_count_effective)
 
                 move_dir_conf = _mf(move_probs.max(dim=1, keepdim=True).values)
                 move_dir_entropy = _mf(
                     -(move_probs.clamp_min(1e-8).log() * move_probs).sum(dim=1, keepdim=True)
                 )
 
-                add_soft_mean = _mf(add_prob)
-                add_soft_sum = _sf(add_prob)
+                # add_probはsource点単位に畳んだ補助信号。
+                # Add量の主比較はtarget voxel単位で見る。
+                add_soft_mean = _mf(add_target_soft_add)
+                add_soft_sum = _sf(add_target_soft_add)
+                add_ratio_soft_value = _mf(add_ratio_soft)
+                add_ratio_hard_value = _mf(add_ratio_hard)
+
+                add_amount_abs_diff = abs(
+                    _sf(add_target_soft_add) - _sf(add_target_hard_add)
+                )
+                add_amount_ratio_abs_diff = abs(add_ratio_soft_value - add_ratio_hard_value)
+                add_soft_budget_mean = _mf(soft_add_budget)
+
+                # pair単位は補助ログとして残す。
+                add_soft_pair_sum = _sf(soft_add_pair)
+                add_hard_pair_sum = _sf(hard_add_pair)
+
+                # target voxel単位の主ログ。
+                add_target_soft_add_sum = _sf(add_target_soft_add)
+                add_target_hard_add_sum = _sf(add_target_hard_add)
+                add_target_soft_hard_sum_abs_diff = abs(
+                    add_target_soft_add_sum - add_target_hard_add_sum
+                )
                 final_w_mean = _mf(final_w)
                 final_w_min = float(final_w.detach().float().amin().cpu()) if final_w.numel() > 0 else 0.0
                 final_w_max = float(final_w.detach().float().amax().cpu()) if final_w.numel() > 0 else 0.0
 
+                # ============================================================
+                # Adjustのguard後Soft/Hard比較
+                # ============================================================
+                # 既存のmove_soft_meanはguard前Softを見ている可能性がある。
+                # そのため、Hard実行に対応するguard後Softで比較する。
+                move_soft_effective_mean = _mf(soft_move_score_effective)
+                move_source_soft_keep_mean = _mf(move_source_soft_keep)
+                move_target_soft_add_mean = _mf(move_target_soft_add)
+
+                move_abs_diff_effective = _mf(
+                    (hard_move - soft_move_score_effective).abs()
+                )
+                move_corr_effective = _corr(
+                    hard_move,
+                    soft_move_score_effective,
+                )
+
+                raw_hard_move_mean = _mf(
+                    raw_hard_move_bool.to(dtype=pts_xyz.dtype).unsqueeze(1)
+                )
+
+                move_guard_reject_rate = (
+                    float(raw_hard_move_count_value - hard_move_count_value)
+                    / max(float(raw_hard_move_count_value), 1.0)
+                )
+
                 print(
                     "[ActuatorHardSoftCompare] "
                     f"drop_soft_mean={drop_soft_mean:.6f}, "
+                    f"drop_score_soft_mean={drop_score_soft_mean:.6f}, "
                     f"drop_hard_mean={drop_hard_mean:.6f}, "
                     f"drop_abs_diff={drop_abs_diff:.6f}, "
                     f"drop_corr={drop_corr:.6f}, "
                     f"drop_proxy_mean={drop_proxy_mean:.6f}, "
                     f"drop_direct_mean={drop_direct_mean:.6f}, "
+                    f"drop_ratio_soft={drop_ratio_soft_value:.6f}, "
+                    f"drop_ratio_hard={drop_ratio_hard_value:.6f}, "
+                    f"drop_amount_abs_diff={drop_amount_abs_diff:.6f}, "
+                    f"drop_amount_voxel_abs_diff={drop_amount_voxel_abs_diff:.6f}, "
+                    f"drop_amount_ratio_abs_diff={drop_amount_ratio_abs_diff:.6f}, "
+                    f"soft_drop_budget_mean={soft_drop_budget_mean:.6f}, "
+                    f"soft_drop_sum={soft_drop_sum_value:.6f}, "
+                    f"hard_drop_sum={hard_drop_sum_value:.6f}, "
+                    f"soft_drop_voxel_sum={soft_drop_voxel_sum_value:.6f}, "
+                    f"hard_drop_voxel_sum={hard_drop_voxel_sum_value:.6f}, "
+                    f"valid_delete_voxel_count={valid_delete_voxel_count_value:.6f}, "
                     f"hard_drop_count={hard_drop_count_value}, "
                     f"delete_target_voxel_count={delete_target_voxel_count_value}, "
                     f"delete_emptied_voxel_count={delete_emptied_voxel_count_value}, "
                     f"move_soft_mean={move_soft_mean:.6f}, "
+                    f"move_score_soft_mean={move_score_soft_mean:.6f}, "
                     f"move_hard_mean={move_hard_mean:.6f}, "
                     f"move_mask_mean={move_mask_mean:.6f}, "
                     f"move_abs_diff={move_abs_diff:.6f}, "
                     f"move_corr={move_corr:.6f}, "
+                    f"move_soft_effective_mean={move_soft_effective_mean:.6f}, "
+                    f"move_abs_diff_effective={move_abs_diff_effective:.6f}, "
+                    f"move_corr_effective={move_corr_effective:.6f}, "
+                    f"move_source_soft_keep_mean={move_source_soft_keep_mean:.6f}, "
+                    f"move_target_soft_add_mean={move_target_soft_add_mean:.6f}, "
+                    f"raw_hard_move_mean={raw_hard_move_mean:.6f}, "
+                    f"move_guard_reject_rate={move_guard_reject_rate:.6f}, "
+                    f"move_ratio_soft={move_ratio_soft_value:.6f}, "
+                    f"move_ratio_hard={move_ratio_hard_value:.6f}, "
+                    f"move_amount_abs_diff={move_amount_abs_diff:.6f}, "
+                    f"move_amount_voxel_abs_diff={move_amount_voxel_abs_diff:.6f}, "
+                    f"move_amount_ratio_abs_diff={move_amount_ratio_abs_diff:.6f}, "
+                    f"soft_move_budget_mean={soft_move_budget_mean:.6f}, "
+                    f"soft_move_sum={soft_move_sum_value:.6f}, "
+                    f"hard_move_sum={hard_move_sum_value:.6f}, "
+                    f"soft_move_voxel_sum={soft_move_voxel_sum_value:.6f}, "
+                    f"hard_move_voxel_sum={hard_move_voxel_sum_value:.6f}, "
+                    f"valid_move_source_voxel_count={valid_move_source_voxel_count_value:.6f}, "
+                    f"valid_move_source_voxel_count_effective={valid_move_source_voxel_count_effective_value:.6f}, "
                     f"hard_move_count={hard_move_count_value}, "
                     f"raw_hard_move_count={raw_hard_move_count_value}, "
                     f"move_dir_conf={move_dir_conf:.6f}, "
@@ -1912,6 +2733,16 @@ class StructureRepairActuator(nn.Module):
                     f"add_count={add_count_value}, "
                     f"add_effective_count={add_effective_count_value}, "
                     f"add_target_voxel_count={add_target_voxel_count_value}, "
+                    f"add_ratio_soft={add_ratio_soft_value:.6f}, "
+                    f"add_ratio_hard={add_ratio_hard_value:.6f}, "
+                    f"add_amount_abs_diff={add_amount_abs_diff:.6f}, "
+                    f"add_amount_ratio_abs_diff={add_amount_ratio_abs_diff:.6f}, "
+                    f"add_soft_budget_mean={add_soft_budget_mean:.6f}, "
+                    f"add_soft_pair_sum={add_soft_pair_sum:.6f}, "
+                    f"add_hard_pair_sum={add_hard_pair_sum:.6f}, "
+                    f"add_target_soft_add_sum={add_target_soft_add_sum:.6f}, "
+                    f"add_target_hard_add_sum={add_target_hard_add_sum:.6f}, "
+                    f"add_target_soft_hard_sum_abs_diff={add_target_soft_hard_sum_abs_diff:.6f}, "
                     f"learned_drop_ratio={_mf(learned_drop_ratio):.6f}, "
                     f"learned_move_ratio={_mf(learned_move_ratio):.6f}, "
                     f"learned_add_ratio={_mf(learned_add_ratio):.6f}, "
@@ -1932,6 +2763,18 @@ class StructureRepairActuator(nn.Module):
                 )
 
         self.debug_tensors = {
+            # AdjustをSoft Prune + Soft Addとして扱うための情報
+            "operation_amount_direct_loss": operation_amount_direct_loss,
+            "drop_amount_target": drop_amount_target.detach(),
+            "move_amount_target": move_amount_target.detach(),
+            "add_amount_target": add_amount_target.detach(),
+            "move_source_soft_delete": move_source_soft_delete,
+            "move_source_soft_keep": move_source_soft_keep,
+            "move_target_soft_add": move_target_soft_add,
+            "move_source_voxel_coords": voxel_coords,
+            "move_target_voxel_coords": move_target_voxel_coords,
+            "move_soft_score_effective": soft_move_score_effective,
+            "move_soft_value_mode": "soft_prune_source_and_soft_add_target",
             "full_octree_context_available": pts_xyz.new_tensor(float(full_context_available)).detach(),
             "actuator_parent_occupancy_code": pts_xyz.new_tensor(float(actuator_parent_occupancy_code)).detach(),
             "actuator_sibling_count": pts_xyz.new_tensor(float(actuator_sibling_count)).detach(),
@@ -1946,6 +2789,27 @@ class StructureRepairActuator(nn.Module):
             "add_priority_max": add_priority.max().detach() if add_priority.numel() > 0 else pts_xyz.new_zeros(()).detach(),
             "add_candidate_ratio": pts_xyz.new_tensor(float(add_candidate_ratio)).detach(),
             "add_candidate_count": pts_xyz.new_tensor(float(add_k)).detach(),
+            "add_ratio_soft": add_ratio_soft.detach(),
+            "add_ratio_hard": add_ratio_hard.detach(),
+            "add_amount_supervision_loss": add_amount_supervision_loss.detach(),
+            "add_amount_soft_consistency_loss": add_amount_soft_consistency_loss.detach(),
+            "add_soft_budget_mean": soft_add_budget.detach().mean(),
+            "add_soft_pair_sum": soft_add_pair.detach().sum(),
+            "add_hard_pair_sum": hard_add_pair.detach().sum(),
+            "add_soft_hard_sum_abs_diff": (soft_add_pair.detach().sum() - hard_add_pair.detach().sum()).abs(),
+            "add_soft_hard_ratio_abs_diff": (add_ratio_soft.detach() - add_ratio_hard.detach()).abs(),
+            # target voxel単位のAdd Hard/Soft状態。
+            # Addの主指標はこちらを使う。
+            "add_target_soft_add": add_target_soft_add.detach(),
+            "add_target_hard_add": add_target_hard_add.detach(),
+            "add_target_add_st": add_target_add_st.detach(),
+            "add_target_voxel_coords": add_target_voxel_coords.detach(),
+            "add_target_soft_add_sum": add_target_soft_add.detach().sum(),
+            "add_target_hard_add_sum": add_target_hard_add.detach().sum(),
+            "add_target_soft_hard_sum_abs_diff": (
+                add_target_soft_add.detach().sum()
+                - add_target_hard_add.detach().sum()
+            ).abs(),
             "learned_drop_ratio": learned_drop_ratio.mean().detach(),
             "learned_drop_prob": learned_drop_prob.detach(),
             "drop_prob_mean": drop_prob.mean().detach(),
@@ -2010,6 +2874,35 @@ class StructureRepairActuator(nn.Module):
             "move_ratio": hard_move.mean().detach(),
             "hard_move_count": pts_xyz.new_tensor(float(hard_move_count_value)).detach(),
             "move_score_mean": move_score.mean().detach(),
+            "move_ratio_soft": move_ratio_soft.detach(),
+            "move_ratio_hard": move_ratio_hard.detach(),
+            "move_ratio_soft_batch_mean": move_ratio_soft_batch.detach().mean(),
+            "move_ratio_hard_batch_mean": move_ratio_hard_batch.detach().mean(),
+            "move_amount_supervision_loss": move_amount_supervision_loss.detach(),
+            "move_amount_soft_consistency_loss": move_amount_soft_consistency_loss.detach(),
+
+            "soft_move_budget_mean": soft_move_budget.detach().mean(),
+            "valid_move_source_voxel_count_mean": valid_move_source_voxel_count.detach().mean(),
+            "valid_move_source_voxel_count_effective_mean": valid_move_source_voxel_count_effective.detach().mean(),
+
+            # 点数基準のAdjust量。
+            "soft_move_sum": soft_move_score_for_guard.detach().sum(),
+            "hard_move_sum": hard_move.detach().sum(),
+            "move_soft_hard_sum_abs_diff": (
+                soft_move_score_for_guard.detach().sum() - hard_move.detach().sum()
+            ).abs(),
+
+            # Voxel数基準のAdjust量。
+            "soft_move_voxel_sum": soft_move_voxel_mass_per_batch.detach().sum(),
+            "hard_move_voxel_sum": hard_move_voxel_mass_per_batch.detach().sum(),
+            "move_soft_hard_voxel_sum_abs_diff": (
+                soft_move_voxel_mass_per_batch.detach().sum()
+                - hard_move_voxel_mass_per_batch.detach().sum()
+            ).abs(),
+
+            "move_soft_hard_ratio_abs_diff": (
+                move_ratio_soft.detach() - move_ratio_hard.detach()
+            ).abs(),
             "move_source_prior_mean": move_source_prior.mean().detach(),
             "adjusted_point_count": pts_xyz.new_tensor(float(hard_move_count_value)).detach(),
             "adjusted_point_rate": pts_xyz.new_tensor(float(adjusted_point_rate_value)).detach(),
@@ -2056,6 +2949,32 @@ class StructureRepairActuator(nn.Module):
             "preserve_ratio": preserve_ratio.detach(),
             "edit_reg": edit_reg.detach(),
             "drop_ratio": drop_ratio.detach(),
+            "drop_ratio_soft": drop_ratio_soft.detach(),
+            "drop_ratio_hard": drop_ratio_hard.detach(),
+            "drop_ratio_soft_batch_mean": drop_ratio_soft_batch.detach().mean(),
+            "drop_ratio_hard_batch_mean": drop_ratio_hard_batch.detach().mean(),
+            "drop_amount_supervision_loss": drop_amount_supervision_loss.detach(),
+            "drop_amount_soft_consistency_loss": drop_amount_soft_consistency_loss.detach(),
+
+            "soft_drop_budget_mean": soft_drop_budget.detach().mean(),
+            "valid_delete_voxel_count_mean": valid_delete_voxel_count.detach().mean(),
+
+            # 点数基準のPrune量。
+            "soft_drop_sum": soft_drop_prob_for_guard.detach().sum(),
+            "hard_drop_sum": hard_drop.detach().sum(),
+            "drop_soft_hard_sum_abs_diff": (
+                soft_drop_prob_for_guard.detach().sum() - hard_drop.detach().sum()
+            ).abs(),
+
+            # Voxel数基準のPrune量。
+            "soft_drop_voxel_sum": soft_drop_voxel_mass_per_batch.detach().sum(),
+            "hard_drop_voxel_sum": hard_drop_voxel_mass_per_batch.detach().sum(),
+            "drop_soft_hard_voxel_sum_abs_diff": (
+                soft_drop_voxel_mass_per_batch.detach().sum()
+                - hard_drop_voxel_mass_per_batch.detach().sum()
+            ).abs(),
+
+            "drop_soft_hard_ratio_abs_diff": (drop_ratio_soft.detach() - drop_ratio_hard.detach()).abs(),
             "keep_ratio": keep_prob.mean().detach(),
             "policy_chain_mean": p_chain.mean().detach(),
             "policy_sibling_mean": p_sibling.mean().detach(),
@@ -2066,6 +2985,28 @@ class StructureRepairActuator(nn.Module):
             "actuator_target_mode": actuator_target_mode, 
         }
         return pts_out, final_w, loss, {
+            # Adjust Soft状態
+            "learned_drop_ratio_requires_grad": pts_xyz.new_tensor(float(learned_drop_ratio.requires_grad)),
+            "learned_add_ratio_requires_grad": pts_xyz.new_tensor(float(learned_add_ratio.requires_grad)),
+            "learned_move_ratio_requires_grad": pts_xyz.new_tensor(float(learned_move_ratio.requires_grad)),
+            "operation_amount_logit_loss": operation_amount_logit_loss.detach(),
+            "drop_amount_logit_mean": drop_amount_logit.detach(),
+            "add_amount_logit_mean": add_amount_logit.detach(),
+            "move_amount_logit_mean": move_amount_logit.detach(),
+            "drop_amount_target_logit": drop_amount_target_logit.detach(),
+            "add_amount_target_logit": add_amount_target_logit.detach(),
+            "move_amount_target_logit": move_amount_target_logit.detach(),
+
+            "drop_amount_head_weight_requires_grad": pts_xyz.new_tensor(float(self.drop_amount_head.weight.requires_grad)),
+            "add_amount_head_weight_requires_grad": pts_xyz.new_tensor(float(self.add_amount_head.weight.requires_grad)),
+            "move_amount_head_weight_requires_grad": pts_xyz.new_tensor(float(self.move_amount_head.weight.requires_grad)),
+            "move_source_soft_delete": move_source_soft_delete,
+            "move_source_soft_keep": move_source_soft_keep,
+            "move_target_soft_add": move_target_soft_add,
+            "move_source_voxel_coords": voxel_coords,
+            "move_target_voxel_coords": move_target_voxel_coords,
+            "move_soft_score_effective": soft_move_score_effective,
+            "move_soft_value_mode": "soft_prune_source_and_soft_add_target",
             "child_slot_candidate_ratio": child_slot_candidate_ratio,
             "repair_gate": repair_gate,
             "drop_prob": drop_prob,
@@ -2084,9 +3025,55 @@ class StructureRepairActuator(nn.Module):
             "add_effective_count": add_effective_count_value,
             "add_candidate_ratio": float(add_candidate_ratio),
             "add_candidate_count": int(add_k),
+            "add_ratio_soft": add_ratio_soft.detach(),
+            "add_ratio_hard": add_ratio_hard.detach(),
+            "add_amount_supervision_loss": add_amount_supervision_loss.detach(),
+            "add_amount_soft_consistency_loss": add_amount_soft_consistency_loss.detach(),
+            "add_soft_budget_mean": soft_add_budget.detach().mean(),
+            "add_soft_pair_sum": soft_add_pair.detach().sum(),
+            "add_hard_pair_sum": hard_add_pair.detach().sum(),
+            "add_soft_hard_sum_abs_diff": (soft_add_pair.detach().sum() - hard_add_pair.detach().sum()).abs(),
+            "add_soft_hard_ratio_abs_diff": (add_ratio_soft.detach() - add_ratio_hard.detach()).abs(),
+            # target voxel単位のAdd Hard/Soft状態。
+            "add_target_soft_add": add_target_soft_add,
+            "add_target_hard_add": add_target_hard_add,
+            "add_target_add_st": add_target_add_st,
+            "add_target_voxel_coords": add_target_voxel_coords,
+            "add_target_soft_add_sum": add_target_soft_add.detach().sum(),
+            "add_target_hard_add_sum": add_target_hard_add.detach().sum(),
+            "add_target_soft_hard_sum_abs_diff": (
+                add_target_soft_add.detach().sum()
+                - add_target_hard_add.detach().sum()
+            ).abs(),
             "learned_drop_ratio": learned_drop_ratio.mean(),
             "learned_drop_prob": learned_drop_prob,
             "drop_prob_mean": drop_prob.mean(),
+            "drop_ratio_soft": drop_ratio_soft.detach(),
+            "drop_ratio_hard": drop_ratio_hard.detach(),
+            "drop_ratio_soft_batch_mean": drop_ratio_soft_batch.detach().mean(),
+            "drop_ratio_hard_batch_mean": drop_ratio_hard_batch.detach().mean(),
+            "drop_amount_supervision_loss": drop_amount_supervision_loss.detach(),
+            "drop_amount_soft_consistency_loss": drop_amount_soft_consistency_loss.detach(),
+
+            "soft_drop_budget_mean": soft_drop_budget.detach().mean(),
+            "valid_delete_voxel_count_mean": valid_delete_voxel_count.detach().mean(),
+
+            # 点数基準のPrune量。
+            "soft_drop_sum": soft_drop_prob_for_guard.detach().sum(),
+            "hard_drop_sum": hard_drop.detach().sum(),
+            "drop_soft_hard_sum_abs_diff": (
+                soft_drop_prob_for_guard.detach().sum() - hard_drop.detach().sum()
+            ).abs(),
+
+            # Voxel数基準のPrune量。
+            "soft_drop_voxel_sum": soft_drop_voxel_mass_per_batch.detach().sum(),
+            "hard_drop_voxel_sum": hard_drop_voxel_mass_per_batch.detach().sum(),
+            "drop_soft_hard_voxel_sum_abs_diff": (
+                soft_drop_voxel_mass_per_batch.detach().sum()
+                - hard_drop_voxel_mass_per_batch.detach().sum()
+            ).abs(),
+
+            "drop_soft_hard_ratio_abs_diff": (drop_ratio_soft.detach() - drop_ratio_hard.detach()).abs(),
             "drop_prob_min": drop_prob.amin() if drop_prob.numel() > 0 else pts_xyz.new_zeros(()),
             "drop_prob_max": drop_prob.amax() if drop_prob.numel() > 0 else pts_xyz.new_zeros(()),
             "drop_prob_direct_mean": drop_prob_direct.mean(),
@@ -2117,6 +3104,35 @@ class StructureRepairActuator(nn.Module):
             "learned_move_ratio_std": learned_move_ratio.float().std(unbiased=False),
             "operation_amount_consistency_loss": operation_amount_consistency_loss,
             "operation_entropy": operation_entropy,
+            "move_ratio_soft": move_ratio_soft.detach(),
+            "move_ratio_hard": move_ratio_hard.detach(),
+            "move_ratio_soft_batch_mean": move_ratio_soft_batch.detach().mean(),
+            "move_ratio_hard_batch_mean": move_ratio_hard_batch.detach().mean(),
+            "move_amount_supervision_loss": move_amount_supervision_loss.detach(),
+            "move_amount_soft_consistency_loss": move_amount_soft_consistency_loss.detach(),
+
+            "soft_move_budget_mean": soft_move_budget.detach().mean(),
+            "valid_move_source_voxel_count_mean": valid_move_source_voxel_count.detach().mean(),
+            "valid_move_source_voxel_count_effective_mean": valid_move_source_voxel_count_effective.detach().mean(),
+
+            # 点数基準のAdjust量。
+            "soft_move_sum": soft_move_score_for_guard.detach().sum(),
+            "hard_move_sum": hard_move.detach().sum(),
+            "move_soft_hard_sum_abs_diff": (
+                soft_move_score_for_guard.detach().sum() - hard_move.detach().sum()
+            ).abs(),
+
+            # Voxel数基準のAdjust量。
+            "soft_move_voxel_sum": soft_move_voxel_mass_per_batch.detach().sum(),
+            "hard_move_voxel_sum": hard_move_voxel_mass_per_batch.detach().sum(),
+            "move_soft_hard_voxel_sum_abs_diff": (
+                soft_move_voxel_mass_per_batch.detach().sum()
+                - hard_move_voxel_mass_per_batch.detach().sum()
+            ).abs(),
+
+            "move_soft_hard_ratio_abs_diff": (
+                move_ratio_soft.detach() - move_ratio_hard.detach()
+            ).abs(),
             "soft_activity_loss": soft_activity_loss,
             "move_direction_ce": move_direction_ce,
             "add_direction_ce": add_direction_ce,
@@ -2214,14 +3230,7 @@ class StructureRepairActuator(nn.Module):
             "final_voxel_update_mode": "state_update_from_initial_voxels",
             "final_voxel_recomputed_from_pts_out": False,
             "point_child_slots": point_child_slots,
-            "point_valid_empty_child_mask": point_valid_empty_child_mask,
-            "initial_voxel_coords": voxel_coords,
-            "final_voxel_coords": final_voxel_coords,
-            "final_voxel_weights": final_w,
-            "voxel_step": voxel_step,
-            "voxel_offset": voxel_offset,
-            "final_voxel_update_mode": "state_update_from_initial_voxels",
-            "final_voxel_recomputed_from_pts_out": False,
+            "point_valid_empty_child_mask": point_valid_empty_child_mask, 
             "full_octree_context_available": bool(full_context_available),
             "actuator_parent_occupancy_code": int(actuator_parent_occupancy_code),
             "actuator_sibling_count": int(actuator_sibling_count),

@@ -35,30 +35,43 @@ def _effective_input_point_limit(args):
     return max(max_points, 0)
 
 
-def maybe_lower_subtree_depth_for_large_input(subtree_depth_meta, raw_point_count, args):
+def maybe_raise_subtree_depth_for_large_input(subtree_depth_meta, raw_point_count, args):
     # 深度メタ情報を破壊せず、必要な調整結果だけをコピーへ書き込む。
     meta = dict(subtree_depth_meta)
+
     # 点群が大きいかどうかの判定に使う既存入力点数上限を取得する。
     point_limit = _effective_input_point_limit(args)
+
     # Debugログで「なぜ深度が変わったか」を確認できるよう閾値を保存する。
     meta["large_input_point_threshold"] = int(point_limit)
+
     # 初期状態では深度調整なしとして記録する。
     meta["large_input_depth_adjusted"] = False
+
     # 上限が未設定、または点数が上限内なら深度を変えない。
     if point_limit <= 0 or int(raw_point_count) <= point_limit:
         return meta, int(meta["depth"])
-    # 現在のSubtree深度を取り出し、大点群時に1段階だけ浅くする。
+
+    # 現在のSubtree深度を取り出す。
     old_depth = int(meta["depth"])
-    # 許容される最小深度より浅くしないように下限を守る。
-    min_depth = max(int(meta.get("min_depth", 1)), 1)
-    # 点群そのものは削らず、分割深度だけを1段階下げる。
-    new_depth = max(min_depth, old_depth - 1)
+
+    # 許容される最大深度を取得する。
+    # max_depth が未設定なら old_depth + 1 を上限にして、少なくとも1段階だけ深くできるようにする。
+    max_depth = int(meta.get("max_depth", getattr(args, "train_subtree_max_depth", old_depth + 1)))
+    max_depth = max(max_depth, old_depth)
+
+    # 大点群時はSubtreeを浅くせず、1段階深くする。
+    new_depth = min(max_depth, old_depth + 1)
+
     # Debugログで元の深度を追えるように保存する。
     meta["large_input_depth_original"] = old_depth
+
     # 実際に使う深度を更新する。
     meta["depth"] = int(new_depth)
+
     # 深度が本当に変わったかを保存する。
     meta["large_input_depth_adjusted"] = bool(new_depth != old_depth)
+
     # 調整後のメタ情報と深度を返す。
     return meta, int(new_depth)
 
