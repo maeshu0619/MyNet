@@ -823,6 +823,78 @@ class StructureRepairActuator(nn.Module):
             ratio = (1.0 - random_mix) * ratio + random_mix * random_ratio
 
         return ratio.clamp(0.0, float(max_ratio))
+    
+    def _scale_amount_downstream_grad(self, ratio, op_name=""):
+        # Amount ratio のforward値は変えず、backwardだけ強める。
+        # 操作ごとに圧縮損失への感度が違うため、Prune/Add/Moveで別々の倍率を使う。
+        # ratio.detach() + scale * (ratio - ratio.detach()) は、
+        # forwardではratioと同じ値になり、backwardではscale倍の勾配を返す。
+        op_name = str(op_name).strip().lower()
+
+        if op_name in {"drop", "prune", "delete"}:
+            scale = float(
+                getattr(
+                    self.args,
+                    "repair_drop_amount_downstream_grad_scale",
+                    getattr(self.args, "repair_amount_downstream_grad_scale", 6.0),
+                )
+            )
+        elif op_name in {"add", "insert"}:
+            scale = float(
+                getattr(
+                    self.args,
+                    "repair_add_amount_downstream_grad_scale",
+                    getattr(self.args, "repair_amount_downstream_grad_scale", 6.0),
+                )
+            )
+        elif op_name in {"move", "adjust", "disp"}:
+            scale = float(
+                getattr(
+                    self.args,
+                    "repair_move_amount_downstream_grad_scale",
+                    getattr(self.args, "repair_amount_downstream_grad_scale", 6.0),
+                )
+            )
+        else:
+            scale = float(getattr(self.args, "repair_amount_downstream_grad_scale", 6.0))
+
+        scale = max(scale, 1.0)
+        return ratio.detach() + scale * (ratio - ratio.detach())
+
+    def _scale_where_downstream_grad(self, value, op_name=""):
+        # Where score / logit のforward値は変えず、backwardだけ強める。
+        # これにより圧縮損失 L_com から drop_head / add_head / move_voxel_head へ戻る勾配を操作別に調整する。
+        op_name = str(op_name).strip().lower()
+
+        if op_name in {"drop", "prune", "delete"}:
+            scale = float(
+                getattr(
+                    self.args,
+                    "repair_drop_where_downstream_grad_scale",
+                    getattr(self.args, "repair_where_downstream_grad_scale", 1.0),
+                )
+            )
+        elif op_name in {"add", "insert"}:
+            scale = float(
+                getattr(
+                    self.args,
+                    "repair_add_where_downstream_grad_scale",
+                    getattr(self.args, "repair_where_downstream_grad_scale", 1.0),
+                )
+            )
+        elif op_name in {"move", "adjust", "disp"}:
+            scale = float(
+                getattr(
+                    self.args,
+                    "repair_move_where_downstream_grad_scale",
+                    getattr(self.args, "repair_where_downstream_grad_scale", 1.0),
+                )
+            )
+        else:
+            scale = float(getattr(self.args, "repair_where_downstream_grad_scale", 1.0))
+
+        scale = max(scale, 1.0)
+        return value.detach() + scale * (value - value.detach())
 
     def _ratio_bias(self, ratio, max_ratio):
         # 学習した操作量を位置scoreへ戻し、何個選ぶかとどこを選ぶかの勾配をつなぐ。
@@ -1219,6 +1291,10 @@ class StructureRepairActuator(nn.Module):
             "repair_drop_amount_random_mix_start",
             "repair_drop_amount_random_mix_end",
         )
+        learned_drop_ratio_for_ops = self._scale_amount_downstream_grad(
+            learned_drop_ratio,
+            op_name="drop",
+        )
         # Prune量head用のSoft/Hard比較値を初期化する。
         # PruneはVoxel単位で行うため、量の比較も点数ではなくVoxel数基準で行う。
         drop_ratio_soft = pts_xyz.new_zeros(())
@@ -1244,6 +1320,10 @@ class StructureRepairActuator(nn.Module):
             0.0,
         )
         learned_drop_logit = self.drop_head(actuator_features)
+        learned_drop_logit = self._scale_where_downstream_grad(
+            learned_drop_logit,
+            op_name="drop",
+        )
         if self.training and drop_score_noise > 0.0:
             learned_drop_logit = learned_drop_logit + torch.randn_like(learned_drop_logit) * drop_score_noise
         learned_drop = torch.sigmoid(learned_drop_logit)
@@ -1253,7 +1333,7 @@ class StructureRepairActuator(nn.Module):
         drop_prob = (repair_gate * delete_prior * learned_drop).clamp(0.0, 1.0)
         if prune_enabled and max_drop_ratio > 0.0:
             # 学習したPrune量を削除scoreへ反映し、量と位置を同じlogit上で調整する。
-            drop_prob = torch.sigmoid(self._safe_logit(drop_prob) + self._ratio_bias(learned_drop_ratio, max_drop_ratio))
+            drop_prob = torch.sigmoid(self._safe_logit(drop_prob) + self._ratio_bias(learned_drop_ratio_for_ops, max_drop_ratio))
         drop_prob_direct = drop_prob
         drop_random_mix = min(
             max(self._annealed_value("repair_drop_random_mix_start", "repair_drop_random_mix_end"), 0.0),
@@ -1291,7 +1371,7 @@ class StructureRepairActuator(nn.Module):
 
         # learned_drop_ratio をTensorのまま使い、削除候補Voxel数に対するSoft削除予算を作る。
         # ここをdetach / float / itemにしないことが重要である。
-        learned_drop_ratio_for_budget = learned_drop_ratio.reshape(B, 1, 1).clamp(
+        learned_drop_ratio_for_budget = learned_drop_ratio_for_ops.reshape(B, 1, 1).clamp(
             0.0,
             float(max_drop_ratio),
         )
@@ -1416,6 +1496,26 @@ class StructureRepairActuator(nn.Module):
             "repair_move_amount_random_mix_start",
             "repair_move_amount_random_mix_end",
         )
+        # AdjustがHard実行0%に潰れるのを防ぐ。
+        # forward値だけ下限を持たせ、backwardは元のlearned_move_ratioへ流す。
+        move_ratio_floor = min(
+            max(float(getattr(self.args, "repair_move_ratio_floor", 0.03)), 0.0),
+            float(max_move_ratio),
+        )
+        if self.training and disp_enabled and move_ratio_floor > 0.0:
+            learned_move_ratio_floored = torch.maximum(
+                learned_move_ratio,
+                learned_move_ratio.new_tensor(move_ratio_floor),
+            )
+            learned_move_ratio = (
+                learned_move_ratio_floored.detach()
+                + learned_move_ratio
+                - learned_move_ratio.detach()
+            )
+        learned_move_ratio_for_ops = self._scale_amount_downstream_grad(
+            learned_move_ratio,
+            op_name="move",
+        )
         # Adjust量head用のSoft/Hard比較値を初期化する。
         # Adjustはsource voxel単位で行うため、量の比較もVoxel数基準で行う。
         move_ratio_soft = pts_xyz.new_zeros(())
@@ -1466,7 +1566,7 @@ class StructureRepairActuator(nn.Module):
             move_score = torch.zeros_like(move_score)
         elif max_move_ratio > 0.0:
             # 学習したAdjust量をsource scoreへ反映し、量と位置を同じlogit上で調整する。
-            move_score = torch.sigmoid(self._safe_logit(move_score) + self._ratio_bias(learned_move_ratio, max_move_ratio))
+            move_score = torch.sigmoid(self._safe_logit(move_score) + self._ratio_bias(learned_move_ratio_for_ops, max_move_ratio))
         move_score_noise = max(
             self._annealed_value("repair_move_score_noise_start", "repair_move_score_noise_end"),
             0.0,
@@ -1490,13 +1590,38 @@ class StructureRepairActuator(nn.Module):
             move_score = move_score * has_valid_move_target
         # 調整もsource voxelを先に選ぶ。Voxel内の一部だけを微小移動してもoccupancyが変わらないため、
         # 選択source voxel内の点を同じtarget voxel候補へ移す方針にする。
-        move_candidate_mask = selection_bool & (~hard_drop_mask.squeeze(1))
+        # Adjust source候補を作る。
+        # まず、dropされておらず、移動先を少なくとも1つ持つ点を基本候補にする。
+        base_move_candidate_mask = selection_bool & (~hard_drop_mask.squeeze(1))
+        base_move_candidate_mask = base_move_candidate_mask & has_valid_move_target.squeeze(1).to(dtype=torch.bool)
+
+        move_candidate_mask = base_move_candidate_mask
         move_max_points = int(getattr(self.args, "repair_move_max_points_per_voxel", 8))
+
         if move_max_points > 0:
-            move_candidate_mask = move_candidate_mask & (
+            limited_move_candidate_mask = base_move_candidate_mask & (
                 voxel_point_counts.squeeze(1) <= float(move_max_points)
             )
-        move_candidate_mask = move_candidate_mask & has_valid_move_target.squeeze(1).to(dtype=torch.bool)
+
+            # 候補が少なすぎる場合だけ、Voxel内点数制限を緩める。
+            # bool maskの切替なのでHard/Soft近似の勾配経路は壊さない。
+            if self.training and bool(getattr(self.args, "repair_move_relax_voxel_count_when_starved", True)):
+                min_ratio = min(
+                    max(float(getattr(self.args, "repair_move_candidate_min_ratio", 0.05)), 0.0),
+                    1.0,
+                )
+                base_count = base_move_candidate_mask.sum(dim=1)
+                limited_count = limited_move_candidate_mask.sum(dim=1)
+                min_count = torch.ceil(base_count.to(dtype=pts_xyz.dtype) * min_ratio).to(dtype=torch.long)
+
+                starved = (base_count > 0) & (limited_count < min_count)
+                move_candidate_mask = torch.where(
+                    starved.view(B, 1),
+                    base_move_candidate_mask,
+                    limited_move_candidate_mask,
+                )
+            else:
+                move_candidate_mask = limited_move_candidate_mask
         # Soft移動候補をHard移動候補と同じ候補集合に制限する。
         # Adjustはsource voxel単位で行うため、Soft側もVoxel単位の量として正規化する。
         move_candidate_weight = move_candidate_mask.unsqueeze(1).to(dtype=move_score.dtype)
@@ -1516,7 +1641,7 @@ class StructureRepairActuator(nn.Module):
 
         # learned_move_ratio をTensorのまま使い、移動候補Voxel数に対するSoft移動予算を作る。
         # ここをdetach / float / itemにしないことが重要である。
-        learned_move_ratio_for_budget = learned_move_ratio.reshape(B, 1, 1).clamp(
+        learned_move_ratio_for_budget = learned_move_ratio_for_ops.reshape(B, 1, 1).clamp(
             0.0,
             float(max_move_ratio),
         )
@@ -1555,6 +1680,10 @@ class StructureRepairActuator(nn.Module):
         move_mask_for_guard = move_mask
 
         move_logits = self.move_voxel_head(actuator_features)
+        move_logits = self._scale_where_downstream_grad(
+            move_logits,
+            op_name="move",
+        )
         move_logits = self._voxel_mean_logits(move_logits, voxel_coords, voxel_cache=voxel_cache)
         move_valid_target = valid_move_points.transpose(1, 2)
         no_valid_move = ~move_valid_target.any(dim=1, keepdim=True)
@@ -1664,6 +1793,10 @@ class StructureRepairActuator(nn.Module):
             empty_guard_reject_bool = guarded_move_candidate_mask & target_existing_occupied_mask
             guarded_move_candidate_mask = guarded_move_candidate_mask & (~target_existing_occupied_mask)
 
+        # duplicate guardをかける前の候補を保存する。
+        # empty target guardは維持したまま、duplicate guardだけ緩和できるようにする。
+        guarded_move_candidate_mask_before_duplicate = guarded_move_candidate_mask.clone()
+
         if target_duplicate_guard_enabled:
             # Soft/Hard共通で、同じtarget voxelへ向かう候補は1つに絞る。
             target_first_unique_candidate_mask = self._first_unique_selected_mask(
@@ -1672,6 +1805,28 @@ class StructureRepairActuator(nn.Module):
             )
             duplicate_guard_reject_bool = guarded_move_candidate_mask & (~target_first_unique_candidate_mask)
             guarded_move_candidate_mask = guarded_move_candidate_mask & target_first_unique_candidate_mask
+
+        # duplicate guardでAdjust候補がほぼ消える場合だけ、duplicate guardを緩める。
+        # empty target guard後の候補へ戻すため、既存occupied targetへの移動は許可しない。
+        if (
+            self.training
+            and target_duplicate_guard_enabled
+            and bool(getattr(self.args, "repair_move_relax_duplicate_guard_when_starved", True))
+        ):
+            min_ratio = min(
+                max(float(getattr(self.args, "repair_move_candidate_min_ratio", 0.05)), 0.0),
+                1.0,
+            )
+            before_dup_count = guarded_move_candidate_mask_before_duplicate.sum(dim=1)
+            after_dup_count = guarded_move_candidate_mask.sum(dim=1)
+            min_count = torch.ceil(before_dup_count.to(dtype=pts_xyz.dtype) * min_ratio).to(dtype=torch.long)
+
+            starved = (before_dup_count > 0) & (after_dup_count < min_count)
+            guarded_move_candidate_mask = torch.where(
+                starved.view(B, 1),
+                guarded_move_candidate_mask_before_duplicate,
+                guarded_move_candidate_mask,
+            )
 
         # guardで落ちた候補のログ用。
         guard_rejected_bool = move_candidate_mask & (~guarded_move_candidate_mask)
@@ -1791,7 +1946,9 @@ class StructureRepairActuator(nn.Module):
         if timing_enabled:
             _mark_runtime("adjust_move")
 
-        final_w = keep_prob * move_source_soft_keep
+        # BCE系損失へ渡る可能性があるため、final_wを確率範囲へ安全に収める。
+        # NaN/Infもここで除去する。
+        final_w = torch.nan_to_num(keep_prob, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
         max_add_ratio_value = self._max_add_ratio()
         # Addする割合を特徴から学習し、固定10%のような張り付きから外す。
         learned_add_ratio = self._learned_operation_ratio(
@@ -1807,6 +1964,10 @@ class StructureRepairActuator(nn.Module):
             learned_add_ratio_before_floor = learned_add_ratio
             learned_add_ratio = torch.maximum(learned_add_ratio, learned_add_ratio.new_tensor(add_ratio_floor)).clamp(0.0, max_add_ratio_value)
             add_ratio_floor_applied = bool((learned_add_ratio > learned_add_ratio_before_floor + 1e-12).detach().any().cpu().item())
+        learned_add_ratio_for_ops = self._scale_amount_downstream_grad(
+            learned_add_ratio,
+            op_name="add",
+        )
         # hardなtop-k個数は整数なので、学習比率の値だけを候補数計算へ渡す。
         learned_add_ratio_value = float(learned_add_ratio.detach().mean().cpu()) if add_enabled else 0.0
         add_k, add_candidate_ratio = self._target_add_count(N, candidate_ratio_override=learned_add_ratio_value)
@@ -1852,6 +2013,10 @@ class StructureRepairActuator(nn.Module):
         )
         if add_k > 0:
             learned_add_logit = self.add_head(actuator_features)
+            learned_add_logit = self._scale_where_downstream_grad(
+                learned_add_logit,
+                op_name="add",
+            )
             add_prior = (
                 0.25 * p_sibling
                 + 0.20 * p_parent
@@ -1870,10 +2035,14 @@ class StructureRepairActuator(nn.Module):
             if sparsepcgc_add_experiment_active and not bool(getattr(self.args, "sparsepcgc_add_use_candidate_score", True)):
                 add_prior = torch.zeros_like(add_prior)
             # Add量の学習結果を位置logitに足し、どのVoxelへ追加するかの勾配も残す。
-            add_logit = learned_add_logit + add_prior + self._ratio_bias(learned_add_ratio, max_add_ratio_value)
+            add_logit = learned_add_logit + add_prior + self._ratio_bias(learned_add_ratio_for_ops, max_add_ratio_value)
             if self.training and add_score_noise > 0.0:
                 add_logit = add_logit + self._gumbel_like(add_logit) * add_score_noise
             add_voxel_logits = self.add_voxel_head(actuator_features)
+            add_voxel_logits = self._scale_where_downstream_grad(
+                add_voxel_logits,
+                op_name="add",
+            )
             add_logit = self._voxel_mean_logits(add_logit, voxel_coords, voxel_cache=voxel_cache)
             add_voxel_logits = self._voxel_mean_logits(add_voxel_logits, voxel_coords, voxel_cache=voxel_cache)
             pair_logits = (add_voxel_logits + add_logit).permute(0, 2, 1).contiguous()
@@ -2019,7 +2188,7 @@ class StructureRepairActuator(nn.Module):
 
                 # add_amount_head が出した learned_add_ratio をTensorのまま使い、
                 # このStepで全体のうち何割をAddするかのSoft予算にする。
-                learned_add_ratio_for_budget = learned_add_ratio.reshape(B, 1).clamp(
+                learned_add_ratio_for_budget = learned_add_ratio_for_ops.reshape(B, 1).clamp(
                     0.0,
                     float(max_add_ratio_value),
                 )
@@ -2384,51 +2553,51 @@ class StructureRepairActuator(nn.Module):
             + (learned_move_ratio.mean() - move_amount_target).pow(2)
             + (learned_add_ratio.mean() - add_amount_target).pow(2)
         )
-        if not hasattr(self, "_printed_amount_debug"):
-            print(
-                "[AmountDebug]",
-                "learn_amounts=", bool(getattr(self.args, "repair_learn_operation_amounts", True)),
-                "drop_req=", bool(learned_drop_ratio.requires_grad),
-                "move_req=", bool(learned_move_ratio.requires_grad),
-                "add_req=", bool(learned_add_ratio.requires_grad),
-                "direct_loss_req=", bool(operation_amount_direct_loss.requires_grad),
-                "direct_loss=", float(operation_amount_direct_loss.detach().cpu()),
-            )
-            self._printed_amount_debug = True
-        if not hasattr(self, "_printed_amount_grad_debug"):
-            amount_params = [
-                self.drop_amount_head.weight,
-                self.drop_amount_head.bias,
-                self.add_amount_head.weight,
-                self.add_amount_head.bias,
-                self.move_amount_head.weight,
-                self.move_amount_head.bias,
-            ]
+        # if not hasattr(self, "_printed_amount_debug"):
+        #     print(
+        #         "[AmountDebug]",
+        #         "learn_amounts=", bool(getattr(self.args, "repair_learn_operation_amounts", True)),
+        #         "drop_req=", bool(learned_drop_ratio.requires_grad),
+        #         "move_req=", bool(learned_move_ratio.requires_grad),
+        #         "add_req=", bool(learned_add_ratio.requires_grad),
+        #         "direct_loss_req=", bool(operation_amount_direct_loss.requires_grad),
+        #         "direct_loss=", float(operation_amount_direct_loss.detach().cpu()),
+        #     )
+        #     self._printed_amount_debug = True
+        # if not hasattr(self, "_printed_amount_grad_debug"):
+        #     amount_params = [
+        #         self.drop_amount_head.weight,
+        #         self.drop_amount_head.bias,
+        #         self.add_amount_head.weight,
+        #         self.add_amount_head.bias,
+        #         self.move_amount_head.weight,
+        #         self.move_amount_head.bias,
+        #     ]
 
-            amount_grads = torch.autograd.grad(
-                operation_amount_direct_loss,
-                amount_params,
-                retain_graph=True,
-                create_graph=False,
-                allow_unused=True,
-            )
+        #     amount_grads = torch.autograd.grad(
+        #         operation_amount_direct_loss,
+        #         amount_params,
+        #         retain_graph=True,
+        #         create_graph=False,
+        #         allow_unused=True,
+        #     )
 
-            def _grad_norm(g):
-                if g is None:
-                    return None
-                return float(g.detach().float().norm().cpu())
+        #     def _grad_norm(g):
+        #         if g is None:
+        #             return None
+        #         return float(g.detach().float().norm().cpu())
 
-            print(
-                "[AmountGradDebug:direct_loss]",
-                "drop_w=", _grad_norm(amount_grads[0]),
-                "drop_b=", _grad_norm(amount_grads[1]),
-                "add_w=", _grad_norm(amount_grads[2]),
-                "add_b=", _grad_norm(amount_grads[3]),
-                "move_w=", _grad_norm(amount_grads[4]),
-                "move_b=", _grad_norm(amount_grads[5]),
-            )
+        #     print(
+        #         "[AmountGradDebug:direct_loss]",
+        #         "drop_w=", _grad_norm(amount_grads[0]),
+        #         "drop_b=", _grad_norm(amount_grads[1]),
+        #         "add_w=", _grad_norm(amount_grads[2]),
+        #         "add_b=", _grad_norm(amount_grads[3]),
+        #         "move_w=", _grad_norm(amount_grads[4]),
+        #         "move_b=", _grad_norm(amount_grads[5]),
+        #     )
 
-            self._printed_amount_grad_debug = True
+        #     self._printed_amount_grad_debug = True
         # 各操作量headが実際のsoft操作率を追えるようにし、量headにも安定した勾配を渡す。
         operation_amount_consistency_loss = (
             (drop_ratio - learned_drop_ratio.mean()).pow(2)
@@ -2450,6 +2619,97 @@ class StructureRepairActuator(nn.Module):
         )
         exploration_noise = max(float(drop_score_noise), float(move_score_noise), float(add_score_noise))
         operation_temperature = float(getattr(self.args, "repair_priority_gate_tau", getattr(self.args, "repair_policy_temperature", 1.0)))
+        # ============================================================
+        # Where headへ直接かけるActuator補助損失
+        # ============================================================
+        # 目的
+        # ・圧縮損失ではなく、L_actuator側からWhere headへ勾配を流す
+        # ・Amount headではなく、drop_head / add_head / move source score側を更新する
+        # ・hard選択結果は教師としてdetachし、soft score側だけを学習させる
+        # ============================================================
+
+        eps = torch.finfo(pts_xyz.dtype).eps
+
+        # ------------------------------------------------------------
+        # Prune Where補助損失
+        # ------------------------------------------------------------
+        # hard_dropはdetachして教師にする。
+        # soft_drop_prob_for_guard側だけに勾配を流す。
+        # これにより drop_head にActuator損失由来の勾配が出る。
+        drop_where_actuator_loss = pts_xyz.new_zeros(())
+        if prune_enabled:
+            drop_where_pred = torch.nan_to_num(
+                soft_drop_prob_for_guard,
+                nan=0.5,
+                posinf=1.0,
+                neginf=0.0,
+            ).clamp(eps, 1.0 - eps)
+
+            drop_where_target = torch.nan_to_num(
+                hard_drop.detach(),
+                nan=0.0,
+                posinf=1.0,
+                neginf=0.0,
+            ).clamp(0.0, 1.0)
+            with torch.cuda.amp.autocast(enabled=False):
+                drop_where_actuator_loss = torch.nn.functional.binary_cross_entropy(
+                    drop_where_pred.float(),
+                    drop_where_target.float(),
+                )
+
+        # ------------------------------------------------------------
+        # Move Where補助損失
+        # ------------------------------------------------------------
+        # hard_moveはdetachして教師にする。
+        # soft_move_score_for_guard側だけに勾配を流す。
+        # これによりMove source選択側にActuator損失由来の勾配が出る。
+        move_where_actuator_loss = pts_xyz.new_zeros(())
+        if disp_enabled:
+            move_where_pred = torch.nan_to_num(
+                soft_move_score_for_guard,
+                nan=0.5,
+                posinf=1.0,
+                neginf=0.0,
+            ).clamp(eps, 1.0 - eps)
+
+            move_where_target = torch.nan_to_num(
+                hard_move.detach(),
+                nan=0.0,
+                posinf=1.0,
+                neginf=0.0,
+            ).clamp(0.0, 1.0)
+            with torch.cuda.amp.autocast(enabled=False):
+                move_where_actuator_loss = torch.nn.functional.binary_cross_entropy(
+                    move_where_pred.float(),
+                    move_where_target.float(),
+                )
+
+        # ------------------------------------------------------------
+        # Add Where補助損失
+        # ------------------------------------------------------------
+        # Addはsource点単位ではなく、target voxel pair単位で選んでいる。
+        # そのため soft_add_pair / hard_add_pair を使う。
+        # これにより add_head と add_voxel_head にActuator損失由来の勾配が出る。
+        add_where_actuator_loss = pts_xyz.new_zeros(())
+        if add_enabled and soft_add_pair.numel() > 0 and hard_add_pair.numel() > 0:
+            add_where_pred = torch.nan_to_num(
+                soft_add_pair,
+                nan=0.5,
+                posinf=1.0,
+                neginf=0.0,
+            ).clamp(eps, 1.0 - eps)
+
+            add_where_target = torch.nan_to_num(
+                hard_add_pair.detach(),
+                nan=0.0,
+                posinf=1.0,
+                neginf=0.0,
+            ).clamp(0.0, 1.0)
+            with torch.cuda.amp.autocast(enabled=False):
+                add_where_actuator_loss = torch.nn.functional.binary_cross_entropy(
+                    add_where_pred.float(),
+                    add_where_target.float(),
+                )
         loss = (
             edit_reg
             + float(getattr(self.args, "repair_ratio_weight", 0.1)) * ratio_loss
@@ -2468,55 +2728,58 @@ class StructureRepairActuator(nn.Module):
             + float(getattr(self.args, "sparsepcgc_empty_target_penalty_weight", 0.0)) * empty_target_violation_loss
             + float(getattr(self.args, "sparsepcgc_target_duplicate_penalty_weight", 0.0)) * target_duplicate_voxel_loss
             + float(getattr(self.args, "repair_local_guard_weight", 0.25)) * local_edit_guard
-            + float(getattr(self.args, "repair_operation_amount_consistency_weight", 1.0)) * operation_amount_consistency_loss
-            + float(getattr(self.args, "repair_operation_amount_direct_weight", 10.0)) * operation_amount_direct_loss
-            + float(getattr(self.args, "repair_operation_amount_logit_weight", 0.05)) * operation_amount_logit_loss
+            + float(getattr(self.args, "repair_operation_amount_consistency_weight", 0.01)) * operation_amount_consistency_loss
+            + float(getattr(self.args, "repair_operation_amount_direct_weight", 0.01)) * operation_amount_direct_loss
+            + float(getattr(self.args, "repair_operation_amount_logit_weight", 1e-4)) * operation_amount_logit_loss
             + float(getattr(self.args, "repair_soft_activity_weight", 1e-3)) * soft_activity_loss
             + float(getattr(self.args, "repair_move_direction_ce_weight", 1e-3)) * move_direction_ce
             + float(getattr(self.args, "repair_add_direction_ce_weight", 1e-3)) * add_direction_ce
-            # 量headを学習させるための専用損失。
-            # Hard実行量は教師、learned_*_ratio側は学習対象として扱う。
-            + float(getattr(self.args, "repair_drop_amount_supervision_weight", 1.0)) * drop_amount_supervision_loss
-            + float(getattr(self.args, "repair_drop_amount_soft_consistency_weight", 0.1)) * drop_amount_soft_consistency_loss
-            + float(getattr(self.args, "repair_move_amount_supervision_weight", 1.0)) * move_amount_supervision_loss
-            + float(getattr(self.args, "repair_move_amount_soft_consistency_weight", 0.1)) * move_amount_soft_consistency_loss
-            + float(getattr(self.args, "repair_add_amount_supervision_weight", 1.0)) * add_amount_supervision_loss
-            + float(getattr(self.args, "repair_add_amount_soft_consistency_weight", 0.1)) * add_amount_soft_consistency_loss
+            + float(getattr(self.args, "repair_drop_where_actuator_weight", 0.1)) * drop_where_actuator_loss
+            + float(getattr(self.args, "repair_add_where_actuator_weight", 0.1)) * add_where_actuator_loss
+            + float(getattr(self.args, "repair_move_where_actuator_weight", 0.1)) * move_where_actuator_loss
+            # 量headは補助損失ではなく、主に圧縮損失で操作量を学習させる。
+            # ここは勾配を完全に死なせないための弱い足場に留める。
+            + float(getattr(self.args, "repair_drop_amount_supervision_weight", 0.001)) * drop_amount_supervision_loss
+            + float(getattr(self.args, "repair_drop_amount_soft_consistency_weight", 0.0005)) * drop_amount_soft_consistency_loss
+            + float(getattr(self.args, "repair_move_amount_supervision_weight", 0.001)) * move_amount_supervision_loss
+            + float(getattr(self.args, "repair_move_amount_soft_consistency_weight", 0.0005)) * move_amount_soft_consistency_loss
+            + float(getattr(self.args, "repair_add_amount_supervision_weight", 0.001)) * add_amount_supervision_loss
+            + float(getattr(self.args, "repair_add_amount_soft_consistency_weight", 0.0005)) * add_amount_soft_consistency_loss
         )
-        if not hasattr(self, "_printed_amount_grad_debug_loss"):
-            amount_params = [
-                self.drop_amount_head.weight,
-                self.drop_amount_head.bias,
-                self.add_amount_head.weight,
-                self.add_amount_head.bias,
-                self.move_amount_head.weight,
-                self.move_amount_head.bias,
-            ]
+        # if not hasattr(self, "_printed_amount_grad_debug_loss"):
+        #     amount_params = [
+        #         self.drop_amount_head.weight,
+        #         self.drop_amount_head.bias,
+        #         self.add_amount_head.weight,
+        #         self.add_amount_head.bias,
+        #         self.move_amount_head.weight,
+        #         self.move_amount_head.bias,
+        #     ]
 
-            amount_grads = torch.autograd.grad(
-                loss,
-                amount_params,
-                retain_graph=True,
-                create_graph=False,
-                allow_unused=True,
-            )
+        #     amount_grads = torch.autograd.grad(
+        #         loss,
+        #         amount_params,
+        #         retain_graph=True,
+        #         create_graph=False,
+        #         allow_unused=True,
+        #     )
 
-            def _grad_norm(g):
-                if g is None:
-                    return None
-                return float(g.detach().float().norm().cpu())
+        #     def _grad_norm(g):
+        #         if g is None:
+        #             return None
+        #         return float(g.detach().float().norm().cpu())
 
-            print(
-                "[AmountGradDebug:actuator_loss]",
-                "drop_w=", _grad_norm(amount_grads[0]),
-                "drop_b=", _grad_norm(amount_grads[1]),
-                "add_w=", _grad_norm(amount_grads[2]),
-                "add_b=", _grad_norm(amount_grads[3]),
-                "move_w=", _grad_norm(amount_grads[4]),
-                "move_b=", _grad_norm(amount_grads[5]),
-            )
-
-            self._printed_amount_grad_debug_loss = True
+        #     print(
+        #         "[AmountGradDebug:actuator_loss]",
+        #         "drop_w=", _grad_norm(amount_grads[0]),
+        #         "drop_b=", _grad_norm(amount_grads[1]),
+        #         "add_w=", _grad_norm(amount_grads[2]),
+        #         "add_b=", _grad_norm(amount_grads[3]),
+        #         "move_w=", _grad_norm(amount_grads[4]),
+        #         "move_b=", _grad_norm(amount_grads[5]),
+        #     )
+        #     self._printed_amount_grad_debug_loss = True
+        
         if timing_enabled:
             _mark_runtime("postprocess")
             runtime_timing["total"] = float(time.perf_counter() - runtime_start)

@@ -337,6 +337,18 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--max_drop_ratio', default=0.50, type=float, help='点削除ゲートの上限割合')
     parser.add_argument('--repair_delete_max_points_per_voxel', default=8, type=int, help='削除候補にするleaf voxel内の最大点数(0なら無制限)')
     parser.add_argument('--repair_move_max_points_per_voxel', default=8, type=int, help='move source候補にするleaf voxel内の最大点数(0なら無制限)')
+    parser.add_argument(
+        '--repair_move_relax_voxel_count_when_starved',
+        default=True,
+        type=str2bool,
+        help='Adjust候補が少なすぎる場合だけrepair_move_max_points_per_voxel制限を緩める',
+    )
+    parser.add_argument(
+        '--repair_move_candidate_min_ratio',
+        default=0.05,
+        type=float,
+        help='Adjust候補不足とみなす最小候補割合',
+    )
     parser.add_argument('--repair_drop_ratio_weight', default=4.0, type=float, help='点削除割合制御損失の重み')
     parser.add_argument('--repair_drop_shape_guard_weight', default=1.0, type=float, help='形状保持点を削除しすぎない正則化')
     parser.add_argument('--repair_drop_soft_proxy_tau', default=8.0, type=float, help='Prune soft proxyでdrop logit飽和を避けるための温度')
@@ -355,6 +367,12 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--repair_selection_mode', default='target', type=str, help='修復操作のhard選択方式(target/threshold_cap)。threshold_capでは目標割合を強制せず上限として扱う')
     parser.add_argument('--repair_move_hard_threshold', default=0.5, type=float, help='threshold_cap時に移動をhard化する最小score')
     parser.add_argument('--max_move_ratio', default=1.00, type=float, help='Adjustの学習済み実行割合の上限')
+    parser.add_argument(
+        '--repair_move_ratio_floor',
+        default=0.03,
+        type=float,
+        help='学習中にAdjustのHard実行割合が0へ潰れないようにする最小forward割合。backwardは元のlearned ratioへ流す',
+    )
     parser.add_argument('--repair_drop_hard_threshold', default=0.5, type=float, help='threshold_cap時に削除をhard化する最小score')
     parser.add_argument('--repair_add_hard_threshold', default=0.5, type=float, help='threshold_cap時に追加をhard化する最小score')
     parser.add_argument('--repair_quant_guard_weight', default=1.0, type=float, help='量子化ボクセル上で無効な移動/追加を抑える正則化')
@@ -370,12 +388,37 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--repair_add_weight_random_mix_end', default=0.0, type=float, help='探索終了後に追加点final_wへ混ぜるランダム重み割合')
     parser.add_argument('--repair_learn_operation_amounts', default=True, type=str2bool, help='Add/Adjustの実行量を固定比率ではなくActuator特徴から学習する')
     parser.add_argument('--repair_operation_amount_bias_scale', default=2.0, type=float, help='学習されたAdd/Adjust実行量を位置logitへ反映する強さ')
-    parser.add_argument('--repair_operation_amount_consistency_weight', default=1.0, type=float, help='学習済み操作割合と実soft操作率を一致させる補助損失重み')
-    parser.add_argument('--repair_drop_amount_random_mix_start', default=0.35, type=float, help='探索初期にPrune実行量へ混ぜるランダム割合')
+  
+    """損失項の重みパラメータ"""
+    # 圧縮損失における点操作のAmount
+    parser.add_argument('--repair_amount_downstream_grad_scale', default=10.0, type=float, help='Amount ratioから実際の点操作へ向かう下流勾配だけを強める倍率。forward値は変えず、backwardだけ強める')
+    parser.add_argument('--repair_drop_amount_downstream_grad_scale', default=20.0, type=float, help='Prune Amount ratioから実際の削除操作へ向かう下流勾配だけを強める倍率')
+    parser.add_argument('--repair_add_amount_downstream_grad_scale', default=10, type=float, help='Add Amount ratioから実際の追加操作へ向かう下流勾配だけを強める倍率')
+    parser.add_argument('--repair_move_amount_downstream_grad_scale', default=8.0, type=float, help='Move Amount ratioから実際の移動操作へ向かう下流勾配だけを強める倍率')
+    # 圧縮損失における点操作のWhere
+    parser.add_argument('--repair_where_downstream_grad_scale', default=1.0, type=float, help='Where scoreから実際の点操作へ向かう下流勾配だけを強める倍率。forward値は変えず、backwardだけ強める')
+    parser.add_argument('--repair_drop_where_downstream_grad_scale', default=1.0, type=float, help='Prune Where scoreから実際の削除操作へ向かう下流勾配だけを強める倍率')
+    parser.add_argument('--repair_add_where_downstream_grad_scale', default=1.0, type=float, help='Add Where scoreから実際の追加操作へ向かう下流勾配だけを強める倍率')
+    parser.add_argument('--repair_move_where_downstream_grad_scale', default=2.0, type=float, help='Move Where scoreから実際の移動操作へ向かう下流勾配だけを強める倍率')
+    # Actuatorにおける点操作のWhere
+    parser.add_argument('--repair_drop_where_actuator_weight', default=0.3, type=float, help='Prune Where scoreへ直接かけるActuator補助損失重み')
+    parser.add_argument('--repair_add_where_actuator_weight', default=0.3, type=float, help='Add Where scoreへ直接かけるActuator補助損失重み')
+    parser.add_argument('--repair_move_where_actuator_weight', default=0.3, type=float, help='Move Where scoreまたは方向へ直接かけるActuator補助損失重み')
+    # Actuatorにおける点操作のAmount
+    parser.add_argument('--repair_operation_amount_consistency_weight', default=0.1, type=float, help='学習済み操作割合と実soft操作率を一致させる補助損失重み')
+    parser.add_argument('--repair_operation_amount_direct_weight', default=0.01, type=float, help='learned操作割合を目標割合へ近づける直接補助損失。圧縮主目的では弱く使う')
+    parser.add_argument('--repair_drop_amount_supervision_weight', default=0.001, type=float, help='Prune hard実行量を教師にするAmount補助損失。圧縮主目的では弱く使う')
+    parser.add_argument('--repair_drop_amount_soft_consistency_weight', default=0.0005, type=float, help='Prune soft実行量とlearned ratioの整合補助損失')
+    parser.add_argument('--repair_move_amount_supervision_weight', default=0.001, type=float, help='Move hard実行量を教師にするAmount補助損失。圧縮主目的では弱く使う')
+    parser.add_argument('--repair_move_amount_soft_consistency_weight', default=0.0005, type=float, help='Move soft実行量とlearned ratioの整合補助損失')
+    parser.add_argument('--repair_add_amount_supervision_weight', default=0.001, type=float, help='Add hard実行量を教師にするAmount補助損失。圧縮主目的では弱く使う')
+    parser.add_argument('--repair_add_amount_soft_consistency_weight', default=0.0005, type=float, help='Add soft実行量とlearned ratioの整合補助損失')
+
+    parser.add_argument('--repair_drop_amount_random_mix_start', default=0.1, type=float, help='探索初期にPrune実行量へ混ぜるランダム割合')
     parser.add_argument('--repair_drop_amount_random_mix_end', default=0.0, type=float, help='探索終了後にPrune実行量へ混ぜるランダム割合')
-    parser.add_argument('--repair_add_amount_random_mix_start', default=0.35, type=float, help='探索初期にAdd実行量へ混ぜるランダム割合')
+    parser.add_argument('--repair_add_amount_random_mix_start', default=0.1, type=float, help='探索初期にAdd実行量へ混ぜるランダム割合')
     parser.add_argument('--repair_add_amount_random_mix_end', default=0.0, type=float, help='探索終了後にAdd実行量へ混ぜるランダム割合')
-    parser.add_argument('--repair_move_amount_random_mix_start', default=0.35, type=float, help='探索初期にAdjust実行量へ混ぜるランダム割合')
+    parser.add_argument('--repair_move_amount_random_mix_start', default=0.1, type=float, help='探索初期にAdjust実行量へ混ぜるランダム割合')
     parser.add_argument('--repair_move_amount_random_mix_end', default=0.0, type=float, help='探索終了後にAdjust実行量へ混ぜるランダム割合')
     parser.add_argument('--repair_move_score_noise_start', default=0.0, type=float, help='探索初期にAdjust source scoreへ入れる正規ノイズ量')
     parser.add_argument('--repair_move_score_noise_end', default=0.0, type=float, help='探索終了後にAdjust source scoreへ入れる正規ノイズ量')
@@ -462,9 +505,9 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument('--compression_primary_warmup_steps', default=0, type=int, help='compression_primaryでw_comを滑らかに上げるstep数(0で無効)')
     parser.add_argument('--cp_lambda_geom', default=1.0, type=float, help='compression_primaryのgeometry safety penalty重み')
-    parser.add_argument('--cp_lambda_single', default=1.0, type=float, help='compression_primaryのsingle-child safety penalty重み')
-    parser.add_argument('--cp_lambda_nodes', default=1.0, type=float, help='compression_primaryのnode safety penalty重み')
-    parser.add_argument('--cp_lambda_actuator', default=0.1, type=float, help='compression_primaryのactuator safety penalty重み')
+    parser.add_argument('--cp_lambda_single', default=0.05, type=float, help='compression_primaryのsingle-child safety penalty重み')
+    parser.add_argument('--cp_lambda_nodes', default=0.03, type=float, help='compression_primaryのnode safety penalty重み')
+    parser.add_argument('--cp_lambda_actuator', default=0.05, type=float, help='compression_primaryのactuator safety penalty重み')
     parser.add_argument('--cp_lambda_sparsepcgc', default=0.0, type=float, help='compression_primaryのSparsePCGC soft aux safety penalty重み')
     parser.add_argument('--cp_lambda_op', default=0.0, type=float, help='compression_primaryのoperation safety penalty重み(現状は実験用、default無効)')
     parser.add_argument('--cp_tau_geom', default=0.06, type=float, help='compression_primaryのgeometry許容閾値')
@@ -477,10 +520,10 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--cp_log_grad_terms', default=True, type=str2bool, help='compression_primaryの各loss項のrequires_grad/finiteをログするか')
     parser.add_argument('--w_geom',     default=10**4, type=float, help='幾何損失ブロック全体の重み')
     parser.add_argument('--geom_d2_weight', default=0.2, type=float, help='loss_type=cd+d2 のときの D2PSNR 報酬項の重み')
-    parser.add_argument('--w_com',      default=10, type=float, help='圧縮損失ブロック全体の重み（actual/surrogate backendでは total-bit 差[%%] に直接掛かる）')
+    parser.add_argument('--w_com',      default=1, type=float, help='圧縮損失ブロック全体の重み（actual/surrogate backendでは total-bit 差[%%] に直接掛かる）')
     parser.add_argument('--w_attr',     default=1, type=float, help='原因分解損失ブロック全体の重み')
-    parser.add_argument('--w_policy',   default=1, type=float, help='構造修復ポリシー損失ブロック全体の重み')
-    parser.add_argument('--w_actuator', default=0.05, type=float, help='構造修復アクチュエータ正則化損失ブロック全体の重み')
+    parser.add_argument('--w_policy',   default=0.03, type=float, help='構造修復ポリシー損失ブロック全体の重み')
+    parser.add_argument('--w_actuator', default=7, type=float, help='構造修復アクチュエータ正則化損失ブロック全体の重み')
     parser.add_argument('--w_prun',     default=None, type=float, help='旧名: --w_attr の後方互換alias')
     parser.add_argument('--w_add',      default=None, type=float, help='旧名: --w_policy の後方互換alias')
     parser.add_argument('--w_dis',      default=None, type=float, help='旧名: --w_actuator の後方互換alias')
@@ -581,6 +624,12 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--compression_surrogate_replay_batch', default=8, type=int, help='Surrogate replay学習のbatch数')
     parser.add_argument('--compression_surrogate_replay_entries', default=512, type=int, help='Surrogate replay bufferの最大件数')
     parser.add_argument('--compression_surrogate_forward_mode', default='teacher_ste', type=str, help='surrogate損失のforward値(surrogate/teacher_ste)')
+    parser.add_argument(
+        '--detach_surrogate_from_network',
+        default=True,
+        type=str2bool,
+        help='TrueならSurrogate由来の勾配をNetwork側へ流さない。SurrogateはActual模倣・ログ・値比較専用にする',
+    )
     parser.add_argument('--compression_surrogate_aux_node_weight', default=0.0, type=float, help='Surrogate debug用soft Octree node補助項の重み')
     parser.add_argument('--compression_surrogate_aux_single_weight', default=0.0, type=float, help='Surrogate debug用soft単一子ノード補助項の重み')
     parser.add_argument('--compression_surrogate_aux_in_objective', default=False, type=str2bool, help='soft Octree補助項を主圧縮objectiveへ混ぜるか。FalseならCompression Lossは実bit差分のみ')
@@ -621,7 +670,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--sparsepcgc_aux_min_sign_match', default=0.50, type=float, help='proxy aux backpropを許可する最小rolling符号一致率')
     parser.add_argument('--sparsepcgc_aux_gating_window', default=100, type=int, help='proxy aux gateに使うrollingサンプル数')
     parser.add_argument('--sparsepcgc_disable_add', default=False, type=str2bool, help='SparsePCGCでは新規active coordinate増加を避けるため追加操作を既定で止める')
-    parser.add_argument('--surrogate_step', default=500, type=int, help='main network更新前にSurrogateだけをactual teacherへfitさせるstep数')
+    parser.add_argument('--surrogate_step', default=0, type=int, help='main network更新前にSurrogateだけをactual teacherへfitさせるstep数')
     parser.add_argument('--surrogate_pretrain_lr', default=1e-4, type=float, help='Surrogate pretrain中のlearning rate')
     parser.add_argument('--surrogate_pretrain_actual_refresh_interval', default=10, type=int, help='Surrogate pretrain中のactual teacher refresh間隔')
     parser.add_argument('--surrogate_pretrain_freeze_network', default=True, type=str2bool, help='Surrogate pretrain中にmain networkをfreezeするか')
@@ -717,6 +766,12 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--voxel_collision_log_stages', default='input_gt,model_output_raw,compression_input', type=str, help='Voxel衝突率ログ対象stageのカンマ区切り一覧')
     parser.add_argument('--enable_sparsepcgc_empty_target_guard', default=True, type=str2bool, help='SparsePCGC互換量子化後に既存occupied targetへ入るAdjustをpreserveへ戻す')
     parser.add_argument('--enable_sparsepcgc_target_duplicate_guard', default=True, type=str2bool, help='SparsePCGC互換量子化後に同じtarget voxelへ集まるAdjustを1点だけ残してpreserveへ戻す')
+    parser.add_argument(
+        '--repair_move_relax_duplicate_guard_when_starved',
+        default=True,
+        type=str2bool,
+        help='Adjust候補がduplicate guardで少なすぎる場合だけduplicate guardを緩める。empty target guardは維持する',
+    )
     parser.add_argument('--sparsepcgc_empty_target_penalty_weight', default=0.0, type=float, help='既存occupied targetへ入るAdjustのsoft penalty重み')
     parser.add_argument('--sparsepcgc_target_duplicate_penalty_weight', default=0.0, type=float, help='同じtarget voxelへ複数Adjustするsoft penalty重み')
     parser.add_argument('--enable_sparsepcgc_occupancy_debug', default=False, type=str2bool, help='SparsePCGC本体の候補occupancy確率/label/bit推定ログをactual評価時だけ取得する')
@@ -833,10 +888,10 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--patch_sort_grid_size', default=1024, type=int, help='spatial_sort時の粗い空間グリッド分解能')
     parser.add_argument('--patch_info_cache', default=True, type=str2bool, help='パッチ分割結果をCPUキャッシュして再利用するか')
     parser.add_argument('--train_patch_subset_enable', default=True, type=str2bool, help='train時にpatch subsetではなくOctree subtree subset学習を使うか')
-    parser.add_argument('--train_subtree_level', default=0, type=int, help='train subtree深さ(0ならrepair_unit_levelを使う)')
+    parser.add_argument('--train_subtree_level', default=4, type=int, help='train subtree深さ(0ならrepair_unit_levelを使う)')
     parser.add_argument('--train_subtree_randomize_level', default=True, type=str2bool, help='train時にsubtree深さを一定範囲でランダム化するか')
     parser.add_argument('--train_subtree_level_jitter', default=1, type=int, help='train_subtree_levelの前後に何段までランダム化を許すか')
-    parser.add_argument('--train_subtree_level_min', default=0, type=int, help='train時subtree深さの最小値(0ならbase-jitter)')
+    parser.add_argument('--train_subtree_level_min', default=4, type=int, help='train時subtree深さの最小値(0ならbase-jitter)')
     parser.add_argument('--train_subtree_level_max', default=0, type=int, help='train時subtree深さの最大値(0ならbase+jitter)')
     parser.add_argument('--train_subtree_random_full_range', default=False, type=str2bool, help='min/max未指定時にデータから推定した全Octree深さ範囲からランダムに選ぶ')
     parser.add_argument('--train_subtree_level_sampling', default='uniform_random', type=str, help='subtree深さサンプリング方法(uniform_random/coverage_cycle)')
@@ -927,16 +982,16 @@ def parse_pugan_args(parser, file_day, file_time):
     else:
         args.more_training_ckpt = ""
 
-    args.repair_operation_amount_logit_weight = max(
-        float(getattr(args, "repair_operation_amount_logit_weight", 0.05)),
-        0.0,
-    )
-    args.repair_operation_amount_logit_scale = max(
-        float(getattr(args, "repair_operation_amount_logit_scale", 6.0)),
-        1e-6,
-    )
+    args.repair_operation_amount_logit_weight = max(float(getattr(args, "repair_operation_amount_logit_weight", 0.05)), 0.0)
+    args.repair_operation_amount_logit_scale = max(float(getattr(args, "repair_operation_amount_logit_scale", 6.0)), 1e-6)
     args.w_com = max(float(getattr(args, "w_com", 10.0)), 0.0)
-    
+    args.repair_drop_where_actuator_weight = max(float(getattr(args, "repair_drop_where_actuator_weight", 0.1)), 0.0)
+    args.repair_add_where_actuator_weight = max(float(getattr(args, "repair_add_where_actuator_weight", 0.3)), 0.0)
+    args.repair_move_where_actuator_weight = max(float(getattr(args, "repair_move_where_actuator_weight", 0.3)), 0.0)
+    args.repair_where_downstream_grad_scale = max(float(getattr(args, "repair_where_downstream_grad_scale", 1.0)), 1.0)
+    args.repair_drop_where_downstream_grad_scale = max(float(getattr(args, "repair_drop_where_downstream_grad_scale", args.repair_where_downstream_grad_scale)), 1.0)
+    args.repair_add_where_downstream_grad_scale = max(float(getattr(args, "repair_add_where_downstream_grad_scale", args.repair_where_downstream_grad_scale)), 1.0)
+    args.repair_move_where_downstream_grad_scale = max(float(getattr(args, "repair_move_where_downstream_grad_scale", args.repair_where_downstream_grad_scale)), 1.0)
 
     args._add_cli_provided = _cli_option_was_provided("--add")
     args._use_amp_cli_provided = _cli_option_was_provided("--use_amp")
@@ -1438,14 +1493,36 @@ def parse_pugan_args(parser, file_day, file_time):
     args.actual_total_bit_objective_mix = min(max(float(getattr(args, "actual_total_bit_objective_mix", 0.5)), 0.0), 1.0)
     # Add/Adjustの実行量をActuator特徴から学習するかをboolへ正規化する。
     args.repair_learn_operation_amounts = bool(getattr(args, "repair_learn_operation_amounts", True))
+
     # 学習された操作量を位置logitへ戻す強さを非負値へ正規化する。
-    args.repair_operation_amount_bias_scale = max(float(getattr(args, "repair_operation_amount_bias_scale", 2.0)), 0.0)
+    args.repair_operation_amount_bias_scale = max(
+        float(getattr(args, "repair_operation_amount_bias_scale", 2.0)),
+        0.0,
+    )
+
+    # Amount ratioから下流の点操作へ向かう勾配だけを強める倍率を正規化する。
+    args.repair_amount_downstream_grad_scale = max(
+        float(getattr(args, "repair_amount_downstream_grad_scale", 6.0)),
+        1.0,
+    )
+    args.repair_drop_amount_downstream_grad_scale = max(
+        float(getattr(args, "repair_drop_amount_downstream_grad_scale", args.repair_amount_downstream_grad_scale)),
+        1.0,
+    )
+    args.repair_add_amount_downstream_grad_scale = max(
+        float(getattr(args, "repair_add_amount_downstream_grad_scale", args.repair_amount_downstream_grad_scale)),
+        1.0,
+    )
+    args.repair_move_amount_downstream_grad_scale = max(
+        float(getattr(args, "repair_move_amount_downstream_grad_scale", args.repair_amount_downstream_grad_scale)),
+        1.0,
+    )
+
     # 学習済み操作割合と実soft操作率を結ぶ補助損失の強さを非負値へ収める。
     args.repair_operation_amount_consistency_weight = max(
         float(getattr(args, "repair_operation_amount_consistency_weight", 1.0)),
         0.0,
     )
-    
     # 学習初期のPrune/Add/Adjust実行量探索率を0-1へ収める。
     args.repair_drop_amount_random_mix_start = min(max(float(getattr(args, "repair_drop_amount_random_mix_start", 0.35)), 0.0), 1.0)
     args.repair_drop_amount_random_mix_end = min(max(float(getattr(args, "repair_drop_amount_random_mix_end", 0.0)), 0.0), 1.0)
@@ -1559,7 +1636,7 @@ def parse_pugan_args(parser, file_day, file_time):
     sparsepcgc_backend = compress_key == "sparsepcgc" or args.compression_loss_backend.startswith("sparsepcgc_")
     if sparsepcgc_backend:
         if not _cli_option_was_provided("--surrogate_step"):
-            args.surrogate_step = max(int(getattr(args, "surrogate_step", 0)), 2000)
+            args.surrogate_step = max(int(getattr(args, "surrogate_step", 0)), 0)
         if args.compression_loss_backend.endswith("_surrogate") and not _cli_option_was_provided("--disable_actual_codec_during_train"):
             # SparsePCGC surrogateは実SparsePCGC bit教師が必要なので、既定ではactual teacherを止めない。
             args.disable_actual_codec_during_train = False
@@ -1667,9 +1744,9 @@ def parse_pugan_args(parser, file_day, file_time):
         if not _cli_option_was_provided("--max_move_ratio"):
             args.max_move_ratio = max(float(getattr(args, "max_move_ratio", 0.0)), 1.00) # Adjustの実行量上限を0〜100%へ広げる
         if not _cli_option_was_provided("--repair_operation_amount_consistency_weight"):
-            args.repair_operation_amount_consistency_weight = max(
-                float(getattr(args, "repair_operation_amount_consistency_weight", 1.0)),
-                2.0,
+            args.repair_operation_amount_consistency_weight = min(
+                max(float(getattr(args, "repair_operation_amount_consistency_weight", 0.01)), 0.0),
+                0.01,
             )
         if not _cli_option_was_provided("--repair_add_ratio_weight"):
             args.repair_add_ratio_weight = max(float(getattr(args, "repair_add_ratio_weight", 4.0)), 8.0)
@@ -1692,15 +1769,15 @@ def parse_pugan_args(parser, file_day, file_time):
         if not _cli_option_was_provided("--repair_add_weight_random_mix_end"):
             args.repair_add_weight_random_mix_end = 0.0
         if not _cli_option_was_provided("--repair_drop_amount_random_mix_start"):
-            args.repair_drop_amount_random_mix_start = 0.75
+            args.repair_drop_amount_random_mix_start = 0.10
         if not _cli_option_was_provided("--repair_drop_amount_random_mix_end"):
             args.repair_drop_amount_random_mix_end = 0.0
         if not _cli_option_was_provided("--repair_add_amount_random_mix_start"):
-            args.repair_add_amount_random_mix_start = 0.65
+            args.repair_add_amount_random_mix_start = 0.10
         if not _cli_option_was_provided("--repair_add_amount_random_mix_end"):
             args.repair_add_amount_random_mix_end = 0.0
         if not _cli_option_was_provided("--repair_move_amount_random_mix_start"):
-            args.repair_move_amount_random_mix_start = 0.75
+            args.repair_move_amount_random_mix_start = 0.10
         if not _cli_option_was_provided("--repair_move_amount_random_mix_end"):
             args.repair_move_amount_random_mix_end = 0.0
         if not _cli_option_was_provided("--repair_move_score_noise_start"):

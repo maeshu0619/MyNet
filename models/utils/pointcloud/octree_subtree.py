@@ -572,6 +572,82 @@ def _build_single_subtree_tree(subtree_key, point_idx, subtree_ref, global_coord
         "repair_unit_keys": repair_unit_keys,
     }
 
+def _prefix_child_set_from_coords(global_coords, path, global_depth: int):
+    # 指定path直下に存在する子slotだけを、全Octree mapを作らず直接求める。
+    coords = _cpu_long(global_coords).reshape(-1, 3)
+    global_depth = max(int(global_depth), 1)
+    depth = len(path)
+
+    if coords.numel() == 0 or depth >= global_depth:
+        return set()
+
+    if depth > 0:
+        cell = _cell_from_path(path)
+        shift = global_depth - depth
+        prefix = torch.bitwise_right_shift(coords, shift)
+        mask = (prefix == cell.view(1, 3)).all(dim=1)
+        coords = coords[mask]
+        if coords.numel() == 0:
+            return set()
+
+    bit_pos = global_depth - depth - 1
+    child = (
+        ((coords[:, 0] >> bit_pos) & 1) * 4
+        + ((coords[:, 1] >> bit_pos) & 1) * 2
+        + ((coords[:, 2] >> bit_pos) & 1)
+    )
+    return set(int(v) for v in torch.unique(child, sorted=True).tolist())
+
+
+def _build_required_full_child_map(global_coords, subtree_ref, selected_keys, global_depth: int):
+    # 選択Subtreeのfull contextで参照されるpathだけ child map を作る。
+    # SparsePCGCの文脈は維持しつつ、全Octree map構築を避ける。
+    depth = int(subtree_ref["depth"][0].detach().cpu().item())
+    full_child_map = {}
+    selected_paths = []
+
+    for subtree_key in selected_keys:
+        cell = _decode_subtree_key(int(subtree_key), depth)
+        path = _path_from_cell(cell, depth)
+        selected_paths.append(path)
+
+        # ancestor occupancy 用
+        for level in range(0, len(path)):
+            ancestor_path = path[:level]
+            if ancestor_path not in full_child_map:
+                full_child_map[ancestor_path] = _prefix_child_set_from_coords(
+                    global_coords,
+                    ancestor_path,
+                    global_depth,
+                )
+
+        # parent occupancy 用
+        parent_path = path[:-1]
+        if parent_path not in full_child_map:
+            full_child_map[parent_path] = _prefix_child_set_from_coords(
+                global_coords,
+                parent_path,
+                global_depth,
+            )
+
+    # sibling occupancy 用
+    for path in selected_paths:
+        parent_path = path[:-1]
+        selected_child = path[-1] if path else 0
+        parent_children = full_child_map.get(parent_path, set())
+
+        for child in parent_children:
+            if int(child) == int(selected_child):
+                continue
+            sibling_path = parent_path + (int(child),)
+            if sibling_path not in full_child_map:
+                full_child_map[sibling_path] = _prefix_child_set_from_coords(
+                    global_coords,
+                    sibling_path,
+                    global_depth,
+                )
+
+    return full_child_map
 
 def _build_single_full_octree_context(subtree_key, subtree_ref, full_child_map, global_depth: int):
     depth = int(subtree_ref["depth"][0].detach().cpu().item())
@@ -624,7 +700,13 @@ def _build_group_octree_metadata(pts_xyz, subtree_ref, all_groups, args=None):
     pts_b = torch.nan_to_num(pts_xyz[0].detach().to(torch.float32), nan=0.0, posinf=0.0, neginf=0.0)
     global_coords = torch.round((pts_b - offset.view(3, 1)) / qs).to(torch.long).transpose(0, 1).contiguous().detach().to("cpu")
     global_coords = global_coords.clamp_min(0)
-    full_child_map = _child_map_from_coords(global_coords, global_depth)
+    selected_keys = [int(subtree_key) for subtree_key, _ in all_groups]
+    full_child_map = _build_required_full_child_map(
+        global_coords,
+        subtree_ref,
+        selected_keys,
+        global_depth,
+    )
     repair_unit_level = int(getattr(args, "repair_unit_level", int(subtree_ref["depth"][0].detach().cpu().item()))) if args is not None else None
     subtree_trees = {}
     full_octree_contexts = {}

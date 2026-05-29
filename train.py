@@ -715,7 +715,6 @@ def train(model, args, loss, writer, plot, notifier=None):
 
             for step, pts in enumerate(loader): # Step開始
                 """基本情報のセットアップ"""
-                t1 = time.time()
                 st_step = time.time()
                 file_path = active_dataset.files[step]
                 cache_key = make_step_cache_key(file_path, args) # ファイルパスと設定から一意なキーを作り、前処理結果、Codec結果、Patch情報などのキャッシュ参照に使う
@@ -796,6 +795,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                 compression_gen_xyz = None # 圧縮Lossへ渡した出力点群をVoxel衝突ログで参照する
                 train_edit_stats = None # 点操作を見計算状態にする
                 noise_debug = empty_noise_debug() # 圧縮損失用に量子化前の点群に加えるノイズのデバッグ情報を初期化
+                # VoxelCollisionログ用のGT点群である。
+                # full-cloud時は全体点群、Subtree時は後で選択Subtreeに差し替える。
+                voxel_collision_input_gt = input_xyz[:, :3, :]
                 subtree_depth_meta = {} # 深度などの情報保存
                 subtree_trees = {} # 事前構築したSubtree内部OctreeをCPU側で保持する
                 full_octree_contexts = {} # full-cloud Octree内でのSubtree文脈をCPU側で保持する
@@ -808,18 +810,47 @@ def train(model, args, loss, writer, plot, notifier=None):
                 subtree_point_counts = [int(input_xyz.shape[-1])] # Subtree点数分布の初期値として、全体点群の点数をリストで保存
                 anchor_reason = "not_subtree_mode"
                 subtree_loss_scope = "full_cloud"
-                
                 """Subtree分割学習"""
                 if subtree_mode:                    
                     """Subtree分割学習のセットアップ"""
                     optimizer.zero_grad(set_to_none=True) # 残った勾配の削除
                     subset_enabled = True # 部分集合学習を有効にする
                     input_attr_full = input_pcd[:, 3:, :].contiguous() if input_pcd.shape[1] > 3 else None # 属性のとりだし
-                    subtree_depth_meta = sample_train_subtree_depth( input_xyz, args, global_step=global_train_step, cache_key=cache_key) # Octree深度の決定
-                    subtree_depth_meta, requested_subtree_depth = maybe_raise_subtree_depth_for_large_input( subtree_depth_meta, raw_pts_num, args) # 大点群時は点を捨てずにSubtree深度だけ1段階浅くする
-                    requested_subtree_depth = int(requested_subtree_depth) # 調整後のSubtree深度を整数で取り出す
-                    min_subtree_points = max(int(getattr(args, "train_subtree_min_points", 1)), 1) # Subtreeとして採用する点数の最小点数
-                    subtree_group_state = build_octree_subtree_groups_with_retry( input_xyz, args, requested_subtree_depth, min_subtree_points, allow_largest_fallback=True) # 入力点群から指定深度のOctree Subtree群を作る
+                    subtree_depth_meta = sample_train_subtree_depth(
+                        input_xyz,
+                        args,
+                        global_step=global_train_step,
+                        cache_key=cache_key,
+                    ) # Octree深度の決定
+
+                    subtree_depth_meta, requested_subtree_depth = maybe_raise_subtree_depth_for_large_input(
+                        subtree_depth_meta,
+                        raw_pts_num,
+                        args,
+                    ) # 大点群時のSubtree深度調整
+
+                    # Subtree分割の最小Depthを2に固定する
+                    train_subtree_depth_floor = int(getattr(args, "train_subtree_depth_floor", 4))
+                    requested_subtree_depth = max(int(requested_subtree_depth), train_subtree_depth_floor)
+
+                    # ログ上も、最終的に要求したDepthを分かるように残す
+                    subtree_depth_meta = dict(subtree_depth_meta)
+                    subtree_depth_meta["depth_floor"] = int(train_subtree_depth_floor)
+                    subtree_depth_meta["depth_after_floor"] = int(requested_subtree_depth)
+
+                    min_subtree_points = max(int(getattr(args, "train_subtree_min_points", 1)), 1)
+                    subtree_group_state = build_octree_subtree_groups_with_retry(
+                        input_xyz,
+                        args,
+                        requested_subtree_depth,
+                        min_subtree_points,
+                        allow_largest_fallback=True,
+                    )
+                    # subtree_depth_meta = sample_train_subtree_depth( input_xyz, args, global_step=global_train_step, cache_key=cache_key) # Octree深度の決定
+                    # subtree_depth_meta, requested_subtree_depth = maybe_raise_subtree_depth_for_large_input( subtree_depth_meta, raw_pts_num, args) # 大点群時は点を捨てずにSubtree深度だけ1段階浅くする
+                    # requested_subtree_depth = int(requested_subtree_depth) # 調整後のSubtree深度を整数で取り出す
+                    # min_subtree_points = max(int(getattr(args, "train_subtree_min_points", 1)), 1) # Subtreeとして採用する点数の最小点数
+                    # subtree_group_state = build_octree_subtree_groups_with_retry( input_xyz, args, requested_subtree_depth, min_subtree_points, allow_largest_fallback=True) # 入力点群から指定深度のOctree Subtree群を作る
                     """Subtree情報"""
                     subtree_ref = subtree_group_state["subtree_ref"] # Subtree参照情報の抽出
                     if subtree_ref is None:
@@ -885,26 +916,21 @@ def train(model, args, loss, writer, plot, notifier=None):
                     else:
                         subtree_point_counts = [int(point_idx.numel()) for _, point_idx in selected_groups]
                         subtree_loss_scope = "subtree_output_vs_subtree_input"
+                        
                     # ============================================================
                     # 選択済みSubtreeだけmetadataを構築する
                     # これにより、同一階層の全Subtreeに対するtree/context構築を避ける
                     # ============================================================
                     if not is_anchor_step:
-                        metadata_t0 = time.time()
+                        t1 = time.time()
                         subtree_trees, full_octree_contexts, group_meta = build_selected_group_octree_metadata(
                             input_xyz,
                             subtree_ref,
                             selected_groups,
                             args=args,
                         )
-                        metadata_t1 = time.time()
-                        # print(
-                        #     f"Selected Subtree Metadata: {metadata_t1 - metadata_t0:.2f} sec "
-                        #     f"selected_groups={len(selected_groups)}, "
-                        #     f"subtree_trees={len(subtree_trees)}, "
-                        #     f"full_octree_contexts={len(full_octree_contexts)}, "
-                        #     f"group_meta={len(group_meta)}"
-                        # )
+                        t2 = time.time()
+                        # print(t2-t1)
                     else:
                         subtree_trees = {}
                         full_octree_contexts = {}
@@ -992,7 +1018,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                                     selected_subtree_keys=None,
                                     subtree_tree=None,
                                     full_octree_context=None,
-                                    octree_input_mode="full_cloud",
+                                    octree_input_mode="full_cloud"
                                     )
                             if final_w is not None and not torch.isfinite(final_w).all(): # final重みにNanやinfが混ざっていないか確認
                                 writer.write( "Warning: final_w contains NaN/Inf. " "It will be sanitized before point-edit summary and losses.")
@@ -1060,6 +1086,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 args._current_exact_teacher_uses_full_context = bool(use_subtree_tree and use_full_octree_context) # full文脈の使用可否
                                 args._current_exact_teacher_fallback_reason = "" if (use_subtree_tree and use_full_octree_context) else "missing_prebuilt_subtree_tree_or_full_octree_context" # fallback理由
                                 subtree_xyz = input_xyz.index_select(2, point_idx).contiguous() # 全体対入力点群から現在Subtreeに属する点だけを取り出す
+                                # VoxelCollisionログでは、Subtree学習中のGTも選択Subtreeに揃える。
+                                # これを入れないと input_gt だけ full cloud 全体になり、診断対象がずれる。
+                                voxel_collision_input_gt = subtree_xyz[:, :3, :]
                                 subtree_attr = None
                                 if input_attr_full is not None:
                                     subtree_attr = input_attr_full.index_select(2, point_idx).contiguous() # 属性を取り出す
@@ -1155,6 +1184,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                                         loss_bit_sub = zero
                                         loss_single_sub = zero
                                         loss_nodes_sub = zero
+                                
 
                                 """損失項の計算"""
                                 L_geom = L_geom + (L_geom_sub / num_selected)
@@ -1175,6 +1205,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                             noise_debug = merge_noise_debug_values(subtree_noise_debug_values)
                             if subtree_compression_term_sums:
                                 loss.last_compression_terms = subtree_compression_term_sums
+
                     finally:
                         args._log_this_step = prev_log_flag
 
@@ -1225,10 +1256,92 @@ def train(model, args, loss, writer, plot, notifier=None):
                 L_discrete_policy = L.new_zeros(())
                 cp_debug = {} # compression primaryモード用のdebug情報を空辞書で初期化
                 if compression_primary_mode: # 圧縮優先の場合、圧縮損失を重視した損失を再計算
-                    L_com_objective = float(getattr(args, "w_com", 10.0)) * L_com_objective
+                    L, L_com_objective, cp_debug = build_compression_primary_loss(
+                        args,
+                        terms=terms,
+                        L_com=L_com,
+                        L_geom=L_geom,
+                        L_actuator=L_actuator,
+                        global_train_step=global_train_step,
+                        stage_factors=stage_factors,
+                    )
+
+                    # ============================================================
+                    # Compression Primary の勾配復帰
+                    # ============================================================
+                    # build_compression_primary_loss が hard actual bit だけを目的にした場合、
+                    # L_com_objective が no_grad_graph になる。
+                    # その場合、forward値は hard actual のまま維持し、
+                    # backwardだけ loss_bit / loss_nodes / loss_single / op 由来の
+                    # 微分可能proxyへ流す。
+                    #
+                    # 重要：
+                    #   Surrogate予測値そのものは使わない。
+                    #   terms["surrogate"] はここに入れない。
+                    # ============================================================
+                    if not (torch.is_tensor(L_com_objective) and L_com_objective.requires_grad):
+                        compression_grad_terms = []
+
+                        bit_term = terms.get("bit", None)
+                        if torch.is_tensor(bit_term) and bit_term.requires_grad:
+                            compression_grad_terms.append(
+                                float(getattr(args, "com_bit", 1.0)) * bit_term
+                            )
+
+                        node_term = terms.get("node", None)
+                        if torch.is_tensor(node_term) and node_term.requires_grad:
+                            compression_grad_terms.append(
+                                float(getattr(args, "cp_lambda_nodes", 1.0)) * node_term
+                            )
+
+                        single_term = terms.get("single", None)
+                        if torch.is_tensor(single_term) and single_term.requires_grad:
+                            compression_grad_terms.append(
+                                float(getattr(args, "cp_lambda_single", 1.0)) * single_term
+                            )
+
+                        op_term = terms.get("op", None)
+                        if (
+                            torch.is_tensor(op_term)
+                            and op_term.requires_grad
+                            and float(getattr(args, "cp_lambda_op", 0.0)) > 0.0
+                        ):
+                            compression_grad_terms.append(
+                                float(getattr(args, "cp_lambda_op", 0.0)) * op_term
+                            )
+
+                        if compression_grad_terms:
+                            compression_proxy_for_grad = compression_grad_terms[0]
+                            for term in compression_grad_terms[1:]:
+                                compression_proxy_for_grad = compression_proxy_for_grad + term
+
+                            compression_proxy_for_grad = torch.nan_to_num(
+                                compression_proxy_for_grad,
+                                nan=0.0,
+                                posinf=0.0,
+                                neginf=0.0,
+                            )
+
+                            # forward値はL_com_objectiveのhard actual値を維持し、
+                            # backwardだけcompression_proxy_for_gradへ流すSTEである。
+                            L_com_objective = L_com_objective.detach() + (
+                                compression_proxy_for_grad - compression_proxy_for_grad.detach()
+                            )
+
+                            # step_gradログで L_com も no_grad_graph にならないように同期する。
+                            # forward値は変わらない。
+                            L_com = L_com_objective
+
+                            if isinstance(cp_debug, dict):
+                                cp_debug["compression_grad_fallback_used"] = True
+                                cp_debug["compression_grad_fallback_source"] = "bit_node_single_op_proxy_ste"
+                        else:
+                            if isinstance(cp_debug, dict):
+                                cp_debug["compression_grad_fallback_used"] = False
+                                cp_debug["compression_grad_fallback_source"] = "no_grad_proxy_available"
+
                     L_downstream = L_com_objective
-                    L, L_com_objective, cp_debug = build_compression_primary_loss( args, terms=terms, L_com=L_com, L_geom=L_geom, L_actuator=L_actuator, global_train_step=global_train_step, stage_factors=stage_factors)
-                    L_downstream = L_com_objective
+
                     L = (
                         L
                         + stage_factors["attr"] * args.w_attr * L_attr
@@ -1297,12 +1410,17 @@ def train(model, args, loss, writer, plot, notifier=None):
                     comp_debug["operation_entropy_moving_avg"] = sum(operation_entropy_history) / float(max(len(operation_entropy_history), 1)) # 操作entropyの移動平均をCSVへ渡す
                 if train_edit_stats is None:
                     train_edit_stats = summarize_point_edits( input_xyz=input_xyz[:, :3, :], gen_pts=gen_pts, final_w=final_w, args=args) # 入力/出力点群を比較し、操作を計算
+                # 念のため、未設定時はfull cloudへ戻す。
+                # 通常はStep開始時に設定され、Subtree学習時は選択Subtreeに差し替わる。
+                if voxel_collision_input_gt is None:
+                    voxel_collision_input_gt = input_xyz[:, :3, :]
+
                 voxel_collision_debug = _collect_train_voxel_collision_stats(
                     args,
                     writer,
                     global_train_step,
                     {
-                        "input_gt": input_xyz[:, :3, :],
+                        "input_gt": voxel_collision_input_gt,
                         "model_output_raw": gen_xyz,
                         "compression_input": compression_gen_xyz,
                     },
