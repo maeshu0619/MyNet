@@ -1219,28 +1219,43 @@ class SurrogateCompressionLossMixin:
         # x_soft自体はsoft圧縮proxyに使うため壊さない。
         # Surrogate予測に入れる入力だけdetachする。
         x_surrogate_pred = x_soft.detach() if detach_surrogate_from_network else x_soft
+        x_pred = None
         if inputs_finite:
             # ============================================================
             # Surrogate予測入力をNetworkから切り離す
             # ============================================================
-            detach_surrogate_from_network = bool(
-                getattr(args, "detach_surrogate_from_network", True)
-            )
-
-            x_pred = x_soft.detach() if detach_surrogate_from_network else x_soft
-            pred_raw = (
-                self.compression_surrogate.forward_raw(x_pred)
-                if hasattr(self.compression_surrogate, "forward_raw")
-                else self.compression_surrogate(x_pred)
-            )
-            pred = self.compression_surrogate(x_pred)
-            if not self._all_finite(pred):
+            x_pred = x_surrogate_pred
+            if detach_surrogate_from_network:
+                with torch.no_grad():
+                    pred_raw = (
+                        self.compression_surrogate.forward_raw(x_pred)
+                        if hasattr(self.compression_surrogate, "forward_raw")
+                        else self.compression_surrogate(x_pred)
+                    )
+                    pred = self.compression_surrogate(x_pred)
+            else:
                 pred_raw = (
                     self.compression_surrogate.forward_raw(x_pred)
                     if hasattr(self.compression_surrogate, "forward_raw")
                     else self.compression_surrogate(x_pred)
                 )
                 pred = self.compression_surrogate(x_pred)
+            if not self._all_finite(pred):
+                if detach_surrogate_from_network:
+                    with torch.no_grad():
+                        pred_raw = (
+                            self.compression_surrogate.forward_raw(x_pred)
+                            if hasattr(self.compression_surrogate, "forward_raw")
+                            else self.compression_surrogate(x_pred)
+                        )
+                        pred = self.compression_surrogate(x_pred)
+                else:
+                    pred_raw = (
+                        self.compression_surrogate.forward_raw(x_pred)
+                        if hasattr(self.compression_surrogate, "forward_raw")
+                        else self.compression_surrogate(x_pred)
+                    )
+                    pred = self.compression_surrogate(x_pred)
             if not self._all_finite(pred):
                 self._log_surrogate_event("using zero prediction because inference stayed non-finite after reset.")
                 pred_raw = x_soft.new_zeros((x_soft.shape[0], 1), dtype=torch.float32)
@@ -1485,12 +1500,30 @@ class SurrogateCompressionLossMixin:
         lcom_with_sparse = main_loss + aux_loss + sparse_aux_loss
         L_com = lcom_without_sparse + sparse_aux_objective
 
-        if forward_mode == "teacher_ste" and inputs_finite and sparsepcgc_aux_used_for_backprop:
-            grad_source = "surrogate_ste_plus_proxy_aux"
-        elif forward_mode == "teacher_ste" and inputs_finite:
-            grad_source = "surrogate_ste"
-        elif sparsepcgc_aux_used_for_backprop:
-            grad_source = "proxy_only"
+        def _has_grad(value):
+            return bool(torch.is_tensor(value) and value.requires_grad)
+
+        surrogate_pred_grad_active = bool(
+            (not detach_surrogate_from_network)
+            and inputs_finite
+            and _has_grad(surrogate_bit_percent)
+            and abs(float(surrogate_weight)) > 0.0
+        )
+        soft_rate_proxy_grad_active = _has_grad(soft_rate_proxy_ste)
+        soft_prune_proxy_grad_active = _has_grad(soft_prune_rate_ste)
+        sparse_aux_grad_active = bool(sparsepcgc_aux_used_for_backprop and _has_grad(sparse_aux_objective))
+        network_grad_components = []
+        if surrogate_pred_grad_active:
+            network_grad_components.append("surrogate_pred_ste")
+        if soft_rate_proxy_grad_active:
+            network_grad_components.append("soft_rate_proxy_ste")
+        if soft_prune_proxy_grad_active:
+            network_grad_components.append("soft_prune_proxy_ste")
+        if sparse_aux_grad_active:
+            network_grad_components.append("sparsepcgc_aux")
+
+        if network_grad_components:
+            grad_source = "+".join(network_grad_components)
         else:
             grad_source = "actual_only_no_grad"
         backend_label = self._surrogate_backend_label(args, teacher_codec)
@@ -1515,6 +1548,7 @@ class SurrogateCompressionLossMixin:
         stored_aux = aux_loss
         stored_sparsepcgc = sparse_aux_term
         stored_op = soft_rate_proxy_for_grad
+        compression_grad_component_summary = ",".join(network_grad_components) if network_grad_components else "none"
         
         self._store_compression_terms(
             main=stored_main,
@@ -1693,6 +1727,29 @@ class SurrogateCompressionLossMixin:
             "surrogate_loss_for_grad": self._scalar(surrogate_loss_for_grad_weighted.detach()),
             "proxy_aux_for_grad": self._scalar(proxy_aux_for_grad.detach()),
             "grad_source": grad_source,
+            "detach_surrogate_from_network": bool(detach_surrogate_from_network),
+            "surrogate_weight_effective": float(surrogate_weight),
+            "surrogate_pred_requires_grad": _has_grad(surrogate_bit_percent),
+            "surrogate_input_requires_grad": _has_grad(x_pred),
+            "loss_bit_proxy_requires_grad": _has_grad(loss_bit_proxy),
+            "soft_rate_proxy_requires_grad": _has_grad(soft_rate_proxy_for_grad),
+            "soft_rate_proxy_ste_requires_grad": _has_grad(soft_rate_proxy_ste),
+            "soft_prune_proxy_requires_grad": _has_grad(prune_com_proxy),
+            "soft_prune_rate_ste_requires_grad": _has_grad(soft_prune_rate_ste),
+            "main_loss_requires_grad": _has_grad(main_loss),
+            "lcom_requires_grad": _has_grad(L_com),
+            "stored_main_requires_grad": _has_grad(stored_main),
+            "stored_bit_requires_grad": _has_grad(stored_bit),
+            "stored_node_requires_grad": _has_grad(stored_node),
+            "stored_single_requires_grad": _has_grad(stored_single),
+            "stored_op_requires_grad": _has_grad(stored_op),
+            "stored_surrogate_requires_grad": _has_grad(stored_surrogate),
+            "network_grad_from_surrogate_pred": bool(surrogate_pred_grad_active),
+            "network_grad_from_soft_rate_proxy": bool(soft_rate_proxy_grad_active),
+            "network_grad_from_soft_prune_proxy": bool(soft_prune_proxy_grad_active),
+            "network_grad_from_sparsepcgc_aux": bool(sparse_aux_grad_active),
+            "network_grad_component_summary": compression_grad_component_summary,
+            "compression_soft_prune_rate_proxy_grad_weight": float(prune_rate_proxy_grad_weight),
             "actual_value_is_fresh": bool(teacher_refreshed),
             "actual_value_source": actual_value_source,
             "actual_value_source_detail": (

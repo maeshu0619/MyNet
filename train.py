@@ -112,6 +112,49 @@ def _safe_scalar_for_grad_log(value):
             return None
 
 
+def _summarize_nonfinite_grads(model, limit=8):
+    # Loss自体が有限でも、backward中に一部パラメータ勾配だけNaN/Infになることがある。
+    base_model = _unwrap_train_model(model)
+    bad_names = []
+    bad_element_count = 0
+    checked_param_count = 0
+    checked_element_count = 0
+    for name, param in base_model.named_parameters():
+        if not param.requires_grad or param.grad is None:
+            continue
+        checked_param_count += 1
+        grad = param.grad.detach()
+        checked_element_count += int(grad.numel())
+        finite_mask = torch.isfinite(grad)
+        if bool(finite_mask.all().item()):
+            continue
+        bad_count = int((~finite_mask).sum().detach().cpu().item())
+        bad_element_count += bad_count
+        if len(bad_names) < int(limit):
+            bad_names.append(f"{name}:{bad_count}")
+    return {
+        "has_nonfinite": bad_element_count > 0,
+        "bad_element_count": int(bad_element_count),
+        "checked_param_count": int(checked_param_count),
+        "checked_element_count": int(checked_element_count),
+        "bad_names": bad_names,
+    }
+
+
+def _format_nonfinite_grad_summary(summary):
+    if not summary or not summary.get("has_nonfinite", False):
+        return "none"
+    names = ",".join(summary.get("bad_names", []))
+    if not names:
+        names = "unlisted"
+    return (
+        f"bad_elements={int(summary.get('bad_element_count', 0))}, "
+        f"checked_params={int(summary.get('checked_param_count', 0))}, "
+        f"checked_elements={int(summary.get('checked_element_count', 0))}, "
+        f"params={names}"
+    )
+
+
 def _format_soft_proxy_debug(args):
     merged = {}
     for attr_name in ("_soft_proxy_geom_debug", "_soft_proxy_com_debug"):
@@ -341,7 +384,7 @@ def build_step_grad_rows(
         return []
 
     interval = max(int(getattr(args, "step_grad_log_interval", 1)), 1)
-    if (int(global_step) + 1) % interval != 0:
+    if int(global_step) != 0 and (int(global_step) + 1) % interval != 0:
         return []
 
     base_model = _unwrap_train_model(model)
@@ -716,6 +759,7 @@ def train(model, args, loss, writer, plot, notifier=None):
             for step, pts in enumerate(loader): # Step開始
                 """基本情報のセットアップ"""
                 st_step = time.time()
+                optimizer.zero_grad(set_to_none=True) # 前Stepの勾配を必ず消し、条件分岐による勾配蓄積を防ぐ
                 file_path = active_dataset.files[step]
                 cache_key = make_step_cache_key(file_path, args) # ファイルパスと設定から一意なキーを作り、前処理結果、Codec結果、Patch情報などのキャッシュ参照に使う
                 raw_pts_num = int(pts.shape[1] if pts.dim() == 3 else pts.shape[0]) # 受け取ったデータの元点数を数え、点数比較やログに使用
@@ -1240,6 +1284,42 @@ def train(model, args, loss, writer, plot, notifier=None):
                 """圧縮損失の合成"""
                 terms = getattr(loss, "last_compression_terms", {}) or {} # 直前の圧縮損失の内訳の取得
                 L_com_objective = compose_train_compression_objective(args, terms, L_com, La_fit) # actual/surrogateではL_com直結と内訳合成を半々で混ぜる
+                # ============================================================
+                # 非有限損失の保険
+                # ============================================================
+                # Actuator内部で inf / nan が出ても L_total 全体を壊さないようにする。
+                # 根本原因は structure_actuator.py 側で潰すが、train側でも防御する。
+                # ============================================================
+                L_actuator = torch.nan_to_num(
+                    L_actuator,
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                )
+                L_attr = torch.nan_to_num(
+                    L_attr,
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                )
+                L_policy = torch.nan_to_num(
+                    L_policy,
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                )
+                L_geom = torch.nan_to_num(
+                    L_geom,
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                )
+                L_com_objective = torch.nan_to_num(
+                    L_com_objective,
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                )
 
                 """形状損失を合成"""
                 legacy_L_downstream = (
@@ -1280,6 +1360,14 @@ def train(model, args, loss, writer, plot, notifier=None):
                     #   terms["surrogate"] はここに入れない。
                     # ============================================================
                     if not (torch.is_tensor(L_com_objective) and L_com_objective.requires_grad):
+                        # ============================================================
+                        # Compression Primary の勾配復帰
+                        # ============================================================
+                        # forward値は L_com_objective の値を維持する。
+                        # backwardだけ、微分可能な圧縮proxyへ流す。
+                        # これにより、L_com が Add / Prune / Move の Where と Amount に届く。
+                        # ============================================================
+
                         compression_grad_terms = []
 
                         bit_term = terms.get("bit", None)
@@ -1322,19 +1410,28 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 neginf=0.0,
                             )
 
-                            # forward値はL_com_objectiveのhard actual値を維持し、
-                            # backwardだけcompression_proxy_for_gradへ流すSTEである。
-                            L_com_objective = L_com_objective.detach() + (
-                                compression_proxy_for_grad - compression_proxy_for_grad.detach()
+                            # 勾配復帰の強さ。
+                            # forward値は変えず、backwardだけproxy側へ流す。
+                            proxy_grad_weight = float(
+                                getattr(args, "compression_primary_proxy_grad_weight", 0.10)
                             )
 
-                            # step_gradログで L_com も no_grad_graph にならないように同期する。
-                            # forward値は変わらない。
+                            if torch.is_tensor(L_com_objective):
+                                L_com_objective = L_com_objective + proxy_grad_weight * (
+                                    compression_proxy_for_grad - compression_proxy_for_grad.detach()
+                                )
+                            else:
+                                L_com_objective = compression_proxy_for_grad.detach() + proxy_grad_weight * (
+                                    compression_proxy_for_grad - compression_proxy_for_grad.detach()
+                                )
+
+                            # step_gradログ上でも L_com が同じ勾配経路を持つようにする
                             L_com = L_com_objective
 
                             if isinstance(cp_debug, dict):
                                 cp_debug["compression_grad_fallback_used"] = True
-                                cp_debug["compression_grad_fallback_source"] = "bit_node_single_op_proxy_ste"
+                                cp_debug["compression_grad_fallback_source"] = "always_bit_node_single_op_proxy_ste"
+                                cp_debug["compression_primary_proxy_grad_weight"] = proxy_grad_weight
                         else:
                             if isinstance(cp_debug, dict):
                                 cp_debug["compression_grad_fallback_used"] = False
@@ -1474,6 +1571,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                     ("L_attr", L_attr),
                     ("L_policy", L_policy),
                     ("L_actuator", L_actuator),
+                    ("weighted_L_attr", stage_factors["attr"] * args.w_attr * L_attr),
+                    ("weighted_L_policy", stage_factors["policy"] * args.w_policy * L_policy),
+                    ("weighted_L_actuator", stage_factors["repair"] * args.w_actuator * L_actuator),
                     ("loss_bit", loss_bit),
                     ("loss_nodes", loss_nodes),
                     ("loss_single", loss_single),
@@ -1529,46 +1629,89 @@ def train(model, args, loss, writer, plot, notifier=None):
                     amp_info["scale_before"] = scale_before # AMP Debug情報に更新前ぉssSacleを保存
                     scaler.scale(L).backward() # LをAMP用にスケーリングしてから逆伝播
                     scaler.unscale_(optimizer) # Optimizer内の勾配を元のスケールへ戻す
-                    grad_clip = float(getattr(args, "train_grad_clip", 0.0)) # 勾配ノルムの上限値を設定から取得する
-                    if grad_clip > 0.0:
-                        torch.nn.utils.clip_grad_norm_( [p for p in model.parameters() if p.requires_grad], max_norm=grad_clip) # 学習対象パラメータの勾配ノルムをGrad Clip以下に制限
                     if bool(getattr(args, "debug_grad_flow", False)):
                         log_grad_flow(args, writer, model, step + 1, num_steps, global_step=global_train_step) # 各層・各モジュールに勾配が届いているか否かの判定ログ
-                    scaler.step(optimizer) # Optimizer更新
-                    optimizer_state = scaler._per_optimizer_states[id(optimizer)] # このOptimizerに対するGradScaler内部状態を取得
-                    found_inf = 0.0
-                    if optimizer_state["found_inf_per_device"]:
-                        found_inf = float( sum(v.item() for v in optimizer_state["found_inf_per_device"].values())) # GPUごとのInf検出値を合計し、、このStepでAMP Overflowが発生したかを数値化
-                    scaler.update() # GradScalerのLoss Scaleを更新
-                    scale_after = float(scaler.get_scale()) # 更新後のAMP loss scaleを取得
-                    amp_info["found_inf"] = found_inf # Inf/NaN勾配の検出量をAMP Debug情報へ保存する
-                    amp_info["scale_after"] = scale_after # 更新後Loss ScaleをAMP Debug情報へ保存
-                    step_completed = found_inf == 0.0 and scale_after >= scale_before # Inf/NaNが検出されなければOptimizer更新成功とする
-                    if step_completed: # 成功した場合の処理
-                        consecutive_amp_skips = 0
+                    nonfinite_grad_summary = _summarize_nonfinite_grads(
+                        model,
+                        limit=int(getattr(args, "nonfinite_grad_log_param_limit", 8)),
+                    )
+                    if (
+                        bool(getattr(args, "skip_optimizer_on_nonfinite_grad", True))
+                        and bool(nonfinite_grad_summary.get("has_nonfinite", False))
+                    ):
+                        skip_optimizer_reason = "non_finite_grad"
+                        comp_debug["optimizer_skip_reason"] = skip_optimizer_reason
+                        comp_debug["nonfinite_grad_summary"] = _format_nonfinite_grad_summary(nonfinite_grad_summary)
+                        loss.last_compression_debug = comp_debug
+                        optimizer.zero_grad(set_to_none=True)
+                        scaler.update()
+                        scale_after = float(scaler.get_scale())
+                        amp_info["found_inf"] = float(nonfinite_grad_summary.get("bad_element_count", 0))
+                        amp_info["scale_after"] = scale_after
+                        writer.write(
+                            "Skip Optimizing!!! reason=non_finite_grad; "
+                            f"{comp_debug['nonfinite_grad_summary']}; "
+                            f"episode={episode + 1}, epoch={epoch + 1}, step={step + 1}/{num_steps}"
+                        )
+                        consecutive_amp_skips += 1
                     else:
-                        writer.write( f"Skip Optimizing!!! reason=amp_found_inf_or_scale_drop; " f"found_inf={found_inf:.6g}, scale_before={scale_before:.6g}, scale_after={scale_after:.6g}, " f"episode={episode + 1}, epoch={epoch + 1}, step={step + 1}/{num_steps}") # AMP skipの理由とscale状態を同じ行に出す
-                        consecutive_amp_skips += 1 # Skipの連続回数を1回増やす
-                        if consecutive_amp_skips >= amp_overflow_patience: # AMP Overflowが設定回数以上連続したかの判定
+                        grad_clip = float(getattr(args, "train_grad_clip", 0.0)) # 勾配ノルムの上限値を設定から取得する
+                        if grad_clip > 0.0:
+                            torch.nn.utils.clip_grad_norm_( [p for p in model.parameters() if p.requires_grad], max_norm=grad_clip) # 学習対象パラメータの勾配ノルムをGrad Clip以下に制限
+                        scaler.step(optimizer) # Optimizer更新
+                        optimizer_state = scaler._per_optimizer_states[id(optimizer)] # このOptimizerに対するGradScaler内部状態を取得
+                        found_inf = 0.0
+                        if optimizer_state["found_inf_per_device"]:
+                            found_inf = float( sum(v.item() for v in optimizer_state["found_inf_per_device"].values())) # GPUごとのInf検出値を合計し、、このStepでAMP Overflowが発生したかを数値化
+                        scaler.update() # GradScalerのLoss Scaleを更新
+                        scale_after = float(scaler.get_scale()) # 更新後Loss Scaleを取得
+                        amp_info["found_inf"] = found_inf # Inf/NaN勾配の検出量をAMP Debug情報へ保存する
+                        amp_info["scale_after"] = scale_after # 更新後Loss ScaleをAMP Debug情報へ保存
+                        step_completed = found_inf == 0.0 and scale_after >= scale_before # Inf/NaNが検出されなければOptimizer更新成功とする
+                        if step_completed: # 成功した場合の処理
                             consecutive_amp_skips = 0
-                            if use_cuda and cuda_bf16_ops_safe():
-                                amp_dtype = torch.bfloat16
-                                amp_scaler_enabled = False
-                                writer.write( "float16 AMP overflow persisted; switched AMP autocast to bfloat16.")
-                            else:
-                                use_amp = False
-                                amp_scaler_enabled = False
-                                scaler = torch.cuda.amp.GradScaler(enabled=False)
-                                writer.write( "float16 AMP overflow persisted; disabled AMP and continue in float32.")
+                        else:
+                            writer.write( f"Skip Optimizing!!! reason=amp_found_inf_or_scale_drop; " f"found_inf={found_inf:.6g}, scale_before={scale_before:.6g}, scale_after={scale_after:.6g}, " f"episode={episode + 1}, epoch={epoch + 1}, step={step + 1}/{num_steps}") # AMP skipの理由とscale状態を同じ行に出す
+                            consecutive_amp_skips += 1 # Skipの連続回数を1回増やす
+                            if consecutive_amp_skips >= amp_overflow_patience: # AMP Overflowが設定回数以上連続したかの判定
+                                consecutive_amp_skips = 0
+                                if use_cuda and cuda_bf16_ops_safe():
+                                    amp_dtype = torch.bfloat16
+                                    amp_scaler_enabled = False
+                                    writer.write( "float16 AMP overflow persisted; switched AMP autocast to bfloat16.")
+                                else:
+                                    use_amp = False
+                                    amp_scaler_enabled = False
+                                    scaler = torch.cuda.amp.GradScaler(enabled=False)
+                                    writer.write( "float16 AMP overflow persisted; disabled AMP and continue in float32.")
                 else:
                     L.backward() # 通常の勾配を流す
-                    grad_clip = float(getattr(args, "train_grad_clip", 0.0)) # 勾配クリップの上限値取得
-                    if grad_clip > 0.0:
-                        torch.nn.utils.clip_grad_norm_( [p for p in model.parameters() if p.requires_grad], max_norm=grad_clip) # 勾配爆発抑制
                     log_grad_flow(args, writer, model, step + 1, num_steps, global_step=global_train_step) # 各モジュールの勾配状態をログに出す
-                    optimizer.step() # モデルパラメータの更新
-                    step_completed = True # 更新フラグをTrueにする
-                    consecutive_amp_skips = 0 # AMP loss scale連続Skip回数を0に戻す
+                    nonfinite_grad_summary = _summarize_nonfinite_grads(
+                        model,
+                        limit=int(getattr(args, "nonfinite_grad_log_param_limit", 8)),
+                    )
+                    if (
+                        bool(getattr(args, "skip_optimizer_on_nonfinite_grad", True))
+                        and bool(nonfinite_grad_summary.get("has_nonfinite", False))
+                    ):
+                        skip_optimizer_reason = "non_finite_grad"
+                        comp_debug["optimizer_skip_reason"] = skip_optimizer_reason
+                        comp_debug["nonfinite_grad_summary"] = _format_nonfinite_grad_summary(nonfinite_grad_summary)
+                        loss.last_compression_debug = comp_debug
+                        optimizer.zero_grad(set_to_none=True)
+                        writer.write(
+                            "Skip Optimizing!!! reason=non_finite_grad; "
+                            f"{comp_debug['nonfinite_grad_summary']}; "
+                            f"episode={episode + 1}, epoch={epoch + 1}, step={step + 1}/{num_steps}"
+                        )
+                    else:
+                        grad_clip = float(getattr(args, "train_grad_clip", 0.0)) # 勾配クリップの上限値取得
+                        if grad_clip > 0.0:
+                            torch.nn.utils.clip_grad_norm_( [p for p in model.parameters() if p.requires_grad], max_norm=grad_clip) # 勾配爆発抑制
+                        optimizer.step() # モデルパラメータの更新
+                        step_completed = True # 更新フラグをTrueにする
+                        consecutive_amp_skips = 0 # AMP loss scale連続Skip回数を0に戻す
                 if step_completed: # Optimizer更新が成功したら差分ログを出す
                     log_param_updates( args, writer, model, param_update_snapshots, step + 1, num_steps)
                 if timing_enabled:

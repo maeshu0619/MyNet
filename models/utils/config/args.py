@@ -250,6 +250,12 @@ def parse_pugan_args(parser, file_day, file_time):
         type=float,
         help='amount ratio計算時のlogit制限スケール。sigmoid飽和を抑える',
     )
+    parser.add_argument(
+        '--repair_operation_amount_target_prob_max',
+        default=0.98,
+        type=float,
+        help='amount logit補助教師でtarget/maxが1.0になるときの上限確率。logit目標の過大化を防ぐ',
+    )
 
     """ネットワーク条件"""
     # Network
@@ -366,6 +372,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--repair_move_source_prior_weight', default=0.35, type=float, help='原因診断scoreからmove source候補を起こす補助重み')
     parser.add_argument('--repair_selection_mode', default='target', type=str, help='修復操作のhard選択方式(target/threshold_cap)。threshold_capでは目標割合を強制せず上限として扱う')
     parser.add_argument('--repair_move_hard_threshold', default=0.5, type=float, help='threshold_cap時に移動をhard化する最小score')
+    parser.add_argument('--target_move_ratio', default=0.05, type=float, help='Adjust/Moveの目標実行割合。未指定時もtarget_repair_ratioとは分けて扱う')
     parser.add_argument('--max_move_ratio', default=1.00, type=float, help='Adjustの学習済み実行割合の上限')
     parser.add_argument(
         '--repair_move_ratio_floor',
@@ -373,6 +380,7 @@ def parse_pugan_args(parser, file_day, file_time):
         type=float,
         help='学習中にAdjustのHard実行割合が0へ潰れないようにする最小forward割合。backwardは元のlearned ratioへ流す',
     )
+    parser.add_argument('--repair_move_warmup_steps', default=0, type=int, help='Adjust/Move実行上限を学習初期に徐々に上げるstep数')
     parser.add_argument('--repair_drop_hard_threshold', default=0.5, type=float, help='threshold_cap時に削除をhard化する最小score')
     parser.add_argument('--repair_add_hard_threshold', default=0.5, type=float, help='threshold_cap時に追加をhard化する最小score')
     parser.add_argument('--repair_quant_guard_weight', default=1.0, type=float, help='量子化ボクセル上で無効な移動/追加を抑える正則化')
@@ -395,6 +403,8 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--repair_drop_amount_downstream_grad_scale', default=20.0, type=float, help='Prune Amount ratioから実際の削除操作へ向かう下流勾配だけを強める倍率')
     parser.add_argument('--repair_add_amount_downstream_grad_scale', default=10, type=float, help='Add Amount ratioから実際の追加操作へ向かう下流勾配だけを強める倍率')
     parser.add_argument('--repair_move_amount_downstream_grad_scale', default=8.0, type=float, help='Move Amount ratioから実際の移動操作へ向かう下流勾配だけを強める倍率')
+    parser.add_argument('--repair_amount_downstream_grad_max_scale', default=8.0, type=float, help='Amount downstream STE倍率の上限。極端な勾配増幅を抑える')
+    parser.add_argument('--repair_soft_normalizer_floor', default=1e-4, type=float, help='Soft操作量正規化の分母下限。AMP fp16で0除算/inf勾配を防ぐ')
     # 圧縮損失における点操作のWhere
     parser.add_argument('--repair_where_downstream_grad_scale', default=1.0, type=float, help='Where scoreから実際の点操作へ向かう下流勾配だけを強める倍率。forward値は変えず、backwardだけ強める')
     parser.add_argument('--repair_drop_where_downstream_grad_scale', default=1.0, type=float, help='Prune Where scoreから実際の削除操作へ向かう下流勾配だけを強める倍率')
@@ -509,7 +519,13 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--cp_lambda_nodes', default=0.03, type=float, help='compression_primaryのnode safety penalty重み')
     parser.add_argument('--cp_lambda_actuator', default=0.05, type=float, help='compression_primaryのactuator safety penalty重み')
     parser.add_argument('--cp_lambda_sparsepcgc', default=0.0, type=float, help='compression_primaryのSparsePCGC soft aux safety penalty重み')
-    parser.add_argument('--cp_lambda_op', default=0.0, type=float, help='compression_primaryのoperation safety penalty重み(現状は実験用、default無効)')
+    parser.add_argument('--cp_lambda_op', default=0.5, type=float, help='compression_primaryのoperation safety penalty重み(現状は実験用、default無効)')
+    parser.add_argument(
+        '--compression_primary_proxy_grad_weight',
+        default=0.10,
+        type=float,
+        help='compression_primaryでhard圧縮目的のforward値を保ったまま、backwardだけ微分可能proxyへ流す重み',
+    )
     parser.add_argument('--cp_tau_geom', default=0.06, type=float, help='compression_primaryのgeometry許容閾値')
     parser.add_argument('--cp_tau_single', default=0.0, type=float, help='compression_primaryのsingle-child許容閾値')
     parser.add_argument('--cp_tau_nodes', default=0.0, type=float, help='compression_primaryのnode許容閾値')
@@ -634,6 +650,18 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--compression_surrogate_aux_single_weight', default=0.0, type=float, help='Surrogate debug用soft単一子ノード補助項の重み')
     parser.add_argument('--compression_surrogate_aux_in_objective', default=False, type=str2bool, help='soft Octree補助項を主圧縮objectiveへ混ぜるか。FalseならCompression Lossは実bit差分のみ')
     parser.add_argument('--compression_surrogate_log_soft_aux', default=True, type=str2bool, help='soft Octree node/single差分を主objectiveに混ぜず常時計算・ログする')
+    parser.add_argument('--compression_soft_node_actuator_grad_weight', default=10.0, type=float, help='soft actuator rate proxyをnode項へSTEで戻す重み')
+    parser.add_argument('--compression_soft_single_actuator_grad_weight', default=5.0, type=float, help='soft actuator rate proxyをsingle項へSTEで戻す重み')
+    parser.add_argument('--compression_soft_bit_actuator_grad_weight', default=10.0, type=float, help='soft actuator rate proxyをbit proxy項へSTEで戻す重み')
+    parser.add_argument('--compression_soft_prune_node_grad_weight', default=25.0, type=float, help='soft prune node proxyをnode項へSTEで戻す重み')
+    parser.add_argument('--compression_soft_prune_single_grad_weight', default=20.0, type=float, help='soft prune single proxyをsingle項へSTEで戻す重み')
+    parser.add_argument('--compression_soft_prune_bit_grad_weight', default=30.0, type=float, help='soft prune bit proxyをbit proxy項へSTEで戻す重み')
+    parser.add_argument('--compression_soft_rate_point_weight', default=0.25, type=float, help='soft rate proxy内のpoint数差分重み')
+    parser.add_argument('--compression_soft_rate_node_weight', default=0.10, type=float, help='soft rate proxy内のnode項重み')
+    parser.add_argument('--compression_soft_rate_single_weight', default=0.05, type=float, help='soft rate proxy内のsingle項重み')
+    parser.add_argument('--compression_soft_rate_sparsepcgc_weight', default=0.05, type=float, help='soft rate proxy内のSparsePCGC proxy重み')
+    parser.add_argument('--compression_soft_rate_proxy_grad_weight', default=0.05, type=float, help='actual値forwardにsoft rate proxy勾配だけを足すSTE重み')
+    parser.add_argument('--compression_soft_prune_rate_proxy_grad_weight', default=10.0, type=float, help='actual値forwardにsoft prune proxy勾配だけを足すSTE重み')
     parser.add_argument('--compression_octree_stat_depth', default=0, type=int, help='実圧縮debug用Octree統計の深さ(0なら点群から推定)')
     parser.add_argument('--compression_octree_stat_force', default=True, type=str2bool, help='圧縮器が返すnode/singleが0でも点群からOctree統計を補完する')
     parser.add_argument('--compression_surrogate_grad_clip', default=10.0, type=float, help='圧縮サロゲートの勾配クリップ')
@@ -743,8 +771,8 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--loss_grad_probe_enabled', default=False, type=str2bool, help='損失項ごとのmodule/操作別勾配CSVを出力するか')
     parser.add_argument('--loss_grad_probe_interval', default=1, type=int, help='損失項ごとの勾配CSVを何stepごとに出すか')
     parser.add_argument('--step_grad_log', default=True, type=str2bool, help='train.py内蔵の損失項ごとのmodule/操作別勾配CSVを出力するか')
-    parser.add_argument('--step_grad_log_interval', default=1, type=int, help='train.py内蔵step_grad CSVを何stepごとに出すか')
-    parser.add_argument('--step_grad_first_step_only', default=True, type=str2bool, help='step_grad CSVをglobal_step=0だけに制限するか')
+    parser.add_argument('--step_grad_log_interval', default=50, type=int, help='train.py内蔵step_grad CSVを何stepごとに出すか')
+    parser.add_argument('--step_grad_first_step_only', default=False, type=str2bool, help='step_grad CSVをglobal_step=0だけに制限するか')
     parser.add_argument('--compression_bad_step_penalty_scale', default=1.25, type=float, help='実bit悪化stepの主圧縮勾配倍率')
     parser.add_argument('--compression_boost_requires_surrogate_frozen', default=True, type=str2bool, help='good/bad勾配倍率をSurrogate frozen後だけ有効にする')
     parser.add_argument('--compression_boost_max_abs_error', default=1.0, type=float, help='good/bad勾配倍率を許可するSurrogate abs error上限')
@@ -950,6 +978,8 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--debug_grad_flow', default=False, type=str2bool, help='勾配ノルムをログ出力するか')
     parser.add_argument('--debug_grad_flow_rate', default=1, type=int, help='勾配ログの出力間隔')
     parser.add_argument('--train_grad_clip', default=0.0, type=float, help='学習時の勾配クリップ値（0で無効）')
+    parser.add_argument('--skip_optimizer_on_nonfinite_grad', default=True, type=str2bool, help='Lossが有限でも勾配にNaN/Infがあるstepはoptimizer更新をスキップする')
+    parser.add_argument('--nonfinite_grad_log_param_limit', default=8, type=int, help='非有限勾配を検出したときにログへ出すパラメータ名の最大数')
     parser.add_argument('--debug_timing', default=False, type=str2bool, help='ステップ内の時間内訳をログ出力するか')
     parser.add_argument('--sparsepcgc_hard_debug_interval', default=0, type=int, help='SparsePCGCの重いhard統計を何Stepごとに収集するか(0で無効)')
     parser.add_argument('--sparsepcgc_hard_debug_on_log', default=False, type=str2bool, help='Trueなら通常Stepログ時にもSparsePCGC hard統計を収集する')
@@ -984,6 +1014,10 @@ def parse_pugan_args(parser, file_day, file_time):
 
     args.repair_operation_amount_logit_weight = max(float(getattr(args, "repair_operation_amount_logit_weight", 0.05)), 0.0)
     args.repair_operation_amount_logit_scale = max(float(getattr(args, "repair_operation_amount_logit_scale", 6.0)), 1e-6)
+    args.repair_operation_amount_target_prob_max = min(
+        max(float(getattr(args, "repair_operation_amount_target_prob_max", 0.98)), 0.50),
+        1.0 - 1e-4,
+    )
     args.w_com = max(float(getattr(args, "w_com", 10.0)), 0.0)
     args.repair_drop_where_actuator_weight = max(float(getattr(args, "repair_drop_where_actuator_weight", 0.1)), 0.0)
     args.repair_add_where_actuator_weight = max(float(getattr(args, "repair_add_where_actuator_weight", 0.3)), 0.0)
@@ -1440,6 +1474,9 @@ def parse_pugan_args(parser, file_day, file_time):
     args.step_grad_log = bool(getattr(args, "step_grad_log", True))
     args.step_grad_log_interval = max(int(getattr(args, "step_grad_log_interval", 1)), 1)
     args.step_grad_first_step_only = bool(getattr(args, "step_grad_first_step_only", True))
+    args.skip_optimizer_on_nonfinite_grad = bool(getattr(args, "skip_optimizer_on_nonfinite_grad", True))
+    args.nonfinite_grad_log_param_limit = max(int(getattr(args, "nonfinite_grad_log_param_limit", 8)), 0)
+    args.train_grad_clip = max(float(getattr(args, "train_grad_clip", 0.0)), 0.0)
     args.surrogate_update_during_training = bool(getattr(args, "surrogate_update_during_training", True))
     args.surrogate_update_interval = max(int(getattr(args, "surrogate_update_interval", 1)), 1)
     args.surrogate_joint_lr_scale = max(float(getattr(args, "surrogate_joint_lr_scale", 0.1)), 0.0)
@@ -1501,6 +1538,10 @@ def parse_pugan_args(parser, file_day, file_time):
     )
 
     # Amount ratioから下流の点操作へ向かう勾配だけを強める倍率を正規化する。
+    args.repair_amount_downstream_grad_max_scale = max(
+        float(getattr(args, "repair_amount_downstream_grad_max_scale", 8.0)),
+        1.0,
+    )
     args.repair_amount_downstream_grad_scale = max(
         float(getattr(args, "repair_amount_downstream_grad_scale", 6.0)),
         1.0,
@@ -1517,12 +1558,27 @@ def parse_pugan_args(parser, file_day, file_time):
         float(getattr(args, "repair_move_amount_downstream_grad_scale", args.repair_amount_downstream_grad_scale)),
         1.0,
     )
+    args.repair_amount_downstream_grad_scale = min(args.repair_amount_downstream_grad_scale, args.repair_amount_downstream_grad_max_scale)
+    args.repair_drop_amount_downstream_grad_scale = min(args.repair_drop_amount_downstream_grad_scale, args.repair_amount_downstream_grad_max_scale)
+    args.repair_add_amount_downstream_grad_scale = min(args.repair_add_amount_downstream_grad_scale, args.repair_amount_downstream_grad_max_scale)
+    args.repair_move_amount_downstream_grad_scale = min(args.repair_move_amount_downstream_grad_scale, args.repair_amount_downstream_grad_max_scale)
+    args.repair_soft_normalizer_floor = max(float(getattr(args, "repair_soft_normalizer_floor", 1e-4)), 1e-8)
 
     # 学習済み操作割合と実soft操作率を結ぶ補助損失の強さを非負値へ収める。
     args.repair_operation_amount_consistency_weight = max(
         float(getattr(args, "repair_operation_amount_consistency_weight", 1.0)),
         0.0,
     )
+    args.repair_operation_amount_direct_weight = max(
+        float(getattr(args, "repair_operation_amount_direct_weight", 0.01)),
+        0.0,
+    )
+    args.repair_drop_amount_supervision_weight = max(float(getattr(args, "repair_drop_amount_supervision_weight", 0.001)), 0.0)
+    args.repair_drop_amount_soft_consistency_weight = max(float(getattr(args, "repair_drop_amount_soft_consistency_weight", 0.0005)), 0.0)
+    args.repair_move_amount_supervision_weight = max(float(getattr(args, "repair_move_amount_supervision_weight", 0.001)), 0.0)
+    args.repair_move_amount_soft_consistency_weight = max(float(getattr(args, "repair_move_amount_soft_consistency_weight", 0.0005)), 0.0)
+    args.repair_add_amount_supervision_weight = max(float(getattr(args, "repair_add_amount_supervision_weight", 0.001)), 0.0)
+    args.repair_add_amount_soft_consistency_weight = max(float(getattr(args, "repair_add_amount_soft_consistency_weight", 0.0005)), 0.0)
     # 学習初期のPrune/Add/Adjust実行量探索率を0-1へ収める。
     args.repair_drop_amount_random_mix_start = min(max(float(getattr(args, "repair_drop_amount_random_mix_start", 0.35)), 0.0), 1.0)
     args.repair_drop_amount_random_mix_end = min(max(float(getattr(args, "repair_drop_amount_random_mix_end", 0.0)), 0.0), 1.0)
@@ -1741,12 +1797,33 @@ def parse_pugan_args(parser, file_day, file_time):
             args.max_drop_ratio = max(float(getattr(args, "max_drop_ratio", 0.0)), 0.50) # Pruneの探索上限を0〜50%へ広げる
         if not _cli_option_was_provided("--max_repair_ratio"):
             args.max_repair_ratio = max(float(getattr(args, "max_repair_ratio", 0.0)), 1.00) # Adjustのsource候補上限を0〜100%へ広げる
+        if not _cli_option_was_provided("--target_move_ratio"):
+            args.target_move_ratio = 0.05
         if not _cli_option_was_provided("--max_move_ratio"):
-            args.max_move_ratio = max(float(getattr(args, "max_move_ratio", 0.0)), 1.00) # Adjustの実行量上限を0〜100%へ広げる
+            args.max_move_ratio = min(
+                max(float(getattr(args, "target_move_ratio", 0.05)), 0.15),
+                0.20,
+            ) # SparsePCGCではMove急増がbit/geometryを崩しやすいため実行上限を抑える
+        if not _cli_option_was_provided("--repair_move_warmup_steps"):
+            args.repair_move_warmup_steps = max(int(getattr(args, "repair_move_warmup_steps", 0)), 600)
+        if not _cli_option_was_provided("--repair_amount_downstream_grad_max_scale"):
+            args.repair_amount_downstream_grad_max_scale = min(
+                max(float(getattr(args, "repair_amount_downstream_grad_max_scale", 8.0)), 1.0),
+                8.0,
+            )
+        if not _cli_option_was_provided("--repair_soft_normalizer_floor"):
+            args.repair_soft_normalizer_floor = max(float(getattr(args, "repair_soft_normalizer_floor", 1e-4)), 1e-4)
+        if not _cli_option_was_provided("--train_grad_clip"):
+            args.train_grad_clip = 100.0
         if not _cli_option_was_provided("--repair_operation_amount_consistency_weight"):
             args.repair_operation_amount_consistency_weight = min(
                 max(float(getattr(args, "repair_operation_amount_consistency_weight", 0.01)), 0.0),
                 0.01,
+            )
+        if not _cli_option_was_provided("--repair_operation_amount_direct_weight"):
+            args.repair_operation_amount_direct_weight = max(
+                float(getattr(args, "repair_operation_amount_direct_weight", 0.01)),
+                0.02,
             )
         if not _cli_option_was_provided("--repair_add_ratio_weight"):
             args.repair_add_ratio_weight = max(float(getattr(args, "repair_add_ratio_weight", 4.0)), 8.0)
@@ -1781,7 +1858,7 @@ def parse_pugan_args(parser, file_day, file_time):
         if not _cli_option_was_provided("--repair_move_amount_random_mix_end"):
             args.repair_move_amount_random_mix_end = 0.0
         if not _cli_option_was_provided("--repair_move_score_noise_start"):
-            args.repair_move_score_noise_start = 0.50
+            args.repair_move_score_noise_start = 0.15
         if not _cli_option_was_provided("--repair_move_score_noise_end"):
             args.repair_move_score_noise_end = 0.0
         if not _cli_option_was_provided("--repair_drop_score_noise_start"):
@@ -1868,7 +1945,7 @@ def parse_pugan_args(parser, file_day, file_time):
         if not _cli_option_was_provided("--repair_add_hard_threshold"):
             args.repair_add_hard_threshold = 0.35 if sparsepcgc_backend else 0.0
         if not _cli_option_was_provided("--repair_move_hard_threshold"):
-            args.repair_move_hard_threshold = min(float(getattr(args, "repair_move_hard_threshold", 0.5)), 0.05)
+            args.repair_move_hard_threshold = 0.20 if sparsepcgc_backend else min(float(getattr(args, "repair_move_hard_threshold", 0.5)), 0.05)
         if not _cli_option_was_provided("--repair_drop_hard_threshold"):
             args.repair_drop_hard_threshold = min(float(getattr(args, "repair_drop_hard_threshold", 0.5)), 0.25)
         if not _cli_option_was_provided("--repair_exploration_fraction"):
@@ -2017,7 +2094,13 @@ def parse_pugan_args(parser, file_day, file_time):
     args.max_drop_ratio = min(max(float(getattr(args, "max_drop_ratio", args.target_drop_ratio)), args.target_drop_ratio), 1.0)
     args.target_repair_ratio = min(max(float(getattr(args, "target_repair_ratio", 0.0)), 0.0), 0.95)
     args.max_repair_ratio = min(max(float(getattr(args, "max_repair_ratio", args.target_repair_ratio)), args.target_repair_ratio), 1.0)
-    args.max_move_ratio = min(max(float(getattr(args, "max_move_ratio", args.target_repair_ratio)), args.target_repair_ratio), 1.0)
+    args.target_move_ratio = min(max(float(getattr(args, "target_move_ratio", args.target_repair_ratio)), 0.0), 0.95)
+    args.max_move_ratio = min(max(float(getattr(args, "max_move_ratio", args.target_move_ratio)), args.target_move_ratio), 1.0)
+    args.repair_move_ratio_floor = min(
+        max(float(getattr(args, "repair_move_ratio_floor", 0.0)), 0.0),
+        args.max_move_ratio,
+    )
+    args.repair_move_warmup_steps = max(int(getattr(args, "repair_move_warmup_steps", 0)), 0)
     args.repair_delete_max_points_per_voxel = max(int(getattr(args, "repair_delete_max_points_per_voxel", 8)), 0)
     args.repair_move_max_points_per_voxel = max(int(getattr(args, "repair_move_max_points_per_voxel", 8)), 0)
     args.add_noop_keep_threshold = min(max(float(getattr(args, "add_noop_keep_threshold", 0.5)), 0.0), 1.0)

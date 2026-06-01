@@ -1223,6 +1223,8 @@ class Network(nn.Module):
                     "repair_move_require_empty_target": bool(actuator_stats.get("repair_move_require_empty_target", True)),
                     "repair_move_require_empty_target_effective": bool(actuator_stats.get("repair_move_require_empty_target_effective", True)),
                     "repair_move_max_points_per_voxel": int(actuator_stats.get("repair_move_max_points_per_voxel", 0)),
+                    "repair_move_warmup": float(actuator_stats.get("repair_move_warmup", 1.0)),
+                    "target_move_ratio": float(actuator_stats.get("target_move_ratio", 0.0)),
                     "max_move_ratio": float(actuator_stats.get("max_move_ratio", 0.0)),
                     "repair_move_hard_threshold": float(actuator_stats.get("repair_move_hard_threshold", 0.0)),
                     "moved_different_voxel_count": int(actuator_stats.get("moved_different_voxel_count", 0)),
