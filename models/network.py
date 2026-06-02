@@ -692,6 +692,7 @@ class Network(nn.Module):
             single_proxy_full_list = []
             node_proxy_full_list = []
             lowprob_proxy_full_list = []
+            occupancy_nll_proxy_full_list = []
             quant_proxy_full_list = []
             cause_scores_means = []
             subtree_scores_means = []
@@ -779,7 +780,8 @@ class Network(nn.Module):
                     snap_delta_full_list.append(structure_b["snap_delta"].to(device=pts_xyz.device, dtype=pts_xyz.dtype))
                     single_proxy_full_list.append(structure_b["single_proxy"].to(device=pts_xyz.device, dtype=pts_xyz.dtype))
                     node_proxy_full_list.append(structure_b["node_proxy"].to(device=pts_xyz.device, dtype=pts_xyz.dtype))
-                    lowprob_proxy_full_list.append(structure_b["occupancy_nll_proxy"].to(device=pts_xyz.device, dtype=pts_xyz.dtype))
+                    lowprob_proxy_full_list.append(structure_b["lowprob_proxy"].to(device=pts_xyz.device, dtype=pts_xyz.dtype))
+                    occupancy_nll_proxy_full_list.append(structure_b["occupancy_nll_proxy"].to(device=pts_xyz.device, dtype=pts_xyz.dtype))
                     quant_proxy_full_list.append(structure_b["quant_proxy"].to(device=pts_xyz.device, dtype=pts_xyz.dtype))
                 else:
                     structure_feat_full_list.append(self._propagate_encoder_features(full_xyz_b, analysis_xyz_b, structure_feat_b))
@@ -790,12 +792,16 @@ class Network(nn.Module):
                     snap_delta_full_list.append(self._propagate_encoder_features(full_xyz_b, analysis_xyz_b, snap_delta_b))
                     single_proxy_b = structure_b["single_proxy"].to(device=pts_xyz.device, dtype=pts_xyz.dtype)
                     node_proxy_b = structure_b["node_proxy"].to(device=pts_xyz.device, dtype=pts_xyz.dtype)
-                    lowprob_proxy_b = structure_b["occupancy_nll_proxy"].to(device=pts_xyz.device, dtype=pts_xyz.dtype)
+                    lowprob_proxy_b = structure_b["lowprob_proxy"].to(device=pts_xyz.device, dtype=pts_xyz.dtype)
+                    occupancy_nll_proxy_b = structure_b["occupancy_nll_proxy"].to(device=pts_xyz.device, dtype=pts_xyz.dtype)
                     quant_proxy_b = structure_b["quant_proxy"].to(device=pts_xyz.device, dtype=pts_xyz.dtype)
                     single_proxy_full_list.append(self._propagate_encoder_features(full_xyz_b, analysis_xyz_b, single_proxy_b))
                     node_proxy_full_list.append(self._propagate_encoder_features(full_xyz_b, analysis_xyz_b, node_proxy_b))
                     lowprob_proxy_full_list.append(self._propagate_encoder_features(full_xyz_b, analysis_xyz_b, lowprob_proxy_b))
                     quant_proxy_full_list.append(self._propagate_encoder_features(full_xyz_b, analysis_xyz_b, quant_proxy_b))
+                    occupancy_nll_proxy_full_list.append(
+                        self._propagate_encoder_features(full_xyz_b, analysis_xyz_b, occupancy_nll_proxy_b)
+                    )
 
                 """平均値の保存"""
                 cause_scores_means.append(cause_scores_b.mean(dim=2))
@@ -845,6 +851,7 @@ class Network(nn.Module):
                 "point_feature_voxel_mode": structure_b.get("point_feature_voxel_mode", "local_xyz") if structure_b is not None else "local_xyz",
                 "structural_voxel_key": structure_b.get("structural_voxel_key") if structure_b is not None else None,
                 "point_feature_voxel_key": structure_b.get("point_feature_voxel_key") if structure_b is not None else None,
+                "occupancy_nll_proxy_full": torch.cat(occupancy_nll_proxy_full_list, dim=0),
             }
 
             cause_mean = torch.stack(cause_scores_means, dim=0).mean(dim=0).squeeze(0).detach().cpu()
@@ -911,7 +918,8 @@ class Network(nn.Module):
             repair_priority_full = repair_priority
             structure["single_proxy_full"] = structure["single_proxy"].to(device=pts_xyz.device, dtype=pts_xyz.dtype)
             structure["node_proxy_full"] = structure["node_proxy"].to(device=pts_xyz.device, dtype=pts_xyz.dtype)
-            structure["lowprob_proxy_full"] = structure["occupancy_nll_proxy"].to(device=pts_xyz.device, dtype=pts_xyz.dtype)
+            structure["lowprob_proxy_full"] = structure["lowprob_proxy"].to(device=pts_xyz.device, dtype=pts_xyz.dtype)
+            structure["occupancy_nll_proxy_full"] = structure["occupancy_nll_proxy"].to(device=pts_xyz.device, dtype=pts_xyz.dtype)
             structure["quant_proxy_full"] = structure["quant_proxy"].to(device=pts_xyz.device, dtype=pts_xyz.dtype)
             loss_attr_sparse = None
             loss_policy_sparse = None
@@ -1002,6 +1010,12 @@ class Network(nn.Module):
             "drop_prob_direct",
             "drop_prob_proxy",
             "drop_logit",
+            "learned_drop_logit",
+            "soft_drop_where_grad_base",
+            "soft_drop_prob_for_ste",
+            "prune_where_proxy",
+            "soft_drop_where_grad_masked",
+            "soft_drop_where_grad_direct",
             "drop_shape_guard",
             "learned_drop_prob",
             "learned_drop_ratio",
@@ -1078,15 +1092,39 @@ class Network(nn.Module):
         repair_gate = actuator_stats["repair_gate"]
 
         """問題スコアの算出"""
-        single_chain_score = self._masked_point_mean(structure["single_proxy_full"].pow(2), selection_mask) # single_proxy_fullを二乗し、選択マスクがある場合はその範囲だけで平均して、単一子ノードの強さを表すスカラー値を算出
-        lowprob_score = self._masked_point_mean(structure["lowprob_proxy_full"], selection_mask) # 低確率施入パターンのプロキシ値を、選択マスクがある場合はその範囲だけで平均して問題度を表すスカラー値にする
-        lowprob_ratio = self._masked_point_mean( # 低確率Occupancyと判定される点の割合を計算する処理を開始
+        single_chain_score = self._masked_point_mean(
+            structure["single_proxy_full"].pow(2),
+            selection_mask,
+        )
+
+        # Occupancy NLL proxy は、低確率ratioとは別に平均値として計算する
+        occupancy_nll_score = self._masked_point_mean(
+            structure["occupancy_nll_proxy_full"],
+            selection_mask,
+        )
+
+        # Low-probability Occupancy proxy は、lowprob_proxy_full から計算する
+        lowprob_score = self._masked_point_mean(
+            structure["lowprob_proxy_full"],
+            selection_mask,
+        )
+
+        # Low-probability Occupancy Ratio は、lowprob_proxy_full が閾値を超えた点の割合として計算する
+        lowprob_ratio = self._masked_point_mean(
             (structure["lowprob_proxy_full"] > 0.5).to(dtype=pts_xyz.dtype),
             selection_mask,
         )
-        node_score = self._masked_point_mean(structure["node_proxy_full"], selection_mask) # Octree Node数や局所Node構造の問題を表す変数で、Node系の構造問題スコアにする
-        quant_score = self._masked_point_mean(structure["quant_proxy_full"], selection_mask) # 量子化由来の問題を表す変数で、量子化の構造問題スコアにする
-        
+
+        node_score = self._masked_point_mean(
+            structure["node_proxy_full"],
+            selection_mask,
+        )
+
+        quant_score = self._masked_point_mean(
+            structure["quant_proxy_full"],
+            selection_mask,
+        )
+
         """ログ"""
         if self._should_collect_runtime_debug():
             with torch.no_grad():
@@ -1250,7 +1288,8 @@ class Network(nn.Module):
                     "policy_argmax_counts": policy_argmax_counts,
                     "operation_by_cause": self._operation_by_cause(debug_cause_scores, debug_policy_probs),
                     "policy_entropy": float(policy_entropy.detach().cpu()),
-                    "occupancy_nll_proxy": float(lowprob_score.detach().cpu()),
+                    "occupancy_nll_proxy": float(occupancy_nll_score.detach().cpu()),
+                    "lowprob_occupancy_score": float(lowprob_score.detach().cpu()),
                     "lowprob_occupancy_ratio": float(lowprob_ratio.detach().cpu()),
                     "single_chain_score": float(single_chain_score.detach().cpu()),
                     "node_score": float(node_score.detach().cpu()),

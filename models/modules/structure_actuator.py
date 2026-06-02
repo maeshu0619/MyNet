@@ -74,13 +74,13 @@ class StructureRepairActuator(nn.Module):
         target_repair_ratio = float(
             getattr(self.args, "target_repair_ratio", getattr(self.args, "target_disp_ratio", 0.20))
         )
-        target_drop_ratio = float(getattr(self.args, "target_drop_ratio", 0.05))
-        init_drop = target_drop_ratio / max(target_repair_ratio, 1e-6)
+        init_drop_ratio = float(getattr(self.args, "repair_init_drop_ratio", 0.05))
+        init_drop = init_drop_ratio / max(target_repair_ratio, 1e-6)
         init_drop = min(max(init_drop, 1e-4), 0.95)
         init_drop_bias = math.log(init_drop / max(1.0 - init_drop, 1e-6))
         nn.init.constant_(self.drop_head[-1].bias, init_drop_bias)
-        target_add_ratio = min(max(float(getattr(self.args, "target_add_ratio", 0.03)), 1e-4), 0.95)
-        init_add_bias = math.log(target_add_ratio / max(1.0 - target_add_ratio, 1e-6))
+        init_add_ratio = min(max(float(getattr(self.args, "repair_init_add_ratio", 0.03)), 1e-4), 0.95)
+        init_add_bias = math.log(init_add_ratio / max(1.0 - init_add_ratio, 1e-6))
         nn.init.constant_(self.add_head[-1].bias, init_add_bias)
         nn.init.constant_(self.drop_amount_head.bias, 0.0)
         nn.init.constant_(self.add_amount_head.bias, 0.0)
@@ -1421,8 +1421,9 @@ class StructureRepairActuator(nn.Module):
         # _scale_where_downstream_grad はその後に適用し、forward値は有界のまま、
         # backwardだけ操作別倍率で調整する。
         # ============================================================
-        raw_drop_logit = torch.nan_to_num(
-            self.drop_head(actuator_features),
+        raw_drop_logit = self.drop_head(actuator_features)
+        raw_drop_logit_for_forward = torch.nan_to_num(
+            raw_drop_logit,
             nan=0.0,
             posinf=float(getattr(self.args, "repair_drop_where_logit_scale", 6.0)),
             neginf=-float(getattr(self.args, "repair_drop_where_logit_scale", 6.0)),
@@ -1432,7 +1433,7 @@ class StructureRepairActuator(nn.Module):
             float(getattr(self.args, "repair_drop_where_logit_scale", 6.0)),
             1e-6,
         )
-        learned_drop_logit = drop_logit_scale * torch.tanh(raw_drop_logit / drop_logit_scale)
+        learned_drop_logit = drop_logit_scale * torch.tanh(raw_drop_logit_for_forward / drop_logit_scale)
 
         learned_drop_logit = self._scale_where_downstream_grad(
             learned_drop_logit,
@@ -1448,6 +1449,30 @@ class StructureRepairActuator(nn.Module):
         learned_drop_prob = learned_drop.mean()
         drop_proxy_tau = max(float(getattr(self.args, "repair_drop_soft_proxy_tau", 8.0)), 1e-6)
         drop_prob_proxy = torch.sigmoid(learned_drop_logit / drop_proxy_tau)
+        raw_proxy_grad_eps = min(
+            max(
+                float(
+                    getattr(
+                        self.args,
+                        "repair_drop_where_proxy_raw_grad_eps",
+                        0.001,
+                    )
+                ),
+                0.0,
+            ),
+            0.20,
+        )
+        if raw_proxy_grad_eps > 0.0:
+            raw_drop_logit_for_grad = torch.where(
+                torch.isfinite(raw_drop_logit),
+                raw_drop_logit,
+                raw_drop_logit.detach().new_zeros(raw_drop_logit.shape),
+            )
+            drop_prob_proxy = (
+                drop_prob_proxy
+                + raw_proxy_grad_eps
+                * (raw_drop_logit_for_grad - raw_drop_logit_for_grad.detach())
+            )
         drop_prob = (repair_gate * delete_prior * learned_drop).clamp(0.0, 1.0)
         if prune_enabled and max_drop_ratio > 0.0:
             # ============================================================
@@ -1574,15 +1599,56 @@ class StructureRepairActuator(nn.Module):
             0.0,
         )
 
-        soft_drop_where_grad_base = (
+        # ============================================================
+        # Prune Where用のSTE勾配経路
+        # ============================================================
+        # forwardの削除候補制限は delete_candidate_weight に従う。
+        # ただし backward では、delete_candidate_weight によって
+        # drop_head 勾配が完全に0化されるのを避ける。
+        #
+        # soft_drop_where_grad_masked
+        #   実際の削除候補制限を反映した従来のproxy
+        #
+        # soft_drop_where_grad_direct
+        #   drop_headへ直接戻すための保険proxy
+        #   forward値はmasked側に合わせ、backwardだけdrop_prob_proxyへ流す。
+        # ============================================================
+
+        soft_drop_where_grad_masked = (
             drop_prob_proxy * delete_candidate_weight
         ).clamp(0.0, 1.0)
+
+        soft_drop_where_direct_grad_scale = max(
+            float(getattr(self.args, "repair_prune_where_direct_grad_scale", 0.10)),
+            0.0,
+        )
+
+        # ============================================================
+        # 重要：
+        # direct経路では clamp をかけない。
+        # forward値は masked 側に合わせるが、backwardだけ drop_prob_proxy へ直接返す。
+        # ここで clamp すると、forward が 0/1 境界にいる場合に再び勾配が消える。
+        # ============================================================
+        soft_drop_where_grad_direct = (
+            soft_drop_where_grad_masked.detach()
+            + soft_drop_where_direct_grad_scale
+            * (drop_prob_proxy - drop_prob_proxy.detach())
+        )
+
+        # forward値は soft_drop_where_grad_masked と同じ。
+        # backwardでは masked 経路と direct 経路の両方を使う。
+        soft_drop_where_grad_base = (
+            soft_drop_where_grad_masked.detach()
+            + (soft_drop_where_grad_masked - soft_drop_where_grad_masked.detach())
+            + (soft_drop_where_grad_direct - soft_drop_where_grad_direct.detach())
+        )
 
         soft_drop_prob_for_ste = (
             soft_drop_prob_for_guard.detach()
             + prune_where_ste_grad_scale
             * (soft_drop_where_grad_base - soft_drop_where_grad_base.detach())
         )
+
         hard_drop_mask = self._hard_voxel_drop_mask(
             voxel_coords,
             drop_prob,
@@ -1594,13 +1660,27 @@ class StructureRepairActuator(nn.Module):
         )
         hard_drop = hard_drop_mask.to(dtype=pts_xyz.dtype)
 
+
+
         # Hard forward + Soft backward のSTE。
-        # forwardではVoxel単位のhard_drop、backwardではsoft_drop_probを使う。
-        # これにより drop_head には「どこを削除するか」、
-        # drop_amount_head には「どのくらい削除するか」の勾配が戻る。
+        # forwardではVoxel単位のhard_drop、backwardではPrune Where専用proxyを使う。
         drop_prob_st = hard_drop - soft_drop_prob_for_ste.detach() + soft_drop_prob_for_ste
 
-        keep_prob = (1.0 - drop_prob_st).clamp(0.0, 1.0)
+        # ============================================================
+        # keep_prob も hard forward + soft backward にする。
+        # forward値は 1 - hard_drop のまま。
+        # backwardだけ Prune Where proxy へ戻す。
+        #
+        # ここで clamp(0, 1) を直接かけると、
+        # keep_prob が 0 または 1 の境界に張り付き、Prune Where 勾配が消えやすい。
+        # ============================================================
+        keep_prob_hard = (1.0 - hard_drop).clamp(0.0, 1.0)
+        keep_prob_soft_for_grad = 1.0 - soft_drop_where_grad_base
+
+        keep_prob = (
+            keep_prob_hard.detach()
+            + (keep_prob_soft_for_grad - keep_prob_soft_for_grad.detach())
+        )
 
         # Soft/Hard削除量の監視値。
         # point sum は実際に何点消えるかの確認用。
@@ -2168,7 +2248,14 @@ class StructureRepairActuator(nn.Module):
 
         # BCE系損失へ渡る可能性があるため、final_wを確率範囲へ安全に収める。
         # NaN/Infもここで除去する。
-        final_w = torch.nan_to_num(keep_prob, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+        # forward値は keep_prob_hard によって 0/1 範囲内にある。
+        # ここで clamp すると backward が再び境界で潰れるため、nan_to_num のみにする。
+        final_w = torch.nan_to_num(
+            keep_prob,
+            nan=0.0,
+            posinf=1.0,
+            neginf=0.0,
+        )
         max_add_ratio_value = self._max_add_ratio()
         # Addする割合を特徴から学習し、固定10%のような張り付きから外す。
         learned_add_ratio = self._learned_operation_ratio(
@@ -2724,8 +2811,14 @@ class StructureRepairActuator(nn.Module):
         prune_soft_bit = self._masked_mean(prune_keep_signal * prune_bit_importance, selection_mask)
         drop_prob_direct_mean = self._masked_mean(drop_prob_direct, selection_mask)
         drop_prob_proxy_mean = self._masked_mean(drop_prob_proxy, selection_mask)
-        drop_direct_target = drop_prob_proxy_mean.new_tensor(float(target_drop_ratio))
-        drop_direct_target_loss = (drop_prob_proxy_mean - drop_direct_target).pow(2)
+        amount_target_mode = str(
+            getattr(self.args, "repair_amount_target_mode", "none")
+        ).strip().lower()
+        if amount_target_mode == "target":
+            drop_direct_target = drop_prob_proxy_mean.new_tensor(float(target_drop_ratio))
+            drop_direct_target_loss = (drop_prob_proxy_mean - drop_direct_target).pow(2)
+        else:
+            drop_direct_target_loss = drop_prob_proxy_mean.new_zeros(())
         drop_entropy_point = -(
             drop_prob_proxy.clamp(1e-6, 1.0 - 1e-6) * drop_prob_proxy.clamp(1e-6, 1.0).log()
             + (1.0 - drop_prob_proxy).clamp(1e-6, 1.0) * (1.0 - drop_prob_proxy).clamp(1e-6, 1.0).log()
@@ -2749,10 +2842,6 @@ class StructureRepairActuator(nn.Module):
         #   2. Soft/Hard実行量と learned_*_ratio の整合性
         #   3. 上限cap超過ペナルティ
         # ============================================================
-        amount_target_mode = str(
-            getattr(self.args, "repair_amount_target_mode", "none")
-        ).strip().lower()
-
         if amount_target_mode == "target":
             drop_amount_target = learned_drop_ratio.new_tensor(
                 float(getattr(self.args, "target_drop_ratio", 0.0)) if prune_enabled else 0.0
@@ -2869,8 +2958,13 @@ class StructureRepairActuator(nn.Module):
         # これにより drop_head にActuator損失由来の勾配が出る。
         drop_where_actuator_loss = pts_xyz.new_zeros(())
         if prune_enabled:
+            # ========================================================
+            # Prune Where補助損失は drop_prob_proxy に直接かける。
+            # soft_drop_prob_for_ste は hard/guard/予算/clamp を経由しており、
+            # drop_head への勾配確認用としては遠すぎる。
+            # ========================================================
             drop_where_pred = torch.nan_to_num(
-                soft_drop_prob_for_guard,
+                drop_prob_proxy,
                 nan=0.5,
                 posinf=1.0,
                 neginf=0.0,
@@ -2882,11 +2976,28 @@ class StructureRepairActuator(nn.Module):
                 posinf=1.0,
                 neginf=0.0,
             ).clamp(0.0, 1.0)
+
             with torch.cuda.amp.autocast(enabled=False):
-                drop_where_actuator_loss = torch.nn.functional.binary_cross_entropy(
+                drop_where_loss_raw = torch.nn.functional.binary_cross_entropy(
                     drop_where_pred.float(),
                     drop_where_target.float(),
+                    reduction="none",
                 )
+
+            # selection_mask がある場合だけ対象点に制限する。
+            # ただし delete_candidate_weight では重み付けしない。
+            # それを使うと、候補枯渇時にまた drop_head 勾配が0になる。
+            if selection_mask is not None:
+                where_loss_weight = selection_mask.to(
+                    device=drop_where_loss_raw.device,
+                    dtype=drop_where_loss_raw.dtype,
+                )
+                if where_loss_weight.ndim == 2:
+                    where_loss_weight = where_loss_weight.unsqueeze(1)
+                denom = where_loss_weight.sum().clamp_min(1.0)
+                drop_where_actuator_loss = (drop_where_loss_raw * where_loss_weight.float()).sum() / denom
+            else:
+                drop_where_actuator_loss = drop_where_loss_raw.mean()
 
         # ------------------------------------------------------------
         # Move Where補助損失
@@ -3575,6 +3686,12 @@ class StructureRepairActuator(nn.Module):
             "drop_prob_direct": drop_prob_direct,
             "drop_prob_proxy": drop_prob_proxy,
             "drop_logit": learned_drop_logit,
+            "learned_drop_logit": learned_drop_logit,
+            "soft_drop_where_grad_base": soft_drop_where_grad_base,
+            "prune_where_proxy": soft_drop_where_grad_base,
+            "soft_drop_prob_for_ste": soft_drop_prob_for_ste,
+            "soft_drop_where_grad_masked": soft_drop_where_grad_masked,
+            "soft_drop_where_grad_direct": soft_drop_where_grad_direct,
             "add_prob": add_prob,
             "add_priority": add_priority,
             "add_ratio": add_ratio,

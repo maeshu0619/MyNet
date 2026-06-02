@@ -393,13 +393,24 @@ class OctreeStructureAnalysis(nn.Module):
         child_index = ((coords[:, 0] & 1) * 4 + (coords[:, 1] & 1) * 2 + (coords[:, 2] & 1)).to(torch.long)
         occupancy = torch.zeros((unique_parents.shape[0], 8), device=device, dtype=torch.bool)
         occupancy[inverse, child_index] = True
+        pattern_weights = (2 ** torch.arange(8, device=device, dtype=torch.long)).view(1, 8)
+        parent_pattern_code = (occupancy.to(torch.long) * pattern_weights).sum(dim=1)
+
+        pattern_hist = torch.bincount(parent_pattern_code, minlength=256).to(dtype=dtype)
+        parent_pattern_prob = pattern_hist.index_select(0, parent_pattern_code).clamp_min(1.0)
+        parent_pattern_prob = parent_pattern_prob / parent_pattern_prob.sum().clamp_min(1.0)
+
+        point_pattern_prob = parent_pattern_prob.index_select(0, inverse).view(1, 1, N)
+        pattern_nll = -torch.log2(point_pattern_prob.clamp_min(torch.finfo(dtype).eps))
+        pattern_nll = pattern_nll / 8.0
         child_counts = occupancy.sum(dim=1).to(dtype=dtype).clamp_min(1.0)
         point_child_counts = child_counts.index_select(0, inverse).view(1, 1, N)
         row_exist = pts_xyz.new_ones((1, 1, N))
         mean_occ = (point_child_counts / 8.0).clamp(0.0, 1.0)
         single_proxy = (point_child_counts <= 1.0).to(dtype=dtype)
-        self_occ = pts_xyz.new_ones((1, 1, N))
+        self_occ = point_pattern_prob.clamp(0.0, 1.0)
         bit_entropy = (torch.log2(point_child_counts).view(1, 1, N) / 3.0).clamp(0.0, 1.0)
+        bit_entropy = torch.maximum(bit_entropy, pattern_nll.clamp(0.0, 1.0))
         sibling_occ = ((point_child_counts - 1.0) / 7.0).clamp(0.0, 1.0)
         neighbor_occ = self._neighbor_occupancy_from_global_coords(coords).to(device=device, dtype=dtype).view(1, 1, N)
         child_id = (child_index.to(dtype=dtype).view(1, 1, N) / 7.0).clamp(0.0, 1.0)

@@ -559,6 +559,299 @@ def _collect_train_voxel_collision_stats(args, writer, global_step, stage_tensor
                 writer.write(f"VoxelCollisionSampling[{stage}]: {note}")
     return flat
 
+def _hard_occupancy_stats_mean_for_train(args, pts_b3n):
+    """
+    Actual Occupancyと同じ hard_octree_occupancy_stats をバッチ平均で計算する。
+    この関数の値はhard統計なので、forward値・ログ値として使う。
+    勾配はここからは流さない。
+    """
+    if pts_b3n is None or not torch.is_tensor(pts_b3n):
+        return None
+    if pts_b3n.ndim != 3 or pts_b3n.shape[1] != 3:
+        return None
+
+    compress_key = (
+        str(getattr(args, "compress", ""))
+        .strip()
+        .lower()
+        .replace("-", "")
+        .replace("_", "")
+        .replace(" ", "")
+    )
+
+    if compress_key == "sparsepcgc":
+        qs = float(getattr(args, "sparsepcgc_voxel_size", getattr(args, "octree_voxel", 1.0)))
+        quant_mode = "sparsepcgc"
+        pos_quantscale = int(getattr(args, "sparsepcgc_pos_quantscale", 1))
+    else:
+        qs = float(getattr(args, "qs", 1.0))
+        quant_mode = "round"
+        pos_quantscale = 1
+
+    max_depth = int(getattr(args, "sparsepcgc_occupancy_max_depth", 0))
+
+    stat_list = []
+    with torch.no_grad():
+        pts_det = pts_b3n.detach()
+        for b in range(int(pts_det.shape[0])):
+            stat_list.append(
+                hard_octree_occupancy_stats(
+                    pts_det[b, :3, :],
+                    qs=qs,
+                    max_depth=max_depth,
+                    quant_mode=quant_mode,
+                    pos_quantscale=pos_quantscale,
+                )
+            )
+
+    if not stat_list:
+        return None
+
+    keys = (
+        "occupancy_entropy",
+        "occupancy_nll",
+        "occupancy_pattern_count",
+        "lowprob_occupancy_ratio",
+        "occupancy_predictability",
+        "node_count",
+    )
+
+    out = {}
+    for key in keys:
+        values = [float(stat.get(key, 0.0)) for stat in stat_list]
+        out[key] = sum(values) / float(max(len(values), 1))
+
+    return out
+
+
+def _hard_occupancy_objective_for_train(args, before_xyz, after_xyz, device, dtype):
+    """
+    Actualと同じhard Occupancy統計から、学習用forward値を作る。
+    ただし、この値自体はdetachされたhard値なので勾配は流れない。
+    """
+    before_stats = _hard_occupancy_stats_mean_for_train(args, before_xyz)
+    after_stats = _hard_occupancy_stats_mean_for_train(args, after_xyz)
+
+    if before_stats is None or after_stats is None:
+        return None, {}
+
+    entropy_delta = float(after_stats["occupancy_entropy"] - before_stats["occupancy_entropy"])
+    nll_delta = float(after_stats["occupancy_nll"] - before_stats["occupancy_nll"])
+    pattern_before = max(float(before_stats["occupancy_pattern_count"]), 1.0)
+    pattern_delta_norm = float(after_stats["occupancy_pattern_count"] - before_stats["occupancy_pattern_count"]) / pattern_before
+    lowprob_delta = float(after_stats["lowprob_occupancy_ratio"] - before_stats["lowprob_occupancy_ratio"])
+
+    # 現在のoctree_stats.pyでは occupancy_nll は occupancy_entropy と同じ値で返る。
+    # そのため、デフォルトではentropyを主成分にし、nllは重複を避けるため小さく扱う。
+    w_entropy = float(getattr(args, "exact_occupancy_entropy_loss_weight", 1.0))
+    w_nll = float(getattr(args, "exact_occupancy_nll_loss_weight", 0.0))
+    w_pattern = float(getattr(args, "exact_occupancy_pattern_loss_weight", 0.25))
+    w_lowprob = float(getattr(args, "exact_occupancy_lowprob_loss_weight", 1.0))
+
+    hard_obj_value = (
+        w_entropy * entropy_delta
+        + w_nll * nll_delta
+        + w_pattern * pattern_delta_norm
+        + w_lowprob * lowprob_delta
+    )
+
+    hard_obj = torch.tensor(
+        hard_obj_value,
+        device=device,
+        dtype=dtype,
+    )
+
+    debug = {
+        "exact_occ_entropy_before": float(before_stats["occupancy_entropy"]),
+        "exact_occ_entropy_after": float(after_stats["occupancy_entropy"]),
+        "exact_occ_entropy_delta": float(entropy_delta),
+        "exact_occ_nll_before": float(before_stats["occupancy_nll"]),
+        "exact_occ_nll_after": float(after_stats["occupancy_nll"]),
+        "exact_occ_nll_delta": float(nll_delta),
+        "exact_occ_pattern_before": float(before_stats["occupancy_pattern_count"]),
+        "exact_occ_pattern_after": float(after_stats["occupancy_pattern_count"]),
+        "exact_occ_pattern_delta_norm": float(pattern_delta_norm),
+        "exact_occ_lowprob_before": float(before_stats["lowprob_occupancy_ratio"]),
+        "exact_occ_lowprob_after": float(after_stats["lowprob_occupancy_ratio"]),
+        "exact_occ_lowprob_delta": float(lowprob_delta),
+        "exact_occ_hard_objective": float(hard_obj_value),
+        "actual_occupancy_predictability_after": float(after_stats["occupancy_predictability"]),
+    }
+
+    return hard_obj, debug
+
+
+def _soft_occupancy_proxy_for_train(args, terms, model, out_label):
+    """
+    Actual Occupancy hard統計の代わりにbackwardへ使うsoft proxyを作る。
+    forward値はhard側を使うため、この値は勾配用である。
+
+    既存のcompression termsとActuator soft termsだけを使い、
+    新しい重いpairwise計算は入れない。
+    """
+    soft_terms = []
+
+    def _append_term(value, weight):
+        if torch.is_tensor(value) and value.requires_grad:
+            v = value
+            if v.numel() != 1:
+                v = v.mean()
+            v = torch.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
+            soft_terms.append(float(weight) * v)
+
+    # 圧縮proxy側。termsは loss.last_compression_terms 由来である。
+    _append_term(terms.get("bit", None), float(getattr(args, "exact_occ_soft_bit_weight", 1.0)))
+    _append_term(terms.get("node", None), float(getattr(args, "exact_occ_soft_node_weight", 1.0)))
+    _append_term(terms.get("single", None), float(getattr(args, "exact_occ_soft_single_weight", 0.5)))
+    _append_term(terms.get("op", None), float(getattr(args, "exact_occ_soft_op_weight", 0.25)))
+
+    # キーが存在する実装ではOccupancy/lowprob系も使う。
+    for key in (
+        "lowprob",
+        "lowprob_occupancy",
+        "occupancy",
+        "occupancy_nll",
+        "sparsepcgc_aux",
+        "sparsepcgc_aux_objective",
+    ):
+        _append_term(terms.get(key, None), float(getattr(args, "exact_occ_soft_extra_weight", 1.0)))
+
+    # Actuator側のsoft termsも使う。
+    actuator_soft_terms = {}
+
+    base_model = model.module if hasattr(model, "module") else model
+    model_soft_terms = getattr(base_model, "last_actuator_soft_terms", {})
+    if isinstance(model_soft_terms, dict):
+        actuator_soft_terms.update(model_soft_terms)
+
+    if isinstance(out_label, dict):
+        for key in (
+            "drop_prob_proxy",
+            "soft_drop_where_grad_base",
+            "learned_drop_logit",
+            "drop_logit",
+            "prune_where_proxy",
+            "prune_soft_bit",
+            "prune_soft_node",
+            "prune_soft_single",
+            "prune_soft_rate",
+        ):
+            value = out_label.get(key, None)
+            if torch.is_tensor(value):
+                actuator_soft_terms[key] = value
+
+    _append_term(
+        actuator_soft_terms.get("prune_soft_bit", None),
+        float(getattr(args, "exact_occ_soft_prune_bit_weight", 1.0)),
+    )
+    _append_term(
+        actuator_soft_terms.get("prune_soft_node", None),
+        float(getattr(args, "exact_occ_soft_prune_node_weight", 0.75)),
+    )
+    _append_term(
+        actuator_soft_terms.get("prune_soft_single", None),
+        float(getattr(args, "exact_occ_soft_prune_single_weight", 0.5)),
+    )
+    _append_term(
+        actuator_soft_terms.get("prune_soft_rate", None),
+        float(getattr(args, "exact_occ_soft_prune_rate_weight", 0.25)),
+    )
+
+    drop_prob_proxy = actuator_soft_terms.get("drop_prob_proxy", None)
+    if torch.is_tensor(drop_prob_proxy) and drop_prob_proxy.requires_grad:
+        drop_prob_safe = drop_prob_proxy.clamp(1e-6, 1.0 - 1e-6)
+        drop_entropy = -(
+            drop_prob_safe * drop_prob_safe.log()
+            + (1.0 - drop_prob_safe) * (1.0 - drop_prob_safe).log()
+        ).mean()
+        _append_term(
+            drop_entropy,
+            float(getattr(args, "exact_occ_soft_drop_entropy_weight", 0.05)),
+        )
+
+    if not soft_terms:
+        return None, {"exact_occ_soft_proxy_available": False}
+
+    soft_proxy = soft_terms[0]
+    for term in soft_terms[1:]:
+        soft_proxy = soft_proxy + term
+
+    soft_proxy = torch.nan_to_num(
+        soft_proxy,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+
+    return soft_proxy, {
+        "exact_occ_soft_proxy_available": True,
+        "exact_occ_soft_proxy_term_count": int(len(soft_terms)),
+    }
+
+
+def _build_exact_occupancy_ste_term(args, terms, model, out_label, before_xyz, after_xyz):
+    """
+    Actual hard Occupancy値をforwardに使い、
+    soft proxyをbackwardに使うSTE項を作る。
+
+    返り値:
+      ste_term
+        forward値はActual hard Occupancy objective
+        backwardはsoft proxyへ流れる
+      debug
+        CSVやログに残す値
+    """
+    if after_xyz is None or not torch.is_tensor(after_xyz):
+        return None, {}
+
+    weight = float(getattr(args, "exact_occupancy_ste_loss_weight", 0.0))
+    if weight <= 0.0:
+        return None, {"exact_occupancy_ste_used": False, "exact_occupancy_ste_disabled": True}
+
+    hard_obj, hard_debug = _hard_occupancy_objective_for_train(
+        args,
+        before_xyz=before_xyz,
+        after_xyz=after_xyz,
+        device=after_xyz.device,
+        dtype=after_xyz.dtype,
+    )
+    if hard_obj is None:
+        return None, {"exact_occupancy_ste_used": False, "exact_occupancy_ste_reason": "hard_stats_unavailable"}
+
+    soft_proxy, soft_debug = _soft_occupancy_proxy_for_train(
+        args,
+        terms=terms,
+        model=model,
+        out_label=out_label,
+    )
+
+    debug = {}
+    debug.update(hard_debug)
+    debug.update(soft_debug)
+
+    if soft_proxy is None or not (torch.is_tensor(soft_proxy) and soft_proxy.requires_grad):
+        # soft proxyがない場合は、hard値だけをforwardに足す。
+        # ただし勾配は流れない。
+        ste_term = weight * hard_obj.detach()
+        debug["exact_occupancy_ste_used"] = True
+        debug["exact_occupancy_ste_grad_used"] = False
+        debug["exact_occupancy_ste_weight"] = float(weight)
+        return ste_term, debug
+
+    soft_grad_weight = float(getattr(args, "exact_occupancy_ste_grad_weight", 1.0))
+
+    # forwardはhard_obj、backwardはsoft_proxy。
+    ste_term = weight * (
+        hard_obj.detach()
+        + soft_grad_weight * (soft_proxy - soft_proxy.detach())
+    )
+
+    debug["exact_occupancy_ste_used"] = True
+    debug["exact_occupancy_ste_grad_used"] = True
+    debug["exact_occupancy_ste_weight"] = float(weight)
+    debug["exact_occupancy_ste_grad_weight"] = float(soft_grad_weight)
+
+    return ste_term, debug
 
 def run_episode_full_cloud_validation(
     *,
@@ -1582,6 +1875,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 cp_debug["compression_grad_fallback_used"] = True
                                 cp_debug["compression_grad_fallback_source"] = "always_bit_node_single_op_proxy_ste"
                                 cp_debug["compression_primary_proxy_grad_weight"] = proxy_grad_weight
+
                         else:
                             if isinstance(cp_debug, dict):
                                 cp_debug["compression_grad_fallback_used"] = False
@@ -1590,29 +1884,18 @@ def train(model, args, loss, writer, plot, notifier=None):
                     # ============================================================
                     # Prune Where 専用の L_com 勾配復帰
                     # ============================================================
-                    # Actuator内では drop_prob_proxy / prune_soft_* が作られている。
-                    # しかし通常の bit/node/single/op proxy だけでは drop_head へ
-                    # 勾配が届かない場合がある。
-                    #
-                    # ここでは forward値を一切変えず、
-                    # backwardだけ Prune Where proxy へ流す。
-                    #
-                    # 重要：
-                    #   ・Surrogate損失は使わない
-                    #   ・L_com_objective の forward値は変えない
-                    #   ・drop_head へ L_com 勾配を戻すための gradient-only 接続である
+                    # 目的
+                    # ・forward値は一切変えない
+                    # ・backwardだけ Prune Where、つまり drop_head へ返す
+                    # ・target_drop_ratio へ寄せるMSEは使わない
+                    # ・SparsePCGCで有効な「bit/node/singleを減らす方向」のproxyを使う
                     # ============================================================
-                    # ============================================================
-                    # Prune Where proxy の取得元
-                    # ============================================================
-                    # 基本は Network.last_actuator_soft_terms を使う。
-                    # ただし、forward返り値の out_label にも同じ非detach Tensorがある場合は、
-                    # out_label側を優先して上書きする。
-                    # ============================================================
+
                     actuator_soft_terms = {}
 
+                    base_model_for_prune_proxy = _unwrap_train_model(model)
                     model_soft_terms = getattr(
-                        _unwrap_train_model(model),
+                        base_model_for_prune_proxy,
                         "last_actuator_soft_terms",
                         {},
                     )
@@ -1621,8 +1904,12 @@ def train(model, args, loss, writer, plot, notifier=None):
 
                     if isinstance(out_label, dict):
                         for key in (
-                            "drop_prob_proxy",
+                            "prune_where_proxy",
+                            "soft_drop_where_grad_base",
+                            "soft_drop_prob_for_ste",
+                            "learned_drop_logit",
                             "drop_logit",
+                            "drop_prob_proxy",
                             "prune_soft_geom",
                             "prune_soft_rate",
                             "prune_soft_node",
@@ -1634,6 +1921,13 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 actuator_soft_terms[key] = value
 
                     prune_where_grad_terms = []
+
+                    # ------------------------------------------------------------
+                    # bit/node/single/rateを減らす方向のPrune Where proxy
+                    # ------------------------------------------------------------
+                    # prune_soft_bit/node/single/rate は、削除すべき構造的に重い点を
+                    # drop_prob_proxy 経由で学習させるための項である。
+                    # ------------------------------------------------------------
 
                     prune_bit_term = actuator_soft_terms.get("prune_soft_bit", None)
                     if torch.is_tensor(prune_bit_term) and prune_bit_term.requires_grad:
@@ -1663,56 +1957,71 @@ def train(model, args, loss, writer, plot, notifier=None):
                             * prune_rate_term
                         )
 
-                    drop_prob_proxy = actuator_soft_terms.get("drop_prob_proxy", None)
-                    if torch.is_tensor(drop_prob_proxy) and drop_prob_proxy.requires_grad:
-                        # ====================================================
-                        # targetなしPrune Where補助勾配
-                        # ====================================================
-                        # drop_prob_proxy_mean を target_drop_ratio へ寄せると、
-                        # Prune Amountがtarget方向へ引っ張られる。
-                        #
-                        # ここでは量の目標は与えず、drop_headが全点同じ値に潰れないように、
-                        # 分散とエントロピーだけを使う。
-                        # forward値は変えず、drop_headへの微小な勾配経路だけを作る。
-                        # ====================================================
-                        drop_prob_proxy_safe = drop_prob_proxy.clamp(1e-6, 1.0 - 1e-6)
+                    # ------------------------------------------------------------
+                    # 形状を壊すPruneは抑える
+                    # ------------------------------------------------------------
+                    # prune_soft_geom は「削ると形状的に危ない場所」に対するペナルティである。
+                    # bit系proxyと同時に入れることで、単純な全削除方向を避ける。
+                    # ------------------------------------------------------------
 
-                        drop_entropy = -(
-                            drop_prob_proxy_safe * drop_prob_proxy_safe.log()
-                            + (1.0 - drop_prob_proxy_safe)
-                            * (1.0 - drop_prob_proxy_safe).log()
-                        ).mean()
-
-                        drop_variance = drop_prob_proxy_safe.float().var(unbiased=False)
-
+                    prune_geom_term = actuator_soft_terms.get("prune_soft_geom", None)
+                    if torch.is_tensor(prune_geom_term) and prune_geom_term.requires_grad:
                         prune_where_grad_terms.append(
-                            float(getattr(args, "compression_soft_prune_direct_grad_weight", 0.05))
-                            * (drop_entropy - 0.10 * drop_variance)
-                        )
-                    # ============================================================
-                    # drop_logit からの保険用 direct grad
-                    # ============================================================
-                    # drop_prob_proxy が飽和気味でも、bounded済みのdrop_logitから
-                    # drop_headへ小さい勾配を直接返す。
-                    #
-                    # forward値は変えず、Prune Whereが完全0になることだけを防ぐ。
-                    # ============================================================
-                    drop_logit = actuator_soft_terms.get("drop_logit", None)
-                    if torch.is_tensor(drop_logit) and drop_logit.requires_grad:
-                        drop_logit_scale = max(
-                            float(getattr(args, "repair_drop_where_logit_scale", 6.0)),
-                            1e-6,
-                        )
-                        drop_prob_from_logit = torch.sigmoid(drop_logit / drop_logit_scale)
-                        drop_prob_from_logit_mean = drop_prob_from_logit.mean()
-                        drop_target = drop_prob_from_logit_mean.new_tensor(
-                            float(getattr(args, "target_drop_ratio", 0.02))
+                            float(getattr(args, "compression_soft_prune_geom_guard_weight", 1.0))
+                            * prune_geom_term
                         )
 
-                        prune_where_grad_terms.append(
-                            float(getattr(args, "compression_soft_prune_logit_direct_grad_weight", 0.01))
-                            * (drop_prob_from_logit_mean - drop_target).pow(2)
-                        )
+                    # ------------------------------------------------------------
+                    # bit/node/single/rate proxyが取れない場合の最小保険
+                    # ------------------------------------------------------------
+                    # target_drop_ratioへ寄せるMSEは使わない。
+                    # fallbackでは、Prune Where proxyに小さい勾配だけを返す。
+                    # 符号は「削除候補を少し増やす」向きにして、Prune Whereが完全0で止まるのを防ぐ。
+                    # ------------------------------------------------------------
+
+                    if not prune_where_grad_terms:
+                        fallback_proxy = None
+                        fallback_source = "none"
+
+                        for key in (
+                            "prune_where_proxy",
+                            "soft_drop_where_grad_base",
+                            "soft_drop_prob_for_ste",
+                            "drop_prob_proxy",
+                            "learned_drop_logit",
+                            "drop_logit",
+                        ):
+                            value = actuator_soft_terms.get(key, None)
+                            if torch.is_tensor(value) and value.requires_grad:
+                                fallback_proxy = value
+                                fallback_source = key
+                                break
+
+                        if fallback_proxy is not None:
+                            fallback_anchor = torch.nan_to_num(
+                                fallback_proxy.float().mean(),
+                                nan=0.0,
+                                posinf=0.0,
+                                neginf=0.0,
+                            )
+
+                            prune_where_grad_terms.append(
+                                -float(getattr(args, "compression_soft_prune_logit_direct_grad_weight", 0.01))
+                                * fallback_anchor
+                            )
+
+                            if isinstance(cp_debug, dict):
+                                cp_debug["prune_where_grad_fallback_source"] = fallback_source
+                        else:
+                            if isinstance(cp_debug, dict):
+                                cp_debug["prune_where_grad_fallback_source"] = "no_requires_grad_proxy"
+
+                    # ------------------------------------------------------------
+                    # L_com_objectiveへgradient-onlyで足す
+                    # ------------------------------------------------------------
+                    # forward値は0であり、損失値そのものは変えない。
+                    # backwardだけ Prune Where proxy へ流す。
+                    # ------------------------------------------------------------
 
                     if prune_where_grad_terms:
                         prune_where_proxy_for_grad = prune_where_grad_terms[0]
@@ -1727,7 +2036,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                         )
 
                         prune_where_proxy_grad_weight = float(
-                            getattr(args, "compression_soft_prune_where_proxy_grad_weight", 0.05)
+                            getattr(args, "compression_soft_prune_where_proxy_grad_weight", 0.10)
                         )
                         prune_where_proxy_grad_max = max(
                             float(getattr(args, "compression_soft_prune_where_proxy_grad_max", 1.0)),
@@ -1749,12 +2058,14 @@ def train(model, args, loss, writer, plot, notifier=None):
                             if compression_extra_grad_delta is None:
                                 compression_extra_grad_delta = prune_where_proxy_grad_delta
                             else:
-                                compression_extra_grad_delta = compression_extra_grad_delta + prune_where_proxy_grad_delta
+                                compression_extra_grad_delta = (
+                                    compression_extra_grad_delta + prune_where_proxy_grad_delta
+                                )
 
                             if isinstance(cp_debug, dict):
                                 cp_debug["prune_where_grad_proxy_used"] = True
                                 cp_debug["prune_where_grad_proxy_weight"] = prune_where_proxy_grad_weight
-                                cp_debug["prune_where_grad_proxy_source"] = "actuator_last_soft_terms"
+                                cp_debug["prune_where_grad_proxy_source"] = "prune_soft_terms_or_fallback"
                     else:
                         if isinstance(cp_debug, dict):
                             cp_debug["prune_where_grad_proxy_used"] = False
@@ -1763,11 +2074,120 @@ def train(model, args, loss, writer, plot, notifier=None):
                     L_downstream = L_com_objective
                     # build_compression_primary_loss が返した L は、
                     # 後から追加した gradient-only proxy をまだ含んでいない。
+
+                    # ============================================================
+                    # Actual Occupancy hard統計 + soft proxy勾配のSTE項
+                    # ============================================================
+                    # forward値は hard_octree_occupancy_stats と同じActual値にする。
+                    # backwardは既存のsoft圧縮proxy/Actuator soft termsへ流す。
+                    # これにより、Predicted Occupancyの数値はActual定義に揃えつつ、
+                    # 学習時にはNetwork側へ勾配を返す。
+                    # ============================================================
+                    exact_occ_ste_term, exact_occ_debug = _build_exact_occupancy_ste_term(
+                        args,
+                        terms=terms,
+                        model=model,
+                        out_label=out_label,
+                        before_xyz=voxel_collision_input_gt,
+                        after_xyz=gen_xyz,
+                    )
+
+                    if torch.is_tensor(exact_occ_ste_term):
+                        L_com_objective = L_com_objective + exact_occ_ste_term
+                        L_com = L_com_objective
+
+                        if compression_extra_grad_delta is None:
+                            compression_extra_grad_delta = exact_occ_ste_term
+                        else:
+                            compression_extra_grad_delta = compression_extra_grad_delta + exact_occ_ste_term
+
+                    if isinstance(cp_debug, dict):
+                        cp_debug.update(exact_occ_debug)
+
                     # そのため、実際に backward される L にも同じ差分を足す。
                     # 差分のforward値は0なので、損失値そのものは変わらない。
                     if torch.is_tensor(compression_extra_grad_delta) and compression_extra_grad_delta.requires_grad:
                         L = L + compression_extra_grad_delta
 
+                    # ============================================================
+                    # Prune Where direct gradient anchor
+                    # ============================================================
+                    # L_com_objective.requires_grad=True でも、勾配がMoveにしか流れていない場合がある。
+                    # そのため、requires_gradの有無ではなく、Prune Where専用proxyを常に探して、
+                    # forward値0のgradient-only項としてL_com_objectiveへ追加する。
+                    #
+                    # target_drop_ratioへ寄せるMSEは使わない。
+                    # 目的は drop_head の勾配0を防ぐことだけである。
+                    # ============================================================
+                    prune_where_direct_weight = float(
+                        getattr(args, "compression_soft_prune_logit_direct_grad_weight", 0.01)
+                    )
+
+                    if prune_where_direct_weight > 0.0:
+                        base_model_for_prune_proxy = _unwrap_train_model(model)
+                        actuator_soft_terms = dict(
+                            getattr(base_model_for_prune_proxy, "last_actuator_soft_terms", {}) or {}
+                        )
+
+                        # 念のためargs側にも保存されている場合は拾う
+                        args_soft_terms = getattr(args, "_last_actuator_soft_terms", None)
+                        if isinstance(args_soft_terms, dict):
+                            actuator_soft_terms.update(args_soft_terms)
+
+                        prune_where_proxy = None
+                        prune_where_proxy_source = "none"
+
+                        for key in (
+                            "soft_drop_where_grad_direct",
+                            "drop_prob_proxy",
+                            "learned_drop_logit",
+                            "drop_logit",
+                            "soft_drop_prob_for_ste",
+                            "prune_where_proxy",
+                            "soft_drop_where_grad_base",
+                        ):
+                            value = actuator_soft_terms.get(key, None)
+                            if torch.is_tensor(value) and value.requires_grad:
+                                prune_where_proxy = value
+                                prune_where_proxy_source = key
+                                break
+
+                        if prune_where_proxy is not None:
+                            prune_where_anchor = torch.nan_to_num(
+                                prune_where_proxy.float().mean(),
+                                nan=0.0,
+                                posinf=0.0,
+                                neginf=0.0,
+                            )
+
+                            # forward値は0、backwardだけPrune Whereへ返す
+                            prune_where_grad_delta = prune_where_direct_weight * (
+                                prune_where_anchor - prune_where_anchor.detach()
+                            )
+
+                            L_com_objective = L_com_objective + prune_where_grad_delta
+                            L_com = L_com_objective
+                            L_downstream = L_com_objective
+
+                            # ============================================================
+                            # 実際にbackwardされるLにもPrune Where direct anchorを足す
+                            # ============================================================
+                            # L_com_objective / L_com / L_downstream だけを書き換えても、
+                            # build_compression_primary_loss が返した L には後付けproxyが入らない。
+                            # そのため、drop_headへ返すgradient-only項をL_totalにも明示的に足す。
+                            # forward値は0なので、損失値そのものは変わらない。
+                            # ============================================================
+                            L = L + prune_where_grad_delta
+
+                            if isinstance(cp_debug, dict):
+                                cp_debug["prune_where_direct_anchor_used"] = True
+                                cp_debug["prune_where_direct_anchor_source"] = prune_where_proxy_source
+                                cp_debug["prune_where_direct_anchor_weight"] = prune_where_direct_weight
+                        else:
+                            if isinstance(cp_debug, dict):
+                                cp_debug["prune_where_direct_anchor_used"] = False
+                                cp_debug["prune_where_direct_anchor_source"] = "no_requires_grad_proxy"
+                                
                     L = (
                         L
                         + stage_factors["attr"] * args.w_attr * L_attr
@@ -1826,6 +2246,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                 ):
                     if debug_key in structure_debug and debug_key not in comp_debug:
                         comp_debug[debug_key] = structure_debug.get(debug_key)
+
                 operation_entropy_value = finite_float_or_none(structure_debug.get("operation_entropy")) # 探索多様性の移動平均を出すために現在値を取り出す
                 if operation_entropy_value is not None:
                     operation_entropy_history = list(getattr(args, "_operation_entropy_history", [])) # 直近の操作entropy履歴を取得する
@@ -1869,6 +2290,68 @@ def train(model, args, loss, writer, plot, notifier=None):
 
                 """CSV"""
                 compression_metric_row = build_compression_metric_row( args, global_step=global_train_step, episode=episode, epoch=epoch, step=step, stage=current_stage, comp_debug=comp_debug, L_com=L_com) # 圧縮StepCSVに書き込む1行を作る
+                # ============================================================
+                # Actual hard Occupancy値はActual列・exact列にだけ入れる
+                # Predicted列はsoft proxy側の値を残す
+                # ============================================================
+                if isinstance(comp_debug, dict):
+                    if "exact_occ_entropy_delta" in comp_debug:
+                        compression_metric_row["actual_occupancy_entropy_delta"] = comp_debug["exact_occ_entropy_delta"]
+                        compression_metric_row["exact_hard_occupancy_entropy_delta"] = comp_debug["exact_occ_entropy_delta"]
+
+                        pred = compression_metric_row.get("predicted_occupancy_entropy_delta", None)
+                        if pred is not None:
+                            try:
+                                compression_metric_row["gap_occupancy_entropy_delta"] = (
+                                    float(pred) - float(comp_debug["exact_occ_entropy_delta"])
+                                )
+                            except Exception:
+                                pass
+
+                    if "exact_occ_nll_delta" in comp_debug:
+                        compression_metric_row["actual_occupancy_nll_delta"] = comp_debug["exact_occ_nll_delta"]
+                        compression_metric_row["exact_hard_occupancy_nll_delta"] = comp_debug["exact_occ_nll_delta"]
+
+                        pred = compression_metric_row.get("predicted_occupancy_nll_delta", None)
+                        if pred is not None:
+                            try:
+                                compression_metric_row["gap_occupancy_nll_delta"] = (
+                                    float(pred) - float(comp_debug["exact_occ_nll_delta"])
+                                )
+                            except Exception:
+                                pass
+
+                    if "exact_occ_pattern_delta_norm" in comp_debug:
+                        compression_metric_row["actual_occupancy_pattern_delta"] = comp_debug["exact_occ_pattern_delta_norm"]
+                        compression_metric_row["exact_hard_occupancy_pattern_delta_norm"] = comp_debug["exact_occ_pattern_delta_norm"]
+
+                        pred = compression_metric_row.get("predicted_occupancy_pattern_delta", None)
+                        if pred is not None:
+                            try:
+                                compression_metric_row["gap_occupancy_pattern_delta"] = (
+                                    float(pred) - float(comp_debug["exact_occ_pattern_delta_norm"])
+                                )
+                            except Exception:
+                                pass
+
+                    if "exact_occ_lowprob_after" in comp_debug:
+                        compression_metric_row["actual_lowprob_occupancy_ratio_after"] = comp_debug["exact_occ_lowprob_after"]
+                        compression_metric_row["exact_hard_lowprob_occupancy_ratio_after"] = comp_debug["exact_occ_lowprob_after"]
+
+                        pred = compression_metric_row.get("predicted_lowprob_occupancy_ratio", None)
+                        if pred is not None:
+                            try:
+                                compression_metric_row["gap_lowprob_occupancy_ratio"] = (
+                                    float(pred) - float(comp_debug["exact_occ_lowprob_after"])
+                                )
+                            except Exception:
+                                pass
+
+                    if "exact_occupancy_ste_weight" in comp_debug:
+                        compression_metric_row["training_exact_occupancy_ste_weight"] = comp_debug["exact_occupancy_ste_weight"]
+
+                    if "exact_occupancy_ste_grad_used" in comp_debug:
+                        compression_metric_row["training_exact_occupancy_ste_grad_used"] = comp_debug["exact_occupancy_ste_grad_used"]
                 operation_metric_row = build_operation_metric_row( args, global_step=global_train_step, episode=episode, epoch=epoch, step=step, stage=current_stage, comp_debug=comp_debug, structure_debug=structure_debug, edit_stats=train_edit_stats) # 点操作StepCSVに書き込む1行を作る
 
                 """ログ"""

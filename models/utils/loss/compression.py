@@ -857,6 +857,81 @@ class CompressionLossMixin:
                 "sparsepcgc_low_prob_threshold",
                 _float(before_stats, "sparsepcgc_low_prob_threshold", 0.1),
             )
+            # SparsePCGCの実符号化は、hard-octreeのpattern histogramではなく、
+            # upsampler/classifierが出す候補voxelごとのoccupancy labelを算術符号化する。
+            # そのためSparsePCGC候補occupancyが取れている時は、Predicted/Actualの
+            # 主occupancy指標も同じ候補空間の値に揃える。
+            before_candidate = _int(before_stats, "sparsepcgc_candidate_count", 0)
+            after_candidate = _int(after_stats, "sparsepcgc_candidate_count", 0)
+            before_entropy_sparse = _float(before_stats, "sparsepcgc_pred_prob_entropy", float("nan"))
+            after_entropy_sparse = _float(after_stats, "sparsepcgc_pred_prob_entropy", float("nan"))
+            before_nll_sparse = _float(before_stats, "sparsepcgc_pred_occupancy_nll", float("nan"))
+            after_nll_sparse = _float(after_stats, "sparsepcgc_pred_occupancy_nll", float("nan"))
+            before_predictability_sparse = _float(before_stats, "sparsepcgc_prob_true_mean", float("nan"))
+            after_predictability_sparse = _float(after_stats, "sparsepcgc_prob_true_mean", float("nan"))
+            before_low_count_sparse = _float(before_stats, "sparsepcgc_prob_true_low_count", float("nan"))
+            after_low_count_sparse = _float(after_stats, "sparsepcgc_prob_true_low_count", float("nan"))
+            before_low_sparse = _float(before_stats, "sparsepcgc_prob_true_low_ratio", float("nan"))
+            after_low_sparse = _float(after_stats, "sparsepcgc_prob_true_low_ratio", float("nan"))
+
+            debug["occupancy_proxy_definition"] = (
+                "SparsePCGC candidate occupancy from sigmoid(out_cls.F) and isin(out_cls.C, x_high.C)"
+            )
+            debug["actual_occupancy_definition"] = (
+                "SparsePCGC candidate occupancy labels used by BinaryArithmeticCoding"
+            )
+            debug["predicted_occupancy_definition"] = (
+                "SparsePCGC candidate probability/NLL in the same candidate space as actual labels"
+            )
+
+            if before_candidate > 0 or after_candidate > 0:
+                candidate_delta = after_candidate - before_candidate
+                debug["occupancy_pattern_before"] = before_candidate
+                debug["occupancy_pattern_after"] = after_candidate
+                debug["occupancy_pattern_delta"] = candidate_delta
+                debug["actual_occupancy_pattern_before"] = before_candidate
+                debug["actual_occupancy_pattern_after"] = after_candidate
+                debug["actual_occupancy_pattern_delta"] = candidate_delta
+
+            if np.isfinite(before_entropy_sparse) and np.isfinite(after_entropy_sparse):
+                entropy_delta_sparse = after_entropy_sparse - before_entropy_sparse
+                debug["occupancy_entropy_before"] = before_entropy_sparse
+                debug["occupancy_entropy_after"] = after_entropy_sparse
+                debug["occupancy_entropy_delta"] = entropy_delta_sparse
+                debug["actual_occupancy_entropy_before"] = before_entropy_sparse
+                debug["actual_occupancy_entropy_after"] = after_entropy_sparse
+                debug["actual_occupancy_entropy_delta"] = entropy_delta_sparse
+
+            if np.isfinite(before_nll_sparse) and np.isfinite(after_nll_sparse):
+                nll_delta_sparse = after_nll_sparse - before_nll_sparse
+                debug["occupancy_nll_before"] = before_nll_sparse
+                debug["occupancy_nll_after"] = after_nll_sparse
+                debug["occupancy_nll_delta"] = nll_delta_sparse
+                debug["actual_occupancy_nll_before"] = before_nll_sparse
+                debug["actual_occupancy_nll_after"] = after_nll_sparse
+                debug["actual_occupancy_nll_delta"] = nll_delta_sparse
+
+            if np.isfinite(before_low_sparse) and np.isfinite(after_low_sparse):
+                low_delta_sparse = after_low_sparse - before_low_sparse
+                debug["lowprob_occupancy_ratio"] = after_low_sparse
+                debug["actual_lowprob_occupancy_ratio_before"] = before_low_sparse
+                debug["actual_lowprob_occupancy_ratio_after"] = after_low_sparse
+                debug["actual_lowprob_occupancy_ratio_delta"] = low_delta_sparse
+
+            if np.isfinite(before_low_count_sparse) and np.isfinite(after_low_count_sparse):
+                low_count_delta_sparse = after_low_count_sparse - before_low_count_sparse
+                debug["lowprob_occupancy_count_before"] = before_low_count_sparse
+                debug["lowprob_occupancy_count_after"] = after_low_count_sparse
+                debug["actual_lowprob_occupancy_count_before"] = before_low_count_sparse
+                debug["actual_lowprob_occupancy_count_after"] = after_low_count_sparse
+                debug["actual_lowprob_occupancy_count_delta"] = low_count_delta_sparse
+
+            if np.isfinite(before_predictability_sparse) and np.isfinite(after_predictability_sparse):
+                debug["actual_occupancy_predictability_before"] = before_predictability_sparse
+                debug["actual_occupancy_predictability_after"] = after_predictability_sparse
+                debug["actual_occupancy_predictability_delta"] = (
+                    after_predictability_sparse - before_predictability_sparse
+                )
         if "sparsepcgc_exact_estimated_bits" in before_stats or "sparsepcgc_exact_estimated_bits" in after_stats:
             exact_float_keys = [
                 "sparsepcgc_exact_occupancy_label_ratio",

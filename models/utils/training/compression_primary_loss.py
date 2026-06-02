@@ -69,12 +69,27 @@ def build_compression_primary_loss(
     # actual codec値は微分不能なので、actual_total_bit_percent_fresh等はlossに入れない。
     # compression_primaryの学習信号はsurrogate/proxy/soft auxのtensorだけから作る。
     # debugやCSVの.item()済み値はcheckpoint/log/teacher用であり、backward対象にしない。
+    L_sparsepcgc = as_scalar_loss_tensor(terms.get("sparsepcgc", None))
     main_source, L_com_main = select_compression_primary_main(terms, L_com)
     if uses_actual_total_bit_objective(args):
         # actual/surrogate系ではL_com直結と圧縮内訳を半々で混ぜた主目的にする。
         L_com_main = compose_train_compression_main(args, terms, L_com_main, zero_like_loss(L_com_main))
         # Debugで混合主目的を使ったことを追えるようにsource名へ印を付ける。
         main_source = f"{main_source}+mixed_terms"
+        # SparsePCGC補助項はsurrogate側でgate済みのTensorだけがterms["sparsepcgc"]へ入る。
+        # actual_total_bit_objective_mix=1.0ではcompose側で内訳項が捨てられるため、
+        # forward値はactualのまま、backwardだけSparsePCGC補助へ戻す。
+        sparsepcgc_main_grad_weight = max(
+            float(getattr(args, "cp_sparsepcgc_aux_main_grad_weight", getattr(args, "com_sparsepcgc", 0.0))),
+            0.0,
+        )
+        if sparsepcgc_main_grad_weight > 0.0 and term_requires_grad(L_sparsepcgc):
+            L_com_main = L_com_main + sparsepcgc_main_grad_weight * (
+                L_sparsepcgc - L_sparsepcgc.detach()
+            )
+            main_source = f"{main_source}+sparsepcgc_aux_grad"
+    else:
+        sparsepcgc_main_grad_weight = 0.0
     warmup_steps = int(getattr(args, "compression_primary_warmup_steps", 0))
     if warmup_steps > 0:
         warmup = min(1.0, float(int(global_train_step) + 1) / float(warmup_steps))
@@ -85,7 +100,6 @@ def build_compression_primary_loss(
     zero = zero_like_loss(L_com_primary)
     L_single = as_scalar_loss_tensor(terms.get("single", None))
     L_nodes = as_scalar_loss_tensor(terms.get("node", None))
-    L_sparsepcgc = as_scalar_loss_tensor(terms.get("sparsepcgc", None))
     L_op = as_scalar_loss_tensor(terms.get("op", None))
 
     P_geom = relu_penalty(as_scalar_loss_tensor(L_geom), getattr(args, "cp_tau_geom", 0.06))
@@ -148,6 +162,7 @@ def build_compression_primary_loss(
         "single_delta_penalty": case_float(single_delta_penalty, float("nan")),
         "single_delta_penalty_weight": float(single_delta_penalty_weight),
         "single_delta_penalty_used_for_backprop": bool(single_delta_penalty_used),
+        "cp_sparsepcgc_main_grad_weight": float(sparsepcgc_main_grad_weight),
         "cp_total": case_float(L, float("nan")),
         "cp_main_requires_grad": term_requires_grad(L_com_main),
         "cp_geom_requires_grad": term_requires_grad(L_geom),
