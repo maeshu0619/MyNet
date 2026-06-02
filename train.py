@@ -1484,6 +1484,10 @@ def train(model, args, loss, writer, plot, notifier=None):
                         global_train_step=global_train_step,
                         stage_factors=stage_factors,
                     )
+                    # L_com_objective に後から足す gradient-only proxy を、
+                    # 実際に backward される L にも反映するための蓄積変数である。
+                    # forward値は0なので、損失値自体は変えない。
+                    compression_extra_grad_delta = None
 
                     # ============================================================
                     # Compression Primary の勾配復帰
@@ -1556,9 +1560,16 @@ def train(model, args, loss, writer, plot, notifier=None):
                             )
 
                             if torch.is_tensor(L_com_objective):
-                                L_com_objective = L_com_objective + proxy_grad_weight * (
+                                compression_proxy_grad_delta = proxy_grad_weight * (
                                     compression_proxy_for_grad - compression_proxy_for_grad.detach()
                                 )
+
+                                L_com_objective = L_com_objective + compression_proxy_grad_delta
+
+                                if compression_extra_grad_delta is None:
+                                    compression_extra_grad_delta = compression_proxy_grad_delta
+                                else:
+                                    compression_extra_grad_delta = compression_extra_grad_delta + compression_proxy_grad_delta
                             else:
                                 L_com_objective = compression_proxy_for_grad.detach() + proxy_grad_weight * (
                                     compression_proxy_for_grad - compression_proxy_for_grad.detach()
@@ -1576,7 +1587,186 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 cp_debug["compression_grad_fallback_used"] = False
                                 cp_debug["compression_grad_fallback_source"] = "no_grad_proxy_available"
 
+                    # ============================================================
+                    # Prune Where 専用の L_com 勾配復帰
+                    # ============================================================
+                    # Actuator内では drop_prob_proxy / prune_soft_* が作られている。
+                    # しかし通常の bit/node/single/op proxy だけでは drop_head へ
+                    # 勾配が届かない場合がある。
+                    #
+                    # ここでは forward値を一切変えず、
+                    # backwardだけ Prune Where proxy へ流す。
+                    #
+                    # 重要：
+                    #   ・Surrogate損失は使わない
+                    #   ・L_com_objective の forward値は変えない
+                    #   ・drop_head へ L_com 勾配を戻すための gradient-only 接続である
+                    # ============================================================
+                    # ============================================================
+                    # Prune Where proxy の取得元
+                    # ============================================================
+                    # 基本は Network.last_actuator_soft_terms を使う。
+                    # ただし、forward返り値の out_label にも同じ非detach Tensorがある場合は、
+                    # out_label側を優先して上書きする。
+                    # ============================================================
+                    actuator_soft_terms = {}
+
+                    model_soft_terms = getattr(
+                        _unwrap_train_model(model),
+                        "last_actuator_soft_terms",
+                        {},
+                    )
+                    if isinstance(model_soft_terms, dict):
+                        actuator_soft_terms.update(model_soft_terms)
+
+                    if isinstance(out_label, dict):
+                        for key in (
+                            "drop_prob_proxy",
+                            "drop_logit",
+                            "prune_soft_geom",
+                            "prune_soft_rate",
+                            "prune_soft_node",
+                            "prune_soft_single",
+                            "prune_soft_bit",
+                        ):
+                            value = out_label.get(key, None)
+                            if torch.is_tensor(value):
+                                actuator_soft_terms[key] = value
+
+                    prune_where_grad_terms = []
+
+                    prune_bit_term = actuator_soft_terms.get("prune_soft_bit", None)
+                    if torch.is_tensor(prune_bit_term) and prune_bit_term.requires_grad:
+                        prune_where_grad_terms.append(
+                            float(getattr(args, "compression_soft_prune_bit_grad_weight", 30.0))
+                            * prune_bit_term
+                        )
+
+                    prune_node_term = actuator_soft_terms.get("prune_soft_node", None)
+                    if torch.is_tensor(prune_node_term) and prune_node_term.requires_grad:
+                        prune_where_grad_terms.append(
+                            float(getattr(args, "compression_soft_prune_node_grad_weight", 25.0))
+                            * prune_node_term
+                        )
+
+                    prune_single_term = actuator_soft_terms.get("prune_soft_single", None)
+                    if torch.is_tensor(prune_single_term) and prune_single_term.requires_grad:
+                        prune_where_grad_terms.append(
+                            float(getattr(args, "compression_soft_prune_single_grad_weight", 20.0))
+                            * prune_single_term
+                        )
+
+                    prune_rate_term = actuator_soft_terms.get("prune_soft_rate", None)
+                    if torch.is_tensor(prune_rate_term) and prune_rate_term.requires_grad:
+                        prune_where_grad_terms.append(
+                            float(getattr(args, "compression_soft_rate_point_weight", 0.25))
+                            * prune_rate_term
+                        )
+
+                    drop_prob_proxy = actuator_soft_terms.get("drop_prob_proxy", None)
+                    if torch.is_tensor(drop_prob_proxy) and drop_prob_proxy.requires_grad:
+                        # ====================================================
+                        # targetなしPrune Where補助勾配
+                        # ====================================================
+                        # drop_prob_proxy_mean を target_drop_ratio へ寄せると、
+                        # Prune Amountがtarget方向へ引っ張られる。
+                        #
+                        # ここでは量の目標は与えず、drop_headが全点同じ値に潰れないように、
+                        # 分散とエントロピーだけを使う。
+                        # forward値は変えず、drop_headへの微小な勾配経路だけを作る。
+                        # ====================================================
+                        drop_prob_proxy_safe = drop_prob_proxy.clamp(1e-6, 1.0 - 1e-6)
+
+                        drop_entropy = -(
+                            drop_prob_proxy_safe * drop_prob_proxy_safe.log()
+                            + (1.0 - drop_prob_proxy_safe)
+                            * (1.0 - drop_prob_proxy_safe).log()
+                        ).mean()
+
+                        drop_variance = drop_prob_proxy_safe.float().var(unbiased=False)
+
+                        prune_where_grad_terms.append(
+                            float(getattr(args, "compression_soft_prune_direct_grad_weight", 0.05))
+                            * (drop_entropy - 0.10 * drop_variance)
+                        )
+                    # ============================================================
+                    # drop_logit からの保険用 direct grad
+                    # ============================================================
+                    # drop_prob_proxy が飽和気味でも、bounded済みのdrop_logitから
+                    # drop_headへ小さい勾配を直接返す。
+                    #
+                    # forward値は変えず、Prune Whereが完全0になることだけを防ぐ。
+                    # ============================================================
+                    drop_logit = actuator_soft_terms.get("drop_logit", None)
+                    if torch.is_tensor(drop_logit) and drop_logit.requires_grad:
+                        drop_logit_scale = max(
+                            float(getattr(args, "repair_drop_where_logit_scale", 6.0)),
+                            1e-6,
+                        )
+                        drop_prob_from_logit = torch.sigmoid(drop_logit / drop_logit_scale)
+                        drop_prob_from_logit_mean = drop_prob_from_logit.mean()
+                        drop_target = drop_prob_from_logit_mean.new_tensor(
+                            float(getattr(args, "target_drop_ratio", 0.02))
+                        )
+
+                        prune_where_grad_terms.append(
+                            float(getattr(args, "compression_soft_prune_logit_direct_grad_weight", 0.01))
+                            * (drop_prob_from_logit_mean - drop_target).pow(2)
+                        )
+
+                    if prune_where_grad_terms:
+                        prune_where_proxy_for_grad = prune_where_grad_terms[0]
+                        for term in prune_where_grad_terms[1:]:
+                            prune_where_proxy_for_grad = prune_where_proxy_for_grad + term
+
+                        prune_where_proxy_for_grad = torch.nan_to_num(
+                            prune_where_proxy_for_grad,
+                            nan=0.0,
+                            posinf=0.0,
+                            neginf=0.0,
+                        )
+
+                        prune_where_proxy_grad_weight = float(
+                            getattr(args, "compression_soft_prune_where_proxy_grad_weight", 0.05)
+                        )
+                        prune_where_proxy_grad_max = max(
+                            float(getattr(args, "compression_soft_prune_where_proxy_grad_max", 1.0)),
+                            0.0,
+                        )
+                        prune_where_proxy_grad_weight = min(
+                            max(prune_where_proxy_grad_weight, 0.0),
+                            prune_where_proxy_grad_max,
+                        )
+
+                        if prune_where_proxy_grad_weight > 0.0:
+                            prune_where_proxy_grad_delta = prune_where_proxy_grad_weight * (
+                                prune_where_proxy_for_grad - prune_where_proxy_for_grad.detach()
+                            )
+
+                            L_com_objective = L_com_objective + prune_where_proxy_grad_delta
+                            L_com = L_com_objective
+
+                            if compression_extra_grad_delta is None:
+                                compression_extra_grad_delta = prune_where_proxy_grad_delta
+                            else:
+                                compression_extra_grad_delta = compression_extra_grad_delta + prune_where_proxy_grad_delta
+
+                            if isinstance(cp_debug, dict):
+                                cp_debug["prune_where_grad_proxy_used"] = True
+                                cp_debug["prune_where_grad_proxy_weight"] = prune_where_proxy_grad_weight
+                                cp_debug["prune_where_grad_proxy_source"] = "actuator_last_soft_terms"
+                    else:
+                        if isinstance(cp_debug, dict):
+                            cp_debug["prune_where_grad_proxy_used"] = False
+                            cp_debug["prune_where_grad_proxy_source"] = "no_prune_soft_terms_available"
+
                     L_downstream = L_com_objective
+                    # build_compression_primary_loss が返した L は、
+                    # 後から追加した gradient-only proxy をまだ含んでいない。
+                    # そのため、実際に backward される L にも同じ差分を足す。
+                    # 差分のforward値は0なので、損失値そのものは変わらない。
+                    if torch.is_tensor(compression_extra_grad_delta) and compression_extra_grad_delta.requires_grad:
+                        L = L + compression_extra_grad_delta
 
                     L = (
                         L

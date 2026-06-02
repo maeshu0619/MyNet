@@ -74,12 +74,12 @@ class StructureRepairActuator(nn.Module):
         target_repair_ratio = float(
             getattr(self.args, "target_repair_ratio", getattr(self.args, "target_disp_ratio", 0.20))
         )
-        target_drop_ratio = float(getattr(self.args, "target_drop_ratio", 0.01))
+        target_drop_ratio = float(getattr(self.args, "target_drop_ratio", 0.05))
         init_drop = target_drop_ratio / max(target_repair_ratio, 1e-6)
         init_drop = min(max(init_drop, 1e-4), 0.95)
         init_drop_bias = math.log(init_drop / max(1.0 - init_drop, 1e-6))
         nn.init.constant_(self.drop_head[-1].bias, init_drop_bias)
-        target_add_ratio = min(max(float(getattr(self.args, "target_add_ratio", 0.01)), 1e-4), 0.95)
+        target_add_ratio = min(max(float(getattr(self.args, "target_add_ratio", 0.03)), 1e-4), 0.95)
         init_add_bias = math.log(target_add_ratio / max(1.0 - target_add_ratio, 1e-6))
         nn.init.constant_(self.add_head[-1].bias, init_add_bias)
         nn.init.constant_(self.drop_amount_head.bias, 0.0)
@@ -829,7 +829,29 @@ class StructureRepairActuator(nn.Module):
         if max_ratio <= 0.0:
             return actuator_features.new_zeros((actuator_features.shape[0], 1, 1))
 
-        pooled = actuator_features.mean(dim=2, keepdim=True)
+        # ============================================================
+        # Amount head 用の集約特徴
+        # ============================================================
+        # 既存実装では mean だけを使っていたため、
+        # 点群内の局所的な強い異常やばらつきがAmount headへ入りにくかった。
+        #
+        # headの入力チャネル数は変えず、mean + std + max を同じC次元に合成する。
+        # これにより既存の drop/add/move_amount_head の構造を壊さず、
+        # Stepごとの操作割合が入力状態に応じて変化しやすくなる。
+        # ============================================================
+        mean_feat = actuator_features.mean(dim=2, keepdim=True)
+        max_feat = actuator_features.amax(dim=2, keepdim=True)
+
+        if actuator_features.shape[2] > 1:
+            std_feat = actuator_features.std(dim=2, keepdim=True, unbiased=False)
+        else:
+            std_feat = torch.zeros_like(mean_feat)
+
+        pooled = (
+            mean_feat
+            + float(getattr(self.args, "repair_amount_pool_std_weight", 0.50)) * std_feat
+            + float(getattr(self.args, "repair_amount_pool_max_weight", 0.25)) * max_feat
+        )
 
         # まず必ず amount head を通す。
         # raw logit を軽く正規化し、sigmoid 飽和による amount_head 勾配消失を抑える。
@@ -930,7 +952,20 @@ class StructureRepairActuator(nn.Module):
         else:
             scale = float(getattr(self.args, "repair_where_downstream_grad_scale", 1.0))
 
-        scale = max(scale, 1.0)
+        # Where勾配倍率を安全範囲に制限する。
+        # 既存実装では max(scale, 1.0) により1倍未満へ下げられなかった。
+        # しかし Add Where だけが突出している場合は、forward値を変えずに
+        # backwardだけ弱める必要がある。
+        min_scale = max(
+            float(getattr(self.args, "repair_where_downstream_grad_min_scale", 0.05)),
+            1e-4,
+        )
+        max_scale = max(
+            float(getattr(self.args, "repair_where_downstream_grad_max_scale", 8.0)),
+            min_scale,
+        )
+        scale = min(max(scale, min_scale), max_scale)
+
         return value.detach() + scale * (value - value.detach())
 
     def _ratio_bias(self, ratio, max_ratio):
@@ -941,14 +976,14 @@ class StructureRepairActuator(nn.Module):
         return self._safe_logit(normalized) * float(getattr(self.args, "repair_operation_amount_bias_scale", 2.0))
 
     def _max_add_ratio(self):
-        target_ratio = self._target_add_ratio_value()
+        # targetなしAmount学習では、target_add_ratioを上限決定に使わない。
+        # max_add_ratioだけをAdd Amountの探索上限として使う。
         if self._sparsepcgc_add_experiment_active():
-            max_ratio = max(float(getattr(self.args, "sparsepcgc_add_max_ratio", 0.003)), target_ratio)
+            max_ratio = float(getattr(self.args, "sparsepcgc_add_max_ratio", getattr(self.args, "max_add_ratio", 0.30)))
             max_ratio = max_ratio * self._sparsepcgc_add_warmup()
-            max_ratio = max(max_ratio, target_ratio)
         else:
-            max_ratio = max(float(getattr(self.args, "max_add_ratio", max(target_ratio, 0.0))), target_ratio)
-        return max(max_ratio, 0.0)
+            max_ratio = float(getattr(self.args, "max_add_ratio", 0.30))
+        return min(max(max_ratio, 0.0), 0.30)
 
     def _target_add_ratio_value(self):
         if self._sparsepcgc_add_experiment_active():
@@ -1331,8 +1366,13 @@ class StructureRepairActuator(nn.Module):
         )
         if full_context_available:
             delete_prior = delete_prior + 0.05 * full_context_bonus
-        target_drop_ratio = float(getattr(self.args, "target_drop_ratio", 0.01)) if prune_enabled else 0.0
-        max_drop_ratio = max(float(getattr(self.args, "max_drop_ratio", max(target_drop_ratio, 0.01))), target_drop_ratio)
+        # targetなしAmount学習では、Pruneの実行量をtarget_drop_ratioへ寄せない。
+        # max_drop_ratioだけを0〜30%の探索上限として使う。
+        target_drop_ratio = 0.0
+        max_drop_ratio = min(
+            max(float(getattr(self.args, "max_drop_ratio", 0.30)), 0.0),
+            0.30,
+        ) if prune_enabled else 0.0
         if not prune_enabled:
             max_drop_ratio = 0.0
         # Pruneする割合を特徴から学習し、固定target_drop_ratioだけに依存しない削除数にする。
@@ -1371,21 +1411,71 @@ class StructureRepairActuator(nn.Module):
             self._annealed_value("repair_drop_score_noise_start", "repair_drop_score_noise_end"),
             0.0,
         )
-        learned_drop_logit = self.drop_head(actuator_features)
+        # ============================================================
+        # Prune Where logit の飽和対策
+        # ============================================================
+        # drop_head の raw logit が数十〜数百になると、
+        # sigmoidが完全飽和して drop_prob_proxy から drop_head へ勾配が戻らなくなる。
+        #
+        # そのため、forward値として使うlogitをtanhで有界化する。
+        # _scale_where_downstream_grad はその後に適用し、forward値は有界のまま、
+        # backwardだけ操作別倍率で調整する。
+        # ============================================================
+        raw_drop_logit = torch.nan_to_num(
+            self.drop_head(actuator_features),
+            nan=0.0,
+            posinf=float(getattr(self.args, "repair_drop_where_logit_scale", 6.0)),
+            neginf=-float(getattr(self.args, "repair_drop_where_logit_scale", 6.0)),
+        )
+
+        drop_logit_scale = max(
+            float(getattr(self.args, "repair_drop_where_logit_scale", 6.0)),
+            1e-6,
+        )
+        learned_drop_logit = drop_logit_scale * torch.tanh(raw_drop_logit / drop_logit_scale)
+
         learned_drop_logit = self._scale_where_downstream_grad(
             learned_drop_logit,
             op_name="drop",
         )
+
         if self.training and drop_score_noise > 0.0:
             learned_drop_logit = learned_drop_logit + torch.randn_like(learned_drop_logit) * drop_score_noise
+            # ノイズ追加後もsigmoid飽和を避けるため、もう一度有界化する。
+            learned_drop_logit = drop_logit_scale * torch.tanh(learned_drop_logit / drop_logit_scale)
+
         learned_drop = torch.sigmoid(learned_drop_logit)
         learned_drop_prob = learned_drop.mean()
         drop_proxy_tau = max(float(getattr(self.args, "repair_drop_soft_proxy_tau", 8.0)), 1e-6)
         drop_prob_proxy = torch.sigmoid(learned_drop_logit / drop_proxy_tau)
         drop_prob = (repair_gate * delete_prior * learned_drop).clamp(0.0, 1.0)
         if prune_enabled and max_drop_ratio > 0.0:
-            # 学習したPrune量を削除scoreへ反映し、量と位置を同じlogit上で調整する。
-            drop_prob = torch.sigmoid(self._safe_logit(drop_prob) + self._ratio_bias(learned_drop_ratio_for_ops, max_drop_ratio))
+            # ============================================================
+            # Prune Amount由来のratio biasを弱める
+            # ============================================================
+            # Amountは「何個削るか」を決める役割であり、
+            # Whereは「どこを削るか」のランキングを決める役割である。
+            #
+            # ここでratio biasを強く足しすぎると、drop_probが一気に1.0へ寄り、
+            # drop_headのWhere勾配が再び消える。
+            # そのためPruneだけbias倍率とclipを別に持たせる。
+            # ============================================================
+            prune_ratio_bias = self._ratio_bias(learned_drop_ratio_for_ops, max_drop_ratio)
+            prune_ratio_bias = prune_ratio_bias * float(
+                getattr(self.args, "repair_prune_ratio_bias_scale", 0.10)
+            )
+            prune_ratio_bias_clip = max(
+                float(getattr(self.args, "repair_prune_ratio_bias_clip", 1.50)),
+                0.0,
+            )
+            if prune_ratio_bias_clip > 0.0:
+                prune_ratio_bias = prune_ratio_bias.clamp(
+                    -prune_ratio_bias_clip,
+                    prune_ratio_bias_clip,
+                )
+
+            drop_prob = torch.sigmoid(self._safe_logit(drop_prob) + prune_ratio_bias)
+
         drop_prob_direct = drop_prob
         drop_random_mix = min(
             max(self._annealed_value("repair_drop_random_mix_start", "repair_drop_random_mix_end"), 0.0),
@@ -1453,11 +1543,46 @@ class StructureRepairActuator(nn.Module):
             neginf=0.0,
         )
 
-        # Hard比較・guard・STE用には0〜1に収めた値を使う。
-        # soft_drop_prob本体は予算正規化で1を超える場合があるため、
-        # Hardの0/1削除と比較する主指標には使わない。
-        # clamp後でも、1未満の範囲ではdrop_head / drop_amount_headへ勾配は流れる。
-        soft_drop_prob_for_guard = soft_drop_prob.clamp(0.0, 1.0)
+        soft_drop_prob_clamped = soft_drop_prob.clamp(0.0, 1.0)
+
+        saturated_grad_eps = max(
+            float(getattr(self.args, "repair_drop_where_saturated_grad_eps", 0.05)),
+            0.0,
+        )
+        saturated_grad_eps = min(saturated_grad_eps, 0.20)
+
+        # ============================================================
+        # Prune guard用のsoft値
+        # ============================================================
+        # forward値は0〜1にclampした値を使う。
+        # backwardではsoft_drop_prob側へ微小勾配を残す。
+        # ============================================================
+        soft_drop_prob_for_guard = (
+            soft_drop_prob_clamped
+            + saturated_grad_eps * (soft_drop_prob - soft_drop_prob.detach())
+        )
+
+        # ============================================================
+        # Prune Where用のSTE勾配経路
+        # ============================================================
+        # soft_drop_prob_for_guard はforward安全性のため0〜1へclampした値を使う。
+        # ただしclamp飽和時にdrop_head勾配が消えないよう、
+        # backwardだけ drop_prob_proxy 側へ戻す。
+        # ============================================================
+        prune_where_ste_grad_scale = max(
+            float(getattr(self.args, "repair_prune_where_ste_grad_scale", 1.0)),
+            0.0,
+        )
+
+        soft_drop_where_grad_base = (
+            drop_prob_proxy * delete_candidate_weight
+        ).clamp(0.0, 1.0)
+
+        soft_drop_prob_for_ste = (
+            soft_drop_prob_for_guard.detach()
+            + prune_where_ste_grad_scale
+            * (soft_drop_where_grad_base - soft_drop_where_grad_base.detach())
+        )
         hard_drop_mask = self._hard_voxel_drop_mask(
             voxel_coords,
             drop_prob,
@@ -1473,7 +1598,7 @@ class StructureRepairActuator(nn.Module):
         # forwardではVoxel単位のhard_drop、backwardではsoft_drop_probを使う。
         # これにより drop_head には「どこを削除するか」、
         # drop_amount_head には「どのくらい削除するか」の勾配が戻る。
-        drop_prob_st = hard_drop - soft_drop_prob_for_guard.detach() + soft_drop_prob_for_guard
+        drop_prob_st = hard_drop - soft_drop_prob_for_ste.detach() + soft_drop_prob_for_ste
 
         keep_prob = (1.0 - drop_prob_st).clamp(0.0, 1.0)
 
@@ -1545,10 +1670,15 @@ class StructureRepairActuator(nn.Module):
             if selection_mask is not None:
                 source_prior = source_prior * selection_mask.to(device=pts_xyz.device, dtype=pts_xyz.dtype)
             move_score = torch.maximum(move_score, source_prior * (1.0 - hard_drop))
-        target_move_ratio = max(float(getattr(self.args, "target_move_ratio", target_ratio)), 0.0) if disp_enabled else 0.0
-        raw_max_move_ratio = max(float(getattr(self.args, "max_move_ratio", target_move_ratio)), target_move_ratio) if disp_enabled else 0.0
+        # targetなしAmount学習では、Moveの実行量をtarget_move_ratioへ寄せない。
+        # max_move_ratioだけを0〜30%の探索上限として使う。
+        target_move_ratio = 0.0
+        raw_max_move_ratio = min(
+            max(float(getattr(self.args, "max_move_ratio", 0.30)), 0.0),
+            0.30,
+        ) if disp_enabled else 0.0
         move_warmup = self._repair_move_warmup()
-        max_move_ratio = max(target_move_ratio, raw_max_move_ratio * move_warmup) if disp_enabled else 0.0
+        max_move_ratio = raw_max_move_ratio * move_warmup if disp_enabled else 0.0
         # Adjustする割合を特徴から学習し、固定target_ratioだけに依存しないsource数にする。
         learned_move_ratio = self._learned_operation_ratio(
             actuator_features,
@@ -2405,14 +2535,11 @@ class StructureRepairActuator(nn.Module):
                 # 実際に追加したtarget voxel数を使う。
                 add_ratio_hard = add_target_hard_add.detach().sum() / max(float(B * N), 1.0)
 
-                # 既存の add_ratio は損失用としてSoft側に寄せる。
-                add_ratio = add_ratio_soft
-                target_add_ratio = pts_xyz.new_tensor(self._target_add_ratio_value() if add_enabled else 0.0)
-                if threshold_cap_mode:
-                    max_add_ratio_t = pts_xyz.new_tensor(self._max_add_ratio())
-                    add_ratio_loss = torch.relu(add_ratio - max_add_ratio_t).pow(2)
-                else:
-                    add_ratio_loss = (add_ratio - target_add_ratio).pow(2)
+                # targetなしAmount学習では、Add実行量をtargetへ寄せない。
+                # 上限を超えた場合だけ罰する。
+                max_add_ratio_t = pts_xyz.new_tensor(float(max_add_ratio_value))
+                add_ratio_loss = torch.relu(add_ratio - max_add_ratio_t).pow(2)
+
                 # add_amount_head 専用の量一致損失。
                 # Hard実行量は教師値としてdetachし、learned_add_ratio側だけに勾配を流す。
                 add_amount_supervision_loss = (
@@ -2538,10 +2665,13 @@ class StructureRepairActuator(nn.Module):
         moved_delta_mean = (delta_norm * hard_move).sum() / moved_points
 
         repair_gate_mean = self._masked_mean(repair_gate, selection_mask)
-        if threshold_cap_mode:
-            ratio_loss = torch.relu(repair_gate_mean - gate_cap_ratio) ** 2
-        else:
-            ratio_loss = (repair_gate_mean - target_ratio) ** 2
+
+        # targetなしAmount学習では、repair対象率もtargetへ寄せない。
+        # max_repair_ratioを超えた場合だけ罰する。
+        ratio_loss = torch.relu(
+            repair_gate_mean - repair_gate_mean.new_tensor(float(max_repair_ratio))
+        ).pow(2)
+
         shape_guard = self._masked_mean(repair_gate * shape_score, selection_mask)
         drop_ratio = drop_ratio_soft
         if threshold_cap_mode or bool(getattr(self.args, "repair_learn_operation_amounts", True)):
@@ -2553,7 +2683,12 @@ class StructureRepairActuator(nn.Module):
         # shape guardは0〜1に収めたSoft削除強度で計算する。
         # STE本体のsoft_drop_probは量勾配用、guardは過大値を避けるためsoft_drop_prob_for_guardを使う。
         drop_shape_guard = self._masked_mean(soft_drop_prob_for_guard * shape_score, selection_mask)
-        prune_drop_signal = (0.25 * drop_prob_direct + 0.75 * drop_prob_proxy).clamp(0.0, 1.0)
+        # Prune Where勾配をdrop_headへ戻すため、Prune soft proxyはdrop_prob_proxyを主に使う。
+        # target量ではなく、どの点を削るとrate/structureが変わるかを学習させる。
+        prune_drop_signal = (
+            0.10 * soft_drop_prob_for_guard.detach()
+            + 0.90 * drop_prob_proxy
+        ).clamp(0.0, 1.0)
         prune_keep_signal = (1.0 - prune_drop_signal).clamp(0.0, 1.0)
         leaf_delete_gain = (
             voxel_point_counts <= float(max(delete_max_points, 1))
@@ -2603,118 +2738,98 @@ class StructureRepairActuator(nn.Module):
             selection_mask,
         )
         # ============================================================
-        # amount head へ確実に勾配を返すための直接量損失
-        # Hard/Soft操作量がdetachや正規化で勾配を失っても、
-        # learned_*_ratio 自体を目標操作量へ近づける経路を残す。
+        # targetなしAmount学習
         # ============================================================
-        drop_amount_target = learned_drop_ratio.new_tensor(
-            float(getattr(self.args, "target_drop_ratio", 0.01)) if prune_enabled else 0.0
-        ).clamp(0.0, float(max_drop_ratio))
-
-        move_amount_target = learned_move_ratio.new_tensor(
-            float(getattr(self.args, "target_move_ratio", getattr(self.args, "target_repair_ratio", getattr(self.args, "target_disp_ratio", 0.20)))) if disp_enabled else 0.0
-        ).clamp(0.0, float(max_move_ratio))
-
-        add_amount_target = learned_add_ratio.new_tensor(
-            float(self._target_add_ratio_value()) if add_enabled else 0.0
-        ).clamp(0.0, float(max_add_ratio_value))
-
+        # Amount headを固定targetへ寄せると、L_comではなくtarget方向へ学習が進む。
+        # そのため、repair_amount_target_mode='none' では
+        # direct/logit target損失を0にする。
+        #
+        # Amountの学習は以下で行う。
+        #   1. L_comから実操作へ戻る下流勾配
+        #   2. Soft/Hard実行量と learned_*_ratio の整合性
+        #   3. 上限cap超過ペナルティ
         # ============================================================
-        # amount head raw logit への直接補助損失
-        # ratio経由の損失は sigmoid 飽和時に amount_head 勾配が0になり得る。
-        # そのため、既存のSoft/Hard/STE経路は維持したまま、
-        # raw logitを目標ratioのlogitへ寄せる補助経路を追加する。
-        # ============================================================
-        drop_amount_logit = self._operation_amount_logit(
-            actuator_features,
-            self.drop_amount_head,
-        ).mean()
+        amount_target_mode = str(
+            getattr(self.args, "repair_amount_target_mode", "none")
+        ).strip().lower()
 
-        add_amount_logit = self._operation_amount_logit(
-            actuator_features,
-            self.add_amount_head,
-        ).mean()
+        if amount_target_mode == "target":
+            drop_amount_target = learned_drop_ratio.new_tensor(
+                float(getattr(self.args, "target_drop_ratio", 0.0)) if prune_enabled else 0.0
+            ).clamp(0.0, float(max_drop_ratio))
 
-        move_amount_logit = self._operation_amount_logit(
-            actuator_features,
-            self.move_amount_head,
-        ).mean()
+            move_amount_target = learned_move_ratio.new_tensor(
+                float(getattr(self.args, "target_move_ratio", 0.0)) if disp_enabled else 0.0
+            ).clamp(0.0, float(max_move_ratio))
 
-        drop_amount_target_logit = self._target_ratio_logit(
-            drop_amount_target.detach(),
-            max_drop_ratio,
-            learned_drop_ratio,
-        )
+            add_amount_target = learned_add_ratio.new_tensor(
+                float(getattr(self.args, "target_add_ratio", 0.0)) if add_enabled else 0.0
+            ).clamp(0.0, float(max_add_ratio_value))
 
-        add_amount_target_logit = self._target_ratio_logit(
-            add_amount_target.detach(),
-            max_add_ratio_value,
-            learned_add_ratio,
-        )
+            drop_amount_logit = self._operation_amount_logit(
+                actuator_features,
+                self.drop_amount_head,
+            ).mean()
 
-        move_amount_target_logit = self._target_ratio_logit(
-            move_amount_target.detach(),
-            max_move_ratio,
-            learned_move_ratio,
-        )
+            add_amount_logit = self._operation_amount_logit(
+                actuator_features,
+                self.add_amount_head,
+            ).mean()
 
-        operation_amount_logit_loss = (
-            (drop_amount_logit - drop_amount_target_logit.detach()).pow(2)
-            + (add_amount_logit - add_amount_target_logit.detach()).pow(2)
-            + (move_amount_logit - move_amount_target_logit.detach()).pow(2)
-        )
+            move_amount_logit = self._operation_amount_logit(
+                actuator_features,
+                self.move_amount_head,
+            ).mean()
 
-        operation_amount_direct_loss = (
-            (learned_drop_ratio.mean() - drop_amount_target).pow(2)
-            + (learned_move_ratio.mean() - move_amount_target).pow(2)
-            + (learned_add_ratio.mean() - add_amount_target).pow(2)
-        )
-        # if not hasattr(self, "_printed_amount_debug"):
-        #     print(
-        #         "[AmountDebug]",
-        #         "learn_amounts=", bool(getattr(self.args, "repair_learn_operation_amounts", True)),
-        #         "drop_req=", bool(learned_drop_ratio.requires_grad),
-        #         "move_req=", bool(learned_move_ratio.requires_grad),
-        #         "add_req=", bool(learned_add_ratio.requires_grad),
-        #         "direct_loss_req=", bool(operation_amount_direct_loss.requires_grad),
-        #         "direct_loss=", float(operation_amount_direct_loss.detach().cpu()),
-        #     )
-        #     self._printed_amount_debug = True
-        # if not hasattr(self, "_printed_amount_grad_debug"):
-        #     amount_params = [
-        #         self.drop_amount_head.weight,
-        #         self.drop_amount_head.bias,
-        #         self.add_amount_head.weight,
-        #         self.add_amount_head.bias,
-        #         self.move_amount_head.weight,
-        #         self.move_amount_head.bias,
-        #     ]
+            drop_amount_target_logit = self._target_ratio_logit(
+                drop_amount_target.detach(),
+                max_drop_ratio,
+                learned_drop_ratio,
+            )
 
-        #     amount_grads = torch.autograd.grad(
-        #         operation_amount_direct_loss,
-        #         amount_params,
-        #         retain_graph=True,
-        #         create_graph=False,
-        #         allow_unused=True,
-        #     )
+            add_amount_target_logit = self._target_ratio_logit(
+                add_amount_target.detach(),
+                max_add_ratio_value,
+                learned_add_ratio,
+            )
 
-        #     def _grad_norm(g):
-        #         if g is None:
-        #             return None
-        #         return float(g.detach().float().norm().cpu())
+            move_amount_target_logit = self._target_ratio_logit(
+                move_amount_target.detach(),
+                max_move_ratio,
+                learned_move_ratio,
+            )
 
-        #     print(
-        #         "[AmountGradDebug:direct_loss]",
-        #         "drop_w=", _grad_norm(amount_grads[0]),
-        #         "drop_b=", _grad_norm(amount_grads[1]),
-        #         "add_w=", _grad_norm(amount_grads[2]),
-        #         "add_b=", _grad_norm(amount_grads[3]),
-        #         "move_w=", _grad_norm(amount_grads[4]),
-        #         "move_b=", _grad_norm(amount_grads[5]),
-        #     )
+            operation_amount_logit_loss = (
+                (drop_amount_logit - drop_amount_target_logit.detach()).pow(2)
+                + (add_amount_logit - add_amount_target_logit.detach()).pow(2)
+                + (move_amount_logit - move_amount_target_logit.detach()).pow(2)
+            )
 
-        #     self._printed_amount_grad_debug = True
-        # 各操作量headが実際のsoft操作率を追えるようにし、量headにも安定した勾配を渡す。
+            operation_amount_direct_loss = (
+                (learned_drop_ratio.mean() - drop_amount_target).pow(2)
+                + (learned_move_ratio.mean() - move_amount_target).pow(2)
+                + (learned_add_ratio.mean() - add_amount_target).pow(2)
+            )
+        else:
+            # targetなしAmount学習では、固定targetへ寄せる損失は使わない。
+            # ただし後段のdebug_tensors / returnで参照されるため、
+            # target系Tensorは0として必ず定義しておく。
+            drop_amount_target = learned_drop_ratio.new_zeros(())
+            move_amount_target = learned_move_ratio.new_zeros(())
+            add_amount_target = learned_add_ratio.new_zeros(())
+
+            drop_amount_target_logit = learned_drop_ratio.new_zeros(())
+            move_amount_target_logit = learned_move_ratio.new_zeros(())
+            add_amount_target_logit = learned_add_ratio.new_zeros(())
+
+            drop_amount_logit = learned_drop_ratio.new_zeros(())
+            move_amount_logit = learned_move_ratio.new_zeros(())
+            add_amount_logit = learned_add_ratio.new_zeros(())
+
+            operation_amount_logit_loss = learned_drop_ratio.new_zeros(())
+            operation_amount_direct_loss = learned_drop_ratio.new_zeros(())
+
+
         operation_amount_consistency_loss = (
             (drop_ratio - learned_drop_ratio.mean()).pow(2)
             + (move_ratio_soft - learned_move_ratio.mean()).pow(2)
