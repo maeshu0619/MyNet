@@ -29,6 +29,31 @@ def add_checkpoint_metric(metric_sums, key, value):
     metric_sums["counts"][key] = int(metric_sums["counts"].get(key, 0)) + 1
 
 
+def _is_sparsepcgc_backend(args):
+    compress_key = str(getattr(args, "compress", "")).strip().lower().replace("-", "").replace("_", "")
+    backend = str(getattr(args, "compression_loss_backend", "")).strip().lower()
+    return compress_key == "sparsepcgc" or backend.startswith("sparsepcgc_")
+
+
+def resolve_checkpoint_actual_metric(args, metrics):
+    source = str(getattr(args, "checkpoint_actual_source", "auto")).strip().lower()
+    if source == "auto":
+        source = "full_cloud" if _is_sparsepcgc_backend(args) else "fresh"
+    if source == "full_cloud":
+        return {
+            "source": "full_cloud",
+            "delta": finite_float_or_none(metrics.get("full_cloud_actual_delta")),
+            "count": int(metrics.get("full_cloud_actual_count") or 0),
+            "min_count": max(int(getattr(args, "checkpoint_full_cloud_min_count", 1)), 0),
+        }
+    return {
+        "source": "fresh",
+        "delta": finite_float_or_none(metrics.get("fresh_actual_delta")),
+        "count": int(metrics.get("fresh_actual_count") or 0),
+        "min_count": 1,
+    }
+
+
 def accumulate_checkpoint_metrics(metric_sums, compression_row, operation_row, step_metric_values):
     explicit_values = {
         "total_loss": step_metric_values[0],
@@ -75,6 +100,13 @@ def accumulate_checkpoint_metrics(metric_sums, compression_row, operation_row, s
     }
     for key, value in explicit_values.items():
         add_checkpoint_metric(metric_sums, key, value)
+
+    if bool(compression_row.get("full_cloud_teacher_used", False)):
+        full_cloud_value = finite_float_or_none(compression_row.get("full_cloud_actual_percent"))
+        if full_cloud_value is not None:
+            add_checkpoint_metric(metric_sums, "full_cloud_actual_percent", full_cloud_value)
+            if bool(compression_row.get("fresh_actual", False)):
+                add_checkpoint_metric(metric_sums, "full_cloud_actual_percent_fresh", full_cloud_value)
 
     actual_value = finite_float_or_none(compression_row.get("actual_total_bit_percent_fresh"))
     if actual_value is not None:
@@ -143,6 +175,16 @@ def finalize_checkpoint_metrics(args, stage, episode, plot, metric_sums, gate_re
         "fresh_actual_count": int(metric_sums["counts"].get("actual_total_bit_percent_fresh", 0)),
         "cached_actual_delta": checkpoint_average(metric_sums, "actual_total_bit_percent_cached"),
         "cached_actual_count": int(metric_sums["counts"].get("actual_total_bit_percent_cached", 0)),
+        "full_cloud_actual_delta": (
+            checkpoint_average(metric_sums, "full_cloud_actual_percent_fresh")
+            if int(metric_sums["counts"].get("full_cloud_actual_percent_fresh", 0)) > 0
+            else checkpoint_average(metric_sums, "full_cloud_actual_percent")
+        ),
+        "full_cloud_actual_count": (
+            int(metric_sums["counts"].get("full_cloud_actual_percent_fresh", 0))
+            if int(metric_sums["counts"].get("full_cloud_actual_percent_fresh", 0)) > 0
+            else int(metric_sums["counts"].get("full_cloud_actual_percent", 0))
+        ),
         "surrogate_pred_bit_percent": checkpoint_average(metric_sums, "surrogate_pred_bit_percent"),
         "surrogate_abs_bit_error": checkpoint_average(metric_sums, "surrogate_abs_bit_error"),
         "proxy_delta_percent": checkpoint_average(metric_sums, "proxy_delta_percent"),
@@ -225,6 +267,20 @@ def finalize_checkpoint_metrics(args, stage, episode, plot, metric_sums, gate_re
             "operation_ok": bool(operation_ok),
             "geom_reference": geom_ref,
             "repair_reference": repair_ref,
+        }
+    )
+    actual_metric = resolve_checkpoint_actual_metric(args, metrics)
+    actual_ok = (
+        actual_metric["delta"] is not None
+        and int(actual_metric["count"]) >= int(actual_metric["min_count"])
+    )
+    metrics.update(
+        {
+            "checkpoint_actual_delta": actual_metric["delta"],
+            "checkpoint_actual_count": int(actual_metric["count"]),
+            "checkpoint_actual_source": actual_metric["source"],
+            "checkpoint_eligible": bool(actual_ok),
+            "checkpoint_ineligible_reason": "" if actual_ok else "insufficient_checkpoint_actual",
         }
     )
     return metrics

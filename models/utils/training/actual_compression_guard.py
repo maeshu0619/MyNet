@@ -25,6 +25,21 @@ def _is_actual_backend(args):
     return backend.endswith("_surrogate") or "_actual" in backend
 
 
+def _selected_actual_metric(checkpoint_metrics):
+    metrics = checkpoint_metrics or {}
+    source = str(metrics.get("checkpoint_actual_source") or "fresh").strip().lower() or "fresh"
+    delta = _finite_float(metrics.get("checkpoint_actual_delta"), None)
+    count = int(metrics.get("checkpoint_actual_count") or 0)
+    if delta is None and source == "full_cloud":
+        delta = _finite_float(metrics.get("full_cloud_actual_delta"), None)
+        count = int(metrics.get("full_cloud_actual_count") or 0)
+    if delta is None:
+        source = "fresh"
+        delta = _finite_float(metrics.get("fresh_actual_delta"), None)
+        count = int(metrics.get("fresh_actual_count") or 0)
+    return source, delta, count
+
+
 def _extract_state_dict(payload):
     if isinstance(payload, dict):
         for key in ("state_dict", "model_state_dict", "model", "net"):
@@ -116,13 +131,29 @@ def apply_actual_compression_guard(
         return None
     if not _is_actual_backend(args):
         return None
-    fresh_count = int(checkpoint_metrics.get("fresh_actual_count") or 0)
-    min_fresh = max(int(getattr(args, "actual_guard_min_fresh", 1)), 1)
-    if fresh_count < min_fresh:
+    if not bool(checkpoint_metrics.get("checkpoint_eligible", True)):
+        reason = str(checkpoint_metrics.get("checkpoint_ineligible_reason") or "checkpoint_ineligible")
+        if writer is not None and hasattr(writer, "write"):
+            writer.write(
+                "ActualCompressionGuard: skipped "
+                f"episode={episode + 1}, reason={reason}"
+            )
+        return {
+            "action": "skipped",
+            "reason": reason,
+            "checkpoint_eligible": False,
+        }
+
+    actual_source, actual_delta, actual_count = _selected_actual_metric(checkpoint_metrics)
+    min_count = (
+        max(int(getattr(args, "checkpoint_full_cloud_min_count", 1)), 0)
+        if actual_source == "full_cloud"
+        else max(int(getattr(args, "actual_guard_min_fresh", 1)), 1)
+    )
+    if actual_count < min_count:
         return None
 
-    fresh_delta = _finite_float(checkpoint_metrics.get("fresh_actual_delta"), None)
-    if fresh_delta is None:
+    if actual_delta is None:
         return None
 
     guard_state.setdefault("best_delta", float("inf"))
@@ -131,31 +162,36 @@ def apply_actual_compression_guard(
 
     episode_path = os.path.join(ckpt_dir, f"{episode}.pth")
     eps = max(float(getattr(args, "actual_guard_improvement_epsilon", 1e-6)), 0.0)
-    if fresh_delta < float(guard_state["best_delta"]) - eps:
-        guard_state["best_delta"] = fresh_delta
+    if actual_delta < float(guard_state["best_delta"]) - eps:
+        guard_state["best_delta"] = actual_delta
         guard_state["best_path"] = episode_path
         guard_state["bad_count"] = 0
         message = (
             "ActualCompressionGuard: new_best "
-            f"episode={episode + 1}, fresh_actual_delta={fresh_delta:.6f}, path={episode_path}"
+            f"episode={episode + 1}, actual_source={actual_source}, "
+            f"actual_delta={actual_delta:.6f}, path={episode_path}"
         )
         if writer is not None and hasattr(writer, "write"):
             writer.write(message)
         return {
             "action": "new_best",
-            "fresh_actual_delta": fresh_delta,
-            "best_delta": fresh_delta,
+            "fresh_actual_delta": actual_delta,
+            "actual_delta": actual_delta,
+            "actual_source": actual_source,
+            "best_delta": actual_delta,
             "best_path": episode_path,
             "bad_count": 0,
         }
 
     tolerance = max(float(getattr(args, "actual_guard_tolerance", 0.25)), 0.0)
     best_delta = float(guard_state["best_delta"])
-    if fresh_delta <= best_delta + tolerance:
+    if actual_delta <= best_delta + tolerance:
         guard_state["bad_count"] = 0
         return {
             "action": "within_tolerance",
-            "fresh_actual_delta": fresh_delta,
+            "fresh_actual_delta": actual_delta,
+            "actual_delta": actual_delta,
+            "actual_source": actual_source,
             "best_delta": best_delta,
             "bad_count": 0,
         }
@@ -164,7 +200,9 @@ def apply_actual_compression_guard(
     patience = max(int(getattr(args, "actual_guard_patience", 2)), 1)
     event = {
         "action": "worse",
-        "fresh_actual_delta": fresh_delta,
+        "fresh_actual_delta": actual_delta,
+        "actual_delta": actual_delta,
+        "actual_source": actual_source,
         "best_delta": best_delta,
         "bad_count": int(guard_state["bad_count"]),
         "patience": patience,
@@ -173,7 +211,7 @@ def apply_actual_compression_guard(
         if writer is not None and hasattr(writer, "write"):
             writer.write(
                 "ActualCompressionGuard: worse "
-                f"episode={episode + 1}, fresh_actual_delta={fresh_delta:.6f}, "
+                f"episode={episode + 1}, actual_source={actual_source}, actual_delta={actual_delta:.6f}, "
                 f"best={best_delta:.6f}, bad_count={guard_state['bad_count']}/{patience}"
             )
         return event
@@ -237,13 +275,15 @@ def apply_actual_compression_guard(
             "new_lrs": new_lrs,
             "surrogate_lrs": surrogate_floor_event.get("lr_after_floor", []),
             "surrogate_lr_floor_applied": bool(surrogate_floor_event.get("lr_floor_applied", False)),
-            "actual_total_bit_percent_fresh": fresh_delta,
+            "actual_total_bit_percent_fresh": actual_delta,
+            "checkpoint_actual_delta": actual_delta,
+            "checkpoint_actual_source": actual_source,
         }
     )
     if writer is not None and hasattr(writer, "write"):
         writer.write(
             "ActualCompressionGuard: "
-            f"{event['action']} episode={episode + 1}, fresh_actual_delta={fresh_delta:.6f}, "
+            f"{event['action']} episode={episode + 1}, actual_source={actual_source}, actual_delta={actual_delta:.6f}, "
             f"best={best_delta:.6f}, restored={restored}, surrogate_restored={surrogate_restored}, "
             f"guard_lr_changed={event['guard_lr_changed']}, new_lrs={new_lrs}"
         )

@@ -6,8 +6,8 @@ from cfgs.utils import str2bool
 
 # sparsepcgc_move_existing_target_only
 
-pretrained_date = "20260524" 
-pretrained_time = "230456"
+pretrained_date = "20260601" 
+pretrained_time = "150718"
 
 surrogate_date = "20260524"
 surrogate_time = "230456"
@@ -843,6 +843,9 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--actual_guard_min_fresh', default=1, type=int, help='actual guardを判定する最低fresh actual計測数')
     parser.add_argument('--actual_guard_restore_best', default=True, type=str2bool, help='actual guard発動時にbest episode checkpointへ戻す')
     parser.add_argument('--actual_guard_improvement_epsilon', default=1e-6, type=float, help='actual guardのbest更新に必要な最小改善幅')
+    parser.add_argument('--checkpoint_actual_source', default='auto', type=str, help='actual checkpoint/guardの主指標(auto/fresh/full_cloud)')
+    parser.add_argument('--checkpoint_full_cloud_min_count', default=1, type=int, help='full_cloud actualをcheckpoint主指標に使う最低件数')
+    parser.add_argument('--checkpoint_min_optimizer_step_ratio', default=0.20, type=float, help='この割合未満しかoptimizer更新できないepisodeはbest/guard対象外')
     parser.add_argument('--max_train_steps', default=0, type=int, help='デバッグ用: 0より大きい場合、そのglobal step数でtrain loopを早期終了する')
     parser.add_argument('--save_good_bad_cases', default=False, type=str2bool, help='actual deltaが大きく改善/悪化したstepのdebug summaryをCSV保存する')
     parser.add_argument('--save_proxy_actual_bad_cases', default=True, type=str2bool, help='proxy/cause scoreとactual bitの符号が逆のcaseをCSV保存する')
@@ -932,6 +935,8 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--train_subtree_min_points', default=5, type=int, help='train時に優先的に選ぶsubtreeの最小点数（満たす候補が無ければフォールバック）')
     parser.add_argument('--train_patch_subset_patches_per_step', default=1, type=int, help='1 stepで処理するsubtree数')
     parser.add_argument('--train_patch_subset_anchor_interval', default=32, type=int, help='subtree subset学習時に何stepごとにfull-cloud anchor学習を挟むか(0なら間隔指定なし)')
+    parser.add_argument('--train_full_cloud_actual_interval', default=0, type=int, help='subtree学習中にfull-cloud actual圧縮損失で学習する間隔。0で無効')
+    parser.add_argument('--train_full_cloud_val_frames', default=5, type=int, help='episode末にfull-cloud actual validationへ使う最大フレーム数。0で無効')
     parser.add_argument('--train_subtree_full_cloud_prob', default=0.03, type=float, help='subtree subset学習時に確率的にfull-cloud anchorへ切り替える確率')
     parser.add_argument('--train_patch_subset_sampling', default='coverage_cycle', type=str, help='subtree subset学習の選択方法(coverage_cycle)')
     parser.add_argument('--train_patch_subset_log', default=True, type=str2bool, help='subtree subset学習の選択状況をログ出力するか')
@@ -1612,6 +1617,19 @@ def parse_pugan_args(parser, file_day, file_time):
     args.actual_guard_min_fresh = max(int(getattr(args, "actual_guard_min_fresh", 1)), 1)
     args.actual_guard_restore_best = bool(getattr(args, "actual_guard_restore_best", True))
     args.actual_guard_improvement_epsilon = max(float(getattr(args, "actual_guard_improvement_epsilon", 1e-6)), 0.0)
+    args.checkpoint_actual_source = str(
+        getattr(args, "checkpoint_actual_source", "auto")
+    ).strip().lower()
+    if args.checkpoint_actual_source not in {"auto", "fresh", "full_cloud"}:
+        raise ValueError("--checkpoint_actual_source must be one of: auto, fresh, full_cloud")
+    args.checkpoint_full_cloud_min_count = max(
+        int(getattr(args, "checkpoint_full_cloud_min_count", 1)),
+        0,
+    )
+    args.checkpoint_min_optimizer_step_ratio = min(
+        max(float(getattr(args, "checkpoint_min_optimizer_step_ratio", 0.20)), 0.0),
+        1.0,
+    )
     args.max_train_steps = max(int(getattr(args, "max_train_steps", 0)), 0)
     args.save_good_bad_cases = bool(getattr(args, "save_good_bad_cases", False))
     args.save_proxy_actual_bad_cases = bool(getattr(args, "save_proxy_actual_bad_cases", True))
@@ -1691,6 +1709,13 @@ def parse_pugan_args(parser, file_day, file_time):
     args.compression_octree_stat_force = bool(getattr(args, "compression_octree_stat_force", True))
     sparsepcgc_backend = compress_key == "sparsepcgc" or args.compression_loss_backend.startswith("sparsepcgc_")
     if sparsepcgc_backend:
+        if not _cli_option_was_provided("--use_amp"):
+            # SparsePCGC actual/surrogate訓練はbit教師と点操作が大きく揺れるため、既定はfp32で安定性を優先する。
+            args.use_amp = False
+        if not _cli_option_was_provided("--checkpoint_actual_source"):
+            args.checkpoint_actual_source = "full_cloud"
+        if not _cli_option_was_provided("--train_full_cloud_actual_interval"):
+            args.train_full_cloud_actual_interval = 64
         if not _cli_option_was_provided("--surrogate_step"):
             args.surrogate_step = max(int(getattr(args, "surrogate_step", 0)), 0)
         if args.compression_loss_backend.endswith("_surrogate") and not _cli_option_was_provided("--disable_actual_codec_during_train"):
@@ -1814,7 +1839,7 @@ def parse_pugan_args(parser, file_day, file_time):
         if not _cli_option_was_provided("--repair_soft_normalizer_floor"):
             args.repair_soft_normalizer_floor = max(float(getattr(args, "repair_soft_normalizer_floor", 1e-4)), 1e-4)
         if not _cli_option_was_provided("--train_grad_clip"):
-            args.train_grad_clip = 100.0
+            args.train_grad_clip = 10.0
         if not _cli_option_was_provided("--repair_operation_amount_consistency_weight"):
             args.repair_operation_amount_consistency_weight = min(
                 max(float(getattr(args, "repair_operation_amount_consistency_weight", 0.01)), 0.0),
@@ -2021,6 +2046,10 @@ def parse_pugan_args(parser, file_day, file_time):
     args.train_patch_subset_anchor_interval = int(getattr(args, "train_patch_subset_anchor_interval", 0))
     if args.train_patch_subset_anchor_interval < 0:
         raise ValueError("--train_patch_subset_anchor_interval must be >= 0")
+    args.train_full_cloud_actual_interval = int(getattr(args, "train_full_cloud_actual_interval", 0))
+    if args.train_full_cloud_actual_interval < 0:
+        raise ValueError("--train_full_cloud_actual_interval must be >= 0")
+    args.train_full_cloud_val_frames = max(int(getattr(args, "train_full_cloud_val_frames", 5)), 0)
     args.train_subtree_full_cloud_prob = float(getattr(args, "train_subtree_full_cloud_prob", 0.0))
     if not 0.0 <= args.train_subtree_full_cloud_prob <= 1.0:
         raise ValueError("--train_subtree_full_cloud_prob must be in [0, 1]")

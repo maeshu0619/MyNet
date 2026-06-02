@@ -559,6 +559,140 @@ def _collect_train_voxel_collision_stats(args, writer, global_step, stage_tensor
                 writer.write(f"VoxelCollisionSampling[{stage}]: {note}")
     return flat
 
+
+def run_episode_full_cloud_validation(
+    *,
+    model,
+    args,
+    loss,
+    writer,
+    seq_datasets,
+    episode,
+    global_step,
+    use_cuda,
+    use_amp,
+    amp_dtype,
+):
+    max_frames = max(int(getattr(args, "train_full_cloud_val_frames", 5)), 0)
+    if max_frames <= 0:
+        return {"value": None, "count": 0, "sample_names": []}
+    source = str(getattr(args, "checkpoint_actual_source", "auto")).strip().lower()
+    compress_key = str(getattr(args, "compress", "")).strip().lower().replace("-", "").replace("_", "")
+    backend = str(getattr(args, "compression_loss_backend", "")).strip().lower()
+    sparsepcgc_backend = compress_key == "sparsepcgc" or backend.startswith("sparsepcgc_")
+    if source not in {"auto", "full_cloud"} or not sparsepcgc_backend:
+        return {"value": None, "count": 0, "sample_names": []}
+
+    values = []
+    sample_names = []
+    was_training = bool(model.training)
+    old_replay_max = getattr(loss, "surrogate_replay_max_entries", None)
+    saved_args = {
+        name: getattr(args, name, None)
+        for name in (
+            "_current_teacher_scope",
+            "_current_teacher_anchor_reason",
+            "_current_exact_teacher_mode",
+            "_current_exact_teacher_uses_full_context",
+            "_current_exact_teacher_fallback_reason",
+            "_current_sample_name",
+            "_current_subtree_id",
+            "_log_this_step",
+            "_collect_structure_debug",
+            "_collect_sparsepcgc_debug",
+        )
+    }
+    model.eval()
+    if old_replay_max is not None:
+        loss.surrogate_replay_max_entries = 0
+    try:
+        for _, dataset in seq_datasets:
+            if len(values) >= max_frames:
+                break
+            for idx in range(len(dataset)):
+                if len(values) >= max_frames:
+                    break
+                file_path = dataset.files[idx]
+                pts = dataset[idx]
+                cache_key = f"{make_step_cache_key(file_path, args)}|episode_full_cloud_validation"
+                args._global_train_step = int(global_step)
+                args._current_sample_name = os.path.basename(str(file_path))
+                args._current_teacher_scope = "full_cloud"
+                args._current_teacher_anchor_reason = "episode_full_cloud_validation"
+                args._current_exact_teacher_mode = "full_cloud"
+                args._current_exact_teacher_uses_full_context = False
+                args._current_exact_teacher_fallback_reason = ""
+                args._current_subtree_id = ""
+                args._log_this_step = False
+                args._collect_structure_debug = False
+                args._collect_sparsepcgc_debug = False
+                try:
+                    input_pcd = prepare_subtree_input_pcd(pts, use_cuda)
+                    input_xyz = input_pcd[:, :3, :]
+                    input_attr = input_pcd[:, 3:, :].contiguous() if input_pcd.shape[1] > 3 else None
+                    autocast_ctx = torch.cuda.amp.autocast(dtype=amp_dtype, enabled=use_amp) if use_cuda else nullcontext()
+                    with torch.no_grad(), autocast_ctx:
+                        gen_pts, _, _, _, final_w, _, _, _, out_label = model.forward(
+                            input_xyz,
+                            input_attr,
+                            cache_key=cache_key,
+                            return_attr_output=False,
+                            subtree_ref=None,
+                            selected_subtree_keys=None,
+                            subtree_tree=None,
+                            full_octree_context=None,
+                            octree_input_mode="full_cloud",
+                        )
+                        gen_xyz = gen_pts[:, :3, :]
+                        final_w_for_loss = None if _discrete_loss_mode_value(args) == "hard" else final_w
+                        compression_gen_xyz, _ = prepare_compression_points(
+                            gen_xyz,
+                            args,
+                            model,
+                            collect_stats=False,
+                        )
+                        loss.get_compression_loss(
+                            args,
+                            gen_xyz=compression_gen_xyz,
+                            gt_xyz=input_xyz[:, :3, :],
+                            final_w=final_w_for_loss,
+                            cache_key=cache_key,
+                            refresh_actual_gen="always",
+                            actual_gen_xyz=gen_xyz,
+                            subtree_tree=None,
+                            full_octree_context=None,
+                            octree_input_mode="full_cloud",
+                        )
+                    comp_debug = dict(getattr(loss, "last_compression_debug", {}) or {})
+                    value = finite_float_or_none(
+                        comp_debug.get("full_cloud_actual_percent", comp_debug.get("actual_total_bit_percent"))
+                    )
+                    if value is not None:
+                        values.append(float(value))
+                        sample_names.append(os.path.basename(str(file_path)))
+                except Exception as exc:
+                    writer.write(
+                        "FullCloudValidationWarning: "
+                        f"episode={episode + 1}, sample={os.path.basename(str(file_path))}, "
+                        f"error={type(exc).__name__}: {str(exc)[:300]}"
+                    )
+    finally:
+        if old_replay_max is not None:
+            loss.surrogate_replay_max_entries = old_replay_max
+        for name, value in saved_args.items():
+            setattr(args, name, value)
+        if was_training:
+            model.train()
+
+    avg_value = sum(values) / float(len(values)) if values else None
+    writer.write(
+        "FullCloudValidationSummary: "
+        f"episode={episode + 1}, count={len(values)}, "
+        f"actual_percent={avg_value if avg_value is not None else 'n/a'}, "
+        f"samples={','.join(sample_names[:8]) or 'none'}"
+    )
+    return {"value": avg_value, "count": len(values), "sample_names": sample_names}
+
 def load_more_training_checkpoint(model, args, writer):
     # more_training=False の場合は、追加学習用checkpointを読まない
     if not bool(getattr(args, "more_training", False)):
@@ -704,6 +838,7 @@ def train(model, args, loss, writer, plot, notifier=None):
     scaler = amp_state["scaler"] # AMPのGradScaler。AMPでスケーリングされた勾配を逆スケーリングしてOptimizerに渡すために使う
     amp_overflow_patience = amp_state["amp_overflow_patience"] # AMPでオーバーフローが起きたときに、学習を安定させるためにOptimizerのステップをスキップする回数の設定
     consecutive_amp_skips = amp_state["consecutive_amp_skips"] # AMPでオーバーフローが起きたときにOptimizerのステップをスキップする回数のカウンタ
+    consecutive_nonfinite_grad_skips = 0
     warmup_whole_cloud_caches(model, args, loss, seq_datasets, writer, use_cuda, use_amp, amp_dtype) # 全体点群処理で使う重い前処理やCodec関連情報を先に作り、学習中の初回Stepだけ極端に遅くなるのを抑える
     loader_kwargs = build_loader_kwargs( args, model, writer, use_cuda) # DataLoaderに渡すBatchSize等の設定
 
@@ -745,6 +880,10 @@ def train(model, args, loss, writer, plot, notifier=None):
         episode_checkpoint_sums = new_checkpoint_metric_sum()
         episode_compression_sums = new_compression_episode_sum()
         episode_operation_sums = new_operation_episode_sum()
+        episode_optimizer_total_count = 0
+        episode_optimizer_step_count = 0
+        episode_nonfinite_grad_skip_count = 0
+        episode_max_consecutive_nonfinite_grad_skips = 0
 
         for epoch, (seq_dir, dataset) in enumerate(seq_datasets): # Epoch開始
             writer.write(f"⦿⦿⦿ Epoch {epoch + 1}/{num_seq} : {seq_dir} ⦿⦿⦿")
@@ -1615,12 +1754,16 @@ def train(model, args, loss, writer, plot, notifier=None):
                 total_loss_finite = bool(torch.isfinite(L.detach()).all().item()) and skip_optimizer_reason is None # LがNanなどでないか否かの判定
                 param_update_snapshots = None # 更新前パラメータの記録を見作成で初期化
                 amp_info = { "enabled": bool(amp_scaler_enabled), "found_inf": None, "scale_before": None, "scale_after": None, "consecutive_amp_skips": int(consecutive_amp_skips)} # AMPの状態を記録する辞書を作る
+                last_nonfinite_grad_summary = None
                 if total_loss_finite: # 総損失がInfでないとき、更新前パラメータを記録
                     param_update_snapshots = capture_param_update_snapshots( args, model, step + 1, num_steps)
                 if skip_optimizer_reason is not None: # Optimizer更新を止める必要があるか否かの判定
                     writer.write( f"Skip Optimizing!!! reason={skip_optimizer_reason}; " f"episode={episode + 1}, epoch={epoch + 1}, step={step + 1}/{num_steps}") # Skip理由と位置を同じ行に出す
                     writer.write( "Skipped optimizer step because actual codec teacher fell back to proxy at " f"episode={episode + 1}, epoch={epoch + 1}, step={step + 1}/{num_steps}; " "this prevents proxy-only updates from replacing real-compression imitation.")
                 elif not total_loss_finite:
+                    skip_optimizer_reason = "non_finite_total_loss"
+                    comp_debug["optimizer_skip_reason"] = skip_optimizer_reason
+                    loss.last_compression_debug = comp_debug
                     writer.write( f"Skip Optimizing!!! reason=non_finite_total_loss; " f"episode={episode + 1}, epoch={epoch + 1}, step={step + 1}/{num_steps}, L={float(L.detach().float().mean().cpu()) if torch.is_tensor(L) else float('nan'):.6g}") # 非有限Lossの理由と値を同じ行に出す
                     writer.write( f"Skipped optimizer step due to non-finite total loss at " f"episode={episode + 1}, epoch={epoch + 1}, step={step + 1}/{num_steps}.")
                 elif amp_scaler_enabled: # AMP用の逆伝播・更新処理へ進む
@@ -1635,6 +1778,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                         model,
                         limit=int(getattr(args, "nonfinite_grad_log_param_limit", 8)),
                     )
+                    last_nonfinite_grad_summary = nonfinite_grad_summary
                     if (
                         bool(getattr(args, "skip_optimizer_on_nonfinite_grad", True))
                         and bool(nonfinite_grad_summary.get("has_nonfinite", False))
@@ -1671,6 +1815,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                         if step_completed: # 成功した場合の処理
                             consecutive_amp_skips = 0
                         else:
+                            skip_optimizer_reason = "amp_found_inf_or_scale_drop"
+                            comp_debug["optimizer_skip_reason"] = skip_optimizer_reason
+                            loss.last_compression_debug = comp_debug
                             writer.write( f"Skip Optimizing!!! reason=amp_found_inf_or_scale_drop; " f"found_inf={found_inf:.6g}, scale_before={scale_before:.6g}, scale_after={scale_after:.6g}, " f"episode={episode + 1}, epoch={epoch + 1}, step={step + 1}/{num_steps}") # AMP skipの理由とscale状態を同じ行に出す
                             consecutive_amp_skips += 1 # Skipの連続回数を1回増やす
                             if consecutive_amp_skips >= amp_overflow_patience: # AMP Overflowが設定回数以上連続したかの判定
@@ -1691,6 +1838,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                         model,
                         limit=int(getattr(args, "nonfinite_grad_log_param_limit", 8)),
                     )
+                    last_nonfinite_grad_summary = nonfinite_grad_summary
                     if (
                         bool(getattr(args, "skip_optimizer_on_nonfinite_grad", True))
                         and bool(nonfinite_grad_summary.get("has_nonfinite", False))
@@ -1712,6 +1860,41 @@ def train(model, args, loss, writer, plot, notifier=None):
                         optimizer.step() # モデルパラメータの更新
                         step_completed = True # 更新フラグをTrueにする
                         consecutive_amp_skips = 0 # AMP loss scale連続Skip回数を0に戻す
+                episode_optimizer_total_count += 1
+                if step_completed:
+                    episode_optimizer_step_count += 1
+                    consecutive_nonfinite_grad_skips = 0
+                elif skip_optimizer_reason == "non_finite_grad":
+                    episode_nonfinite_grad_skip_count += 1
+                    consecutive_nonfinite_grad_skips += 1
+                    episode_max_consecutive_nonfinite_grad_skips = max(
+                        episode_max_consecutive_nonfinite_grad_skips,
+                        consecutive_nonfinite_grad_skips,
+                    )
+                optimizer_success_ratio = episode_optimizer_step_count / float(max(episode_optimizer_total_count, 1))
+                if last_nonfinite_grad_summary:
+                    comp_debug["nonfinite_grad_bad_element_count"] = int(last_nonfinite_grad_summary.get("bad_element_count", 0))
+                    comp_debug["nonfinite_grad_checked_param_count"] = int(last_nonfinite_grad_summary.get("checked_param_count", 0))
+                    comp_debug["nonfinite_grad_checked_element_count"] = int(last_nonfinite_grad_summary.get("checked_element_count", 0))
+                    if bool(last_nonfinite_grad_summary.get("has_nonfinite", False)) and "nonfinite_grad_summary" not in comp_debug:
+                        comp_debug["nonfinite_grad_summary"] = _format_nonfinite_grad_summary(last_nonfinite_grad_summary)
+                comp_debug["optimizer_step"] = bool(step_completed)
+                comp_debug["optimizer_skip_reason"] = str(skip_optimizer_reason or "")
+                comp_debug["optimizer_step_success_rate_episode"] = float(optimizer_success_ratio)
+                comp_debug["consecutive_nonfinite_grad_skips"] = int(consecutive_nonfinite_grad_skips)
+                loss.last_compression_debug = comp_debug
+                compression_metric_row.update(
+                    {
+                        "optimizer_step": bool(step_completed),
+                        "optimizer_skip_reason": str(skip_optimizer_reason or ""),
+                        "optimizer_step_success_rate_episode": float(optimizer_success_ratio),
+                        "nonfinite_grad_bad_element_count": int(comp_debug.get("nonfinite_grad_bad_element_count", 0)),
+                        "nonfinite_grad_checked_param_count": int(comp_debug.get("nonfinite_grad_checked_param_count", 0)),
+                        "nonfinite_grad_checked_element_count": int(comp_debug.get("nonfinite_grad_checked_element_count", 0)),
+                        "consecutive_nonfinite_grad_skips": int(consecutive_nonfinite_grad_skips),
+                        "nonfinite_grad_summary": str(comp_debug.get("nonfinite_grad_summary", "")),
+                    }
+                )
                 if step_completed: # Optimizer更新が成功したら差分ログを出す
                     log_param_updates( args, writer, model, param_update_snapshots, step + 1, num_steps)
                 if timing_enabled:
@@ -1829,6 +2012,70 @@ def train(model, args, loss, writer, plot, notifier=None):
         writer.write(f"Saved episode plots/csv: {plot.save_dir}")
         writer.flush()
         checkpoint_metrics = finalize_checkpoint_metrics( args, current_stage, episode, plot, episode_checkpoint_sums, checkpoint_gate_refs)
+        full_cloud_val = run_episode_full_cloud_validation(
+            model=model,
+            args=args,
+            loss=loss,
+            writer=writer,
+            seq_datasets=seq_datasets,
+            episode=episode,
+            global_step=global_train_step,
+            use_cuda=use_cuda,
+            use_amp=use_amp,
+            amp_dtype=amp_dtype,
+        )
+        checkpoint_metrics["full_cloud_val_actual_percent"] = full_cloud_val.get("value")
+        checkpoint_metrics["full_cloud_val_actual_count"] = int(full_cloud_val.get("count") or 0)
+        if (
+            str(checkpoint_metrics.get("checkpoint_actual_source", "")).strip().lower() == "full_cloud"
+            and full_cloud_val.get("value") is not None
+            and int(full_cloud_val.get("count") or 0) > 0
+        ):
+            checkpoint_metrics["full_cloud_actual_delta"] = float(full_cloud_val["value"])
+            checkpoint_metrics["full_cloud_actual_count"] = int(full_cloud_val["count"])
+            checkpoint_metrics["checkpoint_actual_delta"] = float(full_cloud_val["value"])
+            checkpoint_metrics["checkpoint_actual_count"] = int(full_cloud_val["count"])
+            checkpoint_metrics["checkpoint_eligible"] = True
+            checkpoint_metrics["checkpoint_ineligible_reason"] = ""
+        optimizer_success_ratio = episode_optimizer_step_count / float(max(episode_optimizer_total_count, 1))
+        min_optimizer_success_ratio = float(getattr(args, "checkpoint_min_optimizer_step_ratio", 0.20))
+        optimizer_success_ok = optimizer_success_ratio >= min_optimizer_success_ratio
+        nonfinite_consecutive_ok = episode_max_consecutive_nonfinite_grad_skips < 2
+        checkpoint_reasons = []
+        existing_reason = str(checkpoint_metrics.get("checkpoint_ineligible_reason") or "").strip()
+        if existing_reason:
+            checkpoint_reasons.append(existing_reason)
+        if not optimizer_success_ok:
+            checkpoint_reasons.append("optimizer_step_success_ratio_low")
+        if not nonfinite_consecutive_ok:
+            checkpoint_reasons.append("consecutive_nonfinite_grad")
+        checkpoint_metrics.update(
+            {
+                "optimizer_step_count": int(episode_optimizer_step_count),
+                "optimizer_total_step_count": int(episode_optimizer_total_count),
+                "optimizer_step_success_ratio": float(optimizer_success_ratio),
+                "optimizer_success_ok": bool(optimizer_success_ok),
+                "episode_nonfinite_grad_skip_count": int(episode_nonfinite_grad_skip_count),
+                "episode_max_consecutive_nonfinite_grad_skips": int(episode_max_consecutive_nonfinite_grad_skips),
+                "nonfinite_consecutive_ok": bool(nonfinite_consecutive_ok),
+                "checkpoint_eligible": bool(
+                    checkpoint_metrics.get("checkpoint_eligible", False)
+                    and optimizer_success_ok
+                    and nonfinite_consecutive_ok
+                ),
+                "checkpoint_ineligible_reason": ",".join(dict.fromkeys(checkpoint_reasons)),
+            }
+        )
+        writer.write(
+            "EpisodeOptimizerSummary: "
+            f"episode={episode + 1}, "
+            f"optimizer_steps={episode_optimizer_step_count}/{episode_optimizer_total_count}, "
+            f"success_ratio={optimizer_success_ratio:.6f}, "
+            f"nonfinite_grad_skips={episode_nonfinite_grad_skip_count}, "
+            f"max_consecutive_nonfinite_grad_skips={episode_max_consecutive_nonfinite_grad_skips}, "
+            f"checkpoint_eligible={checkpoint_metrics['checkpoint_eligible']}, "
+            f"reason={checkpoint_metrics.get('checkpoint_ineligible_reason') or 'none'}"
+        )
         append_csv_row( metric_csv_paths.get("checkpoint_episode"), CHECKPOINT_METRIC_COLUMNS, checkpoint_metrics)
         compression_episode_metrics = finalize_compression_episode_metrics( episode, current_stage, episode_compression_sums)
         append_csv_row( metric_csv_paths.get("compression_episode"), COMPRESSION_EPISODE_METRIC_COLUMNS, compression_episode_metrics)

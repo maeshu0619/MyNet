@@ -391,10 +391,7 @@ def test(model, args, writer):
         and not bool(getattr(args, "sparsepcgc_enable_add_experiment", False))
         and not bool(getattr(args, "_add_cli_provided", False))
     ):
-        args.add = False
-        args.target_add_ratio = 0.0
-        args.max_add_ratio = 0.0
-        writer.write("SparsePCGC Add is disabled for test inference unless --add or sparsepcgc_enable_add_experiment is explicit.")
+        writer.write("SparsePCGC Add follows args/checkpoint settings in test inference; no implicit test-only disable was applied.")
 
     writer.write("Test Role: inference_only")
     writer.write(f"checkpoint: {args.ckpt}")
@@ -402,6 +399,16 @@ def test(model, args, writer):
     writer.write(f"output_log: {args.output_log}")
     writer.write(f"save_output_points: {bool(getattr(args, 'save_test_ply', False))}")
     writer.write(f"output_dir: {args.save_ply_dir}")
+    writer.write(
+        "Test Operation Config: "
+        f"add_enabled={bool(getattr(args, 'add', False))}, "
+        f"target_add_ratio={float(getattr(args, 'target_add_ratio', 0.0)):.6f}, "
+        f"max_add_ratio={float(getattr(args, 'max_add_ratio', 0.0)):.6f}, "
+        f"target_drop_ratio={float(getattr(args, 'target_drop_ratio', 0.0)):.6f}, "
+        f"max_drop_ratio={float(getattr(args, 'max_drop_ratio', 0.0)):.6f}, "
+        f"target_move_ratio={float(getattr(args, 'target_move_ratio', 0.0)):.6f}, "
+        f"max_move_ratio={float(getattr(args, 'max_move_ratio', 0.0)):.6f}"
+    )
     terminal_log(f"Profile CSV: {args.output_log}")
     terminal_log(f"Save output points: {bool(getattr(args, 'save_test_ply', False))}")
     terminal_log(f"Output point directory: {args.save_ply_dir}")

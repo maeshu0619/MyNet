@@ -75,6 +75,21 @@ def _format_metric(value):
     return "n/a" if value is None else f"{value:.6f}"
 
 
+def _selected_actual_metric(checkpoint_metrics):
+    metrics = checkpoint_metrics or {}
+    source = str(metrics.get("checkpoint_actual_source") or "fresh").strip().lower() or "fresh"
+    delta = _finite_float(metrics.get("checkpoint_actual_delta"), None)
+    count = int(metrics.get("checkpoint_actual_count") or 0)
+    if delta is None and source == "full_cloud":
+        delta = _finite_float(metrics.get("full_cloud_actual_delta"), None)
+        count = int(metrics.get("full_cloud_actual_count") or 0)
+    if delta is None:
+        source = "fresh"
+        delta = _finite_float(metrics.get("fresh_actual_delta"), None)
+        count = int(metrics.get("fresh_actual_count") or 0)
+    return source, delta, count
+
+
 def save_episode_checkpoint(
     model,
     ckpt_dir,
@@ -131,12 +146,17 @@ def save_episode_checkpoint(
             model_path = _save_state_dict(model, ckpt_dir, "best.pth", loss=loss)
             best_trackers["best_pth_source"] = filename
 
-    actual_delta = _finite_float(checkpoint_metrics.get("fresh_actual_delta"), None)
+    actual_source, actual_delta, actual_count = _selected_actual_metric(checkpoint_metrics)
     fresh_count = int(checkpoint_metrics.get("fresh_actual_count") or 0)
     cached_count = int(checkpoint_metrics.get("cached_actual_count") or 0)
+    full_cloud_count = int(checkpoint_metrics.get("full_cloud_actual_count") or 0)
+    checkpoint_eligible = bool(checkpoint_metrics.get("checkpoint_eligible", True))
+    checkpoint_ineligible_reason = str(checkpoint_metrics.get("checkpoint_ineligible_reason") or "")
     geometry_ok = bool(checkpoint_metrics.get("geometry_ok", False))
     safety_ok = bool(checkpoint_metrics.get("safety_ok", False))
-    if actual_backend and actual_delta is not None and fresh_count > 0:
+    if actual_backend and (not checkpoint_eligible):
+        not_updated_reasons.append(checkpoint_ineligible_reason or "checkpoint_ineligible")
+    elif actual_backend and actual_delta is not None and actual_count > 0:
         if actual_delta < best_trackers["actual_candidate"]:
             best_trackers["actual_candidate"] = actual_delta
             best_trackers["has_actual_candidate"] = True
@@ -144,7 +164,7 @@ def save_episode_checkpoint(
             checkpoint_updates.append("best_actual_delta_candidate")
             writer.write(
                 f"New actual-delta candidate at episode {episode + 1}, "
-                f"fresh_actual_delta={actual_delta:.6f}, fresh_count={fresh_count}, "
+                f"{actual_source}_actual_delta={actual_delta:.6f}, actual_count={actual_count}, "
                 f"geom_ok={geometry_ok}, safety_ok={safety_ok}"
             )
             if not best_trackers["has_actual_improved"]:
@@ -162,7 +182,7 @@ def save_episode_checkpoint(
             checkpoint_updates.append(filename.replace(".pth", ""))
             writer.write(
                 f"New {stage_name} actual-delta best at episode {episode + 1}, "
-                f"fresh_actual_delta={actual_delta:.6f}, path={filename}"
+                f"{actual_source}_actual_delta={actual_delta:.6f}, path={filename}"
             )
 
         if actual_delta < 0.0 and geometry_ok and safety_ok and actual_delta < best_trackers["actual_improved"]:
@@ -174,7 +194,7 @@ def save_episode_checkpoint(
             checkpoint_updates.append("best_actual_delta_improved")
             writer.write(
                 f"New improved actual-delta best at episode {episode + 1}, "
-                f"fresh_actual_delta={actual_delta:.6f}, fresh_count={fresh_count}, "
+                f"{actual_source}_actual_delta={actual_delta:.6f}, actual_count={actual_count}, "
                 "path=best_actual_delta_improved.pth and best.pth"
             )
         else:
@@ -187,10 +207,13 @@ def save_episode_checkpoint(
     elif actual_backend:
         if actual_delta is None:
             not_updated_reasons.append("nonfinite_metric")
-        if fresh_count <= 0:
-            not_updated_reasons.append("cached_actual_only" if cached_count > 0 else "no_fresh_actual")
+        if actual_count <= 0:
+            if actual_source == "full_cloud":
+                not_updated_reasons.append("no_full_cloud_actual")
+            else:
+                not_updated_reasons.append("cached_actual_only" if cached_count > 0 else "no_fresh_actual")
         fallback_path = None
-        if not best_trackers["has_actual_candidate"]:
+        if checkpoint_eligible and not best_trackers["has_actual_candidate"]:
             joint_loss = _finite_float(loss_by_stage.get("joint"), None)
             if joint_loss is not None and stage_name == "joint" and current_loss <= joint_loss:
                 fallback_path = "best_loss_joint.pth"
@@ -215,8 +238,12 @@ def save_episode_checkpoint(
         "CheckpointSummary: "
         f"episode={episode + 1}, stage={stage_name}, "
         f"loss={_format_metric(current_loss)}, "
-        f"fresh_actual_delta={_format_metric(actual_delta)}, "
+        f"actual_source={actual_source}, "
+        f"selected_actual_delta={_format_metric(actual_delta)}, "
         f"fresh_count={fresh_count}, "
+        f"full_cloud_count={full_cloud_count}, "
+        f"actual_count={actual_count}, "
+        f"checkpoint_eligible={checkpoint_eligible}, "
         f"geom_ok={geometry_ok}, safety_ok={safety_ok}, "
         f"best_pth_source={best_trackers.get('best_pth_source')}, "
         f"surrogate_best={_format_metric(best_trackers.get('surrogate_best_metric'))}, "
