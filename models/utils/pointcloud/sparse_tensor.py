@@ -1,7 +1,11 @@
 from typing import Dict
 
 import torch
-
+from .sparsepcgc_voxel import (
+    canonical_sparsepcgc_voxel_coords,
+    sparsepcgc_voxel_coords_to_xyz,
+    resolve_sparsepcgc_quant_metadata,
+)
 
 def _normalize_coord_scale_like(pts_xyz: torch.Tensor, coord_scale):
     if coord_scale is None:

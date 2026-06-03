@@ -1639,6 +1639,10 @@ class SurrogateCompressionLossMixin:
         else:
             actual_occupancy_debug = {}
 
+        full_cloud_corr_state = getattr(args, "_full_cloud_actual_correction_state", {}) or {}
+        if not isinstance(full_cloud_corr_state, dict):
+            full_cloud_corr_state = {}
+
         self.last_compression_debug = {
             "metric": "actual_total_bit_percent",
             "teacher_codec": teacher_codec,
@@ -1831,6 +1835,12 @@ class SurrogateCompressionLossMixin:
             "teacher_gap_status": str(teacher_gap_debug.get("teacher_gap_status", "")),
             "full_cloud_teacher_count": int(1 if teacher_type_label == "full_cloud_actual" else 0),
             "subtree_teacher_count": int(1 if teacher_type_label == "subtree_local_actual" else 0),
+            "full_cloud_actual_correction_gap_ema": full_cloud_corr_state.get("ema_full_vs_subtree_gap"),
+            "full_cloud_actual_correction_context_gap_ema": full_cloud_corr_state.get("ema_full_vs_context_gap"),
+            "full_cloud_actual_correction_proxy_gap_ema": full_cloud_corr_state.get("ema_full_vs_proxy_gap"),
+            "full_cloud_actual_correction_last_full_delta": full_cloud_corr_state.get("last_full_actual_delta"),
+            "full_cloud_actual_correction_last_subtree_delta": full_cloud_corr_state.get("last_subtree_actual_delta"),
+            "full_cloud_actual_correction_last_context_delta": full_cloud_corr_state.get("last_full_context_delta"),
             "teacher_type_counts": str(teacher_type_label),
             "full_cloud_replay_ratio": float(replay_ratio),
             "full_cloud_calib_interval": int(getattr(args, "surrogate_full_cloud_calib_interval", 0)),

@@ -1,7 +1,6 @@
 import math
-
 import torch
-
+from .sparsepcgc_voxel import canonical_sparsepcgc_voxel_coords
 
 def _as_points_n3(pts):
     if pts is None:
@@ -56,12 +55,14 @@ def sparsepcgc_quantized_coords(
 
 
 def _quantize_xyz_n3(xyz, voxel_size, pos_quantscale):
-    voxel = max(float(voxel_size), 1e-9)
-    pos_q = max(float(pos_quantscale), 1.0)
-    coords = torch.round(xyz / voxel)
-    if pos_q > 1.0:
-        coords = torch.round(coords / pos_q)
-    return coords.to(torch.long)
+    return canonical_sparsepcgc_voxel_coords(
+        xyz,
+        args=None,
+        coord_scale=None,
+        voxel_size=float(voxel_size),
+        pos_quantscale=int(pos_quantscale),
+        global_offset=None,
+    ).to(torch.long)
 
 
 def _sample_points_if_needed(xyz, max_points):

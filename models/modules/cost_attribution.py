@@ -32,12 +32,20 @@ class CostAttributionModule(nn.Module):
         self.debug_tensors = {}
 
     def forward(self, features):
+        if not torch.is_tensor(features):
+            raise TypeError("features must be a Tensor.")
+        if features.ndim != 3:
+            raise ValueError(f"features must have shape [B, C, N], got {tuple(features.shape)}")
+
+        input_mode = "node_voxel" if bool(getattr(self, "node_voxel_mode", False)) else "point"
         logits = self.net(features)
         scores = torch.softmax(logits, dim=1)
         if torch.is_grad_enabled():
             self.debug_tensors = {
                 "cause_mean": scores.mean().detach(),
                 "cause_max": scores.max().detach(),
+                "input_mode": input_mode,
+                "input_shape": tuple(features.shape),
             }
         return scores, logits
 

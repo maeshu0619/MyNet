@@ -306,6 +306,68 @@ class OctreeStructureAnalysis(nn.Module):
             out = out.to(dtype=dtype)
         return out
 
+    def _build_node_voxel_descriptor(
+        self,
+        pts_xyz,
+        feature,
+        oct_ctx,
+        subtree_tree=None,
+        full_octree_context=None,
+        point_feature_voxel_key=None,
+        prebuilt_ctx=None,
+    ):
+        if not bool(getattr(self.args, "octree_structure_node_descriptor", True)):
+            return None
+
+        desc = {
+            "node_features": feature,
+            "node_mask": torch.ones(
+                (pts_xyz.shape[0], pts_xyz.shape[-1]),
+                device=pts_xyz.device,
+                dtype=torch.bool,
+            ),
+            "point_feature_voxel_key": point_feature_voxel_key,
+            "global_qs": None,
+            "global_offset": None,
+            "source": "local_xyz",
+        }
+
+        context = subtree_tree if isinstance(subtree_tree, dict) else full_octree_context
+        if isinstance(context, dict):
+            if "global_qs" in context:
+                desc["global_qs"] = context.get("global_qs")
+            if "global_offset" in context:
+                desc["global_offset"] = context.get("global_offset")
+
+        if prebuilt_ctx is not None and isinstance(subtree_tree, dict):
+            coords = self._tree_tensor(subtree_tree, "global_voxel_coords", pts_xyz.device, dtype=torch.long)
+            if coords is not None:
+                if coords.ndim == 2 and coords.shape[-1] == 3:
+                    coords = coords.transpose(0, 1).contiguous().unsqueeze(0)
+                elif coords.ndim == 3 and coords.shape[-1] == 3:
+                    coords = coords.permute(0, 2, 1).contiguous()
+                desc["voxel_coords"] = coords
+                desc["source"] = "prebuilt_subtree_tree"
+
+            for tree_key, out_key in (
+                ("node_depths", "node_depth"),
+                ("occupancy_codes", "occupancy_code"),
+                ("parent_ids", "parent_id"),
+                ("child_indices", "child_index"),
+                ("sibling_occupancy", "sibling_occupancy"),
+                ("global_morton_keys", "global_morton_keys"),
+            ):
+                value = self._tree_tensor(subtree_tree, tree_key, pts_xyz.device)
+                if value is not None:
+                    desc[out_key] = value
+        else:
+            desc["voxel_coords"] = None
+
+        if oct_ctx is not None and torch.is_tensor(oct_ctx):
+            desc["oct_ctx"] = oct_ctx
+
+        return desc
+
     @staticmethod
     def _fit_point_rows(values, point_count: int):
         if values is None:
@@ -650,6 +712,15 @@ class OctreeStructureAnalysis(nn.Module):
 
         if feature.shape[1] != self.feature_dim:
             raise RuntimeError(f"Octree feature dim mismatch: {feature.shape[1]} != {self.feature_dim}")
+        node_voxel_desc = self._build_node_voxel_descriptor(
+            pts_xyz=pts_xyz,
+            feature=feature.to(dtype=input_dtype),
+            oct_ctx=oct_ctx.to(dtype=input_dtype),
+            subtree_tree=subtree_tree,
+            full_octree_context=full_octree_context,
+            point_feature_voxel_key=point_feature_voxel_key,
+            prebuilt_ctx=prebuilt_ctx,
+        )
 
         return {
             "features": feature.to(dtype=input_dtype),
@@ -678,4 +749,5 @@ class OctreeStructureAnalysis(nn.Module):
             if prebuilt_ctx is not None
             else None,
             "point_feature_voxel_key": point_feature_voxel_key,
+            "node_voxel_desc": node_voxel_desc,
         }

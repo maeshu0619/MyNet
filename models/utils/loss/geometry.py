@@ -87,6 +87,10 @@ class GeometryLossMixin:
     def get_geometry_loss(self, args, gen_pts, gt_pts, final_w=None, out_label=None):
         use_torch_d2 = args.trainORtest == "train"
         audit_enabled = self._should_verbose_step(args) or args.trainORtest != "train"
+        # Phase2/Phase6では out_label がdictになる。
+        # geometry lossで使う外れ点ラベルは従来互換の point_label だけである。
+        if isinstance(out_label, dict):
+            out_label = out_label.get("point_label", None)
         if gen_pts.shape[-1] == 0 or gt_pts.shape[-1] == 0:
             self._set_geometry_debug(
                 mode="empty",

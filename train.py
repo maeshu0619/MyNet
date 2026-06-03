@@ -41,6 +41,11 @@ from models.utils.compression.octree_stats import hard_octree_occupancy_stats
 from models.utils.training.utils_grad import *
 from models.utils.config.args import parse_pugan_args
 
+from models.utils.training.full_cloud_actual_correction import (
+    update_full_cloud_actual_correction_state,
+    build_full_cloud_actual_correction_loss,
+)
+
 from models.utils.training.utils import *
 from models.utils.training.noise_debug import *
 from models.utils.training.correlation import *
@@ -54,6 +59,7 @@ from models.utils.training.scalar_utils import *
 from models.utils.training.correlation_debug import *
 from models.utils.training.sparsepcgc_controls import *
 from models.utils.training.compression_primary_loss import *
+from models.utils.training.full_context_subtree_loss import build_full_context_subtree_delta_loss
 from models.utils.training.case_debug import *
 from models.utils.training.metric_csv import *
 from models.utils.training.metric_columns import LOSS_GRAD_PROBE_COLUMNS
@@ -89,6 +95,48 @@ STEP_GRAD_COLUMNS = [
     "param_name_sample",
 ]
 
+def _log_sparsepcgc_restore_debug(args, writer, out_label, prefix="VoxelRestoreDebug"):
+    # Phase2: canonical voxel coordsから復元した点群候補のdebugだけを出す。
+    # 学習に使うgen_xyzはここでは変更しない。
+    if not bool(getattr(args, "sparsepcgc_restore_points_debug", False)):
+        return
+    if not bool(getattr(args, "_log_this_step", True)):
+        return
+    if writer is None or not hasattr(writer, "write"):
+        return
+    if not isinstance(out_label, dict):
+        return
+
+    before_coords = out_label.get("canonical_voxel_coords_before", None)
+    after_coords = out_label.get("canonical_voxel_coords_after", None)
+    restored_xyz = out_label.get("restored_xyz_debug", None)
+    restore_info = out_label.get("restore_info", {}) or {}
+
+    def _shape(x):
+        if torch.is_tensor(x):
+            return tuple(x.shape)
+        return None
+
+    def _range_text(x):
+        if not torch.is_tensor(x) or x.numel() == 0:
+            return "n/a"
+        x_det = x.detach()
+        return (
+            f"min={float(x_det.amin().float().cpu()):.6g}, "
+            f"max={float(x_det.amax().float().cpu()):.6g}"
+        )
+
+    writer.write(
+        f"{prefix}: "
+        f"before_coords_shape={_shape(before_coords)}, "
+        f"after_coords_shape={_shape(after_coords)}, "
+        f"restored_xyz_shape={_shape(restored_xyz)}, "
+        f"restored_xyz_range={_range_text(restored_xyz)}, "
+        f"restore_input_points={restore_info.get('restore_input_points', 'n/a')}, "
+        f"restore_output_points={restore_info.get('restore_output_points', 'n/a')}, "
+        f"restore_center={restore_info.get('restore_center', 'n/a')}, "
+        f"restore_unique={restore_info.get('restore_unique', 'n/a')}"
+    )
 
 def _unwrap_train_model(model):
     # DataParallelで包まれている場合は中身のモデルを取り出す
@@ -1113,6 +1161,10 @@ def train(model, args, loss, writer, plot, notifier=None):
     checkpoint_gate_refs = {} # ChackPoint保存判定で使う基準値や過去値を保持
     best_trackers = None # 複数指標でBest CheckPointを追跡するための状態を初期化
     actual_guard_state = {"best_delta": float("inf"), "best_path": None, "bad_count": 0} # 実Codex評価が悪化したときに、巻き戻す
+    full_cloud_correction_state = {}
+    last_subtree_actual_debug_for_correction = {}
+    last_full_context_debug_for_correction = {}
+    last_full_cloud_correction_update_debug = {}
 
     """モデル保存先ファイルのセットアップ"""
     output_dir = os.path.join(args.out_path)
@@ -1466,6 +1518,10 @@ def train(model, args, loss, writer, plot, notifier=None):
                     loss_bit = input_xyz.new_zeros(())
                     loss_single = input_xyz.new_zeros(())
                     loss_nodes = input_xyz.new_zeros(())
+                    L_full_context_subtree_delta = input_xyz.new_zeros(())
+                    full_context_subtree_delta_debug = {}
+                    full_cloud_correction_loss = input_xyz.new_zeros(())
+                    full_cloud_correction_debug = {}
                     gen_xyz = None
                     final_w = None
                     out_label = None
@@ -1504,6 +1560,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 base_model = model.module if hasattr(model, "module") else model # DataParallelで包まれているばあいは中身のモデルを取り出す
                                 encoder_debug_chunks.append(dict(getattr(base_model, "last_encoder_debug", {}) or {})) # Encoder Debug情報をコピーして保存
                             gen_xyz = gen_pts[:, :3, :]
+                            _log_sparsepcgc_restore_debug(args, writer, out_label)
                             train_edit_stats = summarize_point_edits( input_xyz=input_xyz[:, :3, :], gen_pts=gen_pts, final_w=final_w, args=args) # 入力点群と出力点群を比較し、各操作の編集統計を計算
                             final_w_for_loss = None
                             if _discrete_loss_mode_value(args) != "hard":
@@ -1528,6 +1585,22 @@ def train(model, args, loss, writer, plot, notifier=None):
                                             full_octree_context=None,
                                             octree_input_mode="full_cloud",
                                             )
+                                    base_model_for_correction = model.module if hasattr(model, "module") else model
+                                    full_cloud_debug_for_correction = dict(getattr(loss, "last_compression_debug", {}) or {})
+                                    full_cloud_correction_state, last_full_cloud_correction_update_debug = update_full_cloud_actual_correction_state(
+                                        args=args,
+                                        state=full_cloud_correction_state,
+                                        full_cloud_debug=full_cloud_debug_for_correction,
+                                        subtree_debug=last_subtree_actual_debug_for_correction,
+                                        full_context_debug=last_full_context_debug_for_correction,
+                                        actuator_voxel_state=getattr(base_model_for_correction, "last_actuator_voxel_state", None),
+                                        reference=gen_xyz,
+                                        global_step=global_train_step,
+                                    )
+                                    try:
+                                        setattr(args, "_full_cloud_actual_correction_state", full_cloud_correction_state)
+                                    except Exception:
+                                        pass
                                 else:
                                     writer.write("!!! Skipping compression loss calculation due to stage factor setting. !!!")
                                     zero = input_xyz.new_zeros(())
@@ -1542,6 +1615,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                             subtree_edit_sums = new_point_edit_sums() # 複数Subtreeの点編集統計を累積するための変数を初期化
                             subtree_noise_debug_values = [] # 各Subtreeで圧縮用ノイズを加えたかなどを統合
                             subtree_compression_term_sums = {} # Subtreeごとの圧縮損失内訳を累積する辞書
+                            subtree_full_context_delta_debug_values = [] # 各Subtreeのfull-context delta debugを統合するためのリスト
 
                             for subtree_key, point_idx in selected_groups: # 選択されたSubtreeを1つずつ取り出し、それぞれ日いて点群を切り出し、Forward、形状損失、圧縮損失を計算
                                 args._current_teacher_scope = "subtree_local" # Subtree stepではteacherが局所点群基準であることをLoss側へ渡す
@@ -1626,6 +1700,8 @@ def train(model, args, loss, writer, plot, notifier=None):
                                     encoder_debug_chunks.append(dict(getattr(base_model, "last_encoder_debug", {}) or {}))
 
                                 gen_subtree_xyz = gen_subtree_pts[:, :3, :]
+                                base_model_for_full_context = model.module if hasattr(model, "module") else model
+                                actuator_voxel_state_sub = getattr(base_model_for_full_context, "last_actuator_voxel_state", None)
                                 subtree_edit_stats = summarize_point_edits( input_xyz=subtree_xyz[:, :3, :], gen_pts=gen_subtree_pts, final_w=final_w_sub, args=args) # Subtree入力とSubtree出力を比較し、操作などを計算する
                                 add_point_edit_sums(subtree_edit_sums, subtree_edit_stats) # 現在Subtreeの編集統計を、Step全体の編集統計に累積する
                                 final_w_sub_loss = None
@@ -1653,6 +1729,18 @@ def train(model, args, loss, writer, plot, notifier=None):
                                             full_octree_context=full_octree_context,
                                             octree_input_mode=octree_input_mode,
                                             )
+                                        L_full_context_subtree_delta_sub, full_context_subtree_delta_debug_sub = build_full_context_subtree_delta_loss(
+                                            args,
+                                            full_octree_context=full_octree_context,
+                                            subtree_tree=subtree_tree,
+                                            actuator_voxel_state=actuator_voxel_state_sub,
+                                            reference=gen_subtree_xyz,
+                                        )
+                                        L_full_context_subtree_delta = L_full_context_subtree_delta + (
+                                            L_full_context_subtree_delta_sub / num_selected
+                                        )
+                                        if isinstance(full_context_subtree_delta_debug_sub, dict):
+                                            subtree_full_context_delta_debug_values.append(full_context_subtree_delta_debug_sub)
                                         accumulate_compression_terms( subtree_compression_term_sums, getattr(loss, "last_compression_terms", {}) or {}, 1.0 / num_selected) # 現在Subtreeで計算された圧縮損失内訳を1/Subtree数の重みをつけて、Step全体の圧縮損失内訳に累積する
                                     else:
                                         zero = subtree_xyz.new_zeros(())
@@ -1660,6 +1748,12 @@ def train(model, args, loss, writer, plot, notifier=None):
                                         loss_bit_sub = zero
                                         loss_single_sub = zero
                                         loss_nodes_sub = zero
+                                        full_context_subtree_delta_debug_sub = {
+                                            "full_context_subtree_delta_used": False,
+                                            "full_context_subtree_delta_reason": "compression_stage_disabled",
+                                            "full_context_subtree_delta_value": 0.0,
+                                        }
+                                        subtree_full_context_delta_debug_values.append(full_context_subtree_delta_debug_sub)
                                 
 
                                 """損失項の計算"""
@@ -1681,6 +1775,43 @@ def train(model, args, loss, writer, plot, notifier=None):
                             noise_debug = merge_noise_debug_values(subtree_noise_debug_values)
                             if subtree_compression_term_sums:
                                 loss.last_compression_terms = subtree_compression_term_sums
+                            last_subtree_actual_debug_for_correction = dict(getattr(loss, "last_compression_debug", {}) or {})
+                            if subtree_full_context_delta_debug_values:
+                                merged_full_context_debug = {}
+                                all_keys = set()
+                                for item in subtree_full_context_delta_debug_values:
+                                    if isinstance(item, dict):
+                                        all_keys.update(item.keys())
+
+                                for key in sorted(all_keys):
+                                    values = [
+                                        item.get(key)
+                                        for item in subtree_full_context_delta_debug_values
+                                        if isinstance(item, dict) and key in item
+                                    ]
+                                    numeric_values = []
+                                    bool_values = []
+                                    text_values = []
+                                    for value in values:
+                                        if isinstance(value, bool):
+                                            bool_values.append(value)
+                                        elif isinstance(value, (int, float)):
+                                            numeric_values.append(float(value))
+                                        elif torch.is_tensor(value) and value.numel() == 1:
+                                            numeric_values.append(float(value.detach().float().cpu()))
+                                        elif value is not None:
+                                            text_values.append(str(value))
+
+                                    if numeric_values:
+                                        merged_full_context_debug[key] = sum(numeric_values) / float(max(len(numeric_values), 1))
+                                    elif bool_values:
+                                        merged_full_context_debug[key] = any(bool_values)
+                                    elif text_values:
+                                        merged_full_context_debug[key] = "|".join(sorted(set(text_values)))
+
+                                full_context_subtree_delta_debug = merged_full_context_debug
+                            if isinstance(full_context_subtree_delta_debug, dict):
+                                last_full_context_debug_for_correction = dict(full_context_subtree_delta_debug)
 
                     finally:
                         args._log_this_step = prev_log_flag
@@ -1715,6 +1846,10 @@ def train(model, args, loss, writer, plot, notifier=None):
 
                 """圧縮損失の合成"""
                 terms = getattr(loss, "last_compression_terms", {}) or {} # 直前の圧縮損失の内訳の取得
+                if torch.is_tensor(L_full_context_subtree_delta):
+                    terms = dict(terms)
+                    terms["full_context_subtree_delta"] = L_full_context_subtree_delta
+                    
                 L_com_objective = compose_train_compression_objective(args, terms, L_com, La_fit) # actual/surrogateではL_com直結と内訳合成を半々で混ぜる
                 # ============================================================
                 # 非有限損失の保険
@@ -2200,12 +2335,51 @@ def train(model, args, loss, writer, plot, notifier=None):
                     if callable(policy_loss_fn):
                         L_discrete_policy = policy_loss_fn(L_downstream.detach())
                         L = L + L_discrete_policy
+                base_model_for_correction = model.module if hasattr(model, "module") else model
+                full_cloud_correction_loss, full_cloud_correction_debug = build_full_cloud_actual_correction_loss(
+                    args=args,
+                    correction_state=full_cloud_correction_state,
+                    actuator_voxel_state=getattr(base_model_for_correction, "last_actuator_voxel_state", None),
+                    reference=gen_xyz if torch.is_tensor(gen_xyz) else input_xyz,
+                    global_step=global_train_step,
+                )
+
+                if bool(getattr(args, "full_cloud_actual_correction_loss_enable", False)):
+                    L = L + float(getattr(args, "full_cloud_actual_correction_weight", 0.05)) * full_cloud_correction_loss
 
                 """情報精査"""
                 comp_debug = dict(getattr(loss, "last_compression_debug", {}) or {}) # 直前の圧縮Debug情報を取り出す
                 if cp_debug: # Compression Primaryモード用のDebug情報が存在するか判定
                     comp_debug.update(cp_debug) # 圧縮目的のDebug情報を追加
                     loss.last_compression_debug = comp_debug # 統合後のcomp_debugをLossに保存
+                if isinstance(full_context_subtree_delta_debug, dict) and full_context_subtree_delta_debug:
+                    comp_debug.update(full_context_subtree_delta_debug)
+                    loss.last_compression_debug = comp_debug
+                if isinstance(last_full_cloud_correction_update_debug, dict) and last_full_cloud_correction_update_debug:
+                    comp_debug.update(last_full_cloud_correction_update_debug)
+                if isinstance(full_cloud_correction_debug, dict) and full_cloud_correction_debug:
+                    comp_debug.update(full_cloud_correction_debug)
+
+                if isinstance(full_cloud_correction_state, dict):
+                    comp_debug.update(
+                        {
+                            "full_cloud_corr_ema_full_vs_subtree_gap": full_cloud_correction_state.get("ema_full_vs_subtree_gap"),
+                            "full_cloud_corr_ema_full_vs_context_gap": full_cloud_correction_state.get("ema_full_vs_context_gap"),
+                            "full_cloud_corr_ema_full_vs_proxy_gap": full_cloud_correction_state.get("ema_full_vs_proxy_gap"),
+                            "full_cloud_corr_ema_full_actual_delta": full_cloud_correction_state.get("ema_full_actual_delta"),
+                            "full_cloud_corr_last_full_actual_delta": full_cloud_correction_state.get("last_full_actual_delta"),
+                            "full_cloud_corr_last_subtree_actual_delta": full_cloud_correction_state.get("last_subtree_actual_delta"),
+                            "full_cloud_corr_last_full_context_delta": full_cloud_correction_state.get("last_full_context_delta"),
+                            "full_cloud_corr_last_subtree_proxy_delta": full_cloud_correction_state.get("last_subtree_proxy_delta"),
+                            "full_cloud_corr_last_update_step": full_cloud_correction_state.get("last_update_step"),
+                        }
+                    )
+
+                comp_debug["full_cloud_corr_loss_added_to_total"] = bool(
+                    getattr(args, "full_cloud_actual_correction_loss_enable", False)
+                )
+                loss.last_compression_debug = comp_debug
+
                 base_model = model.module if hasattr(model, "module") else model # DataParallelで包まれている場合は中身のモデルを取り出す
                 structure_debug = getattr(base_model, "last_structure_debug", {}) or {} # モデル内部で記録された構造解析・構造修復のDebug情報を取得
                 for debug_key in ( # 圧縮CSVからも構造入力モードを追えるように必要項目だけを転記する
@@ -2243,9 +2417,31 @@ def train(model, args, loss, writer, plot, notifier=None):
                     "actuator_final_voxel_state_available",
                     "final_voxel_update_mode",
                     "final_voxel_recomputed_from_pts_out",
+                    "network_voxel_node_input_requested",
+                    "network_voxel_node_input_used",
+                    "network_voxel_node_fallback",
+                    "network_voxel_node_fallback_reason",
+                    "network_voxel_node_count",
+                    "network_voxel_node_source",
+                    "network_voxel_node_feature_shape",
                 ):
                     if debug_key in structure_debug and debug_key not in comp_debug:
                         comp_debug[debug_key] = structure_debug.get(debug_key)
+                if (
+                    bool(getattr(args, "network_voxel_node_debug", True))
+                    and bool(getattr(args, "_log_this_step", True))
+                    and isinstance(structure_debug, dict)
+                    and bool(structure_debug.get("network_voxel_node_input_requested", False))
+                ):
+                    writer.write(
+                        "VoxelNodeInputDebug: "
+                        f"used={bool(structure_debug.get('network_voxel_node_input_used', False))}, "
+                        f"fallback={bool(structure_debug.get('network_voxel_node_fallback', False))}, "
+                        f"reason={structure_debug.get('network_voxel_node_fallback_reason', '')}, "
+                        f"node_count={int(structure_debug.get('network_voxel_node_count', 0) or 0)}, "
+                        f"source={structure_debug.get('network_voxel_node_source', 'none')}, "
+                        f"feature_shape={structure_debug.get('network_voxel_node_feature_shape', '')}"
+                    )
 
                 operation_entropy_value = finite_float_or_none(structure_debug.get("operation_entropy")) # 探索多様性の移動平均を出すために現在値を取り出す
                 if operation_entropy_value is not None:
@@ -2290,6 +2486,99 @@ def train(model, args, loss, writer, plot, notifier=None):
 
                 """CSV"""
                 compression_metric_row = build_compression_metric_row( args, global_step=global_train_step, episode=episode, epoch=epoch, step=step, stage=current_stage, comp_debug=comp_debug, L_com=L_com) # 圧縮StepCSVに書き込む1行を作る
+                if isinstance(comp_debug, dict):
+                    for key in (
+                        "full_cloud_corr_update_used",
+                        "full_cloud_corr_update_reason",
+                        "full_cloud_corr_loss_used",
+                        "full_cloud_corr_loss_reason",
+                        "full_cloud_corr_loss_value",
+                        "full_cloud_corr_loss_enabled",
+                        "full_cloud_corr_loss_added_to_total",
+                        "full_cloud_corr_loss_severity",
+                        "full_cloud_corr_ema_full_vs_subtree_gap",
+                        "full_cloud_corr_ema_full_vs_context_gap",
+                        "full_cloud_corr_ema_full_vs_proxy_gap",
+                        "full_cloud_corr_ema_full_actual_delta",
+                        "full_cloud_corr_last_full_actual_delta",
+                        "full_cloud_corr_last_subtree_actual_delta",
+                        "full_cloud_corr_last_full_context_delta",
+                        "full_cloud_corr_last_subtree_proxy_delta",
+                        "full_cloud_corr_last_update_step",
+                        "full_cloud_corr_move_count",
+                        "full_cloud_corr_add_count",
+                        "full_cloud_corr_drop_count",
+                        "full_cloud_corr_same_voxel_move_rejected",
+                        "full_cloud_corr_existing_target_rejected",
+                        "full_cloud_corr_duplicate_target_rejected",
+                        "full_cloud_corr_child_slot_rejected",
+                        "full_cloud_corr_empty_target_rejected",
+                    ):
+                        if key in comp_debug:
+                            compression_metric_row[key] = comp_debug[key]
+                if (
+                    bool(getattr(args, "full_cloud_actual_correction_debug", True))
+                    and bool(getattr(args, "_log_this_step", True))
+                    and isinstance(comp_debug, dict)
+                    and (
+                        comp_debug.get("full_cloud_corr_update_used", False)
+                        or comp_debug.get("full_cloud_corr_loss_used", False)
+                    )
+                ):
+                    writer.write(
+                        "FullCloudActualCorrection: "
+                        f"update_used={bool(comp_debug.get('full_cloud_corr_update_used', False))}, "
+                        f"update_reason={comp_debug.get('full_cloud_corr_update_reason', 'none')}, "
+                        f"loss_used={bool(comp_debug.get('full_cloud_corr_loss_used', False))}, "
+                        f"loss_enabled={bool(comp_debug.get('full_cloud_corr_loss_enabled', False))}, "
+                        f"loss={float(comp_debug.get('full_cloud_corr_loss_value', 0.0) or 0.0):.6g}, "
+                        f"ema_full_delta={float(comp_debug.get('full_cloud_corr_ema_full_actual_delta', 0.0) or 0.0):.6g}, "
+                        f"gap_full_subtree={float(comp_debug.get('full_cloud_corr_ema_full_vs_subtree_gap', 0.0) or 0.0):.6g}, "
+                        f"gap_full_context={float(comp_debug.get('full_cloud_corr_ema_full_vs_context_gap', 0.0) or 0.0):.6g}, "
+                        f"gap_full_proxy={float(comp_debug.get('full_cloud_corr_ema_full_vs_proxy_gap', 0.0) or 0.0):.6g}, "
+                        f"move={float(comp_debug.get('full_cloud_corr_move_count', 0.0) or 0.0):.0f}, "
+                        f"add={float(comp_debug.get('full_cloud_corr_add_count', 0.0) or 0.0):.0f}, "
+                        f"drop={float(comp_debug.get('full_cloud_corr_drop_count', 0.0) or 0.0):.0f}, "
+                        f"move_reject_same={float(comp_debug.get('full_cloud_corr_same_voxel_move_rejected', 0.0) or 0.0):.0f}, "
+                        f"move_reject_existing={float(comp_debug.get('full_cloud_corr_existing_target_rejected', 0.0) or 0.0):.0f}, "
+                        f"move_reject_duplicate={float(comp_debug.get('full_cloud_corr_duplicate_target_rejected', 0.0) or 0.0):.0f}, "
+                        f"move_reject_child_slot={float(comp_debug.get('full_cloud_corr_child_slot_rejected', 0.0) or 0.0):.0f}, "
+                        f"move_reject_empty={float(comp_debug.get('full_cloud_corr_empty_target_rejected', 0.0) or 0.0):.0f}"
+                    )
+
+                if isinstance(comp_debug, dict):
+                    for key in (
+                        "full_context_subtree_delta_used",
+                        "full_context_subtree_delta_reason",
+                        "full_context_subtree_delta_value",
+                        "full_context_subtree_delta_before_nodes",
+                        "full_context_subtree_delta_after_nodes",
+                        "full_context_subtree_delta_node_delta_norm",
+                        "full_context_subtree_delta_before_single",
+                        "full_context_subtree_delta_after_single",
+                        "full_context_subtree_delta_single_delta",
+                        "full_context_subtree_delta_before_entropy",
+                        "full_context_subtree_delta_after_entropy",
+                        "full_context_subtree_delta_entropy_delta",
+                        "full_context_subtree_delta_before_lowprob",
+                        "full_context_subtree_delta_after_lowprob",
+                        "full_context_subtree_delta_lowprob_delta",
+                        "full_context_subtree_delta_before_nll",
+                        "full_context_subtree_delta_after_nll",
+                        "full_context_subtree_delta_nll_delta",
+                        "full_context_subtree_delta_before_count",
+                        "full_context_subtree_delta_after_count",
+                        "full_context_subtree_delta_count_delta_norm",
+                        "full_context_subtree_delta_before_isolated",
+                        "full_context_subtree_delta_after_isolated",
+                        "full_context_subtree_delta_isolated_delta",
+                        "full_context_subtree_delta_grad_used",
+                        "full_context_subtree_delta_weight",
+                        "cp_full_context_subtree_delta",
+                        "cp_full_context_subtree_delta_requires_grad",
+                    ):
+                        if key in comp_debug:
+                            compression_metric_row[key] = comp_debug[key]
                 # ============================================================
                 # Actual hard Occupancy値はActual列・exact列にだけ入れる
                 # Predicted列はsoft proxy側の値を残す
@@ -2380,6 +2669,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                     ("L_geom", L_geom),
                     ("L_com", L_com),
                     ("L_com_objective", L_com_objective),
+                    ("full_context_subtree_delta", L_full_context_subtree_delta),
                     ("L_attr", L_attr),
                     ("L_policy", L_policy),
                     ("L_actuator", L_actuator),

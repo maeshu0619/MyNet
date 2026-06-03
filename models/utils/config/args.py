@@ -329,6 +329,13 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--encoder_pre_downsample_mode', default='voxel', type=str, help='Encoder前downsample方法(voxel)')
     parser.add_argument('--encoder_sparse_tensor', default=True, type=str2bool, help='入力点群を点数維持のSparse Tensor表現(量子化座標+occupancy feature)へ変換するか')
     parser.add_argument('--sparse_tensor_keep_after_encoder', default=True, type=str2bool, help='Encoder後も診断/方策決定まではUpsampling後のSparse Tensor経路を維持するか')
+    parser.add_argument('--network_voxel_node_input', default=False, type=str2bool, help='Network入力を点群中心ではなくVoxel/Node中心にする')
+    parser.add_argument('--network_voxel_node_fallback_point', default=True, type=str2bool, help='Node/Voxel入力情報が不足した場合に点群経路へfallbackする')
+    parser.add_argument('--network_voxel_node_debug', default=True, type=str2bool, help='Node/Voxel入力経路のdebug情報を出す')
+    parser.add_argument('--octree_structure_node_descriptor', default=True, type=str2bool, help='OctreeStructureAnalysisでnode/voxel descriptorを返す')
+    parser.add_argument('--voxel_node_use_full_context', default=True, type=str2bool, help='Node/Voxel入力でfull_octree_contextを使う')
+    parser.add_argument('--voxel_node_use_subtree_context', default=True, type=str2bool, help='Node/Voxel入力でsubtree_treeを使う')
+    parser.add_argument('--voxel_node_restore_output_debug', default=False, type=str2bool, help='Voxel/Node経路のfinal_voxel_coordsから点群復元debugを行う')
     parser.add_argument('--encoder_raw_downsample_factor', default=10.0, type=float, help='Sparse Tensor化後にEncoderへ入れるため何倍ダウンサンプリングするか（10なら点数を約1/10にする）')
     parser.add_argument('--encoder_pre_downsample_max_points', default=8192, type=int, help='Encoderへ入れる最大点数')
     parser.add_argument('--encoder_cdist_max_points', default=4096, type=int, help='pointops CUDAが使えずtorch.cdist KNNへ落ちた時のEncoder最大点数（0なら無効）')
@@ -424,6 +431,36 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--repair_add_min_offset_qstep', default=0.20, type=float, help='追加点が基点と重複しないための最小オフセット(量子化step比)')
     parser.add_argument('--repair_add_min_offset_weight', default=0.5, type=float, help='追加点オフセットが小さすぎる時のペナルティ重み')
     parser.add_argument('--repair_move_require_empty_target', default=True, type=str2bool, help='移動先を空の近傍量子化ボクセルに制限するか')
+    parser.add_argument(
+        '--repair_voxel_edit_state',
+        default=True,
+        type=str2bool,
+        help='Actuator内でPrune/Add/Move後のVoxel編集状態を作る',
+    )
+    parser.add_argument(
+        '--repair_voxel_move_as_relocate',
+        default=True,
+        type=str2bool,
+        help='Moveをsource voxel削除 + target voxel追加としてVoxel編集状態に反映する',
+    )
+    parser.add_argument(
+        '--repair_voxel_edit_require_empty_move_target',
+        default=True,
+        type=str2bool,
+        help='Voxel編集状態ではMove targetをempty voxelに限定する',
+    )
+    parser.add_argument(
+        '--repair_voxel_edit_unique_targets',
+        default=True,
+        type=str2bool,
+        help='Voxel編集状態では同じtarget voxelへ複数Move/Addが集まるのを1つにまとめる',
+    )
+    parser.add_argument(
+        '--repair_voxel_edit_debug',
+        default=False,
+        type=str2bool,
+        help='Voxel編集状態のdebugログを有効化する',
+    )
     parser.add_argument('--repair_move_prefer_occupied_target', default=False, type=str2bool, help='移動先候補に既存occupied voxelを優先し、codec上のmergeを促すか')
     parser.add_argument('--repair_move_source_prior_weight', default=0.35, type=float, help='原因診断scoreからmove source候補を起こす補助重み')
     parser.add_argument('--repair_selection_mode', default='target', type=str, help='修復操作のhard選択方式(target/threshold_cap)。threshold_capでは目標割合を強制せず上限として扱う')
@@ -454,6 +491,30 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--repair_operation_amount_bias_scale', default=2.0, type=float, help='学習されたAdd/Adjust実行量を位置logitへ反映する強さ')
   
     """損失項の重みパラメータ"""
+    parser.add_argument('--full_context_subtree_loss', default=True, type=str2bool, help='Subtree編集をfull cloud文脈上のoccupancy差分として評価する補助lossを使う')
+    parser.add_argument('--full_context_subtree_loss_weight', default=0.2, type=float, help='full-context subtree delta lossの重み')
+    parser.add_argument('--full_context_subtree_loss_grad_weight', default=0.1, type=float, help='full-context subtree delta lossのproxy勾配重み')
+    parser.add_argument('--full_context_subtree_loss_require_context', default=True, type=str2bool, help='subtree_tree/full_octree_contextがない場合はfull-context subtree lossを無効化する')
+    parser.add_argument('--full_context_subtree_loss_log', default=True, type=str2bool, help='full-context subtree delta lossのdebugログを出す')
+    parser.add_argument('--full_context_subtree_loss_node_weight', default=0.05, type=float, help='full-context subtree loss内のnode count差分重み')
+    parser.add_argument('--full_context_subtree_loss_single_weight', default=0.10, type=float, help='full-context subtree loss内のsingle-child差分重み')
+    parser.add_argument('--full_context_subtree_loss_entropy_weight', default=0.20, type=float, help='full-context subtree loss内のoccupancy entropy差分重み')
+    parser.add_argument('--full_context_subtree_loss_nll_weight', default=0.00, type=float, help='full-context subtree loss内のoccupancy NLL差分重み')
+    parser.add_argument('--full_context_subtree_loss_lowprob_weight', default=0.20, type=float, help='full-context subtree loss内のlowprob occupancy差分重み')
+    parser.add_argument('--full_context_subtree_loss_count_weight', default=0.02, type=float, help='full-context subtree loss内のoccupied voxel数差分重み')
+    parser.add_argument('--full_context_subtree_loss_fragment_weight', default=0.05, type=float, help='full-context subtree loss内のisolated voxel / fragmentation差分重み')
+    parser.add_argument('--full_context_subtree_loss_max_depth', default=0, type=int, help='full-context subtree lossで使うoccupancy統計の最大深さ。0ならcoords範囲から推定する')
+    parser.add_argument('--full_cloud_actual_correction', default=True, type=str2bool, help='periodic full cloud actualを使ってsubtree/proxy lossを補正する')
+    parser.add_argument('--full_cloud_actual_correction_weight', default=0.05, type=float, help='full cloud actual correctionをlossへ反映する重み')
+    parser.add_argument('--full_cloud_actual_correction_warmup_steps', default=100, type=int, help='full cloud actual correctionを有効化するまでのwarmup step')
+    parser.add_argument('--full_cloud_actual_correction_ema', default=0.90, type=float, help='full cloud actual gapのEMA係数')
+    parser.add_argument('--full_cloud_actual_correction_clip', default=5.0, type=float, help='full cloud actual correction値のclip上限')
+    parser.add_argument('--full_cloud_actual_correction_debug', default=True, type=str2bool, help='full cloud actual correctionのdebugログを出す')
+    parser.add_argument('--full_cloud_actual_correction_loss_enable', default=False, type=str2bool, help='full cloud actual correctionを実際にlossへ足すか')
+    parser.add_argument('--full_cloud_actual_correction_penalize_move', default=True, type=str2bool, help='full cloud actual悪化時にMove量を補正ペナルティの観測対象にする')
+    parser.add_argument('--full_cloud_actual_correction_penalize_add', default=True, type=str2bool, help='full cloud actual悪化時にAdd量を補正ペナルティの観測対象にする')
+    parser.add_argument('--full_cloud_actual_correction_penalize_drop', default=False, type=str2bool, help='full cloud actual悪化時にDrop量を補正ペナルティの観測対象にする')
+
     # 圧縮損失における点操作のAmount
     parser.add_argument('--repair_amount_downstream_grad_scale', default=10.0, type=float, help='Amount ratioから実際の点操作へ向かう下流勾配だけを強める倍率。forward値は変えず、backwardだけ強める')
     parser.add_argument('--repair_drop_amount_downstream_grad_scale', default=120.0, type=float, help='Prune Amount ratioから実際の削除操作へ向かう下流勾配だけを強める倍率')
@@ -697,6 +758,36 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--sparsepcgc_match_qs', default=False, type=str2bool, help='SparsePCGCの有効量子化幅を--qsに合わせる（SparsePCGC本体条件を優先するならFalse）')
     parser.add_argument('--sparsepcgc_voxel_size', default=1.0, type=float, help='SparsePCGC load_sparse_tensorのvoxel_size')
     parser.add_argument('--sparsepcgc_pos_quantscale', default=1, type=int, help='SparsePCGC posQuantscale')
+    parser.add_argument(
+        '--sparsepcgc_dequantize_center',
+        default=False,
+        type=str2bool,
+        help='canonical voxel coordsからxyzへ戻すときにvoxel中心へ半step寄せるか',
+    )
+    parser.add_argument(
+        '--sparsepcgc_restore_points_debug',
+        default=False,
+        type=str2bool,
+        help='canonical voxel coordsから復元した点群のdebugログを出す',
+    )
+    parser.add_argument(
+        '--sparsepcgc_restore_unique_voxels',
+        default=True,
+        type=str2bool,
+        help='voxel coordsから点群復元するときに重複voxelを1点へまとめる',
+    )
+    parser.add_argument(
+        '--sparsepcgc_restore_points_max_log',
+        default=5,
+        type=int,
+        help='復元点群debugで表示するサンプル数',
+    )
+    parser.add_argument(
+        '--sparsepcgc_quant_mode',
+        default='round_voxel_then_pos',
+        type=str,
+        help='SparsePCGC互換canonical voxel座標の量子化方式。既定は round(xyz/voxel_size) 後に round(/posQuantscale) を行う',
+    )
     parser.add_argument('--sparsepcgc_psnr_resolution', default=1023, type=int, help='SparsePCGC lossy評価用PSNR resolution')
     parser.add_argument('--sparsepcgc_test_d2', default=False, type=str2bool, help='SparsePCGC lossy評価でD2を計算するか')
     parser.add_argument('--sparsepcgc_dense_scale_ae_list', default='1,0,1,0,1,0', type=str, help='SparsePCGC dense_lossy用AE scale list')
@@ -1409,6 +1500,20 @@ def parse_pugan_args(parser, file_day, file_time):
     args.sparsepcgc_voxel_size = max(float(getattr(args, "sparsepcgc_voxel_size", 1.0)), 1e-12)
     args.sparsepcgc_pos_quantscale = max(int(getattr(args, "sparsepcgc_pos_quantscale", 1)), 1)
     args.sparsepcgc_effective_qs = float(args.sparsepcgc_voxel_size) * float(args.sparsepcgc_pos_quantscale)
+    args.repair_voxel_edit_state = bool(getattr(args, "repair_voxel_edit_state", True))
+    args.repair_voxel_move_as_relocate = bool(getattr(args, "repair_voxel_move_as_relocate", True))
+    args.repair_voxel_edit_require_empty_move_target = bool(
+        getattr(args, "repair_voxel_edit_require_empty_move_target", True)
+    )
+    args.repair_voxel_edit_unique_targets = bool(getattr(args, "repair_voxel_edit_unique_targets", True))
+    args.repair_voxel_edit_debug = bool(getattr(args, "repair_voxel_edit_debug", False))
+    args.sparsepcgc_dequantize_center = bool(getattr(args, "sparsepcgc_dequantize_center", False))
+    args.sparsepcgc_restore_points_debug = bool(getattr(args, "sparsepcgc_restore_points_debug", False))
+    args.sparsepcgc_restore_unique_voxels = bool(getattr(args, "sparsepcgc_restore_unique_voxels", True))
+    args.sparsepcgc_restore_points_max_log = max(int(getattr(args, "sparsepcgc_restore_points_max_log", 5)), 0)
+    args.sparsepcgc_quant_mode = str(
+        getattr(args, "sparsepcgc_quant_mode", "round_voxel_then_pos")
+    ).strip().lower()
     args.sparsepcgc_dense_scale_ae_list = _parse_csv_ints(args.sparsepcgc_dense_scale_ae_list)
     args.sparsepcgc_dense_scale_sr_list = _parse_csv_ints(args.sparsepcgc_dense_scale_sr_list)
     args.sparsepcgc_pos_quantscale_list = _parse_csv_ints(args.sparsepcgc_pos_quantscale_list)

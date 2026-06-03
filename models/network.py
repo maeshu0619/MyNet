@@ -7,6 +7,11 @@ from .utils.pointcloud import utils_repkpu
 from .utils.pointcloud.utils_repkpu import get_knn_pts, index_points
 from .utils.pointcloud.octree_subtree import assign_octree_subtree_keys, subtree_membership_mask
 from .utils.pointcloud.sparse_tensor import build_sparse_point_tensor_single
+from .utils.pointcloud.sparsepcgc_voxel import (
+    quantize_sparsepcgc_coords,
+    unique_voxel_coords_batched,
+    restore_points_from_voxel_coords,
+)
 from .modules.cause_aggregation import CauseDiagnosisAggregation
 from .modules.cost_attribution import CAUSE_NAMES, CostAttributionModule
 from .modules.octree_structure import OctreeStructureAnalysis
@@ -153,6 +158,267 @@ class Network(nn.Module):
         if int(first_sorted_idx.numel()) != int(num_unique):
             raise RuntimeError("Failed to recover one representative index per voxel.")
         return first_sorted_idx
+
+    """Node/Voxel入力用関数"""
+    @staticmethod
+    def _normalize_node_voxel_coords(coords, device=None):
+        if coords is None:
+            return None
+        if not torch.is_tensor(coords):
+            coords = torch.as_tensor(coords)
+        if device is not None:
+            coords = coords.to(device=device)
+        if coords.ndim == 2:
+            if coords.shape[0] == 3:
+                coords = coords.unsqueeze(0)
+            elif coords.shape[1] == 3:
+                coords = coords.transpose(0, 1).contiguous().unsqueeze(0)
+            else:
+                return None
+        elif coords.ndim == 3:
+            if coords.shape[1] == 3:
+                coords = coords.contiguous()
+            elif coords.shape[2] == 3:
+                coords = coords.permute(0, 2, 1).contiguous()
+            else:
+                return None
+        else:
+            return None
+        return coords.to(dtype=torch.long).contiguous()
+
+    @staticmethod
+    def _first_tensor_from_dict(dict_obj, keys):
+        if not isinstance(dict_obj, dict):
+            return None
+        for key in keys:
+            value = dict_obj.get(key, None)
+            if torch.is_tensor(value):
+                return value
+        return None
+
+    @staticmethod
+    def _first_value_from_dict(dict_obj, keys):
+        if not isinstance(dict_obj, dict):
+            return None
+        for key in keys:
+            if key in dict_obj and dict_obj.get(key, None) is not None:
+                return dict_obj.get(key)
+        return None
+
+    def _fit_feature_channels(self, feature, target_channels):
+        if feature.shape[1] == int(target_channels):
+            return feature
+        if feature.shape[1] > int(target_channels):
+            return feature[:, :int(target_channels), :].contiguous()
+        pad = feature.new_zeros(
+            feature.shape[0],
+            int(target_channels) - feature.shape[1],
+            feature.shape[2],
+        )
+        return torch.cat([feature, pad], dim=1).contiguous()
+
+    def _build_node_features_from_voxel_coords(self, coords_b3n, pts_xyz, node_mask=None):
+        coords_f = coords_b3n.to(device=pts_xyz.device, dtype=pts_xyz.dtype)
+        if coords_f.shape[-1] <= 0:
+            return pts_xyz.new_zeros((pts_xyz.shape[0], int(getattr(self.args, "fused_feat_dim", getattr(self.args, "out_dim", 64))), 0))
+
+        if node_mask is not None and torch.is_tensor(node_mask):
+            mask = node_mask.to(device=pts_xyz.device, dtype=torch.bool)
+            if mask.ndim == 3:
+                mask = mask.squeeze(1)
+        else:
+            mask = torch.ones((coords_f.shape[0], coords_f.shape[-1]), device=pts_xyz.device, dtype=torch.bool)
+
+        valid_f = mask.unsqueeze(1).to(dtype=coords_f.dtype)
+        denom = valid_f.sum(dim=2, keepdim=True).clamp_min(1.0)
+        mean = (coords_f * valid_f).sum(dim=2, keepdim=True) / denom
+        centered = coords_f - mean
+        span = centered.abs().amax(dim=2, keepdim=True).clamp_min(1.0)
+        norm = centered / span
+
+        radius = torch.linalg.norm(norm, dim=1, keepdim=True).clamp(0.0, 4.0) / 4.0
+        parity = (coords_b3n.remainder(2).to(dtype=pts_xyz.dtype) * 2.0) - 1.0
+        depth_proxy = torch.linalg.norm(coords_f - coords_f.amin(dim=2, keepdim=True), dim=1, keepdim=True)
+        depth_proxy = depth_proxy / depth_proxy.amax(dim=2, keepdim=True).clamp_min(1.0)
+
+        base_feature = torch.cat(
+            [
+                norm,
+                norm.abs(),
+                radius,
+                parity,
+                depth_proxy,
+                valid_f,
+            ],
+            dim=1,
+        )
+        return self._fit_feature_channels(
+            base_feature,
+            int(getattr(self.args, "fused_feat_dim", getattr(self.args, "out_dim", 64))),
+        )
+
+    def _build_node_voxel_input(
+        self,
+        pts_xyz,
+        coord_scale=None,
+        subtree_tree=None,
+        full_octree_context=None,
+        octree_input_mode="auto",
+    ):
+        """
+        subtree_tree/full_octree_context/canonical voxel coordsから
+        Network用のnode/voxel featureを作る。
+        """
+        debug = {
+            "network_voxel_node_input_requested": bool(getattr(self.args, "network_voxel_node_input", False)),
+            "network_voxel_node_input_used": False,
+            "network_voxel_node_fallback": False,
+            "network_voxel_node_fallback_reason": "",
+            "network_voxel_node_count": 0,
+            "network_voxel_node_source": "none",
+            "network_voxel_node_feature_shape": "",
+        }
+
+        if not bool(getattr(self.args, "network_voxel_node_input", False)):
+            debug["network_voxel_node_fallback_reason"] = "disabled_by_args"
+            return None, debug
+
+        allow_fallback = bool(getattr(self.args, "network_voxel_node_fallback_point", True))
+        use_subtree = bool(getattr(self.args, "voxel_node_use_subtree_context", True))
+        use_full = bool(getattr(self.args, "voxel_node_use_full_context", True))
+
+        coords_raw = None
+        source = "none"
+
+        if use_subtree and isinstance(subtree_tree, dict):
+            coords_raw = self._first_tensor_from_dict(
+                subtree_tree,
+                (
+                    "global_voxel_coords",
+                    "subtree_global_voxel_coords",
+                    "occupied_voxel_coords",
+                    "full_global_voxel_coords",
+                ),
+            )
+            if coords_raw is not None:
+                source = "subtree_tree"
+
+        if coords_raw is None and use_full and isinstance(full_octree_context, dict):
+            coords_raw = self._first_tensor_from_dict(
+                full_octree_context,
+                (
+                    "global_voxel_coords",
+                    "full_global_voxel_coords",
+                    "full_occupied_voxel_coords",
+                    "occupied_voxel_coords",
+                ),
+            )
+            if coords_raw is not None:
+                source = "full_octree_context"
+
+        meta = None
+        if coords_raw is None:
+            # full/subtree文脈が無い場合は、Phase1のcanonical量子化だけを試す。
+            # full cloud anchorではsubtree_tree/full_octree_contextが無いので、
+            # fallback許可時は点群経路へ戻す。
+            if subtree_tree is None and full_octree_context is None and allow_fallback:
+                debug["network_voxel_node_fallback"] = True
+                debug["network_voxel_node_fallback_reason"] = "missing_subtree_and_full_context"
+                return None, debug
+
+            try:
+                q_result = quantize_sparsepcgc_coords(
+                    pts_xyz,
+                    self.args,
+                    coord_scale=coord_scale,
+                    offset=None,
+                    return_metadata=True,
+                )
+                if isinstance(q_result, tuple) and len(q_result) == 2:
+                    coords_raw, meta = q_result
+                else:
+                    coords_raw = q_result
+                source = "canonical_quantize"
+            except Exception as exc:
+                if allow_fallback:
+                    debug["network_voxel_node_fallback"] = True
+                    debug["network_voxel_node_fallback_reason"] = f"canonical_quantize_failed:{type(exc).__name__}"
+                    return None, debug
+                raise
+
+        coords_b3n = self._normalize_node_voxel_coords(coords_raw, device=pts_xyz.device)
+        if coords_b3n is None or coords_b3n.shape[-1] <= 0:
+            if allow_fallback:
+                debug["network_voxel_node_fallback"] = True
+                debug["network_voxel_node_fallback_reason"] = "invalid_or_empty_voxel_coords"
+                return None, debug
+            raise ValueError("Node/Voxel input requested but voxel coords are invalid or empty.")
+
+        unique_result = unique_voxel_coords_batched(coords_b3n)
+        voxel_coords = unique_result["coords"].to(device=pts_xyz.device, dtype=torch.long)
+        node_mask = unique_result["valid_mask"].to(device=pts_xyz.device, dtype=torch.bool)
+        node_counts = unique_result["counts"].to(device=pts_xyz.device, dtype=torch.long)
+
+        if isinstance(meta, dict):
+            restore_meta = dict(meta)
+        else:
+            restore_meta = {}
+
+        context_for_meta = subtree_tree if isinstance(subtree_tree, dict) else full_octree_context
+        if isinstance(context_for_meta, dict):
+            global_qs = self._first_value_from_dict(context_for_meta, ("global_qs", "effective_qs"))
+            global_offset = self._first_value_from_dict(context_for_meta, ("global_offset", "global_offset_tensor"))
+            if global_qs is not None:
+                restore_meta["global_qs"] = global_qs
+            if global_offset is not None:
+                restore_meta["global_offset"] = global_offset
+
+        try:
+            node_xyz, restore_info = restore_points_from_voxel_coords(
+                voxel_coords,
+                meta=restore_meta if restore_meta else None,
+                args=self.args,
+                center=bool(getattr(self.args, "sparsepcgc_dequantize_center", False)),
+                unique=False,
+                dtype=pts_xyz.dtype,
+                device=pts_xyz.device,
+            )
+        except Exception as exc:
+            if allow_fallback:
+                debug["network_voxel_node_fallback"] = True
+                debug["network_voxel_node_fallback_reason"] = f"restore_failed:{type(exc).__name__}"
+                return None, debug
+            raise
+
+        node_features = self._build_node_features_from_voxel_coords(
+            voxel_coords,
+            pts_xyz=pts_xyz,
+            node_mask=node_mask,
+        )
+
+        debug.update(
+            {
+                "network_voxel_node_input_used": True,
+                "network_voxel_node_fallback": False,
+                "network_voxel_node_fallback_reason": "",
+                "network_voxel_node_count": int(node_xyz.shape[-1]),
+                "network_voxel_node_source": str(source),
+                "network_voxel_node_feature_shape": str(tuple(node_features.shape)),
+            }
+        )
+
+        return {
+            "voxel_coords": voxel_coords,
+            "node_xyz": node_xyz,
+            "node_features": node_features,
+            "node_mask": node_mask,
+            "node_counts": node_counts,
+            "global_qs": restore_meta.get("global_qs", None),
+            "global_offset": restore_meta.get("global_offset", None),
+            "restore_meta": restore_meta,
+            "restore_info": restore_info,
+            "source": str(source),
+        }, debug
 
     """Encoder用関数"""
     def _voxel_downsample_single(self, pts_xyz, coord_scale): # 1つの点群サンプルに対して、Voxel DownSamplingを行う関数
@@ -594,6 +860,19 @@ class Network(nn.Module):
             raise ValueError("pts_xyz must have shape [B, 3, N]")
 
         self.last_actuator_voxel_state = None
+        original_pts_xyz = pts_xyz
+        original_pts_attr = pts_attr
+        node_voxel_input_state = None
+        node_voxel_debug = {
+            "network_voxel_node_input_requested": bool(getattr(self.args, "network_voxel_node_input", False)),
+            "network_voxel_node_input_used": False,
+            "network_voxel_node_fallback": False,
+            "network_voxel_node_fallback_reason": "not_evaluated",
+            "network_voxel_node_count": 0,
+            "network_voxel_node_source": "none",
+            "network_voxel_node_feature_shape": "",
+        }
+
         try:
             setattr(self.args, "_last_actuator_voxel_state", None)
         except Exception:
@@ -646,15 +925,76 @@ class Network(nn.Module):
             runtime_t0 = time.time()
             
         """Encoder"""
-        encode_state = self._encode(pts_xyz, coord_scale=coord_scale) # 入力点群を_encodeに渡して特徴抽出を行う
+        if bool(getattr(self.args, "network_voxel_node_input", False)):
+            node_voxel_input_state, node_voxel_debug = self._build_node_voxel_input(
+                pts_xyz,
+                coord_scale=coord_scale,
+                subtree_tree=subtree_tree,
+                full_octree_context=full_octree_context,
+                octree_input_mode=octree_input_mode,
+            )
+            if node_voxel_input_state is not None:
+                pts_xyz = node_voxel_input_state["node_xyz"].to(device=pts_xyz.device, dtype=pts_xyz.dtype)
+                pts_attr = None
+                selection_mask = node_voxel_input_state["node_mask"]
+                prebuilt_subtree_mode = False
+                full_unit_keys = None
+                prebuilt_repair_unit_keys = None
+                prebuilt_subtree_keys = None
+
+        """Encoder"""
+        if node_voxel_input_state is not None:
+            fused_feat_node = node_voxel_input_state["node_features"].to(device=pts_xyz.device, dtype=pts_xyz.dtype)
+            encode_state = {
+                "fused_feat": fused_feat_node,
+                "local_feat": fused_feat_node,
+                "analysis_xyz": pts_xyz,
+                "analysis_counts": [
+                    int(count.detach().cpu()) if torch.is_tensor(count) else int(count)
+                    for count in node_voxel_input_state["node_counts"]
+                ],
+                "encoder_counts": [
+                    int(count.detach().cpu()) if torch.is_tensor(count) else int(count)
+                    for count in node_voxel_input_state["node_counts"]
+                ],
+                "full_counts": [
+                    int(count.detach().cpu()) if torch.is_tensor(count) else int(count)
+                    for count in node_voxel_input_state["node_counts"]
+                ],
+                "raw_counts": [
+                    int(original_pts_xyz.shape[-1])
+                    for _ in range(int(pts_xyz.shape[0]))
+                ],
+                "pre_sparse_counts": [
+                    int(count.detach().cpu()) if torch.is_tensor(count) else int(count)
+                    for count in node_voxel_input_state["node_counts"]
+                ],
+                "voxel_sizes": [0.0 for _ in range(int(pts_xyz.shape[0]))],
+                "kept_sparse_after_encoder": False,
+            }
+        else:
+            encode_state = self._encode(pts_xyz, coord_scale=coord_scale)
+
         if timing_enabled:
             self._sync_if_cuda_tensor(pts_xyz)
             runtime_encode_end = time.time()
         fused_feat = encode_state["fused_feat"] # 統合抽出
         analysis_xyz = encode_state["analysis_xyz"] # Octree構造解析に使う点群座標を取り出す
         analysis_counts = encode_state["analysis_counts"] # analysis_xyzの有効点数をバッチごとに取り出す
-        keep_sparse_path = encode_state["kept_sparse_after_encoder"] # Encoder後もSparse Tensor側の点群を規準に処理するかどうかを取り出す
-        if prebuilt_subtree_mode:
+        keep_sparse_path = bool(encode_state.get("kept_sparse_after_encoder", False))
+        if node_voxel_input_state is not None:
+            analysis_unit_keys = None
+            analysis_subtree_keys = None
+            if isinstance(node_voxel_input_state.get("voxel_coords", None), torch.Tensor):
+                coords_for_keys = node_voxel_input_state["voxel_coords"]
+                if coords_for_keys.ndim == 3 and coords_for_keys.shape[1] == 3:
+                    coords_key = coords_for_keys[:, 0, :].to(torch.long) * 73856093
+                    coords_key = coords_key + coords_for_keys[:, 1, :].to(torch.long) * 19349663
+                    coords_key = coords_key + coords_for_keys[:, 2, :].to(torch.long) * 83492791
+                    analysis_unit_keys = coords_key
+                    analysis_subtree_keys = coords_key
+
+        elif prebuilt_subtree_mode:
             analysis_unit_keys = self._tree_point_keys(
                 subtree_tree,
                 ("repair_unit_keys", "point_node_ids"),
@@ -669,17 +1009,23 @@ class Network(nn.Module):
                 analysis_xyz.shape[2],
                 analysis_xyz.device,
             )
-        else:
-            analysis_unit_keys = assign_octree_subtree_keys(analysis_xyz, subtree_ref) if subtree_ref is not None else None # 解析用点群に対してSubtree Keyを割り当てる
-            analysis_subtree_keys = analysis_unit_keys
-        analysis_selection_mask = subtree_membership_mask(analysis_subtree_keys, selected_subtree_keys) if analysis_subtree_keys is not None and selected_subtree_keys is not None else None # 解析用点群に対して、選択されたSubtreeに属する点だけを示すマスクを作る
 
-        if timing_enabled: # 時間計測が有効か否か
+        else:
+            analysis_unit_keys = assign_octree_subtree_keys(analysis_xyz, subtree_ref) if subtree_ref is not None else None
+            analysis_subtree_keys = analysis_unit_keys
+
+        analysis_selection_mask = (
+            subtree_membership_mask(analysis_subtree_keys, selected_subtree_keys)
+            if analysis_subtree_keys is not None and selected_subtree_keys is not None
+            else None
+        )
+        if timing_enabled:
             self._sync_if_cuda_tensor(pts_xyz)
             runtime_structure_start = time.time()
-            runtime_diagnosis_total = 0.0
-            runtime_attribution_total = 0.0
-            runtime_decision_total = 0.0
+
+        runtime_diagnosis_total = 0.0
+        runtime_attribution_total = 0.0
+        runtime_decision_total = 0.0
 
         if keep_sparse_path: # Sparse Tensor側の点群を規準として構造解析を行うか否か
             """変数の初期化"""
@@ -928,6 +1274,17 @@ class Network(nn.Module):
             self._sync_if_cuda_tensor(pts_xyz)
             runtime_structure_end = time.time()
 
+        if node_voxel_input_state is not None and isinstance(structure, dict):
+            structure["network_voxel_node_input_used"] = True
+            structure["network_voxel_node_state"] = node_voxel_input_state
+            structure["network_voxel_coords"] = node_voxel_input_state.get("voxel_coords", None)
+            structure["network_voxel_node_mask"] = node_voxel_input_state.get("node_mask", None)
+            structure["network_voxel_node_source"] = node_voxel_input_state.get("source", "unknown")
+            if node_voxel_input_state.get("global_qs", None) is not None:
+                structure["global_qs"] = node_voxel_input_state.get("global_qs", None)
+            if node_voxel_input_state.get("global_offset", None) is not None:
+                structure["global_offset"] = node_voxel_input_state.get("global_offset", None)
+
         """点操作実行"""
         actuator_input = torch.cat([structure_feat_full, subtree_scores_full, policy_probs_full, repair_priority_full], dim=1) # 構造特徴、原因スコアなどをチャネル方向に結合
         pts_out, final_w, edit_loss, actuator_stats = self.actuator( # 実際に点操作を行う
@@ -949,8 +1306,24 @@ class Network(nn.Module):
                 "initial_voxel_coords",
                 "final_voxel_coords",
                 "final_voxel_weights",
+                "final_voxel_valid_mask",
                 "voxel_step",
                 "voxel_offset",
+                "voxel_edit_mode",
+                "voxel_edit_state_enabled",
+                "voxel_edit_initial_count",
+                "voxel_edit_final_count",
+                "voxel_edit_drop_count",
+                "voxel_edit_add_count",
+                "voxel_edit_move_count",
+                "voxel_edit_same_voxel_move_rejected",
+                "voxel_edit_existing_target_rejected",
+                "voxel_edit_duplicate_target_rejected",
+                "voxel_edit_child_slot_rejected",
+                "voxel_edit_empty_target_rejected",
+                "point_aligned_initial_voxel_coords",
+                "point_aligned_final_voxel_coords",
+                "point_aligned_final_voxel_weights",
             )
             if actuator_stats.get(key, None) is not None
         }
@@ -975,6 +1348,44 @@ class Network(nn.Module):
             setattr(self.args, "_last_actuator_voxel_state", self.last_actuator_voxel_state)
         except Exception:
             pass
+        # Phase3: occupied voxel編集状態をdebug_tensorsからも参照できるようにする。
+        for key in (
+            "final_voxel_coords",
+            "final_voxel_weights",
+            "final_voxel_valid_mask",
+            "voxel_edit_mode",
+            "voxel_edit_state_enabled",
+            "voxel_edit_initial_count",
+            "voxel_edit_final_count",
+            "voxel_edit_drop_count",
+            "voxel_edit_add_count",
+            "voxel_edit_move_count",
+        ):
+            if key in actuator_voxel_state:
+                self.debug_tensors[key] = actuator_voxel_state[key]
+        if node_voxel_input_state is not None:
+            for key in (
+                "voxel_coords",
+                "node_features",
+                "node_mask",
+                "node_counts",
+            ):
+                value = node_voxel_input_state.get(key, None)
+                if torch.is_tensor(value):
+                    self.debug_tensors[f"network_voxel_node_{key}"] = value
+
+        # Phase2: Actuator側で作ったcanonical voxel復元debugをNetwork側にも保存する。
+        # 戻り値形式は変えない。
+        if isinstance(actuator_stats, dict):
+            for key in (
+                "canonical_voxel_coords_before",
+                "canonical_voxel_coords_after",
+                "voxel_restore_meta",
+                "restored_xyz_debug",
+                "restore_info",
+            ):
+                if key in actuator_stats:
+                    self.debug_tensors[key] = actuator_stats[key]
 
         actuator_local_value = actuator_stats.get("local_recomputed", False)
         if torch.is_tensor(actuator_local_value):
@@ -999,6 +1410,11 @@ class Network(nn.Module):
                 f"actuator_voxel_mode={actuator_stats.get('actuator_voxel_mode', 'unknown')}, "
                 f"cause_aggregation_unit_mode={cause_aggregation_unit_mode}, "
                 f"local_recomputed={forward_local_recomputed}"
+                f", voxel_node_used={bool(node_voxel_debug.get('network_voxel_node_input_used', False))}, "
+                f"voxel_node_fallback={bool(node_voxel_debug.get('network_voxel_node_fallback', False))}, "
+                f"voxel_node_reason={node_voxel_debug.get('network_voxel_node_fallback_reason', '')}, "
+                f"voxel_node_count={int(node_voxel_debug.get('network_voxel_node_count', 0) or 0)}, "
+                f"voxel_node_source={node_voxel_debug.get('network_voxel_node_source', 'none')}"
             )
         soft_term_keys = (
             "add_prob_mean",
@@ -1089,6 +1505,42 @@ class Network(nn.Module):
             loss_repair = pts_xyz.new_zeros(())
 
         out_label = pts_xyz.new_zeros((pts_xyz.shape[0], pts_xyz.shape[2]))
+        if isinstance(actuator_stats, dict):
+            out_label = {
+                "point_label": out_label,
+                "canonical_voxel_coords_before": actuator_stats.get("canonical_voxel_coords_before", None),
+                "canonical_voxel_coords_after": actuator_stats.get("canonical_voxel_coords_after", None),
+                "voxel_restore_meta": actuator_stats.get("voxel_restore_meta", None),
+                "restored_xyz_debug": actuator_stats.get("restored_xyz_debug", None),
+                "restore_info": actuator_stats.get("restore_info", None),
+            }
+            if node_voxel_input_state is not None:
+                out_label["network_voxel_node_input_used"] = True
+                out_label["network_voxel_coords"] = node_voxel_input_state.get("voxel_coords", None)
+                out_label["network_voxel_node_mask"] = node_voxel_input_state.get("node_mask", None)
+                out_label["network_voxel_node_restore_info"] = node_voxel_input_state.get("restore_info", None)
+                if bool(getattr(self.args, "voxel_node_restore_output_debug", False)):
+                    final_coords_for_restore = actuator_voxel_state.get("final_voxel_coords", None)
+                    final_meta_for_restore = (
+                        actuator_stats.get("voxel_restore_meta", None)
+                        or node_voxel_input_state.get("restore_meta", None)
+                    )
+                    if final_coords_for_restore is not None:
+                        try:
+                            restored_voxel_xyz, restored_voxel_info = restore_points_from_voxel_coords(
+                                final_coords_for_restore,
+                                meta=final_meta_for_restore,
+                                args=self.args,
+                                center=bool(getattr(self.args, "sparsepcgc_dequantize_center", False)),
+                                unique=True,
+                                dtype=pts_xyz.dtype,
+                                device=pts_xyz.device,
+                            )
+                            out_label["network_voxel_node_restored_xyz_debug"] = restored_voxel_xyz
+                            out_label["network_voxel_node_restored_info"] = restored_voxel_info
+                        except Exception as exc:
+                            out_label["network_voxel_node_restore_error"] = f"{type(exc).__name__}:{str(exc)[:160]}"
+
         repair_gate = actuator_stats["repair_gate"]
 
         """問題スコアの算出"""
@@ -1156,6 +1608,14 @@ class Network(nn.Module):
                     "final_voxel_recomputed_from_pts_out": bool(
                         actuator_stats.get("final_voxel_recomputed_from_pts_out", True)
                     ),
+                    "voxel_edit_state_enabled": bool(actuator_stats.get("voxel_edit_state_enabled", False)),
+                    "voxel_edit_mode": str(actuator_stats.get("voxel_edit_mode", "unknown")),
+                    "voxel_edit_initial_count": int(actuator_stats.get("voxel_edit_initial_count", 0)),
+                    "voxel_edit_final_count": int(actuator_stats.get("voxel_edit_final_count", 0)),
+                    "voxel_edit_drop_count": int(actuator_stats.get("voxel_edit_drop_count", 0)),
+                    "voxel_edit_add_count": int(actuator_stats.get("voxel_edit_add_count", 0)),
+                    "voxel_edit_move_count": int(actuator_stats.get("voxel_edit_move_count", 0)),
+
                     "actuator_full_octree_context_available": bool(actuator_stats.get("full_octree_context_available", False)),
                     "actuator_parent_occupancy_code": int(actuator_stats.get("actuator_parent_occupancy_code", 0)),
                     "actuator_sibling_count": int(actuator_stats.get("actuator_sibling_count", 0)),
@@ -1298,6 +1758,13 @@ class Network(nn.Module):
                     "use_subtree_tree": bool(subtree_tree is not None),
                     "use_full_octree_context": bool(full_octree_context is not None),
                     "octree_input_mode": str(structure.get("octree_input_mode", "local_recomputed")),
+                    "network_voxel_node_input_requested": bool(node_voxel_debug.get("network_voxel_node_input_requested", False)),
+                    "network_voxel_node_input_used": bool(node_voxel_debug.get("network_voxel_node_input_used", False)),
+                    "network_voxel_node_fallback": bool(node_voxel_debug.get("network_voxel_node_fallback", False)),
+                    "network_voxel_node_fallback_reason": str(node_voxel_debug.get("network_voxel_node_fallback_reason", "")),
+                    "network_voxel_node_count": int(node_voxel_debug.get("network_voxel_node_count", 0) or 0),
+                    "network_voxel_node_source": str(node_voxel_debug.get("network_voxel_node_source", "none")),
+                    "network_voxel_node_feature_shape": str(node_voxel_debug.get("network_voxel_node_feature_shape", "")),
                     "octree_input_mode_requested": str(structure.get("octree_input_mode_requested", octree_input_mode)),
                     "structural_voxel_mode": str(structure.get("structural_voxel_mode", "local_recomputed")),
                     "point_feature_voxel_mode": str(structure.get("point_feature_voxel_mode", "local_xyz")),
@@ -1318,7 +1785,15 @@ class Network(nn.Module):
                     "exact_teacher_fallback_reason": str(getattr(self.args, "_current_exact_teacher_fallback_reason", "")),
                 }
         else:
-            self.last_structure_debug = {}
+            self.last_structure_debug = {
+                "network_voxel_node_input_requested": bool(node_voxel_debug.get("network_voxel_node_input_requested", False)),
+                "network_voxel_node_input_used": bool(node_voxel_debug.get("network_voxel_node_input_used", False)),
+                "network_voxel_node_fallback": bool(node_voxel_debug.get("network_voxel_node_fallback", False)),
+                "network_voxel_node_fallback_reason": str(node_voxel_debug.get("network_voxel_node_fallback_reason", "")),
+                "network_voxel_node_count": int(node_voxel_debug.get("network_voxel_node_count", 0) or 0),
+                "network_voxel_node_source": str(node_voxel_debug.get("network_voxel_node_source", "none")),
+                "network_voxel_node_feature_shape": str(node_voxel_debug.get("network_voxel_node_feature_shape", "")),
+            }
 
         if timing_enabled:
             actuator_runtime = getattr(self.actuator, "last_runtime_timing", {}) or {}

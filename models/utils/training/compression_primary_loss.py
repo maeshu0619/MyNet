@@ -102,6 +102,10 @@ def build_compression_primary_loss(
     L_nodes = as_scalar_loss_tensor(terms.get("node", None))
     L_op = as_scalar_loss_tensor(terms.get("op", None))
 
+    L_full_context_subtree_delta = as_scalar_loss_tensor(
+        terms.get("full_context_subtree_delta", None)
+    )
+
     P_geom = relu_penalty(as_scalar_loss_tensor(L_geom), getattr(args, "cp_tau_geom", 0.06))
     P_single = relu_penalty(L_single, getattr(args, "cp_tau_single", 0.0)) if L_single is not None else zero
     P_nodes = relu_penalty(L_nodes, getattr(args, "cp_tau_nodes", 0.0)) if L_nodes is not None else zero
@@ -140,6 +144,11 @@ def build_compression_primary_loss(
         + sf_repair * float(getattr(args, "cp_lambda_actuator", 0.1)) * P_actuator
         + sf_repair * float(getattr(args, "cp_lambda_op", 0.0)) * P_op
         + sf_com * single_delta_penalty_weight * single_delta_penalty
+        + sf_com * (
+            L_full_context_subtree_delta
+            if L_full_context_subtree_delta is not None
+            else zero
+        )
     )
 
     debug = {
@@ -154,6 +163,10 @@ def build_compression_primary_loss(
         "cp_P_sparsepcgc": case_float(P_sparsepcgc, float("nan")),
         "cp_P_actuator": case_float(P_actuator, float("nan")),
         "cp_P_op": case_float(P_op, float("nan")),
+        "cp_full_context_subtree_delta": case_float(
+            L_full_context_subtree_delta if L_full_context_subtree_delta is not None else zero,
+            0.0,
+        ),
         "node_loss_weight_raw": float(node_weight_raw),
         "node_loss_weight_effective": float(node_weight_effective),
         "single_loss_weight_raw": float(single_weight_raw),
@@ -171,6 +184,7 @@ def build_compression_primary_loss(
         "cp_sparsepcgc_requires_grad": term_requires_grad(L_sparsepcgc),
         "cp_actuator_requires_grad": term_requires_grad(L_actuator),
         "cp_op_requires_grad": term_requires_grad(L_op),
+        "cp_full_context_subtree_delta_requires_grad": term_requires_grad(L_full_context_subtree_delta),
         "cp_main_finite": term_is_finite(L_com_main),
         "cp_geom_finite": term_is_finite(L_geom),
         "cp_single_finite": term_is_finite(L_single) if L_single is not None else True,
@@ -178,6 +192,11 @@ def build_compression_primary_loss(
         "cp_sparsepcgc_finite": term_is_finite(L_sparsepcgc) if L_sparsepcgc is not None else True,
         "cp_actuator_finite": term_is_finite(L_actuator),
         "cp_op_finite": term_is_finite(L_op) if L_op is not None else True,
+        "cp_full_context_subtree_delta_finite": (
+            term_is_finite(L_full_context_subtree_delta)
+            if L_full_context_subtree_delta is not None
+            else True
+        ),
     }
     return L, sf_com * L_com_primary, debug
 
@@ -195,6 +214,7 @@ def log_compression_primary_terms(writer, step, num_steps, cp_debug):
         f"P_sparsepcgc={float(cp_debug.get('cp_P_sparsepcgc', 0.0)):.6f}, "
         f"P_actuator={float(cp_debug.get('cp_P_actuator', 0.0)):.6f}, "
         f"P_op={float(cp_debug.get('cp_P_op', 0.0)):.6f}, "
+        f"full_context_subtree_delta={float(cp_debug.get('cp_full_context_subtree_delta', 0.0)):.6f}, "
         f"node_w={float(cp_debug.get('node_loss_weight_effective', 0.0)):.6f}/"
         f"{float(cp_debug.get('node_loss_weight_raw', 0.0)):.6f}, "
         f"single_w={float(cp_debug.get('single_loss_weight_effective', 0.0)):.6f}/"
@@ -207,6 +227,7 @@ def log_compression_primary_terms(writer, step, num_steps, cp_debug):
         f"single={bool(cp_debug.get('cp_single_requires_grad', False))}, "
         f"nodes={bool(cp_debug.get('cp_nodes_requires_grad', False))}, "
         f"sparsepcgc={bool(cp_debug.get('cp_sparsepcgc_requires_grad', False))}, "
+        f"full_context_subtree_delta={bool(cp_debug.get('cp_full_context_subtree_delta_requires_grad', False))}, "
         f"actuator={bool(cp_debug.get('cp_actuator_requires_grad', False))}, "
         f"op={bool(cp_debug.get('cp_op_requires_grad', False))}], "
         "finite["

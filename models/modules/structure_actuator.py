@@ -3,6 +3,13 @@ import time
 
 import torch
 import torch.nn as nn
+from models.utils.pointcloud.sparsepcgc_voxel import (
+    canonical_sparsepcgc_voxel_coords,
+    restore_points_from_voxel_coords,
+    sparsepcgc_effective_qs_value,
+    sparsepcgc_effective_qs_tensor,
+    sparsepcgc_voxel_size_tensor,
+)
 
 class StructureRepairActuator(nn.Module):
     """Apply small geometry-preserving movements that realize repair policies.
@@ -122,23 +129,44 @@ class StructureRepairActuator(nn.Module):
         # 初期Octree/Subtreeメタデータがある場合は、そのglobal_qs/global_offsetを優先する。
         # これにより、Network入力前に作ったVoxel座標系をActuator内でも維持する。
         if isinstance(octree_context, dict):
-            if "global_qs" in octree_context:
-                qs_value = float(octree_context.get("global_qs", self._effective_qs()))
+            qs_raw = octree_context.get("global_qs", self._effective_qs())
+
+            if torch.is_tensor(qs_raw):
+                step = qs_raw.to(device=pts_xyz.device, dtype=pts_xyz.dtype).reshape(-1, 1, 1)
+                if step.shape[0] == 1 and pts_xyz.shape[0] > 1:
+                    step = step.expand(pts_xyz.shape[0], -1, -1)
+                if step.shape[0] != pts_xyz.shape[0]:
+                    raise ValueError("octree_context['global_qs'] batch size does not match pts_xyz.")
+                step = step.clamp_min(1e-9)
             else:
-                qs_value = float(self._effective_qs())
+                qs_value = max(float(qs_raw), 1e-9)
+                step = pts_xyz.new_full((pts_xyz.shape[0], 1, 1), qs_value)
 
             if "global_offset" in octree_context:
                 offset = octree_context["global_offset"]
                 if not torch.is_tensor(offset):
                     offset = torch.as_tensor(offset)
-                offset = offset.to(device=pts_xyz.device, dtype=pts_xyz.dtype).reshape(1, 3, 1)
+                offset = offset.to(device=pts_xyz.device, dtype=pts_xyz.dtype)
+
+                if offset.ndim == 1 and offset.numel() == 3:
+                    offset = offset.view(1, 3, 1)
+                elif offset.ndim == 2 and offset.shape[-1] == 3:
+                    offset = offset.view(-1, 3, 1)
+                elif offset.ndim == 2 and offset.shape[0] == 3:
+                    offset = offset.unsqueeze(0)
+                elif offset.ndim == 3 and offset.shape[1] == 3:
+                    offset = offset[:, :, :1]
+                else:
+                    raise ValueError("octree_context['global_offset'] must have shape [3], [B,3], [3,1], or [B,3,1].")
+
                 if offset.shape[0] == 1 and pts_xyz.shape[0] > 1:
                     offset = offset.expand(pts_xyz.shape[0], -1, -1)
+                if offset.shape[0] != pts_xyz.shape[0]:
+                    raise ValueError("octree_context['global_offset'] batch size does not match pts_xyz.")
             else:
                 offset = pts_xyz.new_zeros((pts_xyz.shape[0], 3, 1))
 
-            step = pts_xyz.new_full((pts_xyz.shape[0], 1, 1), max(qs_value, 1e-9))
-            return step, offset, True
+            return step.contiguous(), offset.contiguous(), True
 
         # fallback時だけ従来のvoxel_stepを使う。
         step = self._voxel_step(pts_xyz, coord_scale)
@@ -160,11 +188,7 @@ class StructureRepairActuator(nn.Module):
             .replace(" ", "")
         )
         if compress_key == "sparsepcgc":
-            return max(
-                float(getattr(self.args, "sparsepcgc_effective_qs", 0.0))
-                or float(getattr(self.args, "sparsepcgc_voxel_size", 1.0)) * float(getattr(self.args, "sparsepcgc_pos_quantscale", 1)),
-                1e-9,
-            )
+            return max(float(sparsepcgc_effective_qs_value(self.args)), 1e-9)
         if compress_key in {"gpcc", "gpcctmc3"}:
             return max(float(getattr(self.args, "gpcc_effective_qs", getattr(self.args, "qs", 1.0))), 1e-9)
         return max(float(getattr(self.args, "qs", 2.0)), 1e-9)
@@ -196,6 +220,21 @@ class StructureRepairActuator(nn.Module):
         return pts_xyz.new_full((pts_xyz.shape[0], 1, 1), raw_max / max(float(coord_scale), 1e-9))
 
     def _voxel_step(self, pts_xyz, coord_scale):
+        compress_key = (
+            str(getattr(self.args, "compress", ""))
+            .strip()
+            .lower()
+            .replace("-", "")
+            .replace("_", "")
+            .replace(" ", "")
+        )
+        if compress_key == "sparsepcgc":
+            return sparsepcgc_effective_qs_tensor(
+                pts_xyz,
+                args=self.args,
+                coord_scale=coord_scale,
+            ).clamp_min(1e-9)
+        
         qstep = self._effective_qs()
         if coord_scale is None:
             return pts_xyz.new_full((pts_xyz.shape[0], 1, 1), qstep)
@@ -211,17 +250,13 @@ class StructureRepairActuator(nn.Module):
         return torch.round(pts_xyz / voxel_step.clamp_min(1e-9)).to(torch.long)
 
     def _sparsepcgc_voxel_size(self, pts_xyz, coord_scale):
-        voxel_size = max(float(getattr(self.args, "sparsepcgc_voxel_size", 1.0)), 1e-9)
-        if coord_scale is None:
-            return pts_xyz.new_full((pts_xyz.shape[0], 1, 1), voxel_size)
-        if torch.is_tensor(coord_scale):
-            scale = coord_scale.to(device=pts_xyz.device, dtype=pts_xyz.dtype).reshape(-1, 1, 1)
-            if scale.shape[0] == 1 and pts_xyz.shape[0] > 1:
-                scale = scale.expand(pts_xyz.shape[0], -1, -1)
-            return voxel_size / scale.clamp_min(1e-9)
-        return pts_xyz.new_full((pts_xyz.shape[0], 1, 1), voxel_size / max(float(coord_scale), 1e-9))
+        return sparsepcgc_voxel_size_tensor(
+            pts_xyz,
+            args=self.args,
+            coord_scale=coord_scale,
+        ).clamp_min(1e-9)
 
-    def _sparsepcgc_quantized_coords(self, pts_xyz, coord_scale, fallback_voxel_step=None):
+    def _sparsepcgc_quantized_coords(self, pts_xyz, coord_scale, fallback_voxel_step=None, global_offset=None):
         compress_key = (
             str(getattr(self.args, "compress", ""))
             .strip()
@@ -230,16 +265,19 @@ class StructureRepairActuator(nn.Module):
             .replace("_", "")
             .replace(" ", "")
         )
+
         if compress_key != "sparsepcgc":
             step = fallback_voxel_step if fallback_voxel_step is not None else self._voxel_step(pts_xyz, coord_scale)
-            return self._voxel_coords(pts_xyz, step)
-        voxel_size = self._sparsepcgc_voxel_size(pts_xyz, coord_scale)
-        coords = torch.round(pts_xyz / voxel_size.clamp_min(1e-9))
-        pos_q = max(float(getattr(self.args, "sparsepcgc_pos_quantscale", 1)), 1.0)
-        if pos_q > 1.0:
-            coords = torch.round(coords / pos_q)
-        return coords.to(torch.long)
+            if global_offset is None:
+                return self._voxel_coords(pts_xyz, step)
+            return self._voxel_coords(pts_xyz - global_offset, step)
 
+        return canonical_sparsepcgc_voxel_coords(
+            pts_xyz,
+            args=self.args,
+            coord_scale=coord_scale,
+            global_offset=global_offset,
+        ).to(torch.long)
     @classmethod
     def _coords_membership_mask(cls, query_coords, reference_coords):
         B, _, N = query_coords.shape
@@ -457,6 +495,200 @@ class StructureRepairActuator(nn.Module):
             selected_inverse = item["inverse"][mask_b]
             total += int(torch.unique(selected_inverse, sorted=False).numel())
         return total
+
+    def _append_unique_voxel_coords(self, base_coords, add_coords):
+        """
+        base occupied coordsにadd coordsを追加し、重複voxelを1つにまとめる。
+        入出力は[N, 3]のlong tensorである。
+        """
+        if base_coords is None:
+            base_coords = add_coords.new_empty((0, 3), dtype=torch.long)
+        base_coords = base_coords.to(dtype=torch.long).reshape(-1, 3)
+
+        if add_coords is None:
+            return torch.unique(base_coords, dim=0, sorted=True) if base_coords.numel() > 0 else base_coords
+
+        add_coords = add_coords.to(device=base_coords.device, dtype=torch.long).reshape(-1, 3)
+        if add_coords.numel() == 0:
+            return torch.unique(base_coords, dim=0, sorted=True) if base_coords.numel() > 0 else base_coords
+        if base_coords.numel() == 0:
+            return torch.unique(add_coords, dim=0, sorted=True)
+
+        return torch.unique(torch.cat([base_coords, add_coords], dim=0), dim=0, sorted=True)
+
+    def _remove_voxel_coords(self, base_coords, remove_coords):
+        """
+        base occupied coordsからremove coordsを削除する。
+        入出力は[N, 3]のlong tensorである。
+        """
+        base_coords = base_coords.to(dtype=torch.long).reshape(-1, 3)
+        if base_coords.numel() == 0:
+            return base_coords
+        if remove_coords is None:
+            return base_coords
+
+        remove_coords = remove_coords.to(device=base_coords.device, dtype=torch.long).reshape(-1, 3)
+        if remove_coords.numel() == 0:
+            return base_coords
+
+        remove_unique = torch.unique(remove_coords, dim=0, sorted=True)
+        remove_mask = self._coords_membership(base_coords, remove_unique)
+        return base_coords[~remove_mask].contiguous()
+
+    def _first_unique_rows_mask(self, coords_n3):
+        """
+        [N, 3]座標について、同一座標の最初の出現だけTrueにする。
+        duplicate targetを1つだけ残すために使う。
+        """
+        coords_n3 = coords_n3.to(dtype=torch.long).reshape(-1, 3)
+        if coords_n3.numel() == 0:
+            return torch.zeros((0,), device=coords_n3.device, dtype=torch.bool)
+
+        _, inverse = torch.unique(coords_n3, dim=0, sorted=True, return_inverse=True)
+        idx = torch.arange(inverse.numel(), device=inverse.device, dtype=inverse.dtype)
+        sort_key = inverse * inverse.numel() + idx
+        order = torch.argsort(sort_key)
+        sorted_inverse = inverse.index_select(0, order)
+
+        first_sorted = torch.ones_like(sorted_inverse, dtype=torch.bool)
+        if sorted_inverse.numel() > 1:
+            first_sorted[1:] = sorted_inverse[1:] != sorted_inverse[:-1]
+
+        mask = torch.zeros_like(inverse, dtype=torch.bool)
+        mask[order[first_sorted]] = True
+        return mask
+
+    def _build_voxel_edit_state_single(
+        self,
+        voxel_coords_b,
+        hard_drop_mask_b,
+        add_target_coords_b,
+        add_target_mask_b,
+        move_source_mask_b,
+        move_target_coords_b,
+        move_valid_mask_b,
+    ):
+        """
+        1batch分のPrune/Add/Moveをoccupied voxel集合上に反映する。
+        Moveは source occupied voxel削除 + target empty voxel追加として扱う。
+        """
+        coords_n3 = voxel_coords_b.transpose(0, 1).contiguous().to(dtype=torch.long)
+        initial_unique = torch.unique(coords_n3, dim=0, sorted=True)
+
+        current = initial_unique
+        debug = {
+            "initial_count": int(initial_unique.shape[0]),
+            "drop_count": 0,
+            "add_count": 0,
+            "move_count": 0,
+            "same_voxel_move_rejected": 0,
+            "existing_target_rejected": 0,
+            "duplicate_target_rejected": 0,
+            "final_count": int(initial_unique.shape[0]),
+        }
+
+        # ------------------------------------------------------------
+        # Prune：点ではなく、選ばれた点が属するoccupied voxelを削除する。
+        # ------------------------------------------------------------
+        if hard_drop_mask_b is not None:
+            drop_mask = hard_drop_mask_b.to(device=coords_n3.device, dtype=torch.bool).reshape(-1)
+            if drop_mask.numel() == coords_n3.shape[0] and bool(drop_mask.any().item()):
+                drop_coords = torch.unique(coords_n3[drop_mask], dim=0, sorted=True)
+                current = self._remove_voxel_coords(current, drop_coords)
+                debug["drop_count"] = int(drop_coords.shape[0])
+
+        # ------------------------------------------------------------
+        # Add：empty child-slot / empty neighbor voxelをoccupiedに追加する。
+        # ------------------------------------------------------------
+        if add_target_coords_b is not None and add_target_mask_b is not None:
+            add_coords_n3 = add_target_coords_b.transpose(0, 1).contiguous().to(device=coords_n3.device, dtype=torch.long)
+            add_mask = add_target_mask_b.to(device=coords_n3.device, dtype=torch.bool).reshape(-1)
+            if add_mask.numel() == add_coords_n3.shape[0] and bool(add_mask.any().item()):
+                selected_add = add_coords_n3[add_mask]
+                unique_add_mask = self._first_unique_rows_mask(selected_add)
+                debug["duplicate_target_rejected"] += int((~unique_add_mask).sum().item())
+                selected_add = selected_add[unique_add_mask]
+
+                # 念のため、既存occupiedへAddする候補は除外する。
+                already_occupied = self._coords_membership(selected_add, current)
+                debug["existing_target_rejected"] += int(already_occupied.sum().item())
+                selected_add = selected_add[~already_occupied]
+
+                if selected_add.numel() > 0:
+                    current = self._append_unique_voxel_coords(current, selected_add)
+                    debug["add_count"] = int(selected_add.shape[0])
+
+        # ------------------------------------------------------------
+        # Move：source voxelを削除し、target voxelを追加する。
+        # ------------------------------------------------------------
+        if move_source_mask_b is not None and move_target_coords_b is not None:
+            move_mask = move_source_mask_b.to(device=coords_n3.device, dtype=torch.bool).reshape(-1)
+            if move_valid_mask_b is not None:
+                move_mask = move_mask & move_valid_mask_b.to(device=coords_n3.device, dtype=torch.bool).reshape(-1)
+
+            move_targets_n3 = move_target_coords_b.transpose(0, 1).contiguous().to(device=coords_n3.device, dtype=torch.long)
+
+            if move_mask.numel() == coords_n3.shape[0] and move_targets_n3.shape[0] == coords_n3.shape[0] and bool(move_mask.any().item()):
+                source_coords = coords_n3[move_mask]
+                target_coords = move_targets_n3[move_mask]
+
+                same_voxel = (source_coords == target_coords).all(dim=1)
+                debug["same_voxel_move_rejected"] = int(same_voxel.sum().item())
+                source_coords = source_coords[~same_voxel]
+                target_coords = target_coords[~same_voxel]
+
+                if target_coords.numel() > 0:
+                    # Move targetは初期occupiedおよびPrune/Add反映後のcurrentに存在しないものだけ許可する。
+                    target_existing = self._coords_membership(target_coords, current)
+                    debug["existing_target_rejected"] += int(target_existing.sum().item())
+                    source_coords = source_coords[~target_existing]
+                    target_coords = target_coords[~target_existing]
+
+                if target_coords.numel() > 0:
+                    unique_target_mask = self._first_unique_rows_mask(target_coords)
+                    debug["duplicate_target_rejected"] += int((~unique_target_mask).sum().item())
+                    source_coords = source_coords[unique_target_mask]
+                    target_coords = target_coords[unique_target_mask]
+
+                if target_coords.numel() > 0:
+                    source_unique = torch.unique(source_coords, dim=0, sorted=True)
+                    target_unique = torch.unique(target_coords, dim=0, sorted=True)
+                    current = self._remove_voxel_coords(current, source_unique)
+                    current = self._append_unique_voxel_coords(current, target_unique)
+                    debug["move_count"] = int(target_unique.shape[0])
+
+        current = torch.unique(current, dim=0, sorted=True) if current.numel() > 0 else current
+        debug["final_count"] = int(current.shape[0])
+        weights = torch.ones((1, int(current.shape[0])), device=current.device, dtype=torch.float32)
+        return current.transpose(0, 1).contiguous(), weights, debug
+
+    def _pad_voxel_edit_state(self, coords_list, weights_list, device, dtype):
+        """
+        batchごとに長さが違うfinal voxel coordsを[B, 3, M]へpaddingする。
+        final_voxel_valid_maskも同時に返す。
+        """
+        batch_size = len(coords_list)
+        max_count = max([int(coords.shape[-1]) for coords in coords_list] or [0])
+
+        if max_count <= 0:
+            coords = torch.empty((batch_size, 3, 0), device=device, dtype=torch.long)
+            weights = torch.empty((batch_size, 1, 0), device=device, dtype=dtype)
+            valid_mask = torch.empty((batch_size, 0), device=device, dtype=torch.bool)
+            return coords, weights, valid_mask
+
+        padded_coords = torch.zeros((batch_size, 3, max_count), device=device, dtype=torch.long)
+        padded_weights = torch.zeros((batch_size, 1, max_count), device=device, dtype=dtype)
+        valid_mask = torch.zeros((batch_size, max_count), device=device, dtype=torch.bool)
+
+        for b, coords_b in enumerate(coords_list):
+            count = int(coords_b.shape[-1])
+            if count <= 0:
+                continue
+            padded_coords[b, :, :count] = coords_b.to(device=device, dtype=torch.long)
+            padded_weights[b, :, :count] = weights_list[b].to(device=device, dtype=dtype)
+            valid_mask[b, :count] = True
+
+        return padded_coords, padded_weights, valid_mask
 
     @classmethod
     def _selected_voxels_absent_count(cls, before_coords, selected_mask, after_coords, after_mask):
@@ -1304,7 +1536,13 @@ class StructureRepairActuator(nn.Module):
                     "forbid_local_voxel_recompute=True."
                 )
             # prebuilt voxelがない場合だけfallbackとして再Voxel化する。
-            voxel_coords = self._voxel_coords(pts_xyz - voxel_offset, voxel_step)
+            # SparsePCGC時はcanonical共通関数を通し、round(xyz/voxel_size) → round(/posQuantscale) に統一する。
+            voxel_coords = self._sparsepcgc_quantized_coords(
+                pts_xyz,
+                coord_scale,
+                fallback_voxel_step=voxel_step,
+                global_offset=voxel_offset,
+            )
             actuator_voxel_mode = "local_recomputed"
             actuator_local_recomputed = True
 
@@ -1318,6 +1556,14 @@ class StructureRepairActuator(nn.Module):
             point_valid_empty_child_mask = octree_context.get("point_valid_empty_child_mask", None)
         # ここから先はprebuilt/localどちらでも共通で必要である。
         voxel_cache = self._build_voxel_cache(voxel_coords)
+        # Phase3: 点操作とは別に、occupied voxel集合としての編集状態を作る。
+        # 既存のpts_out/final_wはこの時点では変更しない。
+        voxel_edit_state_enabled = bool(getattr(self.args, "repair_voxel_edit_state", True))
+        voxel_edit_mode = "prune_add_move_voxel_state" if voxel_edit_state_enabled else "disabled"
+
+        voxel_edit_initial_coords = voxel_coords.detach()
+        voxel_edit_initial_count = self._unique_voxel_count_from_cache(voxel_cache)
+
         neighbor_offsets = self.neighbor_offsets.to(device=pts_xyz.device, dtype=pts_xyz.dtype)
         neighbor_offsets_long = self.neighbor_offsets.to(device=pts_xyz.device, dtype=torch.long)
 
@@ -1659,7 +1905,8 @@ class StructureRepairActuator(nn.Module):
             voxel_cache=voxel_cache,
         )
         hard_drop = hard_drop_mask.to(dtype=pts_xyz.dtype)
-
+        # Phase3: Pruneは点削除ではなく、対象点が属するoccupied voxelの削除候補として記録する。
+        voxel_edit_drop_mask = hard_drop_mask.detach().squeeze(1).to(dtype=torch.bool)
 
 
         # Hard forward + Soft backward のSTE。
@@ -1951,6 +2198,8 @@ class StructureRepairActuator(nn.Module):
         # ============================================================
         hard_move_mask = torch.zeros((B, 1, N), device=pts_xyz.device, dtype=torch.bool)
         hard_move = hard_move_mask.to(dtype=pts_xyz.dtype)
+
+
         raw_hard_move_bool = torch.zeros((B, N), device=pts_xyz.device, dtype=torch.bool)
 
         move_mask = hard_move
@@ -2145,6 +2394,8 @@ class StructureRepairActuator(nn.Module):
             voxel_cache=voxel_cache,
         )
         hard_move = hard_move_mask.to(dtype=pts_xyz.dtype)
+        # Phase3: guard後に確定したHard Move sourceをVoxel編集状態用に保存する。
+        voxel_edit_move_source_mask = hard_move_mask.detach().squeeze(1).to(dtype=torch.bool)
 
         # ------------------------------------------------------------
         # Soft Moveも同じguard後候補から作る。
@@ -2226,6 +2477,38 @@ class StructureRepairActuator(nn.Module):
         delta = move_mask * primitive_delta
         pts_out = pts_xyz + delta
         move_target_voxel_coords = voxel_coords + selected_offsets_long
+        # Phase3: Moveを source voxel削除 + target voxel追加 として扱うためのtarget制約。
+        voxel_edit_same_move_mask = (move_target_voxel_coords == voxel_coords).all(dim=1)
+
+        voxel_edit_move_target_existing_mask = self._coords_membership_mask(
+            move_target_voxel_coords,
+            voxel_coords,
+        )
+
+        voxel_edit_move_target_empty_mask = torch.gather(
+            empty_target_mask,
+            2,
+            move_idx_flat.unsqueeze(-1),
+        ).squeeze(-1)
+
+        if child_slot_mask is not None:
+            voxel_edit_move_child_slot_mask = torch.gather(
+                child_slot_mask,
+                2,
+                move_idx_flat.unsqueeze(-1),
+            ).squeeze(-1)
+        else:
+            voxel_edit_move_child_slot_mask = torch.ones_like(voxel_edit_move_target_empty_mask, dtype=torch.bool)
+
+        voxel_edit_move_valid_mask = voxel_edit_move_source_mask
+        voxel_edit_move_valid_mask = voxel_edit_move_valid_mask & (~voxel_edit_same_move_mask)
+
+        if bool(getattr(self.args, "repair_voxel_edit_require_empty_move_target", True)):
+            voxel_edit_move_valid_mask = voxel_edit_move_valid_mask & voxel_edit_move_target_empty_mask
+            voxel_edit_move_valid_mask = voxel_edit_move_valid_mask & (~voxel_edit_move_target_existing_mask)
+
+        voxel_edit_move_valid_mask = voxel_edit_move_valid_mask & voxel_edit_move_child_slot_mask
+
         final_voxel_coords = torch.where(
             hard_move_mask.to(device=voxel_coords.device, dtype=torch.bool).expand_as(voxel_coords),
             move_target_voxel_coords,
@@ -2328,6 +2611,10 @@ class StructureRepairActuator(nn.Module):
         add_target_hard_add = pts_xyz.new_zeros((B, 1, 0))
         add_target_add_st = pts_xyz.new_zeros((B, 1, 0))
         add_target_voxel_coords = voxel_coords.new_empty((B, 3, 0))
+        # Phase3: Addが実行されない場合でも、Voxel編集状態構築で参照できる空のAdd候補を用意する。
+        voxel_edit_add_target_coords = add_target_voxel_coords.detach()
+        voxel_edit_add_target_mask = torch.zeros((B, 0), device=pts_xyz.device, dtype=torch.bool)
+
         add_score_noise = max(
             self._annealed_value("repair_add_score_noise_start", "repair_add_score_noise_end"),
             0.0,
@@ -2603,6 +2890,12 @@ class StructureRepairActuator(nn.Module):
                 # 追加先target voxel座標もtarget単位で保持する。
                 add_target_voxel_coords = selected_add_voxels_long
 
+                # Phase3: Addは点追加ではなく、target occupied voxel追加候補として記録する。
+                voxel_edit_add_target_coords = add_target_voxel_coords.detach()
+                voxel_edit_add_target_mask = (
+                    add_target_hard_add.detach().squeeze(1).to(dtype=torch.bool)
+                )
+
                 # final_wへ入れる追加点の重みはtarget voxel単位STEを使う。
                 added_w = add_target_add_st
 
@@ -2677,6 +2970,71 @@ class StructureRepairActuator(nn.Module):
         )
         hard_keep_mask = final_w.detach() >= hardening_threshold
         after_occupied_voxels = self._unique_voxel_count(final_voxel_coords, hard_keep_mask)
+        # Phase3: Prune/Add/Moveをoccupied voxel集合へ反映した最終Voxel状態を作る。
+        # 既存のpts_out/final_wは変更しない。
+        voxel_edit_debug_list = []
+        voxel_edit_coords_list = []
+        voxel_edit_weights_list = []
+
+        if voxel_edit_state_enabled:
+            for b in range(B):
+                coords_b, weights_b, debug_b = self._build_voxel_edit_state_single(
+                    voxel_coords_b=voxel_coords[b],
+                    hard_drop_mask_b=voxel_edit_drop_mask[b],
+                    add_target_coords_b=voxel_edit_add_target_coords[b] if voxel_edit_add_target_coords.shape[2] > 0 else None,
+                    add_target_mask_b=voxel_edit_add_target_mask[b] if voxel_edit_add_target_mask.numel() > 0 else None,
+                    move_source_mask_b=voxel_edit_move_source_mask[b],
+                    move_target_coords_b=move_target_voxel_coords[b],
+                    move_valid_mask_b=voxel_edit_move_valid_mask[b],
+                )
+                voxel_edit_coords_list.append(coords_b)
+                voxel_edit_weights_list.append(weights_b.to(device=pts_xyz.device, dtype=pts_xyz.dtype))
+                voxel_edit_debug_list.append(debug_b)
+
+            voxel_edit_final_coords, voxel_edit_final_weights, voxel_edit_valid_mask = self._pad_voxel_edit_state(
+                voxel_edit_coords_list,
+                voxel_edit_weights_list,
+                device=pts_xyz.device,
+                dtype=pts_xyz.dtype,
+            )
+        else:
+            voxel_edit_final_coords = final_voxel_coords.detach().to(dtype=torch.long)
+            voxel_edit_final_weights = final_w.detach()
+            voxel_edit_valid_mask = torch.ones(
+                (B, int(voxel_edit_final_coords.shape[-1])),
+                device=pts_xyz.device,
+                dtype=torch.bool,
+            )
+            voxel_edit_debug_list = [
+                {
+                    "initial_count": int(voxel_edit_final_coords.shape[-1]),
+                    "drop_count": 0,
+                    "add_count": 0,
+                    "move_count": 0,
+                    "same_voxel_move_rejected": 0,
+                    "existing_target_rejected": 0,
+                    "duplicate_target_rejected": 0,
+                    "final_count": int(voxel_edit_final_coords.shape[-1]),
+                }
+                for _ in range(B)
+            ]
+
+        voxel_edit_initial_count_value = int(sum(item.get("initial_count", 0) for item in voxel_edit_debug_list))
+        voxel_edit_final_count_value = int(sum(item.get("final_count", 0) for item in voxel_edit_debug_list))
+        voxel_edit_drop_count_value = int(sum(item.get("drop_count", 0) for item in voxel_edit_debug_list))
+        voxel_edit_add_count_value = int(sum(item.get("add_count", 0) for item in voxel_edit_debug_list))
+        voxel_edit_move_count_value = int(sum(item.get("move_count", 0) for item in voxel_edit_debug_list))
+        voxel_edit_same_voxel_move_rejected_value = int(sum(item.get("same_voxel_move_rejected", 0) for item in voxel_edit_debug_list))
+        voxel_edit_existing_target_rejected_value = int(sum(item.get("existing_target_rejected", 0) for item in voxel_edit_debug_list))
+        voxel_edit_duplicate_target_rejected_value = int(sum(item.get("duplicate_target_rejected", 0) for item in voxel_edit_debug_list))
+
+        voxel_edit_child_slot_rejected_value = int(
+            (voxel_edit_move_source_mask & (~voxel_edit_move_child_slot_mask)).detach().sum().item()
+        )
+        voxel_edit_empty_target_rejected_value = int(
+            (voxel_edit_move_source_mask & (~voxel_edit_move_target_empty_mask)).detach().sum().item()
+        )
+
         delete_target_voxel_count_value = self._unique_voxel_count_from_cache(voxel_cache, hard_drop_mask)
         delete_removed_point_count_value = int(hard_drop_mask.detach().sum().item())
         delete_emptied_voxel_count_value = self._selected_voxels_absent_count(
@@ -3431,6 +3789,42 @@ class StructureRepairActuator(nn.Module):
                     f"final_voxel_point_count={int(final_voxel_coords.shape[2])}, "
                     f"final_voxel_added_slots={int(final_voxel_coords.shape[2] - voxel_coords.shape[2])}"
                 )
+        # Phase2: 将来のVoxel/Octree出力を点群xyzへ戻すためのdebug経路。
+        # 既存のpts_out/gen_xyzは置き換えない。
+        canonical_voxel_coords_before = voxel_coords.detach()
+        canonical_voxel_coords_after = final_voxel_coords.detach()
+
+        voxel_restore_meta = {
+            "global_qs": voxel_step.detach(),
+            "global_offset": voxel_offset.detach(),
+            "effective_qs_tensor": voxel_step.detach(),
+            "global_offset_tensor": voxel_offset.detach(),
+            "voxel_size": float(getattr(self.args, "sparsepcgc_voxel_size", 1.0)),
+            "pos_quantscale": int(getattr(self.args, "sparsepcgc_pos_quantscale", 1)),
+            "quant_mode": str(getattr(self.args, "sparsepcgc_quant_mode", "round_voxel_then_pos")),
+        }
+
+        restored_xyz_debug = None
+        restore_info = {
+            "restore_input_points": int(canonical_voxel_coords_after.shape[-1]),
+            "restore_output_points": int(canonical_voxel_coords_after.shape[-1]),
+            "restore_unique": bool(getattr(self.args, "sparsepcgc_restore_unique_voxels", True)),
+            "restore_center": bool(getattr(self.args, "sparsepcgc_dequantize_center", False)),
+            "restore_has_meta": True,
+        }
+
+        if bool(getattr(self.args, "sparsepcgc_restore_points_debug", False)):
+            with torch.no_grad():
+                restored_xyz_debug, restore_info = restore_points_from_voxel_coords(
+                    canonical_voxel_coords_after,
+                    meta=voxel_restore_meta,
+                    args=self.args,
+                    center=bool(getattr(self.args, "sparsepcgc_dequantize_center", False)),
+                    unique=bool(getattr(self.args, "sparsepcgc_restore_unique_voxels", True)),
+                    dtype=pts_xyz.dtype,
+                    device=pts_xyz.device,
+                )
+                restored_xyz_debug = restored_xyz_debug.detach()
 
         self.debug_tensors = {
             # AdjustをSoft Prune + Soft Addとして扱うための情報
@@ -3655,6 +4049,27 @@ class StructureRepairActuator(nn.Module):
             "policy_comp_mean": p_comp.mean().detach(),
             "policy_outlier_mean": p_outlier.mean().detach(),
             "actuator_target_mode": actuator_target_mode, 
+            "voxel_edit_state_enabled": pts_xyz.new_tensor(float(voxel_edit_state_enabled)).detach(),
+            "voxel_edit_mode": voxel_edit_mode,
+            "voxel_edit_initial_coords": voxel_edit_initial_coords,
+            "voxel_edit_final_coords": voxel_edit_final_coords.detach(),
+            "voxel_edit_final_weights": voxel_edit_final_weights.detach(),
+            "voxel_edit_valid_mask": voxel_edit_valid_mask.detach(),
+            "voxel_edit_initial_count": pts_xyz.new_tensor(float(voxel_edit_initial_count_value)).detach(),
+            "voxel_edit_final_count": pts_xyz.new_tensor(float(voxel_edit_final_count_value)).detach(),
+            "voxel_edit_drop_count": pts_xyz.new_tensor(float(voxel_edit_drop_count_value)).detach(),
+            "voxel_edit_add_count": pts_xyz.new_tensor(float(voxel_edit_add_count_value)).detach(),
+            "voxel_edit_move_count": pts_xyz.new_tensor(float(voxel_edit_move_count_value)).detach(),
+            "voxel_edit_same_voxel_move_rejected": pts_xyz.new_tensor(float(voxel_edit_same_voxel_move_rejected_value)).detach(),
+            "voxel_edit_existing_target_rejected": pts_xyz.new_tensor(float(voxel_edit_existing_target_rejected_value)).detach(),
+            "voxel_edit_duplicate_target_rejected": pts_xyz.new_tensor(float(voxel_edit_duplicate_target_rejected_value)).detach(),
+            "voxel_edit_child_slot_rejected": pts_xyz.new_tensor(float(voxel_edit_child_slot_rejected_value)).detach(),
+            "voxel_edit_empty_target_rejected": pts_xyz.new_tensor(float(voxel_edit_empty_target_rejected_value)).detach(),
+            "canonical_voxel_coords_before": canonical_voxel_coords_before,
+            "canonical_voxel_coords_after": canonical_voxel_coords_after,
+            "voxel_restore_meta": voxel_restore_meta,
+            "restored_xyz_debug": restored_xyz_debug,
+            "restore_info": restore_info,
         }
         return pts_out, final_w, loss, {
             # Adjust Soft状態
@@ -3902,12 +4317,39 @@ class StructureRepairActuator(nn.Module):
             "quant_add_guard": quant_add_guard,
             "local_edit_guard": local_edit_guard,
             "point_parent_node_ids": point_parent_node_ids,
-            "initial_voxel_coords": voxel_coords,
-            "final_voxel_coords": final_voxel_coords,
-            "final_voxel_weights": final_w,
+
+            # Phase3: occupied voxel集合としての編集状態。
+            # final_voxel_coords / final_voxel_weights は点対応ではなくoccupied voxel対応へ切り替える。
+            "voxel_edit_state_enabled": bool(voxel_edit_state_enabled),
+            "voxel_edit_mode": voxel_edit_mode,
+            "initial_voxel_coords": voxel_edit_initial_coords,
+            "final_voxel_coords": voxel_edit_final_coords,
+            "final_voxel_weights": voxel_edit_final_weights,
+            "final_voxel_valid_mask": voxel_edit_valid_mask,
             "voxel_step": voxel_step,
             "voxel_offset": voxel_offset,
-            "final_voxel_update_mode": "state_update_from_initial_voxels",
+
+            # 既存の点対応Voxel状態も必要な場合に参照できるように残す。
+            "point_aligned_initial_voxel_coords": voxel_coords,
+            "point_aligned_final_voxel_coords": final_voxel_coords,
+            "point_aligned_final_voxel_weights": final_w,
+
+            "voxel_edit_initial_count": voxel_edit_initial_count_value,
+            "voxel_edit_final_count": voxel_edit_final_count_value,
+            "voxel_edit_drop_count": voxel_edit_drop_count_value,
+            "voxel_edit_add_count": voxel_edit_add_count_value,
+            "voxel_edit_move_count": voxel_edit_move_count_value,
+            "voxel_edit_same_voxel_move_rejected": voxel_edit_same_voxel_move_rejected_value,
+            "voxel_edit_existing_target_rejected": voxel_edit_existing_target_rejected_value,
+            "voxel_edit_duplicate_target_rejected": voxel_edit_duplicate_target_rejected_value,
+            "voxel_edit_child_slot_rejected": voxel_edit_child_slot_rejected_value,
+            "voxel_edit_empty_target_rejected": voxel_edit_empty_target_rejected_value,
+            "canonical_voxel_coords_before": canonical_voxel_coords_before,
+            "canonical_voxel_coords_after": canonical_voxel_coords_after,
+            "voxel_restore_meta": voxel_restore_meta,
+            "restored_xyz_debug": restored_xyz_debug,
+            "restore_info": restore_info,
+            "final_voxel_update_mode": "occupied_voxel_edit_state_phase3",
             "final_voxel_recomputed_from_pts_out": False,
             "point_child_slots": point_child_slots,
             "point_valid_empty_child_mask": point_valid_empty_child_mask, 

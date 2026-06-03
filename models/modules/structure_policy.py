@@ -76,12 +76,20 @@ class StructureRepairPolicy(nn.Module):
         return raw / raw.sum(dim=1, keepdim=True).clamp_min(1e-6)
 
     def forward(self, features):
+        if not torch.is_tensor(features):
+            raise TypeError("features must be a Tensor.")
+        if features.ndim != 3:
+            raise ValueError(f"features must have shape [B, C, N], got {tuple(features.shape)}")
+
+        input_mode = "node_voxel" if bool(getattr(self, "node_voxel_mode", False)) else "point"
         logits = self.net(features)
         probs = F.softmax(logits / self.temperature, dim=1)
         if torch.is_grad_enabled():
             self.debug_tensors = {
                 "repair_ratio": (1.0 - probs[:, 0:1, :]).mean().detach(),
                 "policy_entropy": (-(probs.clamp_min(1e-6).log() * probs).sum(dim=1)).mean().detach(),
+                "input_mode": input_mode,
+                "input_shape": tuple(features.shape),
             }
         return probs, logits
 
