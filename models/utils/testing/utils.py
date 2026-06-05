@@ -20,7 +20,59 @@ from models.utils.patching.patch import (
     merge_patch_outputs,
 )
 
+def _build_full_cloud_canonical_context_for_test(input_pcd, args):
+    """
+    test.py full_cloud 推論用に、入力点群から full cloud canonical voxel metadata を作る。
+    目的は、OctreeStructureAnalysis.forward() が要求する
+    full_octree_context['global_voxel_coords'] を必ず渡すことである。
 
+    input_pcd は [B, 3, N] を想定する。
+    現状の test.py は batch_size=1 なので B=1 前提で扱う。
+    """
+    if input_pcd is None or not torch.is_tensor(input_pcd):
+        return None
+
+    if input_pcd.ndim != 3 or input_pcd.shape[1] < 3:
+        raise ValueError(
+            "_build_full_cloud_canonical_context_for_test expects input_pcd with shape [B, 3, N], "
+            f"but got {tuple(input_pcd.shape)}"
+        )
+
+    xyz = input_pcd[:, :3, :].contiguous()
+    device = xyz.device
+    dtype = xyz.dtype
+
+    voxel_size = float(getattr(args, "sparsepcgc_voxel_size", 1.0))
+    pos_q = int(getattr(args, "sparsepcgc_pos_quantscale", 1))
+    effective_qs = max(voxel_size * max(pos_q, 1), 1e-9)
+
+    # full cloud 全体で共通の原点を使う。
+    # これにより、同一サンプル内の voxel coords が一意な canonical basis になる。
+    global_offset = xyz.amin(dim=2, keepdim=True).detach()
+
+    coords = torch.round((xyz - global_offset) / effective_qs).to(torch.long)
+
+    coords_n3 = coords[0].transpose(0, 1).contiguous()
+
+    # morton ではないが、octree_structure.py 側の global_morton_keys と同じ用途で
+    # point/node 対応の安定キーとして使う。
+    global_keys = (
+        coords_n3[:, 0] * 73856093
+        + coords_n3[:, 1] * 19349663
+        + coords_n3[:, 2] * 83492791
+    ).view(1, -1).contiguous()
+
+    return {
+        "global_voxel_coords": coords,
+        "global_morton_keys": global_keys,
+        "global_offset": global_offset,
+        "global_qs": torch.full(
+            (xyz.shape[0],),
+            float(effective_qs),
+            device=device,
+            dtype=dtype,
+        ),
+    }
 
 def _adapt_encoder_state_dict_for_sparse_input(model, encoder_state, writer=None):
     key = "stem.0.weight"
@@ -757,6 +809,7 @@ def _run_full_cloud_inference(model, input_pcd, args, cache_key, use_cuda, use_a
     encoder_debug_chunks = []
     subtree_ref = None
     with _autocast_context(use_cuda, use_amp, amp_dtype):
+        full_octree_context = _build_full_cloud_canonical_context_for_test(input_pcd, args)
         model_out = model.forward(
             input_xyz,
             input_attr,
@@ -764,6 +817,8 @@ def _run_full_cloud_inference(model, input_pcd, args, cache_key, use_cuda, use_a
             compute_internal_losses=False,
             subtree_ref=subtree_ref,
             selected_subtree_keys=None,
+            full_octree_context=full_octree_context,
+            octree_input_mode="full_cloud",
         )
     base_model = model.module if hasattr(model, "module") else model
     encoder_debug_chunks.append(dict(getattr(base_model, "last_encoder_debug", {}) or {}))

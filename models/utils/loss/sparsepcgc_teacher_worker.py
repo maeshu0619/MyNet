@@ -39,6 +39,40 @@ def _jsonable(value: Any) -> Any:
 def _debug(message: str) -> None:
     print(f"[SparsePCGCWorker] {message}", file=sys.stderr, flush=True)
 
+def _collect_cuda_stats(prefix: str = "sparsepcgc_worker") -> dict[str, Any]:
+    """
+    SparsePCGC workerプロセス側のCUDA使用量を数値dictで返す。
+    encoder_multiple.py側のstatsが返らない場合でも、worker wrapper側で最低限の実測値を取る。
+    """
+    out: dict[str, Any] = {
+        f"{prefix}_cuda_available": False,
+        f"{prefix}_cuda_device": "",
+        f"{prefix}_cuda_allocated_mb": 0.0,
+        f"{prefix}_cuda_reserved_mb": 0.0,
+        f"{prefix}_cuda_max_allocated_mb": 0.0,
+        f"{prefix}_cuda_max_reserved_mb": 0.0,
+    }
+
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return out
+
+        device_index = torch.cuda.current_device()
+        device = torch.device(f"cuda:{device_index}")
+        torch.cuda.synchronize(device)
+
+        out[f"{prefix}_cuda_available"] = True
+        out[f"{prefix}_cuda_device"] = str(device)
+        out[f"{prefix}_cuda_allocated_mb"] = float(torch.cuda.memory_allocated(device)) / (1024.0 ** 2)
+        out[f"{prefix}_cuda_reserved_mb"] = float(torch.cuda.memory_reserved(device)) / (1024.0 ** 2)
+        out[f"{prefix}_cuda_max_allocated_mb"] = float(torch.cuda.max_memory_allocated(device)) / (1024.0 ** 2)
+        out[f"{prefix}_cuda_max_reserved_mb"] = float(torch.cuda.max_memory_reserved(device)) / (1024.0 ** 2)
+    except Exception as exc:
+        out[f"{prefix}_cuda_stats_error"] = str(exc)
+
+    return out
 
 def _setup_protocol_stdout() -> None:
     global _PROTOCOL_OUT
@@ -72,6 +106,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--dense-scale-sr-list", default="0,1,1,2,2,3")
     parser.add_argument("--pos-quantscale-list", default="4")
     parser.add_argument("--decode", action="store_true")
+    parser.add_argument(
+        "--gpu-stats",
+        action="store_true",
+        help="encode_one前後のCUDA/GPU使用量をresultへ含める",
+    )
+    parser.add_argument(
+        "--gpu-stats-print",
+        action="store_true",
+        help="encode_one前後のCUDA/GPU使用量をstderrへ出す",
+    )
     return parser.parse_args()
 
 
@@ -125,7 +169,14 @@ def main() -> int:
         _emit({"status": "init_error", "message": str(exc), "traceback": traceback.format_exc()})
         return 2
 
-    _emit({"status": "ready", "mode": args.mode, "device": args.device})
+    ready_payload = {
+        "status": "ready",
+        "mode": args.mode,
+        "device": args.device,
+    }
+    if bool(args.gpu_stats):
+        ready_payload.update(_collect_cuda_stats("sparsepcgc_worker_init"))
+    _emit(ready_payload)
 
     for raw_line in sys.stdin:
         line = raw_line.strip()
@@ -145,6 +196,10 @@ def main() -> int:
         try:
             input_file = Path(str(request["input_file"])).expanduser().resolve()
             output_dir = Path(str(request["output_dir"])).expanduser().resolve()
+            gpu_before = {}
+            if bool(args.gpu_stats):
+                gpu_before = _collect_cuda_stats("sparsepcgc_worker_before")
+
             with contextlib.redirect_stdout(sys.stderr):
                 result = encoder.encode_one(
                     input_file,
@@ -156,6 +211,59 @@ def main() -> int:
                     exact_teacher_uses_full_context=bool(request.get("exact_teacher_uses_full_context", False)),
                     exact_teacher_fallback_reason=str(request.get("exact_teacher_fallback_reason", "")),
                 )
+
+            gpu_after = {}
+            if bool(args.gpu_stats):
+                gpu_after = _collect_cuda_stats("sparsepcgc_worker_after")
+
+            if not isinstance(result, dict):
+                result = {"sparsepcgc_worker_raw_result": result}
+
+            if bool(args.gpu_stats):
+                result.update(gpu_before)
+                result.update(gpu_after)
+
+                # encoder_multiple.py 側が別名でCUDA statsを返している場合に備え、
+                # train側で拾いやすい代表keyへ正規化する。
+                result["sparsepcgc_worker_cuda_available"] = bool(
+                    result.get("sparsepcgc_worker_after_cuda_available", False)
+                )
+                result["sparsepcgc_worker_cuda_device"] = str(
+                    result.get("sparsepcgc_worker_after_cuda_device", "")
+                )
+                result["sparsepcgc_worker_cuda_allocated_mb"] = float(
+                    result.get("sparsepcgc_worker_after_cuda_allocated_mb", 0.0) or 0.0
+                )
+                result["sparsepcgc_worker_cuda_reserved_mb"] = float(
+                    result.get("sparsepcgc_worker_after_cuda_reserved_mb", 0.0) or 0.0
+                )
+                result["sparsepcgc_worker_cuda_max_allocated_mb"] = float(
+                    result.get("sparsepcgc_worker_after_cuda_max_allocated_mb", 0.0) or 0.0
+                )
+                result["sparsepcgc_worker_cuda_max_reserved_mb"] = float(
+                    result.get("sparsepcgc_worker_after_cuda_max_reserved_mb", 0.0) or 0.0
+                )
+                result["sparsepcgc_worker_cuda_allocated_delta_mb"] = float(
+                    result.get("sparsepcgc_worker_after_cuda_allocated_mb", 0.0) or 0.0
+                ) - float(
+                    result.get("sparsepcgc_worker_before_cuda_allocated_mb", 0.0) or 0.0
+                )
+                result["sparsepcgc_worker_cuda_reserved_delta_mb"] = float(
+                    result.get("sparsepcgc_worker_after_cuda_reserved_mb", 0.0) or 0.0
+                ) - float(
+                    result.get("sparsepcgc_worker_before_cuda_reserved_mb", 0.0) or 0.0
+                )
+
+                if bool(args.gpu_stats_print):
+                    _debug(
+                        "GPUStats: "
+                        f"device={result.get('sparsepcgc_worker_cuda_device', '')}, "
+                        f"allocated={float(result.get('sparsepcgc_worker_cuda_allocated_mb', 0.0)):.2f}MB, "
+                        f"reserved={float(result.get('sparsepcgc_worker_cuda_reserved_mb', 0.0)):.2f}MB, "
+                        f"max_allocated={float(result.get('sparsepcgc_worker_cuda_max_allocated_mb', 0.0)):.2f}MB, "
+                        f"max_reserved={float(result.get('sparsepcgc_worker_cuda_max_reserved_mb', 0.0)):.2f}MB"
+                    )
+
             _emit({"status": "ok", "request_id": request_id, "result": result})
         except Exception as exc:
             _emit(

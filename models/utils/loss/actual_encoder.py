@@ -433,6 +433,10 @@ class _SparsePCGCActualEncoder:
             "--pos-quantscale-list",
             self._csv_arg(getattr(self.args, "sparsepcgc_pos_quantscale_list", "4")),
         ]
+        if bool(getattr(self.args, "sparsepcgc_worker_gpu_stats", True)):
+            cmd.append("--gpu-stats")
+        if bool(getattr(self.args, "sparsepcgc_worker_gpu_stats_print", False)):
+            cmd.append("--gpu-stats-print")
         if bool(getattr(self.args, "sparsepcgc_offset", False)):
             cmd.append("--offset")
         if bool(getattr(self.args, "sparsepcgc_test_d2", False)):
@@ -603,6 +607,79 @@ class _SparsePCGCActualEncoder:
             result = response.get("result", {})
             bit = float(result.get("file_size", result.get("bit", 0.0)))
             point_count = int(result.get("point_count", result.get("num_points_raw", pts_3n.shape[-1])))
+            # ============================================================
+            # Phase2:
+            # SparsePCGC exact occupancy teacher のvalid判定
+            # ============================================================
+            exact_candidate_count = int(result.get("sparsepcgc_exact_candidate_count", 0) or 0)
+            exact_nll = result.get("sparsepcgc_exact_occupancy_nll", float("nan"))
+            exact_bits = result.get("sparsepcgc_exact_estimated_bits", float("nan"))
+
+            try:
+                exact_nll_float = float(exact_nll)
+            except Exception:
+                exact_nll_float = float("nan")
+
+            try:
+                exact_bits_float = float(exact_bits)
+            except Exception:
+                exact_bits_float = float("nan")
+
+            exact_valid = (
+                exact_candidate_count > 0
+                and np.isfinite(exact_nll_float)
+                and np.isfinite(exact_bits_float)
+            )
+
+            result["sparsepcgc_exact_teacher_valid"] = bool(exact_valid)
+            result["sparsepcgc_exact_teacher_invalid_reason"] = ""
+
+            if not exact_valid and bool(exact_occupancy):
+                if exact_candidate_count <= 0:
+                    result["sparsepcgc_exact_teacher_invalid_reason"] = "candidate_count_zero"
+                elif not np.isfinite(exact_nll_float):
+                    result["sparsepcgc_exact_teacher_invalid_reason"] = "nll_non_finite"
+                elif not np.isfinite(exact_bits_float):
+                    result["sparsepcgc_exact_teacher_invalid_reason"] = "bits_non_finite"
+                else:
+                    result["sparsepcgc_exact_teacher_invalid_reason"] = "unknown"
+            # ============================================================
+            # Phase2: SparsePCGC exact occupancy teacher の状態を明示する
+            # ============================================================
+            # SparsePCGC本体は変更しない。
+            # workerが返したexact candidateが有効かどうかだけをmyNet側で判定する。
+            exact_candidate_count = int(result.get("sparsepcgc_exact_candidate_count", 0) or 0)
+            exact_nll = result.get("sparsepcgc_exact_occupancy_nll", float("nan"))
+            exact_bits = result.get("sparsepcgc_exact_estimated_bits", float("nan"))
+
+            try:
+                exact_nll_float = float(exact_nll)
+            except Exception:
+                exact_nll_float = float("nan")
+
+            try:
+                exact_bits_float = float(exact_bits)
+            except Exception:
+                exact_bits_float = float("nan")
+
+            exact_valid = (
+                exact_candidate_count > 0
+                and np.isfinite(exact_nll_float)
+                and np.isfinite(exact_bits_float)
+            )
+
+            result["sparsepcgc_exact_teacher_valid"] = bool(exact_valid)
+            result["sparsepcgc_exact_teacher_invalid_reason"] = ""
+
+            if not exact_valid and bool(exact_occupancy):
+                if exact_candidate_count <= 0:
+                    result["sparsepcgc_exact_teacher_invalid_reason"] = "candidate_count_zero"
+                elif not np.isfinite(exact_nll_float):
+                    result["sparsepcgc_exact_teacher_invalid_reason"] = "nll_non_finite"
+                elif not np.isfinite(exact_bits_float):
+                    result["sparsepcgc_exact_teacher_invalid_reason"] = "bits_non_finite"
+                else:
+                    result["sparsepcgc_exact_teacher_invalid_reason"] = "unknown"
             node = float(result.get("node_count", result.get("node", 0.0)))
             single = float(result.get("single_child_count", result.get("single", 0.0)))
             stats = {
@@ -618,8 +695,33 @@ class _SparsePCGCActualEncoder:
             }
             for key, value in result.items():
                 key_text = str(key)
-                if key_text.startswith("sparsepcgc_") or key_text.startswith("exact_"):
+
+                keep_key = (
+                    key_text.startswith("sparsepcgc_")
+                    or key_text.startswith("exact_")
+                    or key_text.startswith("cuda_")
+                    or key_text.startswith("gpu_")
+                    or key_text.startswith("worker_cuda_")
+                    or key_text.startswith("worker_gpu_")
+                    or key_text.startswith("sparsepcgc_worker_cuda_")
+                    or key_text.startswith("sparsepcgc_worker_gpu_")
+                )
+
+                if keep_key:
                     stats[str(key)] = value
+            # train.py側で扱いやすい短縮aliasも用意する。
+            if "sparsepcgc_worker_cuda_allocated_mb" in stats:
+                stats["actual_sparsepcgc_worker_cuda_allocated_mb"] = stats["sparsepcgc_worker_cuda_allocated_mb"]
+            if "sparsepcgc_worker_cuda_reserved_mb" in stats:
+                stats["actual_sparsepcgc_worker_cuda_reserved_mb"] = stats["sparsepcgc_worker_cuda_reserved_mb"]
+            if "sparsepcgc_worker_cuda_max_allocated_mb" in stats:
+                stats["actual_sparsepcgc_worker_cuda_max_allocated_mb"] = stats["sparsepcgc_worker_cuda_max_allocated_mb"]
+            if "sparsepcgc_worker_cuda_max_reserved_mb" in stats:
+                stats["actual_sparsepcgc_worker_cuda_max_reserved_mb"] = stats["sparsepcgc_worker_cuda_max_reserved_mb"]
+            if "sparsepcgc_worker_cuda_allocated_delta_mb" in stats:
+                stats["actual_sparsepcgc_worker_cuda_allocated_delta_mb"] = stats["sparsepcgc_worker_cuda_allocated_delta_mb"]
+            if "sparsepcgc_worker_cuda_reserved_delta_mb" in stats:
+                stats["actual_sparsepcgc_worker_cuda_reserved_delta_mb"] = stats["sparsepcgc_worker_cuda_reserved_delta_mb"]
             return stats
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)

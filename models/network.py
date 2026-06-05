@@ -187,6 +187,128 @@ class Network(nn.Module):
         return coords.to(dtype=torch.long).contiguous()
 
     @staticmethod
+    def _normalize_unit_keys(unit_keys, batch_size, point_count, device):
+        """
+        CauseDiagnosisAggregationへ渡すunit_keysを [B, N] に揃える。
+        global_morton_keys / structural_voxel_key / point_feature_voxel_key の形状差を吸収する。
+        """
+        if unit_keys is None:
+            return None
+
+        if not torch.is_tensor(unit_keys):
+            unit_keys = torch.as_tensor(unit_keys)
+
+        unit_keys = unit_keys.to(device=device, dtype=torch.long)
+
+        if unit_keys.ndim == 1:
+            unit_keys = unit_keys.view(1, -1)
+
+        elif unit_keys.ndim == 2:
+            if unit_keys.shape[0] == 1:
+                pass
+            elif unit_keys.shape[1] == 1:
+                unit_keys = unit_keys.reshape(1, -1)
+            else:
+                pass
+
+        elif unit_keys.ndim == 3:
+            if unit_keys.shape[1] == 1:
+                unit_keys = unit_keys.squeeze(1)
+            elif unit_keys.shape[2] == 1:
+                unit_keys = unit_keys.squeeze(2)
+            else:
+                return None
+        else:
+            return None
+
+        if unit_keys.ndim != 2:
+            return None
+
+        B = int(batch_size)
+        N = int(point_count)
+
+        if unit_keys.shape[0] == 1 and B > 1:
+            unit_keys = unit_keys.expand(B, -1).contiguous()
+
+        if unit_keys.shape[0] != B:
+            return None
+
+        current_n = int(unit_keys.shape[1])
+
+        if current_n == N:
+            return unit_keys.contiguous()
+
+        if current_n <= 0:
+            return None
+
+        if current_n > N:
+            return unit_keys[:, :N].contiguous()
+
+        pad = unit_keys[:, -1:].expand(B, N - current_n)
+        return torch.cat([unit_keys, pad], dim=1).contiguous()
+
+    def _unit_keys_from_voxel_coords(self, context, batch_size, point_count, device):
+        """
+        repair_unit_keys / global_morton_keys が無い場合に、
+        global_voxel_coords から CauseDiagnosisAggregation 用の unit_keys=[B,N] を作る。
+        これは local recompute ではなく、prebuilt global voxel coords に基づく fallback である。
+        """
+        if not isinstance(context, dict):
+            return None
+
+        coords_raw = self._first_tensor_from_dict(
+            context,
+            (
+                "global_voxel_coords",
+                "subtree_global_voxel_coords",
+                "occupied_voxel_coords",
+                "full_global_voxel_coords",
+                "full_occupied_voxel_coords",
+            ),
+        )
+        if coords_raw is None:
+            return None
+
+        coords_b3n = self._normalize_node_voxel_coords(coords_raw, device=device)
+        if coords_b3n is None or coords_b3n.shape[-1] <= 0:
+            return None
+
+        coords_b3n = coords_b3n.to(device=device, dtype=torch.long)
+
+        if coords_b3n.shape[0] == 1 and int(batch_size) > 1:
+            coords_b3n = coords_b3n.expand(int(batch_size), -1, -1).contiguous()
+
+        if coords_b3n.shape[0] != int(batch_size):
+            return None
+
+        # 点数を analysis_xyz に合わせる。
+        current_n = int(coords_b3n.shape[-1])
+        target_n = int(point_count)
+
+        if current_n > target_n:
+            coords_b3n = coords_b3n[:, :, :target_n].contiguous()
+        elif current_n < target_n:
+            if current_n <= 0:
+                return None
+            pad = coords_b3n[:, :, -1:].expand(coords_b3n.shape[0], 3, target_n - current_n)
+            coords_b3n = torch.cat([coords_b3n, pad], dim=2).contiguous()
+
+        # 3次元voxel座標から安定した整数keyを作る。
+        # morton keyそのものではないが、同一voxelを同一repair unitにまとめる目的には十分である。
+        unit_keys = (
+            coords_b3n[:, 0, :] * 73856093
+            + coords_b3n[:, 1, :] * 19349663
+            + coords_b3n[:, 2, :] * 83492791
+        )
+
+        return self._normalize_unit_keys(
+            unit_keys,
+            batch_size=batch_size,
+            point_count=point_count,
+            device=device,
+        )
+    
+    @staticmethod
     def _first_tensor_from_dict(dict_obj, keys):
         if not isinstance(dict_obj, dict):
             return None
@@ -318,10 +440,14 @@ class Network(nn.Module):
 
         meta = None
         if coords_raw is None:
-            # full/subtree文脈が無い場合は、Phase1のcanonical量子化だけを試す。
-            # full cloud anchorではsubtree_tree/full_octree_contextが無いので、
-            # fallback許可時は点群経路へ戻す。
-            if subtree_tree is None and full_octree_context is None and allow_fallback:
+            missing_subtree_and_full_context = (
+                subtree_tree is None
+                and full_octree_context is None
+            )
+
+            # full_octree_context がある場合は、subtree_tree が無くてもNode/Voxel経路を継続する。
+            # full cloud anchorでは full_octree_context の global_voxel_coords を使う。
+            if missing_subtree_and_full_context and allow_fallback:
                 debug["network_voxel_node_fallback"] = True
                 debug["network_voxel_node_fallback_reason"] = "missing_subtree_and_full_context"
                 return None, debug
@@ -723,6 +849,117 @@ class Network(nn.Module):
         return mask.to(device=device, dtype=torch.bool)
 
     @staticmethod
+    def _slice_point_aligned_tensor(value, point_mask, batch_size, device):
+        """
+        full cloud 上の点・voxelに対応するTensorを、subtree maskで切り出す。
+        ここではB=1のsubtree学習を主対象にする。
+        """
+        if value is None:
+            return None
+        if not torch.is_tensor(value):
+            value = torch.as_tensor(value)
+
+        value = value.to(device=device)
+        mask = point_mask
+        if mask.ndim == 3:
+            mask = mask.squeeze(1)
+        mask = mask.to(device=device, dtype=torch.bool)
+
+        if mask.shape[0] != batch_size:
+            if mask.shape[0] == 1 and batch_size > 1:
+                mask = mask.expand(batch_size, -1)
+            else:
+                raise ValueError("subtree point_mask batch size does not match.")
+
+        # B=1以外では可変長subsetをそのままTensor化できないため、明示的に止める。
+        if batch_size != 1:
+            raise ValueError(
+                "full-cloud-coordinate subtree subset currently supports batch_size=1 only. "
+                "Use batch_size=1 for subtree training or add padding logic."
+            )
+
+        mask_b = mask[0]
+
+        # [B, 3, N] または [B, C, N]
+        if value.ndim == 3 and value.shape[0] in (1, batch_size) and value.shape[2] == mask_b.numel():
+            if value.shape[0] == 1 and batch_size > 1:
+                value = value.expand(batch_size, -1, -1)
+            return value[0:1, :, mask_b].contiguous()
+
+        # [B, N, K]
+        if value.ndim == 3 and value.shape[0] in (1, batch_size) and value.shape[1] == mask_b.numel():
+            if value.shape[0] == 1 and batch_size > 1:
+                value = value.expand(batch_size, -1, -1)
+            return value[0:1, mask_b, :].contiguous()
+
+        # [B, N]
+        if value.ndim == 2 and value.shape[0] in (1, batch_size) and value.shape[1] == mask_b.numel():
+            if value.shape[0] == 1 and batch_size > 1:
+                value = value.expand(batch_size, -1)
+            return value[0:1, mask_b].contiguous()
+
+        # [N]
+        if value.ndim == 1 and value.shape[0] == mask_b.numel():
+            return value[mask_b].view(1, -1).contiguous()
+
+        # 点数に対応しないメタ情報はそのまま返す。
+        return value
+
+    def _build_full_coord_subtree_context(
+        self,
+        base_context,
+        point_mask,
+        batch_size,
+        device,
+    ):
+        """
+        full cloud contextから、selected_subtree_keysに対応する点だけを切り出した
+        subtree contextを作る。
+
+        重要：
+        global_voxel_coordsを再計算しない。
+        full cloudで作ったglobal_voxel_coordsのsubsetだけを使う。
+        """
+        if not isinstance(base_context, dict):
+            return None
+
+        subtree_context = {}
+
+        point_aligned_keys = (
+            "global_voxel_coords",
+            "subtree_global_voxel_coords",
+            "occupied_voxel_coords",
+            "full_global_voxel_coords",
+            "repair_unit_keys",
+            "point_node_ids",
+            "point_subtree_keys",
+            "point_parent_node_ids",
+            "point_child_slots",
+            "point_valid_empty_child_mask",
+        )
+
+        for key, value in base_context.items():
+            if key in point_aligned_keys:
+                subtree_context[key] = self._slice_point_aligned_tensor(
+                    value,
+                    point_mask=point_mask,
+                    batch_size=batch_size,
+                    device=device,
+                )
+            else:
+                subtree_context[key] = value
+
+        # 以後の全モジュールが同じ名前を見るように正規化する。
+        if subtree_context.get("global_voxel_coords", None) is None:
+            for alt_key in ("subtree_global_voxel_coords", "occupied_voxel_coords", "full_global_voxel_coords"):
+                if subtree_context.get(alt_key, None) is not None:
+                    subtree_context["global_voxel_coords"] = subtree_context[alt_key]
+                    break
+
+        subtree_context["subtree_is_full_cloud_coord_subset"] = True
+        return subtree_context
+
+    @staticmethod
     def _fit_point_key_rows(keys, batch_size, num_points, device):
         if keys is None:
             return None
@@ -881,6 +1118,25 @@ class Network(nn.Module):
         prebuilt_subtree_mode = subtree_tree is not None
         full_unit_keys = None # Subtree Key保存用の変数初期化
         selection_mask = None # 選択されたSubtreeに属する点だけを示すマスクの初期化
+        canonical_subtree_tree = subtree_tree
+        # full cloud forward でも、full_octree_context から repair unit key を先に用意する。
+        # repair_unit_keys / point_node_ids / global_morton_keys が無い場合は、
+        # global_voxel_coords から同一voxel単位の key を作る。
+        if isinstance(full_octree_context, dict):
+            full_unit_keys = self._tree_point_keys(
+                full_octree_context,
+                ("repair_unit_keys", "point_node_ids", "global_morton_keys"),
+                pts_xyz.shape[0],
+                pts_xyz.shape[2],
+                pts_xyz.device,
+            )
+            if full_unit_keys is None:
+                full_unit_keys = self._unit_keys_from_voxel_coords(
+                    full_octree_context,
+                    batch_size=pts_xyz.shape[0],
+                    point_count=pts_xyz.shape[2],
+                    device=pts_xyz.device,
+                )
         prebuilt_repair_unit_keys = self._tree_point_keys(
             subtree_tree,
             ("repair_unit_keys", "point_node_ids"),
@@ -897,8 +1153,29 @@ class Network(nn.Module):
         )
         if prebuilt_subtree_mode:
             full_unit_keys = prebuilt_repair_unit_keys
+
             if full_unit_keys is None:
-                raise ValueError("subtree_tree must provide repair_unit_keys or point_node_ids for Network prebuilt subtree mode.")
+                full_unit_keys = self._tree_point_keys(
+                    subtree_tree,
+                    ("global_morton_keys",),
+                    pts_xyz.shape[0],
+                    pts_xyz.shape[2],
+                    pts_xyz.device,
+                )
+
+            if full_unit_keys is None:
+                full_unit_keys = self._unit_keys_from_voxel_coords(
+                    subtree_tree,
+                    batch_size=pts_xyz.shape[0],
+                    point_count=pts_xyz.shape[2],
+                    device=pts_xyz.device,
+                )
+
+            if full_unit_keys is None:
+                raise ValueError(
+                    "subtree_tree must provide repair_unit_keys, point_node_ids, global_morton_keys, "
+                    "or global_voxel_coords for Network prebuilt subtree mode."
+                )
             if selected_subtree_keys is not None and prebuilt_subtree_keys is not None:
                 selected_subtree_keys = selected_subtree_keys.to(device=pts_xyz.device, dtype=prebuilt_subtree_keys.dtype).reshape(-1)
                 selection_mask = self._normalize_point_mask(
@@ -907,8 +1184,62 @@ class Network(nn.Module):
                     num_points=pts_xyz.shape[2],
                     device=pts_xyz.device,
                 )
-        elif subtree_ref is not None: # Subtree参照情報が与えられているか確認
-            full_unit_keys = assign_octree_subtree_keys(pts_xyz, subtree_ref)
+                canonical_subtree_tree = self._build_full_coord_subtree_context(
+                    subtree_tree,
+                    point_mask=selection_mask,
+                    batch_size=pts_xyz.shape[0],
+                    device=pts_xyz.device,
+                )
+                # canonical_subtree_tree に含まれる点数に合わせて key を取り直す。
+                canonical_point_count = pts_xyz.shape[2]
+                if isinstance(canonical_subtree_tree, dict):
+                    gv = canonical_subtree_tree.get("global_voxel_coords", None)
+                    gv_norm = self._normalize_node_voxel_coords(gv, device=pts_xyz.device)
+                    if gv_norm is not None:
+                        canonical_point_count = int(gv_norm.shape[-1])
+
+                full_unit_keys = self._tree_point_keys(
+                    canonical_subtree_tree,
+                    ("repair_unit_keys", "point_node_ids", "global_morton_keys"),
+                    pts_xyz.shape[0],
+                    canonical_point_count,
+                    pts_xyz.device,
+                )
+                if full_unit_keys is None:
+                    full_unit_keys = self._unit_keys_from_voxel_coords(
+                        canonical_subtree_tree,
+                        batch_size=pts_xyz.shape[0],
+                        point_count=canonical_point_count,
+                        device=pts_xyz.device,
+                    )
+        elif subtree_ref is not None:
+            # full_octree_contextにpoint_subtree_keysがあるなら、それを優先する。
+            # なければ従来通りpts_xyzから計算するが、これはfallbackである。
+            full_context_subtree_keys = self._tree_point_keys(
+                full_octree_context,
+                ("point_subtree_keys",),
+                pts_xyz.shape[0],
+                pts_xyz.shape[2],
+                pts_xyz.device,
+            )
+
+            full_context_repair_keys = self._tree_point_keys(
+                full_octree_context,
+                ("repair_unit_keys", "point_node_ids", "global_morton_keys"),
+                pts_xyz.shape[0],
+                pts_xyz.shape[2],
+                pts_xyz.device,
+            )
+
+            if full_context_repair_keys is not None:
+                full_unit_keys = full_context_repair_keys
+            elif full_context_subtree_keys is not None:
+                # 最後のfallbackとしてのみ使う。
+                # これはsubtree単位の粗い集約になるため、repair unitとしては精度が落ちる。
+                full_unit_keys = full_context_subtree_keys
+            else:
+                full_unit_keys = assign_octree_subtree_keys(pts_xyz, subtree_ref)
+
             if selected_subtree_keys is not None:
                 selected_subtree_keys = selected_subtree_keys.to(device=pts_xyz.device, dtype=full_unit_keys.dtype).reshape(-1)
                 selection_mask = subtree_membership_mask(full_unit_keys, selected_subtree_keys)
@@ -918,6 +1249,14 @@ class Network(nn.Module):
                     num_points=pts_xyz.shape[2],
                     device=pts_xyz.device,
                 )
+
+                if isinstance(full_octree_context, dict):
+                    canonical_subtree_tree = self._build_full_coord_subtree_context(
+                        full_octree_context,
+                        point_mask=selection_mask,
+                        batch_size=pts_xyz.shape[0],
+                        device=pts_xyz.device,
+                    )
 
         timing_enabled = self._timing_enabled() # 時間計測を行うか否か取得
         if timing_enabled:
@@ -929,19 +1268,36 @@ class Network(nn.Module):
             node_voxel_input_state, node_voxel_debug = self._build_node_voxel_input(
                 pts_xyz,
                 coord_scale=coord_scale,
-                subtree_tree=subtree_tree,
+                subtree_tree=canonical_subtree_tree,
                 full_octree_context=full_octree_context,
                 octree_input_mode=octree_input_mode,
             )
             if node_voxel_input_state is not None:
                 pts_xyz = node_voxel_input_state["node_xyz"].to(device=pts_xyz.device, dtype=pts_xyz.dtype)
                 pts_attr = None
+
+                # ここで selection_mask を full cloud 用maskのまま使ってはいけない。
+                # pts_xyz はすでに subtree subset のnode_xyzになっているため、
+                # 以後のselection_maskは subset 内の有効node全体を指すmaskにする。
                 selection_mask = node_voxel_input_state["node_mask"]
+
+                # subset化済みcontextを以後の構造解析・Actuatorにも渡す。
+                subtree_tree = canonical_subtree_tree
+
                 prebuilt_subtree_mode = False
                 full_unit_keys = None
                 prebuilt_repair_unit_keys = None
                 prebuilt_subtree_keys = None
 
+        # ============================================================
+        # Phase4:
+        # CostAttributionModule に、現在の入力が点群かNode/Voxelかを伝える。
+        # これを入れないと cost_attribution.py 側の input_mode debug が常に point になりやすい。
+        # ============================================================
+        try:
+            self.cost_attributor.node_voxel_mode = bool(node_voxel_input_state is not None)
+        except Exception:
+            pass
         """Encoder"""
         if node_voxel_input_state is not None:
             fused_feat_node = node_voxel_input_state["node_features"].to(device=pts_xyz.device, dtype=pts_xyz.dtype)
@@ -1068,10 +1424,10 @@ class Network(nn.Module):
                 structure_b = self.structure_analyzer(
                     analysis_xyz_b,
                     coord_scale=coord_scale_b,
-                    subtree_tree=subtree_tree if b == 0 else None,
+                    subtree_tree=canonical_subtree_tree if b == 0 else None,
                     full_octree_context=full_octree_context if b == 0 else None,
                     octree_input_mode=octree_input_mode,
-                ) # 解析用点群に対して、Octree構造解析を行う
+                )
                 if timing_enabled:
                     self._sync_if_cuda_tensor(pts_xyz)
                     runtime_diag_end = time.time()
@@ -1093,17 +1449,51 @@ class Network(nn.Module):
                     
                 """原因スコア集約器"""
                 unit_keys_b = None if analysis_unit_keys is None else analysis_unit_keys[b:b + 1, :analysis_count]
+                aggregation_key_source_b = "analysis_unit_keys" if unit_keys_b is not None else "none"
+
                 if unit_keys_b is None:
                     unit_keys_b = structure_b.get("structural_voxel_key", None)
+                    if unit_keys_b is not None:
+                        aggregation_key_source_b = "structure_b.structural_voxel_key"
+
                     if unit_keys_b is None:
                         unit_keys_b = structure_b.get("point_feature_voxel_key", None)
-                aggregated_b = self.cause_aggregator( # 原因スコアを点単位からSubtree/Repair Unit単位へ集約する
+                        if unit_keys_b is not None:
+                            aggregation_key_source_b = "structure_b.point_feature_voxel_key"
+
+                unit_keys_b = self._normalize_unit_keys(
+                    unit_keys_b,
+                    batch_size=analysis_xyz_b.shape[0],
+                    point_count=analysis_xyz_b.shape[-1],
+                    device=analysis_xyz_b.device,
+                )
+
+                if unit_keys_b is None:
+                    raise ValueError(
+                        "Network.forward could not provide prebuilt unit_keys to CauseDiagnosisAggregation "
+                        f"in sparse/per-sample path. analysis_xyz_b={tuple(analysis_xyz_b.shape)}, "
+                        f"structural_voxel_key={None if structure_b.get('structural_voxel_key', None) is None else tuple(structure_b.get('structural_voxel_key').shape)}, "
+                        f"point_feature_voxel_key={None if structure_b.get('point_feature_voxel_key', None) is None else tuple(structure_b.get('point_feature_voxel_key').shape)}"
+                    )
+
+                aggregated_b = self.cause_aggregator(
                     pts_xyz=analysis_xyz_b,
                     cause_scores=cause_scores_b,
                     cause_targets=cause_targets_b,
                     unit_keys=unit_keys_b,
                 )
                 aggregation_unit_modes.append(str(aggregated_b.get("unit_mode", "unknown")))
+                if isinstance(structure_b, dict):
+                    structure_b["phase4_aggregation_key_source"] = str(aggregation_key_source_b)
+                    structure_b["phase4_aggregation_unit_count"] = int(
+                        aggregated_b.get("unit_count", 0)
+                    )
+                    structure_b["phase4_aggregation_max_unit_size"] = int(
+                        aggregated_b.get("max_unit_size", 0)
+                    )
+                    structure_b["phase4_aggregation_min_unit_size"] = int(
+                        aggregated_b.get("min_unit_size", 0)
+                    )
                 subtree_scores_b = aggregated_b["scores"] # Subtree原因スコア
                 subtree_targets_b = aggregated_b["targets"] # Subtree教師
                 repair_priority_b = aggregated_b["priority"].to(device=pts_xyz.device, dtype=fused_feat_b.dtype) # DeviceとDtypeを合わせる
@@ -1186,6 +1576,29 @@ class Network(nn.Module):
             structure = { # Actuatorや診断値計算で使う構造情報の辞書設定
                 "features": structure_feat_full,
                 "snap_delta": torch.cat(snap_delta_full_list, dim=0),
+                "phase4_aggregation_key_source": structure_b.get(
+                    "phase4_aggregation_key_source",
+                    "unknown",
+                ) if structure_b is not None else "unknown",
+                "phase4_aggregation_unit_count": int(
+                    structure_b.get("phase4_aggregation_unit_count", 0)
+                    if structure_b is not None
+                    else 0
+                ),
+                "phase4_aggregation_max_unit_size": int(
+                    structure_b.get("phase4_aggregation_max_unit_size", 0)
+                    if structure_b is not None
+                    else 0
+                ),
+                "phase4_aggregation_min_unit_size": int(
+                    structure_b.get("phase4_aggregation_min_unit_size", 0)
+                    if structure_b is not None
+                    else 0
+                ),
+                "phase4_structural_key_source": structure_b.get(
+                    "phase4_structural_key_source",
+                    "unknown",
+                ) if structure_b is not None else "unknown",
                 "single_proxy_full": torch.cat(single_proxy_full_list, dim=0),
                 "node_proxy_full": torch.cat(node_proxy_full_list, dim=0),
                 "lowprob_proxy_full": torch.cat(lowprob_proxy_full_list, dim=0),
@@ -1217,7 +1630,7 @@ class Network(nn.Module):
             structure = self.structure_analyzer(
                 analysis_xyz,
                 coord_scale=coord_scale,
-                subtree_tree=subtree_tree,
+                subtree_tree=canonical_subtree_tree,
                 full_octree_context=full_octree_context,
                 octree_input_mode=octree_input_mode,
             )
@@ -1238,15 +1651,159 @@ class Network(nn.Module):
                 runtime_attr_end = time.time()
                 runtime_attribution_total += runtime_attr_end - runtime_attr_start
                 runtime_decision_start = time.time()
+                
+            # ============================================================
+            # Phase4:
+            # CauseAggregation に渡す unit_keys の出所を明示する。
+            # local recomputeではなく、prebuilt/canonical keyを優先する。
+            # ============================================================
+            unit_keys = full_unit_keys
+            aggregation_key_source = "full_unit_keys" if unit_keys is not None else "none"
+
+            if unit_keys is None:
+                unit_keys = structure.get("structural_voxel_key", None)
+                if unit_keys is not None:
+                    aggregation_key_source = "structure.structural_voxel_key"
+
+            if unit_keys is None:
+                unit_keys = structure.get("point_feature_voxel_key", None)
+                if unit_keys is not None:
+                    aggregation_key_source = "structure.point_feature_voxel_key"
+
+            if unit_keys is None:
+                unit_keys = self._unit_keys_from_voxel_coords(
+                    canonical_subtree_tree,
+                    batch_size=analysis_xyz.shape[0],
+                    point_count=analysis_xyz.shape[-1],
+                    device=analysis_xyz.device,
+                )
+                if unit_keys is not None:
+                    aggregation_key_source = "canonical_subtree_tree.global_voxel_coords_hash"
+
+            if unit_keys is None:
+                unit_keys = self._unit_keys_from_voxel_coords(
+                    full_octree_context,
+                    batch_size=analysis_xyz.shape[0],
+                    point_count=analysis_xyz.shape[-1],
+                    device=analysis_xyz.device,
+                )
+                if unit_keys is not None:
+                    aggregation_key_source = "full_octree_context.global_voxel_coords_hash"
+
+            unit_keys = self._normalize_unit_keys(
+                unit_keys,
+                batch_size=analysis_xyz.shape[0],
+                point_count=analysis_xyz.shape[-1],
+                device=analysis_xyz.device,
+            )
+
+            if unit_keys is None:
+                raise ValueError(
+                    "Network.forward could not provide prebuilt unit_keys to CauseDiagnosisAggregation "
+                    f"in full-cloud path. analysis_xyz={tuple(analysis_xyz.shape)}, "
+                    f"full_unit_keys=None, "
+                    f"structural_voxel_key={None if structure.get('structural_voxel_key', None) is None else tuple(structure.get('structural_voxel_key').shape)}, "
+                    f"point_feature_voxel_key={None if structure.get('point_feature_voxel_key', None) is None else tuple(structure.get('point_feature_voxel_key').shape)}, "
+                    f"octree_input_mode={structure.get('octree_input_mode', '')}, "
+                    f"structural_voxel_mode={structure.get('structural_voxel_mode', '')}"
+                )
+
             aggregated = self.cause_aggregator(
                 pts_xyz=analysis_xyz,
                 cause_scores=cause_scores,
                 cause_targets=cause_targets,
-                unit_keys=full_unit_keys
-                if full_unit_keys is not None
-                else structure.get("structural_voxel_key", None)
-                if structure.get("structural_voxel_key", None) is not None
-                else structure.get("point_feature_voxel_key", None),
+                unit_keys=unit_keys,
+            )
+
+            structure["aggregation_unit_keys"] = unit_keys
+            structure["aggregation_unit_mode"] = str(aggregated.get("unit_mode", "unknown"))
+
+            # ============================================================
+            # Phase4:
+            # aggregation key の出所とunit統計をdebugへ保存する。
+            # 同じ値を何度も代入しない。
+            # ============================================================
+            structure["phase4_aggregation_key_source"] = str(aggregation_key_source)
+            structure["phase4_aggregation_unit_count"] = int(
+                aggregated.get("unit_count", 0)
+            )
+            structure["phase4_aggregation_max_unit_size"] = int(
+                aggregated.get("max_unit_size", 0)
+            )
+            structure["phase4_aggregation_min_unit_size"] = int(
+                aggregated.get("min_unit_size", 0)
+            )
+
+            aggregation_unit_modes = [str(aggregated.get("unit_mode", "unknown"))]
+            structure["phase4_aggregation_key_source"] = str(aggregation_key_source)
+            structure["phase4_aggregation_unit_count"] = int(
+                aggregated.get("unit_count", 0)
+            )
+            structure["phase4_aggregation_max_unit_size"] = int(
+                aggregated.get("max_unit_size", 0)
+            )
+            structure["phase4_aggregation_min_unit_size"] = int(
+                aggregated.get("min_unit_size", 0)
+            )
+            structure["phase4_aggregation_key_source"] = str(aggregation_key_source)
+            structure["phase4_aggregation_unit_count"] = int(
+                aggregated.get("unit_count", 0)
+            )
+            structure["phase4_aggregation_max_unit_size"] = int(
+                aggregated.get("max_unit_size", 0)
+            )
+            structure["phase4_aggregation_min_unit_size"] = int(
+                aggregated.get("min_unit_size", 0)
+            )
+            structure["phase4_aggregation_key_source"] = str(aggregation_key_source)
+            structure["phase4_aggregation_unit_count"] = int(
+                aggregated.get("unit_count", 0)
+            )
+            structure["phase4_aggregation_max_unit_size"] = int(
+                aggregated.get("max_unit_size", 0)
+            )
+            structure["phase4_aggregation_min_unit_size"] = int(
+                aggregated.get("min_unit_size", 0)
+            )
+            structure["phase4_aggregation_key_source"] = str(aggregation_key_source)
+            structure["phase4_aggregation_unit_count"] = int(
+                aggregated.get("unit_count", 0)
+            )
+            structure["phase4_aggregation_max_unit_size"] = int(
+                aggregated.get("max_unit_size", 0)
+            )
+            structure["phase4_aggregation_min_unit_size"] = int(
+                aggregated.get("min_unit_size", 0)
+            )
+            structure["phase4_aggregation_key_source"] = str(aggregation_key_source)
+            structure["phase4_aggregation_unit_count"] = int(
+                aggregated.get("unit_count", 0)
+            )
+            structure["phase4_aggregation_max_unit_size"] = int(
+                aggregated.get("max_unit_size", 0)
+            )
+            structure["phase4_aggregation_min_unit_size"] = int(
+                aggregated.get("min_unit_size", 0)
+            )
+            structure["phase4_aggregation_key_source"] = str(aggregation_key_source)
+            structure["phase4_aggregation_unit_count"] = int(
+                aggregated.get("unit_count", 0)
+            )
+            structure["phase4_aggregation_max_unit_size"] = int(
+                aggregated.get("max_unit_size", 0)
+            )
+            structure["phase4_aggregation_min_unit_size"] = int(
+                aggregated.get("min_unit_size", 0)
+            )
+            structure["phase4_aggregation_key_source"] = str(aggregation_key_source)
+            structure["phase4_aggregation_unit_count"] = int(
+                aggregated.get("unit_count", 0)
+            )
+            structure["phase4_aggregation_max_unit_size"] = int(
+                aggregated.get("max_unit_size", 0)
+            )
+            structure["phase4_aggregation_min_unit_size"] = int(
+                aggregated.get("min_unit_size", 0)
             )
             aggregation_unit_modes = [str(aggregated.get("unit_mode", "unknown"))]
             subtree_scores = aggregated["scores"]
@@ -1286,7 +1843,46 @@ class Network(nn.Module):
                 structure["global_offset"] = node_voxel_input_state.get("global_offset", None)
 
         """点操作実行"""
-        actuator_input = torch.cat([structure_feat_full, subtree_scores_full, policy_probs_full, repair_priority_full], dim=1) # 構造特徴、原因スコアなどをチャネル方向に結合
+        actuator_input = torch.cat(
+            [structure_feat_full, subtree_scores_full, policy_probs_full, repair_priority_full],
+            dim=1,
+        ) # 構造特徴、原因スコアなどをチャネル方向に結合
+
+        # ============================================================
+        # FullCloud時は、Actuatorにもfull_octree_contextをoctree_contextとして渡す。
+        # これにより、Actuator内部のvoxel_coordsもfull cloud canonical基準に固定する。
+        # ============================================================
+        octree_mode_text = str(octree_input_mode or "auto").strip().lower()
+        is_full_cloud_forward = octree_mode_text == "full_cloud"
+
+        if is_full_cloud_forward:
+            actuator_octree_context = full_octree_context
+            actuator_octree_context_source = "full_octree_context"
+        else:
+            actuator_octree_context = canonical_subtree_tree
+            actuator_octree_context_source = "canonical_subtree_tree"
+
+        if (
+            is_full_cloud_forward
+            and bool(getattr(self.args, "full_cloud_require_actuator_octree_context", True))
+            and not isinstance(actuator_octree_context, dict)
+        ):
+            raise RuntimeError(
+                "FullCloud forward requires full_octree_context to be passed as "
+                "Actuator octree_context, but full_octree_context is missing."
+            )
+
+        if (
+            is_full_cloud_forward
+            and bool(getattr(self.args, "full_cloud_require_actuator_octree_context", True))
+            and isinstance(actuator_octree_context, dict)
+            and actuator_octree_context.get("global_voxel_coords", None) is None
+        ):
+            raise RuntimeError(
+                "FullCloud forward requires full_octree_context['global_voxel_coords'] "
+                "for Actuator canonical voxel path."
+            )
+
         pts_out, final_w, edit_loss, actuator_stats = self.actuator( # 実際に点操作を行う
             pts_xyz=pts_xyz,
             structure=structure,
@@ -1296,9 +1892,18 @@ class Network(nn.Module):
             repair_priority=repair_priority_full,
             coord_scale=coord_scale,
             selection_mask=selection_mask,
-            octree_context=subtree_tree,
+            octree_context=actuator_octree_context,
             full_octree_context=full_octree_context,
         )
+        if isinstance(actuator_stats, dict):
+            actuator_stats["actuator_octree_context_source"] = str(actuator_octree_context_source)
+            actuator_stats["actuator_octree_context_is_full_cloud"] = bool(is_full_cloud_forward)
+            actuator_stats["actuator_octree_context_available"] = bool(isinstance(actuator_octree_context, dict))
+            actuator_stats["actuator_octree_context_has_global_voxel_coords"] = bool(
+                isinstance(actuator_octree_context, dict)
+                and actuator_octree_context.get("global_voxel_coords", None) is not None
+            )
+            
         # Actuatorが内部で更新したVoxel状態をLoss / compression.py 側から読めるように保存する。
         actuator_voxel_state = {
             key: actuator_stats.get(key, None)
@@ -1324,6 +1929,25 @@ class Network(nn.Module):
                 "point_aligned_initial_voxel_coords",
                 "point_aligned_final_voxel_coords",
                 "point_aligned_final_voxel_weights",
+                "voxel_soft_drop_score",
+                "voxel_soft_add_score",
+                "voxel_soft_move_score",
+                "voxel_soft_drop_amount",
+                "voxel_soft_add_amount",
+                "voxel_soft_move_amount",
+                "voxel_soft_edit_score",
+                "voxel_soft_edit_count_proxy",
+                "drop_ratio_soft",
+                "drop_ratio_hard",
+                "add_ratio_soft",
+                "add_ratio_hard",
+                "move_ratio_soft",
+                "move_ratio_hard",
+                "add_ratio_loss_value",
+                "add_consistency_loss_value",
+                "voxel_soft_drop_mean",
+                "voxel_soft_add_mean",
+                "voxel_soft_move_mean",
             )
             if actuator_stats.get(key, None) is not None
         }
@@ -1342,7 +1966,18 @@ class Network(nn.Module):
         actuator_voxel_state["actuator_local_recomputed"] = bool(
             actuator_stats.get("local_recomputed", actuator_stats.get("actuator_local_recomputed", True))
         )
-
+        actuator_voxel_state["actuator_octree_context_source"] = str(
+            actuator_stats.get("actuator_octree_context_source", "unknown")
+        )
+        actuator_voxel_state["actuator_octree_context_is_full_cloud"] = bool(
+            actuator_stats.get("actuator_octree_context_is_full_cloud", False)
+        )
+        actuator_voxel_state["actuator_octree_context_available"] = bool(
+            actuator_stats.get("actuator_octree_context_available", False)
+        )
+        actuator_voxel_state["actuator_octree_context_has_global_voxel_coords"] = bool(
+            actuator_stats.get("actuator_octree_context_has_global_voxel_coords", False)
+        )
         self.last_actuator_voxel_state = actuator_voxel_state
         try:
             setattr(self.args, "_last_actuator_voxel_state", self.last_actuator_voxel_state)
@@ -1373,6 +2008,12 @@ class Network(nn.Module):
                 value = node_voxel_input_state.get(key, None)
                 if torch.is_tensor(value):
                     self.debug_tensors[f"network_voxel_node_{key}"] = value
+        # Phase7-3: Node/Voxel経路のTensor系debug。
+        # 長期保存用ではなく、直近forward確認用である。
+        if isinstance(node_voxel_debug, dict):
+            self.debug_tensors["network_voxel_node_count_tensor"] = pts_xyz.new_tensor(
+                float(node_voxel_debug.get("network_voxel_node_count", 0) or 0)
+            ).detach()
 
         # Phase2: Actuator側で作ったcanonical voxel復元debugをNetwork側にも保存する。
         # 戻り値形式は変えない。
@@ -1398,8 +2039,22 @@ class Network(nn.Module):
             or actuator_local_recomputed
             or "local_recomputed" in cause_aggregation_unit_mode
         )
-        if str(octree_input_mode or "auto").strip().lower() == "prebuilt_subtree_tree" and forward_local_recomputed:
+        if octree_mode_text == "prebuilt_subtree_tree" and forward_local_recomputed:
             raise RuntimeError("prebuilt_subtree_tree forward used a local_recomputed path.")
+
+        if (
+            octree_mode_text == "full_cloud"
+            and bool(getattr(self.args, "full_cloud_forbid_actuator_local_recompute", True))
+            and forward_local_recomputed
+        ):
+            raise RuntimeError(
+                "full_cloud forward used a local_recomputed path. "
+                f"structure_local_recomputed={bool(structure.get('local_recomputed', False))}, "
+                f"actuator_local_recomputed={bool(actuator_local_recomputed)}, "
+                f"cause_aggregation_unit_mode={cause_aggregation_unit_mode}, "
+                f"actuator_octree_context_source={actuator_stats.get('actuator_octree_context_source', 'unknown')}, "
+                f"actuator_voxel_mode={actuator_stats.get('actuator_voxel_mode', 'unknown')}"
+            )
         if self._should_collect_runtime_debug() and self.writer is not None and hasattr(self.writer, "write"):
             self.writer.write(
                 "NetworkStructureMode: "
@@ -1464,6 +2119,14 @@ class Network(nn.Module):
             "move_direction_ce",
             "learned_move_ratio",
             "soft_activity_loss",
+            "voxel_soft_drop_score",
+            "voxel_soft_add_score",
+            "voxel_soft_move_score",
+            "voxel_soft_drop_amount",
+            "voxel_soft_add_amount",
+            "voxel_soft_move_amount",
+            "voxel_soft_edit_score",
+            "voxel_soft_edit_count_proxy",
         )
         self.last_actuator_soft_terms = {
             key: value
@@ -1594,6 +2257,18 @@ class Network(nn.Module):
                 active_policy_count = sum(1 for value in policy_argmax_counts.values() if value > 0)
                 structure_local_recomputed = bool(structure.get("local_recomputed", False))
                 self.last_structure_debug = {
+                    "actuator_octree_context_source": str(
+                        actuator_stats.get("actuator_octree_context_source", "unknown")
+                    ),
+                    "actuator_octree_context_is_full_cloud": bool(
+                        actuator_stats.get("actuator_octree_context_is_full_cloud", False)
+                    ),
+                    "actuator_octree_context_available": bool(
+                        actuator_stats.get("actuator_octree_context_available", False)
+                    ),
+                    "actuator_octree_context_has_global_voxel_coords": bool(
+                        actuator_stats.get("actuator_octree_context_has_global_voxel_coords", False)
+                    ),
                     "actuator_voxel_state_saved": bool(
                         isinstance(getattr(self.args, "_last_actuator_voxel_state", None), dict)
                     ),
@@ -1636,7 +2311,57 @@ class Network(nn.Module):
                     "actuator_local_recomputed": actuator_local_recomputed,
                     "prebuilt_metadata_used": bool(subtree_tree is not None and not structure_local_recomputed and not actuator_local_recomputed),
                     "prebuilt_fallback": bool((subtree_tree is not None) and (structure_local_recomputed or actuator_local_recomputed or "local_recomputed" in cause_aggregation_unit_mode)),
-                    "repair_unit_keys_used": bool("prebuilt" in cause_aggregation_unit_mode and full_unit_keys is not None),
+                    "repair_unit_keys_used": bool(
+                        "prebuilt" in cause_aggregation_unit_mode
+                        and (
+                            full_unit_keys is not None
+                            or structure.get("aggregation_unit_keys", None) is not None
+                            or structure.get("structural_voxel_key", None) is not None
+                            or structure.get("point_feature_voxel_key", None) is not None
+                        )
+                    ),
+                    "aggregation_unit_key_available": bool(
+                        structure.get("aggregation_unit_keys", None) is not None
+                    ),
+                    # ============================================================
+                    # Phase4:
+                    # CostAttribution / CauseAggregation / OctreeStructure が
+                    # Node/Voxel基準で動いているかを確認するdebug。
+                    # ============================================================
+                    "phase4_cost_attribution_input_mode": str(
+                        getattr(self.cost_attributor, "debug_tensors", {}).get("input_mode", "unknown")
+                    ),
+                    "phase4_cost_scores_requires_grad": bool(
+                        getattr(self.cost_attributor, "debug_tensors", {}).get("scores_requires_grad", False)
+                    ),
+                    "phase4_cost_logits_requires_grad": bool(
+                        getattr(self.cost_attributor, "debug_tensors", {}).get("logits_requires_grad", False)
+                    ),
+                    "phase4_cause_entropy": float(
+                        getattr(self.cost_attributor, "debug_tensors", {}).get(
+                            "cause_entropy",
+                            pts_xyz.new_zeros(())
+                        ).detach().cpu()
+                    )
+                    if torch.is_tensor(
+                        getattr(self.cost_attributor, "debug_tensors", {}).get("cause_entropy", None)
+                    )
+                    else 0.0,
+                    "phase4_aggregation_key_source": str(
+                        structure.get("phase4_aggregation_key_source", "unknown")
+                    ),
+                    "phase4_aggregation_unit_count": int(
+                        structure.get("phase4_aggregation_unit_count", 0) or 0
+                    ),
+                    "phase4_aggregation_min_unit_size": int(
+                        structure.get("phase4_aggregation_min_unit_size", 0) or 0
+                    ),
+                    "phase4_aggregation_max_unit_size": int(
+                        structure.get("phase4_aggregation_max_unit_size", 0) or 0
+                    ),
+                    "phase4_structural_key_source": str(
+                        structure.get("phase4_structural_key_source", "unknown")
+                    ),
                     "loss_attr": float(loss_attr.detach().cpu()),
                     "loss_policy": float(loss_policy.detach().cpu()),
                     "loss_repair": float(loss_repair.detach().cpu()),
@@ -1760,6 +2485,15 @@ class Network(nn.Module):
                     "octree_input_mode": str(structure.get("octree_input_mode", "local_recomputed")),
                     "network_voxel_node_input_requested": bool(node_voxel_debug.get("network_voxel_node_input_requested", False)),
                     "network_voxel_node_input_used": bool(node_voxel_debug.get("network_voxel_node_input_used", False)),
+                    "full_cloud_anchor_node_voxel_used": bool(
+                        str(octree_input_mode or "").strip().lower() == "full_cloud"
+                        and bool(node_voxel_debug.get("network_voxel_node_input_used", False))
+                    ),
+                    "subtree_node_voxel_used": bool(
+                        str(octree_input_mode or "").strip().lower() != "full_cloud"
+                        and bool(node_voxel_debug.get("network_voxel_node_input_used", False))
+                    ),
+                    "phase7_node_voxel_debug_available": True,
                     "network_voxel_node_fallback": bool(node_voxel_debug.get("network_voxel_node_fallback", False)),
                     "network_voxel_node_fallback_reason": str(node_voxel_debug.get("network_voxel_node_fallback_reason", "")),
                     "network_voxel_node_count": int(node_voxel_debug.get("network_voxel_node_count", 0) or 0),
@@ -1793,6 +2527,24 @@ class Network(nn.Module):
                 "network_voxel_node_count": int(node_voxel_debug.get("network_voxel_node_count", 0) or 0),
                 "network_voxel_node_source": str(node_voxel_debug.get("network_voxel_node_source", "none")),
                 "network_voxel_node_feature_shape": str(node_voxel_debug.get("network_voxel_node_feature_shape", "")),
+                "phase4_cost_attribution_input_mode": str(
+                    getattr(self.cost_attributor, "debug_tensors", {}).get("input_mode", "unknown")
+                ),
+                "phase4_aggregation_key_source": str(
+                    structure.get("phase4_aggregation_key_source", "unknown")
+                    if isinstance(structure, dict)
+                    else "unknown"
+                ),
+                "phase4_aggregation_unit_count": int(
+                    structure.get("phase4_aggregation_unit_count", 0)
+                    if isinstance(structure, dict)
+                    else 0
+                ),
+                "phase4_structural_key_source": str(
+                    structure.get("phase4_structural_key_source", "unknown")
+                    if isinstance(structure, dict)
+                    else "unknown"
+                ),
             }
 
         if timing_enabled:

@@ -38,12 +38,37 @@ class CostAttributionModule(nn.Module):
             raise ValueError(f"features must have shape [B, C, N], got {tuple(features.shape)}")
 
         input_mode = "node_voxel" if bool(getattr(self, "node_voxel_mode", False)) else "point"
+
         logits = self.net(features)
+
+        # ============================================================
+        # Phase4:
+        # CostAttribution の logits が NaN/Inf になると、
+        # policy / actuator 側まで壊れるため、softmax前に安全化する。
+        # ============================================================
+        logits = torch.nan_to_num(
+            logits,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+
         scores = torch.softmax(logits, dim=1)
+
         if torch.is_grad_enabled():
+            score_entropy = -(
+                scores.clamp_min(1e-8).log()
+                * scores
+            ).sum(dim=1).mean()
+
             self.debug_tensors = {
                 "cause_mean": scores.mean().detach(),
                 "cause_max": scores.max().detach(),
+                "cause_entropy": score_entropy.detach(),
+                "logits_abs_mean": logits.detach().abs().mean(),
+                "logits_abs_max": logits.detach().abs().max(),
+                "scores_requires_grad": bool(scores.requires_grad),
+                "logits_requires_grad": bool(logits.requires_grad),
                 "input_mode": input_mode,
                 "input_shape": tuple(features.shape),
             }

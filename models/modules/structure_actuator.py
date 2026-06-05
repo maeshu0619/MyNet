@@ -1487,19 +1487,16 @@ class StructureRepairActuator(nn.Module):
         context_voxel_coords = None
         if isinstance(octree_context, dict) and octree_context.get("global_voxel_coords", None) is not None:
             context_voxel_coords = octree_context["global_voxel_coords"]
-            if not (
-                isinstance(octree_context, dict)
-                and octree_context.get("global_voxel_coords", None) is not None
-            ):
-                if bool(getattr(self.args, "warn_missing_input_voxel", True)):
-                    global_step = getattr(self.args, "_global_train_step", "NA")
-                    sample_name = getattr(self.args, "_current_sample_name", "NA")
-                    print(
-                        f"[Warning] Voxel is NOT found! "
-                        f"Network input prebuilt Octree/Voxel was not passed to Actuator. "
-                        f"global_step={global_step}, sample={sample_name}, "
-                        f"fallback=local_recomputed"
-                    )
+        else:
+            if bool(getattr(self.args, "warn_missing_input_voxel", True)):
+                global_step = getattr(self.args, "_global_train_step", "NA")
+                sample_name = getattr(self.args, "_current_sample_name", "NA")
+                print(
+                    f"[Warning] Voxel is NOT found! "
+                    f"Network input prebuilt Octree/Voxel was not passed to Actuator. "
+                    f"global_step={global_step}, sample={sample_name}, "
+                    f"fallback=local_recomputed"
+                )
             if not torch.is_tensor(context_voxel_coords):
                 context_voxel_coords = torch.as_tensor(context_voxel_coords)
             context_voxel_coords = context_voxel_coords.to(device=pts_xyz.device, dtype=torch.long)
@@ -1521,7 +1518,8 @@ class StructureRepairActuator(nn.Module):
             if int(context_voxel_coords.shape[2]) != int(pts_xyz.shape[2]):
                 raise ValueError(
                     "octree_context['global_voxel_coords'] point count must match pts_xyz. "
-                    "Do not pad/truncate global voxel coords because it breaks the initial Octree/Voxel correspondence."
+                    "This usually means subtree_tree was not sliced as a subset of full cloud global coords. "
+                    "Build canonical_subtree_tree from full_octree_context using selected_subtree_keys before calling Actuator."
                 )
 
         if context_voxel_coords is not None:
@@ -2123,7 +2121,7 @@ class StructureRepairActuator(nn.Module):
 
             # 候補が少なすぎる場合だけ、Voxel内点数制限を緩める。
             # bool maskの切替なのでHard/Soft近似の勾配経路は壊さない。
-            if self.training and bool(getattr(self.args, "repair_move_relax_voxel_count_when_starved", True)):
+            if self.training and bool(getattr(self.args, "repair_move_relax_voxel_count_when_starved", False)):
                 min_ratio = min(
                     max(float(getattr(self.args, "repair_move_candidate_min_ratio", 0.05)), 0.0),
                     1.0,
@@ -2337,7 +2335,7 @@ class StructureRepairActuator(nn.Module):
         if (
             self.training
             and target_duplicate_guard_enabled
-            and bool(getattr(self.args, "repair_move_relax_duplicate_guard_when_starved", True))
+            and bool(getattr(self.args, "repair_move_relax_duplicate_guard_when_starved", False))
         ):
             min_ratio = min(
                 max(float(getattr(self.args, "repair_move_candidate_min_ratio", 0.05)), 0.0),
@@ -2372,23 +2370,38 @@ class StructureRepairActuator(nn.Module):
             no_guarded_candidate = guarded_candidate_count <= 0
 
             if bool(no_guarded_candidate.any().detach().cpu().item()):
-                fallback_move_weight = base_move_candidate_mask.unsqueeze(1).to(dtype=move_candidate_voxel_weight.dtype)
-                tiny = float(getattr(self.args, "repair_amount_dead_candidate_grad_eps", 1e-4))
-
-                move_allowed_weight = (
-                    guarded_move_candidate_mask.unsqueeze(1).to(dtype=move_candidate_voxel_weight.dtype)
-                    + tiny * fallback_move_weight
-                ).clamp(0.0, 1.0)
+                # Phase1:
+                # SparsePCGCではMove候補が消えた場合にbase候補へ戻さない。
+                # 候補復活はoccupancy pattern破壊を再発させるため、
+                # forward/backwardともguard後候補だけを使う。
+                move_allowed_weight = guarded_move_candidate_mask.unsqueeze(1).to(
+                    dtype=move_candidate_voxel_weight.dtype
+                )
             else:
-                move_allowed_weight = guarded_move_candidate_mask.unsqueeze(1).to(dtype=move_candidate_voxel_weight.dtype)
+                move_allowed_weight = guarded_move_candidate_mask.unsqueeze(1).to(
+                    dtype=move_candidate_voxel_weight.dtype
+                )
         else:
             move_allowed_weight = guarded_move_candidate_mask.unsqueeze(1).to(dtype=move_candidate_voxel_weight.dtype)
+
+        move_target_ratio_for_hard = move_target_ratio
+        min_move_expected_voxels = max(
+            float(getattr(self.args, "repair_move_min_hard_expected_voxels", 1.0)),
+            0.0,
+        )
+        if min_move_expected_voxels > 0.0 and disp_enabled:
+            expected_move_voxels = (
+                learned_move_ratio.detach().reshape(B, 1, 1)
+                * valid_move_source_voxel_count_effective.detach()
+            ).mean()
+            if float(expected_move_voxels.cpu()) < min_move_expected_voxels:
+                move_target_ratio_for_hard = 0.0
 
         hard_move_mask = self._hard_voxel_drop_mask(
             voxel_coords,
             move_score,
-            target_drop_ratio=move_target_ratio,
-            max_drop_ratio=move_target_ratio,
+            target_drop_ratio=move_target_ratio_for_hard,
+            max_drop_ratio=move_target_ratio_for_hard,
             selection_mask=guarded_move_candidate_mask.unsqueeze(1),
             hard_threshold=float(getattr(self.args, "repair_move_hard_threshold", 0.5)),
             voxel_cache=voxel_cache,
@@ -2915,10 +2928,11 @@ class StructureRepairActuator(nn.Module):
                 # 実際に追加したtarget voxel数を使う。
                 add_ratio_hard = add_target_hard_add.detach().sum() / max(float(B * N), 1.0)
 
-                # targetなしAmount学習では、Add実行量をtargetへ寄せない。
-                # 上限を超えた場合だけ罰する。
                 max_add_ratio_t = pts_xyz.new_tensor(float(max_add_ratio_value))
-                add_ratio_loss = torch.relu(add_ratio - max_add_ratio_t).pow(2)
+
+                # Addの学習用実行率はtarget voxel単位のsoft量を使う。
+                # add_ratio_hardはhard mask由来なので、学習用lossには直接使わない。
+                add_ratio_loss = torch.relu(add_ratio_soft - max_add_ratio_t).pow(2)
 
                 # add_amount_head 専用の量一致損失。
                 # Hard実行量は教師値としてdetachし、learned_add_ratio側だけに勾配を流す。
@@ -2962,6 +2976,9 @@ class StructureRepairActuator(nn.Module):
                     add_target_voxel_coords,
                     (add_target_hard_add.detach() >= hardening_threshold),
                 )
+        # 後段互換用の add_ratio は、古いゼロ初期値ではなく学習用のsoft実行率にする。
+        # hard実行率は add_ratio_hard として別keyで保持する。
+        add_ratio = add_ratio_soft
         if timing_enabled:
             _mark_runtime("add")
 
@@ -3277,12 +3294,22 @@ class StructureRepairActuator(nn.Module):
             operation_amount_direct_loss = learned_drop_ratio.new_zeros(())
 
 
+        # Addは古い add_ratio ではなく、target voxel単位のsoft実行率を使う。
+        # hard-soft consistency は hard側をdetachし、soft側だけを学習対象にする。
+        add_hard_soft_consistency_loss = (
+            add_ratio_soft - add_ratio_hard.detach()
+        ).abs()
+
         operation_amount_consistency_loss = (
             (drop_ratio - learned_drop_ratio.mean()).pow(2)
             + (move_ratio_soft - learned_move_ratio.mean()).pow(2)
-            + (add_ratio - learned_add_ratio.mean()).pow(2)
+            + (add_ratio_soft - learned_add_ratio.mean()).pow(2)
+            + add_hard_soft_consistency_loss
         )
-        operation_ratio_vec = torch.stack([drop_ratio, move_ratio_soft, add_ratio]).clamp_min(0.0)
+
+        operation_ratio_vec = torch.stack(
+            [drop_ratio, move_ratio_soft, add_ratio_soft]
+        ).clamp_min(0.0)
         operation_ratio_prob = operation_ratio_vec / operation_ratio_vec.sum().clamp_min(1e-6)
         operation_entropy = -(operation_ratio_prob * operation_ratio_prob.clamp_min(1e-6).log()).sum()
         soft_activity_loss = (
@@ -3846,7 +3873,8 @@ class StructureRepairActuator(nn.Module):
             "full_context_bonus_mean": full_context_bonus.mean().detach(),
             "child_slot_candidate_ratio": child_slot_candidate_ratio.detach(),
             "repair_gate": repair_gate.mean().detach(),
-            "add_ratio": add_ratio.detach(),
+            # 既存keyの add_ratio は互換用に残すが、中身は学習用のsoft実行率にする。
+            "add_ratio": add_ratio_soft.detach(),
             "add_prob_mean": add_prob.mean().detach(),
             "add_prob_max": add_prob.max().detach() if add_prob.numel() > 0 else pts_xyz.new_zeros(()).detach(),
             "add_priority_mean": add_priority.mean().detach(),
@@ -3861,7 +3889,7 @@ class StructureRepairActuator(nn.Module):
             "add_soft_pair_sum": soft_add_pair.detach().sum(),
             "add_hard_pair_sum": hard_add_pair.detach().sum(),
             "add_soft_hard_sum_abs_diff": (soft_add_pair.detach().sum() - hard_add_pair.detach().sum()).abs(),
-            "add_soft_hard_ratio_abs_diff": (add_ratio_soft.detach() - add_ratio_hard.detach()).abs(),
+            "add_hard_soft_consistency_loss": add_hard_soft_consistency_loss.detach(),
             # target voxel単位のAdd Hard/Soft状態。
             # Addの主指標はこちらを使う。
             "add_target_soft_add": add_target_soft_add.detach(),
@@ -4110,6 +4138,29 @@ class StructureRepairActuator(nn.Module):
             "add_prob": add_prob,
             "add_priority": add_priority,
             "add_ratio": add_ratio,
+
+            # Phase7-3: soft ratioも既に計算済みのratio値を使う。
+            # mean(score)とratioがズレるとdebug解釈が混乱するため、ratio系はratio変数に統一する。
+            "drop_ratio_soft": drop_ratio_soft.detach() if torch.is_tensor(drop_ratio_soft) else pts_xyz.new_tensor(0.0),
+            "add_ratio_soft": add_ratio_soft.detach() if torch.is_tensor(add_ratio_soft) else pts_xyz.new_tensor(0.0),
+            "move_ratio_soft": move_ratio_soft.detach() if torch.is_tensor(move_ratio_soft) else pts_xyz.new_tensor(0.0),
+
+            # Phase7-3: hard ratioは既に計算済みの値を使う。
+            # add_target_mask / move_source_mask という変数はこの実装には存在しないため使わない。
+            "drop_ratio_hard": drop_ratio_hard.detach() if torch.is_tensor(drop_ratio_hard) else pts_xyz.new_tensor(0.0),
+            "add_ratio_hard": add_ratio_hard.detach() if torch.is_tensor(add_ratio_hard) else pts_xyz.new_tensor(0.0),
+            "move_ratio_hard": move_ratio_hard.detach() if torch.is_tensor(move_ratio_hard) else pts_xyz.new_tensor(0.0),
+
+            "voxel_soft_drop_mean": torch.nan_to_num(drop_prob_proxy.float().mean(), nan=0.0, posinf=0.0, neginf=0.0).detach(),
+            "voxel_soft_add_mean": torch.nan_to_num(add_target_soft_add.float().mean(), nan=0.0, posinf=0.0, neginf=0.0).detach(),
+            "voxel_soft_move_mean": torch.nan_to_num(soft_move_score_effective.float().mean(), nan=0.0, posinf=0.0, neginf=0.0).detach(),
+
+            "add_ratio_loss_value": add_ratio_loss.detach() if torch.is_tensor(add_ratio_loss) else pts_xyz.new_tensor(0.0),
+            # Phase7-3: Add単体のhard/soft整合性debug。
+            # add_consistency_loss という変数は存在しないため、既存の add_hard_soft_consistency_loss を使う。
+            "add_consistency_loss_value": add_hard_soft_consistency_loss.detach() if torch.is_tensor(add_hard_soft_consistency_loss) else pts_xyz.new_tensor(0.0),
+            # Phase7-3: Add Amount head側のsoft ratio整合性debug。
+            "add_amount_consistency_loss_value": add_amount_soft_consistency_loss.detach() if torch.is_tensor(add_amount_soft_consistency_loss) else pts_xyz.new_tensor(0.0),
             "add_prob_mean": add_prob.mean(),
             "add_prob_max": add_prob.max() if add_prob.numel() > 0 else pts_xyz.new_zeros(()),
             "add_priority_mean": add_priority.mean(),
@@ -4345,6 +4396,36 @@ class StructureRepairActuator(nn.Module):
             "voxel_edit_child_slot_rejected": voxel_edit_child_slot_rejected_value,
             "voxel_edit_empty_target_rejected": voxel_edit_empty_target_rejected_value,
             "canonical_voxel_coords_before": canonical_voxel_coords_before,
+            # Phase7-2: full-context / full-cloud correctionへ渡す微分可能なsoft編集量。
+            # hard mask / final_voxel_coords.long() ではなく、既存のsoft probability / score / amountを使う。
+            # ここはloss接続用なのでdetachしない。
+            "voxel_soft_drop_score": torch.nan_to_num(drop_prob_proxy.float().mean(), nan=0.0, posinf=0.0, neginf=0.0),
+            "voxel_soft_add_score": torch.nan_to_num(add_target_soft_add.float().mean(), nan=0.0, posinf=0.0, neginf=0.0),
+            "voxel_soft_move_score": torch.nan_to_num(soft_move_score_effective.float().mean(), nan=0.0, posinf=0.0, neginf=0.0),
+
+            "voxel_soft_drop_amount": torch.nan_to_num(learned_drop_ratio.float().mean(), nan=0.0, posinf=0.0, neginf=0.0),
+            "voxel_soft_add_amount": torch.nan_to_num(learned_add_ratio.float().mean(), nan=0.0, posinf=0.0, neginf=0.0),
+            "voxel_soft_move_amount": torch.nan_to_num(learned_move_ratio.float().mean(), nan=0.0, posinf=0.0, neginf=0.0),
+
+            "voxel_soft_edit_score": torch.nan_to_num(
+                (
+                    drop_prob_proxy.float().mean()
+                    + add_target_soft_add.float().mean()
+                    + soft_move_score_effective.float().mean()
+                ) / 3.0,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ),
+
+            "voxel_soft_edit_count_proxy": torch.nan_to_num(
+                soft_drop_mass
+                + add_target_soft_add.float().sum()
+                + soft_move_score_effective.float().sum(),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ),
             "canonical_voxel_coords_after": canonical_voxel_coords_after,
             "voxel_restore_meta": voxel_restore_meta,
             "restored_xyz_debug": restored_xyz_debug,

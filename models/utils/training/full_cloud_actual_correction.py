@@ -66,6 +66,25 @@ def _soft_tensor_from_args(args, keys):
             return value.float().mean()
     return None
 
+def _soft_tensor_from_state_or_args(args, actuator_voxel_state, state_keys, args_keys):
+    """
+    優先順位:
+    1. actuator_voxel_state内のsoft量
+    2. args._last_actuator_soft_terms内のsoft量
+    3. None
+    hard countはここでは返さない。
+    """
+    if isinstance(actuator_voxel_state, dict):
+        for key in state_keys:
+            value = actuator_voxel_state.get(key, None)
+            if torch.is_tensor(value):
+                if value.numel() == 0:
+                    continue
+                value = torch.nan_to_num(value.float().mean(), nan=0.0, posinf=0.0, neginf=0.0)
+                if value.requires_grad:
+                    return value
+
+    return _soft_tensor_from_args(args, args_keys)
 
 def update_full_cloud_actual_correction_state(
     args,
@@ -219,6 +238,20 @@ def update_full_cloud_actual_correction_state(
         actuator_voxel_state,
         ("voxel_edit_drop_count", "hard_drop_count", "selected_drop_count_hard"),
     )
+    # Phase7-2: stateにはgraph付きTensorを保存しない。
+    # soft量を記録する場合も必ずfloat化する。
+    state["last_soft_move_value"] = _count_from_state(
+        actuator_voxel_state,
+        ("voxel_soft_move_amount", "voxel_soft_move_score"),
+    )
+    state["last_soft_add_value"] = _count_from_state(
+        actuator_voxel_state,
+        ("voxel_soft_add_amount", "voxel_soft_add_score"),
+    )
+    state["last_soft_drop_value"] = _count_from_state(
+        actuator_voxel_state,
+        ("voxel_soft_drop_amount", "voxel_soft_drop_score"),
+    )
     state["last_same_voxel_move_rejected"] = _count_from_state(
         actuator_voxel_state,
         ("voxel_edit_same_voxel_move_rejected",),
@@ -256,6 +289,9 @@ def update_full_cloud_actual_correction_state(
             "full_cloud_corr_move_count": state["last_move_count"],
             "full_cloud_corr_add_count": state["last_add_count"],
             "full_cloud_corr_drop_count": state["last_drop_count"],
+            "full_cloud_corr_soft_move_value": state.get("last_soft_move_value", 0.0),
+            "full_cloud_corr_soft_add_value": state.get("last_soft_add_value", 0.0),
+            "full_cloud_corr_soft_drop_value": state.get("last_soft_drop_value", 0.0),
         }
     )
 
@@ -279,6 +315,13 @@ def build_full_cloud_actual_correction_loss(
         "full_cloud_corr_loss_reason": "not_initialized",
         "full_cloud_corr_loss_value": 0.0,
         "full_cloud_corr_loss_enabled": bool(getattr(args, "full_cloud_actual_correction_loss_enable", False)),
+        "full_cloud_actual_correction_loss_enabled": bool(getattr(args, "full_cloud_actual_correction_loss_enable", False)),
+        "full_cloud_actual_correction_loss_value": 0.0,
+        "full_cloud_actual_correction_soft_proxy_used": False,
+        "full_vs_subtree_gap": 0.0,
+        "full_vs_context_gap": 0.0,
+        "ema_full_vs_subtree_gap": 0.0,
+        "ema_full_vs_context_gap": 0.0,
     }
 
     if not bool(getattr(args, "full_cloud_actual_correction", True)):
@@ -312,26 +355,95 @@ def build_full_cloud_actual_correction_loss(
         severity_value = min(severity_value, clip_value)
     severity = zero + zero.new_tensor(float(severity_value))
 
-    move_term = _soft_tensor_from_args(args, ("learned_move_ratio", "move_ratio_soft", "soft_move_voxel_sum"))
-    add_term = _soft_tensor_from_args(args, ("learned_add_ratio", "add_ratio_soft", "soft_add_sum"))
-    drop_term = _soft_tensor_from_args(args, ("soft_drop_mass", "drop_prob_proxy", "drop_prob_mean", "learned_drop_prob"))
+    use_soft_proxy = bool(getattr(args, "full_cloud_actual_correction_soft_proxy", True))
+
+    move_term = None
+    add_term = None
+    drop_term = None
+
+    if use_soft_proxy:
+        move_term = _soft_tensor_from_state_or_args(
+            args,
+            actuator_voxel_state,
+            (
+                "voxel_soft_move_amount",
+                "voxel_soft_move_score",
+                "voxel_soft_edit_score",
+                "voxel_soft_edit_count_proxy",
+            ),
+            (
+                "voxel_soft_move_amount",
+                "voxel_soft_move_score",
+                "learned_move_ratio",
+                "move_ratio_soft",
+                "soft_move_voxel_sum",
+            ),
+        )
+        add_term = _soft_tensor_from_state_or_args(
+            args,
+            actuator_voxel_state,
+            (
+                "voxel_soft_add_amount",
+                "voxel_soft_add_score",
+                "voxel_soft_edit_score",
+                "voxel_soft_edit_count_proxy",
+            ),
+            (
+                "voxel_soft_add_amount",
+                "voxel_soft_add_score",
+                "learned_add_ratio",
+                "add_ratio_soft",
+                "soft_add_sum",
+            ),
+        )
+        drop_term = _soft_tensor_from_state_or_args(
+            args,
+            actuator_voxel_state,
+            (
+                "voxel_soft_drop_amount",
+                "voxel_soft_drop_score",
+                "voxel_soft_edit_score",
+                "voxel_soft_edit_count_proxy",
+            ),
+            (
+                "voxel_soft_drop_amount",
+                "voxel_soft_drop_score",
+                "soft_drop_mass",
+                "drop_prob_proxy",
+                "drop_prob_mean",
+                "learned_drop_prob",
+            ),
+        )
 
     penalty = zero
 
     if bool(getattr(args, "full_cloud_actual_correction_penalize_move", True)):
         if move_term is not None:
-            penalty = penalty + move_term.to(device=zero.device, dtype=zero.dtype).reshape(())
+            penalty = penalty + float(getattr(args, "full_cloud_actual_correction_move_weight", 1.0)) * move_term.to(
+                device=zero.device,
+                dtype=zero.dtype,
+            ).reshape(())
 
     if bool(getattr(args, "full_cloud_actual_correction_penalize_add", True)):
         if add_term is not None:
-            penalty = penalty + add_term.to(device=zero.device, dtype=zero.dtype).reshape(())
+            penalty = penalty + float(getattr(args, "full_cloud_actual_correction_add_weight", 0.5)) * add_term.to(
+                device=zero.device,
+                dtype=zero.dtype,
+            ).reshape(())
 
     if bool(getattr(args, "full_cloud_actual_correction_penalize_drop", False)):
         if drop_term is not None:
-            penalty = penalty + drop_term.to(device=zero.device, dtype=zero.dtype).reshape(())
+            penalty = penalty + float(getattr(args, "full_cloud_actual_correction_drop_weight", 0.0)) * drop_term.to(
+                device=zero.device,
+                dtype=zero.dtype,
+            ).reshape(())
 
     if not torch.is_tensor(penalty) or penalty.numel() == 0:
         debug["full_cloud_corr_loss_reason"] = "missing_soft_operation_terms"
+        return zero, debug
+
+    if use_soft_proxy and not penalty.requires_grad:
+        debug["full_cloud_corr_loss_reason"] = "soft_operation_terms_have_no_grad"
         return zero, debug
 
     correction_loss = severity.detach() * penalty
@@ -342,6 +454,21 @@ def build_full_cloud_actual_correction_loss(
             "full_cloud_corr_loss_reason": "built",
             "full_cloud_corr_loss_value": _safe_float(correction_loss, 0.0),
             "full_cloud_corr_loss_severity": float(severity_value),
+            "full_cloud_corr_soft_proxy_used": bool(use_soft_proxy),
+            "full_cloud_actual_correction_loss_enabled": bool(getattr(args, "full_cloud_actual_correction_loss_enable", False)),
+            "full_cloud_actual_correction_loss_value": _safe_float(correction_loss, 0.0),
+            "full_cloud_actual_correction_soft_proxy_used": bool(use_soft_proxy),
+            "full_vs_subtree_gap": _safe_float(correction_state.get("last_full_actual_delta", 0.0), 0.0) - _safe_float(correction_state.get("last_subtree_actual_delta", 0.0), 0.0),
+            "full_vs_context_gap": _safe_float(correction_state.get("last_full_actual_delta", 0.0), 0.0) - _safe_float(correction_state.get("last_full_context_delta", 0.0), 0.0),
+            "ema_full_vs_subtree_gap": _safe_float(correction_state.get("ema_full_vs_subtree_gap", 0.0), 0.0),
+            "ema_full_vs_context_gap": _safe_float(correction_state.get("ema_full_vs_context_gap", 0.0), 0.0),
+            "full_cloud_corr_move_soft_value": _safe_float(move_term, 0.0),
+            "full_cloud_corr_add_soft_value": _safe_float(add_term, 0.0),
+            "full_cloud_corr_drop_soft_value": _safe_float(drop_term, 0.0),
+            "full_cloud_corr_move_weight": float(getattr(args, "full_cloud_actual_correction_move_weight", 1.0)),
+            "full_cloud_corr_add_weight": float(getattr(args, "full_cloud_actual_correction_add_weight", 0.5)),
+            "full_cloud_corr_drop_weight": float(getattr(args, "full_cloud_actual_correction_drop_weight", 0.0)),
+            "full_cloud_corr_penalty_requires_grad": bool(torch.is_tensor(penalty) and penalty.requires_grad),
             "full_cloud_corr_loss_enabled": bool(getattr(args, "full_cloud_actual_correction_loss_enable", False)),
             "full_cloud_corr_ema_full_vs_subtree_gap": _state_get_float(correction_state, "ema_full_vs_subtree_gap", 0.0),
             "full_cloud_corr_ema_full_vs_context_gap": _state_get_float(correction_state, "ema_full_vs_context_gap", 0.0),

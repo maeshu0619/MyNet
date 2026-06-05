@@ -141,6 +141,27 @@ def _first_existing_value(dict_obj, keys):
             return dict_obj.get(key)
     return None
 
+def _first_grad_tensor(dict_obj, keys):
+    """
+    actuator_voxel_stateから、勾配を持つsoft scalar/tensorを取り出す。
+    hard countやdetach済み値は学習用proxyには使わない。
+    """
+    if not isinstance(dict_obj, dict):
+        return None
+    for key in keys:
+        value = dict_obj.get(key, None)
+        if torch.is_tensor(value) and value.requires_grad:
+            if value.numel() == 0:
+                continue
+            value = torch.nan_to_num(value.float().mean(), nan=0.0, posinf=0.0, neginf=0.0)
+            return value
+    return None
+
+
+def _soft_proxy_term_or_zero(reference, value):
+    if torch.is_tensor(value) and value.requires_grad:
+        return value.to(device=reference.device, dtype=reference.dtype).reshape(())
+    return reference.new_zeros(())
 
 def _stats_delta(before_stats, after_stats, key, normalize_by_before=False):
     before = float(before_stats.get(key, 0.0))
@@ -182,6 +203,14 @@ def build_full_context_subtree_delta_loss(
         "full_context_subtree_delta_before_isolated": 0.0,
         "full_context_subtree_delta_after_isolated": 0.0,
         "full_context_subtree_delta_grad_used": False,
+        "full_context_subtree_hard_loss_value": 0.0,
+        "full_context_subtree_soft_proxy_used": False,
+        "full_context_subtree_soft_proxy_loss_value": 0.0,
+        "full_context_subtree_soft_proxy_severity": 0.0,
+        "full_context_subtree_soft_proxy_move_mean": 0.0,
+        "full_context_subtree_soft_proxy_add_mean": 0.0,
+        "full_context_subtree_soft_proxy_drop_mean": 0.0,
+        "full_context_subtree_soft_proxy_weight": float(getattr(args, "full_context_subtree_soft_proxy_weight", 0.05)),
     }
 
     if not bool(getattr(args, "full_context_subtree_loss", True)):
@@ -313,6 +342,83 @@ def build_full_context_subtree_delta_loss(
 
     loss_value = hard_loss.detach()
 
+    # Phase7-2:
+    # hard_lossはoccupancy stats由来なのでdebug / teacher値としてdetachしたまま扱う。
+    # 実際の勾配はActuator由来のsoft edit量へ弱く返す。
+    soft_proxy_loss = zero
+
+    if bool(getattr(args, "full_context_subtree_soft_proxy", True)):
+        raw_hard_severity = hard_loss.detach().clamp_min(0.0)
+        severity_floor = max(
+            float(getattr(args, "full_context_subtree_soft_proxy_severity_floor", 0.0)),
+            0.0,
+        )
+        if severity_floor > 0.0:
+            hard_severity = torch.where(
+                raw_hard_severity > 0.0,
+                torch.maximum(raw_hard_severity, raw_hard_severity.new_tensor(severity_floor)),
+                raw_hard_severity,
+            )
+        else:
+            hard_severity = raw_hard_severity
+
+        soft_move = _first_grad_tensor(
+            actuator_voxel_state,
+            (
+                "voxel_soft_move_amount",
+                "voxel_soft_move_score",
+                "move_ratio_soft",
+                "learned_move_ratio",
+                "soft_move_voxel_sum",
+            ),
+        )
+        soft_add = _first_grad_tensor(
+            actuator_voxel_state,
+            (
+                "voxel_soft_add_amount",
+                "voxel_soft_add_score",
+                "add_ratio_soft",
+                "learned_add_ratio",
+                "soft_add_sum",
+            ),
+        )
+        soft_drop = _first_grad_tensor(
+            actuator_voxel_state,
+            (
+                "voxel_soft_drop_amount",
+                "voxel_soft_drop_score",
+                "drop_ratio_soft",
+                "learned_drop_ratio",
+                "soft_drop_mass",
+                "drop_prob_proxy",
+            ),
+        )
+
+        soft_move_term = _soft_proxy_term_or_zero(zero, soft_move)
+        soft_add_term = _soft_proxy_term_or_zero(zero, soft_add)
+        soft_drop_term = _soft_proxy_term_or_zero(zero, soft_drop)
+
+        soft_penalty = (
+            float(getattr(args, "full_context_subtree_soft_proxy_move_weight", 1.0)) * soft_move_term
+            + float(getattr(args, "full_context_subtree_soft_proxy_add_weight", 0.5)) * soft_add_term
+            + float(getattr(args, "full_context_subtree_soft_proxy_drop_weight", 0.0)) * soft_drop_term
+        )
+
+        if torch.is_tensor(soft_penalty) and soft_penalty.requires_grad:
+            soft_proxy_loss = (
+                float(getattr(args, "full_context_subtree_soft_proxy_weight", 0.05))
+                * hard_severity
+                * soft_penalty
+            )
+            loss_value = loss_value + soft_proxy_loss
+            debug["full_context_subtree_delta_grad_used"] = True
+            debug["full_context_subtree_soft_proxy_used"] = True
+            debug["full_context_subtree_soft_proxy_loss_value"] = _safe_float(soft_proxy_loss)
+            debug["full_context_subtree_soft_proxy_severity"] = _safe_float(hard_severity)
+            debug["full_context_subtree_soft_proxy_move_mean"] = _safe_float(soft_move_term)
+            debug["full_context_subtree_soft_proxy_add_mean"] = _safe_float(soft_add_term)
+            debug["full_context_subtree_soft_proxy_drop_mean"] = _safe_float(soft_drop_term)
+
     final_weights = _first_existing_tensor(actuator_voxel_state, ("final_voxel_weights", "point_aligned_final_voxel_weights"))
     if (
         torch.is_tensor(final_weights)
@@ -322,6 +428,11 @@ def build_full_context_subtree_delta_loss(
         proxy = torch.nan_to_num(final_weights.float().mean(), nan=0.0, posinf=0.0, neginf=0.0)
         loss_value = loss_value + float(getattr(args, "full_context_subtree_loss_grad_weight", 0.1)) * (proxy - proxy.detach())
         debug["full_context_subtree_delta_grad_used"] = True
+        debug["full_context_subtree_final_weight_proxy_used"] = True
+        debug["full_context_subtree_final_weight_proxy_value"] = _safe_float(proxy)
+    else:
+        debug["full_context_subtree_final_weight_proxy_used"] = False
+        debug["full_context_subtree_final_weight_proxy_value"] = 0.0
 
     weight = float(getattr(args, "full_context_subtree_loss_weight", 0.2))
     loss_value = weight * loss_value
@@ -351,6 +462,18 @@ def build_full_context_subtree_delta_loss(
             "full_context_subtree_delta_used": True,
             "full_context_subtree_delta_reason": "ok",
             "full_context_subtree_delta_value": _safe_float(loss_value),
+            "full_context_subtree_hard_loss_value": _safe_float(hard_loss.detach()),
+            "full_context_subtree_soft_proxy_used": bool(debug.get("full_context_subtree_soft_proxy_used", False)),
+            "full_context_subtree_soft_proxy_loss_value": float(debug.get("full_context_subtree_soft_proxy_loss_value", 0.0)),
+            "full_context_subtree_hard_loss": _safe_float(hard_loss.detach()),
+            "full_context_subtree_loss_total": _safe_float(loss_value),
+            "full_context_hard_loss": _safe_float(hard_loss.detach()),
+            "full_context_soft_proxy_loss": float(debug.get("full_context_subtree_soft_proxy_loss_value", 0.0)),
+            "full_context_subtree_soft_proxy_severity": float(debug.get("full_context_subtree_soft_proxy_severity", 0.0)),
+            "full_context_subtree_soft_proxy_move_mean": float(debug.get("full_context_subtree_soft_proxy_move_mean", 0.0)),
+            "full_context_subtree_soft_proxy_add_mean": float(debug.get("full_context_subtree_soft_proxy_add_mean", 0.0)),
+            "full_context_subtree_soft_proxy_drop_mean": float(debug.get("full_context_subtree_soft_proxy_drop_mean", 0.0)),
+            "full_context_subtree_soft_proxy_weight": float(getattr(args, "full_context_subtree_soft_proxy_weight", 0.05)),
             "full_context_subtree_delta_before_nodes": float(before_nodes),
             "full_context_subtree_delta_after_nodes": float(after_nodes),
             "full_context_subtree_delta_node_delta_norm": (after_nodes - before_nodes) / max(abs(before_nodes), 1.0),
@@ -374,6 +497,13 @@ def build_full_context_subtree_delta_loss(
             "full_context_subtree_delta_isolated_delta": float(after_isolated - before_isolated),
             "full_context_subtree_delta_weight": float(weight),
             "full_context_subtree_delta_batch_count": int(len(losses)),
+            "full_context_subtree_voxel_state_source": "actuator_voxel_state",
+            "full_context_subtree_uses_initial_voxel_coords": bool(before_subtree_raw is not None),
+            "full_context_subtree_uses_final_voxel_coords": bool(after_subtree_raw is not None),
+            "full_context_subtree_uses_final_valid_mask": bool(after_valid_mask is not None),
+            "full_context_subtree_same_state_contract": bool(
+                before_subtree_raw is not None and after_subtree_raw is not None
+            ),
         }
     )
 

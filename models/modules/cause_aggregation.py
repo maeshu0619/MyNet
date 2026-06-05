@@ -64,12 +64,41 @@ class CauseDiagnosisAggregation(nn.Module):
         agg_scores = []
         agg_targets = []
         priorities = []
+        unit_counts = []
+        min_unit_sizes = []
+        max_unit_sizes = []
         for b in range(pts_xyz.shape[0]):
             score_b, priority_b = self._aggregate_single(cause_scores[b], keys[b])
             target_b, _ = self._aggregate_single(cause_targets[b], keys[b])
             agg_scores.append(score_b)
             agg_targets.append(target_b.detach())
             priorities.append(priority_b.detach())
+
+            # ============================================================
+            # Phase4:
+            # unit key が粗すぎないかを確認する。
+            # 例:
+            # - unit_count=1 なら全点が1unitに潰れている可能性がある
+            # - max_unit_size が極端に大きいと局所診断が粗すぎる
+            # ============================================================
+            unique_b, inverse_b = torch.unique(
+                keys[b],
+                sorted=False,
+                return_inverse=True,
+            )
+            count_b = torch.bincount(
+                inverse_b,
+                minlength=int(unique_b.numel()),
+            )
+
+            unit_counts.append(int(unique_b.numel()))
+
+            if count_b.numel() > 0:
+                min_unit_sizes.append(int(count_b.min().detach().cpu()))
+                max_unit_sizes.append(int(count_b.max().detach().cpu()))
+            else:
+                min_unit_sizes.append(0)
+                max_unit_sizes.append(0)
         return {
             "scores": torch.stack(agg_scores, dim=0),
             "targets": torch.stack(agg_targets, dim=0),
@@ -77,4 +106,7 @@ class CauseDiagnosisAggregation(nn.Module):
             "unit_keys": keys,
             "unit_mode": unit_mode,
             "local_recomputed": unit_mode == "local_recomputed",
+            "unit_count": int(max(unit_counts) if unit_counts else 0),
+            "min_unit_size": int(min(min_unit_sizes) if min_unit_sizes else 0),
+            "max_unit_size": int(max(max_unit_sizes) if max_unit_sizes else 0),
         }

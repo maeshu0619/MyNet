@@ -29,6 +29,11 @@ from record.write import Writing
 from record.plot import PlotMaker
 from models.utils.pointcloud.utils_repkpu import *
 from models.utils.pointcloud.octree_subtree import *
+from models.utils.pointcloud.sparsepcgc_voxel import (
+    quantize_sparsepcgc_coords,
+    attach_sparsepcgc_voxel_meta,
+    restore_points_from_voxel_coords,
+)
 from models.utils.pointcloud.quant_noise import add_uniform_quantization_noise, resolve_uniform_noise_delta
 from models.utils.pointcloud.voxel_collision import (
     compute_voxel_collision_stats_batch,
@@ -62,7 +67,7 @@ from models.utils.training.compression_primary_loss import *
 from models.utils.training.full_context_subtree_loss import build_full_context_subtree_delta_loss
 from models.utils.training.case_debug import *
 from models.utils.training.metric_csv import *
-from models.utils.training.metric_columns import LOSS_GRAD_PROBE_COLUMNS
+from models.utils.training.metric_columns import LOSS_GRAD_PROBE_COLUMNS, PHASE7_EVAL_SUMMARY_COLUMNS
 from models.utils.training.actual_codec_status import *
 from models.utils.training.metric_rows import *
 from models.utils.training.lr_control import apply_optimizer_lr_floor, step_scheduler_with_floor, optimizer_lrs_safe
@@ -138,6 +143,396 @@ def _log_sparsepcgc_restore_debug(args, writer, out_label, prefix="VoxelRestoreD
         f"restore_unique={restore_info.get('restore_unique', 'n/a')}"
     )
 
+def _build_full_cloud_octree_context_for_train(input_xyz, args, coord_scale=None):
+    """
+    full cloud anchor用の最小full_octree_contextを作る。
+    Node/Voxel入力経路へ入れるため、global_voxel_coords/global_qs/global_offsetを必ず持たせる。
+    """
+    q_result = quantize_sparsepcgc_coords(
+        input_xyz,
+        args,
+        coord_scale=coord_scale,
+        offset=None,
+        return_metadata=True,
+    )
+
+    if isinstance(q_result, tuple) and len(q_result) == 2:
+        global_voxel_coords, voxel_meta = q_result
+    else:
+        global_voxel_coords = q_result
+        voxel_meta = {}
+
+    full_octree_context = attach_sparsepcgc_voxel_meta(
+        {
+            "octree_context_scope": "full_cloud",
+            "octree_input_mode": "full_cloud",
+        },
+        global_voxel_coords.detach().to(dtype=torch.long),
+        voxel_meta,
+    )
+
+    full_octree_context["full_global_voxel_coords"] = full_octree_context["global_voxel_coords"]
+    full_octree_context["full_occupied_voxel_coords"] = full_octree_context["global_voxel_coords"]
+
+    return full_octree_context
+
+def _full_cloud_canonical_meta(full_cloud_canonical_context):
+    """
+    full cloud で一度だけ作った canonical voxel metadata を取り出す。
+    Subtree / actual復元 / full-context loss は必ずこれを使う。
+    """
+    if not isinstance(full_cloud_canonical_context, dict):
+        return {}
+
+    meta = full_cloud_canonical_context.get("sparsepcgc_voxel_meta", None)
+    if isinstance(meta, dict):
+        return dict(meta)
+
+    out = {}
+    if "global_qs" in full_cloud_canonical_context:
+        out["global_qs"] = full_cloud_canonical_context["global_qs"]
+        out["effective_qs_tensor"] = full_cloud_canonical_context["global_qs"]
+    if "global_offset" in full_cloud_canonical_context:
+        out["global_offset"] = full_cloud_canonical_context["global_offset"]
+        out["global_offset_tensor"] = full_cloud_canonical_context["global_offset"]
+    return out
+
+def _full_cloud_anchor_node_count_estimate(full_cloud_canonical_context, args):
+    """
+    FullCloud anchorで訓練graphを作るか判定するためのnode/voxel数推定値を返す。
+
+    注意:
+    ここではforward前なので、Network内部の厳密なnode数はまだ分からない。
+    そのため、full cloud canonical voxel coords の点対応数を安全側の上限推定として使う。
+    """
+    if not isinstance(full_cloud_canonical_context, dict):
+        return 0, "context_missing"
+
+    key = str(
+        getattr(args, "full_cloud_anchor_node_count_key", "global_voxel_coords")
+    ).strip()
+
+    coords = full_cloud_canonical_context.get(key, None)
+
+    if not torch.is_tensor(coords):
+        # 指定keyが無い場合は、既存の代表keyへfallbackする。
+        for fallback_key in (
+            "global_voxel_coords",
+            "full_global_voxel_coords",
+            "full_occupied_voxel_coords",
+        ):
+            coords = full_cloud_canonical_context.get(fallback_key, None)
+            if torch.is_tensor(coords):
+                key = fallback_key
+                break
+
+    if not torch.is_tensor(coords):
+        return 0, "coords_missing"
+
+    if coords.ndim == 3:
+        return int(coords.shape[-1]), key
+
+    if coords.ndim == 2:
+        return int(coords.shape[0]), key
+
+    return int(coords.numel()), key
+
+
+def _resolve_full_cloud_anchor_no_grad(args, full_cloud_canonical_context):
+    """
+    FullCloud anchorで学習graphを作るか、no-grad teacher更新に落とすかを決める。
+
+    基本方針:
+    - full_cloud_anchor_allow_grad=False なら常にno-grad
+    - full_cloud_anchor_grad_node_limit<=0 なら常にno-grad
+    - node/voxel数推定値が上限を超えたらno-grad
+    - 上限内のときだけgradを許可する
+    """
+    node_count, count_source = _full_cloud_anchor_node_count_estimate(
+        full_cloud_canonical_context,
+        args,
+    )
+
+    allow_grad = bool(getattr(args, "full_cloud_anchor_allow_grad", False))
+    node_limit = int(getattr(args, "full_cloud_anchor_grad_node_limit", 50000))
+
+    if not allow_grad:
+        return True, "full_cloud_anchor_grad_disabled", node_count, count_source
+
+    if node_limit <= 0:
+        return True, "full_cloud_anchor_grad_node_limit_non_positive", node_count, count_source
+
+    if node_count <= 0:
+        return True, "full_cloud_anchor_node_count_unavailable", node_count, count_source
+
+    if node_count > node_limit:
+        return True, f"full_cloud_anchor_node_limit_exceeded:{node_count}>{node_limit}", node_count, count_source
+
+    return False, f"full_cloud_anchor_grad_allowed:{node_count}<={node_limit}", node_count, count_source
+
+def _slice_full_cloud_canonical_context(
+    full_cloud_canonical_context,
+    point_idx,
+    *,
+    device,
+):
+    """
+    full cloud canonical voxel coords を point_idx で切り出し、
+    Subtree入力点と1対1対応する subtree_tree 用contextを作る。
+    """
+    if not isinstance(full_cloud_canonical_context, dict):
+        raise RuntimeError("full_cloud_canonical_context is missing.")
+
+    full_coords = full_cloud_canonical_context.get("full_global_voxel_coords", None)
+    if full_coords is None:
+        full_coords = full_cloud_canonical_context.get("global_voxel_coords", None)
+
+    if not torch.is_tensor(full_coords):
+        raise RuntimeError("full cloud canonical global_voxel_coords is missing.")
+
+    if full_coords.ndim != 3 or full_coords.shape[1] != 3:
+        raise RuntimeError(
+            f"full cloud canonical coords must be [B,3,N], got {tuple(full_coords.shape)}"
+        )
+
+    point_idx = point_idx.to(device=full_coords.device, dtype=torch.long)
+    subtree_coords = full_coords.index_select(2, point_idx).detach().to(device=device, dtype=torch.long)
+
+    out = {
+        "octree_context_scope": "subtree_from_full_cloud_canonical",
+        "octree_input_mode": "prebuilt_subtree_tree",
+        "canonical_source": "full_cloud_canonical",
+        "global_voxel_coords": subtree_coords,
+        "subtree_global_voxel_coords": subtree_coords,
+        "full_global_voxel_coords": full_coords.detach().to(device=device, dtype=torch.long),
+        "full_occupied_voxel_coords": full_coords.detach().to(device=device, dtype=torch.long),
+    }
+
+    for key in (
+        "global_qs",
+        "global_offset",
+        "sparsepcgc_voxel_meta",
+    ):
+        if key in full_cloud_canonical_context:
+            out[key] = full_cloud_canonical_context[key]
+
+    return out
+
+
+def _inject_full_cloud_canonical_into_subtree_metadata(
+    *,
+    subtree_tree,
+    full_octree_context,
+    full_cloud_canonical_context,
+    point_idx,
+    device,
+):
+    """
+    build_selected_group_octree_metadata() が返した metadata に対して、
+    voxel座標系だけを full cloud canonical に強制的に差し替える。
+    これにより、局所Subtree由来の再量子化を排除する。
+    """
+    canonical_subtree_context = _slice_full_cloud_canonical_context(
+        full_cloud_canonical_context,
+        point_idx,
+        device=device,
+    )
+
+    patched_subtree_tree = dict(subtree_tree or {})
+    patched_subtree_tree.update(canonical_subtree_context)
+
+    patched_full_context = dict(full_octree_context or {})
+    patched_full_context.update(
+        {
+            "canonical_source": "full_cloud_canonical",
+            # current subtree入力に対応するcoords
+            "global_voxel_coords": canonical_subtree_context["global_voxel_coords"],
+            # full cloud全体のoccupied coords
+            "full_global_voxel_coords": canonical_subtree_context["full_global_voxel_coords"],
+            "full_occupied_voxel_coords": canonical_subtree_context["full_occupied_voxel_coords"],
+        }
+    )
+
+    for key in (
+        "global_qs",
+        "global_offset",
+        "sparsepcgc_voxel_meta",
+    ):
+        if key in canonical_subtree_context:
+            patched_full_context[key] = canonical_subtree_context[key]
+
+    return patched_subtree_tree, patched_full_context
+
+def _select_actual_gen_xyz_from_voxel_state(
+    args,
+    writer,
+    model,
+    fallback_xyz,
+    prefix="VoxelRestoredActual",
+    canonical_context=None,
+):
+    """
+    actual compression専用に、model.last_actuator_voxel_state['final_voxel_coords'] から点群を復元する。
+    geometry loss用のgen_xyzは変更しない。
+    flagがFalseなら完全に既存挙動を維持する。
+    """
+    if not bool(getattr(args, "use_voxel_restored_points_for_actual", False)):
+        return fallback_xyz, {
+            "used": False,
+            "fallback": False,
+            "reason": "disabled",
+            "original_gen_points": int(fallback_xyz.shape[-1]) if torch.is_tensor(fallback_xyz) else 0,
+            "restored_actual_points": 0,
+            "final_voxel_coords_count": 0,
+        }
+
+    base_model = model.module if hasattr(model, "module") else model
+    voxel_state = getattr(base_model, "last_actuator_voxel_state", None)
+
+    require_state = bool(getattr(args, "voxel_restored_actual_require_state", False))
+
+    def _fallback(reason):
+        if require_state:
+            raise RuntimeError(f"{prefix}: {reason}")
+        original_min, original_max = _phase7_tensor_range(fallback_xyz)
+        return fallback_xyz, {
+            "used": False,
+            "fallback": True,
+            "reason": reason,
+            "original_gen_points": int(fallback_xyz.shape[-1]) if torch.is_tensor(fallback_xyz) else 0,
+            "restored_actual_points": 0,
+            "final_voxel_coords_count": 0,
+            "original_gen_xyz_min": original_min,
+            "original_gen_xyz_max": original_max,
+            "restored_actual_xyz_min": 0.0,
+            "restored_actual_xyz_max": 0.0,
+        }
+
+    if not isinstance(voxel_state, dict):
+        return _fallback("last_actuator_voxel_state_missing")
+
+    final_voxel_coords = voxel_state.get("final_voxel_coords", None)
+    if not torch.is_tensor(final_voxel_coords):
+        return _fallback("final_voxel_coords_missing")
+
+    if final_voxel_coords.ndim != 3 or final_voxel_coords.shape[1] != 3:
+        return _fallback(f"invalid_final_voxel_coords_shape={tuple(final_voxel_coords.shape)}")
+
+    final_voxel_valid_mask = voxel_state.get("final_voxel_valid_mask", None)
+    voxel_step = voxel_state.get("voxel_step", None)
+    voxel_offset = voxel_state.get("voxel_offset", None)
+
+    # ============================================================
+    # 復元にも full cloud canonical metadata を優先して使う。
+    # これにより final_voxel_coords → xyz の復元座標系も一意になる。
+    # ============================================================
+    meta = _full_cloud_canonical_meta(canonical_context)
+
+    if not meta:
+        meta = {}
+        if torch.is_tensor(voxel_step):
+            meta["effective_qs_tensor"] = voxel_step.detach().to(
+                device=final_voxel_coords.device,
+                dtype=fallback_xyz.dtype,
+            )
+            meta["global_qs"] = meta["effective_qs_tensor"]
+        if torch.is_tensor(voxel_offset):
+            meta["global_offset_tensor"] = voxel_offset.detach().to(
+                device=final_voxel_coords.device,
+                dtype=fallback_xyz.dtype,
+            )
+            meta["global_offset"] = meta["global_offset_tensor"]
+    else:
+        if "effective_qs_tensor" in meta and torch.is_tensor(meta["effective_qs_tensor"]):
+            meta["effective_qs_tensor"] = meta["effective_qs_tensor"].detach().to(
+                device=final_voxel_coords.device,
+                dtype=fallback_xyz.dtype,
+            )
+            meta["global_qs"] = meta["effective_qs_tensor"]
+        if "global_offset_tensor" in meta and torch.is_tensor(meta["global_offset_tensor"]):
+            meta["global_offset_tensor"] = meta["global_offset_tensor"].detach().to(
+                device=final_voxel_coords.device,
+                dtype=fallback_xyz.dtype,
+            )
+            meta["global_offset"] = meta["global_offset_tensor"]
+
+    coords = final_voxel_coords.detach().to(device=fallback_xyz.device, dtype=torch.long)
+
+    if torch.is_tensor(final_voxel_valid_mask):
+        valid_mask = final_voxel_valid_mask.detach().to(device=coords.device, dtype=torch.bool)
+        if valid_mask.ndim == 3:
+            valid_mask = valid_mask.squeeze(1)
+    else:
+        valid_mask = torch.ones(
+            (coords.shape[0], coords.shape[2]),
+            device=coords.device,
+            dtype=torch.bool,
+        )
+
+    restored_list = []
+    restored_counts = []
+
+    for b in range(coords.shape[0]):
+        valid_b = valid_mask[b]
+        coords_b = coords[b:b + 1, :, valid_b]
+        if coords_b.shape[-1] <= 0:
+            return _fallback("empty_valid_final_voxel_coords")
+
+        meta_b = dict(meta)
+        if "effective_qs_tensor" in meta_b and torch.is_tensor(meta_b["effective_qs_tensor"]):
+            meta_b["effective_qs_tensor"] = meta_b["effective_qs_tensor"][b:b + 1]
+            meta_b["global_qs"] = meta_b["effective_qs_tensor"]
+        if "global_offset_tensor" in meta_b and torch.is_tensor(meta_b["global_offset_tensor"]):
+            meta_b["global_offset_tensor"] = meta_b["global_offset_tensor"][b:b + 1]
+            meta_b["global_offset"] = meta_b["global_offset_tensor"]
+
+        restored_b, _ = restore_points_from_voxel_coords(
+            coords_b,
+            meta=meta_b if meta_b else None,
+            args=args,
+            center=bool(getattr(args, "sparsepcgc_dequantize_center", False)),
+            unique=True,
+            dtype=fallback_xyz.dtype,
+            device=fallback_xyz.device,
+        )
+        restored_list.append(restored_b)
+        restored_counts.append(int(restored_b.shape[-1]))
+
+    if len(set(restored_counts)) != 1:
+        return _fallback(f"variable_restored_counts={restored_counts}")
+
+    restored_xyz = torch.cat(restored_list, dim=0).contiguous()
+
+    if bool(getattr(args, "use_voxel_restored_points_for_actual_debug", True)):
+        if writer is not None and hasattr(writer, "write") and bool(getattr(args, "_log_this_step", True)):
+            restored_det = restored_xyz.detach()
+            writer.write(
+                f"{prefix}: used=True, "
+                f"points={int(restored_xyz.shape[-1])}, "
+                f"range_min={float(restored_det.amin().float().cpu()):.6g}, "
+                f"range_max={float(restored_det.amax().float().cpu()):.6g}, "
+                f"counts={restored_counts}"
+            )
+
+    original_min, original_max = _phase7_tensor_range(fallback_xyz)
+    restored_min, restored_max = _phase7_tensor_range(restored_xyz)
+    final_voxel_count = int(valid_mask.detach().bool().sum().cpu()) if torch.is_tensor(valid_mask) else int(coords.shape[-1])
+
+    return restored_xyz, {
+        "used": True,
+        "fallback": False,
+        "reason": "",
+        "points": int(restored_xyz.shape[-1]),
+        "counts": restored_counts,
+        "original_gen_points": int(fallback_xyz.shape[-1]) if torch.is_tensor(fallback_xyz) else 0,
+        "restored_actual_points": int(restored_xyz.shape[-1]),
+        "final_voxel_coords_count": int(final_voxel_count),
+        "original_gen_xyz_min": original_min,
+        "original_gen_xyz_max": original_max,
+        "restored_actual_xyz_min": restored_min,
+        "restored_actual_xyz_max": restored_max,
+    }
+
 def _unwrap_train_model(model):
     # DataParallelで包まれている場合は中身のモデルを取り出す
     return model.module if hasattr(model, "module") else model
@@ -159,6 +554,1006 @@ def _safe_scalar_for_grad_log(value):
     except Exception:
             return None
 
+def _phase7_debug_enabled(args, global_step):
+    if not bool(getattr(args, "phase7_debug", True)):
+        return False
+    interval = max(int(getattr(args, "phase7_debug_every", 10)), 1)
+    return bool(getattr(args, "_log_this_step", False)) or (int(global_step) % interval == 0)
+
+
+def _phase7_float(value, default=0.0):
+    try:
+        if value is None:
+            return float(default)
+        if torch.is_tensor(value):
+            if value.numel() == 0:
+                return float(default)
+            value = value.detach().float()
+            value = torch.nan_to_num(value, nan=0.0, posinf=0.0, neginf=0.0)
+            return float(value.mean().cpu())
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _phase7_bool(value):
+    if torch.is_tensor(value):
+        try:
+            return bool(float(value.detach().float().mean().cpu()) > 0.5)
+        except Exception:
+            return False
+    return bool(value)
+
+
+def _phase7_tensor_range(x):
+    if not torch.is_tensor(x) or x.numel() == 0:
+        return 0.0, 0.0
+    x_det = torch.nan_to_num(x.detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
+    return float(x_det.amin().cpu()), float(x_det.amax().cpu())
+
+
+def _phase7_final_voxel_count(model):
+    base_model = model.module if hasattr(model, "module") else model
+    voxel_state = getattr(base_model, "last_actuator_voxel_state", None)
+    if not isinstance(voxel_state, dict):
+        return 0
+    valid_mask = voxel_state.get("final_voxel_valid_mask", None)
+    coords = voxel_state.get("final_voxel_coords", None)
+    if torch.is_tensor(valid_mask):
+        return int(valid_mask.detach().bool().sum().cpu())
+    if torch.is_tensor(coords):
+        return int(coords.shape[-1])
+    return 0
+
+
+def _phase7_update_from_structure(comp_debug, structure_debug, *, is_anchor_step):
+    if not isinstance(comp_debug, dict) or not isinstance(structure_debug, dict):
+        return
+
+    for key in (
+        "network_voxel_node_input_requested",
+        "network_voxel_node_input_used",
+        "network_voxel_node_fallback",
+        "network_voxel_node_fallback_reason",
+        "network_voxel_node_source",
+        "network_voxel_node_count",
+        "network_voxel_node_feature_shape",
+        "full_cloud_anchor_node_voxel_used",
+        "subtree_node_voxel_used",
+
+        # ============================================================
+        # Phase5:
+        # Phase4でNetwork側が出した構造整合性debugもcomp_debugへ渡す。
+        # ============================================================
+        "phase4_cost_attribution_input_mode",
+        "phase4_cost_scores_requires_grad",
+        "phase4_cost_logits_requires_grad",
+        "phase4_cause_entropy",
+        "phase4_aggregation_key_source",
+        "phase4_aggregation_unit_count",
+        "phase4_aggregation_min_unit_size",
+        "phase4_aggregation_max_unit_size",
+        "phase4_structural_key_source",
+        "cause_aggregation_unit_mode",
+        "local_recomputed",
+        "structure_local_recomputed",
+        "actuator_local_recomputed",
+    ):
+        if key in structure_debug:
+            comp_debug[key] = structure_debug.get(key)
+
+    comp_debug["full_cloud_anchor_node_voxel_used"] = bool(
+        is_anchor_step and bool(structure_debug.get("network_voxel_node_input_used", False))
+    )
+    comp_debug["subtree_node_voxel_used"] = bool(
+        (not is_anchor_step) and bool(structure_debug.get("network_voxel_node_input_used", False))
+    )
+def _phase5_structure_safety_debug(args, structure_debug, *, is_anchor_step):
+    """
+    Phase5:
+    Phase4でNetwork側が出したNode/Voxel・aggregation debugを、
+    train.py側で監査できる形に正規化する。
+
+    ここではTensorを保持しない。
+    CSV/ログ用のbool, int, float, strだけを返す。
+    """
+    if not isinstance(structure_debug, dict):
+        return {
+            "phase5_structure_debug_available": False,
+            "phase5_structure_safety_ok": False,
+            "phase5_structure_safety_reason": "structure_debug_missing",
+        }
+
+    node_requested = bool(structure_debug.get("network_voxel_node_input_requested", False))
+    node_used = bool(structure_debug.get("network_voxel_node_input_used", False))
+    node_fallback = bool(structure_debug.get("network_voxel_node_fallback", False))
+    node_fallback_reason = str(structure_debug.get("network_voxel_node_fallback_reason", ""))
+
+    cost_input_mode = str(structure_debug.get("phase4_cost_attribution_input_mode", "unknown"))
+    aggregation_key_source = str(structure_debug.get("phase4_aggregation_key_source", "unknown"))
+    structural_key_source = str(structure_debug.get("phase4_structural_key_source", "unknown"))
+    cause_unit_mode = str(structure_debug.get("cause_aggregation_unit_mode", "unknown"))
+
+    unit_count = int(structure_debug.get("phase4_aggregation_unit_count", 0) or 0)
+    min_unit_size = int(structure_debug.get("phase4_aggregation_min_unit_size", 0) or 0)
+    max_unit_size = int(structure_debug.get("phase4_aggregation_max_unit_size", 0) or 0)
+
+    valid_key_sources = {
+        "full_unit_keys",
+        "analysis_unit_keys",
+        "structure.structural_voxel_key",
+        "structure.point_feature_voxel_key",
+        "structure_b.structural_voxel_key",
+        "structure_b.point_feature_voxel_key",
+        "canonical_subtree_tree.global_voxel_coords_hash",
+        "full_octree_context.global_voxel_coords_hash",
+    }
+
+    valid_structural_sources = {
+        "global_morton_keys",
+        "global_voxel_coords_hash",
+    }
+
+    raw_structure_local_recomputed = bool(
+        structure_debug.get("local_recomputed", False)
+    )
+    raw_cause_local_recomputed = (
+        str(cause_unit_mode).strip().lower() == "local_recomputed"
+    )
+    raw_actuator_local_recomputed = bool(
+        structure_debug.get("actuator_local_recomputed", False)
+    )
+    raw_structure_debug_local_recomputed = bool(
+        structure_debug.get("structure_local_recomputed", False)
+    )
+
+    local_recomputed = bool(
+        raw_structure_local_recomputed
+        or raw_cause_local_recomputed
+        or raw_actuator_local_recomputed
+        or raw_structure_debug_local_recomputed
+    )
+
+    canonical_node_path_ok = bool(
+        node_used
+        and not node_fallback
+        and cost_input_mode == "node_voxel"
+        and aggregation_key_source in valid_key_sources
+        and structural_key_source in valid_structural_sources
+        and unit_count > 0
+        and max_unit_size > 0
+    )
+
+    reasons = []
+
+    if node_requested and not node_used:
+        reasons.append("node_voxel_requested_but_not_used")
+
+    if node_fallback:
+        reasons.append(f"node_voxel_fallback:{node_fallback_reason}")
+
+    if node_used and cost_input_mode not in {"node_voxel", "unknown"}:
+        reasons.append(f"cost_attribution_input_mode_not_node_voxel:{cost_input_mode}")
+
+    if aggregation_key_source not in valid_key_sources:
+        reasons.append(f"invalid_aggregation_key_source:{aggregation_key_source}")
+
+    if unit_count <= 0:
+        reasons.append("aggregation_unit_count_zero")
+
+    if max_unit_size <= 0:
+        reasons.append("aggregation_max_unit_size_zero")
+
+    if structural_key_source not in valid_structural_sources and node_used:
+        reasons.append(f"invalid_structural_key_source:{structural_key_source}")
+
+    if (
+        local_recomputed
+        and bool(getattr(args, "phase5_forbid_local_recompute", True))
+        and not canonical_node_path_ok
+    ):
+        reasons.append("local_recomputed_detected")
+
+    unit_collapse_warn = bool(unit_count == 1 and max_unit_size > 1)
+    if (
+        unit_collapse_warn
+        and bool(getattr(args, "phase5_warn_unit_collapse", True))
+        and bool(getattr(args, "phase5_guard_unit_collapse_as_error", False))
+    ):
+        reasons.append("aggregation_unit_collapse")
+
+    ok = len(reasons) == 0
+
+    return {
+        "phase5_structure_debug_available": True,
+        "phase5_structure_safety_ok": bool(ok),
+        "phase5_structure_safety_reason": "ok" if ok else "|".join(reasons),
+        "phase5_is_anchor_step": bool(is_anchor_step),
+        "phase5_node_voxel_requested": bool(node_requested),
+        "phase5_node_voxel_used": bool(node_used),
+        "phase5_node_voxel_fallback": bool(node_fallback),
+        "phase5_node_voxel_fallback_reason": str(node_fallback_reason),
+        "phase5_cost_attribution_input_mode": str(cost_input_mode),
+        "phase5_aggregation_key_source": str(aggregation_key_source),
+        "phase5_structural_key_source": str(structural_key_source),
+        "phase5_cause_aggregation_unit_mode": str(cause_unit_mode),
+        "phase5_aggregation_unit_count": int(unit_count),
+        "phase5_aggregation_min_unit_size": int(min_unit_size),
+        "phase5_aggregation_max_unit_size": int(max_unit_size),
+        "phase5_local_recomputed": bool(local_recomputed),
+        "phase5_raw_structure_local_recomputed": bool(raw_structure_local_recomputed),
+        "phase5_raw_cause_local_recomputed": bool(raw_cause_local_recomputed),
+        "phase5_raw_actuator_local_recomputed": bool(raw_actuator_local_recomputed),
+        "phase5_raw_structure_debug_local_recomputed": bool(raw_structure_debug_local_recomputed),
+        "phase5_canonical_node_path_ok": bool(canonical_node_path_ok),
+        "phase5_unit_collapse_warn": bool(unit_collapse_warn),
+    }
+
+
+def _phase5_apply_structure_guard(args, writer, phase5_debug, *, global_step):
+    """
+    Phase5:
+    構造経路の異常を検出したとき、設定に応じて学習を止める。
+    """
+    if not isinstance(phase5_debug, dict):
+        return
+
+    if not bool(getattr(args, "phase5_structure_guard", True)):
+        return
+
+    if bool(phase5_debug.get("phase5_structure_safety_ok", False)):
+        return
+
+    reason = str(phase5_debug.get("phase5_structure_safety_reason", "unknown"))
+
+    message = (
+        "Phase5StructureGuard: "
+        f"global_step={int(global_step)}, "
+        f"ok=False, "
+        f"reason={reason}, "
+        f"node_used={bool(phase5_debug.get('phase5_node_voxel_used', False))}, "
+        f"fallback={bool(phase5_debug.get('phase5_node_voxel_fallback', False))}, "
+        f"cost_input={phase5_debug.get('phase5_cost_attribution_input_mode', 'unknown')}, "
+        f"agg_source={phase5_debug.get('phase5_aggregation_key_source', 'unknown')}, "
+        f"struct_source={phase5_debug.get('phase5_structural_key_source', 'unknown')}, "
+        f"unit_count={int(phase5_debug.get('phase5_aggregation_unit_count', 0) or 0)}, "
+        f"unit_size=[{int(phase5_debug.get('phase5_aggregation_min_unit_size', 0) or 0)}, "
+        f"{int(phase5_debug.get('phase5_aggregation_max_unit_size', 0) or 0)}], "
+        f"canonical_node_path_ok={bool(phase5_debug.get('phase5_canonical_node_path_ok', False))}, "
+        f"raw_local_structure={bool(phase5_debug.get('phase5_raw_structure_local_recomputed', False))}, "
+        f"raw_local_cause={bool(phase5_debug.get('phase5_raw_cause_local_recomputed', False))}, "
+        f"raw_local_actuator={bool(phase5_debug.get('phase5_raw_actuator_local_recomputed', False))}, "
+        f"raw_local_structure_debug={bool(phase5_debug.get('phase5_raw_structure_debug_local_recomputed', False))}"
+    )
+
+    if writer is not None and hasattr(writer, "write"):
+        writer.write(message)
+
+    if bool(getattr(args, "phase5_structure_guard_raise", True)):
+        raise RuntimeError(message)
+
+def _phase7_update_from_voxel_state(comp_debug, model):
+    if not isinstance(comp_debug, dict):
+        return
+
+    base_model = model.module if hasattr(model, "module") else model
+    voxel_state = getattr(base_model, "last_actuator_voxel_state", None)
+
+    if not isinstance(voxel_state, dict):
+        comp_debug["phase7_actuator_voxel_state_available"] = False
+        return
+
+    comp_debug["phase7_actuator_voxel_state_available"] = True
+
+    key_map = {
+        "drop_ratio_soft": "drop_ratio_soft",
+        "drop_ratio_hard": "drop_ratio_hard",
+        "add_ratio_soft": "add_ratio_soft",
+        "add_ratio_hard": "add_ratio_hard",
+        "move_ratio_soft": "move_ratio_soft",
+        "move_ratio_hard": "move_ratio_hard",
+        "add_ratio_loss_value": "add_ratio_loss_value",
+        "add_consistency_loss_value": "add_consistency_loss_value",
+        "voxel_soft_drop_mean": "voxel_soft_drop_mean",
+        "voxel_soft_add_mean": "voxel_soft_add_mean",
+        "voxel_soft_move_mean": "voxel_soft_move_mean",
+        "voxel_edit_drop_count": "voxel_edit_drop_count",
+        "voxel_edit_add_count": "voxel_edit_add_count",
+        "voxel_edit_move_count": "voxel_edit_move_count",
+        "same_voxel_move_rejected": "voxel_edit_same_voxel_move_rejected",
+        "existing_target_rejected": "voxel_edit_existing_target_rejected",
+        "duplicate_target_rejected": "voxel_edit_duplicate_target_rejected",
+        "child_slot_rejected": "voxel_edit_child_slot_rejected",
+        "empty_target_rejected": "voxel_edit_empty_target_rejected",
+    }
+
+    for out_key, state_key in key_map.items():
+        comp_debug[out_key] = _phase7_float(
+            voxel_state.get(state_key, None),
+            0.0,
+        )
+
+    comp_debug["final_voxel_coords_count"] = int(
+        _phase7_final_voxel_count(model)
+    )
+
+def _phase7_writer_line(args, writer, text):
+    if writer is not None and hasattr(writer, "write"):
+        writer.write(text)
+    if bool(getattr(args, "phase7_debug_print", True)):
+        print(text)
+
+def _phase7_should_log_interval(args, global_step, every_attr, default_every):
+    interval = max(int(getattr(args, every_attr, default_every)), 1)
+    return bool(getattr(args, "_log_this_step", False)) or (int(global_step) % interval == 0)
+
+
+def _phase7_apply_ablation_mode(args, writer):
+    """
+    Phase7-4:
+    phase7_ablation_mode != none のときだけ既存argsを上書きする。
+    none の場合は完全に既存挙動を維持する。
+    """
+    mode = str(getattr(args, "phase7_ablation_mode", "none")).strip().lower()
+    if mode in {"", "none"}:
+        setattr(args, "_phase7_ablation_applied", False)
+        setattr(args, "_phase7_ablation_effective_mode", "none")
+        return
+
+    valid_modes = {
+        "baseline",
+        "voxel_actual_only",
+        "full_context_only",
+        "correction_only",
+        "voxel_actual_full_context",
+        "full_phase7",
+        "debug_only",
+    }
+    if mode not in valid_modes:
+        raise ValueError(f"Unsupported phase7_ablation_mode: {mode}")
+
+    # 既存状態を記録する。ログ用であり、復元はしない。
+    before = {
+        "use_voxel_restored_points_for_actual": bool(getattr(args, "use_voxel_restored_points_for_actual", False)),
+        "full_context_subtree_soft_proxy": bool(getattr(args, "full_context_subtree_soft_proxy", True)),
+        "full_cloud_actual_correction_loss_enable": bool(getattr(args, "full_cloud_actual_correction_loss_enable", False)),
+        "full_cloud_actual_correction_soft_proxy": bool(getattr(args, "full_cloud_actual_correction_soft_proxy", True)),
+        "phase7_debug": bool(getattr(args, "phase7_debug", True)),
+        "phase7_grad_debug": bool(getattr(args, "phase7_grad_debug", False)),
+        "phase7_metric_columns": bool(getattr(args, "phase7_metric_columns", True)),
+    }
+
+    if mode == "baseline":
+        args.use_voxel_restored_points_for_actual = False
+        args.full_context_subtree_soft_proxy = False
+        args.full_cloud_actual_correction_loss_enable = False
+        args.full_cloud_actual_correction_soft_proxy = False
+
+    elif mode == "voxel_actual_only":
+        args.use_voxel_restored_points_for_actual = True
+        args.full_context_subtree_soft_proxy = False
+        args.full_cloud_actual_correction_loss_enable = False
+        args.full_cloud_actual_correction_soft_proxy = False
+
+    elif mode == "full_context_only":
+        args.use_voxel_restored_points_for_actual = False
+        args.full_context_subtree_soft_proxy = True
+        args.full_cloud_actual_correction_loss_enable = False
+        args.full_cloud_actual_correction_soft_proxy = False
+
+    elif mode == "correction_only":
+        args.use_voxel_restored_points_for_actual = False
+        args.full_context_subtree_soft_proxy = False
+        args.full_cloud_actual_correction_loss_enable = True
+        args.full_cloud_actual_correction_soft_proxy = True
+
+    elif mode == "voxel_actual_full_context":
+        args.use_voxel_restored_points_for_actual = True
+        args.full_context_subtree_soft_proxy = True
+        args.full_cloud_actual_correction_loss_enable = False
+        args.full_cloud_actual_correction_soft_proxy = False
+
+    elif mode == "full_phase7":
+        args.use_voxel_restored_points_for_actual = True
+        args.full_context_subtree_soft_proxy = True
+        args.full_cloud_actual_correction_loss_enable = True
+        args.full_cloud_actual_correction_soft_proxy = True
+
+    elif mode == "debug_only":
+        args.use_voxel_restored_points_for_actual = False
+        args.full_context_subtree_soft_proxy = False
+        args.full_cloud_actual_correction_loss_enable = False
+        args.full_cloud_actual_correction_soft_proxy = False
+        args.phase7_debug = True
+        args.phase7_grad_debug = True
+        args.phase7_metric_columns = True
+        args.phase7_debug_print = True
+
+    after = {
+        "use_voxel_restored_points_for_actual": bool(getattr(args, "use_voxel_restored_points_for_actual", False)),
+        "full_context_subtree_soft_proxy": bool(getattr(args, "full_context_subtree_soft_proxy", True)),
+        "full_cloud_actual_correction_loss_enable": bool(getattr(args, "full_cloud_actual_correction_loss_enable", False)),
+        "full_cloud_actual_correction_soft_proxy": bool(getattr(args, "full_cloud_actual_correction_soft_proxy", True)),
+        "phase7_debug": bool(getattr(args, "phase7_debug", True)),
+        "phase7_grad_debug": bool(getattr(args, "phase7_grad_debug", False)),
+        "phase7_metric_columns": bool(getattr(args, "phase7_metric_columns", True)),
+    }
+
+    setattr(args, "_phase7_ablation_applied", True)
+    setattr(args, "_phase7_ablation_effective_mode", mode)
+    setattr(args, "_phase7_ablation_before", before)
+    setattr(args, "_phase7_ablation_after", after)
+
+    if bool(getattr(args, "phase7_ablation_log", True)):
+        _phase7_writer_line(
+            args,
+            writer,
+            "Phase7AblationMode: "
+            f"mode={mode}, "
+            f"voxel_actual={after['use_voxel_restored_points_for_actual']}, "
+            f"full_context_soft={after['full_context_subtree_soft_proxy']}, "
+            f"correction_loss={after['full_cloud_actual_correction_loss_enable']}, "
+            f"correction_soft={after['full_cloud_actual_correction_soft_proxy']}, "
+            f"debug={after['phase7_debug']}, "
+            f"grad_debug={after['phase7_grad_debug']}, "
+            f"metric_columns={after['phase7_metric_columns']}"
+        )
+
+def _print_phase7_recommended_commands_and_exit():
+    """
+    Phase7-5:
+    推奨軽量実験コマンドを表示して終了する。
+    実験を自動実行しない。
+    """
+    base = (
+        "python train.py "
+        "--surrogate_step 0 "
+        "--phase7_eval_summary True "
+        "--phase7_eval_summary_every 1 "
+        "--phase7_debug True "
+        "--phase7_metric_columns True "
+        "--print_rate 1 "
+        "--max_train_steps 10"
+    )
+
+    commands = {
+        "baseline": f"{base} --phase7_ablation_mode baseline",
+        "voxel_actual_only": f"{base} --phase7_ablation_mode voxel_actual_only",
+        "full_context_only": f"{base} --phase7_ablation_mode full_context_only",
+        "correction_only": f"{base} --phase7_ablation_mode correction_only",
+        "voxel_actual_full_context": f"{base} --phase7_ablation_mode voxel_actual_full_context",
+        "full_phase7": f"{base} --phase7_ablation_mode full_phase7 --max_train_steps 30",
+    }
+
+    print("Phase7 recommended lightweight commands:")
+    for name, command in commands.items():
+        print(f"\n[{name}]")
+        print(command)
+
+def _phase7_grad_sanity_stats(model, zero_eps=1e-12):
+    """
+    Phase7-4:
+    主要module/headのgrad状態を軽量に集計する。
+    graphを保持しないため、必ずdetachしたgradだけを見る。
+    """
+    base_model = model.module if hasattr(model, "module") else model
+    targets = {
+        "drop_head": ["actuator.drop_head."],
+        "add_head": ["actuator.add_head."],
+        "move_head": ["actuator.move_voxel_head."],
+        "drop_amount_head": ["actuator.drop_amount_head."],
+        "add_amount_head": ["actuator.add_amount_head."],
+        "move_amount_head": ["actuator.move_amount_head."],
+        "policy": ["policy_module."],
+        "cost_attr": ["cost_attributor."],
+        "cause_agg": ["cause_aggregator."],
+    }
+
+    out = {}
+    eps = float(zero_eps)
+
+    for label, patterns in targets.items():
+        matched = 0
+        none_count = 0
+        nan_count = 0
+        grad_norm_sum = 0.0
+        grad_max = 0.0
+
+        for name, param in base_model.named_parameters():
+            name_l = str(name).lower()
+            if not any(pattern.lower() in name_l for pattern in patterns):
+                continue
+
+            matched += 1
+            if param.grad is None:
+                none_count += 1
+                continue
+
+            grad = param.grad.detach()
+            if grad.numel() == 0:
+                none_count += 1
+                continue
+
+            grad_f = grad.float().reshape(-1)
+            finite_mask = torch.isfinite(grad_f)
+            if not bool(finite_mask.all().item()):
+                nan_count += int((~finite_mask).sum().detach().cpu().item())
+
+            grad_clean = torch.nan_to_num(grad_f, nan=0.0, posinf=0.0, neginf=0.0)
+            norm_value = float(torch.linalg.norm(grad_clean, ord=2).detach().cpu())
+            max_value = float(grad_clean.abs().max().detach().cpu()) if grad_clean.numel() > 0 else 0.0
+
+            grad_norm_sum += norm_value
+            grad_max = max(grad_max, max_value)
+
+        out[label] = {
+            "matched_param_count": int(matched),
+            "grad_norm": float(grad_norm_sum),
+            "grad_is_none": bool(matched > 0 and none_count == matched),
+            "grad_is_nan": bool(nan_count > 0),
+            "grad_is_zero_like": bool(grad_norm_sum <= eps),
+            "none_grad_param_count": int(none_count),
+            "nan_grad_element_count": int(nan_count),
+            "grad_abs_max": float(grad_max),
+        }
+
+    return out
+
+
+def _phase7_log_grad_sanity(args, writer, model, comp_debug, global_step):
+    if not bool(getattr(args, "phase7_grad_sanity_check", True)):
+        return {}
+    if not _phase7_should_log_interval(args, global_step, "phase7_grad_sanity_every", 10):
+        return {}
+
+    stats = _phase7_grad_sanity_stats(
+        model,
+        zero_eps=float(getattr(args, "phase7_grad_zero_eps", 1e-12)),
+    )
+
+    if isinstance(comp_debug, dict):
+        key_map = {
+            "drop_head": "phase7_grad_drop_head",
+            "add_head": "phase7_grad_add_head",
+            "move_head": "phase7_grad_move_head",
+            "policy": "phase7_grad_policy",
+            "cost_attr": "phase7_grad_cost_attr",
+        }
+        for label, out_key in key_map.items():
+            comp_debug[out_key] = float(stats.get(label, {}).get("grad_norm", 0.0))
+
+        for label, values in stats.items():
+            prefix = f"phase7_grad_sanity_{label}"
+            comp_debug[f"{prefix}_norm"] = float(values.get("grad_norm", 0.0))
+            comp_debug[f"{prefix}_is_none"] = bool(values.get("grad_is_none", False))
+            comp_debug[f"{prefix}_is_nan"] = bool(values.get("grad_is_nan", False))
+            comp_debug[f"{prefix}_is_zero_like"] = bool(values.get("grad_is_zero_like", False))
+
+    parts = []
+    for label in (
+        "drop_head",
+        "add_head",
+        "move_head",
+        "drop_amount_head",
+        "add_amount_head",
+        "move_amount_head",
+        "policy",
+        "cost_attr",
+        "cause_agg",
+    ):
+        values = stats.get(label, {})
+        parts.append(
+            f"{label}:norm={float(values.get('grad_norm', 0.0)):.6g},"
+            f"none={bool(values.get('grad_is_none', False))},"
+            f"nan={bool(values.get('grad_is_nan', False))},"
+            f"zero={bool(values.get('grad_is_zero_like', False))}"
+        )
+
+    _phase7_writer_line(
+        args,
+        writer,
+        "Phase7GradSanity: " + " | ".join(parts)
+    )
+
+    return stats
+
+
+def _phase7_param_update_enabled(args, global_step):
+    if not bool(getattr(args, "phase7_param_update_check", False)):
+        return False
+    return _phase7_should_log_interval(args, global_step, "phase7_param_update_every", 20)
+
+
+def _phase7_take_param_snapshot(model):
+    """
+    Phase7-4:
+    optimizer.step前の主要moduleパラメータをdetach cloneする。
+    default Falseのdebug専用なので、重さは許容する。
+    """
+    base_model = model.module if hasattr(model, "module") else model
+    targets = {
+        "actuator": ["actuator."],
+        "policy": ["policy_module."],
+        "cost_attr": ["cost_attributor."],
+        "cause_agg": ["cause_aggregator."],
+    }
+
+    snapshot = {key: [] for key in targets.keys()}
+
+    for name, param in base_model.named_parameters():
+        if not param.requires_grad:
+            continue
+        name_l = str(name).lower()
+        for label, patterns in targets.items():
+            if any(pattern.lower() in name_l for pattern in patterns):
+                snapshot[label].append((name, param.detach().clone()))
+                break
+
+    return snapshot
+
+
+def _phase7_compare_param_snapshot(model, snapshot, zero_eps=1e-12):
+    """
+    Phase7-4:
+    optimizer.step後に、snapshotとの差分を集計する。
+    graphを保持しない。
+    """
+    base_model = model.module if hasattr(model, "module") else model
+    current_params = {
+        name: param.detach()
+        for name, param in base_model.named_parameters()
+        if param.requires_grad
+    }
+
+    out = {}
+    eps = float(zero_eps)
+
+    for label, items in (snapshot or {}).items():
+        update_norm_sum = 0.0
+        update_max = 0.0
+        compared_count = 0
+
+        for name, before in items:
+            after = current_params.get(name, None)
+            if after is None:
+                continue
+            diff = (after - before.to(device=after.device, dtype=after.dtype)).detach().float().reshape(-1)
+            if diff.numel() == 0:
+                continue
+            diff = torch.nan_to_num(diff, nan=0.0, posinf=0.0, neginf=0.0)
+            update_norm_sum += float(torch.linalg.norm(diff, ord=2).detach().cpu())
+            update_max = max(update_max, float(diff.abs().max().detach().cpu()))
+            compared_count += 1
+
+        out[label] = {
+            "param_update_norm": float(update_norm_sum),
+            "param_update_max": float(update_max),
+            "param_updated": bool(update_norm_sum > eps or update_max > eps),
+            "compared_param_count": int(compared_count),
+        }
+
+    return out
+
+
+def _phase7_log_param_update(args, writer, comp_debug, update_stats, global_step):
+    if not update_stats:
+        return
+
+    if isinstance(comp_debug, dict):
+        comp_debug["phase7_update_actuator"] = float(update_stats.get("actuator", {}).get("param_update_norm", 0.0))
+        comp_debug["phase7_update_policy"] = float(update_stats.get("policy", {}).get("param_update_norm", 0.0))
+        comp_debug["phase7_update_cost_attr"] = float(update_stats.get("cost_attr", {}).get("param_update_norm", 0.0))
+        comp_debug["phase7_update_cause_agg"] = float(update_stats.get("cause_agg", {}).get("param_update_norm", 0.0))
+
+        for label, values in update_stats.items():
+            prefix = f"phase7_param_update_{label}"
+            comp_debug[f"{prefix}_norm"] = float(values.get("param_update_norm", 0.0))
+            comp_debug[f"{prefix}_max"] = float(values.get("param_update_max", 0.0))
+            comp_debug[f"{prefix}_updated"] = bool(values.get("param_updated", False))
+
+    _phase7_writer_line(
+        args,
+        writer,
+        "Phase7ParamUpdate: "
+        f"actuator_norm={float(update_stats.get('actuator', {}).get('param_update_norm', 0.0)):.6g}, "
+        f"actuator_updated={bool(update_stats.get('actuator', {}).get('param_updated', False))}, "
+        f"policy_norm={float(update_stats.get('policy', {}).get('param_update_norm', 0.0)):.6g}, "
+        f"policy_updated={bool(update_stats.get('policy', {}).get('param_updated', False))}, "
+        f"cost_attr_norm={float(update_stats.get('cost_attr', {}).get('param_update_norm', 0.0)):.6g}, "
+        f"cost_attr_updated={bool(update_stats.get('cost_attr', {}).get('param_updated', False))}, "
+        f"cause_agg_norm={float(update_stats.get('cause_agg', {}).get('param_update_norm', 0.0)):.6g}, "
+        f"cause_agg_updated={bool(update_stats.get('cause_agg', {}).get('param_updated', False))}"
+    )
+
+
+def _phase7_add_ablation_summary_to_comp_debug(args, comp_debug):
+    if not isinstance(comp_debug, dict):
+        return
+
+    mode = str(getattr(args, "_phase7_ablation_effective_mode", getattr(args, "phase7_ablation_mode", "none")))
+    comp_debug["phase7_ablation_mode"] = mode
+    comp_debug["phase7_voxel_actual_enabled"] = bool(getattr(args, "use_voxel_restored_points_for_actual", False))
+    comp_debug["phase7_full_context_soft_enabled"] = bool(getattr(args, "full_context_subtree_soft_proxy", True))
+    comp_debug["phase7_correction_loss_enabled"] = bool(getattr(args, "full_cloud_actual_correction_loss_enable", False))
+
+    comp_debug["phase7_actual_input_points"] = int(comp_debug.get("original_gen_points", 0) or 0)
+    comp_debug["phase7_restored_actual_points"] = int(comp_debug.get("restored_actual_points", 0) or 0)
+
+    comp_debug["phase7_full_context_soft_proxy_loss"] = float(
+        comp_debug.get(
+            "full_context_soft_proxy_loss",
+            comp_debug.get("full_context_subtree_soft_proxy_loss_value", 0.0),
+        )
+        or 0.0
+    )
+    comp_debug["phase7_correction_loss"] = float(
+        comp_debug.get(
+            "full_cloud_actual_correction_loss_value",
+            comp_debug.get("full_cloud_corr_loss_value", 0.0),
+        )
+        or 0.0
+    )
+    comp_debug["phase7_full_cloud_actual_delta"] = float(
+        comp_debug.get(
+            "full_cloud_actual_delta",
+            comp_debug.get("full_cloud_actual_percent", comp_debug.get("full_cloud_corr_last_full_actual_delta", 0.0)),
+        )
+        or 0.0
+    )
+    comp_debug["phase7_subtree_actual_delta"] = float(
+        comp_debug.get(
+            "subtree_actual_delta",
+            comp_debug.get("subtree_teacher_percent", comp_debug.get("full_cloud_corr_last_subtree_actual_delta", 0.0)),
+        )
+        or 0.0
+    )
+    comp_debug["phase7_full_vs_subtree_gap"] = float(
+        comp_debug.get(
+            "full_vs_subtree_gap",
+            comp_debug.get("full_cloud_corr_ema_full_vs_subtree_gap", 0.0),
+        )
+        or 0.0
+    )
+
+def _phase7_normalize_actual_debug(args, comp_debug):
+    """
+    Phase7-5:
+    actual SparsePCGC / actual codec結果のkeyをPhase7評価summary用に正規化する。
+    worker内部は変更せず、train.py側で既存keyを吸収する。
+    """
+    if not isinstance(comp_debug, dict):
+        return {}
+
+    scope = str(
+        comp_debug.get(
+            "actual_scope",
+            getattr(args, "_current_teacher_scope", "")
+        )
+    )
+    if not scope:
+        scope = "unknown"
+
+    input_source = str(
+        comp_debug.get(
+            "actual_input_source",
+            "voxel_restored" if bool(comp_debug.get("voxel_restored_actual_used", False)) else "gen_xyz"
+        )
+    )
+
+    total_bits = comp_debug.get(
+        "actual_total_bits",
+        comp_debug.get("gen_actual_bit", comp_debug.get("actual_sparsepcgc_bit", 0.0)),
+    )
+
+    actual_bpp = comp_debug.get(
+        "actual_bpp",
+        comp_debug.get("bpp", 0.0),
+    )
+
+    actual_delta = comp_debug.get(
+        "actual_delta_percent",
+        comp_debug.get("actual_total_bit_percent", comp_debug.get("total_bit", 0.0)),
+    )
+
+    lowprob_count = comp_debug.get(
+        "actual_lowprob_count",
+        comp_debug.get(
+            "actual_lowprob_occupancy_count_after",
+            comp_debug.get("low_prob_true_count", 0.0),
+        ),
+    )
+
+    normalized = {
+        "actual_scope": scope,
+        "actual_input_source": input_source,
+        "actual_used_voxel_restored_points": bool(comp_debug.get("voxel_restored_actual_used", False)),
+        "actual_input_points": int(
+            comp_debug.get(
+                "actual_input_points",
+                comp_debug.get("phase7_actual_input_points", comp_debug.get("gen_points", 0)),
+            )
+            or 0
+        ),
+        "actual_total_bits": _phase7_float(total_bits, 0.0),
+        "actual_bpp": _phase7_float(actual_bpp, 0.0),
+        "actual_delta_percent": _phase7_float(actual_delta, 0.0),
+        "actual_occupancy_nll": _phase7_float(
+            comp_debug.get(
+                "actual_occupancy_nll",
+                comp_debug.get("actual_occupancy_nll_after", comp_debug.get("sparsepcgc_exact_occupancy_nll", 0.0)),
+            ),
+            0.0,
+        ),
+        "actual_occupancy_nll_delta": _phase7_float(
+            comp_debug.get(
+                "actual_occupancy_nll_delta",
+                comp_debug.get("sparsepcgc_exact_occupancy_nll_delta", 0.0),
+            ),
+            0.0,
+        ),
+        "actual_node_count": _phase7_float(
+            comp_debug.get("actual_node_count", comp_debug.get("rate_proxy_after", comp_debug.get("gen_node", 0.0))),
+            0.0,
+        ),
+        "actual_single_child_count": _phase7_float(
+            comp_debug.get("actual_single_child_count", comp_debug.get("single_delta", 0.0)),
+            0.0,
+        ),
+        "actual_lowprob_count": _phase7_float(lowprob_count, 0.0),
+    }
+
+    comp_debug.update(normalized)
+    return normalized
+
+
+def _phase7_eval_summary_path(args, plot):
+    """
+    Phase7-5:
+    summary CSVの保存先を決める。
+    既存metric CSVと同じrun配下へ置く。
+    """
+    name = str(getattr(args, "phase7_eval_summary_name", "phase7_eval_summary.csv")).strip()
+    if not name:
+        name = "phase7_eval_summary.csv"
+
+    base_dir = getattr(plot, "log_dir", None)
+    if base_dir is None:
+        base_dir = getattr(args, "out_path", ".")
+
+    return os.path.join(str(base_dir), name)
+
+
+def _phase7_build_eval_summary_row(
+    args,
+    *,
+    global_step,
+    episode,
+    epoch,
+    step,
+    stage,
+    comp_debug,
+    L_geom,
+    L_com,
+):
+    """
+    Phase7-5:
+    compression_metric_rowより小さい、比較専用summary行を作る。
+    """
+    comp_debug = comp_debug if isinstance(comp_debug, dict) else {}
+    _phase7_normalize_actual_debug(args, comp_debug)
+
+    return {
+        "global_step": int(global_step),
+        "episode": int(episode),
+        "epoch": int(epoch),
+        "step": int(step),
+        "stage": str(stage),
+
+        "phase7_ablation_mode": str(
+            comp_debug.get(
+                "phase7_ablation_mode",
+                getattr(args, "_phase7_ablation_effective_mode", getattr(args, "phase7_ablation_mode", "none")),
+            )
+        ),
+        "voxel_restored_actual_used": bool(comp_debug.get("voxel_restored_actual_used", False)),
+        "network_voxel_node_input_used": bool(comp_debug.get("network_voxel_node_input_used", False)),
+        "network_voxel_node_fallback_reason": str(comp_debug.get("network_voxel_node_fallback_reason", "")),
+        # ============================================================
+        # Phase5:
+        # Node/Voxel canonical経路の安全性summary
+        # ============================================================
+        "phase5_structure_safety_ok": bool(
+            comp_debug.get("phase5_structure_safety_ok", False)
+        ),
+        "phase5_structure_safety_reason": str(
+            comp_debug.get("phase5_structure_safety_reason", "")
+        ),
+        "phase5_cost_attribution_input_mode": str(
+            comp_debug.get("phase5_cost_attribution_input_mode", "")
+        ),
+        "phase5_aggregation_key_source": str(
+            comp_debug.get("phase5_aggregation_key_source", "")
+        ),
+        "phase5_structural_key_source": str(
+            comp_debug.get("phase5_structural_key_source", "")
+        ),
+        "phase5_aggregation_unit_count": int(
+            comp_debug.get("phase5_aggregation_unit_count", 0) or 0
+        ),
+        "phase5_aggregation_min_unit_size": int(
+            comp_debug.get("phase5_aggregation_min_unit_size", 0) or 0
+        ),
+        "phase5_aggregation_max_unit_size": int(
+            comp_debug.get("phase5_aggregation_max_unit_size", 0) or 0
+        ),
+        "phase5_local_recomputed": bool(
+            comp_debug.get("phase5_local_recomputed", False)
+        ),
+        "phase5_unit_collapse_warn": bool(
+            comp_debug.get("phase5_unit_collapse_warn", False)
+        ),
+        "L_geom": _phase7_float(L_geom, 0.0),
+        "L_com": _phase7_float(L_com, 0.0),
+        "full_context_subtree_hard_loss": _phase7_float(
+            comp_debug.get("full_context_subtree_hard_loss", comp_debug.get("full_context_hard_loss", 0.0)),
+            0.0,
+        ),
+        "full_context_subtree_soft_proxy_loss": _phase7_float(
+            comp_debug.get("full_context_subtree_soft_proxy_loss", comp_debug.get("full_context_soft_proxy_loss", 0.0)),
+            0.0,
+        ),
+        "full_cloud_actual_correction_loss": _phase7_float(
+            comp_debug.get("full_cloud_actual_correction_loss", comp_debug.get("full_cloud_actual_correction_loss_value", 0.0)),
+            0.0,
+        ),
+
+        "subtree_local_actual_delta": _phase7_float(
+            comp_debug.get("subtree_local_actual_delta", comp_debug.get("phase7_subtree_actual_delta", 0.0)),
+            0.0,
+        ),
+        "full_cloud_actual_delta": _phase7_float(
+            comp_debug.get("full_cloud_actual_delta", comp_debug.get("phase7_full_cloud_actual_delta", 0.0)),
+            0.0,
+        ),
+        "full_vs_subtree_gap": _phase7_float(
+            comp_debug.get("full_vs_subtree_gap", comp_debug.get("phase7_full_vs_subtree_gap", 0.0)),
+            0.0,
+        ),
+        "full_vs_context_gap": _phase7_float(comp_debug.get("full_vs_context_gap", 0.0), 0.0),
+
+        "drop_ratio_soft": _phase7_float(comp_debug.get("drop_ratio_soft", 0.0), 0.0),
+        "add_ratio_soft": _phase7_float(comp_debug.get("add_ratio_soft", 0.0), 0.0),
+        "move_ratio_soft": _phase7_float(comp_debug.get("move_ratio_soft", 0.0), 0.0),
+        "voxel_edit_drop_count": _phase7_float(comp_debug.get("voxel_edit_drop_count", 0.0), 0.0),
+        "voxel_edit_add_count": _phase7_float(comp_debug.get("voxel_edit_add_count", 0.0), 0.0),
+        "voxel_edit_move_count": _phase7_float(comp_debug.get("voxel_edit_move_count", 0.0), 0.0),
+
+        "drop_grad_norm": _phase7_float(comp_debug.get("drop_grad_norm", comp_debug.get("phase7_grad_drop_head", 0.0)), 0.0),
+        "add_grad_norm": _phase7_float(comp_debug.get("add_grad_norm", comp_debug.get("phase7_grad_add_head", 0.0)), 0.0),
+        "move_grad_norm": _phase7_float(comp_debug.get("move_grad_norm", comp_debug.get("phase7_grad_move_head", 0.0)), 0.0),
+        "policy_grad_norm": _phase7_float(comp_debug.get("policy_grad_norm", comp_debug.get("phase7_grad_policy", 0.0)), 0.0),
+        "cost_attr_grad_norm": _phase7_float(comp_debug.get("cost_attr_grad_norm", comp_debug.get("phase7_grad_cost_attr", 0.0)), 0.0),
+
+        "actual_total_bits": _phase7_float(comp_debug.get("actual_total_bits", 0.0), 0.0),
+        "actual_bpp": _phase7_float(comp_debug.get("actual_bpp", 0.0), 0.0),
+        "actual_occupancy_nll_delta": _phase7_float(comp_debug.get("actual_occupancy_nll_delta", 0.0), 0.0),
+
+        "actual_scope": str(comp_debug.get("actual_scope", "")),
+        "actual_input_source": str(comp_debug.get("actual_input_source", "")),
+        "actual_used_voxel_restored_points": bool(comp_debug.get("actual_used_voxel_restored_points", False)),
+        "actual_input_points": int(comp_debug.get("actual_input_points", 0) or 0),
+        "actual_delta_percent": _phase7_float(comp_debug.get("actual_delta_percent", 0.0), 0.0),
+        "actual_node_count": _phase7_float(comp_debug.get("actual_node_count", 0.0), 0.0),
+        "actual_single_child_count": _phase7_float(comp_debug.get("actual_single_child_count", 0.0), 0.0),
+        "actual_lowprob_count": _phase7_float(comp_debug.get("actual_lowprob_count", 0.0), 0.0),
+    }
+
+
+def _phase7_should_save_eval_summary(args, global_step):
+    if not bool(getattr(args, "phase7_eval_summary", True)):
+        return False
+    interval = max(int(getattr(args, "phase7_eval_summary_every", 1)), 1)
+    return int(global_step) % interval == 0
 
 def _summarize_nonfinite_grads(model, limit=8):
     # Loss自体が有限でも、backward中に一部パラメータ勾配だけNaN/Infになることがある。
@@ -188,6 +1583,57 @@ def _summarize_nonfinite_grads(model, limit=8):
         "bad_names": bad_names,
     }
 
+def _phase7_named_grad_norms(model):
+    base_model = model.module if hasattr(model, "module") else model
+
+    targets = {
+        "drop_grad_norm": [
+            "actuator.drop_head.",
+            "actuator.drop_amount_head.",
+        ],
+        "add_grad_norm": [
+            "actuator.add_head.",
+            "actuator.add_voxel_head.",
+            "actuator.add_amount_head.",
+        ],
+        "move_grad_norm": [
+            "actuator.move_voxel_head.",
+            "actuator.move_amount_head.",
+        ],
+        "policy_grad_norm": [
+            "policy_module.",
+        ],
+        "cost_attr_grad_norm": [
+            "cost_attributor.",
+        ],
+        "cause_agg_grad_norm": [
+            "cause_aggregator.",
+        ],
+    }
+
+    out = {key: 0.0 for key in targets.keys()}
+
+    for name, param in base_model.named_parameters():
+        if param.grad is None:
+            continue
+        grad = param.grad.detach()
+        if grad.numel() == 0:
+            continue
+        name_l = str(name).lower()
+        # Phase7-3: Conv重みなど3次元以上のgradも扱えるように、必ず1次元へ平坦化してからL2 normを取る。
+        grad_clean = torch.nan_to_num(
+            grad.float(),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).reshape(-1)
+
+        grad_norm = float(torch.linalg.norm(grad_clean, ord=2).cpu())
+        for out_key, patterns in targets.items():
+            if any(pattern.lower() in name_l for pattern in patterns):
+                out[out_key] += grad_norm
+
+    return out
 
 def _format_nonfinite_grad_summary(summary):
     if not summary or not summary.get("has_nonfinite", False):
@@ -852,7 +2298,13 @@ def _build_exact_occupancy_ste_term(args, terms, model, out_label, before_xyz, a
     if after_xyz is None or not torch.is_tensor(after_xyz):
         return None, {}
 
-    weight = float(getattr(args, "exact_occupancy_ste_loss_weight", 0.0))
+    weight = float(
+        getattr(
+            args,
+            "exact_occupancy_ste_loss_weight",
+            getattr(args, "sparsepcgc_exact_teacher_loss_weight", 0.0),
+        )
+    )
     if weight <= 0.0:
         return None, {"exact_occupancy_ste_used": False, "exact_occupancy_ste_disabled": True}
 
@@ -886,7 +2338,13 @@ def _build_exact_occupancy_ste_term(args, terms, model, out_label, before_xyz, a
         debug["exact_occupancy_ste_weight"] = float(weight)
         return ste_term, debug
 
-    soft_grad_weight = float(getattr(args, "exact_occupancy_ste_grad_weight", 1.0))
+    soft_grad_weight = float(
+        getattr(
+            args,
+            "exact_occupancy_ste_grad_weight",
+            getattr(args, "sparsepcgc_exact_teacher_grad_weight", 1.0),
+        )
+    )
 
     # forwardはhard_obj、backwardはsoft_proxy。
     ste_term = weight * (
@@ -973,6 +2431,11 @@ def run_episode_full_cloud_validation(
                     input_attr = input_pcd[:, 3:, :].contiguous() if input_pcd.shape[1] > 3 else None
                     autocast_ctx = torch.cuda.amp.autocast(dtype=amp_dtype, enabled=use_amp) if use_cuda else nullcontext()
                     with torch.no_grad(), autocast_ctx:
+                        full_octree_context = _build_full_cloud_octree_context_for_train(
+                            input_xyz,
+                            args,
+                            coord_scale=None,
+                        )
                         gen_pts, _, _, _, final_w, _, _, _, out_label = model.forward(
                             input_xyz,
                             input_attr,
@@ -981,7 +2444,7 @@ def run_episode_full_cloud_validation(
                             subtree_ref=None,
                             selected_subtree_keys=None,
                             subtree_tree=None,
-                            full_octree_context=None,
+                            full_octree_context=full_octree_context,
                             octree_input_mode="full_cloud",
                         )
                         gen_xyz = gen_pts[:, :3, :]
@@ -992,6 +2455,29 @@ def run_episode_full_cloud_validation(
                             model,
                             collect_stats=False,
                         )
+                        gen_xyz_for_actual, voxel_restored_actual_debug = _select_actual_gen_xyz_from_voxel_state(
+                            args,
+                            writer,
+                            model,
+                            gen_xyz,
+                            prefix="VoxelRestoredActual[episode_full_cloud_validation]",
+                            canonical_context=full_cloud_canonical_context,
+                        )
+                        setattr(
+                            args,
+                            "_current_actual_uses_voxel_restored",
+                            bool(voxel_restored_actual_debug.get("used", False)) if isinstance(voxel_restored_actual_debug, dict) else False,
+                        )
+                        # Phase7-3: actual codecへ渡す点群だけの切替debug。
+                        # geometry lossのgen_xyzは変更しない。
+                        if isinstance(voxel_restored_actual_debug, dict):
+                            try:
+                                setattr(args, "_last_voxel_restored_actual_debug", dict(voxel_restored_actual_debug))
+                            except Exception:
+                                pass
+                        args._current_exact_teacher_mode = "full_cloud"
+                        args._current_exact_teacher_uses_full_context = False
+                        args._current_exact_teacher_fallback_reason = ""
                         loss.get_compression_loss(
                             args,
                             gen_xyz=compression_gen_xyz,
@@ -999,12 +2485,45 @@ def run_episode_full_cloud_validation(
                             final_w=final_w_for_loss,
                             cache_key=cache_key,
                             refresh_actual_gen="always",
-                            actual_gen_xyz=gen_xyz,
+                            actual_gen_xyz=gen_xyz_for_actual,
                             subtree_tree=None,
-                            full_octree_context=None,
+                            full_octree_context=full_octree_context,
                             octree_input_mode="full_cloud",
                         )
                     comp_debug = dict(getattr(loss, "last_compression_debug", {}) or {})
+                    phase7_voxel_actual_debug = getattr(args, "_last_voxel_restored_actual_debug", {}) or {}
+                    if isinstance(phase7_voxel_actual_debug, dict):
+                        comp_debug.update(
+                            {
+                                "use_voxel_restored_points_for_actual": bool(getattr(args, "use_voxel_restored_points_for_actual", False)),
+                                "voxel_restored_actual_used": bool(phase7_voxel_actual_debug.get("used", False)),
+                                "voxel_restored_actual_fallback": bool(phase7_voxel_actual_debug.get("fallback", False)),
+                                "voxel_restored_actual_fallback_reason": str(phase7_voxel_actual_debug.get("reason", "")),
+                                "restored_actual_points": int(phase7_voxel_actual_debug.get("restored_actual_points", phase7_voxel_actual_debug.get("points", 0)) or 0),
+                                "original_gen_points": int(phase7_voxel_actual_debug.get("original_gen_points", 0) or 0),
+                                "restored_actual_xyz_min": float(phase7_voxel_actual_debug.get("restored_actual_xyz_min", 0.0) or 0.0),
+                                "restored_actual_xyz_max": float(phase7_voxel_actual_debug.get("restored_actual_xyz_max", 0.0) or 0.0),
+                                "original_gen_xyz_min": float(phase7_voxel_actual_debug.get("original_gen_xyz_min", 0.0) or 0.0),
+                                "original_gen_xyz_max": float(phase7_voxel_actual_debug.get("original_gen_xyz_max", 0.0) or 0.0),
+                                "final_voxel_coords_count": int(phase7_voxel_actual_debug.get("final_voxel_coords_count", comp_debug.get("final_voxel_coords_count", 0)) or 0),
+                            }
+                        )
+
+                    if _phase7_debug_enabled(args, global_train_step):
+                        _phase7_writer_line(
+                            args,
+                            writer,
+                            "Phase7ActualInputDebug: "
+                            f"use_voxel_restored={bool(comp_debug.get('use_voxel_restored_points_for_actual', False))}, "
+                            f"used={bool(comp_debug.get('voxel_restored_actual_used', False))}, "
+                            f"fallback={bool(comp_debug.get('voxel_restored_actual_fallback', False))}, "
+                            f"reason={comp_debug.get('voxel_restored_actual_fallback_reason', '')}, "
+                            f"original_points={int(comp_debug.get('original_gen_points', 0) or 0)}, "
+                            f"restored_points={int(comp_debug.get('restored_actual_points', 0) or 0)}, "
+                            f"final_voxel_count={int(comp_debug.get('final_voxel_coords_count', 0) or 0)}, "
+                            f"orig_range=[{float(comp_debug.get('original_gen_xyz_min', 0.0) or 0.0):.6g}, {float(comp_debug.get('original_gen_xyz_max', 0.0) or 0.0):.6g}], "
+                            f"restored_range=[{float(comp_debug.get('restored_actual_xyz_min', 0.0) or 0.0):.6g}, {float(comp_debug.get('restored_actual_xyz_max', 0.0) or 0.0):.6g}]"
+                        )
                     value = finite_float_or_none(
                         comp_debug.get("full_cloud_actual_percent", comp_debug.get("actual_total_bit_percent"))
                     )
@@ -1132,6 +2651,11 @@ def train(model, args, loss, writer, plot, notifier=None):
     seq_datasets = [(seq_dir, PlyDirDataset(args, seq_dir)) for seq_dir in seq_dirs] # 各シーケンス内のPLY点群ファイルを読み込むデータセットを作る
     total_train_files = sum(len(dataset) for _, dataset in seq_datasets) # 全シーケンスに含まれる点群ファイル数を合計し、総Step数の見積もりなどに使用
     args._total_train_steps_estimate = max(int(getattr(args, "episodes", 1)), 1) * max(int(total_train_files), 1) # Episode数と点群ファイル数からそう学修Step数を概算
+    # Phase7-4:
+    # ablation modeは学習前に一度だけ適用する。
+    # phase7_ablation_mode='none' の場合は何も上書きしない。
+    _phase7_apply_ablation_mode(args, writer)
+
     set_cache_expected = getattr(model, "set_expected_input_cache_entries", None) # モデル側に入力キャッシュ件数を設定する変数
     if callable(set_cache_expected):
         set_cache_expected(total_train_files) # モデルに学習ファイル総数を通知し、入力キャッシュの総低用量を設定
@@ -1143,6 +2667,14 @@ def train(model, args, loss, writer, plot, notifier=None):
     case_debug_path = init_case_debug_csv(args, plot, writer) # 圧縮効率が良い/悪いケースを後から分析するためのCSVの初期化
     case_debug_counts = {"good": 0, "bad": 0}
     metric_csv_paths = init_metric_csvs(args, plot, writer) # 圧縮メトリクス/点操作メトリクス/ChackPoint判定値などの書き込み
+    if bool(getattr(args, "phase7_eval_summary", True)):
+        metric_csv_paths["phase7_eval_summary"] = _phase7_eval_summary_path(args, plot)
+        init_csv_file(
+            metric_csv_paths["phase7_eval_summary"],
+            PHASE7_EVAL_SUMMARY_COLUMNS,
+            writer,
+            "Phase7EvalSummaryCSV",
+        )
     # 各損失項が各モジュール・点操作へ流す勾配量を記録するCSV
     step_grad_dir = getattr(plot, "save_dir", None) or getattr(args, "out_path", ".")
     metric_csv_paths["step_grad"] = os.path.join(step_grad_dir, f"{args.time}_MyNetwork_step_grad.csv")
@@ -1296,6 +2828,21 @@ def train(model, args, loss, writer, plot, notifier=None):
                     input_pcd = input_xyz
 
                 pcd_pts_num = input_xyz.shape[-1]
+                # ============================================================
+                # このStepで使う唯一の voxel 座標系を full cloud から一度だけ作る。
+                # Subtree / full anchor / actual / proxy / debug は必ずこれを基準にする。
+                # ============================================================
+                full_cloud_canonical_context = _build_full_cloud_octree_context_for_train(
+                    input_xyz[:, :3, :],
+                    args,
+                    coord_scale=None,
+                )
+
+                try:
+                    setattr(args, "_full_cloud_canonical_context", full_cloud_canonical_context)
+                    setattr(args, "_full_cloud_canonical_coords_count", int(full_cloud_canonical_context["global_voxel_coords"].shape[-1]))
+                except Exception:
+                    pass
 
                 if timing_enabled: # 時間計測が有効なStepなら
                     sync_for_timing(use_cuda) # CUDA処理の同期
@@ -1457,6 +3004,42 @@ def train(model, args, loss, writer, plot, notifier=None):
                             selected_groups,
                             args=args,
                         )
+                        # ============================================================
+                        # build_selected_group_octree_metadata() が内部で局所再量子化していても、
+                        # ここで必ず full cloud canonical voxel coords に差し替える。
+                        # ============================================================
+                        patched_subtree_trees = {}
+                        patched_full_octree_contexts = {}
+
+                        for selected_key, selected_point_idx in selected_groups:
+                            selected_key_int = int(selected_key)
+
+                            patched_subtree_tree, patched_full_context = _inject_full_cloud_canonical_into_subtree_metadata(
+                                subtree_tree=subtree_trees.get(selected_key_int, {}),
+                                full_octree_context=full_octree_contexts.get(selected_key_int, {}),
+                                full_cloud_canonical_context=full_cloud_canonical_context,
+                                point_idx=selected_point_idx,
+                                device=input_xyz.device,
+                            )
+
+                            patched_subtree_trees[selected_key_int] = patched_subtree_tree
+                            patched_full_octree_contexts[selected_key_int] = patched_full_context
+
+                            if selected_key_int in group_meta:
+                                group_meta[selected_key_int] = dict(group_meta[selected_key_int])
+                            else:
+                                group_meta[selected_key_int] = {}
+
+                            group_meta[selected_key_int]["canonical_source"] = "full_cloud_canonical"
+                            group_meta[selected_key_int]["canonical_subtree_points"] = int(
+                                patched_subtree_tree["global_voxel_coords"].shape[-1]
+                            )
+                            group_meta[selected_key_int]["canonical_full_points"] = int(
+                                patched_full_context["full_global_voxel_coords"].shape[-1]
+                            )
+
+                        subtree_trees = patched_subtree_trees
+                        full_octree_contexts = patched_full_octree_contexts
                         t2 = time.time()
                         # print(t2-t1)
                     else:
@@ -1525,6 +3108,8 @@ def train(model, args, loss, writer, plot, notifier=None):
                     gen_xyz = None
                     final_w = None
                     out_label = None
+                    full_cloud_anchor_no_grad = False
+                    full_cloud_anchor_no_grad_reason = ""
 
                     """モデルの実行"""
                     prev_log_flag = getattr(args, "_log_this_step", False)
@@ -1538,20 +3123,52 @@ def train(model, args, loss, writer, plot, notifier=None):
                             args._current_exact_teacher_uses_full_context = False # 全点群はSubtree文脈を使わない
                             args._current_exact_teacher_fallback_reason = "" # full-cloudではfallback理由なし
                             writer.write("Running full cloud Anchor step.") # Anchor Stepであることをログに出す
-                            autocast_ctx = torch.cuda.amp.autocast(dtype=amp_dtype, enabled=use_amp) if use_cuda else nullcontext() # CUDAかつAMP有効なら混合精度計算の文脈を作る
-                            with autocast_ctx: # 全体点群をモデルに入力し、出力点群と各種補助損失・点編集重みを得る
+
+                            # FullCloud anchorは原則no-gradだが、明示的に許可され、
+                            # かつnode/voxel数が上限以内のときだけ学習graphを作る。
+                            (
+                                full_cloud_anchor_no_grad,
+                                full_cloud_anchor_no_grad_reason,
+                                full_cloud_anchor_node_count,
+                                full_cloud_anchor_node_count_source,
+                            ) = _resolve_full_cloud_anchor_no_grad(
+                                args,
+                                full_cloud_canonical_context,
+                            )
+
+                            writer.write(
+                                "FullCloudAnchorMode: "
+                                f"no_grad={bool(full_cloud_anchor_no_grad)}, "
+                                f"reason={full_cloud_anchor_no_grad_reason}, "
+                                f"node_count={int(full_cloud_anchor_node_count)}, "
+                                f"node_count_source={full_cloud_anchor_node_count_source}, "
+                                f"grad_node_limit={int(getattr(args, 'full_cloud_anchor_grad_node_limit', 50000))}, "
+                                f"allow_grad={bool(getattr(args, 'full_cloud_anchor_allow_grad', False))}"
+                            )
+
+                            autocast_ctx = torch.cuda.amp.autocast(dtype=amp_dtype, enabled=use_amp) if use_cuda else nullcontext()
+                            grad_ctx = torch.no_grad() if full_cloud_anchor_no_grad else nullcontext()
+
+                            with grad_ctx, autocast_ctx: # 全体点群をno-gradでモデルに入力し、teacher更新用の出力だけ得る
                                 """モデルの実行"""
+                                # Step冒頭で作った full cloud canonical context をそのまま使う。
+                                # ここで再量子化してはいけない。
+                                full_octree_context = dict(full_cloud_canonical_context)
+                                full_octree_context["octree_context_scope"] = "full_cloud"
+                                full_octree_context["octree_input_mode"] = "full_cloud"
+                                full_octree_context["canonical_source"] = "full_cloud_canonical"
                                 gen_pts, L_attr, L_policy, L_actuator, final_w, Lp_out, La_fit, La_rep, out_label = model.forward(
                                     input_xyz,
                                     input_attr_full,
                                     cache_key=cache_key,
                                     return_attr_output=False,
+                                    compute_internal_losses=not bool(full_cloud_anchor_no_grad),
                                     subtree_ref=subtree_ref,
                                     selected_subtree_keys=None,
                                     subtree_tree=None,
-                                    full_octree_context=None,
-                                    octree_input_mode="full_cloud"
-                                    )
+                                    full_octree_context=full_octree_context,
+                                    octree_input_mode="full_cloud",
+                                )
                             if final_w is not None and not torch.isfinite(final_w).all(): # final重みにNanやinfが混ざっていないか確認
                                 writer.write( "Warning: final_w contains NaN/Inf. " "It will be sanitized before point-edit summary and losses.")
                                 final_w = torch.nan_to_num(final_w, nan=0.0, posinf=1.0, neginf=0.0) # 変換
@@ -1566,25 +3183,52 @@ def train(model, args, loss, writer, plot, notifier=None):
                             if _discrete_loss_mode_value(args) != "hard":
                                 final_w_for_loss = final_w
                             autocast_ctx = torch.cuda.amp.autocast(dtype=amp_dtype, enabled=use_amp) if use_cuda else nullcontext() # 形状損失と圧縮損失の計算もAMP文脈で行うための設定を作る
-                            with autocast_ctx:
+                            loss_grad_ctx = torch.no_grad() if full_cloud_anchor_no_grad else nullcontext()
+
+                            with loss_grad_ctx, autocast_ctx:
                                 """形状損失の計算"""
-                                L_geom = loss.get_geometry_loss( args, gen_pts=gen_xyz, gt_pts=input_xyz[:, :3, :], final_w=final_w_for_loss, out_label=out_label)
+                                L_geom = loss.get_geometry_loss(
+                                    args,
+                                    gen_pts=gen_xyz,
+                                    gt_pts=input_xyz[:, :3, :],
+                                    final_w=final_w_for_loss,
+                                    out_label=out_label,
+                                )
 
                                 """圧縮損失の計算"""
                                 if stage_factors["com"] != 0.0:
-                                    compression_gen_xyz, noise_debug = prepare_compression_points( gen_xyz, args, model, collect_stats=bool(log_this_step or profile_this_step)) # 圧縮損失用の入力点群を作る
-                                    L_com, loss_bit, loss_single, loss_nodes, _, _ = loss.get_compression_loss( # 圧縮損失の計算
+                                    compression_gen_xyz, noise_debug = prepare_compression_points(
+                                        gen_xyz,
+                                        args,
+                                        model,
+                                        collect_stats=bool(log_this_step or profile_this_step),
+                                    ) # 圧縮損失用の入力点群を作る
+
+                                    gen_xyz_for_actual, voxel_restored_actual_debug = _select_actual_gen_xyz_from_voxel_state(
+                                        args,
+                                        writer,
+                                        model,
+                                        gen_xyz,
+                                        prefix="VoxelRestoredActual[full_cloud_anchor]",
+                                        canonical_context=full_cloud_canonical_context,
+                                    )
+
+                                    args._current_exact_teacher_mode = "full_cloud"
+                                    args._current_exact_teacher_uses_full_context = False
+                                    args._current_exact_teacher_fallback_reason = ""
+
+                                    L_com, loss_bit, loss_single, loss_nodes, _, _ = loss.get_compression_loss(
                                         args,
                                         gen_xyz=compression_gen_xyz,
                                         gt_xyz=input_xyz[:, :3, :],
-                                            final_w=final_w_for_loss,
-                                            cache_key=cache_key,
-                                            refresh_actual_gen=refresh_actual_gen,
-                                            actual_gen_xyz=gen_xyz,
-                                            subtree_tree=None,
-                                            full_octree_context=None,
-                                            octree_input_mode="full_cloud",
-                                            )
+                                        final_w=final_w_for_loss,
+                                        cache_key=cache_key,
+                                        refresh_actual_gen=refresh_actual_gen,
+                                        actual_gen_xyz=gen_xyz_for_actual,
+                                        subtree_tree=None,
+                                        full_octree_context=full_octree_context,
+                                        octree_input_mode="full_cloud",
+                                    )
                                     base_model_for_correction = model.module if hasattr(model, "module") else model
                                     full_cloud_debug_for_correction = dict(getattr(loss, "last_compression_debug", {}) or {})
                                     full_cloud_correction_state, last_full_cloud_correction_update_debug = update_full_cloud_actual_correction_state(
@@ -1594,7 +3238,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                                         subtree_debug=last_subtree_actual_debug_for_correction,
                                         full_context_debug=last_full_context_debug_for_correction,
                                         actuator_voxel_state=getattr(base_model_for_correction, "last_actuator_voxel_state", None),
-                                        reference=gen_xyz,
+                                        reference=gen_xyz_for_actual,
                                         global_step=global_train_step,
                                     )
                                     try:
@@ -1624,9 +3268,20 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 subtree_tree = subtree_trees.get(subtree_key_int) # 事前構築Subtree Octreeを取得する
                                 full_octree_context = full_octree_contexts.get(subtree_key_int) # full-cloud上のSubtree文脈を取得する
                                 subtree_group_meta = group_meta.get(subtree_key_int, {}) or {} # ログ用メタ
-                                use_subtree_tree = subtree_tree is not None # 構造評価に事前構築木を使えるか
-                                use_full_octree_context = full_octree_context is not None # 大域文脈を使えるか
-                                octree_input_mode = "prebuilt_subtree_tree" if use_subtree_tree else "local_recomputed" # 明示的な入力モード
+                                use_subtree_tree = isinstance(subtree_tree, dict) and torch.is_tensor(subtree_tree.get("global_voxel_coords", None))
+                                use_full_octree_context = isinstance(full_octree_context, dict) and torch.is_tensor(
+                                    full_octree_context.get("full_global_voxel_coords", None)
+                                )
+
+                                if not use_subtree_tree or not use_full_octree_context:
+                                    raise RuntimeError(
+                                        "Full-cloud canonical voxel basis is required for subtree training. "
+                                        f"subtree_key={subtree_key_int}, "
+                                        f"use_subtree_tree={use_subtree_tree}, "
+                                        f"use_full_octree_context={use_full_octree_context}"
+                                    )
+
+                                octree_input_mode = "prebuilt_subtree_tree"
                                 args._current_exact_teacher_mode = (
                                     "subtree_with_global_context"
                                     if (use_subtree_tree and use_full_octree_context)
@@ -1715,26 +3370,109 @@ def train(model, args, loss, writer, plot, notifier=None):
                                     L_geom_sub = loss.get_geometry_loss( args, gen_pts=gen_subtree_xyz, gt_pts=subtree_xyz[:, :3, :], final_w=final_w_sub_loss, out_label=out_label_sub)
                                     if stage_factors["com"] != 0.0:
                                         """圧縮損失の計算"""
-                                        compression_subtree_xyz, noise_debug_sub = prepare_compression_points( gen_subtree_xyz, args, model, collect_stats=bool(log_this_step or profile_this_step)) # Subtree出力を圧縮損失用に整える
-                                        subtree_noise_debug_values.append(noise_debug_sub) # 現在Subtreeのノイズ情報を保持する
-                                        L_com_sub, loss_bit_sub, loss_single_sub, loss_nodes_sub, _, _ = loss.get_compression_loss( # 損失計算
+
+                                        # ============================================================
+                                        # Subtree actual/proxy/full-context/debug の基準を、
+                                        # gen_subtree_xyz ではなく Actuator の final voxel edit state に統一する。
+                                        # geometry loss は上で gen_subtree_xyz を使って計算済みなので変更しない。
+                                        # ============================================================
+                                        subtree_voxel_state_xyz, voxel_restored_actual_debug = _select_actual_gen_xyz_from_voxel_state(
+                                            args,
+                                            writer,
+                                            model,
+                                            gen_subtree_xyz,
+                                            prefix="VoxelRestoredActual[subtree]",
+                                            canonical_context=full_octree_context,
+                                        )
+
+                                        subtree_voxel_state_used = bool(
+                                            isinstance(voxel_restored_actual_debug, dict)
+                                            and voxel_restored_actual_debug.get("used", False)
+                                            and not voxel_restored_actual_debug.get("fallback", False)
+                                        )
+
+                                        # voxel state 復元に成功した場合は、proxy側も actual 側も同じ点群を使う。
+                                        # 復元に失敗した場合は既存挙動へfallbackする。
+                                        subtree_compression_source_xyz = subtree_voxel_state_xyz
+
+                                        # voxel state 復元点群はすでに Prune/Add/Move 反映後の occupied voxel 集合である。
+                                        # ここへ final_w_sub_loss をさらに渡すと、Prune が二重反映される危険がある。
+                                        # fallback時だけ従来の final_w_sub_loss を使う。
+                                        final_w_sub_compression = None if subtree_voxel_state_used else final_w_sub_loss
+
+                                        compression_subtree_xyz, noise_debug_sub = prepare_compression_points(
+                                            subtree_compression_source_xyz,
+                                            args,
+                                            model,
+                                            collect_stats=bool(log_this_step or profile_this_step),
+                                        )
+                                        subtree_noise_debug_values.append(noise_debug_sub)
+
+                                        # Phase7/debug/CSV用に、Subtree actual が何を見たかを保存する。
+                                        if isinstance(voxel_restored_actual_debug, dict):
+                                            voxel_restored_actual_debug = dict(voxel_restored_actual_debug)
+                                        else:
+                                            voxel_restored_actual_debug = {}
+
+                                        voxel_restored_actual_debug.update(
+                                            {
+                                                "actual_scope": "subtree",
+                                                "actual_input_source": "voxel_edit_state" if subtree_voxel_state_used else "gen_subtree_xyz_fallback",
+                                                "voxel_restored_actual_used": bool(subtree_voxel_state_used),
+                                                "voxel_restored_actual_fallback": bool(voxel_restored_actual_debug.get("fallback", False)),
+                                                "voxel_restored_actual_fallback_reason": str(voxel_restored_actual_debug.get("reason", "")),
+                                                "subtree_proxy_uses_voxel_state": bool(subtree_voxel_state_used),
+                                                "subtree_actual_uses_voxel_state": bool(subtree_voxel_state_used),
+                                                "subtree_final_w_disabled_for_voxel_state": bool(subtree_voxel_state_used),
+                                            }
+                                        )
+
+                                        try:
+                                            setattr(args, "_last_voxel_restored_actual_debug", dict(voxel_restored_actual_debug))
+                                        except Exception:
+                                            pass
+                                        args._current_exact_teacher_mode = "local_subtree"
+                                        args._current_exact_teacher_uses_full_context = False
+                                        args._current_exact_teacher_fallback_reason = "subtree_training_step"
+                                        L_com_sub, loss_bit_sub, loss_single_sub, loss_nodes_sub, _, _ = loss.get_compression_loss(
                                             args,
                                             gen_xyz=compression_subtree_xyz,
                                             gt_xyz=subtree_xyz[:, :3, :],
-                                            final_w=final_w_sub_loss,
+                                            final_w=final_w_sub_compression,
                                             cache_key=subtree_cache_key,
                                             refresh_actual_gen=refresh_actual_gen,
-                                            actual_gen_xyz=gen_subtree_xyz,
+                                            actual_gen_xyz=subtree_voxel_state_xyz,
                                             subtree_tree=subtree_tree,
                                             full_octree_context=full_octree_context,
                                             octree_input_mode=octree_input_mode,
+                                        )
+
+                                        # loss 側の debug にも、Subtree actual 入力の情報を混ぜる。
+                                        # これを入れないと、後段の Phase7 summary で used=True が見えにくい。
+                                        subtree_comp_debug = dict(getattr(loss, "last_compression_debug", {}) or {})
+                                        subtree_comp_debug.update(voxel_restored_actual_debug)
+                                        loss.last_compression_debug = subtree_comp_debug
+
+                                        if _phase7_debug_enabled(args, global_train_step):
+                                            _phase7_writer_line(
+                                                args,
+                                                writer,
+                                                "SubtreeActualInputDebug: "
+                                                f"used={bool(subtree_voxel_state_used)}, "
+                                                f"fallback={bool(voxel_restored_actual_debug.get('fallback', False))}, "
+                                                f"reason={voxel_restored_actual_debug.get('reason', '')}, "
+                                                f"source={voxel_restored_actual_debug.get('actual_input_source', '')}, "
+                                                f"gen_points={int(gen_subtree_xyz.shape[-1])}, "
+                                                f"actual_points={int(subtree_voxel_state_xyz.shape[-1]) if torch.is_tensor(subtree_voxel_state_xyz) else 0}, "
+                                                f"final_voxel_count={int(voxel_restored_actual_debug.get('final_voxel_coords_count', 0) or 0)}, "
+                                                f"final_w_for_compression={'None' if final_w_sub_compression is None else 'final_w_sub_loss'}"
                                             )
                                         L_full_context_subtree_delta_sub, full_context_subtree_delta_debug_sub = build_full_context_subtree_delta_loss(
                                             args,
                                             full_octree_context=full_octree_context,
                                             subtree_tree=subtree_tree,
                                             actuator_voxel_state=actuator_voxel_state_sub,
-                                            reference=gen_subtree_xyz,
+                                            reference=subtree_voxel_state_xyz,
                                         )
                                         L_full_context_subtree_delta = L_full_context_subtree_delta + (
                                             L_full_context_subtree_delta_sub / num_selected
@@ -1845,10 +3583,18 @@ def train(model, args, loss, writer, plot, notifier=None):
                     loss.last_compression_debug = comp_debug_for_noise # ノイズ情報を追記した圧縮Debug辞書をLossに保存しなおす
 
                 """圧縮損失の合成"""
-                terms = getattr(loss, "last_compression_terms", {}) or {} # 直前の圧縮損失の内訳の取得
+                # compression loss側で作られた微分可能な内訳を取得する。
+                # Phase7-2のfull-context subtree deltaをここへ追加するため、
+                # termsを使う前に必ず初期化する。
+                terms = dict(getattr(loss, "last_compression_terms", {}) or {})
                 if torch.is_tensor(L_full_context_subtree_delta):
                     terms = dict(terms)
                     terms["full_context_subtree_delta"] = L_full_context_subtree_delta
+                    if isinstance(full_context_subtree_delta_debug, dict):
+                        full_context_subtree_delta_debug["full_context_subtree_delta_added_to_terms"] = True
+                        full_context_subtree_delta_debug["full_context_subtree_delta_requires_grad"] = bool(
+                            L_full_context_subtree_delta.requires_grad
+                        )
                     
                 L_com_objective = compose_train_compression_objective(args, terms, L_com, La_fit) # actual/surrogateではL_com直結と内訳合成を半々で混ぜる
                 # ============================================================
@@ -2114,17 +3860,17 @@ def train(model, args, loss, writer, plot, notifier=None):
                     # 符号は「削除候補を少し増やす」向きにして、Prune Whereが完全0で止まるのを防ぐ。
                     # ------------------------------------------------------------
 
-                    if not prune_where_grad_terms:
+                    if True:
                         fallback_proxy = None
                         fallback_source = "none"
 
                         for key in (
-                            "prune_where_proxy",
-                            "soft_drop_where_grad_base",
-                            "soft_drop_prob_for_ste",
                             "drop_prob_proxy",
                             "learned_drop_logit",
                             "drop_logit",
+                            "prune_where_proxy",
+                            "soft_drop_where_grad_base",
+                            "soft_drop_prob_for_ste",
                         ):
                             value = actuator_soft_terms.get(key, None)
                             if torch.is_tensor(value) and value.requires_grad:
@@ -2273,10 +4019,10 @@ def train(model, args, loss, writer, plot, notifier=None):
                         prune_where_proxy_source = "none"
 
                         for key in (
-                            "soft_drop_where_grad_direct",
                             "drop_prob_proxy",
                             "learned_drop_logit",
                             "drop_logit",
+                            "soft_drop_where_grad_direct",
                             "soft_drop_prob_for_ste",
                             "prune_where_proxy",
                             "soft_drop_where_grad_base",
@@ -2343,12 +4089,75 @@ def train(model, args, loss, writer, plot, notifier=None):
                     reference=gen_xyz if torch.is_tensor(gen_xyz) else input_xyz,
                     global_step=global_train_step,
                 )
+                # ============================================================
+                # Phase3:
+                # full-cloud actual correction を compression terms にも保存する。
+                # これにより step_grad / debug / compression_primary 側で追跡できる。
+                # ============================================================
+                if torch.is_tensor(full_cloud_correction_loss):
+                    try:
+                        phase3_terms = dict(getattr(loss, "last_compression_terms", {}) or {})
+                        phase3_terms["full_cloud_actual_correction"] = full_cloud_correction_loss
+                        loss.last_compression_terms = phase3_terms
+                    except Exception:
+                        pass
 
                 if bool(getattr(args, "full_cloud_actual_correction_loss_enable", False)):
-                    L = L + float(getattr(args, "full_cloud_actual_correction_weight", 0.05)) * full_cloud_correction_loss
+                    # ============================================================
+                    # Phase3:
+                    # compression_primary_mode では build_compression_primary_loss 側で
+                    # full_cloud_actual_correction を加算する。
+                    # ここで直接 L に足すと二重加算になるため、legacy mode のみ加算する。
+                    # ============================================================
+                    add_correction_directly = not bool(compression_primary_mode)
+
+                    if add_correction_directly:
+                        L = L + float(getattr(args, "full_cloud_actual_correction_weight", 0.05)) * full_cloud_correction_loss
+
+                    if isinstance(full_cloud_correction_debug, dict):
+                        full_cloud_correction_debug["full_cloud_corr_loss_added_to_total"] = bool(add_correction_directly)
+                        full_cloud_correction_debug["full_cloud_corr_loss_added_via_compression_primary"] = bool(compression_primary_mode)
+                        full_cloud_correction_debug["full_cloud_corr_loss_requires_grad"] = bool(
+                            torch.is_tensor(full_cloud_correction_loss)
+                            and full_cloud_correction_loss.requires_grad
+                        )
+                else:
+                    if isinstance(full_cloud_correction_debug, dict):
+                        full_cloud_correction_debug["full_cloud_corr_loss_added_to_total"] = False
+                        full_cloud_correction_debug["full_cloud_corr_loss_requires_grad"] = bool(
+                            torch.is_tensor(full_cloud_correction_loss)
+                            and full_cloud_correction_loss.requires_grad
+                        )
 
                 """情報精査"""
                 comp_debug = dict(getattr(loss, "last_compression_debug", {}) or {}) # 直前の圧縮Debug情報を取り出す
+                # Phase7-3: Network経路debugをcompression debugへ集約する。
+                base_model_for_phase7 = model.module if hasattr(model, "module") else model
+                phase7_structure_debug = getattr(base_model_for_phase7, "last_structure_debug", {}) or {}
+                _phase7_update_from_structure(
+                    comp_debug,
+                    phase7_structure_debug,
+                    is_anchor_step=bool(is_anchor_step),
+                )
+                _phase7_update_from_voxel_state(comp_debug, model)
+                # Phase7-4:
+                # ablation modeと短時間判定用summaryをcomp_debugへ集約する。
+                _phase7_add_ablation_summary_to_comp_debug(args, comp_debug)
+                if _phase7_debug_enabled(args, global_train_step):
+                    _phase7_writer_line(
+                        args,
+                        writer,
+                        "Phase7PathDebug: "
+                        f"anchor={bool(is_anchor_step)}, "
+                        f"node_used={bool(comp_debug.get('network_voxel_node_input_used', False))}, "
+                        f"node_fallback={bool(comp_debug.get('network_voxel_node_fallback', False))}, "
+                        f"node_reason={comp_debug.get('network_voxel_node_fallback_reason', '')}, "
+                        f"node_source={comp_debug.get('network_voxel_node_source', 'none')}, "
+                        f"node_count={int(comp_debug.get('network_voxel_node_count', 0) or 0)}, "
+                        f"feature_shape={comp_debug.get('network_voxel_node_feature_shape', '')}, "
+                        f"full_anchor_node={bool(comp_debug.get('full_cloud_anchor_node_voxel_used', False))}, "
+                        f"subtree_node={bool(comp_debug.get('subtree_node_voxel_used', False))}"
+                    )
                 if cp_debug: # Compression Primaryモード用のDebug情報が存在するか判定
                     comp_debug.update(cp_debug) # 圧縮目的のDebug情報を追加
                     loss.last_compression_debug = comp_debug # 統合後のcomp_debugをLossに保存
@@ -2359,7 +4168,39 @@ def train(model, args, loss, writer, plot, notifier=None):
                     comp_debug.update(last_full_cloud_correction_update_debug)
                 if isinstance(full_cloud_correction_debug, dict) and full_cloud_correction_debug:
                     comp_debug.update(full_cloud_correction_debug)
-
+                    comp_debug["phase3_full_context_subtree_delta_in_terms"] = bool(
+                        "full_context_subtree_delta" in terms
+                    )
+                    comp_debug["phase3_full_cloud_correction_in_terms"] = bool(
+                        "full_cloud_actual_correction" in getattr(loss, "last_compression_terms", {})
+                    )
+                    comp_debug["phase3_compression_primary_mode"] = bool(compression_primary_mode)
+                    comp_debug["phase3_full_context_requires_grad"] = bool(
+                        torch.is_tensor(L_full_context_subtree_delta)
+                        and L_full_context_subtree_delta.requires_grad
+                    )
+                    comp_debug["phase3_full_cloud_correction_requires_grad"] = bool(
+                        torch.is_tensor(full_cloud_correction_loss)
+                        and full_cloud_correction_loss.requires_grad
+                    )
+                # Phase7-3: full-context / full-cloud correction のhard値・soft proxy値を分けて表示する。
+                if _phase7_debug_enabled(args, global_train_step):
+                    _phase7_writer_line(
+                        args,
+                        writer,
+                        "Phase7LossDebug: "
+                        f"full_context_used={bool(comp_debug.get('full_context_subtree_delta_used', False))}, "
+                        f"hard={float(comp_debug.get('full_context_subtree_hard_loss', comp_debug.get('full_context_subtree_hard_loss_value', 0.0)) or 0.0):.6g}, "
+                        f"soft_proxy={float(comp_debug.get('full_context_subtree_soft_proxy_loss', comp_debug.get('full_context_subtree_soft_proxy_loss_value', 0.0)) or 0.0):.6g}, "
+                        f"total={float(comp_debug.get('full_context_subtree_loss_total', comp_debug.get('full_context_subtree_delta_value', 0.0)) or 0.0):.6g}, "
+                        f"soft_used={bool(comp_debug.get('full_context_subtree_soft_proxy_used', False))}, "
+                        f"corr_enabled={bool(comp_debug.get('full_cloud_actual_correction_loss_enabled', comp_debug.get('full_cloud_corr_loss_enabled', False)))}, "
+                        f"corr_added={bool(comp_debug.get('full_cloud_corr_loss_added_to_total', False))}, "
+                        f"corr_loss={float(comp_debug.get('full_cloud_actual_correction_loss_value', comp_debug.get('full_cloud_corr_loss_value', 0.0)) or 0.0):.6g}, "
+                        f"corr_soft_used={bool(comp_debug.get('full_cloud_actual_correction_soft_proxy_used', comp_debug.get('full_cloud_corr_soft_proxy_used', False)))}, "
+                        f"full_vs_subtree_gap={float(comp_debug.get('full_vs_subtree_gap', comp_debug.get('full_cloud_corr_ema_full_vs_subtree_gap', 0.0)) or 0.0):.6g}, "
+                        f"full_vs_context_gap={float(comp_debug.get('full_vs_context_gap', comp_debug.get('full_cloud_corr_ema_full_vs_context_gap', 0.0)) or 0.0):.6g}"
+                    )
                 if isinstance(full_cloud_correction_state, dict):
                     comp_debug.update(
                         {
@@ -2382,6 +4223,26 @@ def train(model, args, loss, writer, plot, notifier=None):
 
                 base_model = model.module if hasattr(model, "module") else model # DataParallelで包まれている場合は中身のモデルを取り出す
                 structure_debug = getattr(base_model, "last_structure_debug", {}) or {} # モデル内部で記録された構造解析・構造修復のDebug情報を取得
+                # ============================================================
+                # Phase5:
+                # Network内部のNode/Voxel・aggregation整合性をtrain.py側で監査する。
+                # ============================================================
+                phase5_structure_debug = _phase5_structure_safety_debug(
+                    args,
+                    structure_debug,
+                    is_anchor_step=is_anchor_step,
+                )
+
+                if isinstance(comp_debug, dict):
+                    comp_debug.update(phase5_structure_debug)
+                    loss.last_compression_debug = comp_debug
+
+                _phase5_apply_structure_guard(
+                    args,
+                    writer,
+                    phase5_structure_debug,
+                    global_step=global_train_step,
+                )
                 for debug_key in ( # 圧縮CSVからも構造入力モードを追えるように必要項目だけを転記する
                     "use_subtree_tree",
                     "use_full_octree_context",
@@ -2440,7 +4301,15 @@ def train(model, args, loss, writer, plot, notifier=None):
                         f"reason={structure_debug.get('network_voxel_node_fallback_reason', '')}, "
                         f"node_count={int(structure_debug.get('network_voxel_node_count', 0) or 0)}, "
                         f"source={structure_debug.get('network_voxel_node_source', 'none')}, "
-                        f"feature_shape={structure_debug.get('network_voxel_node_feature_shape', '')}"
+                        f"feature_shape={structure_debug.get('network_voxel_node_feature_shape', '')}, "
+                        f"phase5_ok={bool(comp_debug.get('phase5_structure_safety_ok', False))}, "
+                        f"phase5_reason={comp_debug.get('phase5_structure_safety_reason', '')}, "
+                        f"cost_input={structure_debug.get('phase4_cost_attribution_input_mode', 'unknown')}, "
+                        f"agg_source={structure_debug.get('phase4_aggregation_key_source', 'unknown')}, "
+                        f"struct_source={structure_debug.get('phase4_structural_key_source', 'unknown')}, "
+                        f"unit_count={int(structure_debug.get('phase4_aggregation_unit_count', 0) or 0)}, "
+                        f"unit_size=[{int(structure_debug.get('phase4_aggregation_min_unit_size', 0) or 0)}, "
+                        f"{int(structure_debug.get('phase4_aggregation_max_unit_size', 0) or 0)}]"
                     )
 
                 operation_entropy_value = finite_float_or_none(structure_debug.get("operation_entropy")) # 探索多様性の移動平均を出すために現在値を取り出す
@@ -2478,14 +4347,188 @@ def train(model, args, loss, writer, plot, notifier=None):
                     corr_value = finite_float_or_none(corr_debug.get("corr_surrogate_actual")) # Surrogateと実圧縮の相関地を取り出す
                     if ( log_this_step and bool(getattr(args, "surrogate_realign_on_low_corr", False)) and corr_value is not None and corr_value < float(getattr(args, "surrogate_realign_min_corr", 0.3))):
                         writer.write( "SurrogateRealignNotice: " f"corr_surrogate_actual={corr_value:.6f} below " f"{float(getattr(args, 'surrogate_realign_min_corr', 0.3)):.6f}; " f"realign_steps={int(getattr(args, 'surrogate_realign_steps', 0))} " "(current implementation logs the trigger; extra realign steps are not run unless added later).")
-                skip_optimizer_reason = None
-                if ( bool(getattr(args, "skip_optimizer_on_actual_fallback", True)) and bool(comp_debug.get("actual_codec_fallback_to_proxy", False))):
-                    skip_optimizer_reason = "actual_codec_fallback_to_proxy"
-                    comp_debug["optimizer_skip_reason"] = skip_optimizer_reason
-                    loss.last_compression_debug = comp_debug
+                    skip_optimizer_reason = None
+
+                    if bool(is_anchor_step):
+                        comp_debug["full_cloud_anchor_no_grad"] = bool(full_cloud_anchor_no_grad)
+                        comp_debug["full_cloud_anchor_no_grad_reason"] = str(full_cloud_anchor_no_grad_reason)
+                        comp_debug["full_cloud_anchor_node_count"] = int(
+                            locals().get("full_cloud_anchor_node_count", 0)
+                        )
+                        comp_debug["full_cloud_anchor_node_count_source"] = str(
+                            locals().get("full_cloud_anchor_node_count_source", "")
+                        )
+                        comp_debug["full_cloud_anchor_grad_node_limit"] = int(
+                            getattr(args, "full_cloud_anchor_grad_node_limit", 50000)
+                        )
+                        comp_debug["full_cloud_anchor_allow_grad"] = bool(
+                            getattr(args, "full_cloud_anchor_allow_grad", False)
+                        )
+
+                    if bool(is_anchor_step) and bool(full_cloud_anchor_no_grad):
+                        skip_optimizer_reason = "full_cloud_anchor_no_grad"
+                        comp_debug["optimizer_skip_reason"] = skip_optimizer_reason
+                        loss.last_compression_debug = comp_debug
+
+                    elif ( bool(getattr(args, "skip_optimizer_on_actual_fallback", True)) and bool(comp_debug.get("actual_codec_fallback_to_proxy", False))):
+                        skip_optimizer_reason = "actual_codec_fallback_to_proxy"
+                        comp_debug["optimizer_skip_reason"] = skip_optimizer_reason
+                        loss.last_compression_debug = comp_debug
 
                 """CSV"""
                 compression_metric_row = build_compression_metric_row( args, global_step=global_train_step, episode=episode, epoch=epoch, step=step, stage=current_stage, comp_debug=comp_debug, L_com=L_com) # 圧縮StepCSVに書き込む1行を作る
+                if bool(getattr(args, "phase7_metric_columns", True)) and isinstance(comp_debug, dict):
+                    for key in (
+                        # SparsePCGC worker GPU stats
+                        "sparsepcgc_worker_cuda_available",
+                        "sparsepcgc_worker_cuda_device",
+                        "sparsepcgc_worker_cuda_allocated_mb",
+                        "sparsepcgc_worker_cuda_reserved_mb",
+                        "sparsepcgc_worker_cuda_max_allocated_mb",
+                        "sparsepcgc_worker_cuda_max_reserved_mb",
+                        "sparsepcgc_worker_cuda_allocated_delta_mb",
+                        "sparsepcgc_worker_cuda_reserved_delta_mb",
+
+                        "sparsepcgc_worker_before_cuda_allocated_mb",
+                        "sparsepcgc_worker_before_cuda_reserved_mb",
+                        "sparsepcgc_worker_before_cuda_max_allocated_mb",
+                        "sparsepcgc_worker_before_cuda_max_reserved_mb",
+                        "sparsepcgc_worker_after_cuda_allocated_mb",
+                        "sparsepcgc_worker_after_cuda_reserved_mb",
+                        "sparsepcgc_worker_after_cuda_max_allocated_mb",
+                        "sparsepcgc_worker_after_cuda_max_reserved_mb",
+
+                        "actual_sparsepcgc_worker_cuda_allocated_mb",
+                        "actual_sparsepcgc_worker_cuda_reserved_mb",
+                        "actual_sparsepcgc_worker_cuda_max_allocated_mb",
+                        "actual_sparsepcgc_worker_cuda_max_reserved_mb",
+                        "actual_sparsepcgc_worker_cuda_allocated_delta_mb",
+                        "actual_sparsepcgc_worker_cuda_reserved_delta_mb",
+                        
+                        "network_voxel_node_input_used",
+                        "network_voxel_node_fallback",
+                        "network_voxel_node_fallback_reason",
+                        "network_voxel_node_source",
+                        "network_voxel_node_count",
+                        "network_voxel_node_feature_shape",
+                        "full_cloud_anchor_node_voxel_used",
+                        "subtree_node_voxel_used",
+
+                        "voxel_restored_actual_used",
+                        "voxel_restored_actual_fallback",
+                        "voxel_restored_actual_fallback_reason",
+                        "restored_actual_points",
+                        "original_gen_points",
+                        "restored_actual_xyz_min",
+                        "restored_actual_xyz_max",
+                        "original_gen_xyz_min",
+                        "original_gen_xyz_max",
+                        "final_voxel_coords_count",
+
+                        "full_context_hard_loss",
+                        "full_context_soft_proxy_loss",
+                        "full_context_subtree_loss_total",
+                        "full_cloud_actual_correction_loss_value",
+                        "full_cloud_actual_correction_loss_enabled",
+                        "full_cloud_actual_correction_soft_proxy_used",
+                        "full_vs_subtree_gap",
+                        "full_vs_context_gap",
+                        "ema_full_vs_subtree_gap",
+                        "ema_full_vs_context_gap",
+
+                        "drop_ratio_soft",
+                        "drop_ratio_hard",
+                        "add_ratio_soft",
+                        "add_ratio_hard",
+                        "move_ratio_soft",
+                        "move_ratio_hard",
+                        "voxel_soft_drop_mean",
+                        "voxel_soft_add_mean",
+                        "voxel_soft_move_mean",
+                        "voxel_edit_drop_count",
+                        "voxel_edit_add_count",
+                        "voxel_edit_move_count",
+                        "same_voxel_move_rejected",
+                        "existing_target_rejected",
+                        "duplicate_target_rejected",
+                        "child_slot_rejected",
+                        "empty_target_rejected",
+
+                        "drop_grad_norm",
+                        "add_grad_norm",
+                        "move_grad_norm",
+                        "policy_grad_norm",
+                        "cost_attr_grad_norm",
+                        "cause_agg_grad_norm",
+                        # Phase7-4 ablation summary
+                        "phase7_ablation_mode",
+                        "phase7_voxel_actual_enabled",
+                        "phase7_full_context_soft_enabled",
+                        "phase7_correction_loss_enabled",
+
+                        # Phase7-4 grad sanity
+                        "phase7_grad_drop_head",
+                        "phase7_grad_add_head",
+                        "phase7_grad_move_head",
+                        "phase7_grad_policy",
+                        "phase7_grad_cost_attr",
+                        "phase7_grad_sanity_drop_head_norm",
+                        "phase7_grad_sanity_add_head_norm",
+                        "phase7_grad_sanity_move_head_norm",
+                        "phase7_grad_sanity_drop_amount_head_norm",
+                        "phase7_grad_sanity_add_amount_head_norm",
+                        "phase7_grad_sanity_move_amount_head_norm",
+                        "phase7_grad_sanity_policy_norm",
+                        "phase7_grad_sanity_cost_attr_norm",
+                        "phase7_grad_sanity_cause_agg_norm",
+                        "phase7_grad_sanity_drop_head_is_none",
+                        "phase7_grad_sanity_add_head_is_none",
+                        "phase7_grad_sanity_move_head_is_none",
+                        "phase7_grad_sanity_policy_is_none",
+                        "phase7_grad_sanity_cost_attr_is_none",
+                        "phase7_grad_sanity_cause_agg_is_none",
+                        "phase7_grad_sanity_drop_head_is_nan",
+                        "phase7_grad_sanity_add_head_is_nan",
+                        "phase7_grad_sanity_move_head_is_nan",
+                        "phase7_grad_sanity_policy_is_nan",
+                        "phase7_grad_sanity_cost_attr_is_nan",
+                        "phase7_grad_sanity_cause_agg_is_nan",
+                        "phase7_grad_sanity_drop_head_is_zero_like",
+                        "phase7_grad_sanity_add_head_is_zero_like",
+                        "phase7_grad_sanity_move_head_is_zero_like",
+                        "phase7_grad_sanity_policy_is_zero_like",
+                        "phase7_grad_sanity_cost_attr_is_zero_like",
+                        "phase7_grad_sanity_cause_agg_is_zero_like",
+
+                        # Phase7-4 parameter update
+                        "phase7_update_actuator",
+                        "phase7_update_policy",
+                        "phase7_update_cost_attr",
+                        "phase7_update_cause_agg",
+                        "phase7_param_update_actuator_norm",
+                        "phase7_param_update_policy_norm",
+                        "phase7_param_update_cost_attr_norm",
+                        "phase7_param_update_cause_agg_norm",
+                        "phase7_param_update_actuator_max",
+                        "phase7_param_update_policy_max",
+                        "phase7_param_update_cost_attr_max",
+                        "phase7_param_update_cause_agg_max",
+                        "phase7_param_update_actuator_updated",
+                        "phase7_param_update_policy_updated",
+                        "phase7_param_update_cost_attr_updated",
+                        "phase7_param_update_cause_agg_updated",
+
+                        # Phase7-4 short-run判定
+                        "phase7_actual_input_points",
+                        "phase7_restored_actual_points",
+                        "phase7_full_context_soft_proxy_loss",
+                        "phase7_correction_loss",
+                        "phase7_full_cloud_actual_delta",
+                        "phase7_subtree_actual_delta",
+                        "phase7_full_vs_subtree_gap",
+                    ):
+                        if key in comp_debug:
+                            compression_metric_row[key] = comp_debug[key]
                 if isinstance(comp_debug, dict):
                     for key in (
                         "full_cloud_corr_update_used",
@@ -2670,6 +4713,8 @@ def train(model, args, loss, writer, plot, notifier=None):
                     ("L_com", L_com),
                     ("L_com_objective", L_com_objective),
                     ("full_context_subtree_delta", L_full_context_subtree_delta),
+                    ("full_context_subtree_delta", L_full_context_subtree_delta),
+                    ("full_cloud_actual_correction", full_cloud_correction_loss),
                     ("L_attr", L_attr),
                     ("L_policy", L_policy),
                     ("L_actuator", L_actuator),
@@ -2686,17 +4731,20 @@ def train(model, args, loss, writer, plot, notifier=None):
                 sparsepcgc_aux_term = terms.get("sparsepcgc", None)
                 if torch.is_tensor(sparsepcgc_aux_term) and sparsepcgc_aux_term.requires_grad:
                     step_grad_loss_items.append(("sparsepcgc_aux_objective", sparsepcgc_aux_term))
-                step_grad_rows = build_step_grad_rows(
-                    args,
-                    model,
-                    step_grad_loss_items,
-                    global_step=global_train_step,
-                    episode=episode,
-                    epoch=epoch,
-                    step=step,
-                    stage=current_stage,
-                )
-
+                if bool(is_anchor_step) and bool(full_cloud_anchor_no_grad):
+                    step_grad_rows = []
+                    writer.write("StepGradProbe: skipped because full_cloud_anchor_no_grad=True")
+                else:
+                    step_grad_rows = build_step_grad_rows(
+                        args,
+                        model,
+                        step_grad_loss_items,
+                        global_step=global_train_step,
+                        episode=episode,
+                        epoch=epoch,
+                        step=step,
+                        stage=current_stage,
+                    )
                 if step_grad_rows:
                     append_count = 0
                     for step_grad_row in step_grad_rows:
@@ -2721,8 +4769,26 @@ def train(model, args, loss, writer, plot, notifier=None):
                 if total_loss_finite: # 総損失がInfでないとき、更新前パラメータを記録
                     param_update_snapshots = capture_param_update_snapshots( args, model, step + 1, num_steps)
                 if skip_optimizer_reason is not None: # Optimizer更新を止める必要があるか否かの判定
-                    writer.write( f"Skip Optimizing!!! reason={skip_optimizer_reason}; " f"episode={episode + 1}, epoch={epoch + 1}, step={step + 1}/{num_steps}") # Skip理由と位置を同じ行に出す
-                    writer.write( "Skipped optimizer step because actual codec teacher fell back to proxy at " f"episode={episode + 1}, epoch={epoch + 1}, step={step + 1}/{num_steps}; " "this prevents proxy-only updates from replacing real-compression imitation.")
+                    writer.write(
+                        f"Skip Optimizing!!! reason={skip_optimizer_reason}; "
+                        f"episode={episode + 1}, epoch={epoch + 1}, step={step + 1}/{num_steps}"
+                    ) # Skip理由と位置を同じ行に出す
+
+                    if skip_optimizer_reason == "actual_codec_fallback_to_proxy":
+                        writer.write(
+                            "Skipped optimizer step because actual codec teacher fell back to proxy at "
+                            f"episode={episode + 1}, epoch={epoch + 1}, step={step + 1}/{num_steps}; "
+                            "this prevents proxy-only updates from replacing real-compression imitation."
+                        )
+                    elif skip_optimizer_reason == "full_cloud_anchor_no_grad":
+                        writer.write(
+                            "Skipped optimizer step because FullCloud anchor is used only for "
+                            "no-grad calibration / teacher update / actual evaluation. "
+                            f"reason={full_cloud_anchor_no_grad_reason}, "
+                            f"node_count={int(locals().get('full_cloud_anchor_node_count', 0))}, "
+                            f"node_count_source={str(locals().get('full_cloud_anchor_node_count_source', ''))}, "
+                            f"grad_node_limit={int(getattr(args, 'full_cloud_anchor_grad_node_limit', 50000))}"
+                        )
                 elif not total_loss_finite:
                     skip_optimizer_reason = "non_finite_total_loss"
                     comp_debug["optimizer_skip_reason"] = skip_optimizer_reason
@@ -2735,6 +4801,49 @@ def train(model, args, loss, writer, plot, notifier=None):
                     amp_info["scale_before"] = scale_before # AMP Debug情報に更新前ぉssSacleを保存
                     scaler.scale(L).backward() # LをAMP用にスケーリングしてから逆伝播
                     scaler.unscale_(optimizer) # Optimizer内の勾配を元のスケールへ戻す
+                    # Phase7-4:
+                    # unscale後の実gradを対象にsanity checkする。
+                    _phase7_log_grad_sanity(
+                        args,
+                        writer,
+                        model,
+                        comp_debug,
+                        global_train_step,
+                    )
+
+                    if bool(getattr(args, "phase7_grad_debug", False)):
+                        phase7_grad_debug = _phase7_named_grad_norms(model)
+                        comp_debug.update(phase7_grad_debug)
+                        if _phase7_debug_enabled(args, global_train_step):
+                            _phase7_writer_line(
+                                args,
+                                writer,
+                                "Phase7GradDebug: "
+                                f"drop={phase7_grad_debug.get('drop_grad_norm', 0.0):.6g}, "
+                                f"add={phase7_grad_debug.get('add_grad_norm', 0.0):.6g}, "
+                                f"move={phase7_grad_debug.get('move_grad_norm', 0.0):.6g}, "
+                                f"policy={phase7_grad_debug.get('policy_grad_norm', 0.0):.6g}, "
+                                f"cost_attr={phase7_grad_debug.get('cost_attr_grad_norm', 0.0):.6g}, "
+                                f"cause_agg={phase7_grad_debug.get('cause_agg_grad_norm', 0.0):.6g}"
+                            )
+                    if _phase7_debug_enabled(args, global_train_step):
+                        _phase7_writer_line(
+                            args,
+                            writer,
+                            "Phase7ShortRunDebug: "
+                            f"mode={comp_debug.get('phase7_ablation_mode', 'none')}, "
+                            f"voxel_actual={bool(comp_debug.get('phase7_voxel_actual_enabled', False))}, "
+                            f"full_context_soft={bool(comp_debug.get('phase7_full_context_soft_enabled', False))}, "
+                            f"correction_loss_enabled={bool(comp_debug.get('phase7_correction_loss_enabled', False))}, "
+                            f"actual_points={int(comp_debug.get('phase7_actual_input_points', 0) or 0)}, "
+                            f"restored_points={int(comp_debug.get('phase7_restored_actual_points', 0) or 0)}, "
+                            f"full_context_soft_loss={float(comp_debug.get('phase7_full_context_soft_proxy_loss', 0.0) or 0.0):.6g}, "
+                            f"correction_loss={float(comp_debug.get('phase7_correction_loss', 0.0) or 0.0):.6g}, "
+                            f"full_delta={float(comp_debug.get('phase7_full_cloud_actual_delta', 0.0) or 0.0):.6g}, "
+                            f"subtree_delta={float(comp_debug.get('phase7_subtree_actual_delta', 0.0) or 0.0):.6g}, "
+                            f"gap={float(comp_debug.get('phase7_full_vs_subtree_gap', 0.0) or 0.0):.6g}"
+                        )
+
                     if bool(getattr(args, "debug_grad_flow", False)):
                         log_grad_flow(args, writer, model, step + 1, num_steps, global_step=global_train_step) # 各層・各モジュールに勾配が届いているか否かの判定ログ
                     nonfinite_grad_summary = _summarize_nonfinite_grads(
@@ -2764,19 +4873,47 @@ def train(model, args, loss, writer, plot, notifier=None):
                     else:
                         grad_clip = float(getattr(args, "train_grad_clip", 0.0)) # 勾配ノルムの上限値を設定から取得する
                         if grad_clip > 0.0:
-                            torch.nn.utils.clip_grad_norm_( [p for p in model.parameters() if p.requires_grad], max_norm=grad_clip) # 学習対象パラメータの勾配ノルムをGrad Clip以下に制限
+                            torch.nn.utils.clip_grad_norm_(
+                                [p for p in model.parameters() if p.requires_grad],
+                                max_norm=grad_clip,
+                            )
+
+                        phase7_param_snapshot = None
+                        if _phase7_param_update_enabled(args, global_train_step):
+                            phase7_param_snapshot = _phase7_take_param_snapshot(model)
+
                         scaler.step(optimizer) # Optimizer更新
-                        optimizer_state = scaler._per_optimizer_states[id(optimizer)] # このOptimizerに対するGradScaler内部状態を取得
-                        found_inf = 0.0
-                        if optimizer_state["found_inf_per_device"]:
-                            found_inf = float( sum(v.item() for v in optimizer_state["found_inf_per_device"].values())) # GPUごとのInf検出値を合計し、、このStepでAMP Overflowが発生したかを数値化
+
+                        phase7_param_update_stats = {}
+                        if phase7_param_snapshot is not None:
+                            phase7_param_update_stats = _phase7_compare_param_snapshot(
+                                model,
+                                phase7_param_snapshot,
+                                zero_eps=float(getattr(args, "phase7_grad_zero_eps", 1e-12)),
+                            )
+
+                        # Phase7-4:
+                        # GradScalerの内部属性 _per_optimizer_states はPyTorchの版によって存在しない。
+                        # そのため、AMP skip判定は公開APIのscale変化で行う。
+                        # scaler.step() がoverflowでoptimizer.stepをskipした場合、多くの環境ではscale_after < scale_before になる。
                         scaler.update() # GradScalerのLoss Scaleを更新
                         scale_after = float(scaler.get_scale()) # 更新後Loss Scaleを取得
-                        amp_info["found_inf"] = found_inf # Inf/NaN勾配の検出量をAMP Debug情報へ保存する
-                        amp_info["scale_after"] = scale_after # 更新後Loss ScaleをAMP Debug情報へ保存
-                        step_completed = found_inf == 0.0 and scale_after >= scale_before # Inf/NaNが検出されなければOptimizer更新成功とする
+
+                        found_inf = 1.0 if scale_after < scale_before else 0.0
+                        amp_info["found_inf"] = found_inf
+                        amp_info["scale_after"] = scale_after
+
+                        step_completed = scale_after >= scale_before
                         if step_completed: # 成功した場合の処理
                             consecutive_amp_skips = 0
+                            if phase7_param_update_stats:
+                                _phase7_log_param_update(
+                                    args,
+                                    writer,
+                                    comp_debug,
+                                    phase7_param_update_stats,
+                                    global_train_step,
+                                )
                         else:
                             skip_optimizer_reason = "amp_found_inf_or_scale_drop"
                             comp_debug["optimizer_skip_reason"] = skip_optimizer_reason
@@ -2796,6 +4933,30 @@ def train(model, args, loss, writer, plot, notifier=None):
                                     writer.write( "float16 AMP overflow persisted; disabled AMP and continue in float32.")
                 else:
                     L.backward() # 通常の勾配を流す
+                    # Phase7-4:
+                    # backward直後の実gradを対象にsanity checkする。
+                    _phase7_log_grad_sanity(
+                        args,
+                        writer,
+                        model,
+                        comp_debug,
+                        global_train_step,
+                    )
+                    if bool(getattr(args, "phase7_grad_debug", False)):
+                        phase7_grad_debug = _phase7_named_grad_norms(model)
+                        comp_debug.update(phase7_grad_debug)
+                        if _phase7_debug_enabled(args, global_train_step):
+                            _phase7_writer_line(
+                                args,
+                                writer,
+                                "Phase7GradDebug: "
+                                f"drop={phase7_grad_debug.get('drop_grad_norm', 0.0):.6g}, "
+                                f"add={phase7_grad_debug.get('add_grad_norm', 0.0):.6g}, "
+                                f"move={phase7_grad_debug.get('move_grad_norm', 0.0):.6g}, "
+                                f"policy={phase7_grad_debug.get('policy_grad_norm', 0.0):.6g}, "
+                                f"cost_attr={phase7_grad_debug.get('cost_attr_grad_norm', 0.0):.6g}, "
+                                f"cause_agg={phase7_grad_debug.get('cause_agg_grad_norm', 0.0):.6g}"
+                            )
                     log_grad_flow(args, writer, model, step + 1, num_steps, global_step=global_train_step) # 各モジュールの勾配状態をログに出す
                     nonfinite_grad_summary = _summarize_nonfinite_grads(
                         model,
@@ -2818,11 +4979,27 @@ def train(model, args, loss, writer, plot, notifier=None):
                         )
                     else:
                         grad_clip = float(getattr(args, "train_grad_clip", 0.0)) # 勾配クリップの上限値取得
-                        if grad_clip > 0.0:
-                            torch.nn.utils.clip_grad_norm_( [p for p in model.parameters() if p.requires_grad], max_norm=grad_clip) # 勾配爆発抑制
+                        phase7_param_snapshot = None
+                        if _phase7_param_update_enabled(args, global_train_step):
+                            phase7_param_snapshot = _phase7_take_param_snapshot(model)
+
                         optimizer.step() # モデルパラメータの更新
                         step_completed = True # 更新フラグをTrueにする
                         consecutive_amp_skips = 0 # AMP loss scale連続Skip回数を0に戻す
+
+                        if phase7_param_snapshot is not None:
+                            phase7_param_update_stats = _phase7_compare_param_snapshot(
+                                model,
+                                phase7_param_snapshot,
+                                zero_eps=float(getattr(args, "phase7_grad_zero_eps", 1e-12)),
+                            )
+                            _phase7_log_param_update(
+                                args,
+                                writer,
+                                comp_debug,
+                                phase7_param_update_stats,
+                                global_train_step,
+                            )
                 episode_optimizer_total_count += 1
                 if step_completed:
                     episode_optimizer_step_count += 1
@@ -2867,6 +5044,23 @@ def train(model, args, loss, writer, plot, notifier=None):
                 if skip_optimizer_reason is not None or not total_loss_finite:
                     args._last_grad_flow = {} # backwardしていないskip stepでは前stepの勾配値をCSVへ持ち越さない
                 operation_metric_row = attach_grad_flow_to_operation_row(operation_metric_row, args) # backward後に得られた各操作headの勾配normをOperation CSV行へ反映する
+                if _phase7_should_save_eval_summary(args, global_train_step):
+                    phase7_eval_summary_row = _phase7_build_eval_summary_row(
+                        args,
+                        global_step=global_train_step,
+                        episode=episode,
+                        epoch=epoch,
+                        step=step,
+                        stage=current_stage,
+                        comp_debug=comp_debug,
+                        L_geom=L_geom,
+                        L_com=L_com,
+                    )
+                    append_csv_row(
+                        metric_csv_paths.get("phase7_eval_summary"),
+                        PHASE7_EVAL_SUMMARY_COLUMNS,
+                        phase7_eval_summary_row,
+                    )
                 append_csv_row( metric_csv_paths.get("compression_step"), COMPRESSION_METRIC_COLUMNS, compression_metric_row) # 圧縮メトリクスのStep単位CSV1行追記
                 accumulate_compression_episode(episode_compression_sums, compression_metric_row) # Step単位の圧縮メトリクスをEpisode累積器へ加算する
                 append_csv_row( metric_csv_paths.get("operation_step"), OPERATION_METRIC_COLUMNS, operation_metric_row) # 点操作メトリクスのStep単位CSVへ1行追記
@@ -3047,6 +5241,30 @@ def train(model, args, loss, writer, plot, notifier=None):
 
         # 毎エピソードと最高スコアのモデルを保存
         best_loss, model_path, best_trackers = save_episode_checkpoint( model=model, ckpt_dir=ckpt_dir, plot=plot, writer=writer, episode=episode, best_loss=best_loss, args=args, stage=current_stage, checkpoint_metrics=checkpoint_metrics, best_trackers=best_trackers, loss=loss)
+        if bool(getattr(args, "phase7_eval_summary", True)):
+            try:
+                latest_phase7_summary = {
+                    "episode": int(episode),
+                    "stage": str(current_stage),
+                    "model_path": str(model_path),
+                    "phase7_ablation_mode": str(
+                        getattr(args, "_phase7_ablation_effective_mode", getattr(args, "phase7_ablation_mode", "none"))
+                    ),
+                    "checkpoint_metrics": checkpoint_metrics,
+                }
+                phase7_json_path = os.path.join(str(ckpt_dir), "phase7_latest_checkpoint_summary.json")
+                with open(phase7_json_path, "w", encoding="utf-8") as handle:
+                    import json
+                    json.dump(latest_phase7_summary, handle, ensure_ascii=False, indent=2, default=str)
+
+                if model_path:
+                    best_phase7_json_path = os.path.join(str(ckpt_dir), "phase7_best_checkpoint_summary.json")
+                    with open(best_phase7_json_path, "w", encoding="utf-8") as handle:
+                        import json
+                        json.dump(latest_phase7_summary, handle, ensure_ascii=False, indent=2, default=str)
+            except Exception as exc:
+                writer.write(f"Phase7EvalSummaryCheckpointSaveWarning: {type(exc).__name__}: {exc}")
+                
         guard_event = apply_actual_compression_guard( args=args, model=model, loss=loss, optimizer=optimizer, writer=writer, guard_state=actual_guard_state, checkpoint_metrics=checkpoint_metrics, ckpt_dir=ckpt_dir, episode=episode)
         if guard_event:
             guard_event["global_step"] = global_train_step
@@ -3072,6 +5290,9 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Training Arguments')
     parser.add_argument('--trainORtest', default="train", type=str, help='date')
     args = parse_pugan_args(parser, file_day, file_time)
+    if bool(getattr(args, "print_phase7_recommended_commands", False)):
+        _print_phase7_recommended_commands_and_exit()
+        raise SystemExit(0)
     requested_mp_method = str(getattr(args, "mp_start_method", "auto")).strip().lower()
     if requested_mp_method != "auto":
         current_mp_method = mp.get_start_method(allow_none=True)

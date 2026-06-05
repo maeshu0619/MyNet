@@ -103,10 +103,32 @@ class OctreeStructureAnalysis(nn.Module):
             and getattr(self.args, "_log_this_step", True)
         ) or bool(getattr(self.args, "_collect_octree_level_debug", False))
 
-    def _grid_phase(self, pts_xyz, qs_override):
+    def _grid_phase(self, pts_xyz, qs_override, global_offset=None):
         B, _, _ = pts_xyz.shape
         qs = qs_override.to(device=pts_xyz.device, dtype=pts_xyz.dtype).view(B, 1, 1).clamp_min(1e-9)
-        q = pts_xyz / qs
+
+        if global_offset is None:
+            offset = pts_xyz.new_zeros((B, 3, 1))
+        else:
+            if not torch.is_tensor(global_offset):
+                global_offset = torch.as_tensor(global_offset, device=pts_xyz.device, dtype=pts_xyz.dtype)
+            offset = global_offset.to(device=pts_xyz.device, dtype=pts_xyz.dtype)
+
+            if offset.ndim == 1 and offset.numel() == 3:
+                offset = offset.view(1, 3, 1)
+            elif offset.ndim == 2 and offset.shape[-1] == 3:
+                offset = offset.view(-1, 3, 1)
+            elif offset.ndim == 2 and offset.shape[0] == 3:
+                offset = offset.unsqueeze(0)
+            elif offset.ndim == 3 and offset.shape[1] == 3:
+                offset = offset[:, :, :1]
+            else:
+                raise ValueError(f"global_offset has invalid shape: {tuple(offset.shape)}")
+
+            if offset.shape[0] == 1 and B > 1:
+                offset = offset.expand(B, -1, -1)
+
+        q = (pts_xyz - offset) / qs
         q_round = torch.round(q)
         phase = q - torch.floor(q)
         center_delta = (q_round - q) * qs
@@ -340,14 +362,17 @@ class OctreeStructureAnalysis(nn.Module):
                 desc["global_offset"] = context.get("global_offset")
 
         if prebuilt_ctx is not None and isinstance(subtree_tree, dict):
-            coords = self._tree_tensor(subtree_tree, "global_voxel_coords", pts_xyz.device, dtype=torch.long)
-            if coords is not None:
-                if coords.ndim == 2 and coords.shape[-1] == 3:
-                    coords = coords.transpose(0, 1).contiguous().unsqueeze(0)
-                elif coords.ndim == 3 and coords.shape[-1] == 3:
-                    coords = coords.permute(0, 2, 1).contiguous()
-                desc["voxel_coords"] = coords
-                desc["source"] = "prebuilt_subtree_tree"
+            coords_raw = self._tree_tensor(subtree_tree, "global_voxel_coords", pts_xyz.device, dtype=torch.long)
+            if coords_raw is not None:
+                coords_n3 = self._normalize_global_coords_n3(
+                    coords_raw,
+                    point_count=pts_xyz.shape[-1],
+                    device=pts_xyz.device,
+                )
+                if coords_n3 is not None:
+                    # node descriptor側は [B,3,N] 形式で保持する。
+                    desc["voxel_coords"] = coords_n3.transpose(0, 1).contiguous().unsqueeze(0)
+                    desc["source"] = "prebuilt_subtree_tree"
 
             for tree_key, out_key in (
                 ("node_depths", "node_depth"),
@@ -384,6 +409,87 @@ class OctreeStructureAnalysis(nn.Module):
         return torch.cat([values, pad], dim=0)
 
     @staticmethod
+    def _normalize_global_coords_n3(coords, point_count=None, device=None):
+        """
+        global_voxel_coords を [N, 3] に正規化する。
+        受け付ける形は [N,3], [3,N], [B,N,3], [B,3,N] である。
+        現在のOctreeStructureAnalysisはB=1前提でprebuilt contextを作る。
+        """
+        if coords is None:
+            return None
+
+        if not torch.is_tensor(coords):
+            coords = torch.as_tensor(coords)
+
+        if device is not None:
+            coords = coords.to(device=device)
+
+        coords = coords.to(dtype=torch.long)
+
+        if coords.ndim == 2:
+            if coords.shape[1] == 3:
+                out = coords.contiguous()
+            elif coords.shape[0] == 3:
+                out = coords.transpose(0, 1).contiguous()
+            else:
+                return None
+
+        elif coords.ndim == 3:
+            # B=1のみ対応。B>1は可変長subtreeと衝突しやすいため明示的に先頭を使う。
+            if coords.shape[0] != 1:
+                return None
+
+            if coords.shape[2] == 3:
+                # [1, N, 3]
+                out = coords[0].contiguous()
+            elif coords.shape[1] == 3:
+                # [1, 3, N]
+                out = coords[0].transpose(0, 1).contiguous()
+            else:
+                return None
+        else:
+            return None
+
+        if point_count is not None:
+            point_count = int(point_count)
+            current = int(out.shape[0])
+
+            if current == point_count:
+                return out
+
+            if current <= 0:
+                return out.new_zeros((point_count, 3))
+
+            if current > point_count:
+                return out[:point_count].contiguous()
+
+            pad = out[-1:].expand(point_count - current, 3)
+            return torch.cat([out, pad], dim=0).contiguous()
+
+        return out.contiguous()
+    
+    @staticmethod
+    def _stable_voxel_keys_from_coords_n3(coords_n3):
+        """
+        Phase4:
+        global_morton_keys が無い場合でも、
+        full cloud canonical global_voxel_coords から安定したkeyを作る。
+        """
+        if coords_n3 is None:
+            return None
+        if not torch.is_tensor(coords_n3):
+            coords_n3 = torch.as_tensor(coords_n3)
+        if coords_n3.ndim != 2 or coords_n3.shape[1] != 3:
+            return None
+
+        coords_n3 = coords_n3.to(dtype=torch.long)
+        return (
+            coords_n3[:, 0] * 73856093
+            + coords_n3[:, 1] * 19349663
+            + coords_n3[:, 2] * 83492791
+        ).view(1, -1).contiguous()
+
+    @staticmethod
     def _popcount_codes(codes, dtype):
         codes = codes.to(dtype=torch.long).reshape(-1)
         counts = torch.zeros_like(codes, dtype=dtype)
@@ -394,7 +500,15 @@ class OctreeStructureAnalysis(nn.Module):
     def _neighbor_occupancy_from_global_coords(self, coords):
         if coords.numel() == 0:
             return coords.new_zeros((0,), dtype=torch.float32)
+
         coords = coords.to(dtype=torch.long)
+
+        if coords.ndim != 2 or coords.shape[1] != 3:
+            raise ValueError(
+                "_neighbor_occupancy_from_global_coords expects coords with shape [N, 3], "
+                f"but got {tuple(coords.shape)}. "
+                "Normalize global_voxel_coords with _normalize_global_coords_n3() before calling this function."
+            )
         unique_coords = torch.unique(coords, dim=0, sorted=True)
         offsets = self.neighbor_offsets.to(device=coords.device, dtype=torch.long)
         targets = coords[:, None, :] + offsets.view(1, -1, 3)
@@ -439,17 +553,37 @@ class OctreeStructureAnalysis(nn.Module):
         return torch.stack(keys, dim=0) if keys else torch.empty((B, N), device=pts_xyz.device, dtype=torch.long)
 
     def _prebuilt_octree_context(self, pts_xyz, subtree_tree=None, full_octree_context=None):
-        if subtree_tree is None:
+        # subtree_tree を優先する。
+        # なければ full_octree_context の current input 用 global_voxel_coords を使う。
+        source_tree = subtree_tree if isinstance(subtree_tree, dict) else full_octree_context
+
+        if not isinstance(source_tree, dict):
             return None
+
         B, _, N = pts_xyz.shape
         if B != 1:
             return None
+
         device = pts_xyz.device
         dtype = pts_xyz.dtype
-        coords = self._tree_tensor(subtree_tree, "global_voxel_coords", device, dtype=torch.long)
+
+        coords_raw = self._tree_tensor(source_tree, "global_voxel_coords", device, dtype=torch.long)
+        if coords_raw is None or coords_raw.numel() <= 0:
+            return None
+
+        coords = self._normalize_global_coords_n3(
+            coords_raw,
+            point_count=N,
+            device=device,
+        )
         if coords is None or coords.numel() <= 0:
             return None
-        coords = self._fit_point_rows(coords, N)
+
+        if coords.ndim != 2 or coords.shape[1] != 3:
+            raise ValueError(
+                f"global_voxel_coords must be normalized to [N, 3], got {tuple(coords.shape)}"
+            )
+        
         parent_coords = torch.div(coords, 2, rounding_mode="floor")
         unique_parents, inverse = torch.unique(parent_coords, dim=0, sorted=True, return_inverse=True)
         child_index = ((coords[:, 0] & 1) * 4 + (coords[:, 1] & 1) * 2 + (coords[:, 2] & 1)).to(torch.long)
@@ -578,14 +712,21 @@ class OctreeStructureAnalysis(nn.Module):
             raise ValueError("octree_input_mode=prebuilt_subtree_tree could not build a prebuilt octree context.")
         if prebuilt_ctx is None and requested_mode not in {"auto", "full_cloud", "local_recomputed", "debug_local_recomputed"}:
             raise ValueError(f"Unsupported octree_input_mode without prebuilt metadata: {octree_input_mode}")
+        force_canonical = bool(getattr(self.args, "force_full_cloud_canonical_voxel_basis", True))
+
+        if prebuilt_ctx is None and force_canonical:
+            raise ValueError(
+                "force_full_cloud_canonical_voxel_basis=True requires prebuilt global_voxel_coords. "
+                f"octree_input_mode={octree_input_mode}, requested_mode={requested_mode}"
+            )
+
         if (
             prebuilt_ctx is None
             and requested_mode not in {"full_cloud", "debug_local_recomputed"}
             and not bool(getattr(self.args, "allow_local_octree_recompute", False))
         ):
             raise ValueError(
-                "Local Octree recompute is disabled. Use octree_input_mode=full_cloud/debug_local_recomputed "
-                "or provide prebuilt subtree_tree metadata."
+                "Local Octree recompute is disabled. Use prebuilt full-cloud canonical metadata."
             )
 
         with torch.no_grad():
@@ -613,19 +754,110 @@ class OctreeStructureAnalysis(nn.Module):
         neighbor_occ = oct_ctx[:, 6:7, :]
         child_id = oct_ctx[:, 7:8, :]
 
-        phase, snap_delta, snap_delta_norm = self._grid_phase(work_xyz, qs_override)
+        context_source = subtree_tree if isinstance(subtree_tree, dict) else full_octree_context
+        global_offset = None
+        if isinstance(context_source, dict):
+            global_offset = context_source.get("global_offset", None)
+        phase, snap_delta, snap_delta_norm = self._grid_phase(
+            work_xyz,
+            qs_override,
+            global_offset=global_offset,
+        )
         point_feature_voxel_key = None
         geo_stats = self._local_geometry_stats(work_xyz)
         tree_coords = None
         if prebuilt_ctx is not None:
-            raw_tree_coords = self._tree_tensor(subtree_tree, "global_voxel_coords", work_xyz.device, dtype=torch.long)
+            source_tree = subtree_tree if isinstance(subtree_tree, dict) else full_octree_context
+            raw_tree_coords = self._tree_tensor(source_tree, "global_voxel_coords", work_xyz.device, dtype=torch.long)
+
             if raw_tree_coords is not None:
-                tree_coords = raw_tree_coords.view(1, -1, 3)
-        if tree_coords is not None:
-            quant_stats = self._quantized_voxel_stats_from_tree(work_xyz, tree_coords, qs_override, snap_delta_norm)
-            point_feature_voxel_key = self._tree_tensor(subtree_tree, "global_morton_keys", pts_xyz.device, dtype=torch.long)
-            if point_feature_voxel_key is not None:
-                point_feature_voxel_key = self._fit_point_rows(point_feature_voxel_key.reshape(-1, 1), pts_xyz.shape[-1]).reshape(1, -1)
+                coords_n3 = self._normalize_global_coords_n3(
+                    raw_tree_coords,
+                    point_count=work_xyz.shape[-1],
+                    device=work_xyz.device,
+                )
+                if coords_n3 is not None:
+                    tree_coords = coords_n3.view(1, -1, 3).contiguous()
+                    # ============================================================
+                    # Phase5修正:
+                    # prebuilt_subtree_tree / full_cloud canonical 経路では、
+                    # local xyz 再量子化ではなく、prebuilt global_voxel_coords から
+                    # quant_stats を作る。
+                    # これを作らないと後段の quant_merge 参照で
+                    # UnboundLocalError になる。
+                    # ============================================================
+                    quant_stats = self._quantized_voxel_stats_from_tree(
+                        work_xyz,
+                        tree_coords,
+                        qs_override,
+                        snap_delta_norm,
+                    )
+
+                    source_tree_for_point_key = (
+                        subtree_tree
+                        if isinstance(subtree_tree, dict)
+                        else full_octree_context
+                    )
+
+                    point_feature_voxel_key = self._tree_tensor(
+                        source_tree_for_point_key,
+                        "global_morton_keys",
+                        work_xyz.device,
+                        dtype=torch.long,
+                    )
+
+                    if point_feature_voxel_key is not None:
+                        point_feature_voxel_key = self._fit_point_rows(
+                            point_feature_voxel_key.reshape(-1, 1),
+                            work_xyz.shape[-1],
+                        ).reshape(1, -1).to(
+                            device=work_xyz.device,
+                            dtype=torch.long,
+                        )
+        source_tree_for_key = subtree_tree if isinstance(subtree_tree, dict) else full_octree_context
+        structural_voxel_key = None
+        phase4_structural_key_source = "missing"
+        raw_structural_key = None
+
+        if prebuilt_ctx is not None and isinstance(source_tree_for_key, dict):
+            raw_structural_key = self._tree_tensor(
+                source_tree_for_key,
+                "global_morton_keys",
+                pts_xyz.device,
+                dtype=torch.long,
+            )
+
+            if raw_structural_key is not None and raw_structural_key.numel() > 0:
+                structural_voxel_key = self._fit_point_rows(
+                    raw_structural_key.reshape(-1, 1),
+                    pts_xyz.shape[-1],
+                ).reshape(1, -1).to(device=pts_xyz.device, dtype=torch.long)
+                phase4_structural_key_source = "global_morton_keys"
+
+            if structural_voxel_key is None:
+                raw_coords_for_key = self._tree_tensor(
+                    source_tree_for_key,
+                    "global_voxel_coords",
+                    pts_xyz.device,
+                    dtype=torch.long,
+                )
+
+                coords_n3_for_key = self._normalize_global_coords_n3(
+                    raw_coords_for_key,
+                    point_count=pts_xyz.shape[-1],
+                    device=pts_xyz.device,
+                )
+
+                structural_voxel_key = self._stable_voxel_keys_from_coords_n3(
+                    coords_n3_for_key
+                )
+
+                if structural_voxel_key is not None:
+                    structural_voxel_key = structural_voxel_key.to(
+                        device=pts_xyz.device,
+                        dtype=torch.long,
+                    )
+                    phase4_structural_key_source = "global_voxel_coords_hash"
         else:
             if prebuilt_required:
                 raise ValueError("prebuilt_subtree_tree mode requires _quantized_voxel_stats_from_tree().")
@@ -721,7 +953,50 @@ class OctreeStructureAnalysis(nn.Module):
             point_feature_voxel_key=point_feature_voxel_key,
             prebuilt_ctx=prebuilt_ctx,
         )
+        source_tree_for_key = subtree_tree if isinstance(subtree_tree, dict) else full_octree_context
+        structural_voxel_key = None
+        phase4_structural_key_source = "missing"
+        raw_structural_key = None
 
+        if prebuilt_ctx is not None and isinstance(source_tree_for_key, dict):
+            raw_structural_key = self._tree_tensor(
+                source_tree_for_key,
+                "global_morton_keys",
+                pts_xyz.device,
+                dtype=torch.long,
+            )
+
+            if raw_structural_key is not None and raw_structural_key.numel() > 0:
+                structural_voxel_key = self._fit_point_rows(
+                    raw_structural_key.reshape(-1, 1),
+                    pts_xyz.shape[-1],
+                ).reshape(1, -1).to(device=pts_xyz.device, dtype=torch.long)
+                phase4_structural_key_source = "global_morton_keys"
+
+            if structural_voxel_key is None:
+                raw_coords_for_key = self._tree_tensor(
+                    source_tree_for_key,
+                    "global_voxel_coords",
+                    pts_xyz.device,
+                    dtype=torch.long,
+                )
+
+                coords_n3_for_key = self._normalize_global_coords_n3(
+                    raw_coords_for_key,
+                    point_count=pts_xyz.shape[-1],
+                    device=pts_xyz.device,
+                )
+
+                structural_voxel_key = self._stable_voxel_keys_from_coords_n3(
+                    coords_n3_for_key
+                )
+
+                if structural_voxel_key is not None:
+                    structural_voxel_key = structural_voxel_key.to(
+                        device=pts_xyz.device,
+                        dtype=torch.long,
+                    )
+                    phase4_structural_key_source = "global_voxel_coords_hash"
         return {
             "features": feature.to(dtype=input_dtype),
             "cause_targets": cause_targets.to(dtype=input_dtype),
@@ -745,9 +1020,8 @@ class OctreeStructureAnalysis(nn.Module):
             "structural_voxel_mode": "global_context" if prebuilt_ctx is not None else "local_recomputed",
             "point_feature_voxel_mode": "global_context" if prebuilt_ctx is not None else "local_xyz",
             "local_recomputed": prebuilt_ctx is None,
-            "structural_voxel_key": self._tree_tensor(subtree_tree, "global_morton_keys", pts_xyz.device, dtype=torch.long)
-            if prebuilt_ctx is not None
-            else None,
+            "phase4_structural_key_source": str(phase4_structural_key_source),
+            "structural_voxel_key": structural_voxel_key,
             "point_feature_voxel_key": point_feature_voxel_key,
             "node_voxel_desc": node_voxel_desc,
         }

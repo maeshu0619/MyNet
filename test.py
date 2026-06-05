@@ -22,6 +22,7 @@ from models.utils.pointcloud.voxel_collision import (
 )
 from models.utils.pointcloud.utils_repkpu import rearrange
 from models.utils.pointcloud.utils_repkpu import configure_knn_backend
+from models.utils.pointcloud.sparsepcgc_voxel import restore_points_from_voxel_coords
 import models.network as network_module
 from models.utils.testing.utils import (
     _adapt_encoder_state_dict_for_sparse_input,
@@ -151,6 +152,8 @@ def _csv_fields():
         "step",
         "input_path",
         "output_path",
+        "voxel_restored_output_path",
+        "voxel_restored_output_status",
         "inference_mode",
         "input_points",
         "output_points",
@@ -229,6 +232,93 @@ def _write_average_table(rows, writer):
 def _output_point_path(args, step, input_path):
     output_dir = Path(os.path.abspath(os.path.expanduser(args.save_ply_dir)))
     return output_dir / f"{step:04d}_Mine.ply"
+
+def _output_voxel_restored_point_path(args, step, input_path):
+    output_dir = Path(os.path.abspath(os.path.expanduser(args.save_ply_dir)))
+    suffix = str(getattr(args, "voxel_restored_output_suffix", "_voxel_restored"))
+    return output_dir / f"{step:04d}_Mine{suffix}.ply"
+
+
+def _save_voxel_restored_output_points(args, step, input_path, model, fallback_dtype=torch.float32):
+    """
+    Phase7-5:
+    test/inference時に、model.last_actuator_voxel_state['final_voxel_coords'] から復元した点群を別名で保存する。
+    既存の _save_output_points は変更しない。
+    """
+    if not bool(getattr(args, "save_voxel_restored_output", False)):
+        return "", "disabled"
+
+    base_model = model.module if hasattr(model, "module") else model
+    voxel_state = getattr(base_model, "last_actuator_voxel_state", None)
+    require_state = bool(getattr(args, "voxel_restored_output_require_state", False))
+
+    def _fallback(reason):
+        if require_state:
+            raise RuntimeError(f"VoxelRestoredOutput: {reason}")
+        return "", reason
+
+    if not isinstance(voxel_state, dict):
+        return _fallback("last_actuator_voxel_state_missing")
+
+    final_voxel_coords = voxel_state.get("final_voxel_coords", None)
+    if not torch.is_tensor(final_voxel_coords):
+        return _fallback("final_voxel_coords_missing")
+
+    if final_voxel_coords.ndim != 3:
+        return _fallback(f"invalid_final_voxel_coords_shape={tuple(final_voxel_coords.shape)}")
+
+    if final_voxel_coords.shape[1] != 3 and final_voxel_coords.shape[-1] == 3:
+        final_voxel_coords = final_voxel_coords.permute(0, 2, 1).contiguous()
+
+    if final_voxel_coords.shape[1] != 3:
+        return _fallback(f"invalid_final_voxel_coords_shape={tuple(final_voxel_coords.shape)}")
+
+    final_voxel_valid_mask = voxel_state.get("final_voxel_valid_mask", None)
+    coords = final_voxel_coords.detach().to(dtype=torch.long)
+
+    if torch.is_tensor(final_voxel_valid_mask):
+        valid_mask = final_voxel_valid_mask.detach().to(device=coords.device, dtype=torch.bool)
+        if valid_mask.ndim == 3:
+            valid_mask = valid_mask.squeeze(1)
+    else:
+        valid_mask = torch.ones((coords.shape[0], coords.shape[-1]), device=coords.device, dtype=torch.bool)
+
+    if coords.shape[0] != 1:
+        return _fallback(f"batch_size_not_supported_for_single_ply={coords.shape[0]}")
+
+    coords_b = coords[0:1, :, valid_mask[0]]
+    if coords_b.shape[-1] <= 0:
+        return _fallback("empty_valid_final_voxel_coords")
+
+    meta = {}
+    voxel_step = voxel_state.get("voxel_step", None)
+    voxel_offset = voxel_state.get("voxel_offset", None)
+    if torch.is_tensor(voxel_step):
+        meta["effective_qs_tensor"] = voxel_step.detach()[0:1].to(device=coords_b.device, dtype=fallback_dtype)
+        meta["global_qs"] = meta["effective_qs_tensor"]
+    if torch.is_tensor(voxel_offset):
+        meta["global_offset_tensor"] = voxel_offset.detach()[0:1].to(device=coords_b.device, dtype=fallback_dtype)
+        meta["global_offset"] = meta["global_offset_tensor"]
+
+    restored_xyz, restore_info = restore_points_from_voxel_coords(
+        coords_b,
+        meta=meta if meta else None,
+        args=args,
+        center=bool(getattr(args, "sparsepcgc_dequantize_center", False)),
+        unique=True,
+        dtype=fallback_dtype,
+        device=coords_b.device,
+    )
+
+    output_path = _output_voxel_restored_point_path(args, step, input_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    xyz = restored_xyz.squeeze(0).transpose(0, 1).detach().cpu().numpy().astype(np.float32)
+    ok = write_ply(str(output_path), [xyz], ["x", "y", "z"])
+    if not ok:
+        raise RuntimeError(f"write_ply returned False: {output_path}")
+
+    return str(output_path), f"saved points={int(restore_info.get('restore_output_points', xyz.shape[0]))}"
 
 def _save_output_points(args, step, input_path, gen_pts):
     if not bool(getattr(args, "save_test_ply", False)):
@@ -540,6 +630,21 @@ def test(model, args, writer):
 
             save_start = time.perf_counter()
             output_path = _save_output_points(args, step, input_path, gen_pts)
+            voxel_restored_output_path = ""
+            voxel_restored_output_status = "disabled"
+            if bool(getattr(args, "save_voxel_restored_output", False)):
+                voxel_restored_output_path, voxel_restored_output_status = _save_voxel_restored_output_points(
+                    args,
+                    step,
+                    input_path,
+                    model,
+                    fallback_dtype=gen_pts.dtype,
+                )
+                writer.write(
+                    "VoxelRestoredOutput: "
+                    f"path={voxel_restored_output_path or 'none'}, "
+                    f"status={voxel_restored_output_status}"
+                )
             save_time = time.perf_counter() - save_start
             total_inference_time = time.perf_counter() - sample_start
             saved_ply_xyz = None
@@ -560,6 +665,8 @@ def test(model, args, writer):
                 "step": step + 1,
                 "input_path": input_path,
                 "output_path": output_path,
+                "voxel_restored_output_path": voxel_restored_output_path,
+                "voxel_restored_output_status": voxel_restored_output_status,
                 "inference_mode": inference_result.get("mode", requested_mode),
                 "input_points": input_points,
                 "output_points": output_points,

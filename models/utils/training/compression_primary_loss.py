@@ -105,6 +105,40 @@ def build_compression_primary_loss(
     L_full_context_subtree_delta = as_scalar_loss_tensor(
         terms.get("full_context_subtree_delta", None)
     )
+    L_full_cloud_actual_correction = as_scalar_loss_tensor(
+        terms.get("full_cloud_actual_correction", None)
+    )
+
+    full_cloud_correction_cp_weight = max(
+        float(getattr(args, "cp_full_cloud_actual_correction_weight", 1.0)),
+        0.0,
+    )
+
+    if L_full_cloud_actual_correction is not None:
+        L_full_cloud_actual_correction = torch.nan_to_num(
+            L_full_cloud_actual_correction,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+    # ============================================================
+    # Phase3:
+    # full-context subtree delta を compression primary の主勾配として扱う。
+    # 既存の full_context_subtree_loss_weight は loss生成側の内部重みなので、
+    # ここでは compression primary へ混ぜる外側の重みを別に持つ。
+    # ============================================================
+    full_context_cp_weight = max(
+        float(getattr(args, "cp_full_context_subtree_delta_weight", 1.0)),
+        0.0,
+    )
+
+    if L_full_context_subtree_delta is not None:
+        L_full_context_subtree_delta = torch.nan_to_num(
+            L_full_context_subtree_delta,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
 
     P_geom = relu_penalty(as_scalar_loss_tensor(L_geom), getattr(args, "cp_tau_geom", 0.06))
     P_single = relu_penalty(L_single, getattr(args, "cp_tau_single", 0.0)) if L_single is not None else zero
@@ -144,9 +178,14 @@ def build_compression_primary_loss(
         + sf_repair * float(getattr(args, "cp_lambda_actuator", 0.1)) * P_actuator
         + sf_repair * float(getattr(args, "cp_lambda_op", 0.0)) * P_op
         + sf_com * single_delta_penalty_weight * single_delta_penalty
-        + sf_com * (
+        + sf_com * full_context_cp_weight * (
             L_full_context_subtree_delta
             if L_full_context_subtree_delta is not None
+            else zero
+        )
+        + sf_com * full_cloud_correction_cp_weight * (
+            L_full_cloud_actual_correction
+            if L_full_cloud_actual_correction is not None
             else zero
         )
     )
@@ -167,6 +206,22 @@ def build_compression_primary_loss(
             L_full_context_subtree_delta if L_full_context_subtree_delta is not None else zero,
             0.0,
         ),
+        "cp_full_context_subtree_delta_weight": float(full_context_cp_weight),
+        "cp_full_context_subtree_delta_added": bool(L_full_context_subtree_delta is not None),
+        "cp_full_cloud_actual_correction": case_float(
+            L_full_cloud_actual_correction
+            if L_full_cloud_actual_correction is not None
+            else zero,
+            0.0,
+        ),
+        "cp_full_cloud_actual_correction_weight": float(full_cloud_correction_cp_weight),
+        "cp_full_cloud_actual_correction_added": bool(L_full_cloud_actual_correction is not None),
+        "cp_full_cloud_actual_correction_requires_grad": term_requires_grad(L_full_cloud_actual_correction),
+        "cp_full_cloud_actual_correction_used_for_backprop": bool(
+            L_full_cloud_actual_correction is not None
+            and term_requires_grad(L_full_cloud_actual_correction)
+            and full_cloud_correction_cp_weight > 0.0
+        ),
         "node_loss_weight_raw": float(node_weight_raw),
         "node_loss_weight_effective": float(node_weight_effective),
         "single_loss_weight_raw": float(single_weight_raw),
@@ -185,6 +240,11 @@ def build_compression_primary_loss(
         "cp_actuator_requires_grad": term_requires_grad(L_actuator),
         "cp_op_requires_grad": term_requires_grad(L_op),
         "cp_full_context_subtree_delta_requires_grad": term_requires_grad(L_full_context_subtree_delta),
+        "cp_full_context_subtree_delta_used_for_backprop": bool(
+            L_full_context_subtree_delta is not None
+            and term_requires_grad(L_full_context_subtree_delta)
+            and full_context_cp_weight > 0.0
+        ),
         "cp_main_finite": term_is_finite(L_com_main),
         "cp_geom_finite": term_is_finite(L_geom),
         "cp_single_finite": term_is_finite(L_single) if L_single is not None else True,

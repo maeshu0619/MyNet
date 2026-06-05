@@ -312,9 +312,74 @@ class CompressionLossMixin:
             return debug
         start = time.time()
         debug.update(self._sparsepcgc_debug_metrics(args, gen_xyz=gen_xyz, gt_xyz=gt_xyz, final_w=final_w))
+
+        voxel_state = self._get_actuator_voxel_state(args, gen_xyz.device)
+
+        debug["sparsepcgc_debug_uses_same_voxel_state_as_actual"] = bool(
+            voxel_state is not None
+            and bool(debug.get("actual_uses_actuator_voxel_state", False))
+        )
+        debug["sparsepcgc_debug_voxel_state_available"] = bool(voxel_state is not None)
+        debug["sparsepcgc_debug_voxel_state_update_mode"] = (
+            str(voxel_state.get("final_voxel_update_mode", ""))
+            if voxel_state is not None
+            else ""
+        )
+        debug["sparsepcgc_debug_final_voxel_recomputed_from_pts_out"] = (
+            bool(voxel_state.get("final_voxel_recomputed_from_pts_out", True))
+            if voxel_state is not None
+            else True
+        )
+
         debug["sparsepcgc_debug_collected"] = True
         debug["sparsepcgc_debug_time"] = float(time.time() - start)
         return debug
+
+    def _build_sparsepcgc_exact_fallback_teacher_loss(
+        self,
+        args,
+        gen_xyz,
+        gt_xyz,
+        final_w,
+        stats_gen,
+        cached_gt,
+    ):
+        """
+        SparsePCGC exact occupancy candidate が無効な場合のfallback teacherを作る。
+
+        注意：
+        - SparsePCGC本体のactual bitは置き換えない。
+        - これはbackward用の近似teacherである。
+        - まずActuatorのfinal_voxel_coordsを使い、なければ既存soft auxへ落とす。
+        """
+        if not self._is_sparsepcgc_context(args, codec_name=stats_gen.get("codec", None)):
+            return gen_xyz.new_zeros(()), {
+                "sparsepcgc_exact_fallback_used": False,
+                "sparsepcgc_exact_fallback_reason": "not_sparsepcgc",
+                "sparsepcgc_exact_fallback_has_grad": False,
+            }
+
+        aux_terms = self._sparsepcgc_aux_feature_terms(
+            args,
+            gen_xyz=gen_xyz,
+            gt_xyz=gt_xyz,
+            final_w=final_w,
+        )
+
+        aux_loss = aux_terms.get("loss", None)
+        if torch.is_tensor(aux_loss) and aux_loss.requires_grad:
+            return aux_loss, {
+                "sparsepcgc_exact_fallback_used": True,
+                "sparsepcgc_exact_fallback_reason": "sparsepcgc_aux_feature_terms",
+                "sparsepcgc_exact_fallback_has_grad": True,
+            }
+
+        # 最後の保険：勾配がない場合は0を返す。
+        return gen_xyz.new_zeros(()), {
+            "sparsepcgc_exact_fallback_used": False,
+            "sparsepcgc_exact_fallback_reason": "no_grad_aux_available",
+            "sparsepcgc_exact_fallback_has_grad": False,
+        }
 
     def _sparsepcgc_aux_feature_terms(self, args, gen_xyz, gt_xyz, final_w, x_gen=None, x_ref=None):
         if not bool(getattr(args, "sparsepcgc_aux_loss", True)):
@@ -472,6 +537,10 @@ class CompressionLossMixin:
                 if hard_terms is not None
                 else density_gen.detach()
             ),
+            "sparsepcgc_aux_forward_uses_actuator_voxel_state": gen_xyz.new_tensor(
+                float(aux_hard_value_uses_actuator_voxel_state)
+            ).detach(),
+            "sparsepcgc_aux_backward_uses_soft_gen_xyz": gen_xyz.new_tensor(1.0).detach(),
         }
 
     def _get_cached_actual_gt(self, cache_key):
@@ -617,6 +686,44 @@ class CompressionLossMixin:
         exact_sparsepcgc_bits = sum(float(s.get("exact_bits_sparsepcgc_estimate_bitrate", 0.0)) for s in stats_list)
         exact_enabled = any("sparsepcgc_exact_estimated_bits" in s for s in stats_list)
         exact_last = next((s for s in reversed(stats_list) if "sparsepcgc_exact_estimated_bits" in s), {})
+        # ============================================================
+        # Phase2:
+        # actual_encoder.py が返した exact teacher valid 判定を
+        # batch集約後の result にも残す。
+        # これがないと _get_compression_loss_actual_codec() 側で
+        # exact_gen_valid / exact_gt_valid が常にFalseになりやすい。
+        # ============================================================
+        exact_valid_values = [
+            bool(s.get("sparsepcgc_exact_teacher_valid", False))
+            for s in stats_list
+            if "sparsepcgc_exact_estimated_bits" in s
+        ]
+
+        exact_invalid_reasons = [
+            str(s.get("sparsepcgc_exact_teacher_invalid_reason", ""))
+            for s in stats_list
+            if "sparsepcgc_exact_estimated_bits" in s
+            and str(s.get("sparsepcgc_exact_teacher_invalid_reason", "")).strip()
+        ]
+
+        exact_teacher_valid = bool(
+            exact_enabled
+            and exact_candidate_count > 0
+            and len(exact_valid_values) > 0
+            and all(exact_valid_values)
+            and np.isfinite(float(exact_estimated_bits))
+        )
+
+        exact_teacher_invalid_reason = ""
+        if exact_enabled and not exact_teacher_valid:
+            if exact_candidate_count <= 0:
+                exact_teacher_invalid_reason = "candidate_count_zero"
+            elif exact_invalid_reasons:
+                exact_teacher_invalid_reason = ";".join(exact_invalid_reasons[:4])
+            elif not np.isfinite(float(exact_estimated_bits)):
+                exact_teacher_invalid_reason = "bits_non_finite"
+            else:
+                exact_teacher_invalid_reason = "unknown"
 
         def _weighted_octree_stat(key):
             weighted = 0.0
@@ -713,6 +820,8 @@ class CompressionLossMixin:
                     "exact_bits_match": bool(exact_bits_abs_diff <= max(1e-5, abs(float(exact_sparsepcgc_bits)) * 1e-6)),
                     "exact_estimated_vs_actual_bit_gap": float(exact_actual_gap),
                     "exact_estimated_vs_actual_bit_gap_percent": float(exact_actual_gap_percent),
+                    "sparsepcgc_exact_teacher_valid": bool(exact_teacher_valid),
+                    "sparsepcgc_exact_teacher_invalid_reason": str(exact_teacher_invalid_reason),
                 }
             )
         return result
@@ -1091,14 +1200,48 @@ class CompressionLossMixin:
         full_octree_context=None,
         octree_input_mode="auto",
     ):
+        voxel_state = self._get_actuator_voxel_state(args, gen_xyz.device)
+        voxel_actual_debug = {}
+
         actual_xyz = gen_xyz if actual_gen_xyz is None else actual_gen_xyz
+        actual_final_w = final_w
+
+        if (
+            self._is_sparsepcgc_context(args)
+            and voxel_state is not None
+            and bool(getattr(args, "sparsepcgc_actual_use_actuator_voxel_state", True))
+        ):
+            restored_xyz, voxel_actual_debug = self._voxel_state_to_codec_xyz(
+                args,
+                voxel_state=voxel_state,
+                like_xyz=gen_xyz,
+            )
+            if restored_xyz is not None:
+                actual_xyz = restored_xyz
+                # final_voxel_coords はすでにoccupied voxel集合なので、
+                # point-wise final_w をさらに適用しない。
+                actual_final_w = None
+                try:
+                    setattr(args, "_current_actual_uses_voxel_restored", True)
+                except Exception:
+                    pass
+            else:
+                try:
+                    setattr(args, "_current_actual_uses_voxel_restored", False)
+                except Exception:
+                    pass
+        else:
+            try:
+                setattr(args, "_current_actual_uses_voxel_restored", False)
+            except Exception:
+                pass
         cached_gt = self._get_cached_actual_gt(cache_key)
         if cached_gt is None:
             cached_gt = self._encode_actual_batch(args, gt_xyz)
             self._store_cached_actual_gt(cache_key, cached_gt)
 
         # actual codec評価は評価指標なので、train用の量子化ノイズを入れないclean編集点群を使う。
-        stats_gen = self._encode_actual_batch(args, actual_xyz, final_w=final_w)
+        stats_gen = self._encode_actual_batch(args, actual_xyz, final_w=actual_final_w)
         codec_name = str(stats_gen.get("codec", cached_gt.get("codec", "octattention"))).strip().lower()
         backend_label = f"{codec_name}_actual_ste" if use_proxy_surrogate else f"{codec_name}_actual"
         gt_bit = float(cached_gt["bit"])
@@ -1115,7 +1258,7 @@ class CompressionLossMixin:
                 args,
                 gen_xyz=gen_xyz,
                 gt_xyz=gt_xyz,
-                final_w=final_w,
+                final_w=actual_final_w,
                 cache_key=cache_key,
                 run_grad_probe=False,
                 actual_gen_xyz=actual_xyz,
@@ -1141,7 +1284,23 @@ class CompressionLossMixin:
         loss_nodes = gen_xyz.new_tensor(
             self._relative_percent(float(stats_gen["node"]), float(cached_gt["node"]), ref_min=1.0)
         )
-        exact_available = "sparsepcgc_exact_estimated_bits" in stats_gen and "sparsepcgc_exact_estimated_bits" in cached_gt
+        exact_available_raw = (
+            "sparsepcgc_exact_estimated_bits" in stats_gen
+            and "sparsepcgc_exact_estimated_bits" in cached_gt
+        )
+
+        exact_gen_valid = bool(stats_gen.get("sparsepcgc_exact_teacher_valid", False))
+        exact_gt_valid = bool(cached_gt.get("sparsepcgc_exact_teacher_valid", False))
+
+        exact_available = bool(exact_available_raw and exact_gen_valid and exact_gt_valid)
+
+        exact_invalid_reason = ""
+        if exact_available_raw and not exact_available:
+            exact_invalid_reason = (
+                f"gen={stats_gen.get('sparsepcgc_exact_teacher_invalid_reason', '')};"
+                f"gt={cached_gt.get('sparsepcgc_exact_teacher_invalid_reason', '')}"
+            )
+
         exact_nll_delta = float("nan")
         exact_bits_delta = float("nan")
         exact_bpp_delta = float("nan")
@@ -1160,6 +1319,11 @@ class CompressionLossMixin:
                 float(cached_gt.get("sparsepcgc_exact_estimated_bpp", 0.0)),
                 ref_min=1e-9,
             )
+
+            exact_loss_value = exact_bits_delta
+            exact_loss = gen_xyz.new_tensor(float(exact_loss_value))
+        else:
+            exact_loss = gen_xyz.new_zeros(())
         if exact_available and bool(getattr(args, "enable_sparsepcgc_exact_occupancy_loss", False)):
             exact_loss = exact_loss + gen_xyz.new_tensor(
                 float(getattr(args, "sparsepcgc_exact_occupancy_loss_weight", 0.0)) * exact_nll_delta
@@ -1167,7 +1331,62 @@ class CompressionLossMixin:
             exact_loss = exact_loss + gen_xyz.new_tensor(
                 float(getattr(args, "sparsepcgc_exact_bits_loss_weight", 0.0)) * exact_bits_delta
             )
-            L_com = L_com + exact_loss
+
+        exact_teacher_weight = float(getattr(args, "sparsepcgc_exact_teacher_loss_weight", 0.0))
+        exact_teacher_grad_weight = float(getattr(args, "sparsepcgc_exact_teacher_grad_weight", 1.0))
+        exact_fallback_weight = float(getattr(args, "sparsepcgc_exact_fallback_weight", 0.2))
+
+        exact_teacher_loss_for_backprop = gen_xyz.new_zeros(())
+        exact_teacher_used_for_backprop = False
+        exact_fallback_debug = {}
+
+        if exact_teacher_weight > 0.0:
+            if exact_available:
+                fallback_proxy, exact_fallback_debug = self._build_sparsepcgc_exact_fallback_teacher_loss(
+                    args=args,
+                    gen_xyz=gen_xyz,
+                    gt_xyz=gt_xyz,
+                    final_w=final_w,
+                    stats_gen=stats_gen,
+                    cached_gt=cached_gt,
+                )
+
+                # forward値はSparsePCGC exact hard delta。
+                # backwardはfallback_proxyへ流す。
+                if torch.is_tensor(fallback_proxy) and fallback_proxy.requires_grad:
+                    exact_teacher_loss_for_backprop = exact_teacher_weight * (
+                        exact_loss.detach()
+                        + exact_teacher_grad_weight * (fallback_proxy - fallback_proxy.detach())
+                    )
+                    exact_teacher_used_for_backprop = True
+                else:
+                    exact_teacher_loss_for_backprop = exact_teacher_weight * exact_loss.detach()
+                    exact_teacher_used_for_backprop = False
+
+            else:
+                fallback_proxy, exact_fallback_debug = self._build_sparsepcgc_exact_fallback_teacher_loss(
+                    args=args,
+                    gen_xyz=gen_xyz,
+                    gt_xyz=gt_xyz,
+                    final_w=final_w,
+                    stats_gen=stats_gen,
+                    cached_gt=cached_gt,
+                )
+
+                if torch.is_tensor(fallback_proxy) and fallback_proxy.requires_grad:
+                    exact_teacher_loss_for_backprop = exact_fallback_weight * fallback_proxy
+                    exact_teacher_used_for_backprop = True
+                else:
+                    exact_teacher_loss_for_backprop = gen_xyz.new_zeros(())
+                    exact_teacher_used_for_backprop = False
+
+        # ============================================================
+        # Phase2:
+        # exact / fallback teacher を L_com へ接続する。
+        # ============================================================
+        if torch.is_tensor(exact_teacher_loss_for_backprop):
+            L_com = L_com + exact_teacher_loss_for_backprop
+
         self._store_compression_terms(
             main=L_com,
             bit=L_com_hard,
@@ -1176,13 +1395,50 @@ class CompressionLossMixin:
             bpn=gen_xyz.new_zeros(()),
             objective=L_com,
             sparsepcgc_exact=exact_loss,
+            sparsepcgc_exact_teacher=exact_teacher_loss_for_backprop,
             backend=backend_label,
         )
+
         self.last_compression_debug = {
+            "actual_uses_actuator_voxel_state": bool(
+                voxel_state is not None
+                and voxel_actual_debug.get("voxel_state_codec_xyz_used", False)
+            ),
+            "actual_voxel_state_reason": str(
+                voxel_actual_debug.get("voxel_state_codec_xyz_reason", "")
+            ),
+            "actual_voxel_state_points": int(
+                voxel_actual_debug.get("voxel_state_codec_xyz_points", 0)
+            ),
+            "actual_voxel_state_final_voxel_coords_count": int(
+                voxel_actual_debug.get("voxel_state_final_voxel_coords_count", 0)
+            ),
+            "actual_voxel_state_update_mode": str(
+                voxel_actual_debug.get("voxel_state_final_voxel_update_mode", "")
+            ),
+            "actual_voxel_state_recomputed_from_pts_out": bool(
+                voxel_actual_debug.get("voxel_state_final_voxel_recomputed_from_pts_out", True)
+            ),
+            "actual_final_w_source": "none_voxel_state_already_occupied" if actual_final_w is None else "point_final_w",
             "metric": "actual_total_bit_percent",
             "teacher_codec": codec_name,
             "total_bit": loss_bit_percent,
             "bpp": self._relative_percent(float(stats_gen["bpp"]), float(cached_gt["bpp"])),
+            "actual_scope": str(getattr(args, "_current_teacher_scope", "")),
+            "actual_input_source": (
+                "actuator_final_voxel_coords"
+                if bool(getattr(args, "_current_actual_uses_voxel_restored", False))
+                else "gen_xyz_or_actual_gen_xyz"
+            ),
+            "actual_used_voxel_restored_points": bool(getattr(args, "_current_actual_uses_voxel_restored", False)),
+            "actual_input_points": int(stats_gen.get("point_count", 0)),
+            "actual_total_bits": gen_bit,
+            "actual_bpp": float(stats_gen.get("bpp", 0.0)),
+            "actual_delta_percent": loss_bit_percent,
+            "actual_occupancy_nll": float(stats_gen.get("octree_occupancy_nll", 0.0)),
+            "actual_node_count": float(stats_gen.get("node", 0.0)),
+            "actual_single_child_count": float(stats_gen.get("single", 0.0)),
+            "actual_lowprob_count": float(stats_gen.get("octree_lowprob_occupancy_count", 0.0)),
             "gt_points": int(cached_gt["point_count"]),
             "gen_points": int(stats_gen["point_count"]),
             "gt_unique_coord_count": int(cached_gt.get("unique_coord_count", cached_gt.get("point_count", 0))),
@@ -1202,6 +1458,17 @@ class CompressionLossMixin:
             "sparsepcgc_exact_estimated_bits_delta": exact_bits_delta,
             "sparsepcgc_exact_bpp_delta": exact_bpp_delta,
             "sparsepcgc_exact_loss_candidate": self._scalar(exact_loss),
+            # Phase2: SparsePCGC exact / fallback teacher の状態
+            "sparsepcgc_exact_available_raw": bool(exact_available_raw),
+            "sparsepcgc_exact_available": bool(exact_available),
+            "sparsepcgc_exact_gen_valid": bool(exact_gen_valid),
+            "sparsepcgc_exact_gt_valid": bool(exact_gt_valid),
+            "sparsepcgc_exact_invalid_reason": str(exact_invalid_reason),
+            "sparsepcgc_exact_teacher_loss_weight": float(exact_teacher_weight),
+            "sparsepcgc_exact_teacher_grad_weight": float(exact_teacher_grad_weight),
+            "sparsepcgc_exact_fallback_weight": float(exact_fallback_weight),
+            "sparsepcgc_exact_teacher_used_for_backprop": bool(exact_teacher_used_for_backprop),
+            "sparsepcgc_exact_teacher_loss_for_backprop": self._scalar(exact_teacher_loss_for_backprop),
             "sparsepcgc_exact_loss_enabled": bool(
                 exact_available and getattr(args, "enable_sparsepcgc_exact_occupancy_loss", False)
             ),
@@ -1209,6 +1476,8 @@ class CompressionLossMixin:
                 self._get_actuator_voxel_state(args, gen_xyz.device) is not None
             ),
         }
+        self.last_compression_debug.update(exact_fallback_debug)
+
         if codec_name == "sparsepcgc":
             proxy_bit_percent = float(proxy_debug["loss_bit"]) if proxy_debug is not None else float("nan")
             self.last_compression_debug.update(
@@ -1273,11 +1542,154 @@ class CompressionLossMixin:
 
         out = dict(voxel_state)
         if device is not None:
-            for key in ("initial_voxel_coords", "final_voxel_coords", "final_voxel_weights", "voxel_step", "voxel_offset"):
+            for key in (
+                "initial_voxel_coords",
+                "final_voxel_coords",
+                "final_voxel_weights",
+                "final_voxel_valid_mask",
+                "voxel_step",
+                "voxel_offset",
+                "point_aligned_initial_voxel_coords",
+                "point_aligned_final_voxel_coords",
+                "point_aligned_final_voxel_weights",
+                "voxel_soft_drop_score",
+                "voxel_soft_add_score",
+                "voxel_soft_move_score",
+                "voxel_soft_drop_amount",
+                "voxel_soft_add_amount",
+                "voxel_soft_move_amount",
+                "drop_ratio_soft",
+                "add_ratio_soft",
+                "move_ratio_soft",
+            ):
                 value = out.get(key, None)
                 if torch.is_tensor(value):
                     out[key] = value.to(device=device, non_blocking=True)
         return out
+
+    def _voxel_state_to_codec_xyz(self, args, voxel_state, like_xyz):
+        """
+        Actuatorが作ったoccupied voxel stateを、actual codecへ渡す点群に変換する。
+        目的は、actual SparsePCGC / proxy / full-context loss / debug metric が
+        同じ final_voxel_coords を見るようにすることである。
+
+        注意：
+        final_voxel_coords は [B, 3, N] のglobal voxel coordsである。
+        voxel_step / voxel_offset があれば、それを使って点座標へ戻す。
+        なければ coords 自体をfloat座標として使う。
+        """
+        if not isinstance(voxel_state, dict):
+            return None, {
+                "voxel_state_codec_xyz_used": False,
+                "voxel_state_codec_xyz_reason": "missing_voxel_state",
+            }
+
+        coords = voxel_state.get("final_voxel_coords", None)
+        valid_mask = voxel_state.get("final_voxel_valid_mask", None)
+        voxel_step = voxel_state.get("voxel_step", None)
+        voxel_offset = voxel_state.get("voxel_offset", None)
+
+        if coords is None or not torch.is_tensor(coords):
+            return None, {
+                "voxel_state_codec_xyz_used": False,
+                "voxel_state_codec_xyz_reason": "missing_final_voxel_coords",
+            }
+
+        coords = coords.to(device=like_xyz.device, dtype=torch.long)
+
+        if coords.ndim == 2:
+            if coords.shape[0] == 3:
+                coords = coords.unsqueeze(0)
+            elif coords.shape[1] == 3:
+                coords = coords.transpose(0, 1).contiguous().unsqueeze(0)
+            else:
+                return None, {
+                    "voxel_state_codec_xyz_used": False,
+                    "voxel_state_codec_xyz_reason": "invalid_final_voxel_coords_shape",
+                }
+        elif coords.ndim == 3:
+            if coords.shape[1] == 3:
+                coords = coords.contiguous()
+            elif coords.shape[2] == 3:
+                coords = coords.permute(0, 2, 1).contiguous()
+            else:
+                return None, {
+                    "voxel_state_codec_xyz_used": False,
+                    "voxel_state_codec_xyz_reason": "invalid_final_voxel_coords_shape",
+                }
+        else:
+            return None, {
+                "voxel_state_codec_xyz_used": False,
+                "voxel_state_codec_xyz_reason": "invalid_final_voxel_coords_ndim",
+            }
+
+        B = coords.shape[0]
+
+        if valid_mask is not None and torch.is_tensor(valid_mask):
+            valid_mask = valid_mask.to(device=coords.device, dtype=torch.bool)
+            if valid_mask.ndim == 3:
+                valid_mask = valid_mask.squeeze(1)
+            if valid_mask.ndim == 1:
+                valid_mask = valid_mask.view(1, -1)
+            if valid_mask.shape[0] == 1 and B > 1:
+                valid_mask = valid_mask.expand(B, -1)
+            if valid_mask.shape[0] != B or valid_mask.shape[1] != coords.shape[2]:
+                valid_mask = None
+
+        if voxel_step is not None and torch.is_tensor(voxel_step):
+            step = voxel_step.to(device=like_xyz.device, dtype=like_xyz.dtype)
+            if step.ndim == 0:
+                step = step.view(1, 1, 1)
+            elif step.ndim == 1:
+                step = step.view(-1, 1, 1)
+            elif step.ndim == 2:
+                step = step.view(step.shape[0], 1, 1)
+            elif step.ndim == 3:
+                step = step[:, :1, :1]
+            if step.shape[0] == 1 and B > 1:
+                step = step.expand(B, -1, -1)
+        else:
+            step = like_xyz.new_ones((B, 1, 1))
+
+        if voxel_offset is not None and torch.is_tensor(voxel_offset):
+            offset = voxel_offset.to(device=like_xyz.device, dtype=like_xyz.dtype)
+            if offset.ndim == 1 and offset.numel() == 3:
+                offset = offset.view(1, 3, 1)
+            elif offset.ndim == 2 and offset.shape[-1] == 3:
+                offset = offset.view(-1, 3, 1)
+            elif offset.ndim == 2 and offset.shape[0] == 3:
+                offset = offset.unsqueeze(0)
+            elif offset.ndim == 3 and offset.shape[1] == 3:
+                offset = offset[:, :, :1]
+            else:
+                offset = like_xyz.new_zeros((B, 3, 1))
+            if offset.shape[0] == 1 and B > 1:
+                offset = offset.expand(B, -1, -1)
+        else:
+            offset = like_xyz.new_zeros((B, 3, 1))
+
+        xyz = offset + coords.to(dtype=like_xyz.dtype) * step
+
+        # actual encoderはbatch内で可変長を扱うため、paddingは避ける。
+        # ただし既存 _encode_actual_batch は [B,3,N] を想定するので、
+        # B=1ではmaskで切り、B>1ではvalid_maskをfinal_w扱いにする。
+        if valid_mask is not None and B == 1:
+            xyz = xyz[:, :, valid_mask[0]]
+
+        debug = {
+            "voxel_state_codec_xyz_used": True,
+            "voxel_state_codec_xyz_reason": "ok",
+            "voxel_state_codec_xyz_points": int(xyz.shape[-1]),
+            "voxel_state_codec_xyz_batch": int(xyz.shape[0]),
+            "voxel_state_final_voxel_coords_count": int(coords.shape[-1]),
+            "voxel_state_has_valid_mask": bool(valid_mask is not None),
+            "voxel_state_final_voxel_update_mode": str(voxel_state.get("final_voxel_update_mode", "")),
+            "voxel_state_final_voxel_recomputed_from_pts_out": bool(
+                voxel_state.get("final_voxel_recomputed_from_pts_out", True)
+            ),
+            "voxel_state_actuator_voxel_mode": str(voxel_state.get("actuator_voxel_mode", "")),
+        }
+        return xyz.contiguous(), debug
 
     def get_compression_loss(
         self,
