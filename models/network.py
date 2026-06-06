@@ -327,6 +327,69 @@ class Network(nn.Module):
                 return dict_obj.get(key)
         return None
 
+    @staticmethod
+    def _child_slot_from_coords_lastdim(coords):
+        coords = coords.to(dtype=torch.long)
+        return (
+            coords[..., 0].remainder(2)
+            + 2 * coords[..., 1].remainder(2)
+            + 4 * coords[..., 2].remainder(2)
+        ).to(dtype=torch.long)
+
+    def _parent_occupancy_codes_and_child_slots(self, coords_b3n):
+        B, _, N = coords_b3n.shape
+        parent_codes = torch.zeros((B, N), device=coords_b3n.device, dtype=torch.long)
+        child_slots = torch.zeros((B, N), device=coords_b3n.device, dtype=torch.long)
+        for b in range(B):
+            coords = coords_b3n[b].transpose(0, 1).contiguous().to(dtype=torch.long)
+            if coords.numel() == 0:
+                continue
+            parents = torch.div(coords, 2, rounding_mode="floor")
+            slots = self._child_slot_from_coords_lastdim(coords)
+            child_slots[b] = slots
+            unique_parents, inverse = torch.unique(parents, dim=0, sorted=True, return_inverse=True)
+            codes = torch.zeros((unique_parents.shape[0],), device=coords_b3n.device, dtype=torch.long)
+            for slot in range(8):
+                mask = slots == slot
+                if bool(mask.any().item()):
+                    parent_ids = torch.unique(inverse[mask], sorted=False)
+                    bit = codes.new_full((parent_ids.numel(),), 1 << slot)
+                    codes[parent_ids] = torch.bitwise_or(codes[parent_ids], bit)
+            parent_codes[b] = codes.index_select(0, inverse)
+        return parent_codes, child_slots
+
+    def _occupancy_code_popularity_for_features(self, like_tensor, *contexts):
+        parts = []
+
+        def _add_codes(ctx, key, weight=1.0):
+            if not isinstance(ctx, dict) or key not in ctx:
+                return
+            value = ctx.get(key, None)
+            if value is None:
+                return
+            if not torch.is_tensor(value):
+                value = torch.as_tensor(value)
+            value = value.to(device=like_tensor.device, dtype=torch.long).reshape(-1)
+            value = value[(value >= 0) & (value < 256)]
+            if value.numel() <= 0:
+                return
+            repeat = max(int(round(float(weight))), 1)
+            parts.append(value.repeat(repeat))
+
+        for ctx in contexts:
+            _add_codes(ctx, "occupancy_codes", weight=3.0)
+            _add_codes(ctx, "ancestor_occupancy_codes", weight=2.0)
+            _add_codes(ctx, "sibling_occupancy_codes", weight=2.0)
+            _add_codes(ctx, "parent_occupancy_code", weight=2.0)
+
+        smoothing = max(float(getattr(self.args, "repair_pattern_prior_smoothing", 1.0)), 0.0)
+        counts = like_tensor.new_ones((256,), dtype=torch.float32) * smoothing
+        if parts:
+            codes = torch.cat(parts, dim=0)
+            counts.scatter_add_(0, codes, torch.ones_like(codes, dtype=counts.dtype))
+        popularity = torch.log1p(counts)
+        return popularity / popularity.amax().clamp_min(1e-6)
+
     def _fit_feature_channels(self, feature, target_channels):
         if feature.shape[1] == int(target_channels):
             return feature
@@ -339,7 +402,14 @@ class Network(nn.Module):
         )
         return torch.cat([feature, pad], dim=1).contiguous()
 
-    def _build_node_features_from_voxel_coords(self, coords_b3n, pts_xyz, node_mask=None):
+    def _build_node_features_from_voxel_coords(
+        self,
+        coords_b3n,
+        pts_xyz,
+        node_mask=None,
+        subtree_tree=None,
+        full_octree_context=None,
+    ):
         coords_f = coords_b3n.to(device=pts_xyz.device, dtype=pts_xyz.dtype)
         if coords_f.shape[-1] <= 0:
             return pts_xyz.new_zeros((pts_xyz.shape[0], int(getattr(self.args, "fused_feat_dim", getattr(self.args, "out_dim", 64))), 0))
@@ -363,6 +433,24 @@ class Network(nn.Module):
         depth_proxy = torch.linalg.norm(coords_f - coords_f.amin(dim=2, keepdim=True), dim=1, keepdim=True)
         depth_proxy = depth_proxy / depth_proxy.amax(dim=2, keepdim=True).clamp_min(1.0)
 
+        parent_codes, child_slots = self._parent_occupancy_codes_and_child_slots(coords_b3n)
+        slot_values = torch.arange(8, device=coords_b3n.device, dtype=torch.long).view(1, 8, 1)
+        child_slot_onehot = (child_slots.unsqueeze(1) == slot_values).to(dtype=pts_xyz.dtype)
+        parent_code_feature = (parent_codes.to(dtype=pts_xyz.dtype).unsqueeze(1) / 255.0) * 2.0 - 1.0
+        child_count = torch.zeros_like(parent_codes, dtype=pts_xyz.dtype)
+        for bit in range(8):
+            child_count = child_count + ((parent_codes >> bit) & 1).to(dtype=pts_xyz.dtype)
+        child_count = (child_count.unsqueeze(1) / 8.0).clamp(0.0, 1.0)
+        code_popularity = self._occupancy_code_popularity_for_features(
+            pts_xyz,
+            subtree_tree,
+            full_octree_context,
+        )
+        parent_popularity = code_popularity.index_select(
+            0,
+            parent_codes.reshape(-1).clamp(0, 255),
+        ).view(coords_b3n.shape[0], coords_b3n.shape[-1]).unsqueeze(1).to(dtype=pts_xyz.dtype)
+
         base_feature = torch.cat(
             [
                 norm,
@@ -370,6 +458,10 @@ class Network(nn.Module):
                 radius,
                 parity,
                 depth_proxy,
+                child_slot_onehot,
+                parent_code_feature,
+                child_count,
+                parent_popularity,
                 valid_f,
             ],
             dim=1,
@@ -520,6 +612,8 @@ class Network(nn.Module):
             voxel_coords,
             pts_xyz=pts_xyz,
             node_mask=node_mask,
+            subtree_tree=subtree_tree,
+            full_octree_context=full_octree_context,
         )
 
         debug.update(
@@ -1611,8 +1705,23 @@ class Network(nn.Module):
                 "structural_voxel_key": structure_b.get("structural_voxel_key") if structure_b is not None else None,
                 "point_feature_voxel_key": structure_b.get("point_feature_voxel_key") if structure_b is not None else None,
                 "occupancy_nll_proxy_full": torch.cat(occupancy_nll_proxy_full_list, dim=0),
-            }
 
+                # Section2:
+                # sparse pathでは最後に処理したstructure_bのsummaryをdebugとして持つ。
+                "leaf_pattern_available": bool(structure_b.get("leaf_pattern_available", False)) if structure_b is not None else False,
+                "leaf_pattern_source": str(structure_b.get("leaf_pattern_source", "none")) if structure_b is not None else "none",
+                "leaf_pattern_reason": str(structure_b.get("leaf_pattern_reason", "")) if structure_b is not None else "",
+                "leaf_unique_parent_count": int(structure_b.get("leaf_unique_parent_count", 0) or 0) if structure_b is not None else 0,
+                "leaf_unique_pattern_count": int(structure_b.get("leaf_unique_pattern_count", 0) or 0) if structure_b is not None else 0,
+                "leaf_mean_child_count": float(structure_b.get("leaf_mean_child_count", 0.0) or 0.0) if structure_b is not None else 0.0,
+                "leaf_single_child_parent_ratio": float(structure_b.get("leaf_single_child_parent_ratio", 0.0) or 0.0) if structure_b is not None else 0.0,
+                "leaf_max_pattern_frequency": float(structure_b.get("leaf_max_pattern_frequency", 0.0) or 0.0) if structure_b is not None else 0.0,
+                "leaf_candidate_available": bool(structure_b.get("leaf_candidate_available", False)) if structure_b is not None else False,
+                "leaf_delete_gain_mean": float(structure_b.get("leaf_delete_gain_mean", 0.0) or 0.0) if structure_b is not None else 0.0,
+                "leaf_add_gain_mean": float(structure_b.get("leaf_add_gain_mean", 0.0) or 0.0) if structure_b is not None else 0.0,
+                "leaf_move_gain_mean": float(structure_b.get("leaf_move_gain_mean", 0.0) or 0.0) if structure_b is not None else 0.0,
+                "leaf_high_gain_candidate_ratio": float(structure_b.get("leaf_high_gain_candidate_ratio", 0.0) or 0.0) if structure_b is not None else 0.0,
+            }
             cause_mean = torch.stack(cause_scores_means, dim=0).mean(dim=0).squeeze(0).detach().cpu()
             subtree_mean = torch.stack(subtree_scores_means, dim=0).mean(dim=0).squeeze(0).detach().cpu()
             policy_mean = torch.stack(policy_probs_means, dim=0).mean(dim=0).squeeze(0).detach().cpu()
@@ -1948,9 +2057,24 @@ class Network(nn.Module):
                 "voxel_soft_drop_mean",
                 "voxel_soft_add_mean",
                 "voxel_soft_move_mean",
+                "operation_gate_prob",
+                "operation_gate_hard",
+                "operation_gate_logit",
+                "drop_operation_gate",
+                "add_operation_gate",
+                "move_operation_gate",
+                "raw_learned_drop_ratio",
+                "raw_learned_add_ratio",
+                "raw_learned_move_ratio",
             )
             if actuator_stats.get(key, None) is not None
         }
+        if "voxel_edit_initial_count" in actuator_voxel_state:
+            actuator_voxel_state["input_voxel_count"] = actuator_voxel_state["voxel_edit_initial_count"]
+            actuator_voxel_state["before_occupied_voxel_count"] = actuator_voxel_state["voxel_edit_initial_count"]
+        if "voxel_edit_final_count" in actuator_voxel_state:
+            actuator_voxel_state["final_voxel_count"] = actuator_voxel_state["voxel_edit_final_count"]
+            actuator_voxel_state["after_occupied_voxel_count"] = actuator_voxel_state["voxel_edit_final_count"]
 
         actuator_voxel_state["final_voxel_update_mode"] = actuator_stats.get(
             "final_voxel_update_mode",
@@ -2206,6 +2330,17 @@ class Network(nn.Module):
 
         repair_gate = actuator_stats["repair_gate"]
 
+        def _actuator_scalar(key, default=0.0):
+            value = actuator_stats.get(key, None)
+            if torch.is_tensor(value):
+                return float(value.detach().float().mean().cpu())
+            if value is None:
+                return float(default)
+            try:
+                return float(value)
+            except Exception:
+                return float(default)
+
         """問題スコアの算出"""
         single_chain_score = self._masked_point_mean(
             structure["single_proxy_full"].pow(2),
@@ -2290,6 +2425,9 @@ class Network(nn.Module):
                     "voxel_edit_drop_count": int(actuator_stats.get("voxel_edit_drop_count", 0)),
                     "voxel_edit_add_count": int(actuator_stats.get("voxel_edit_add_count", 0)),
                     "voxel_edit_move_count": int(actuator_stats.get("voxel_edit_move_count", 0)),
+                    "input_voxel_count": int(actuator_stats.get("input_voxel_count", actuator_stats.get("voxel_edit_initial_count", 0))),
+                    "final_voxel_count": int(actuator_stats.get("final_voxel_count", actuator_stats.get("voxel_edit_final_count", 0))),
+                    "repair_output_voxel_restored_points": bool(actuator_stats.get("repair_output_voxel_restored_points", False)),
 
                     "actuator_full_octree_context_available": bool(actuator_stats.get("full_octree_context_available", False)),
                     "actuator_parent_occupancy_code": int(actuator_stats.get("actuator_parent_occupancy_code", 0)),
@@ -2300,6 +2438,16 @@ class Network(nn.Module):
                     )
                     if torch.is_tensor(actuator_stats.get("full_context_bonus_mean", None))
                     else float(actuator_stats.get("full_context_bonus_mean", 0.0)),
+                    "leaf_actuator_prior_enabled": bool(
+                        float(actuator_stats.get("leaf_actuator_prior_enabled", pts_xyz.new_zeros(())).detach().cpu()) > 0.5
+                    )
+                    if torch.is_tensor(actuator_stats.get("leaf_actuator_prior_enabled", None))
+                    else bool(actuator_stats.get("leaf_actuator_prior_enabled", False)),
+                    "leaf_actuator_drop_prior_mean": _actuator_scalar("leaf_actuator_drop_prior_mean"),
+                    "leaf_actuator_add_prior_mean": _actuator_scalar("leaf_actuator_add_prior_mean"),
+                    "leaf_actuator_move_prior_mean": _actuator_scalar("leaf_actuator_move_prior_mean"),
+                    "leaf_actuator_best_prior_mean": _actuator_scalar("leaf_actuator_best_prior_mean"),
+                    "leaf_actuator_best_prior_max": _actuator_scalar("leaf_actuator_best_prior_max"),
                     "octree_input_mode": str(structure.get("octree_input_mode", octree_input_mode)),
                     "use_subtree_tree": bool(subtree_tree is not None),
                     "use_full_octree_context": bool(full_octree_context is not None),
@@ -2381,6 +2529,12 @@ class Network(nn.Module):
                     "learned_add_ratio_std": float(actuator_stats.get("learned_add_ratio_std", pts_xyz.new_zeros(())).detach().cpu()),
                     "learned_move_ratio": float(actuator_stats.get("learned_move_ratio", pts_xyz.new_zeros(())).detach().cpu()),
                     "learned_move_ratio_std": float(actuator_stats.get("learned_move_ratio_std", pts_xyz.new_zeros(())).detach().cpu()),
+                    "drop_operation_gate": _actuator_scalar("drop_operation_gate"),
+                    "add_operation_gate": _actuator_scalar("add_operation_gate"),
+                    "move_operation_gate": _actuator_scalar("move_operation_gate"),
+                    "raw_learned_drop_ratio": _actuator_scalar("raw_learned_drop_ratio"),
+                    "raw_learned_add_ratio": _actuator_scalar("raw_learned_add_ratio"),
+                    "raw_learned_move_ratio": _actuator_scalar("raw_learned_move_ratio"),
                     "operation_amount_consistency_loss": float(actuator_stats.get("operation_amount_consistency_loss", pts_xyz.new_zeros(())).detach().cpu()),
                     "operation_entropy": float(actuator_stats.get("operation_entropy", pts_xyz.new_zeros(())).detach().cpu()),
                     "operation_prob_floor_applied": bool(actuator_stats.get("operation_prob_floor_applied", False)),
@@ -2483,7 +2637,57 @@ class Network(nn.Module):
                     "use_subtree_tree": bool(subtree_tree is not None),
                     "use_full_octree_context": bool(full_octree_context is not None),
                     "octree_input_mode": str(structure.get("octree_input_mode", "local_recomputed")),
+
+                    # Section1:
+                    # full cloud canonical voxel coordsに基づくleaf pattern診断のdebug。
+                    "leaf_pattern_available": bool(structure.get("leaf_pattern_available", False)),
+                    "leaf_pattern_source": str(structure.get("leaf_pattern_source", "none")),
+                    "leaf_pattern_reason": str(structure.get("leaf_pattern_reason", "")),
+                    "leaf_unique_parent_count": int(structure.get("leaf_unique_parent_count", 0) or 0),
+                    "leaf_unique_pattern_count": int(structure.get("leaf_unique_pattern_count", 0) or 0),
+                    "leaf_mean_child_count": float(structure.get("leaf_mean_child_count", 0.0) or 0.0),
+                    "leaf_single_child_parent_ratio": float(structure.get("leaf_single_child_parent_ratio", 0.0) or 0.0),
+                    "leaf_max_pattern_frequency": float(structure.get("leaf_max_pattern_frequency", 0.0) or 0.0),
+
+                    # Section2/3:
+                    "leaf_candidate_available": bool(structure.get("leaf_candidate_available", False)),
+                    "leaf_delete_gain_mean": float(structure.get("leaf_delete_gain_mean", 0.0) or 0.0),
+                    "leaf_add_gain_mean": float(structure.get("leaf_add_gain_mean", 0.0) or 0.0),
+                    "leaf_move_gain_mean": float(structure.get("leaf_move_gain_mean", 0.0) or 0.0),
+                    "leaf_high_gain_candidate_ratio": float(structure.get("leaf_high_gain_candidate_ratio", 0.0) or 0.0),
+                    "leaf_feature_integration_used": bool(structure.get("leaf_feature_integration_used", False)),
+                    "leaf_feature_best_gain_mean": float(structure.get("leaf_feature_best_gain_mean", 0.0) or 0.0),
+                    "leaf_feature_best_gain_max": float(structure.get("leaf_feature_best_gain_max", 0.0) or 0.0),
+
+                    # Section4:
+                    "leaf_actuator_prior_enabled": bool(
+                        _actuator_scalar("leaf_actuator_prior_enabled") > 0.5
+                    ),
+                    "leaf_actuator_drop_prior_mean": _actuator_scalar("leaf_actuator_drop_prior_mean"),
+                    "leaf_actuator_add_prior_mean": _actuator_scalar("leaf_actuator_add_prior_mean"),
+                    "leaf_actuator_move_prior_mean": _actuator_scalar("leaf_actuator_move_prior_mean"),
+                    "leaf_actuator_best_prior_mean": _actuator_scalar("leaf_actuator_best_prior_mean"),
+                    "leaf_actuator_best_prior_max": _actuator_scalar("leaf_actuator_best_prior_max"),
+
+                    # Section5:
+                    "leaf_target_direction_prior_enabled": bool(
+                        _actuator_scalar("leaf_target_direction_prior_enabled") > 0.5
+                    ),
+                    "leaf_add_target_match_ratio": _actuator_scalar("leaf_add_target_match_ratio"),
+                    "leaf_move_target_match_ratio": _actuator_scalar("leaf_move_target_match_ratio"),
+                    "leaf_add_target_bias_mean": _actuator_scalar("leaf_add_target_bias_mean"),
+                    "leaf_move_target_bias_mean": _actuator_scalar("leaf_move_target_bias_mean"),
+
                     "network_voxel_node_input_requested": bool(node_voxel_debug.get("network_voxel_node_input_requested", False)),
+                    "leaf_actuator_prior_enabled": bool(
+                        _actuator_scalar("leaf_actuator_prior_enabled") > 0.5
+                    ),
+                    "leaf_actuator_drop_prior_mean": _actuator_scalar("leaf_actuator_drop_prior_mean"),
+                    "leaf_actuator_add_prior_mean": _actuator_scalar("leaf_actuator_add_prior_mean"),
+                    "leaf_actuator_move_prior_mean": _actuator_scalar("leaf_actuator_move_prior_mean"),
+                    "leaf_actuator_best_prior_mean": _actuator_scalar("leaf_actuator_best_prior_mean"),
+                    "leaf_actuator_best_prior_max": _actuator_scalar("leaf_actuator_best_prior_max"),
+
                     "network_voxel_node_input_used": bool(node_voxel_debug.get("network_voxel_node_input_used", False)),
                     "full_cloud_anchor_node_voxel_used": bool(
                         str(octree_input_mode or "").strip().lower() == "full_cloud"
@@ -2544,6 +2748,89 @@ class Network(nn.Module):
                     structure.get("phase4_structural_key_source", "unknown")
                     if isinstance(structure, dict)
                     else "unknown"
+                ),
+
+                # Section1:
+                # full cloud canonical voxel coordsに基づくleaf pattern診断のdebug。
+                "leaf_pattern_available": bool(
+                    structure.get("leaf_pattern_available", False)
+                    if isinstance(structure, dict)
+                    else False
+                ),
+                "leaf_pattern_source": str(
+                    structure.get("leaf_pattern_source", "none")
+                    if isinstance(structure, dict)
+                    else "none"
+                ),
+                "leaf_pattern_reason": str(
+                    structure.get("leaf_pattern_reason", "")
+                    if isinstance(structure, dict)
+                    else "missing"
+                ),
+                "leaf_unique_parent_count": int(
+                    structure.get("leaf_unique_parent_count", 0)
+                    if isinstance(structure, dict)
+                    else 0
+                ),
+                "leaf_unique_pattern_count": int(
+                    structure.get("leaf_unique_pattern_count", 0)
+                    if isinstance(structure, dict)
+                    else 0
+                ),
+                "leaf_mean_child_count": float(
+                    structure.get("leaf_mean_child_count", 0.0)
+                    if isinstance(structure, dict)
+                    else 0.0
+                ),
+                "leaf_single_child_parent_ratio": float(
+                    structure.get("leaf_single_child_parent_ratio", 0.0)
+                    if isinstance(structure, dict)
+                    else 0.0
+                ),
+                "leaf_max_pattern_frequency": float(
+                    structure.get("leaf_max_pattern_frequency", 0.0)
+                    if isinstance(structure, dict)
+                    else 0.0
+                ),
+                "leaf_candidate_available": bool(
+                    structure.get("leaf_candidate_available", False)
+                    if isinstance(structure, dict)
+                    else False
+                ),
+                "leaf_delete_gain_mean": float(
+                    structure.get("leaf_delete_gain_mean", 0.0)
+                    if isinstance(structure, dict)
+                    else 0.0
+                ),
+                "leaf_add_gain_mean": float(
+                    structure.get("leaf_add_gain_mean", 0.0)
+                    if isinstance(structure, dict)
+                    else 0.0
+                ),
+                "leaf_move_gain_mean": float(
+                    structure.get("leaf_move_gain_mean", 0.0)
+                    if isinstance(structure, dict)
+                    else 0.0
+                ),
+                "leaf_high_gain_candidate_ratio": float(
+                    structure.get("leaf_high_gain_candidate_ratio", 0.0)
+                    if isinstance(structure, dict)
+                    else 0.0
+                ),
+                "leaf_feature_integration_used": bool(
+                    structure.get("leaf_feature_integration_used", False)
+                    if isinstance(structure, dict)
+                    else False
+                ),
+                "leaf_feature_best_gain_mean": float(
+                    structure.get("leaf_feature_best_gain_mean", 0.0)
+                    if isinstance(structure, dict)
+                    else 0.0
+                ),
+                "leaf_feature_best_gain_max": float(
+                    structure.get("leaf_feature_best_gain_max", 0.0)
+                    if isinstance(structure, dict)
+                    else 0.0
                 ),
             }
 

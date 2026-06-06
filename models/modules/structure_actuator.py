@@ -63,6 +63,13 @@ class StructureRepairActuator(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv1d(hidden_dim, len(neighbor_offsets), 1),
         )
+        self.operation_gate_head = nn.Sequential(
+            nn.Conv1d(in_channels, hidden_dim, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(hidden_dim, hidden_dim, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(hidden_dim, 3, 1),
+        )
         # Pruneの実行量をActuator特徴から推定し、削除割合も学習対象にする。
         self.drop_amount_head = nn.Conv1d(in_channels, 1, 1)
         # Addの実行量をActuator特徴から推定し、固定比率に張り付かないようにする。
@@ -75,6 +82,7 @@ class StructureRepairActuator(nn.Module):
         nn.init.zeros_(self.add_head[-1].weight)
         nn.init.zeros_(self.add_voxel_head[-1].weight)
         nn.init.zeros_(self.add_voxel_head[-1].bias)
+        nn.init.zeros_(self.operation_gate_head[-1].weight)
         nn.init.normal_(self.drop_amount_head.weight, mean=0.0, std=1e-3)
         nn.init.normal_(self.add_amount_head.weight, mean=0.0, std=1e-3)
         nn.init.normal_(self.move_amount_head.weight, mean=0.0, std=1e-3)
@@ -89,6 +97,18 @@ class StructureRepairActuator(nn.Module):
         init_add_ratio = min(max(float(getattr(self.args, "repair_init_add_ratio", 0.03)), 1e-4), 0.95)
         init_add_bias = math.log(init_add_ratio / max(1.0 - init_add_ratio, 1e-6))
         nn.init.constant_(self.add_head[-1].bias, init_add_bias)
+        init_gate_values = (
+            float(getattr(self.args, "repair_operation_gate_init_drop", 0.50)),
+            float(getattr(self.args, "repair_operation_gate_init_add", 0.50)),
+            float(getattr(self.args, "repair_operation_gate_init_move", 0.50)),
+        )
+        init_gate_bias = [
+            math.log(min(max(v, 1e-4), 1.0 - 1e-4) / max(1.0 - min(max(v, 1e-4), 1.0 - 1e-4), 1e-6))
+            for v in init_gate_values
+        ]
+        nn.init.constant_(self.operation_gate_head[-1].bias[0], init_gate_bias[0])
+        nn.init.constant_(self.operation_gate_head[-1].bias[1], init_gate_bias[1])
+        nn.init.constant_(self.operation_gate_head[-1].bias[2], init_gate_bias[2])
         nn.init.constant_(self.drop_amount_head.bias, 0.0)
         nn.init.constant_(self.add_amount_head.bias, 0.0)
         nn.init.constant_(self.move_amount_head.bias, 0.0)
@@ -125,6 +145,427 @@ class StructureRepairActuator(nn.Module):
 
         return same_parent_mask
 
+    def _fit_leaf_pattern_map(self, value, like_tensor):
+        """
+        Section4:
+        leaf_pattern_diag内の [B,N] / [B,1,N] Tensorを
+        Actuator内の [B,1,N] に揃える。
+        """
+        B, _, N = like_tensor.shape
+        device = like_tensor.device
+        dtype = like_tensor.dtype
+
+        if not torch.is_tensor(value):
+            return like_tensor.new_zeros((B, 1, N))
+
+        out = value.to(device=device, dtype=dtype)
+
+        if out.ndim == 1:
+            out = out.view(1, 1, -1)
+        elif out.ndim == 2:
+            out = out.unsqueeze(1)
+        elif out.ndim == 3:
+            if out.shape[1] != 1:
+                out = out[:, :1, :]
+        else:
+            return like_tensor.new_zeros((B, 1, N))
+
+        if out.shape[0] == 1 and B > 1:
+            out = out.expand(B, -1, -1).contiguous()
+
+        if out.shape[0] != B:
+            return like_tensor.new_zeros((B, 1, N))
+
+        current_n = int(out.shape[-1])
+        if current_n == N:
+            pass
+        elif current_n > N:
+            out = out[:, :, :N].contiguous()
+        elif current_n > 0:
+            pad = out[:, :, -1:].expand(B, 1, N - current_n)
+            out = torch.cat([out, pad], dim=2).contiguous()
+        else:
+            out = like_tensor.new_zeros((B, 1, N))
+
+        return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _leaf_pattern_actuator_priors(self, structure, like_tensor):
+        """
+        Section4:
+        OctreeStructureAnalysisが作ったleaf pattern候補gainを
+        ActuatorのPrune/Add/Move source biasへ変換する。
+
+        ここではforward値を変えるためのpriorとして使うだけで、
+        leaf_pattern_diag自体へ勾配を戻す目的ではない。
+        """
+        B, _, N = like_tensor.shape
+        zero = like_tensor.new_zeros((B, 1, N))
+
+        out = {
+            "enabled": False,
+            "delete_prior": zero,
+            "add_prior": zero,
+            "move_prior": zero,
+            "best_prior": zero,
+            "delete_prior_mean": 0.0,
+            "add_prior_mean": 0.0,
+            "move_prior_mean": 0.0,
+            "best_prior_mean": 0.0,
+            "best_prior_max": 0.0,
+        }
+
+        if not bool(getattr(self.args, "leaf_pattern_actuator_prior", True)):
+            return out
+
+        if not isinstance(structure, dict):
+            return out
+
+        leaf_diag = structure.get("leaf_pattern_diag", None)
+        if not isinstance(leaf_diag, dict):
+            return out
+
+        if not bool(leaf_diag.get("available", False)):
+            return out
+
+        scale = max(float(getattr(self.args, "leaf_pattern_actuator_prior_scale", 2.0)), 1e-6)
+
+        delete_gain = self._fit_leaf_pattern_map(
+            leaf_diag.get("delete_nll_gain", None),
+            like_tensor,
+        ).clamp_min(0.0)
+        add_gain = self._fit_leaf_pattern_map(
+            leaf_diag.get("add_nll_gain", None),
+            like_tensor,
+        ).clamp_min(0.0)
+        move_gain = self._fit_leaf_pattern_map(
+            leaf_diag.get("move_nll_gain", None),
+            like_tensor,
+        ).clamp_min(0.0)
+
+        delete_prior = torch.tanh(delete_gain * scale).clamp(0.0, 1.0).detach()
+        add_prior = torch.tanh(add_gain * scale).clamp(0.0, 1.0).detach()
+        move_prior = torch.tanh(move_gain * scale).clamp(0.0, 1.0).detach()
+        best_prior = torch.maximum(torch.maximum(delete_prior, add_prior), move_prior)
+
+        out.update(
+            {
+                "enabled": True,
+                "delete_prior": delete_prior,
+                "add_prior": add_prior,
+                "move_prior": move_prior,
+                "best_prior": best_prior,
+                "delete_prior_mean": float(delete_prior.detach().float().mean().cpu()),
+                "add_prior_mean": float(add_prior.detach().float().mean().cpu()),
+                "move_prior_mean": float(move_prior.detach().float().mean().cpu()),
+                "best_prior_mean": float(best_prior.detach().float().mean().cpu()),
+                "best_prior_max": float(best_prior.detach().float().max().cpu()),
+            }
+        )
+        return out
+
+    def _fit_leaf_pattern_long_map(self, value, batch_size, point_count, device):
+        """
+        Section5:
+        leaf_pattern_diag内のchild slot Tensorを [B, N] のlong Tensorに揃える。
+        """
+        if not torch.is_tensor(value):
+            return torch.full(
+                (batch_size, point_count),
+                -1,
+                device=device,
+                dtype=torch.long,
+            )
+
+        out = value.to(device=device, dtype=torch.long)
+
+        if out.ndim == 1:
+            out = out.view(1, -1)
+        elif out.ndim == 2:
+            pass
+        elif out.ndim == 3:
+            if out.shape[1] == 1:
+                out = out.squeeze(1)
+            elif out.shape[2] == 1:
+                out = out.squeeze(2)
+            else:
+                out = out[:, 0, :]
+        else:
+            return torch.full(
+                (batch_size, point_count),
+                -1,
+                device=device,
+                dtype=torch.long,
+            )
+
+        if out.shape[0] == 1 and batch_size > 1:
+            out = out.expand(batch_size, -1).contiguous()
+
+        if out.shape[0] != batch_size:
+            return torch.full(
+                (batch_size, point_count),
+                -1,
+                device=device,
+                dtype=torch.long,
+            )
+
+        current_n = int(out.shape[1])
+        if current_n == point_count:
+            return out.contiguous()
+
+        if current_n > point_count:
+            return out[:, :point_count].contiguous()
+
+        if current_n > 0:
+            pad = out[:, -1:].expand(batch_size, point_count - current_n)
+            return torch.cat([out, pad], dim=1).contiguous()
+
+        return torch.full(
+            (batch_size, point_count),
+            -1,
+            device=device,
+            dtype=torch.long,
+        )
+
+    def _leaf_pattern_target_direction_priors(
+        self,
+        structure,
+        target_child_slots,
+        like_tensor,
+        leaf_actuator_prior=None,
+    ):
+        """
+        Section5:
+        Add/Move候補target voxelのchild slotと、
+        OctreeStructureAnalysisが推奨したbest child slotを照合し、
+        一致するtarget方向へlogit biasを作る。
+
+        target_child_slots は [B, N, K] である。
+        戻り値の add_target_bias / move_target_bias も [B, N, K] である。
+        """
+        B, N, K = target_child_slots.shape
+        device = target_child_slots.device
+        dtype = like_tensor.dtype
+
+        zero_bnk = like_tensor.new_zeros((B, N, K))
+
+        out = {
+            "enabled": False,
+            "add_target_bias": zero_bnk,
+            "move_target_bias": zero_bnk,
+            "add_target_match_ratio": 0.0,
+            "move_target_match_ratio": 0.0,
+            "add_target_bias_mean": 0.0,
+            "move_target_bias_mean": 0.0,
+        }
+
+        if not bool(getattr(self.args, "leaf_pattern_target_direction_prior", True)):
+            return out
+
+        if not isinstance(structure, dict):
+            return out
+
+        leaf_diag = structure.get("leaf_pattern_diag", None)
+        if not isinstance(leaf_diag, dict):
+            return out
+
+        if not bool(leaf_diag.get("available", False)):
+            return out
+
+        if leaf_actuator_prior is None or not isinstance(leaf_actuator_prior, dict):
+            return out
+
+        best_add_slot = self._fit_leaf_pattern_long_map(
+            leaf_diag.get("best_add_child_slot", None),
+            batch_size=B,
+            point_count=N,
+            device=device,
+        )
+        best_move_slot = self._fit_leaf_pattern_long_map(
+            leaf_diag.get("best_move_target_child_slot", None),
+            batch_size=B,
+            point_count=N,
+            device=device,
+        )
+
+        add_valid = best_add_slot.ge(0) & best_add_slot.le(7)
+        move_valid = best_move_slot.ge(0) & best_move_slot.le(7)
+
+        add_match = (
+            target_child_slots == best_add_slot.unsqueeze(2)
+        ) & add_valid.unsqueeze(2)
+
+        move_match = (
+            target_child_slots == best_move_slot.unsqueeze(2)
+        ) & move_valid.unsqueeze(2)
+
+        add_source_prior = leaf_actuator_prior.get(
+            "add_prior",
+            like_tensor.new_zeros((B, 1, N)),
+        ).to(device=device, dtype=dtype)
+
+        move_source_prior = leaf_actuator_prior.get(
+            "move_prior",
+            like_tensor.new_zeros((B, 1, N)),
+        ).to(device=device, dtype=dtype)
+
+        if add_source_prior.ndim == 3:
+            add_source_prior = add_source_prior.squeeze(1)
+        if move_source_prior.ndim == 3:
+            move_source_prior = move_source_prior.squeeze(1)
+
+        add_target_bias = add_match.to(dtype=dtype) * add_source_prior.unsqueeze(2)
+        move_target_bias = move_match.to(dtype=dtype) * move_source_prior.unsqueeze(2)
+
+        out.update(
+            {
+                "enabled": True,
+                "add_target_bias": add_target_bias.detach(),
+                "move_target_bias": move_target_bias.detach(),
+                "add_target_match_ratio": float(add_match.to(torch.float32).mean().detach().cpu()),
+                "move_target_match_ratio": float(move_match.to(torch.float32).mean().detach().cpu()),
+                "add_target_bias_mean": float(add_target_bias.detach().float().mean().cpu()),
+                "move_target_bias_mean": float(move_target_bias.detach().float().mean().cpu()),
+            }
+        )
+        return out
+
+    def _leaf_pattern_operation_masks(self, structure, like_tensor):
+        """
+        leaf pattern診断に基づいて、
+        各voxel/nodeがどの操作候補として有効かを決める。
+
+        ここではsoftな推奨ではなく、Actuatorの候補集合を制約するためのmaskを作る。
+        """
+        B, _, N = like_tensor.shape
+        device = like_tensor.device
+
+        false_mask = torch.zeros((B, 1, N), device=device, dtype=torch.bool)
+
+        out = {
+            "enabled": False,
+            "delete_mask": false_mask,
+            "add_mask": false_mask,
+            "move_mask": false_mask,
+        }
+
+        if not bool(getattr(self.args, "leaf_pattern_operation_mask", True)):
+            return out
+
+        if not isinstance(structure, dict):
+            return out
+
+        leaf_diag = structure.get("leaf_pattern_diag", None)
+        if not isinstance(leaf_diag, dict):
+            return out
+
+        if not bool(leaf_diag.get("available", False)):
+            return out
+
+        best_op = leaf_diag.get("best_operation_hint", None)
+        delete_valid = leaf_diag.get("delete_valid_mask", None)
+        add_valid = leaf_diag.get("add_valid_mask", None)
+        move_valid = leaf_diag.get("move_valid_mask", None)
+
+        if not torch.is_tensor(best_op):
+            return out
+
+        best_op = best_op.to(device=device, dtype=torch.long)
+
+        if best_op.ndim == 1:
+            best_op = best_op.view(1, 1, -1)
+        elif best_op.ndim == 2:
+            best_op = best_op.unsqueeze(1)
+        elif best_op.ndim == 3:
+            if best_op.shape[1] != 1:
+                best_op = best_op[:, :1, :]
+        else:
+            return out
+
+        if best_op.shape[0] == 1 and B > 1:
+            best_op = best_op.expand(B, -1, -1).contiguous()
+
+        if best_op.shape[-1] > N:
+            best_op = best_op[:, :, :N]
+        elif best_op.shape[-1] < N and best_op.shape[-1] > 0:
+            pad = best_op[:, :, -1:].expand(B, 1, N - best_op.shape[-1])
+            best_op = torch.cat([best_op, pad], dim=2)
+        elif best_op.shape[-1] <= 0:
+            return out
+
+        def _fit_bool_mask(value):
+            if not torch.is_tensor(value):
+                return torch.ones((B, 1, N), device=device, dtype=torch.bool)
+
+            mask = value.to(device=device, dtype=torch.bool)
+
+            if mask.ndim == 1:
+                mask = mask.view(1, 1, -1)
+            elif mask.ndim == 2:
+                mask = mask.unsqueeze(1)
+            elif mask.ndim == 3:
+                if mask.shape[1] != 1:
+                    mask = mask[:, :1, :]
+            else:
+                return torch.ones((B, 1, N), device=device, dtype=torch.bool)
+
+            if mask.shape[0] == 1 and B > 1:
+                mask = mask.expand(B, -1, -1).contiguous()
+
+            if mask.shape[-1] > N:
+                mask = mask[:, :, :N]
+            elif mask.shape[-1] < N and mask.shape[-1] > 0:
+                pad = mask[:, :, -1:].expand(B, 1, N - mask.shape[-1])
+                mask = torch.cat([mask, pad], dim=2)
+            elif mask.shape[-1] <= 0:
+                return torch.ones((B, 1, N), device=device, dtype=torch.bool)
+
+            return mask
+
+        delete_valid = _fit_bool_mask(delete_valid)
+        add_valid = _fit_bool_mask(add_valid)
+        move_valid = _fit_bool_mask(move_valid)
+
+        delete_mask = (best_op == 1) & delete_valid
+        add_mask = (best_op == 2) & add_valid
+        move_mask = (best_op == 3) & move_valid
+
+        out.update(
+            {
+                "enabled": True,
+                "add_target_bias": add_target_bias.detach(),
+                "move_target_bias": move_target_bias.detach(),
+                "add_target_match_ratio": float(add_match.to(torch.float32).mean().detach().cpu()),
+                "move_target_match_ratio": float(move_match.to(torch.float32).mean().detach().cpu()),
+                "add_target_bias_mean": float(add_target_bias.detach().float().mean().cpu()),
+                "move_target_bias_mean": float(move_target_bias.detach().float().mean().cpu()),
+            }
+        )
+        return out
+
+    def _leaf_pattern_operation_masks(self, structure, like_tensor):
+        """
+        leaf pattern診断は、候補集合を殺すhard maskには使わない。
+        delete/add/move の source/target には既に prior / bias として入っているため、
+        ここでは常に無効maskを返す。
+
+        理由:
+        best_operation_hint は SparsePCGC actual bit を直接最小化した結果ではなく、
+        現在点群内の parent-child occupancy pattern 頻度から作った heuristic である。
+        そのため、ここで候補をhardに消すと、actual圧縮損失として有効な操作まで
+        学習前に消える可能性がある。
+        """
+        B, _, N = like_tensor.shape
+        device = like_tensor.device
+
+        false_mask = torch.zeros((B, 1, N), device=device, dtype=torch.bool)
+
+        return {
+            "enabled": False,
+            "delete_mask": false_mask,
+            "add_mask": false_mask,
+            "move_mask": false_mask,
+        }
+    
     def _context_voxel_step_and_offset(self, pts_xyz, coord_scale, octree_context):
         # 初期Octree/Subtreeメタデータがある場合は、そのglobal_qs/global_offsetを優先する。
         # これにより、Network入力前に作ったVoxel座標系をActuator内でも維持する。
@@ -369,6 +810,73 @@ class StructureRepairActuator(nn.Module):
                 }
             )
         return cache
+
+    @staticmethod
+    def _child_slot_from_coords_lastdim(coords):
+        coords = coords.to(dtype=torch.long)
+        return (
+            coords[..., 0].remainder(2)
+            + 2 * coords[..., 1].remainder(2)
+            + 4 * coords[..., 2].remainder(2)
+        ).to(dtype=torch.long)
+
+    def _point_parent_codes_and_child_slots(self, voxel_coords):
+        B, _, N = voxel_coords.shape
+        parent_codes = torch.zeros((B, N), device=voxel_coords.device, dtype=torch.long)
+        child_slots = torch.zeros((B, N), device=voxel_coords.device, dtype=torch.long)
+        for b in range(B):
+            coords = voxel_coords[b].transpose(0, 1).contiguous().to(dtype=torch.long)
+            if coords.numel() == 0:
+                continue
+            parents = torch.div(coords, 2, rounding_mode="floor")
+            slots = self._child_slot_from_coords_lastdim(coords)
+            child_slots[b] = slots
+            unique_parents, inverse = torch.unique(parents, dim=0, sorted=True, return_inverse=True)
+            codes = torch.zeros((unique_parents.shape[0],), device=voxel_coords.device, dtype=torch.long)
+            for slot in range(8):
+                mask = slots == slot
+                if bool(mask.any().item()):
+                    parent_ids = torch.unique(inverse[mask], sorted=False)
+                    bit = codes.new_full((parent_ids.numel(),), 1 << slot)
+                    codes[parent_ids] = torch.bitwise_or(codes[parent_ids], bit)
+            parent_codes[b] = codes.index_select(0, inverse)
+        return parent_codes, child_slots
+
+    def _occupancy_code_popularity(self, octree_context, full_octree_context, like_tensor):
+        parts = []
+
+        def _add_codes(ctx, key, weight=1.0):
+            if not isinstance(ctx, dict) or key not in ctx:
+                return
+            value = ctx.get(key, None)
+            if value is None:
+                return
+            if not torch.is_tensor(value):
+                value = torch.as_tensor(value)
+            value = value.to(device=like_tensor.device, dtype=torch.long).reshape(-1)
+            value = value[(value >= 0) & (value < 256)]
+            if value.numel() <= 0:
+                return
+            if float(weight) != 1.0:
+                repeat = max(int(round(float(weight))), 1)
+                value = value.repeat(repeat)
+            parts.append(value)
+
+        for ctx in (full_octree_context, octree_context):
+            _add_codes(ctx, "occupancy_codes", weight=3.0)
+            _add_codes(ctx, "ancestor_occupancy_codes", weight=2.0)
+            _add_codes(ctx, "sibling_occupancy_codes", weight=2.0)
+            _add_codes(ctx, "parent_occupancy_code", weight=2.0)
+
+        counts = like_tensor.new_ones((256,), dtype=torch.float32) * float(
+            getattr(self.args, "repair_pattern_prior_smoothing", 1.0)
+        )
+        if parts:
+            codes = torch.cat(parts, dim=0)
+            counts = counts + torch.bincount(codes, minlength=256).to(device=like_tensor.device, dtype=counts.dtype)
+        score = torch.log1p(counts)
+        score = score / score.max().clamp_min(1e-6)
+        return score.to(dtype=like_tensor.dtype)
 
     @classmethod
     def _coords_membership_cached(cls, query_coords, reference_keys, key_mins, key_spans):
@@ -845,6 +1353,7 @@ class StructureRepairActuator(nn.Module):
         selection_mask,
         hard_threshold=0.0,
         voxel_cache=None,
+        force_min_count=False,
     ):
         B, _, N = drop_scores.shape
         hard_drop = torch.zeros_like(drop_scores, dtype=torch.bool)
@@ -893,9 +1402,9 @@ class StructureRepairActuator(nn.Module):
             else:
                 cap_count = int(round(float(max_drop_ratio) * float(voxel_count)))
                 target_count = int(round(float(target_drop_ratio) * float(voxel_count)))
-                if target_drop_ratio > 0.0:
+                if force_min_count and target_drop_ratio > 0.0:
                     target_count = max(target_count, 1)
-                if max_drop_ratio > 0.0:
+                if force_min_count and max_drop_ratio > 0.0:
                     cap_count = max(cap_count, 1)
                 drop_count = min(target_count, cap_count, voxel_count - 1)
             if drop_count <= 0:
@@ -1113,6 +1622,77 @@ class StructureRepairActuator(nn.Module):
             ratio = (1.0 - random_mix) * ratio + random_mix * random_ratio
 
         return ratio.clamp(0.0, float(max_ratio))
+
+    def _learned_operation_gates(self, actuator_features, prune_enabled, add_enabled, move_enabled):
+        B = actuator_features.shape[0]
+        enabled_mask = actuator_features.new_tensor(
+            [
+                1.0 if prune_enabled else 0.0,
+                1.0 if add_enabled else 0.0,
+                1.0 if move_enabled else 0.0,
+            ]
+        ).view(1, 3, 1)
+        if not bool(getattr(self.args, "repair_operation_gate_enabled", True)):
+            gate_prob = enabled_mask.expand(B, -1, -1).contiguous()
+            gate_hard = gate_prob
+            gate = gate_prob
+            gate_logit = torch.where(
+                gate_prob > 0.0,
+                gate_prob.new_full(gate_prob.shape, 8.0),
+                gate_prob.new_full(gate_prob.shape, -8.0),
+            )
+            return gate[:, 0:1], gate[:, 1:2], gate[:, 2:3], gate_prob, gate_hard, gate_logit
+
+        mean_feat = actuator_features.mean(dim=2, keepdim=True)
+        max_feat = actuator_features.amax(dim=2, keepdim=True)
+        if actuator_features.shape[2] > 1:
+            std_feat = actuator_features.std(dim=2, keepdim=True, unbiased=False)
+        else:
+            std_feat = torch.zeros_like(mean_feat)
+        pooled = (
+            mean_feat
+            + float(getattr(self.args, "repair_operation_gate_pool_std_weight", 0.50)) * std_feat
+            + float(getattr(self.args, "repair_operation_gate_pool_max_weight", 0.25)) * max_feat
+        )
+        logit_scale = max(float(getattr(self.args, "repair_operation_gate_logit_scale", 6.0)), 1e-6)
+        raw_logit = torch.nan_to_num(
+            self.operation_gate_head(pooled),
+            nan=0.0,
+            posinf=logit_scale,
+            neginf=-logit_scale,
+        )
+        gate_logit = logit_scale * torch.tanh(raw_logit / logit_scale)
+        temperature = max(float(getattr(self.args, "repair_operation_gate_temperature", 1.0)), 1e-6)
+        gate_prob = torch.sigmoid(gate_logit / temperature) * enabled_mask
+
+        random_mix = min(
+            max(
+                self._annealed_value(
+                    "repair_operation_gate_random_mix_start",
+                    "repair_operation_gate_random_mix_end",
+                ),
+                0.0,
+            ),
+            1.0,
+        )
+        if self.training and random_mix > 0.0:
+            random_gate = torch.rand_like(gate_prob) * enabled_mask
+            gate_prob = (1.0 - random_mix) * gate_prob + random_mix * random_gate
+
+        min_forward = min(
+            max(float(getattr(self.args, "repair_operation_gate_min_forward", 0.0)), 0.0),
+            0.49,
+        )
+        if self.training and min_forward > 0.0:
+            gate_prob = gate_prob * (1.0 - min_forward) + min_forward * enabled_mask
+
+        hard_threshold = min(max(float(getattr(self.args, "repair_operation_gate_hard_threshold", 0.5)), 0.0), 1.0)
+        gate_hard = (gate_prob >= hard_threshold).to(dtype=gate_prob.dtype) * enabled_mask
+        if bool(getattr(self.args, "repair_operation_gate_hard_forward", False)):
+            gate = gate_hard.detach() + gate_prob - gate_prob.detach()
+        else:
+            gate = gate_prob
+        return gate[:, 0:1], gate[:, 1:2], gate[:, 2:3], gate_prob, gate_hard, gate_logit
     
     def _scale_amount_downstream_grad(self, ratio, op_name=""):
         # Amount ratio のforward値は変えず、backwardだけ強める。
@@ -1257,7 +1837,7 @@ class StructureRepairActuator(nn.Module):
             return str(getattr(self.args, "loss_mode", "legacy_total")).strip().lower() == "compression_primary"
         return True
 
-    def _target_add_count(self, point_count, candidate_ratio_override=None):
+    def _target_add_count(self, point_count, candidate_ratio_override=None, force_min_count=None):
         if point_count <= 0 or not self._add_enabled():
             return 0, 0.0
         max_ratio = self._max_add_ratio()
@@ -1272,7 +1852,16 @@ class StructureRepairActuator(nn.Module):
             candidate_ratio = float(candidate_ratio_override)
         candidate_ratio = min(max(candidate_ratio, 0.0), max_ratio)
         max_add_points = int(math.ceil(max_ratio * float(point_count))) if max_ratio > 0.0 else 0
-        add_points = int(math.ceil(candidate_ratio * float(point_count))) if candidate_ratio > 0.0 else 0
+        expected_points = candidate_ratio * float(point_count)
+        if force_min_count is None:
+            force_min_count = bool(getattr(self.args, "repair_force_min_add_voxels", False))
+        min_expected = max(float(getattr(self.args, "repair_add_min_expected_voxels", 1.0)), 0.0)
+        if candidate_ratio <= 0.0:
+            add_points = 0
+        elif force_min_count or expected_points >= min_expected:
+            add_points = int(math.ceil(expected_points))
+        else:
+            add_points = 0
         return min(add_points, max_add_points, point_count), float(candidate_ratio)
 
     @staticmethod
@@ -1449,7 +2038,13 @@ class StructureRepairActuator(nn.Module):
             sparse_score = cause_scores[:, 4:5, :] if cause_scores.shape[1] > 4 else preserve.new_zeros(preserve.shape)
             local_outlier_score = cause_scores[:, 5:6, :] if cause_scores.shape[1] > 5 else preserve.new_zeros(preserve.shape)
         shape_score = cause_scores[:, -1:, :]
-
+        leaf_actuator_prior = self._leaf_pattern_actuator_priors(
+            structure,
+            preserve,
+        )
+        leaf_drop_prior = leaf_actuator_prior["delete_prior"]
+        leaf_add_prior = leaf_actuator_prior["add_prior"]
+        leaf_move_prior = leaf_actuator_prior["move_prior"]
         full_context_available = isinstance(full_octree_context, dict) and bool(full_octree_context)
 
         actuator_parent_occupancy_code = 0
@@ -1497,10 +2092,12 @@ class StructureRepairActuator(nn.Module):
                     f"global_step={global_step}, sample={sample_name}, "
                     f"fallback=local_recomputed"
                 )
+        if context_voxel_coords is not None:
             if not torch.is_tensor(context_voxel_coords):
                 context_voxel_coords = torch.as_tensor(context_voxel_coords)
             context_voxel_coords = context_voxel_coords.to(device=pts_xyz.device, dtype=torch.long)
 
+        if context_voxel_coords is not None:
             if context_voxel_coords.ndim == 2 and context_voxel_coords.shape[-1] == 3:
                 context_voxel_coords = context_voxel_coords.transpose(0, 1).unsqueeze(0)
             elif context_voxel_coords.ndim == 3 and context_voxel_coords.shape[-1] == 3:
@@ -1567,6 +2164,8 @@ class StructureRepairActuator(nn.Module):
 
         empty_target_mask = self._empty_neighbor_target_mask(voxel_coords, voxel_cache=voxel_cache)
 
+        B, _, N = pts_xyz.shape
+
         child_slot_mask = self._child_slot_target_mask(voxel_coords, octree_context)
         if child_slot_mask is not None:
             empty_target_mask = empty_target_mask & child_slot_mask
@@ -1574,13 +2173,84 @@ class StructureRepairActuator(nn.Module):
         else:
             actuator_target_mode = "neighbor_empty_voxel"
 
+        parent_occupancy_codes, source_child_slots = self._point_parent_codes_and_child_slots(voxel_coords)
+        occupancy_code_popularity = self._occupancy_code_popularity(
+            octree_context,
+            full_octree_context,
+            pts_xyz,
+        )
+        source_child_bits = torch.bitwise_left_shift(
+            torch.ones_like(source_child_slots, dtype=torch.long),
+            source_child_slots,
+        )
+        parent_codes_without_source = torch.bitwise_and(
+            parent_occupancy_codes,
+            255 - source_child_bits,
+        )
+        base_pattern_popularity = occupancy_code_popularity.index_select(
+            0,
+            parent_occupancy_codes.reshape(-1).clamp(0, 255),
+        ).view(B, N)
+        drop_pattern_gain = occupancy_code_popularity.index_select(
+            0,
+            parent_codes_without_source.reshape(-1).clamp(0, 255),
+        ).view(B, N) - base_pattern_popularity
+
+        current_voxels_n3 = voxel_coords.transpose(1, 2).contiguous()
+        candidate_neighbor_voxels = (
+            current_voxels_n3[:, :, None, :]
+            + neighbor_offsets_long.view(1, 1, -1, 3)
+        )
+        target_child_slots = self._child_slot_from_coords_lastdim(candidate_neighbor_voxels)
+        target_child_bits = torch.bitwise_left_shift(
+            torch.ones_like(target_child_slots, dtype=torch.long),
+            target_child_slots,
+        )
+        parent_code_expanded = parent_occupancy_codes[:, :, None].expand_as(target_child_bits)
+        add_pattern_codes = torch.bitwise_or(parent_code_expanded, target_child_bits)
+        move_pattern_codes = torch.bitwise_or(
+            torch.bitwise_and(parent_code_expanded, 255 - source_child_bits[:, :, None]),
+            target_child_bits,
+        )
+
+        add_pattern_gain = occupancy_code_popularity.index_select(
+            0,
+            add_pattern_codes.reshape(-1).clamp(0, 255),
+        ).view(B, N, -1) - base_pattern_popularity[:, :, None]
+        move_pattern_gain = occupancy_code_popularity.index_select(
+            0,
+            move_pattern_codes.reshape(-1).clamp(0, 255),
+        ).view(B, N, -1) - base_pattern_popularity[:, :, None]
+
+        pattern_gain_scale = max(float(getattr(self.args, "repair_pattern_prior_scale", 6.0)), 0.0)
+        drop_pattern_prior = torch.tanh(drop_pattern_gain * pattern_gain_scale).unsqueeze(1)
+        add_pattern_prior = torch.tanh(add_pattern_gain * pattern_gain_scale)
+        move_pattern_prior = torch.tanh(move_pattern_gain * pattern_gain_scale)
+
+        leaf_target_direction_prior = self._leaf_pattern_target_direction_priors(
+            structure,
+            target_child_slots,
+            preserve,
+            leaf_actuator_prior=leaf_actuator_prior,
+        )
+        leaf_add_target_bias = leaf_target_direction_prior["add_target_bias"]
+        leaf_move_target_bias = leaf_target_direction_prior["move_target_bias"]
+
+        # leaf pattern診断を「参考bias」ではなく、操作候補集合の制限にも使う。
+        leaf_operation_masks = self._leaf_pattern_operation_masks(
+            structure,
+            preserve,
+        )
+        leaf_delete_op_mask = leaf_operation_masks["delete_mask"]
+        leaf_add_op_mask = leaf_operation_masks["add_mask"]
+        leaf_move_op_mask = leaf_operation_masks["move_mask"]
+
         child_slot_candidate_ratio = None
         if child_slot_mask is not None:
             child_slot_candidate_ratio = child_slot_mask.to(dtype=pts_xyz.dtype).mean()
         else:
             child_slot_candidate_ratio = pts_xyz.new_zeros(())
 
-        B, _, N = pts_xyz.shape
         if selection_mask is None:
             selection_bool = torch.ones((B, N), device=pts_xyz.device, dtype=torch.bool)
         else:
@@ -1589,6 +2259,19 @@ class StructureRepairActuator(nn.Module):
 
         voxel_point_counts = self._voxel_point_counts(voxel_coords, voxel_cache=voxel_cache).to(device=pts_xyz.device)
         before_occupied_voxels = self._unique_voxel_count_from_cache(voxel_cache, selection_bool)
+        (
+            drop_operation_gate,
+            add_operation_gate,
+            move_operation_gate,
+            operation_gate_prob,
+            operation_gate_hard,
+            operation_gate_logit,
+        ) = self._learned_operation_gates(
+            actuator_features,
+            prune_enabled=prune_enabled,
+            add_enabled=add_enabled,
+            move_enabled=disp_enabled,
+        )
 
         if timing_enabled:
             _mark_runtime("setup")
@@ -1610,6 +2293,13 @@ class StructureRepairActuator(nn.Module):
         )
         if full_context_available:
             delete_prior = delete_prior + 0.05 * full_context_bonus
+        if bool(leaf_actuator_prior.get("enabled", False)):
+            delete_prior = delete_prior + float(
+                getattr(self.args, "leaf_pattern_actuator_drop_weight", 0.75)
+            ) * leaf_drop_prior
+        delete_prior = delete_prior + float(
+            getattr(self.args, "repair_drop_pattern_prior_weight", 1.5)
+        ) * drop_pattern_prior
         # targetなしAmount学習では、Pruneの実行量をtarget_drop_ratioへ寄せない。
         # max_drop_ratioだけを0〜30%の探索上限として使う。
         target_drop_ratio = 0.0
@@ -1627,6 +2317,8 @@ class StructureRepairActuator(nn.Module):
             "repair_drop_amount_random_mix_start",
             "repair_drop_amount_random_mix_end",
         )
+        raw_learned_drop_ratio = learned_drop_ratio
+        learned_drop_ratio = learned_drop_ratio * drop_operation_gate
         learned_drop_ratio_for_ops = self._scale_amount_downstream_grad(
             learned_drop_ratio,
             op_name="drop",
@@ -1651,6 +2343,7 @@ class StructureRepairActuator(nn.Module):
         # hard削除数は整数なので、学習比率の値だけを使ってVoxel選択数へ変換する。
         learned_drop_ratio_value = float(learned_drop_ratio.detach().mean().cpu()) if prune_enabled else 0.0
         delete_prior = torch.sigmoid(delete_prior.clamp(-8.0, 8.0))
+        delete_prior = delete_prior * drop_operation_gate
         drop_score_noise = max(
             self._annealed_value("repair_drop_score_noise_start", "repair_drop_score_noise_end"),
             0.0,
@@ -1717,6 +2410,7 @@ class StructureRepairActuator(nn.Module):
                 + raw_proxy_grad_eps
                 * (raw_drop_logit_for_grad - raw_drop_logit_for_grad.detach())
             )
+        drop_prob_proxy = drop_prob_proxy * drop_operation_gate
         drop_prob = (repair_gate * delete_prior * learned_drop).clamp(0.0, 1.0)
         if prune_enabled and max_drop_ratio > 0.0:
             # ============================================================
@@ -1759,16 +2453,17 @@ class StructureRepairActuator(nn.Module):
             drop_prob_proxy = torch.zeros_like(drop_prob_proxy)
         drop_prob = self._voxel_mean_logits(drop_prob, voxel_coords, voxel_cache=voxel_cache).clamp(0.0, 1.0)
         drop_prob_raw_for_amount = drop_prob
-        # 削除は点単位ではなくcodec量子化step上のleaf voxel単位で決める。
-        # Octree occupancyはVoxelが1点でも残ると変わらないため、選択Voxel内の点をまとめて削除する。
         delete_candidate_mask = selection_bool.clone()
         delete_max_points = int(getattr(self.args, "repair_delete_max_points_per_voxel", 8))
         if delete_max_points > 0:
             delete_candidate_mask = delete_candidate_mask & (
                 voxel_point_counts.squeeze(1) <= float(delete_max_points)
             )
-        # Soft削除候補をHard削除候補と同じ候補集合に制限する。
-        # PruneはVoxel単位で削除するため、Soft側もVoxel単位の量として正規化する。
+
+        # leaf pattern診断がDeleteを推奨したnode/voxelだけをDelete source候補にする。
+        # これにより、圧縮率改善と無関係なDeleteを候補集合から除外する。
+        if bool(leaf_operation_masks.get("enabled", False)):
+            delete_candidate_mask = delete_candidate_mask & leaf_delete_op_mask.squeeze(1)
         delete_candidate_weight = delete_candidate_mask.unsqueeze(1).to(dtype=drop_prob.dtype)
 
         # voxel_point_counts は同一Voxel内の全点に同じ点数が入っている。
@@ -1901,6 +2596,7 @@ class StructureRepairActuator(nn.Module):
             selection_mask=delete_candidate_mask.unsqueeze(1),
             hard_threshold=float(getattr(self.args, "repair_drop_hard_threshold", 0.5)),
             voxel_cache=voxel_cache,
+            force_min_count=bool(getattr(self.args, "repair_force_min_drop_voxels", False)),
         )
         hard_drop = hard_drop_mask.to(dtype=pts_xyz.dtype)
         # Phase3: Pruneは点削除ではなく、対象点が属するoccupied voxelの削除候補として記録する。
@@ -1984,6 +2680,11 @@ class StructureRepairActuator(nn.Module):
         )
         if full_context_available:
             move_source_prior = (move_source_prior + 0.05 * full_context_bonus).clamp(0.0, 1.0)
+        if bool(leaf_actuator_prior.get("enabled", False)):
+            move_source_prior = torch.maximum(
+                move_source_prior,
+                float(getattr(self.args, "leaf_pattern_actuator_move_weight", 0.75)) * leaf_move_prior,
+            ).clamp(0.0, 1.0)
         prior_weight = float(getattr(self.args, "repair_move_source_prior_weight", 0.35))
         if sparsepcgc_context:
             prior_weight = max(
@@ -1995,6 +2696,19 @@ class StructureRepairActuator(nn.Module):
             if selection_mask is not None:
                 source_prior = source_prior * selection_mask.to(device=pts_xyz.device, dtype=pts_xyz.dtype)
             move_score = torch.maximum(move_score, source_prior * (1.0 - hard_drop))
+        move_pattern_source_prior = (
+            move_pattern_prior.masked_fill(~empty_target_mask, -1.0)
+            .amax(dim=2)
+            .clamp_min(0.0)
+            .unsqueeze(1)
+        )
+        move_score = torch.maximum(
+            move_score,
+            (
+                float(getattr(self.args, "repair_move_pattern_prior_weight", 1.25))
+                * move_pattern_source_prior
+            ).clamp(0.0, 1.0) * (1.0 - hard_drop),
+        )
         # targetなしAmount学習では、Moveの実行量をtarget_move_ratioへ寄せない。
         # max_move_ratioだけを0〜30%の探索上限として使う。
         target_move_ratio = 0.0
@@ -2012,6 +2726,7 @@ class StructureRepairActuator(nn.Module):
             "repair_move_amount_random_mix_start",
             "repair_move_amount_random_mix_end",
         )
+        raw_learned_move_ratio = learned_move_ratio
         # AdjustがHard実行0%に潰れるのを防ぐ。
         # forward値だけ下限を持たせ、backwardは元のlearned_move_ratioへ流す。
         move_ratio_floor = min(
@@ -2028,6 +2743,8 @@ class StructureRepairActuator(nn.Module):
                 + learned_move_ratio
                 - learned_move_ratio.detach()
             )
+        learned_move_ratio = learned_move_ratio * move_operation_gate
+        move_score = move_score * move_operation_gate
         learned_move_ratio_for_ops = self._scale_amount_downstream_grad(
             learned_move_ratio,
             op_name="move",
@@ -2097,6 +2814,14 @@ class StructureRepairActuator(nn.Module):
             valid_move_points = (~empty_target_mask) & (~dropped_target_mask)
         else:
             valid_move_points = torch.ones_like(empty_target_mask, dtype=torch.bool) & (~dropped_target_mask)
+
+        if (
+            bool(getattr(self.args, "leaf_pattern_target_direction_mask", False))
+            and bool(leaf_target_direction_prior.get("enabled", False))
+        ):
+            move_target_allowed = leaf_move_target_bias > 0
+            valid_move_points = valid_move_points & move_target_allowed
+
         has_valid_move_target = valid_move_points.any(dim=2).unsqueeze(1).to(dtype=move_score.dtype)
         if require_empty_move:
             move_target_valid = has_valid_move_target
@@ -2104,12 +2829,12 @@ class StructureRepairActuator(nn.Module):
         elif prefer_occupied_move:
             move_target_valid = has_valid_move_target
             move_score = move_score * has_valid_move_target
-        # 調整もsource voxelを先に選ぶ。Voxel内の一部だけを微小移動してもoccupancyが変わらないため、
-        # 選択source voxel内の点を同じtarget voxel候補へ移す方針にする。
-        # Adjust source候補を作る。
-        # まず、dropされておらず、移動先を少なくとも1つ持つ点を基本候補にする。
         base_move_candidate_mask = selection_bool & (~hard_drop_mask.squeeze(1))
         base_move_candidate_mask = base_move_candidate_mask & has_valid_move_target.squeeze(1).to(dtype=torch.bool)
+
+        # leaf pattern診断がMoveを推奨したnode/voxelだけをMove source候補にする。
+        if bool(leaf_operation_masks.get("enabled", False)):
+            base_move_candidate_mask = base_move_candidate_mask & leaf_move_op_mask.squeeze(1)
 
         move_candidate_mask = base_move_candidate_mask
         move_max_points = int(getattr(self.args, "repair_move_max_points_per_voxel", 8))
@@ -2209,7 +2934,20 @@ class StructureRepairActuator(nn.Module):
             op_name="move",
         )
         move_logits = self._voxel_mean_logits(move_logits, voxel_coords, voxel_cache=voxel_cache)
+
+        # Section5:
+        # best_move_target_child_slotと一致するtarget方向を強める。
+        # 方向そのものは上流の valid_move_points でmask済みである。
+        if bool(leaf_target_direction_prior.get("enabled", False)):
+            move_logits = move_logits + float(
+                getattr(self.args, "leaf_pattern_move_target_direction_weight", 1.25)
+            ) * leaf_move_target_bias.permute(0, 2, 1).to(
+                device=move_logits.device,
+                dtype=move_logits.dtype,
+            )
+
         move_valid_target = valid_move_points.transpose(1, 2)
+
         no_valid_move = ~move_valid_target.any(dim=1, keepdim=True)
         safe_valid_move = torch.where(no_valid_move, torch.ones_like(move_valid_target), move_valid_target)
         # float16でもoverflowしない負値を使う
@@ -2274,6 +3012,7 @@ class StructureRepairActuator(nn.Module):
             selection_mask=move_candidate_mask.unsqueeze(1),
             hard_threshold=float(getattr(self.args, "repair_move_hard_threshold", 0.5)),
             voxel_cache=voxel_cache,
+            force_min_count=bool(getattr(self.args, "repair_force_min_move_voxels", False)),
         )
         raw_hard_move_bool = raw_hard_move_mask.squeeze(1).detach().to(dtype=torch.bool)
 
@@ -2405,6 +3144,7 @@ class StructureRepairActuator(nn.Module):
             selection_mask=guarded_move_candidate_mask.unsqueeze(1),
             hard_threshold=float(getattr(self.args, "repair_move_hard_threshold", 0.5)),
             voxel_cache=voxel_cache,
+            force_min_count=bool(getattr(self.args, "repair_force_min_move_voxels", False)),
         )
         hard_move = hard_move_mask.to(dtype=pts_xyz.dtype)
         # Phase3: guard後に確定したHard Move sourceをVoxel編集状態用に保存する。
@@ -2561,6 +3301,7 @@ class StructureRepairActuator(nn.Module):
             "repair_add_amount_random_mix_start",
             "repair_add_amount_random_mix_end",
         )
+        raw_learned_add_ratio = learned_add_ratio
         add_ratio_floor_applied = False
         add_ratio_floor = min(max(float(getattr(self.args, "repair_add_ratio_floor", 0.0)), 0.0), max_add_ratio_value)
         if self.training and add_enabled and add_ratio_floor > 0.0:
@@ -2585,13 +3326,18 @@ class StructureRepairActuator(nn.Module):
                 .cpu()
                 .item()
             )
+        learned_add_ratio = learned_add_ratio * add_operation_gate
         learned_add_ratio_for_ops = self._scale_amount_downstream_grad(
             learned_add_ratio,
             op_name="add",
         )
         # hardなtop-k個数は整数なので、学習比率の値だけを候補数計算へ渡す。
         learned_add_ratio_value = float(learned_add_ratio.detach().mean().cpu()) if add_enabled else 0.0
-        add_k, add_candidate_ratio = self._target_add_count(N, candidate_ratio_override=learned_add_ratio_value)
+        add_k, add_candidate_ratio = self._target_add_count(
+            N,
+            candidate_ratio_override=learned_add_ratio_value,
+            force_min_count=bool(getattr(self.args, "repair_force_min_add_voxels", False)),
+        )
         add_ratio = pts_xyz.new_zeros(())
         add_ratio_loss = pts_xyz.new_zeros(())
         add_shape_guard = pts_xyz.new_zeros(())
@@ -2657,6 +3403,13 @@ class StructureRepairActuator(nn.Module):
             )
             if full_context_available:
                 add_prior = add_prior + 0.05 * full_context_bonus
+            if bool(leaf_actuator_prior.get("enabled", False)):
+                add_prior = add_prior + float(
+                    getattr(self.args, "leaf_pattern_actuator_add_weight", 0.50)
+                ) * leaf_add_prior
+            add_prior = add_prior + float(
+                getattr(self.args, "repair_add_pattern_prior_weight", 1.25)
+            ) * add_pattern_prior.clamp_min(0.0).amax(dim=2, keepdim=True).transpose(1, 2)
             if sparsepcgc_add_experiment_active and not bool(getattr(self.args, "sparsepcgc_add_use_candidate_score", True)):
                 add_prior = torch.zeros_like(add_prior)
             # Add量の学習結果を位置logitに足し、どのVoxelへ追加するかの勾配も残す。
@@ -2670,7 +3423,20 @@ class StructureRepairActuator(nn.Module):
             )
             add_logit = self._voxel_mean_logits(add_logit, voxel_coords, voxel_cache=voxel_cache)
             add_voxel_logits = self._voxel_mean_logits(add_voxel_logits, voxel_coords, voxel_cache=voxel_cache)
+
+            if bool(leaf_target_direction_prior.get("enabled", False)):
+                add_voxel_logits = add_voxel_logits + float(
+                    getattr(self.args, "leaf_pattern_add_target_direction_weight", 1.25)
+                ) * leaf_add_target_bias.permute(0, 2, 1).to(
+                    device=add_voxel_logits.device,
+                    dtype=add_voxel_logits.dtype,
+                )
+
             pair_logits = (add_voxel_logits + add_logit).permute(0, 2, 1).contiguous()
+
+            pair_logits = pair_logits + float(
+                getattr(self.args, "repair_add_pair_pattern_prior_weight", 2.0)
+            ) * add_pattern_prior
             if selection_mask is None:
                 base_valid = torch.ones((B, N), device=pts_xyz.device, dtype=torch.bool)
             else:
@@ -2680,9 +3446,18 @@ class StructureRepairActuator(nn.Module):
             base_valid = base_valid & (~hard_drop_mask.squeeze(1))
             if keep_threshold > 0.0:
                 base_valid = base_valid & (keep_prob.detach().squeeze(1) >= keep_threshold)
-            # 追加は空Voxelを選んで、そのVoxel中心に点を置く。
-            # 既存occupied voxelへ追加してもoccupancyが変わらず、Octree rateの改善信号が弱くなるため。
+
+            # leaf pattern診断がAddを推奨したnode/voxelだけをAdd source候補にする。
+            if bool(leaf_operation_masks.get("enabled", False)):
+                base_valid = base_valid & leaf_add_op_mask.squeeze(1)
             valid_pair = empty_target_mask & base_valid.unsqueeze(2)
+            if (
+                bool(getattr(self.args, "leaf_pattern_target_direction_mask", False))
+                and bool(leaf_target_direction_prior.get("enabled", False))
+            ):
+                add_target_allowed = leaf_add_target_bias > 0
+                valid_pair = valid_pair & add_target_allowed
+
             candidate_base_voxels_long = voxel_coords.transpose(1, 2).contiguous().unsqueeze(2)  # [B, N, 1, 3]
             candidate_offsets_long = neighbor_offsets_long.view(1, 1, -1, 3)                    # [1, 1, K, 3]
             candidate_target_voxels_long = candidate_base_voxels_long + candidate_offsets_long  # [B, N, K, 3]
@@ -2986,7 +3761,7 @@ class StructureRepairActuator(nn.Module):
             getattr(self.args, "operation_count_drop_threshold", getattr(self.args, "test_drop_threshold", 0.5))
         )
         hard_keep_mask = final_w.detach() >= hardening_threshold
-        after_occupied_voxels = self._unique_voxel_count(final_voxel_coords, hard_keep_mask)
+        point_aligned_after_occupied_voxels = self._unique_voxel_count(final_voxel_coords, hard_keep_mask)
         # Phase3: Prune/Add/Moveをoccupied voxel集合へ反映した最終Voxel状態を作る。
         # 既存のpts_out/final_wは変更しない。
         voxel_edit_debug_list = []
@@ -3118,6 +3893,7 @@ class StructureRepairActuator(nn.Module):
         sparsepcgc_guard_rejected_count_value = int(guard_rejected_bool.detach().sum().item())
         preserve_hard = (~hard_drop_mask) & (~hard_move_mask)
         preserve_ratio = preserve_hard.to(dtype=pts_xyz.dtype).mean()
+        after_occupied_voxels = voxel_edit_final_count_value if voxel_edit_state_enabled else point_aligned_after_occupied_voxels
 
         delta_norm = torch.linalg.norm(delta, dim=1, keepdim=True)
         voxel_norm_safe = voxel_norm.clamp_min(self._numeric_floor(voxel_norm, default=1e-6))
@@ -3816,10 +4592,35 @@ class StructureRepairActuator(nn.Module):
                     f"final_voxel_point_count={int(final_voxel_coords.shape[2])}, "
                     f"final_voxel_added_slots={int(final_voxel_coords.shape[2] - voxel_coords.shape[2])}"
                 )
-        # Phase2: 将来のVoxel/Octree出力を点群xyzへ戻すためのdebug経路。
-        # 既存のpts_out/gen_xyzは置き換えない。
+        # SparsePCGC/Voxel modeでは、Actuatorの公開出力もoccupied voxel状態から復元する。
+        # 点ごとのsoft座標差分はproxy勾配用に内部で使うだけで、出力点群にはしない。
+        voxel_restored_output_enabled = bool(
+            getattr(
+                self.args,
+                "repair_output_voxel_restored_points",
+                sparsepcgc_context and voxel_edit_state_enabled,
+            )
+        )
+        point_soft_delta_debug = delta
+        if voxel_restored_output_enabled and voxel_edit_state_enabled:
+            pts_out = self._voxel_centers_from_global_coords(
+                voxel_edit_final_coords,
+                voxel_step,
+                voxel_offset,
+                dtype=pts_xyz.dtype,
+            )
+            final_w = voxel_edit_final_weights.to(device=pts_xyz.device, dtype=pts_xyz.dtype)
+            delta = pts_xyz.new_zeros(pts_xyz.shape)
+            delta_norm = torch.zeros_like(delta_norm)
+            moved_delta_mean = pts_xyz.new_zeros(())
+
+        # Phase2: Voxel/Octree出力を点群xyzへ戻すためのdebug経路。
         canonical_voxel_coords_before = voxel_coords.detach()
-        canonical_voxel_coords_after = final_voxel_coords.detach()
+        canonical_voxel_coords_after = (
+            voxel_edit_final_coords.detach()
+            if voxel_edit_state_enabled
+            else final_voxel_coords.detach()
+        )
 
         voxel_restore_meta = {
             "global_qs": voxel_step.detach(),
@@ -3872,6 +4673,48 @@ class StructureRepairActuator(nn.Module):
             "actuator_ancestor_count": pts_xyz.new_tensor(float(actuator_ancestor_count)).detach(),
             "full_context_bonus_mean": full_context_bonus.mean().detach(),
             "child_slot_candidate_ratio": child_slot_candidate_ratio.detach(),
+            "full_context_bonus_mean": full_context_bonus.mean().detach(),
+
+            # Section4:
+            # leaf pattern priorがActuatorへ入っているか確認するdebug。
+            "leaf_actuator_prior_enabled": pts_xyz.new_tensor(
+                float(bool(leaf_actuator_prior.get("enabled", False)))
+            ).detach(),
+            "leaf_actuator_drop_prior_mean": pts_xyz.new_tensor(
+                float(leaf_actuator_prior.get("delete_prior_mean", 0.0))
+            ).detach(),
+            "leaf_actuator_add_prior_mean": pts_xyz.new_tensor(
+                float(leaf_actuator_prior.get("add_prior_mean", 0.0))
+            ).detach(),
+            "leaf_actuator_move_prior_mean": pts_xyz.new_tensor(
+                float(leaf_actuator_prior.get("move_prior_mean", 0.0))
+            ).detach(),
+            "leaf_actuator_best_prior_mean": pts_xyz.new_tensor(
+                float(leaf_actuator_prior.get("best_prior_mean", 0.0))
+            ).detach(),
+            "leaf_actuator_best_prior_max": pts_xyz.new_tensor(
+                float(leaf_actuator_prior.get("best_prior_max", 0.0))
+            ).detach(),
+
+            # Section5:
+            # leaf pattern診断がAdd/Move target方向へ反映されたか確認する。
+            "leaf_target_direction_prior_enabled": pts_xyz.new_tensor(
+                float(bool(leaf_target_direction_prior.get("enabled", False)))
+            ).detach(),
+            "leaf_add_target_match_ratio": pts_xyz.new_tensor(
+                float(leaf_target_direction_prior.get("add_target_match_ratio", 0.0))
+            ).detach(),
+            "leaf_move_target_match_ratio": pts_xyz.new_tensor(
+                float(leaf_target_direction_prior.get("move_target_match_ratio", 0.0))
+            ).detach(),
+            "leaf_add_target_bias_mean": pts_xyz.new_tensor(
+                float(leaf_target_direction_prior.get("add_target_bias_mean", 0.0))
+            ).detach(),
+            "leaf_move_target_bias_mean": pts_xyz.new_tensor(
+                float(leaf_target_direction_prior.get("move_target_bias_mean", 0.0))
+            ).detach(),
+
+            "child_slot_candidate_ratio": child_slot_candidate_ratio.detach(),
             "repair_gate": repair_gate.mean().detach(),
             # 既存keyの add_ratio は互換用に残すが、中身は学習用のsoft実行率にする。
             "add_ratio": add_ratio_soft.detach(),
@@ -3902,6 +4745,15 @@ class StructureRepairActuator(nn.Module):
                 add_target_soft_add.detach().sum()
                 - add_target_hard_add.detach().sum()
             ).abs(),
+            "operation_gate_prob": operation_gate_prob.detach(),
+            "operation_gate_hard": operation_gate_hard.detach(),
+            "operation_gate_logit": operation_gate_logit.detach(),
+            "drop_operation_gate": drop_operation_gate.detach().mean(),
+            "add_operation_gate": add_operation_gate.detach().mean(),
+            "move_operation_gate": move_operation_gate.detach().mean(),
+            "raw_learned_drop_ratio": raw_learned_drop_ratio.mean().detach(),
+            "raw_learned_add_ratio": raw_learned_add_ratio.mean().detach(),
+            "raw_learned_move_ratio": raw_learned_move_ratio.mean().detach(),
             "learned_drop_ratio": learned_drop_ratio.mean().detach(),
             "learned_drop_prob": learned_drop_prob.detach(),
             "drop_prob_mean": drop_prob.mean().detach(),
@@ -4124,6 +4976,47 @@ class StructureRepairActuator(nn.Module):
             "move_soft_value_mode": "soft_prune_source_and_soft_add_target",
             "child_slot_candidate_ratio": child_slot_candidate_ratio,
             "repair_gate": repair_gate,
+            "child_slot_candidate_ratio": child_slot_candidate_ratio,
+
+            # Section4:
+            # Network / train.py / CSVへ渡すためのleaf pattern actuator prior debug。
+            "leaf_actuator_prior_enabled": pts_xyz.new_tensor(
+                float(bool(leaf_actuator_prior.get("enabled", False)))
+            ),
+            "leaf_actuator_drop_prior_mean": pts_xyz.new_tensor(
+                float(leaf_actuator_prior.get("delete_prior_mean", 0.0))
+            ),
+            "leaf_actuator_add_prior_mean": pts_xyz.new_tensor(
+                float(leaf_actuator_prior.get("add_prior_mean", 0.0))
+            ),
+            "leaf_actuator_move_prior_mean": pts_xyz.new_tensor(
+                float(leaf_actuator_prior.get("move_prior_mean", 0.0))
+            ),
+            "leaf_actuator_best_prior_mean": pts_xyz.new_tensor(
+                float(leaf_actuator_prior.get("best_prior_mean", 0.0))
+            ),
+            "leaf_actuator_best_prior_max": pts_xyz.new_tensor(
+                float(leaf_actuator_prior.get("best_prior_max", 0.0))
+            ),
+
+            # Section5:
+            "leaf_target_direction_prior_enabled": pts_xyz.new_tensor(
+                float(bool(leaf_target_direction_prior.get("enabled", False)))
+            ),
+            "leaf_add_target_match_ratio": pts_xyz.new_tensor(
+                float(leaf_target_direction_prior.get("add_target_match_ratio", 0.0))
+            ),
+            "leaf_move_target_match_ratio": pts_xyz.new_tensor(
+                float(leaf_target_direction_prior.get("move_target_match_ratio", 0.0))
+            ),
+            "leaf_add_target_bias_mean": pts_xyz.new_tensor(
+                float(leaf_target_direction_prior.get("add_target_bias_mean", 0.0))
+            ),
+            "leaf_move_target_bias_mean": pts_xyz.new_tensor(
+                float(leaf_target_direction_prior.get("move_target_bias_mean", 0.0))
+            ),
+
+            "repair_gate": repair_gate,
             "drop_prob": drop_prob,
             "keep_prob": keep_prob,
             "drop_prob_direct": drop_prob_direct,
@@ -4189,6 +5082,15 @@ class StructureRepairActuator(nn.Module):
                 add_target_soft_add.detach().sum()
                 - add_target_hard_add.detach().sum()
             ).abs(),
+            "operation_gate_prob": operation_gate_prob,
+            "operation_gate_hard": operation_gate_hard.detach(),
+            "operation_gate_logit": operation_gate_logit,
+            "drop_operation_gate": drop_operation_gate.mean(),
+            "add_operation_gate": add_operation_gate.mean(),
+            "move_operation_gate": move_operation_gate.mean(),
+            "raw_learned_drop_ratio": raw_learned_drop_ratio.mean(),
+            "raw_learned_add_ratio": raw_learned_add_ratio.mean(),
+            "raw_learned_move_ratio": raw_learned_move_ratio.mean(),
             "learned_drop_ratio": learned_drop_ratio.mean(),
             "learned_drop_prob": learned_drop_prob,
             "drop_prob_mean": drop_prob.mean(),
@@ -4301,6 +5203,7 @@ class StructureRepairActuator(nn.Module):
             "force_joint_actuator": bool(force_joint_actuator),
             "threshold_cap_mode": bool(threshold_cap_mode),
             "delta": delta,
+            "point_soft_delta_debug": point_soft_delta_debug,
             "primitive_delta": primitive_delta,
             "move_ratio": hard_move.mean(),
             "hard_move_count": hard_move_count_value,
@@ -4390,6 +5293,10 @@ class StructureRepairActuator(nn.Module):
             "voxel_edit_drop_count": voxel_edit_drop_count_value,
             "voxel_edit_add_count": voxel_edit_add_count_value,
             "voxel_edit_move_count": voxel_edit_move_count_value,
+            "input_voxel_count": voxel_edit_initial_count_value,
+            "final_voxel_count": voxel_edit_final_count_value,
+            "before_occupied_voxel_count_for_stats": before_occupied_voxels,
+            "point_aligned_after_occupied_voxel_count": point_aligned_after_occupied_voxels,
             "voxel_edit_same_voxel_move_rejected": voxel_edit_same_voxel_move_rejected_value,
             "voxel_edit_existing_target_rejected": voxel_edit_existing_target_rejected_value,
             "voxel_edit_duplicate_target_rejected": voxel_edit_duplicate_target_rejected_value,
@@ -4430,6 +5337,7 @@ class StructureRepairActuator(nn.Module):
             "voxel_restore_meta": voxel_restore_meta,
             "restored_xyz_debug": restored_xyz_debug,
             "restore_info": restore_info,
+            "repair_output_voxel_restored_points": bool(voxel_restored_output_enabled),
             "final_voxel_update_mode": "occupied_voxel_edit_state_phase3",
             "final_voxel_recomputed_from_pts_out": False,
             "point_child_slots": point_child_slots,

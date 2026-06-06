@@ -1352,7 +1352,7 @@ class SurrogateCompressionLossMixin:
         soft_rate_proxy_grad_weight = max(
             float(getattr(args, "compression_soft_rate_proxy_grad_weight", 0.05)),
             0.0,
-        )
+        ) * float(main_grad_scale)
         soft_rate_proxy_ste = (
             soft_rate_proxy_grad_weight
             * (soft_rate_proxy_for_grad - soft_rate_proxy_for_grad.detach())
@@ -1362,7 +1362,7 @@ class SurrogateCompressionLossMixin:
         prune_rate_proxy_grad_weight = max(
             float(getattr(args, "compression_soft_prune_rate_proxy_grad_weight", 10.0)),
             0.0,
-        )
+        ) * float(main_grad_scale)
         soft_prune_rate_ste = (
             prune_rate_proxy_grad_weight * (prune_com_proxy - prune_com_proxy.detach())
             if inputs_finite and prune_com_proxy.requires_grad and prune_rate_proxy_grad_weight > 0.0
@@ -1474,25 +1474,52 @@ class SurrogateCompressionLossMixin:
             bool(actual_value_source == "fresh_teacher"),
         )
         sparsepcgc_aux_gating = bool(getattr(args, "sparsepcgc_aux_gating", True))
+        sparsepcgc_aux_gate_mode = str(getattr(args, "sparsepcgc_aux_gate_mode", "hard")).strip().lower()
         sparsepcgc_aux_min_corr = float(getattr(args, "sparsepcgc_aux_min_corr", 0.30))
         sparsepcgc_aux_min_sign = float(getattr(args, "sparsepcgc_aux_min_sign_match", 0.50))
         sparsepcgc_aux_used_for_backprop = bool(sparsepcgc_aux_backprop_requested)
         sparsepcgc_aux_gating_reason = "disabled_by_arg"
+        sparsepcgc_aux_gate_multiplier = 1.0 if sparsepcgc_aux_used_for_backprop else 0.0
         if sparsepcgc_aux_backprop_requested and sparsepcgc_aux_gating:
-            if sparse_corr is None or sparse_sign_match is None:
-                sparsepcgc_aux_used_for_backprop = False
-                sparsepcgc_aux_gating_reason = "insufficient_rolling_pairs"
-            elif sparse_corr < sparsepcgc_aux_min_corr:
-                sparsepcgc_aux_used_for_backprop = False
-                sparsepcgc_aux_gating_reason = "corr_below_threshold"
-            elif sparse_sign_match < sparsepcgc_aux_min_sign:
-                sparsepcgc_aux_used_for_backprop = False
-                sparsepcgc_aux_gating_reason = "sign_match_below_threshold"
+            if sparsepcgc_aux_gate_mode == "soft":
+                min_mult = min(max(float(getattr(args, "sparsepcgc_aux_soft_min_weight", 0.05)), 0.0), 1.0)
+                if sparse_corr is None or sparse_sign_match is None:
+                    sparsepcgc_aux_gate_multiplier = min_mult
+                    sparsepcgc_aux_gating_reason = "soft_insufficient_rolling_pairs"
+                else:
+                    corr_denom = max(1.0 - sparsepcgc_aux_min_corr, 1e-6)
+                    sign_denom = max(1.0 - sparsepcgc_aux_min_sign, 1e-6)
+                    corr_quality = min(max((float(sparse_corr) - sparsepcgc_aux_min_corr) / corr_denom, 0.0), 1.0)
+                    sign_quality = min(max((float(sparse_sign_match) - sparsepcgc_aux_min_sign) / sign_denom, 0.0), 1.0)
+                    quality = min(corr_quality, sign_quality)
+                    sparsepcgc_aux_gate_multiplier = min_mult + (1.0 - min_mult) * quality
+                    if quality >= 1.0:
+                        sparsepcgc_aux_gating_reason = "soft_passed"
+                    elif sparse_corr < sparsepcgc_aux_min_corr:
+                        sparsepcgc_aux_gating_reason = "soft_corr_scaled"
+                    elif sparse_sign_match < sparsepcgc_aux_min_sign:
+                        sparsepcgc_aux_gating_reason = "soft_sign_match_scaled"
+                    else:
+                        sparsepcgc_aux_gating_reason = "soft_partial"
+                sparsepcgc_aux_used_for_backprop = bool(sparsepcgc_aux_gate_multiplier > 0.0)
             else:
-                sparsepcgc_aux_gating_reason = "passed"
+                if sparse_corr is None or sparse_sign_match is None:
+                    sparsepcgc_aux_used_for_backprop = False
+                    sparsepcgc_aux_gate_multiplier = 0.0
+                    sparsepcgc_aux_gating_reason = "insufficient_rolling_pairs"
+                elif sparse_corr < sparsepcgc_aux_min_corr:
+                    sparsepcgc_aux_used_for_backprop = False
+                    sparsepcgc_aux_gate_multiplier = 0.0
+                    sparsepcgc_aux_gating_reason = "corr_below_threshold"
+                elif sparse_sign_match < sparsepcgc_aux_min_sign:
+                    sparsepcgc_aux_used_for_backprop = False
+                    sparsepcgc_aux_gate_multiplier = 0.0
+                    sparsepcgc_aux_gating_reason = "sign_match_below_threshold"
+                else:
+                    sparsepcgc_aux_gating_reason = "passed"
         elif sparsepcgc_aux_backprop_requested:
             sparsepcgc_aux_gating_reason = "gating_disabled"
-        sparsepcgc_aux_weight_effective = sparsepcgc_aux_weight if sparsepcgc_aux_used_for_backprop else 0.0
+        sparsepcgc_aux_weight_effective = sparsepcgc_aux_weight * sparsepcgc_aux_gate_multiplier if sparsepcgc_aux_used_for_backprop else 0.0
         sparse_aux_objective = sparsepcgc_aux_weight_effective * sparse_aux_raw if sparsepcgc_aux_used_for_backprop else sparse_aux_loss.new_zeros(())
         sparse_aux_term = sparse_terms["loss"] if sparsepcgc_aux_used_for_backprop else sparse_terms["loss"].detach().new_zeros(())
         proxy_aux_for_grad = sparse_aux_objective if sparsepcgc_aux_used_for_backprop else sparse_aux_loss.new_zeros(())
@@ -1672,6 +1699,8 @@ class SurrogateCompressionLossMixin:
             "sparsepcgc_aux_backprop": bool(sparsepcgc_aux_backprop_requested),
             "sparsepcgc_aux_used_for_backprop": bool(sparsepcgc_aux_used_for_backprop),
             "sparsepcgc_aux_gating_enabled": bool(sparsepcgc_aux_gating),
+            "sparsepcgc_aux_gate_mode": str(sparsepcgc_aux_gate_mode),
+            "sparsepcgc_aux_gate_multiplier": float(sparsepcgc_aux_gate_multiplier),
             "sparsepcgc_aux_gating_reason": str(sparsepcgc_aux_gating_reason),
             "corr_sparsepcgc_aux_actual_rolling": None if sparse_corr is None else float(sparse_corr),
             "sign_match_sparsepcgc_aux_actual_rolling": None if sparse_sign_match is None else float(sparse_sign_match),

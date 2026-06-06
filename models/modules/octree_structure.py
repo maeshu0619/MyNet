@@ -337,6 +337,7 @@ class OctreeStructureAnalysis(nn.Module):
         full_octree_context=None,
         point_feature_voxel_key=None,
         prebuilt_ctx=None,
+        leaf_pattern_diag=None,
     ):
         if not bool(getattr(self.args, "octree_structure_node_descriptor", True)):
             return None
@@ -390,6 +391,17 @@ class OctreeStructureAnalysis(nn.Module):
 
         if oct_ctx is not None and torch.is_tensor(oct_ctx):
             desc["oct_ctx"] = oct_ctx
+
+        # Section1:
+        # 後続のSectionでActuatorやCostAttributionへ渡せるよう、
+        # leaf pattern診断をdescriptorにも保持する。
+        if isinstance(leaf_pattern_diag, dict):
+            desc["leaf_pattern_diag"] = leaf_pattern_diag
+            desc["leaf_pattern_available"] = bool(leaf_pattern_diag.get("available", False))
+            desc["leaf_parent_pattern_code"] = leaf_pattern_diag.get("parent_pattern_code", None)
+            desc["leaf_child_slot"] = leaf_pattern_diag.get("child_slot", None)
+            desc["leaf_parent_pattern_frequency"] = leaf_pattern_diag.get("parent_pattern_frequency", None)
+            desc["leaf_parent_pattern_nll"] = leaf_pattern_diag.get("parent_pattern_nll", None)
 
         return desc
 
@@ -489,6 +501,780 @@ class OctreeStructureAnalysis(nn.Module):
             + coords_n3[:, 2] * 83492791
         ).view(1, -1).contiguous()
 
+    def _empty_leaf_pattern_diagnosis(self, pts_xyz, reason="disabled"):
+        """
+        Section1:
+        leaf pattern診断が使えない場合でも、後段が同じkeyで参照できるように空診断を返す。
+        ここでは学習挙動を変えないため、すべてdebug/将来拡張用の値として保持する。
+        """
+        B, _, N = pts_xyz.shape
+        device = pts_xyz.device
+        dtype = pts_xyz.dtype
+
+        return {
+            "available": False,
+            "reason": str(reason),
+            "source": "none",
+            "voxel_coords": None,
+            "parent_coords": None,
+            "child_slot": torch.full((B, N), -1, device=device, dtype=torch.long),
+            "parent_pattern_code": torch.zeros((B, N), device=device, dtype=torch.long),
+            "parent_child_count": torch.zeros((B, N), device=device, dtype=dtype),
+            "parent_pattern_frequency": torch.zeros((B, N), device=device, dtype=dtype),
+            "parent_pattern_nll": torch.zeros((B, N), device=device, dtype=dtype),
+            "unique_parent_count": 0,
+            "unique_pattern_count": 0,
+            "mean_child_count": 0.0,
+            "single_child_parent_ratio": 0.0,
+            "max_pattern_frequency": 0.0,
+
+            # Section2:
+            # Delete/Add/Move候補ごとのpattern頻度改善・NLL改善。
+            "delete_pattern_gain": torch.zeros((B, N), device=device, dtype=dtype),
+            "add_pattern_gain": torch.zeros((B, N), device=device, dtype=dtype),
+            "move_pattern_gain": torch.zeros((B, N), device=device, dtype=dtype),
+            "delete_nll_gain": torch.zeros((B, N), device=device, dtype=dtype),
+            "add_nll_gain": torch.zeros((B, N), device=device, dtype=dtype),
+            "move_nll_gain": torch.zeros((B, N), device=device, dtype=dtype),
+            "delete_valid_mask": torch.zeros((B, N), device=device, dtype=torch.bool),
+            "add_valid_mask": torch.zeros((B, N), device=device, dtype=torch.bool),
+            "move_valid_mask": torch.zeros((B, N), device=device, dtype=torch.bool),
+            "best_add_child_slot": torch.full((B, N), -1, device=device, dtype=torch.long),
+            "best_move_target_child_slot": torch.full((B, N), -1, device=device, dtype=torch.long),
+            "best_operation_hint": torch.zeros((B, N), device=device, dtype=torch.long),
+            "delete_gain_mean": 0.0,
+            "add_gain_mean": 0.0,
+            "move_gain_mean": 0.0,
+            "high_gain_candidate_ratio": 0.0,
+            "candidate_available": False,
+
+            # Section3:
+            "leaf_feature_integration_used": False,
+            "leaf_feature_best_gain_mean": 0.0,
+            "leaf_feature_best_gain_max": 0.0,
+        }
+
+    def _leaf_pattern_diagnosis_from_coords(
+        self,
+        pts_xyz,
+        coords_b3n,
+        *,
+        source="global_voxel_coords",
+    ):
+        """
+        Section1:
+        canonical voxel coordsから、各occupied voxelが属するparent nodeとchild slotを求める。
+        さらにparentごとの8-child occupancy patternを作る。
+
+        ここで得る値:
+        - parent_coords
+        - child_slot
+        - parent_pattern_code
+        - parent_child_count
+        - parent_pattern_frequency
+        - parent_pattern_nll
+
+        注意:
+        Section1では損失や操作選択には使わない。
+        まずdebug可能な診断情報として外へ出すだけである。
+        """
+        if not bool(getattr(self.args, "leaf_pattern_diagnosis", True)):
+            return self._empty_leaf_pattern_diagnosis(
+                pts_xyz,
+                reason="disabled_by_args",
+            )
+
+        if coords_b3n is None or not torch.is_tensor(coords_b3n):
+            return self._empty_leaf_pattern_diagnosis(
+                pts_xyz,
+                reason="coords_missing",
+            )
+
+        B, _, N = pts_xyz.shape
+        device = pts_xyz.device
+        dtype = pts_xyz.dtype
+
+        if coords_b3n.ndim == 2:
+            coords_n3 = self._normalize_global_coords_n3(
+                coords_b3n,
+                point_count=N,
+                device=device,
+            )
+            if coords_n3 is None:
+                return self._empty_leaf_pattern_diagnosis(
+                    pts_xyz,
+                    reason="coords_normalize_failed",
+                )
+            coords_b3n = coords_n3.transpose(0, 1).contiguous().unsqueeze(0)
+
+        elif coords_b3n.ndim == 3:
+            if coords_b3n.shape[1] == 3:
+                coords_b3n = coords_b3n.to(device=device, dtype=torch.long).contiguous()
+            elif coords_b3n.shape[2] == 3:
+                coords_b3n = coords_b3n.to(device=device, dtype=torch.long).permute(0, 2, 1).contiguous()
+            else:
+                return self._empty_leaf_pattern_diagnosis(
+                    pts_xyz,
+                    reason=f"invalid_coords_shape={tuple(coords_b3n.shape)}",
+                )
+        else:
+            return self._empty_leaf_pattern_diagnosis(
+                pts_xyz,
+                reason=f"invalid_coords_ndim={coords_b3n.ndim}",
+            )
+
+        if coords_b3n.shape[0] == 1 and B > 1:
+            coords_b3n = coords_b3n.expand(B, -1, -1).contiguous()
+
+        if coords_b3n.shape[0] != B:
+            return self._empty_leaf_pattern_diagnosis(
+                pts_xyz,
+                reason=f"batch_mismatch={coords_b3n.shape[0]}!={B}",
+            )
+
+        if coords_b3n.shape[-1] != N:
+            fixed = []
+            for b in range(B):
+                fixed_b = self._fit_point_rows(
+                    coords_b3n[b].transpose(0, 1).contiguous(),
+                    N,
+                )
+                fixed.append(fixed_b.transpose(0, 1).contiguous())
+            coords_b3n = torch.stack(fixed, dim=0).to(device=device, dtype=torch.long)
+
+        child_slot_list = []
+        parent_code_list = []
+        parent_count_list = []
+        parent_freq_list = []
+        parent_nll_list = []
+        parent_coords_point_list = []
+        delete_pattern_gain_list = []
+        add_pattern_gain_list = []
+        move_pattern_gain_list = []
+        delete_nll_gain_list = []
+        add_nll_gain_list = []
+        move_nll_gain_list = []
+        delete_valid_mask_list = []
+        add_valid_mask_list = []
+        move_valid_mask_list = []
+        best_add_child_slot_list = []
+        best_move_target_child_slot_list = []
+        best_operation_hint_list = []
+
+        delete_gain_mean_values = []
+        add_gain_mean_values = []
+        move_gain_mean_values = []
+        high_gain_candidate_ratio_values = []
+        delete_pattern_gain_list = []
+        add_pattern_gain_list = []
+        move_pattern_gain_list = []
+        delete_nll_gain_list = []
+        add_nll_gain_list = []
+        move_nll_gain_list = []
+        delete_valid_mask_list = []
+        add_valid_mask_list = []
+        move_valid_mask_list = []
+        best_add_child_slot_list = []
+        best_move_target_child_slot_list = []
+        best_operation_hint_list = []
+
+        delete_gain_mean_values = []
+        add_gain_mean_values = []
+        move_gain_mean_values = []
+        high_gain_candidate_ratio_values = []
+
+        unique_parent_count_max = 0
+        unique_pattern_count_max = 0
+        mean_child_count_values = []
+        single_child_ratio_values = []
+        max_pattern_frequency_values = []
+
+        pattern_weights = (2 ** torch.arange(8, device=device, dtype=torch.long)).view(1, 8)
+
+        for b in range(B):
+            coords_n3 = coords_b3n[b].transpose(0, 1).contiguous().to(dtype=torch.long)
+
+            if coords_n3.numel() <= 0:
+                child_slot_list.append(torch.full((N,), -1, device=device, dtype=torch.long))
+                parent_code_list.append(torch.zeros((N,), device=device, dtype=torch.long))
+                parent_count_list.append(torch.zeros((N,), device=device, dtype=dtype))
+                parent_freq_list.append(torch.zeros((N,), device=device, dtype=dtype))
+                parent_nll_list.append(torch.zeros((N,), device=device, dtype=dtype))
+                parent_coords_point_list.append(torch.zeros((3, N), device=device, dtype=torch.long))
+
+                delete_pattern_gain_list.append(torch.zeros((N,), device=device, dtype=dtype))
+                add_pattern_gain_list.append(torch.zeros((N,), device=device, dtype=dtype))
+                move_pattern_gain_list.append(torch.zeros((N,), device=device, dtype=dtype))
+                delete_nll_gain_list.append(torch.zeros((N,), device=device, dtype=dtype))
+                add_nll_gain_list.append(torch.zeros((N,), device=device, dtype=dtype))
+                move_nll_gain_list.append(torch.zeros((N,), device=device, dtype=dtype))
+                delete_valid_mask_list.append(torch.zeros((N,), device=device, dtype=torch.bool))
+                add_valid_mask_list.append(torch.zeros((N,), device=device, dtype=torch.bool))
+                move_valid_mask_list.append(torch.zeros((N,), device=device, dtype=torch.bool))
+                best_add_child_slot_list.append(torch.full((N,), -1, device=device, dtype=torch.long))
+                best_move_target_child_slot_list.append(torch.full((N,), -1, device=device, dtype=torch.long))
+                best_operation_hint_list.append(torch.zeros((N,), device=device, dtype=torch.long))
+                continue
+
+            parent_coords = torch.div(coords_n3, 2, rounding_mode="floor")
+            unique_parents, inverse = torch.unique(
+                parent_coords,
+                dim=0,
+                sorted=True,
+                return_inverse=True,
+            )
+
+            child_slot = (
+                (coords_n3[:, 0] & 1)
+                + 2 * (coords_n3[:, 1] & 1)
+                + 4 * (coords_n3[:, 2] & 1)
+            ).to(dtype=torch.long)
+
+            occupancy = torch.zeros(
+                (unique_parents.shape[0], 8),
+                device=device,
+                dtype=torch.bool,
+            )
+            occupancy[inverse, child_slot] = True
+
+            parent_pattern_code_unique = (
+                occupancy.to(dtype=torch.long) * pattern_weights
+            ).sum(dim=1)
+
+            child_count_unique = occupancy.sum(dim=1).to(dtype=dtype)
+            pattern_hist = torch.bincount(
+                parent_pattern_code_unique,
+                minlength=256,
+            ).to(device=device, dtype=dtype)
+
+            parent_count = max(int(unique_parents.shape[0]), 1)
+            parent_pattern_frequency_unique = (
+                pattern_hist.index_select(0, parent_pattern_code_unique)
+                / float(parent_count)
+            ).clamp(0.0, 1.0)
+
+            parent_pattern_nll_unique = -torch.log2(
+                parent_pattern_frequency_unique.clamp_min(torch.finfo(dtype).eps)
+            )
+
+            parent_coords_point = unique_parents.index_select(0, inverse).transpose(0, 1).contiguous()
+            parent_code_point = parent_pattern_code_unique.index_select(0, inverse)
+            child_count_point = child_count_unique.index_select(0, inverse)
+            pattern_freq_point = parent_pattern_frequency_unique.index_select(0, inverse)
+            pattern_nll_point = parent_pattern_nll_unique.index_select(0, inverse)
+            candidate_scores = self._leaf_pattern_candidate_scores_single(
+                parent_pattern_code_unique,
+                child_count_unique,
+                child_slot,
+                inverse,
+                device=device,
+                dtype=dtype,
+            )
+
+            child_slot_list.append(child_slot)
+            parent_code_list.append(parent_code_point)
+            parent_count_list.append(child_count_point)
+            parent_freq_list.append(pattern_freq_point)
+            parent_nll_list.append(pattern_nll_point)
+            parent_coords_point_list.append(parent_coords_point)
+            delete_pattern_gain_list.append(candidate_scores["delete_pattern_gain"])
+            add_pattern_gain_list.append(candidate_scores["add_pattern_gain"])
+            move_pattern_gain_list.append(candidate_scores["move_pattern_gain"])
+            delete_nll_gain_list.append(candidate_scores["delete_nll_gain"])
+            add_nll_gain_list.append(candidate_scores["add_nll_gain"])
+            move_nll_gain_list.append(candidate_scores["move_nll_gain"])
+            delete_valid_mask_list.append(candidate_scores["delete_valid_mask"])
+            add_valid_mask_list.append(candidate_scores["add_valid_mask"])
+            move_valid_mask_list.append(candidate_scores["move_valid_mask"])
+            best_add_child_slot_list.append(candidate_scores["best_add_child_slot"])
+            best_move_target_child_slot_list.append(candidate_scores["best_move_target_child_slot"])
+            best_operation_hint_list.append(candidate_scores["best_operation_hint"])
+
+            unique_parent_count_max = max(unique_parent_count_max, int(unique_parents.shape[0]))
+            unique_pattern_count_max = max(
+                unique_pattern_count_max,
+                int(torch.unique(parent_pattern_code_unique).numel()),
+            )
+            mean_child_count_values.append(float(child_count_unique.detach().float().mean().cpu()))
+            single_child_ratio_values.append(float((child_count_unique <= 1.0).detach().float().mean().cpu()))
+            max_pattern_frequency_values.append(float(parent_pattern_frequency_unique.detach().float().max().cpu()))
+            gain_threshold = float(getattr(self.args, "leaf_pattern_candidate_gain_threshold", 0.05))
+            delete_gain = candidate_scores["delete_nll_gain"].detach().float()
+            add_gain = candidate_scores["add_nll_gain"].detach().float()
+            move_gain = candidate_scores["move_nll_gain"].detach().float()
+            best_gain = torch.maximum(torch.maximum(delete_gain, add_gain), move_gain)
+
+            delete_gain_mean_values.append(float(delete_gain.mean().cpu()) if delete_gain.numel() > 0 else 0.0)
+            add_gain_mean_values.append(float(add_gain.mean().cpu()) if add_gain.numel() > 0 else 0.0)
+            move_gain_mean_values.append(float(move_gain.mean().cpu()) if move_gain.numel() > 0 else 0.0)
+            high_gain_candidate_ratio_values.append(
+                float((best_gain > gain_threshold).to(torch.float32).mean().cpu())
+                if best_gain.numel() > 0
+                else 0.0
+            )
+
+        child_slot_out = torch.stack(child_slot_list, dim=0)
+        parent_code_out = torch.stack(parent_code_list, dim=0)
+        parent_count_out = torch.stack(parent_count_list, dim=0)
+        parent_freq_out = torch.stack(parent_freq_list, dim=0)
+        parent_nll_out = torch.stack(parent_nll_list, dim=0)
+        parent_coords_out = torch.stack(parent_coords_point_list, dim=0)
+        delete_pattern_gain_out = torch.stack(delete_pattern_gain_list, dim=0)
+        add_pattern_gain_out = torch.stack(add_pattern_gain_list, dim=0)
+        move_pattern_gain_out = torch.stack(move_pattern_gain_list, dim=0)
+        delete_nll_gain_out = torch.stack(delete_nll_gain_list, dim=0)
+        add_nll_gain_out = torch.stack(add_nll_gain_list, dim=0)
+        move_nll_gain_out = torch.stack(move_nll_gain_list, dim=0)
+        delete_valid_mask_out = torch.stack(delete_valid_mask_list, dim=0)
+        add_valid_mask_out = torch.stack(add_valid_mask_list, dim=0)
+        move_valid_mask_out = torch.stack(move_valid_mask_list, dim=0)
+        best_add_child_slot_out = torch.stack(best_add_child_slot_list, dim=0)
+        best_move_target_child_slot_out = torch.stack(best_move_target_child_slot_list, dim=0)
+        best_operation_hint_out = torch.stack(best_operation_hint_list, dim=0)
+
+        return {
+            "available": True,
+            "reason": "",
+            "source": str(source),
+            "voxel_coords": coords_b3n.detach(),
+            "parent_coords": parent_coords_out.detach(),
+            "child_slot": child_slot_out.detach(),
+            "parent_pattern_code": parent_code_out.detach(),
+            "parent_child_count": parent_count_out.detach(),
+            "parent_pattern_frequency": parent_freq_out.detach(),
+            "parent_pattern_nll": parent_nll_out.detach(),
+            "unique_parent_count": int(unique_parent_count_max),
+            "unique_pattern_count": int(unique_pattern_count_max),
+            "mean_child_count": float(sum(mean_child_count_values) / max(len(mean_child_count_values), 1)),
+            "single_child_parent_ratio": float(sum(single_child_ratio_values) / max(len(single_child_ratio_values), 1)),
+            "max_pattern_frequency": float(sum(max_pattern_frequency_values) / max(len(max_pattern_frequency_values), 1)),
+
+            "delete_pattern_gain": delete_pattern_gain_out.detach(),
+            "add_pattern_gain": add_pattern_gain_out.detach(),
+            "move_pattern_gain": move_pattern_gain_out.detach(),
+            "delete_nll_gain": delete_nll_gain_out.detach(),
+            "add_nll_gain": add_nll_gain_out.detach(),
+            "move_nll_gain": move_nll_gain_out.detach(),
+            "delete_valid_mask": delete_valid_mask_out.detach(),
+            "add_valid_mask": add_valid_mask_out.detach(),
+            "move_valid_mask": move_valid_mask_out.detach(),
+            "best_add_child_slot": best_add_child_slot_out.detach(),
+            "best_move_target_child_slot": best_move_target_child_slot_out.detach(),
+            "best_operation_hint": best_operation_hint_out.detach(),
+            "delete_gain_mean": float(sum(delete_gain_mean_values) / max(len(delete_gain_mean_values), 1)),
+            "add_gain_mean": float(sum(add_gain_mean_values) / max(len(add_gain_mean_values), 1)),
+            "move_gain_mean": float(sum(move_gain_mean_values) / max(len(move_gain_mean_values), 1)),
+            "high_gain_candidate_ratio": float(sum(high_gain_candidate_ratio_values) / max(len(high_gain_candidate_ratio_values), 1)),
+            "candidate_available": bool(getattr(self.args, "leaf_pattern_candidate_diagnosis", True)),
+        }
+
+    def _leaf_pattern_candidate_scores_single(
+        self,
+        parent_pattern_code_unique,
+        child_count_unique,
+        child_slot,
+        inverse,
+        *,
+        device,
+        dtype,
+    ):
+        """
+        Section2/3:
+        parent occupancy codeに対して、Delete/Add/Move後のpattern NLL改善量を作る。
+        ここでは操作は実行せず、CostAttributionへ渡すための診断特徴だけを作る。
+        """
+        point_count = int(child_slot.numel())
+        if point_count <= 0 or parent_pattern_code_unique.numel() <= 0:
+            z = torch.zeros((point_count,), device=device, dtype=dtype)
+            b = torch.zeros((point_count,), device=device, dtype=torch.bool)
+            m1 = torch.full((point_count,), -1, device=device, dtype=torch.long)
+            return {
+                "delete_pattern_gain": z,
+                "add_pattern_gain": z,
+                "move_pattern_gain": z,
+                "delete_nll_gain": z,
+                "add_nll_gain": z,
+                "move_nll_gain": z,
+                "delete_valid_mask": b,
+                "add_valid_mask": b,
+                "move_valid_mask": b,
+                "best_add_child_slot": m1,
+                "best_move_target_child_slot": m1,
+                "best_operation_hint": torch.zeros((point_count,), device=device, dtype=torch.long),
+            }
+
+        smoothing = max(float(getattr(self.args, "leaf_pattern_candidate_smoothing", 1.0)), 0.0)
+
+        code_hist = torch.bincount(
+            parent_pattern_code_unique.clamp(0, 255),
+            minlength=256,
+        ).to(device=device, dtype=dtype)
+
+        code_prob = code_hist + float(smoothing)
+        code_prob = code_prob / code_prob.sum().clamp_min(torch.finfo(dtype).eps)
+        code_nll = -torch.log2(code_prob.clamp_min(torch.finfo(dtype).eps))
+
+        current_code = parent_pattern_code_unique.index_select(0, inverse).clamp(0, 255)
+        current_prob = code_prob.index_select(0, current_code)
+        current_nll = code_nll.index_select(0, current_code)
+
+        child_slot = child_slot.clamp(0, 7)
+        child_bit = (1 << child_slot).to(device=device, dtype=torch.long)
+
+        point_child_count = child_count_unique.index_select(0, inverse).to(dtype=dtype)
+
+        # Delete候補
+        delete_code = torch.bitwise_and(
+            current_code,
+            torch.bitwise_not(child_bit),
+        ).clamp(0, 255)
+
+        delete_prob = code_prob.index_select(0, delete_code)
+        delete_nll = code_nll.index_select(0, delete_code)
+
+        delete_pattern_gain = torch.log2(delete_prob.clamp_min(torch.finfo(dtype).eps)) - torch.log2(
+            current_prob.clamp_min(torch.finfo(dtype).eps)
+        )
+        delete_nll_gain = current_nll - delete_nll
+
+        min_children_after = max(int(getattr(self.args, "leaf_pattern_delete_min_children_after", 1)), 0)
+        delete_valid_mask = (point_child_count - 1.0) >= float(min_children_after)
+        delete_pattern_gain = torch.where(delete_valid_mask, delete_pattern_gain, torch.zeros_like(delete_pattern_gain))
+        delete_nll_gain = torch.where(delete_valid_mask, delete_nll_gain, torch.zeros_like(delete_nll_gain))
+
+        # Add / Move候補
+        slot_values = torch.arange(8, device=device, dtype=torch.long).view(1, 8)
+        slot_bits = (1 << slot_values).to(dtype=torch.long)
+
+        current_code_2d = current_code.view(-1, 1)
+        current_prob_2d = current_prob.view(-1, 1)
+        current_nll_2d = current_nll.view(-1, 1)
+
+        empty_slot_mask = torch.bitwise_and(current_code_2d, slot_bits) == 0
+
+        add_code_all = torch.bitwise_or(current_code_2d, slot_bits).clamp(0, 255)
+        add_prob_all = code_prob.index_select(0, add_code_all.reshape(-1)).view(point_count, 8)
+        add_nll_all = code_nll.index_select(0, add_code_all.reshape(-1)).view(point_count, 8)
+
+        add_pattern_gain_all = torch.log2(add_prob_all.clamp_min(torch.finfo(dtype).eps)) - torch.log2(
+            current_prob_2d.clamp_min(torch.finfo(dtype).eps)
+        )
+        add_nll_gain_all = current_nll_2d - add_nll_all
+
+        very_bad = torch.full_like(add_nll_gain_all, -1.0e6)
+        add_score_all = torch.where(empty_slot_mask, add_nll_gain_all, very_bad)
+        add_nll_gain, best_add_slot = add_score_all.max(dim=1)
+        add_valid_mask = empty_slot_mask.any(dim=1)
+        best_add_slot = torch.where(add_valid_mask, best_add_slot, torch.full_like(best_add_slot, -1))
+
+        safe_add_slot = best_add_slot.clamp_min(0).view(-1, 1)
+        add_pattern_gain = add_pattern_gain_all.gather(1, safe_add_slot).view(-1)
+        add_pattern_gain = torch.where(add_valid_mask, add_pattern_gain, torch.zeros_like(add_pattern_gain))
+        add_nll_gain = torch.where(add_valid_mask, add_nll_gain, torch.zeros_like(add_nll_gain))
+
+        source_removed_code = torch.bitwise_and(
+            current_code,
+            torch.bitwise_not(child_bit),
+        ).view(-1, 1)
+
+        move_code_all = torch.bitwise_or(source_removed_code, slot_bits).clamp(0, 255)
+        move_prob_all = code_prob.index_select(0, move_code_all.reshape(-1)).view(point_count, 8)
+        move_nll_all = code_nll.index_select(0, move_code_all.reshape(-1)).view(point_count, 8)
+
+        move_pattern_gain_all = torch.log2(move_prob_all.clamp_min(torch.finfo(dtype).eps)) - torch.log2(
+            current_prob_2d.clamp_min(torch.finfo(dtype).eps)
+        )
+        move_nll_gain_all = current_nll_2d - move_nll_all
+
+        move_score_all = torch.where(empty_slot_mask, move_nll_gain_all, very_bad)
+        move_nll_gain, best_move_slot = move_score_all.max(dim=1)
+        move_valid_mask = empty_slot_mask.any(dim=1) & (point_child_count >= 1.0)
+        best_move_slot = torch.where(move_valid_mask, best_move_slot, torch.full_like(best_move_slot, -1))
+
+        safe_move_slot = best_move_slot.clamp_min(0).view(-1, 1)
+        move_pattern_gain = move_pattern_gain_all.gather(1, safe_move_slot).view(-1)
+        move_pattern_gain = torch.where(move_valid_mask, move_pattern_gain, torch.zeros_like(move_pattern_gain))
+        move_nll_gain = torch.where(move_valid_mask, move_nll_gain, torch.zeros_like(move_nll_gain))
+
+        # 0 preserve, 1 delete, 2 add, 3 move
+        best_operation_hint = torch.stack(
+            [
+                torch.zeros_like(delete_nll_gain),
+                delete_nll_gain,
+                add_nll_gain,
+                move_nll_gain,
+            ],
+            dim=0,
+        ).argmax(dim=0).to(dtype=torch.long)
+
+        return {
+            "delete_pattern_gain": delete_pattern_gain,
+            "add_pattern_gain": add_pattern_gain,
+            "move_pattern_gain": move_pattern_gain,
+            "delete_nll_gain": delete_nll_gain,
+            "add_nll_gain": add_nll_gain,
+            "move_nll_gain": move_nll_gain,
+            "delete_valid_mask": delete_valid_mask,
+            "add_valid_mask": add_valid_mask,
+            "move_valid_mask": move_valid_mask,
+            "best_add_child_slot": best_add_slot,
+            "best_move_target_child_slot": best_move_slot,
+            "best_operation_hint": best_operation_hint,
+        }
+    
+    def _leaf_pattern_feature_channels(self, leaf_pattern_diag, like_tensor):
+        """
+        Section3:
+        leaf pattern候補gainを、既存proxyへ混ぜ込むための0から1特徴へ変換する。
+        feature_dimは増やさず、既存40次元構造を維持する。
+        """
+        B, _, N = like_tensor.shape
+        device = like_tensor.device
+        dtype = like_tensor.dtype
+
+        def _get_float_map(key):
+            if not isinstance(leaf_pattern_diag, dict):
+                return like_tensor.new_zeros((B, 1, N))
+            value = leaf_pattern_diag.get(key, None)
+            if not torch.is_tensor(value):
+                return like_tensor.new_zeros((B, 1, N))
+            value = value.to(device=device, dtype=dtype)
+            if value.ndim == 2:
+                value = value.unsqueeze(1)
+            elif value.ndim == 3 and value.shape[1] != 1:
+                value = value[:, :1, :]
+            if value.shape[0] == 1 and B > 1:
+                value = value.expand(B, -1, -1)
+            if value.shape[-1] != N:
+                if value.shape[-1] > N:
+                    value = value[:, :, :N]
+                elif value.shape[-1] > 0:
+                    pad = value[:, :, -1:].expand(value.shape[0], value.shape[1], N - value.shape[-1])
+                    value = torch.cat([value, pad], dim=2)
+                else:
+                    value = like_tensor.new_zeros((B, 1, N))
+            return torch.nan_to_num(value, nan=0.0, posinf=0.0, neginf=0.0)
+
+        def _get_long_map(key):
+            if not isinstance(leaf_pattern_diag, dict):
+                return torch.zeros((B, 1, N), device=device, dtype=torch.long)
+            value = leaf_pattern_diag.get(key, None)
+            if not torch.is_tensor(value):
+                return torch.zeros((B, 1, N), device=device, dtype=torch.long)
+            value = value.to(device=device, dtype=torch.long)
+            if value.ndim == 2:
+                value = value.unsqueeze(1)
+            elif value.ndim == 3 and value.shape[1] != 1:
+                value = value[:, :1, :]
+            if value.shape[0] == 1 and B > 1:
+                value = value.expand(B, -1, -1)
+            if value.shape[-1] != N:
+                if value.shape[-1] > N:
+                    value = value[:, :, :N]
+                elif value.shape[-1] > 0:
+                    pad = value[:, :, -1:].expand(value.shape[0], value.shape[1], N - value.shape[-1])
+                    value = torch.cat([value, pad], dim=2)
+                else:
+                    value = torch.zeros((B, 1, N), device=device, dtype=torch.long)
+            return value
+
+        scale = max(float(getattr(self.args, "leaf_pattern_feature_gain_scale", 2.0)), 1e-6)
+
+        delete_gain = torch.tanh(_get_float_map("delete_nll_gain").clamp_min(0.0) * scale).clamp(0.0, 1.0)
+        add_gain = torch.tanh(_get_float_map("add_nll_gain").clamp_min(0.0) * scale).clamp(0.0, 1.0)
+        move_gain = torch.tanh(_get_float_map("move_nll_gain").clamp_min(0.0) * scale).clamp(0.0, 1.0)
+        best_gain = torch.maximum(torch.maximum(delete_gain, add_gain), move_gain)
+
+        parent_nll = torch.tanh(_get_float_map("parent_pattern_nll") / 4.0).clamp(0.0, 1.0)
+        parent_freq = _get_float_map("parent_pattern_frequency").clamp(0.0, 1.0)
+        child_count = (_get_float_map("parent_child_count") / 8.0).clamp(0.0, 1.0)
+
+        best_op = _get_long_map("best_operation_hint").to(dtype=dtype)
+        best_op = (best_op / 3.0).clamp(0.0, 1.0)
+
+        return {
+            "delete_gain": delete_gain,
+            "add_gain": add_gain,
+            "move_gain": move_gain,
+            "best_gain": best_gain,
+            "parent_nll": parent_nll,
+            "parent_freq": parent_freq,
+            "child_count": child_count,
+            "best_op": best_op,
+        }
+    
+    def _leaf_pattern_candidate_scores_single(
+        self,
+        parent_pattern_code_unique,
+        child_count_unique,
+        child_slot,
+        inverse,
+        *,
+        device,
+        dtype,
+    ):
+        """
+        Section2:
+        parent occupancy codeごとに、Delete/Add/Move後のpattern頻度改善を計算する。
+        ここでは操作を実行しない。候補診断だけを返す。
+
+        操作定義:
+        - Delete: 現在のchild slotを0へ変える
+        - Add: 同じparent内のempty child slotを1へ変える
+        - Move: 現在のchild slotを0にし、empty child slotを1へ変える
+        """
+        parent_pattern_code_unique = parent_pattern_code_unique.to(device=device, dtype=torch.long).reshape(-1)
+        child_count_unique = child_count_unique.to(device=device, dtype=dtype).reshape(-1)
+        child_slot = child_slot.to(device=device, dtype=torch.long).reshape(-1)
+        inverse = inverse.to(device=device, dtype=torch.long).reshape(-1)
+
+        parent_count = int(parent_pattern_code_unique.numel())
+        point_count = int(child_slot.numel())
+
+        if parent_count <= 0 or point_count <= 0:
+            return {
+                "delete_pattern_gain": torch.zeros((point_count,), device=device, dtype=dtype),
+                "add_pattern_gain": torch.zeros((point_count,), device=device, dtype=dtype),
+                "move_pattern_gain": torch.zeros((point_count,), device=device, dtype=dtype),
+                "delete_nll_gain": torch.zeros((point_count,), device=device, dtype=dtype),
+                "add_nll_gain": torch.zeros((point_count,), device=device, dtype=dtype),
+                "move_nll_gain": torch.zeros((point_count,), device=device, dtype=dtype),
+                "delete_valid_mask": torch.zeros((point_count,), device=device, dtype=torch.bool),
+                "add_valid_mask": torch.zeros((point_count,), device=device, dtype=torch.bool),
+                "move_valid_mask": torch.zeros((point_count,), device=device, dtype=torch.bool),
+                "best_add_child_slot": torch.full((point_count,), -1, device=device, dtype=torch.long),
+                "best_move_target_child_slot": torch.full((point_count,), -1, device=device, dtype=torch.long),
+                "best_operation_hint": torch.zeros((point_count,), device=device, dtype=torch.long),
+            }
+
+        smoothing = max(float(getattr(self.args, "leaf_pattern_candidate_smoothing", 1.0)), 0.0)
+        code_hist = torch.bincount(
+            parent_pattern_code_unique.clamp(0, 255),
+            minlength=256,
+        ).to(device=device, dtype=dtype)
+
+        code_prob = code_hist + float(smoothing)
+        code_prob = code_prob / code_prob.sum().clamp_min(torch.finfo(dtype).eps)
+        code_nll = -torch.log2(code_prob.clamp_min(torch.finfo(dtype).eps))
+
+        current_code = parent_pattern_code_unique.index_select(0, inverse).clamp(0, 255)
+        current_prob = code_prob.index_select(0, current_code)
+        current_nll = code_nll.index_select(0, current_code)
+
+        bit_current = (1 << child_slot.clamp(0, 7)).to(device=device, dtype=torch.long)
+        delete_code = torch.bitwise_and(current_code, torch.bitwise_not(bit_current)).clamp(0, 255)
+
+        delete_prob = code_prob.index_select(0, delete_code)
+        delete_nll = code_nll.index_select(0, delete_code)
+
+        delete_pattern_gain = torch.log2(delete_prob.clamp_min(torch.finfo(dtype).eps)) - torch.log2(
+            current_prob.clamp_min(torch.finfo(dtype).eps)
+        )
+        delete_nll_gain = current_nll - delete_nll
+
+        min_children_after = max(int(getattr(self.args, "leaf_pattern_delete_min_children_after", 1)), 0)
+        point_child_count = child_count_unique.index_select(0, inverse)
+        delete_valid_mask = (point_child_count - 1.0) >= float(min_children_after)
+
+        slot_values = torch.arange(8, device=device, dtype=torch.long).view(1, 8)
+        slot_bits = (1 << slot_values).to(dtype=torch.long)
+        current_code_2d = current_code.view(-1, 1)
+        current_prob_2d = current_prob.view(-1, 1)
+        current_nll_2d = current_nll.view(-1, 1)
+
+        occupied_slot_mask = (torch.bitwise_and(current_code_2d, slot_bits) != 0)
+        empty_slot_mask = ~occupied_slot_mask
+
+        add_code_all = torch.bitwise_or(current_code_2d, slot_bits).clamp(0, 255)
+        add_prob_all = code_prob.index_select(0, add_code_all.reshape(-1)).view(point_count, 8)
+        add_nll_all = code_nll.index_select(0, add_code_all.reshape(-1)).view(point_count, 8)
+
+        add_pattern_gain_all = torch.log2(add_prob_all.clamp_min(torch.finfo(dtype).eps)) - torch.log2(
+            current_prob_2d.clamp_min(torch.finfo(dtype).eps)
+        )
+        add_nll_gain_all = current_nll_2d - add_nll_all
+
+        very_bad = torch.full_like(add_nll_gain_all, -1.0e6)
+        add_score_all = torch.where(empty_slot_mask, add_nll_gain_all, very_bad)
+        best_add_score, best_add_slot = add_score_all.max(dim=1)
+        add_valid_mask = empty_slot_mask.any(dim=1)
+        best_add_slot = torch.where(
+            add_valid_mask,
+            best_add_slot.to(dtype=torch.long),
+            torch.full_like(best_add_slot, -1),
+        )
+
+        add_pattern_gain = torch.where(
+            add_valid_mask,
+            add_pattern_gain_all.gather(1, best_add_slot.clamp_min(0).view(-1, 1)).view(-1),
+            torch.zeros((point_count,), device=device, dtype=dtype),
+        )
+        add_nll_gain = torch.where(
+            add_valid_mask,
+            best_add_score,
+            torch.zeros((point_count,), device=device, dtype=dtype),
+        )
+
+        source_removed_code = torch.bitwise_and(current_code, torch.bitwise_not(bit_current)).view(-1, 1)
+        move_code_all = torch.bitwise_or(source_removed_code, slot_bits).clamp(0, 255)
+        move_prob_all = code_prob.index_select(0, move_code_all.reshape(-1)).view(point_count, 8)
+        move_nll_all = code_nll.index_select(0, move_code_all.reshape(-1)).view(point_count, 8)
+
+        move_pattern_gain_all = torch.log2(move_prob_all.clamp_min(torch.finfo(dtype).eps)) - torch.log2(
+            current_prob_2d.clamp_min(torch.finfo(dtype).eps)
+        )
+        move_nll_gain_all = current_nll_2d - move_nll_all
+
+        move_score_all = torch.where(empty_slot_mask, move_nll_gain_all, very_bad)
+        best_move_score, best_move_slot = move_score_all.max(dim=1)
+        move_valid_mask = empty_slot_mask.any(dim=1) & (point_child_count >= 1.0)
+        best_move_slot = torch.where(
+            move_valid_mask,
+            best_move_slot.to(dtype=torch.long),
+            torch.full_like(best_move_slot, -1),
+        )
+
+        move_pattern_gain = torch.where(
+            move_valid_mask,
+            move_pattern_gain_all.gather(1, best_move_slot.clamp_min(0).view(-1, 1)).view(-1),
+            torch.zeros((point_count,), device=device, dtype=dtype),
+        )
+        move_nll_gain = torch.where(
+            move_valid_mask,
+            best_move_score,
+            torch.zeros((point_count,), device=device, dtype=dtype),
+        )
+
+        delete_pattern_gain = torch.where(delete_valid_mask, delete_pattern_gain, torch.zeros_like(delete_pattern_gain))
+        delete_nll_gain = torch.where(delete_valid_mask, delete_nll_gain, torch.zeros_like(delete_nll_gain))
+
+        # 0 preserve, 1 delete, 2 add, 3 move
+        stacked_gain = torch.stack(
+            [
+                torch.zeros_like(delete_nll_gain),
+                delete_nll_gain,
+                add_nll_gain,
+                move_nll_gain,
+            ],
+            dim=0,
+        )
+        best_operation_hint = stacked_gain.argmax(dim=0).to(dtype=torch.long)
+
+        return {
+            "delete_pattern_gain": delete_pattern_gain,
+            "add_pattern_gain": add_pattern_gain,
+            "move_pattern_gain": move_pattern_gain,
+            "delete_nll_gain": delete_nll_gain,
+            "add_nll_gain": add_nll_gain,
+            "move_nll_gain": move_nll_gain,
+            "delete_valid_mask": delete_valid_mask,
+            "add_valid_mask": add_valid_mask,
+            "move_valid_mask": move_valid_mask,
+            "best_add_child_slot": best_add_slot,
+            "best_move_target_child_slot": best_move_slot,
+            "best_operation_hint": best_operation_hint,
+        }
+    
     @staticmethod
     def _popcount_codes(codes, dtype):
         codes = codes.to(dtype=torch.long).reshape(-1)
@@ -766,6 +1552,22 @@ class OctreeStructureAnalysis(nn.Module):
         point_feature_voxel_key = None
         geo_stats = self._local_geometry_stats(work_xyz)
         tree_coords = None
+
+        # Section1/2:
+        # leaf pattern診断の初期値。
+        # prebuilt canonical voxel coordsが取れた場合だけ、実診断で上書きする。
+        leaf_pattern_diag = self._empty_leaf_pattern_diagnosis(
+            work_xyz,
+            reason="prebuilt_coords_not_available",
+        )
+
+        # Section1:
+        # full cloud canonical / prebuilt subtree のvoxel coordsから作るleaf pattern診断。
+        # 初期値は空診断にしておき、prebuilt coordsが取れた場合だけ上書きする。
+        leaf_pattern_diag = self._empty_leaf_pattern_diagnosis(
+            work_xyz,
+            reason="prebuilt_coords_not_available",
+        )
         if prebuilt_ctx is not None:
             source_tree = subtree_tree if isinstance(subtree_tree, dict) else full_octree_context
             raw_tree_coords = self._tree_tensor(source_tree, "global_voxel_coords", work_xyz.device, dtype=torch.long)
@@ -778,21 +1580,29 @@ class OctreeStructureAnalysis(nn.Module):
                 )
                 if coords_n3 is not None:
                     tree_coords = coords_n3.view(1, -1, 3).contiguous()
-                    # ============================================================
-                    # Phase5修正:
-                    # prebuilt_subtree_tree / full_cloud canonical 経路では、
-                    # local xyz 再量子化ではなく、prebuilt global_voxel_coords から
-                    # quant_stats を作る。
-                    # これを作らないと後段の quant_merge 参照で
-                    # UnboundLocalError になる。
-                    # ============================================================
                     quant_stats = self._quantized_voxel_stats_from_tree(
                         work_xyz,
                         tree_coords,
                         qs_override,
                         snap_delta_norm,
                     )
-
+                    leaf_pattern_diag = self._leaf_pattern_diagnosis_from_coords(
+                        work_xyz,
+                        tree_coords,
+                        source=str(source_tree.get("octree_context_scope", "prebuilt_global_voxel_coords"))
+                        if isinstance(source_tree, dict)
+                        else "prebuilt_global_voxel_coords",
+                    )
+                    # Section1:
+                    # local xyz再量子化ではなく、prebuilt global_voxel_coordsから
+                    # parent node / child slot / 8-child occupancy patternを診断する。
+                    leaf_pattern_diag = self._leaf_pattern_diagnosis_from_coords(
+                        work_xyz,
+                        tree_coords,
+                        source=str(source_tree.get("octree_context_scope", "prebuilt_global_voxel_coords"))
+                        if isinstance(source_tree, dict)
+                        else "prebuilt_global_voxel_coords",
+                    )
                     source_tree_for_point_key = (
                         subtree_tree
                         if isinstance(subtree_tree, dict)
@@ -863,6 +1673,21 @@ class OctreeStructureAnalysis(nn.Module):
                 raise ValueError("prebuilt_subtree_tree mode requires _quantized_voxel_stats_from_tree().")
             quant_stats = self._quantized_voxel_stats(work_xyz, qs_override, snap_delta_norm)
             point_feature_voxel_key = self._point_feature_voxel_key(work_xyz, qs_override)
+
+            # Section1/2:
+            # local再量子化はfull cloud canonical基準ではないため、candidate診断には使わない。
+            leaf_pattern_diag = self._empty_leaf_pattern_diagnosis(
+                work_xyz,
+                reason="local_recomputed_path",
+            )
+
+            # Section1:
+            # local再量子化経路では、full cloud canonical基準ではないため、
+            # leaf pattern診断は使わない。
+            leaf_pattern_diag = self._empty_leaf_pattern_diagnosis(
+                work_xyz,
+                reason="local_recomputed_path",
+            )
         local_density = geo_stats[:, 0:1, :]
         local_curvature = geo_stats[:, 1:2, :]
         local_anisotropy = geo_stats[:, 2:3, :]
@@ -906,6 +1731,39 @@ class OctreeStructureAnalysis(nn.Module):
             + 0.50 * local_curvature
             + 0.25 * local_anisotropy
         ).clamp(0.0, 1.0)
+
+        leaf_feature_integration_used = False
+        leaf_feature_best_gain_mean = 0.0
+        leaf_feature_best_gain_max = 0.0
+
+        if (
+            bool(getattr(self.args, "leaf_pattern_feature_integration", True))
+            and isinstance(leaf_pattern_diag, dict)
+            and bool(leaf_pattern_diag.get("available", False))
+        ):
+            leaf_feat = self._leaf_pattern_feature_channels(
+                leaf_pattern_diag,
+                shape_proxy,
+            )
+            blend = min(max(float(getattr(self.args, "leaf_pattern_feature_blend_weight", 0.35)), 0.0), 1.0)
+
+            delete_gain_feat = leaf_feat["delete_gain"]
+            add_gain_feat = leaf_feat["add_gain"]
+            move_gain_feat = leaf_feat["move_gain"]
+            best_gain_feat = leaf_feat["best_gain"]
+            parent_nll_feat = leaf_feat["parent_nll"]
+
+            # 圧縮上あやしい候補をlow_probability/context/sparse/quant proxyへ反映する。
+            lowprob_proxy = ((1.0 - blend) * lowprob_proxy + blend * torch.maximum(lowprob_proxy, best_gain_feat)).clamp(0.0, 1.0)
+            context_proxy = ((1.0 - blend) * context_proxy + blend * torch.maximum(context_proxy, parent_nll_feat)).clamp(0.0, 1.0)
+            sparse_proxy = ((1.0 - blend) * sparse_proxy + blend * torch.maximum(sparse_proxy, delete_gain_feat)).clamp(0.0, 1.0)
+            quant_proxy = ((1.0 - blend) * quant_proxy + blend * torch.maximum(quant_proxy, torch.maximum(add_gain_feat, move_gain_feat))).clamp(0.0, 1.0)
+
+            # shape_proxyは幾何保持側なので、rate gainだけで過剰に下げない。
+            # ここでは触らず、Section4のActuator側でgeometry guardと一緒に使う。
+            leaf_feature_integration_used = True
+            leaf_feature_best_gain_mean = float(best_gain_feat.detach().float().mean().cpu())
+            leaf_feature_best_gain_max = float(best_gain_feat.detach().float().max().cpu())
 
         cause_targets_raw = torch.cat(
             [
@@ -952,6 +1810,7 @@ class OctreeStructureAnalysis(nn.Module):
             full_octree_context=full_octree_context,
             point_feature_voxel_key=point_feature_voxel_key,
             prebuilt_ctx=prebuilt_ctx,
+            leaf_pattern_diag=leaf_pattern_diag,
         )
         source_tree_for_key = subtree_tree if isinstance(subtree_tree, dict) else full_octree_context
         structural_voxel_key = None
@@ -1024,4 +1883,77 @@ class OctreeStructureAnalysis(nn.Module):
             "structural_voxel_key": structural_voxel_key,
             "point_feature_voxel_key": point_feature_voxel_key,
             "node_voxel_desc": node_voxel_desc,
+
+            "leaf_pattern_diag": leaf_pattern_diag,
+            "leaf_pattern_available": bool(
+                isinstance(leaf_pattern_diag, dict)
+                and leaf_pattern_diag.get("available", False)
+            ),
+            "leaf_pattern_source": str(
+                leaf_pattern_diag.get("source", "none")
+                if isinstance(leaf_pattern_diag, dict)
+                else "none"
+            ),
+            "leaf_pattern_reason": str(
+                leaf_pattern_diag.get("reason", "")
+                if isinstance(leaf_pattern_diag, dict)
+                else "missing"
+            ),
+            "leaf_unique_parent_count": int(
+                leaf_pattern_diag.get("unique_parent_count", 0)
+                if isinstance(leaf_pattern_diag, dict)
+                else 0
+            ),
+            "leaf_unique_pattern_count": int(
+                leaf_pattern_diag.get("unique_pattern_count", 0)
+                if isinstance(leaf_pattern_diag, dict)
+                else 0
+            ),
+            "leaf_mean_child_count": float(
+                leaf_pattern_diag.get("mean_child_count", 0.0)
+                if isinstance(leaf_pattern_diag, dict)
+                else 0.0
+            ),
+            "leaf_single_child_parent_ratio": float(
+                leaf_pattern_diag.get("single_child_parent_ratio", 0.0)
+                if isinstance(leaf_pattern_diag, dict)
+                else 0.0
+            ),
+            "leaf_max_pattern_frequency": float(
+                leaf_pattern_diag.get("max_pattern_frequency", 0.0)
+                if isinstance(leaf_pattern_diag, dict)
+                else 0.0
+            ),
+
+            # Section2:
+            "leaf_candidate_available": bool(
+                leaf_pattern_diag.get("candidate_available", False)
+                if isinstance(leaf_pattern_diag, dict)
+                else False
+            ),
+            "leaf_delete_gain_mean": float(
+                leaf_pattern_diag.get("delete_gain_mean", 0.0)
+                if isinstance(leaf_pattern_diag, dict)
+                else 0.0
+            ),
+            "leaf_add_gain_mean": float(
+                leaf_pattern_diag.get("add_gain_mean", 0.0)
+                if isinstance(leaf_pattern_diag, dict)
+                else 0.0
+            ),
+            "leaf_move_gain_mean": float(
+                leaf_pattern_diag.get("move_gain_mean", 0.0)
+                if isinstance(leaf_pattern_diag, dict)
+                else 0.0
+            ),
+            "leaf_high_gain_candidate_ratio": float(
+                leaf_pattern_diag.get("high_gain_candidate_ratio", 0.0)
+                if isinstance(leaf_pattern_diag, dict)
+                else 0.0
+            ),
+
+            # Section3:
+            "leaf_feature_integration_used": bool(leaf_feature_integration_used),
+            "leaf_feature_best_gain_mean": float(leaf_feature_best_gain_mean),
+            "leaf_feature_best_gain_max": float(leaf_feature_best_gain_max),
         }

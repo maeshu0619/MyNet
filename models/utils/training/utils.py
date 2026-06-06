@@ -402,27 +402,79 @@ def summarize_point_edits(input_xyz, gen_pts, final_w=None, args=None, edit_ref_
             mean_adjust = float(valid_delta.mean().detach().cpu())
         adjusted_points = int(moved_mask.sum().item())
 
+    voxel_state = getattr(args, "_last_actuator_voxel_state", None) if args is not None else None
+    voxel_input_count = 0
+    voxel_add_count = 0
+    voxel_drop_count = 0
+    voxel_move_count = 0
+    voxel_final_count = 0
+    voxel_mode = False
+    if isinstance(voxel_state, dict):
+        def _state_int(*keys):
+            for key in keys:
+                value = voxel_state.get(key, None)
+                if value is not None:
+                    try:
+                        return int(float(value))
+                    except Exception:
+                        return 0
+            return 0
+
+        voxel_mode = bool(voxel_state.get("voxel_edit_state_enabled", False))
+        voxel_input_count = _state_int("input_voxel_count", "before_occupied_voxel_count", "voxel_edit_initial_count")
+        voxel_add_count = _state_int("voxel_edit_add_count", "add_target_voxel_count")
+        voxel_drop_count = _state_int("voxel_edit_drop_count", "delete_target_voxel_count")
+        voxel_move_count = _state_int("voxel_edit_move_count", "move_source_voxel_count")
+        voxel_final_count = _state_int("final_voxel_count", "after_occupied_voxel_count", "voxel_edit_final_count")
+
+    point_added_debug = int(added_points)
+    point_deleted_debug = int(deleted_points)
+    point_adjusted_debug = int(adjusted_points)
+    ratio_denominator = input_points
+    metric_input_points = input_points
+    if voxel_mode and voxel_input_count > 0:
+        metric_input_points = int(voxel_input_count)
+        added_points = int(voxel_add_count)
+        deleted_points = int(voxel_drop_count)
+        adjusted_points = int(voxel_move_count)
+        output_points = int(voxel_final_count)
+        pre_output_points = int(voxel_final_count)
+        ratio_denominator = metric_input_points
+
     return {
-        "input_points": int(input_points),
+        "input_points": int(metric_input_points),
         "pre_output_points": int(pre_output_points),
         "output_points": int(output_points),
         "added_points": int(added_points),
         "deleted_points": int(deleted_points),
         "adjusted_points": int(adjusted_points),
-        "input_points_avg": float(input_points),
+        "input_points_avg": float(metric_input_points),
         "pre_output_points_avg": float(pre_output_points),
         "output_points_avg": float(output_points),
         "added_points_avg": float(added_points),
         "deleted_points_avg": float(deleted_points),
         "adjusted_points_avg": float(adjusted_points),
-        "added_ratio_percent": point_ratio_percent(added_points, input_points),
-        "deleted_ratio_percent": point_ratio_percent(deleted_points, input_points),
-        "adjusted_ratio_percent": point_ratio_percent(adjusted_points, input_points),
+        "added_ratio_percent": point_ratio_percent(added_points, ratio_denominator),
+        "deleted_ratio_percent": point_ratio_percent(deleted_points, ratio_denominator),
+        "adjusted_ratio_percent": point_ratio_percent(adjusted_points, ratio_denominator),
+        "added_ratio_percent_point_debug": point_ratio_percent(point_added_debug, input_points),
+        "deleted_ratio_percent_point_debug": point_ratio_percent(point_deleted_debug, input_points),
+        "adjusted_ratio_percent_point_debug": point_ratio_percent(point_adjusted_debug, input_points),
+        "input_points_point_debug": int(input_points),
+        "voxel_edit_input_count": int(voxel_input_count),
+        "voxel_edit_add_count": int(voxel_add_count),
+        "voxel_edit_drop_count": int(voxel_drop_count),
+        "voxel_edit_move_count": int(voxel_move_count),
+        "voxel_edit_final_count": int(voxel_final_count),
+        "voxel_add_ratio_percent": point_ratio_percent(voxel_add_count, voxel_input_count),
+        "voxel_drop_ratio_percent": point_ratio_percent(voxel_drop_count, voxel_input_count),
+        "voxel_move_ratio_percent": point_ratio_percent(voxel_move_count, voxel_input_count),
+        "voxel_operation_mode": bool(voxel_mode),
         "adjust_threshold": float(threshold),
         "adjust_mean": float(mean_adjust),
         "adjust_max": float(max_adjust),
-        "net_change": int(output_points - input_points),
-        "net_change_avg": float(output_points - input_points),
+        "net_change": int(output_points - metric_input_points),
+        "net_change_avg": float(output_points - metric_input_points),
         "keep_mode": None if keep_info is None else keep_info.get("mode"),
     }
 

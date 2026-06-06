@@ -637,7 +637,42 @@ def _phase7_update_from_structure(comp_debug, structure_debug, *, is_anchor_step
         "cause_aggregation_unit_mode",
         "local_recomputed",
         "structure_local_recomputed",
-        "actuator_local_recomputed",
+       "actuator_local_recomputed",
+
+        # Section2:
+        # leaf pattern candidate診断をmetric CSVへ流すためのdebug key。
+        "leaf_pattern_available",
+        "leaf_pattern_source",
+        "leaf_pattern_reason",
+        "leaf_unique_parent_count",
+        "leaf_unique_pattern_count",
+        "leaf_mean_child_count",
+        "leaf_single_child_parent_ratio",
+        "leaf_max_pattern_frequency",
+        "leaf_candidate_available",
+        "leaf_delete_gain_mean",
+        "leaf_add_gain_mean",
+        "leaf_move_gain_mean",
+        "leaf_high_gain_candidate_ratio",
+
+        # Section3:
+        "leaf_feature_integration_used",
+        "leaf_feature_best_gain_mean",
+        "leaf_feature_best_gain_max",
+
+        # Section4:
+        "leaf_actuator_prior_enabled",
+        "leaf_actuator_drop_prior_mean",
+        "leaf_actuator_add_prior_mean",
+        "leaf_actuator_move_prior_mean",
+        "leaf_actuator_best_prior_mean",
+        "leaf_actuator_best_prior_max",
+
+        "leaf_target_direction_prior_enabled",
+        "leaf_add_target_match_ratio",
+        "leaf_move_target_match_ratio",
+        "leaf_add_target_bias_mean",
+        "leaf_move_target_bias_mean",
     ):
         if key in structure_debug:
             comp_debug[key] = structure_debug.get(key)
@@ -1041,6 +1076,7 @@ def _phase7_grad_sanity_stats(model, zero_eps=1e-12):
         "drop_head": ["actuator.drop_head."],
         "add_head": ["actuator.add_head."],
         "move_head": ["actuator.move_voxel_head."],
+        "operation_gate_head": ["actuator.operation_gate_head."],
         "drop_amount_head": ["actuator.drop_amount_head."],
         "add_amount_head": ["actuator.add_amount_head."],
         "move_amount_head": ["actuator.move_amount_head."],
@@ -1116,6 +1152,7 @@ def _phase7_log_grad_sanity(args, writer, model, comp_debug, global_step):
             "drop_head": "phase7_grad_drop_head",
             "add_head": "phase7_grad_add_head",
             "move_head": "phase7_grad_move_head",
+            "operation_gate_head": "phase7_grad_operation_gate_head",
             "policy": "phase7_grad_policy",
             "cost_attr": "phase7_grad_cost_attr",
         }
@@ -1134,6 +1171,7 @@ def _phase7_log_grad_sanity(args, writer, model, comp_debug, global_step):
         "drop_head",
         "add_head",
         "move_head",
+        "operation_gate_head",
         "drop_amount_head",
         "add_amount_head",
         "move_amount_head",
@@ -1149,11 +1187,6 @@ def _phase7_log_grad_sanity(args, writer, model, comp_debug, global_step):
             f"zero={bool(values.get('grad_is_zero_like', False))}"
         )
 
-    _phase7_writer_line(
-        args,
-        writer,
-        "Phase7GradSanity: " + " | ".join(parts)
-    )
 
     return stats
 
@@ -1531,6 +1564,7 @@ def _phase7_build_eval_summary_row(
         "drop_grad_norm": _phase7_float(comp_debug.get("drop_grad_norm", comp_debug.get("phase7_grad_drop_head", 0.0)), 0.0),
         "add_grad_norm": _phase7_float(comp_debug.get("add_grad_norm", comp_debug.get("phase7_grad_add_head", 0.0)), 0.0),
         "move_grad_norm": _phase7_float(comp_debug.get("move_grad_norm", comp_debug.get("phase7_grad_move_head", 0.0)), 0.0),
+        "operation_gate_grad_norm": _phase7_float(comp_debug.get("operation_gate_grad_norm", comp_debug.get("phase7_grad_operation_gate_head", 0.0)), 0.0),
         "policy_grad_norm": _phase7_float(comp_debug.get("policy_grad_norm", comp_debug.get("phase7_grad_policy", 0.0)), 0.0),
         "cost_attr_grad_norm": _phase7_float(comp_debug.get("cost_attr_grad_norm", comp_debug.get("phase7_grad_cost_attr", 0.0)), 0.0),
 
@@ -1599,6 +1633,9 @@ def _phase7_named_grad_norms(model):
         "move_grad_norm": [
             "actuator.move_voxel_head.",
             "actuator.move_amount_head.",
+        ],
+        "operation_gate_grad_norm": [
+            "actuator.operation_gate_head.",
         ],
         "policy_grad_norm": [
             "policy_module.",
@@ -1740,6 +1777,9 @@ def _step_grad_group_specs():
         ("op_adjust_move", [
             "actuator.move_voxel_head.",
             "actuator.move_amount_head.",
+        ]),
+        ("operation_gate_head", [
+            "actuator.operation_gate_head.",
         ]),
 
         # ============================================================
@@ -2436,6 +2476,7 @@ def run_episode_full_cloud_validation(
                             args,
                             coord_scale=None,
                         )
+                        full_cloud_canonical_context = full_octree_context
                         gen_pts, _, _, _, final_w, _, _, _, out_label = model.forward(
                             input_xyz,
                             input_attr,
@@ -2449,12 +2490,6 @@ def run_episode_full_cloud_validation(
                         )
                         gen_xyz = gen_pts[:, :3, :]
                         final_w_for_loss = None if _discrete_loss_mode_value(args) == "hard" else final_w
-                        compression_gen_xyz, _ = prepare_compression_points(
-                            gen_xyz,
-                            args,
-                            model,
-                            collect_stats=False,
-                        )
                         gen_xyz_for_actual, voxel_restored_actual_debug = _select_actual_gen_xyz_from_voxel_state(
                             args,
                             writer,
@@ -2462,6 +2497,21 @@ def run_episode_full_cloud_validation(
                             gen_xyz,
                             prefix="VoxelRestoredActual[episode_full_cloud_validation]",
                             canonical_context=full_cloud_canonical_context,
+                        )
+
+                        validation_voxel_state_used = bool(
+                            isinstance(voxel_restored_actual_debug, dict)
+                            and voxel_restored_actual_debug.get("used", False)
+                            and not voxel_restored_actual_debug.get("fallback", False)
+                        )
+
+                        validation_compression_source_xyz = gen_xyz_for_actual if validation_voxel_state_used else gen_xyz
+
+                        compression_gen_xyz, _ = prepare_compression_points(
+                            validation_compression_source_xyz,
+                            args,
+                            model,
+                            collect_stats=False,
                         )
                         setattr(
                             args,
@@ -2965,17 +3015,23 @@ def train(model, args, loss, writer, plot, notifier=None):
                         log_for_better_event( for_better_path, "subtree_min_points_miss", global_step=global_train_step + 1, sampled_depth=int(subtree_depth_meta["depth"]), min_subtree_points=min_subtree_points, total_subtree_count=total_subtree_count, action="full_anchor")
                     elif min_points_miss:
                         log_for_better_event( for_better_path, "subtree_min_points_miss", global_step=global_train_step + 1, sampled_depth=int(subtree_depth_meta["depth"]), min_subtree_points=min_subtree_points, total_subtree_count=total_subtree_count, action="legacy_all_subtrees_fallback")
+                    full_cloud_anchor_shadow_train_requested = bool(
+                        is_anchor_step
+                        and bool(getattr(args, "full_cloud_anchor_train_shadow_subtree", True))
+                        and eligible_subtree_count > 0
+                    )
+                    selected_subtree_for_grad = bool((not is_anchor_step) or full_cloud_anchor_shadow_train_requested)
                     selected_subtree_keys = candidate_subtree_keys # 初期状態では候補Subtreeを全て選択対象にする
-                    if eligible_subtree_count > 0 and not is_anchor_step:
+                    if eligible_subtree_count > 0 and selected_subtree_for_grad:
                         selected_subtree_keys = select_octree_subtree_keys(candidate_subtree_keys, global_train_step, args)
                         selected_subtree_keys = select_single_subtree_key( candidate_subtree_keys, selected_subtree_keys, global_train_step, args, cache_key) # 1StepでForwardするSubtreeをランダムに1個へ絞る
                     selected_subtree_count = int(selected_subtree_keys.numel()) # 実際に選択されたSubtree数を数える
-                    subset_step = (not is_anchor_step) and selected_subtree_count < eligible_subtree_count # 候補の一部だけを使ったStepか否かの判定
+                    subset_step = selected_subtree_for_grad and selected_subtree_count < eligible_subtree_count # 候補の一部だけを使ったStepか否かの判定
                     encoder_debug_chunks = [] if detail_log_this_step else None # 詳細ログ対象Stepなら、各Subtree Forward時のEncoder Debugを保存するリスト
 
                     """Selected Groupsの作成"""
                     selected_groups = None
-                    if not is_anchor_step: # Anchorでないとき
+                    if selected_subtree_for_grad: # 通常SubtreeまたはFullCloud anchorのshadow学習Subtree
                         selected_key_set = set(selected_subtree_keys.detach().cpu().tolist()) # 選択されたSubtree Keyの集合
                         group_source = candidate_groups # 選択元となるSubtreeグループ集合
                         selected_groups = [ (subtree_key, point_idx) for subtree_key, point_idx in group_source if subtree_key in selected_key_set] # 選択されたSubtree Keyに対応する情報の抽出
@@ -2996,7 +3052,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                     # 選択済みSubtreeだけmetadataを構築する
                     # これにより、同一階層の全Subtreeに対するtree/context構築を避ける
                     # ============================================================
-                    if not is_anchor_step:
+                    if selected_subtree_for_grad:
                         t1 = time.time()
                         subtree_trees, full_octree_contexts, group_meta = build_selected_group_octree_metadata(
                             input_xyz,
@@ -3110,6 +3166,8 @@ def train(model, args, loss, writer, plot, notifier=None):
                     out_label = None
                     full_cloud_anchor_no_grad = False
                     full_cloud_anchor_no_grad_reason = ""
+                    full_cloud_anchor_shadow_train_active = False
+                    full_cloud_anchor_debug_snapshot = {}
 
                     """モデルの実行"""
                     prev_log_flag = getattr(args, "_log_this_step", False)
@@ -3145,6 +3203,19 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 f"grad_node_limit={int(getattr(args, 'full_cloud_anchor_grad_node_limit', 50000))}, "
                                 f"allow_grad={bool(getattr(args, 'full_cloud_anchor_allow_grad', False))}"
                             )
+                            full_cloud_anchor_shadow_train_active = bool(
+                                full_cloud_anchor_shadow_train_requested
+                                and full_cloud_anchor_no_grad
+                                and selected_groups
+                            )
+                            if full_cloud_anchor_shadow_train_requested:
+                                writer.write(
+                                    "FullCloudAnchorShadowTrain: "
+                                    f"requested={bool(full_cloud_anchor_shadow_train_requested)}, "
+                                    f"active={bool(full_cloud_anchor_shadow_train_active)}, "
+                                    f"selected_subtrees={int(len(selected_groups or []))}, "
+                                    f"reason={'active_shadow_subtree_grad' if full_cloud_anchor_shadow_train_active else 'full_cloud_grad_allowed_or_no_subtree'}"
+                                )
 
                             autocast_ctx = torch.cuda.amp.autocast(dtype=amp_dtype, enabled=use_amp) if use_cuda else nullcontext()
                             grad_ctx = torch.no_grad() if full_cloud_anchor_no_grad else nullcontext()
@@ -3197,13 +3268,6 @@ def train(model, args, loss, writer, plot, notifier=None):
 
                                 """圧縮損失の計算"""
                                 if stage_factors["com"] != 0.0:
-                                    compression_gen_xyz, noise_debug = prepare_compression_points(
-                                        gen_xyz,
-                                        args,
-                                        model,
-                                        collect_stats=bool(log_this_step or profile_this_step),
-                                    ) # 圧縮損失用の入力点群を作る
-
                                     gen_xyz_for_actual, voxel_restored_actual_debug = _select_actual_gen_xyz_from_voxel_state(
                                         args,
                                         writer,
@@ -3212,6 +3276,23 @@ def train(model, args, loss, writer, plot, notifier=None):
                                         prefix="VoxelRestoredActual[full_cloud_anchor]",
                                         canonical_context=full_cloud_canonical_context,
                                     )
+
+                                    full_cloud_voxel_state_used = bool(
+                                        isinstance(voxel_restored_actual_debug, dict)
+                                        and voxel_restored_actual_debug.get("used", False)
+                                        and not voxel_restored_actual_debug.get("fallback", False)
+                                    )
+
+                                    # voxel state 復元に成功した場合は、proxy側もactual側も同じ点群を使う。
+                                    # 復元に失敗した場合だけ従来のgen_xyzへfallbackする。
+                                    full_cloud_compression_source_xyz = gen_xyz_for_actual if full_cloud_voxel_state_used else gen_xyz
+
+                                    compression_gen_xyz, noise_debug = prepare_compression_points(
+                                        full_cloud_compression_source_xyz,
+                                        args,
+                                        model,
+                                        collect_stats=bool(log_this_step or profile_this_step),
+                                    ) # 圧縮損失用の入力点群を作る
 
                                     args._current_exact_teacher_mode = "full_cloud"
                                     args._current_exact_teacher_uses_full_context = False
@@ -3252,9 +3333,39 @@ def train(model, args, loss, writer, plot, notifier=None):
                                     loss_bit = zero
                                     loss_single = zero
                                     loss_nodes = zero
-                        else:
+                            if full_cloud_anchor_shadow_train_active:
+                                full_cloud_anchor_debug_snapshot = dict(getattr(loss, "last_compression_debug", {}) or {})
+                                zero = input_xyz.new_zeros(())
+                                L_geom = zero
+                                L_com = zero
+                                L_attr = zero
+                                L_policy = zero
+                                L_actuator = zero
+                                Lp_out = zero
+                                La_fit = zero
+                                La_rep = zero
+                                loss_bit = zero
+                                loss_single = zero
+                                loss_nodes = zero
+                                L_full_context_subtree_delta = zero
+                                full_context_subtree_delta_debug = {}
+                                noise_debug = {}
+                                train_edit_stats = None
+                                gen_xyz = None
+                                final_w = None
+                                out_label = None
+                                loss.last_compression_terms = {}
+                                writer.write(
+                                    "FullCloudAnchorShadowTrain: "
+                                    "full-cloud actual/correction state updated; "
+                                    "resetting differentiable losses and running selected subtree with grad."
+                                )
+                        if (not is_anchor_step) or full_cloud_anchor_shadow_train_active:
                             """Subtreeの場合"""
-                            writer.write("Running subtree step with selected Subtree.") # Subtree Stepであることをログに出す
+                            if full_cloud_anchor_shadow_train_active:
+                                writer.write("Running shadow subtree step for FullCloud anchor gradient.") # FullCloud anchor用の軽量grad経路
+                            else:
+                                writer.write("Running subtree step with selected Subtree.") # Subtree Stepであることをログに出す
                             num_selected = float(max(len(selected_groups), 1)) # 選択されたSubtree数をFloatで取得
                             subtree_edit_sums = new_point_edit_sums() # 複数Subtreeの点編集統計を累積するための変数を初期化
                             subtree_noise_debug_values = [] # 各Subtreeで圧縮用ノイズを加えたかなどを統合
@@ -3453,20 +3564,6 @@ def train(model, args, loss, writer, plot, notifier=None):
                                         subtree_comp_debug.update(voxel_restored_actual_debug)
                                         loss.last_compression_debug = subtree_comp_debug
 
-                                        if _phase7_debug_enabled(args, global_train_step):
-                                            _phase7_writer_line(
-                                                args,
-                                                writer,
-                                                "SubtreeActualInputDebug: "
-                                                f"used={bool(subtree_voxel_state_used)}, "
-                                                f"fallback={bool(voxel_restored_actual_debug.get('fallback', False))}, "
-                                                f"reason={voxel_restored_actual_debug.get('reason', '')}, "
-                                                f"source={voxel_restored_actual_debug.get('actual_input_source', '')}, "
-                                                f"gen_points={int(gen_subtree_xyz.shape[-1])}, "
-                                                f"actual_points={int(subtree_voxel_state_xyz.shape[-1]) if torch.is_tensor(subtree_voxel_state_xyz) else 0}, "
-                                                f"final_voxel_count={int(voxel_restored_actual_debug.get('final_voxel_coords_count', 0) or 0)}, "
-                                                f"final_w_for_compression={'None' if final_w_sub_compression is None else 'final_w_sub_loss'}"
-                                            )
                                         L_full_context_subtree_delta_sub, full_context_subtree_delta_debug_sub = build_full_context_subtree_delta_loss(
                                             args,
                                             full_octree_context=full_octree_context,
@@ -3550,6 +3647,28 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 full_context_subtree_delta_debug = merged_full_context_debug
                             if isinstance(full_context_subtree_delta_debug, dict):
                                 last_full_context_debug_for_correction = dict(full_context_subtree_delta_debug)
+                            if full_cloud_anchor_shadow_train_active and full_cloud_anchor_debug_snapshot:
+                                base_model_for_shadow_correction = model.module if hasattr(model, "module") else model
+                                (
+                                    full_cloud_correction_state,
+                                    last_full_cloud_correction_update_debug,
+                                ) = update_full_cloud_actual_correction_state(
+                                    args=args,
+                                    state=full_cloud_correction_state,
+                                    full_cloud_debug=full_cloud_anchor_debug_snapshot,
+                                    subtree_debug=last_subtree_actual_debug_for_correction,
+                                    full_context_debug=last_full_context_debug_for_correction,
+                                    actuator_voxel_state=getattr(base_model_for_shadow_correction, "last_actuator_voxel_state", None),
+                                    reference=gen_xyz if torch.is_tensor(gen_xyz) else input_xyz,
+                                    global_step=global_train_step,
+                                )
+                                if isinstance(last_full_cloud_correction_update_debug, dict):
+                                    last_full_cloud_correction_update_debug = dict(last_full_cloud_correction_update_debug)
+                                    last_full_cloud_correction_update_debug["full_cloud_corr_update_source"] = "full_cloud_anchor_shadow_subtree"
+                                try:
+                                    setattr(args, "_full_cloud_actual_correction_state", full_cloud_correction_state)
+                                except Exception:
+                                    pass
 
                     finally:
                         args._log_this_step = prev_log_flag
@@ -4104,19 +4223,28 @@ def train(model, args, loss, writer, plot, notifier=None):
 
                 if bool(getattr(args, "full_cloud_actual_correction_loss_enable", False)):
                     # ============================================================
-                    # Phase3:
-                    # compression_primary_mode では build_compression_primary_loss 側で
-                    # full_cloud_actual_correction を加算する。
-                    # ここで直接 L に足すと二重加算になるため、legacy mode のみ加算する。
+                    # FullCloud anchor shadow training:
+                    # full_cloud_actual_correction_loss は build_compression_primary_loss()
+                    # より後で作られるため、compression_primary_modeでもここでLへ足す。
+                    # forward値はFullCloud悪化時のsoft操作ペナルティであり、
+                    # backwardはshadow SubtreeのActuator soft量へ流れる。
                     # ============================================================
-                    add_correction_directly = not bool(compression_primary_mode)
+                    correction_weight = (
+                        float(getattr(args, "cp_full_cloud_actual_correction_weight", 0.05))
+                        if bool(compression_primary_mode)
+                        else float(getattr(args, "full_cloud_actual_correction_weight", 0.05))
+                    )
+                    add_correction_directly = correction_weight > 0.0
 
                     if add_correction_directly:
-                        L = L + float(getattr(args, "full_cloud_actual_correction_weight", 0.05)) * full_cloud_correction_loss
+                        L = L + correction_weight * full_cloud_correction_loss
 
                     if isinstance(full_cloud_correction_debug, dict):
                         full_cloud_correction_debug["full_cloud_corr_loss_added_to_total"] = bool(add_correction_directly)
-                        full_cloud_correction_debug["full_cloud_corr_loss_added_via_compression_primary"] = bool(compression_primary_mode)
+                        full_cloud_correction_debug["full_cloud_corr_loss_weight_used"] = float(correction_weight)
+                        full_cloud_correction_debug["full_cloud_corr_loss_added_via_compression_primary"] = bool(
+                            compression_primary_mode and add_correction_directly
+                        )
                         full_cloud_correction_debug["full_cloud_corr_loss_requires_grad"] = bool(
                             torch.is_tensor(full_cloud_correction_loss)
                             and full_cloud_correction_loss.requires_grad
@@ -4137,27 +4265,34 @@ def train(model, args, loss, writer, plot, notifier=None):
                 _phase7_update_from_structure(
                     comp_debug,
                     phase7_structure_debug,
-                    is_anchor_step=bool(is_anchor_step),
+                    is_anchor_step=bool(is_anchor_step and not full_cloud_anchor_shadow_train_active),
                 )
                 _phase7_update_from_voxel_state(comp_debug, model)
                 # Phase7-4:
                 # ablation modeと短時間判定用summaryをcomp_debugへ集約する。
                 _phase7_add_ablation_summary_to_comp_debug(args, comp_debug)
-                if _phase7_debug_enabled(args, global_train_step):
-                    _phase7_writer_line(
-                        args,
-                        writer,
-                        "Phase7PathDebug: "
-                        f"anchor={bool(is_anchor_step)}, "
-                        f"node_used={bool(comp_debug.get('network_voxel_node_input_used', False))}, "
-                        f"node_fallback={bool(comp_debug.get('network_voxel_node_fallback', False))}, "
-                        f"node_reason={comp_debug.get('network_voxel_node_fallback_reason', '')}, "
-                        f"node_source={comp_debug.get('network_voxel_node_source', 'none')}, "
-                        f"node_count={int(comp_debug.get('network_voxel_node_count', 0) or 0)}, "
-                        f"feature_shape={comp_debug.get('network_voxel_node_feature_shape', '')}, "
-                        f"full_anchor_node={bool(comp_debug.get('full_cloud_anchor_node_voxel_used', False))}, "
-                        f"subtree_node={bool(comp_debug.get('subtree_node_voxel_used', False))}"
+                if isinstance(full_cloud_anchor_debug_snapshot, dict) and full_cloud_anchor_debug_snapshot:
+                    comp_debug["full_cloud_anchor_shadow_train_requested"] = bool(full_cloud_anchor_shadow_train_requested)
+                    comp_debug["full_cloud_anchor_shadow_train_used"] = bool(full_cloud_anchor_shadow_train_active)
+                    comp_debug["full_cloud_anchor_optimizer_updates"] = bool(full_cloud_anchor_shadow_train_active)
+                    comp_debug["full_cloud_anchor_actual_total_bit_percent"] = full_cloud_anchor_debug_snapshot.get(
+                        "actual_total_bit_percent",
+                        full_cloud_anchor_debug_snapshot.get("actual_bit_percent", None),
                     )
+                    comp_debug["full_cloud_anchor_actual_bit_percent"] = full_cloud_anchor_debug_snapshot.get(
+                        "actual_bit_percent",
+                        full_cloud_anchor_debug_snapshot.get("actual_total_bit_percent", None),
+                    )
+                    comp_debug["full_cloud_anchor_teacher_type"] = full_cloud_anchor_debug_snapshot.get("teacher_type", "")
+                    comp_debug["full_cloud_anchor_full_cloud_teacher_used"] = bool(
+                        full_cloud_anchor_debug_snapshot.get("full_cloud_teacher_used", False)
+                    )
+                    comp_debug["full_cloud_anchor_point_count_before"] = full_cloud_anchor_debug_snapshot.get("point_count_before", None)
+                    comp_debug["full_cloud_anchor_point_count_after"] = full_cloud_anchor_debug_snapshot.get("point_count_after", None)
+                    comp_debug["full_cloud_anchor_unique_coord_before"] = full_cloud_anchor_debug_snapshot.get("unique_coord_before", None)
+                    comp_debug["full_cloud_anchor_unique_coord_after"] = full_cloud_anchor_debug_snapshot.get("unique_coord_after", None)
+
+
                 if cp_debug: # Compression Primaryモード用のDebug情報が存在するか判定
                     comp_debug.update(cp_debug) # 圧縮目的のDebug情報を追加
                     loss.last_compression_debug = comp_debug # 統合後のcomp_debugをLossに保存
@@ -4183,24 +4318,8 @@ def train(model, args, loss, writer, plot, notifier=None):
                         torch.is_tensor(full_cloud_correction_loss)
                         and full_cloud_correction_loss.requires_grad
                     )
-                # Phase7-3: full-context / full-cloud correction のhard値・soft proxy値を分けて表示する。
-                if _phase7_debug_enabled(args, global_train_step):
-                    _phase7_writer_line(
-                        args,
-                        writer,
-                        "Phase7LossDebug: "
-                        f"full_context_used={bool(comp_debug.get('full_context_subtree_delta_used', False))}, "
-                        f"hard={float(comp_debug.get('full_context_subtree_hard_loss', comp_debug.get('full_context_subtree_hard_loss_value', 0.0)) or 0.0):.6g}, "
-                        f"soft_proxy={float(comp_debug.get('full_context_subtree_soft_proxy_loss', comp_debug.get('full_context_subtree_soft_proxy_loss_value', 0.0)) or 0.0):.6g}, "
-                        f"total={float(comp_debug.get('full_context_subtree_loss_total', comp_debug.get('full_context_subtree_delta_value', 0.0)) or 0.0):.6g}, "
-                        f"soft_used={bool(comp_debug.get('full_context_subtree_soft_proxy_used', False))}, "
-                        f"corr_enabled={bool(comp_debug.get('full_cloud_actual_correction_loss_enabled', comp_debug.get('full_cloud_corr_loss_enabled', False)))}, "
-                        f"corr_added={bool(comp_debug.get('full_cloud_corr_loss_added_to_total', False))}, "
-                        f"corr_loss={float(comp_debug.get('full_cloud_actual_correction_loss_value', comp_debug.get('full_cloud_corr_loss_value', 0.0)) or 0.0):.6g}, "
-                        f"corr_soft_used={bool(comp_debug.get('full_cloud_actual_correction_soft_proxy_used', comp_debug.get('full_cloud_corr_soft_proxy_used', False)))}, "
-                        f"full_vs_subtree_gap={float(comp_debug.get('full_vs_subtree_gap', comp_debug.get('full_cloud_corr_ema_full_vs_subtree_gap', 0.0)) or 0.0):.6g}, "
-                        f"full_vs_context_gap={float(comp_debug.get('full_vs_context_gap', comp_debug.get('full_cloud_corr_ema_full_vs_context_gap', 0.0)) or 0.0):.6g}"
-                    )
+
+
                 if isinstance(full_cloud_correction_state, dict):
                     comp_debug.update(
                         {
@@ -4365,7 +4484,11 @@ def train(model, args, loss, writer, plot, notifier=None):
                             getattr(args, "full_cloud_anchor_allow_grad", False)
                         )
 
-                    if bool(is_anchor_step) and bool(full_cloud_anchor_no_grad):
+                    if (
+                        bool(is_anchor_step)
+                        and bool(full_cloud_anchor_no_grad)
+                        and not bool(full_cloud_anchor_shadow_train_active)
+                    ):
                         skip_optimizer_reason = "full_cloud_anchor_no_grad"
                         comp_debug["optimizer_skip_reason"] = skip_optimizer_reason
                         loss.last_compression_debug = comp_debug
@@ -4412,6 +4535,17 @@ def train(model, args, loss, writer, plot, notifier=None):
                         "network_voxel_node_count",
                         "network_voxel_node_feature_shape",
                         "full_cloud_anchor_node_voxel_used",
+                        "full_cloud_anchor_shadow_train_requested",
+                        "full_cloud_anchor_shadow_train_used",
+                        "full_cloud_anchor_optimizer_updates",
+                        "full_cloud_anchor_actual_total_bit_percent",
+                        "full_cloud_anchor_actual_bit_percent",
+                        "full_cloud_anchor_teacher_type",
+                        "full_cloud_anchor_full_cloud_teacher_used",
+                        "full_cloud_anchor_point_count_before",
+                        "full_cloud_anchor_point_count_after",
+                        "full_cloud_anchor_unique_coord_before",
+                        "full_cloud_anchor_unique_coord_after",
                         "subtree_node_voxel_used",
 
                         "voxel_restored_actual_used",
@@ -4457,6 +4591,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                         "drop_grad_norm",
                         "add_grad_norm",
                         "move_grad_norm",
+                        "operation_gate_grad_norm",
                         "policy_grad_norm",
                         "cost_attr_grad_norm",
                         "cause_agg_grad_norm",
@@ -4470,11 +4605,13 @@ def train(model, args, loss, writer, plot, notifier=None):
                         "phase7_grad_drop_head",
                         "phase7_grad_add_head",
                         "phase7_grad_move_head",
+                        "phase7_grad_operation_gate_head",
                         "phase7_grad_policy",
                         "phase7_grad_cost_attr",
                         "phase7_grad_sanity_drop_head_norm",
                         "phase7_grad_sanity_add_head_norm",
                         "phase7_grad_sanity_move_head_norm",
+                        "phase7_grad_sanity_operation_gate_head_norm",
                         "phase7_grad_sanity_drop_amount_head_norm",
                         "phase7_grad_sanity_add_amount_head_norm",
                         "phase7_grad_sanity_move_amount_head_norm",
@@ -4484,18 +4621,21 @@ def train(model, args, loss, writer, plot, notifier=None):
                         "phase7_grad_sanity_drop_head_is_none",
                         "phase7_grad_sanity_add_head_is_none",
                         "phase7_grad_sanity_move_head_is_none",
+                        "phase7_grad_sanity_operation_gate_head_is_none",
                         "phase7_grad_sanity_policy_is_none",
                         "phase7_grad_sanity_cost_attr_is_none",
                         "phase7_grad_sanity_cause_agg_is_none",
                         "phase7_grad_sanity_drop_head_is_nan",
                         "phase7_grad_sanity_add_head_is_nan",
                         "phase7_grad_sanity_move_head_is_nan",
+                        "phase7_grad_sanity_operation_gate_head_is_nan",
                         "phase7_grad_sanity_policy_is_nan",
                         "phase7_grad_sanity_cost_attr_is_nan",
                         "phase7_grad_sanity_cause_agg_is_nan",
                         "phase7_grad_sanity_drop_head_is_zero_like",
                         "phase7_grad_sanity_add_head_is_zero_like",
                         "phase7_grad_sanity_move_head_is_zero_like",
+                        "phase7_grad_sanity_operation_gate_head_is_zero_like",
                         "phase7_grad_sanity_policy_is_zero_like",
                         "phase7_grad_sanity_cost_attr_is_zero_like",
                         "phase7_grad_sanity_cause_agg_is_zero_like",
@@ -4538,6 +4678,8 @@ def train(model, args, loss, writer, plot, notifier=None):
                         "full_cloud_corr_loss_value",
                         "full_cloud_corr_loss_enabled",
                         "full_cloud_corr_loss_added_to_total",
+                        "full_cloud_corr_loss_weight_used",
+                        "full_cloud_corr_loss_requires_grad",
                         "full_cloud_corr_loss_severity",
                         "full_cloud_corr_ema_full_vs_subtree_gap",
                         "full_cloud_corr_ema_full_vs_context_gap",
@@ -4731,7 +4873,11 @@ def train(model, args, loss, writer, plot, notifier=None):
                 sparsepcgc_aux_term = terms.get("sparsepcgc", None)
                 if torch.is_tensor(sparsepcgc_aux_term) and sparsepcgc_aux_term.requires_grad:
                     step_grad_loss_items.append(("sparsepcgc_aux_objective", sparsepcgc_aux_term))
-                if bool(is_anchor_step) and bool(full_cloud_anchor_no_grad):
+                if (
+                    bool(is_anchor_step)
+                    and bool(full_cloud_anchor_no_grad)
+                    and not bool(full_cloud_anchor_shadow_train_active)
+                ):
                     step_grad_rows = []
                     writer.write("StepGradProbe: skipped because full_cloud_anchor_no_grad=True")
                 else:

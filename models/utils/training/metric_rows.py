@@ -45,6 +45,8 @@ def build_compression_metric_row(
         "sparsepcgc_aux_weight_effective": case_float(comp_debug.get("sparsepcgc_aux_weight_effective", float("nan")), float("nan")),
         "corr_sparsepcgc_aux_actual_rolling": case_float(comp_debug.get("corr_sparsepcgc_aux_actual_rolling", float("nan")), float("nan")),
         "sign_match_sparsepcgc_aux_actual_rolling": case_float(comp_debug.get("sign_match_sparsepcgc_aux_actual_rolling", float("nan")), float("nan")),
+        "sparsepcgc_aux_gate_mode": str(comp_debug.get("sparsepcgc_aux_gate_mode", "")),
+        "sparsepcgc_aux_gate_multiplier": case_float(comp_debug.get("sparsepcgc_aux_gate_multiplier", float("nan")), float("nan")),
         "sparsepcgc_aux_gating_reason": str(comp_debug.get("sparsepcgc_aux_gating_reason", "")),
         "lcom_without_sparsepcgc_aux": case_float(comp_debug.get("lcom_without_sparsepcgc_aux", float("nan")), float("nan")),
         "lcom_with_sparsepcgc_aux": case_float(comp_debug.get("lcom_with_sparsepcgc_aux", comp_debug.get("compression_objective", float("nan"))), float("nan")),
@@ -168,6 +170,36 @@ def build_compression_metric_row(
         "use_subtree_tree": bool(comp_debug.get("use_subtree_tree", False)),
         "use_full_octree_context": bool(comp_debug.get("use_full_octree_context", False)),
         "octree_input_mode": str(comp_debug.get("octree_input_mode", "")),
+
+        # Section2:
+        # leaf pattern candidate診断。
+        "leaf_pattern_available": bool(comp_debug.get("leaf_pattern_available", False)),
+        "leaf_pattern_source": str(comp_debug.get("leaf_pattern_source", "")),
+        "leaf_pattern_reason": str(comp_debug.get("leaf_pattern_reason", "")),
+        "leaf_unique_parent_count": case_int(comp_debug.get("leaf_unique_parent_count", 0)),
+        "leaf_unique_pattern_count": case_int(comp_debug.get("leaf_unique_pattern_count", 0)),
+        "leaf_mean_child_count": case_float(comp_debug.get("leaf_mean_child_count", float("nan")), float("nan")),
+        "leaf_single_child_parent_ratio": case_float(comp_debug.get("leaf_single_child_parent_ratio", float("nan")), float("nan")),
+        "leaf_max_pattern_frequency": case_float(comp_debug.get("leaf_max_pattern_frequency", float("nan")), float("nan")),
+        "leaf_candidate_available": bool(comp_debug.get("leaf_candidate_available", False)),
+        "leaf_delete_gain_mean": case_float(comp_debug.get("leaf_delete_gain_mean", float("nan")), float("nan")),
+        "leaf_add_gain_mean": case_float(comp_debug.get("leaf_add_gain_mean", float("nan")), float("nan")),
+        "leaf_move_gain_mean": case_float(comp_debug.get("leaf_move_gain_mean", float("nan")), float("nan")),
+        "leaf_high_gain_candidate_ratio": case_float(comp_debug.get("leaf_high_gain_candidate_ratio", float("nan")), float("nan")),
+
+        # Section3:
+        "leaf_feature_integration_used": bool(comp_debug.get("leaf_feature_integration_used", False)),
+        "leaf_feature_best_gain_mean": case_float(comp_debug.get("leaf_feature_best_gain_mean", float("nan")), float("nan")),
+        "leaf_feature_best_gain_max": case_float(comp_debug.get("leaf_feature_best_gain_max", float("nan")), float("nan")),
+
+        # Section4:
+        "leaf_actuator_prior_enabled": bool(comp_debug.get("leaf_actuator_prior_enabled", False)),
+        "leaf_actuator_drop_prior_mean": case_float(comp_debug.get("leaf_actuator_drop_prior_mean", float("nan")), float("nan")),
+        "leaf_actuator_add_prior_mean": case_float(comp_debug.get("leaf_actuator_add_prior_mean", float("nan")), float("nan")),
+        "leaf_actuator_move_prior_mean": case_float(comp_debug.get("leaf_actuator_move_prior_mean", float("nan")), float("nan")),
+        "leaf_actuator_best_prior_mean": case_float(comp_debug.get("leaf_actuator_best_prior_mean", float("nan")), float("nan")),
+        "leaf_actuator_best_prior_max": case_float(comp_debug.get("leaf_actuator_best_prior_max", float("nan")), float("nan")),
+
         "structural_voxel_mode": str(comp_debug.get("structural_voxel_mode", "")),
         "point_feature_voxel_mode": str(comp_debug.get("point_feature_voxel_mode", "")),
         "selected_subtree_key": str(comp_debug.get("selected_subtree_key", "")),
@@ -549,6 +581,14 @@ def build_operation_metric_row(
         "add_enabled": bool(structure_debug.get("add_enabled", False)),
         "prune_enabled": bool(structure_debug.get("prune_enabled", False)),
         "disp_enabled": bool(structure_debug.get("disp_enabled", False)),
+        "drop_operation_gate": case_float(structure_debug.get("drop_operation_gate", float("nan")), float("nan")),
+        "add_operation_gate": case_float(structure_debug.get("add_operation_gate", float("nan")), float("nan")),
+        "move_operation_gate": case_float(structure_debug.get("move_operation_gate", float("nan")), float("nan")),
+        "operation_gate_grad_norm": case_float((getattr(args, "_last_grad_flow", {}) or {}).get("operation_gate_head_grad_norm", float("nan")), float("nan")),
+        "operation_gate_grad_status": str((getattr(args, "_last_grad_flow", {}) or {}).get("operation_gate_head_grad_status", "")),
+        "raw_learned_drop_ratio": case_float(structure_debug.get("raw_learned_drop_ratio", float("nan")), float("nan")),
+        "raw_learned_add_ratio": case_float(structure_debug.get("raw_learned_add_ratio", float("nan")), float("nan")),
+        "raw_learned_move_ratio": case_float(structure_debug.get("raw_learned_move_ratio", float("nan")), float("nan")),
         "repair_ratio": case_float(structure_debug.get("repair_ratio", float("nan")), float("nan")),
         "preserve_ratio": case_float(structure_debug.get("preserve_ratio", float("nan")), float("nan")),
         "add_prob_mean": case_float(structure_debug.get("add_prob_mean", float("nan")), float("nan")),
@@ -644,6 +684,15 @@ def build_operation_metric_row(
         "added_ratio_percent": case_float(edit_stats.get("added_ratio_percent", float("nan")), float("nan")),
         "deleted_ratio_percent": case_float(edit_stats.get("deleted_ratio_percent", float("nan")), float("nan")),
         "adjusted_ratio_percent": case_float(edit_stats.get("adjusted_ratio_percent", float("nan")), float("nan")),
+        "adjusted_ratio_percent_point_debug": case_float(edit_stats.get("adjusted_ratio_percent_point_debug", edit_stats.get("adjusted_ratio_percent", float("nan"))), float("nan")),
+        "voxel_edit_input_count": case_int(edit_stats.get("voxel_edit_input_count", 0)),
+        "voxel_edit_add_count": case_int(edit_stats.get("voxel_edit_add_count", structure_debug.get("add_target_voxel_count", 0))),
+        "voxel_edit_drop_count": case_int(edit_stats.get("voxel_edit_drop_count", structure_debug.get("delete_target_voxel_count", 0))),
+        "voxel_edit_move_count": case_int(edit_stats.get("voxel_edit_move_count", structure_debug.get("move_source_voxel_count", 0))),
+        "voxel_edit_final_count": case_int(edit_stats.get("voxel_edit_final_count", structure_debug.get("after_occupied_voxel_count", 0))),
+        "voxel_add_ratio_percent": case_float(edit_stats.get("voxel_add_ratio_percent", float("nan")), float("nan")),
+        "voxel_drop_ratio_percent": case_float(edit_stats.get("voxel_drop_ratio_percent", float("nan")), float("nan")),
+        "voxel_move_ratio_percent": case_float(edit_stats.get("voxel_move_ratio_percent", float("nan")), float("nan")),
         "codec_points_after": case_int(comp_debug.get("gen_points", 0)),
         "codec_points_before": case_int(comp_debug.get("gt_points", 0)),
         "codec_unique_after": unique_after,
@@ -703,4 +752,6 @@ def attach_grad_flow_to_operation_row(row, args):
     row["adjust_amount_grad_norm"] = case_float(grad.get("move_amount_grad_norm", row.get("adjust_amount_grad_norm", float("nan"))), float("nan"))
     row["adjust_branch_grad_status"] = str(grad.get("move_branch_grad_status", row.get("adjust_branch_grad_status", "")))
     row["adjust_amount_grad_status"] = str(grad.get("move_amount_grad_status", row.get("adjust_amount_grad_status", "")))
+    row["operation_gate_grad_norm"] = case_float(grad.get("operation_gate_head_grad_norm", row.get("operation_gate_grad_norm", float("nan"))), float("nan"))
+    row["operation_gate_grad_status"] = str(grad.get("operation_gate_head_grad_status", row.get("operation_gate_grad_status", "")))
     return row

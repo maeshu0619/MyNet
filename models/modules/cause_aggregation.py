@@ -17,6 +17,16 @@ class CauseDiagnosisAggregation(nn.Module):
         self.args = args
         self.unit_level = int(getattr(args, "repair_unit_level", max(1, int(getattr(args, "octree_ctx_level", 5)))))
         self.priority_dim = 1
+        self.refine_enabled = bool(getattr(args, "cause_aggregation_learnable_refine", True))
+        self.cause_dim = int(getattr(args, "cause_aggregation_cause_dim", 8))
+        hidden = max(int(getattr(args, "cause_aggregation_refine_hidden", 32)), 1)
+        self.refine = nn.Sequential(
+            nn.Conv1d(self.cause_dim + self.priority_dim, hidden, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(hidden, self.cause_dim, 1),
+        )
+        nn.init.zeros_(self.refine[-1].weight)
+        nn.init.zeros_(self.refine[-1].bias)
 
     def _unit_keys(self, pts_xyz):
         B, _, N = pts_xyz.shape
@@ -99,13 +109,28 @@ class CauseDiagnosisAggregation(nn.Module):
             else:
                 min_unit_sizes.append(0)
                 max_unit_sizes.append(0)
+        scores = torch.stack(agg_scores, dim=0)
+        targets = torch.stack(agg_targets, dim=0)
+        priority = torch.stack(priorities, dim=0)
+        refine_applied = False
+        if self.refine_enabled and scores.shape[1] == self.cause_dim:
+            refine_input = torch.cat([scores, priority.to(dtype=scores.dtype).detach()], dim=1)
+            refine_delta = self.refine(refine_input)
+            refine_scale = max(float(getattr(self.args, "cause_aggregation_refine_scale", 0.10)), 0.0)
+            score_logits = torch.log(scores.clamp_min(1e-6)) + refine_scale * refine_delta
+            scores = torch.softmax(score_logits, dim=1)
+            priority = scores.amax(dim=1, keepdim=True)
+            refine_applied = True
+
         return {
-            "scores": torch.stack(agg_scores, dim=0),
-            "targets": torch.stack(agg_targets, dim=0),
-            "priority": torch.stack(priorities, dim=0),
+            "scores": scores,
+            "targets": targets,
+            "priority": priority,
             "unit_keys": keys,
             "unit_mode": unit_mode,
             "local_recomputed": unit_mode == "local_recomputed",
+            "learnable_refine": bool(self.refine_enabled),
+            "refine_applied": bool(refine_applied),
             "unit_count": int(max(unit_counts) if unit_counts else 0),
             "min_unit_size": int(min(min_unit_sizes) if min_unit_sizes else 0),
             "max_unit_size": int(max(max_unit_sizes) if max_unit_sizes else 0),
