@@ -868,160 +868,105 @@ class OctreeStructureAnalysis(nn.Module):
             "candidate_available": bool(getattr(self.args, "leaf_pattern_candidate_diagnosis", True)),
         }
 
-    def _leaf_pattern_candidate_scores_single(
-        self,
-        parent_pattern_code_unique,
-        child_count_unique,
-        child_slot,
-        inverse,
-        *,
-        device,
-        dtype,
-    ):
+    def _merge_actual_oracle_into_leaf_pattern(self, leaf_pattern_diag, source_tree, like_tensor):
         """
-        Section2/3:
-        parent occupancy codeに対して、Delete/Add/Move後のpattern NLL改善量を作る。
-        ここでは操作は実行せず、CostAttributionへ渡すための診断特徴だけを作る。
+        SparsePCGC actual oracle がtrain.py側で確認した編集候補を、
+        leaf pattern診断と同じ経路でActuatorへ渡す。
+
+        通常のleaf histogram gainはactual codecと完全には一致しないため、
+        actualで改善を確認した候補があるstepではこちらを優先する。
         """
-        point_count = int(child_slot.numel())
-        if point_count <= 0 or parent_pattern_code_unique.numel() <= 0:
-            z = torch.zeros((point_count,), device=device, dtype=dtype)
-            b = torch.zeros((point_count,), device=device, dtype=torch.bool)
-            m1 = torch.full((point_count,), -1, device=device, dtype=torch.long)
-            return {
-                "delete_pattern_gain": z,
-                "add_pattern_gain": z,
-                "move_pattern_gain": z,
-                "delete_nll_gain": z,
-                "add_nll_gain": z,
-                "move_nll_gain": z,
-                "delete_valid_mask": b,
-                "add_valid_mask": b,
-                "move_valid_mask": b,
-                "best_add_child_slot": m1,
-                "best_move_target_child_slot": m1,
-                "best_operation_hint": torch.zeros((point_count,), device=device, dtype=torch.long),
-            }
+        if not isinstance(source_tree, dict):
+            return leaf_pattern_diag
+        if not bool(source_tree.get("actual_oracle_enabled", False)):
+            return leaf_pattern_diag
 
-        smoothing = max(float(getattr(self.args, "leaf_pattern_candidate_smoothing", 1.0)), 0.0)
+        if not isinstance(leaf_pattern_diag, dict):
+            leaf_pattern_diag = self._empty_leaf_pattern_diagnosis(
+                like_tensor,
+                reason="actual_oracle_only",
+            )
 
-        code_hist = torch.bincount(
-            parent_pattern_code_unique.clamp(0, 255),
-            minlength=256,
-        ).to(device=device, dtype=dtype)
+        B, _, N = like_tensor.shape
+        device = like_tensor.device
+        dtype = like_tensor.dtype
 
-        code_prob = code_hist + float(smoothing)
-        code_prob = code_prob / code_prob.sum().clamp_min(torch.finfo(dtype).eps)
-        code_nll = -torch.log2(code_prob.clamp_min(torch.finfo(dtype).eps))
+        def _fit_map(value, *, as_bool=False):
+            if not torch.is_tensor(value):
+                if as_bool:
+                    return torch.zeros((B, N), device=device, dtype=torch.bool)
+                return torch.zeros((B, N), device=device, dtype=dtype)
 
-        current_code = parent_pattern_code_unique.index_select(0, inverse).clamp(0, 255)
-        current_prob = code_prob.index_select(0, current_code)
-        current_nll = code_nll.index_select(0, current_code)
+            out = value.detach().to(device=device)
+            if out.ndim == 1:
+                out = out.view(1, -1)
+            elif out.ndim == 2:
+                pass
+            elif out.ndim == 3:
+                if out.shape[1] == 1:
+                    out = out.squeeze(1)
+                elif out.shape[2] == 1:
+                    out = out.squeeze(2)
+                else:
+                    out = out[:, 0, :]
+            else:
+                if as_bool:
+                    return torch.zeros((B, N), device=device, dtype=torch.bool)
+                return torch.zeros((B, N), device=device, dtype=dtype)
 
-        child_slot = child_slot.clamp(0, 7)
-        child_bit = (1 << child_slot).to(device=device, dtype=torch.long)
+            if out.shape[0] == 1 and B > 1:
+                out = out.expand(B, -1).contiguous()
+            if out.shape[0] != B:
+                if as_bool:
+                    return torch.zeros((B, N), device=device, dtype=torch.bool)
+                return torch.zeros((B, N), device=device, dtype=dtype)
 
-        point_child_count = child_count_unique.index_select(0, inverse).to(dtype=dtype)
+            current_n = int(out.shape[1])
+            if current_n > N:
+                out = out[:, :N].contiguous()
+            elif current_n < N:
+                if current_n > 0:
+                    pad = out[:, -1:].expand(B, N - current_n)
+                    out = torch.cat([out, pad], dim=1).contiguous()
+                else:
+                    if as_bool:
+                        return torch.zeros((B, N), device=device, dtype=torch.bool)
+                    return torch.zeros((B, N), device=device, dtype=dtype)
 
-        # Delete候補
-        delete_code = torch.bitwise_and(
-            current_code,
-            torch.bitwise_not(child_bit),
-        ).clamp(0, 255)
+            if as_bool:
+                return out.to(dtype=torch.bool)
+            return torch.nan_to_num(
+                out.to(dtype=dtype),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
 
-        delete_prob = code_prob.index_select(0, delete_code)
-        delete_nll = code_nll.index_select(0, delete_code)
-
-        delete_pattern_gain = torch.log2(delete_prob.clamp_min(torch.finfo(dtype).eps)) - torch.log2(
-            current_prob.clamp_min(torch.finfo(dtype).eps)
+        out = dict(leaf_pattern_diag)
+        out["available"] = True
+        out["reason"] = ""
+        out["source"] = f"{out.get('source', 'none')}+actual_oracle"
+        out["actual_oracle_enabled"] = True
+        out["actual_oracle_drop_mask"] = _fit_map(
+            source_tree.get("actual_oracle_drop_mask", None),
+            as_bool=True,
         )
-        delete_nll_gain = current_nll - delete_nll
-
-        min_children_after = max(int(getattr(self.args, "leaf_pattern_delete_min_children_after", 1)), 0)
-        delete_valid_mask = (point_child_count - 1.0) >= float(min_children_after)
-        delete_pattern_gain = torch.where(delete_valid_mask, delete_pattern_gain, torch.zeros_like(delete_pattern_gain))
-        delete_nll_gain = torch.where(delete_valid_mask, delete_nll_gain, torch.zeros_like(delete_nll_gain))
-
-        # Add / Move候補
-        slot_values = torch.arange(8, device=device, dtype=torch.long).view(1, 8)
-        slot_bits = (1 << slot_values).to(dtype=torch.long)
-
-        current_code_2d = current_code.view(-1, 1)
-        current_prob_2d = current_prob.view(-1, 1)
-        current_nll_2d = current_nll.view(-1, 1)
-
-        empty_slot_mask = torch.bitwise_and(current_code_2d, slot_bits) == 0
-
-        add_code_all = torch.bitwise_or(current_code_2d, slot_bits).clamp(0, 255)
-        add_prob_all = code_prob.index_select(0, add_code_all.reshape(-1)).view(point_count, 8)
-        add_nll_all = code_nll.index_select(0, add_code_all.reshape(-1)).view(point_count, 8)
-
-        add_pattern_gain_all = torch.log2(add_prob_all.clamp_min(torch.finfo(dtype).eps)) - torch.log2(
-            current_prob_2d.clamp_min(torch.finfo(dtype).eps)
+        out["actual_oracle_drop_score"] = _fit_map(
+            source_tree.get("actual_oracle_drop_score", None),
+            as_bool=False,
         )
-        add_nll_gain_all = current_nll_2d - add_nll_all
-
-        very_bad = torch.full_like(add_nll_gain_all, -1.0e6)
-        add_score_all = torch.where(empty_slot_mask, add_nll_gain_all, very_bad)
-        add_nll_gain, best_add_slot = add_score_all.max(dim=1)
-        add_valid_mask = empty_slot_mask.any(dim=1)
-        best_add_slot = torch.where(add_valid_mask, best_add_slot, torch.full_like(best_add_slot, -1))
-
-        safe_add_slot = best_add_slot.clamp_min(0).view(-1, 1)
-        add_pattern_gain = add_pattern_gain_all.gather(1, safe_add_slot).view(-1)
-        add_pattern_gain = torch.where(add_valid_mask, add_pattern_gain, torch.zeros_like(add_pattern_gain))
-        add_nll_gain = torch.where(add_valid_mask, add_nll_gain, torch.zeros_like(add_nll_gain))
-
-        source_removed_code = torch.bitwise_and(
-            current_code,
-            torch.bitwise_not(child_bit),
-        ).view(-1, 1)
-
-        move_code_all = torch.bitwise_or(source_removed_code, slot_bits).clamp(0, 255)
-        move_prob_all = code_prob.index_select(0, move_code_all.reshape(-1)).view(point_count, 8)
-        move_nll_all = code_nll.index_select(0, move_code_all.reshape(-1)).view(point_count, 8)
-
-        move_pattern_gain_all = torch.log2(move_prob_all.clamp_min(torch.finfo(dtype).eps)) - torch.log2(
-            current_prob_2d.clamp_min(torch.finfo(dtype).eps)
+        out["actual_oracle_drop_used"] = bool(source_tree.get("actual_oracle_drop_used", False))
+        out["actual_oracle_drop_best_percent"] = float(
+            source_tree.get("actual_oracle_drop_best_percent", 0.0) or 0.0
         )
-        move_nll_gain_all = current_nll_2d - move_nll_all
+        out["actual_oracle_drop_tested_count"] = int(
+            source_tree.get("actual_oracle_drop_tested_count", 0) or 0
+        )
+        out["actual_oracle_drop_reason"] = str(
+            source_tree.get("actual_oracle_drop_reason", "")
+        )
+        return out
 
-        move_score_all = torch.where(empty_slot_mask, move_nll_gain_all, very_bad)
-        move_nll_gain, best_move_slot = move_score_all.max(dim=1)
-        move_valid_mask = empty_slot_mask.any(dim=1) & (point_child_count >= 1.0)
-        best_move_slot = torch.where(move_valid_mask, best_move_slot, torch.full_like(best_move_slot, -1))
-
-        safe_move_slot = best_move_slot.clamp_min(0).view(-1, 1)
-        move_pattern_gain = move_pattern_gain_all.gather(1, safe_move_slot).view(-1)
-        move_pattern_gain = torch.where(move_valid_mask, move_pattern_gain, torch.zeros_like(move_pattern_gain))
-        move_nll_gain = torch.where(move_valid_mask, move_nll_gain, torch.zeros_like(move_nll_gain))
-
-        # 0 preserve, 1 delete, 2 add, 3 move
-        best_operation_hint = torch.stack(
-            [
-                torch.zeros_like(delete_nll_gain),
-                delete_nll_gain,
-                add_nll_gain,
-                move_nll_gain,
-            ],
-            dim=0,
-        ).argmax(dim=0).to(dtype=torch.long)
-
-        return {
-            "delete_pattern_gain": delete_pattern_gain,
-            "add_pattern_gain": add_pattern_gain,
-            "move_pattern_gain": move_pattern_gain,
-            "delete_nll_gain": delete_nll_gain,
-            "add_nll_gain": add_nll_gain,
-            "move_nll_gain": move_nll_gain,
-            "delete_valid_mask": delete_valid_mask,
-            "add_valid_mask": add_valid_mask,
-            "move_valid_mask": move_valid_mask,
-            "best_add_child_slot": best_add_slot,
-            "best_move_target_child_slot": best_move_slot,
-            "best_operation_hint": best_operation_hint,
-        }
-    
     def _leaf_pattern_feature_channels(self, leaf_pattern_diag, like_tensor):
         """
         Section3:
@@ -1568,8 +1513,9 @@ class OctreeStructureAnalysis(nn.Module):
             work_xyz,
             reason="prebuilt_coords_not_available",
         )
+        leaf_oracle_source_tree = subtree_tree if isinstance(subtree_tree, dict) else full_octree_context
         if prebuilt_ctx is not None:
-            source_tree = subtree_tree if isinstance(subtree_tree, dict) else full_octree_context
+            source_tree = leaf_oracle_source_tree
             raw_tree_coords = self._tree_tensor(source_tree, "global_voxel_coords", work_xyz.device, dtype=torch.long)
 
             if raw_tree_coords is not None:
@@ -1688,6 +1634,11 @@ class OctreeStructureAnalysis(nn.Module):
                 work_xyz,
                 reason="local_recomputed_path",
             )
+        leaf_pattern_diag = self._merge_actual_oracle_into_leaf_pattern(
+            leaf_pattern_diag,
+            leaf_oracle_source_tree,
+            work_xyz,
+        )
         local_density = geo_stats[:, 0:1, :]
         local_curvature = geo_stats[:, 1:2, :]
         local_anisotropy = geo_stats[:, 2:3, :]

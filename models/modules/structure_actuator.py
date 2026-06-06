@@ -431,140 +431,105 @@ class StructureRepairActuator(nn.Module):
 
     def _leaf_pattern_operation_masks(self, structure, like_tensor):
         """
-        leaf pattern診断に基づいて、
-        各voxel/nodeがどの操作候補として有効かを決める。
+        leaf pattern診断でNLL改善が見込めるsource候補だけを残す。
 
-        ここではsoftな推奨ではなく、Actuatorの候補集合を制約するためのmaskを作る。
+        現在のleaf pattern scoreはSparsePCGCの完全なoracleではないが、
+        無関係な大量Voxel編集を許すとexact occupancy NLLが序盤から悪化する。
+        そのためhard maskは「正の改善候補だけに絞る」軽い安全弁として使う。
         """
         B, _, N = like_tensor.shape
         device = like_tensor.device
 
         false_mask = torch.zeros((B, 1, N), device=device, dtype=torch.bool)
-
         out = {
             "enabled": False,
             "delete_mask": false_mask,
             "add_mask": false_mask,
             "move_mask": false_mask,
+            "actual_oracle_enabled": False,
+            "actual_oracle_drop_used": False,
+            "actual_oracle_drop_best_percent": 0.0,
+            "actual_oracle_drop_tested_count": 0,
+            "actual_oracle_drop_reason": "",
         }
-
-        if not bool(getattr(self.args, "leaf_pattern_operation_mask", True)):
-            return out
 
         if not isinstance(structure, dict):
             return out
-
         leaf_diag = structure.get("leaf_pattern_diag", None)
         if not isinstance(leaf_diag, dict):
             return out
 
+        # actual SparsePCGCで改善確認済みの候補があるstepでは、
+        # empirical leaf-pattern maskではなくoracle maskを優先する。
+        # force_no_edit時はdrop maskが全falseになり、全操作を明示的に止める。
+        if bool(leaf_diag.get("actual_oracle_enabled", False)):
+            oracle_drop_mask = self._fit_leaf_pattern_map(
+                leaf_diag.get("actual_oracle_drop_mask", None),
+                like_tensor,
+            ).to(dtype=torch.bool)
+            out.update(
+                {
+                    "enabled": True,
+                    "delete_mask": oracle_drop_mask,
+                    "add_mask": false_mask,
+                    "move_mask": false_mask,
+                    "actual_oracle_enabled": True,
+                    "actual_oracle_drop_used": bool(leaf_diag.get("actual_oracle_drop_used", False)),
+                    "actual_oracle_drop_best_percent": float(
+                        leaf_diag.get("actual_oracle_drop_best_percent", 0.0) or 0.0
+                    ),
+                    "actual_oracle_drop_tested_count": int(
+                        leaf_diag.get("actual_oracle_drop_tested_count", 0) or 0
+                    ),
+                    "actual_oracle_drop_reason": str(
+                        leaf_diag.get("actual_oracle_drop_reason", "")
+                    ),
+                }
+            )
+            return out
+
+        if not bool(getattr(self.args, "leaf_pattern_operation_mask", False)):
+            return out
         if not bool(leaf_diag.get("available", False)):
             return out
 
-        best_op = leaf_diag.get("best_operation_hint", None)
-        delete_valid = leaf_diag.get("delete_valid_mask", None)
-        add_valid = leaf_diag.get("add_valid_mask", None)
-        move_valid = leaf_diag.get("move_valid_mask", None)
+        threshold = max(float(getattr(self.args, "leaf_pattern_operation_mask_gain_threshold", 0.02)), 0.0)
+        delete_gain = self._fit_leaf_pattern_map(leaf_diag.get("delete_nll_gain", None), like_tensor)
+        add_gain = self._fit_leaf_pattern_map(leaf_diag.get("add_nll_gain", None), like_tensor)
+        move_gain = self._fit_leaf_pattern_map(leaf_diag.get("move_nll_gain", None), like_tensor)
 
-        if not torch.is_tensor(best_op):
+        delete_valid = self._fit_leaf_pattern_map(
+            leaf_diag.get("delete_valid_mask", None),
+            like_tensor,
+        ).to(dtype=torch.bool)
+        add_valid = self._fit_leaf_pattern_map(
+            leaf_diag.get("add_valid_mask", None),
+            like_tensor,
+        ).to(dtype=torch.bool)
+        move_valid = self._fit_leaf_pattern_map(
+            leaf_diag.get("move_valid_mask", None),
+            like_tensor,
+        ).to(dtype=torch.bool)
+
+        # DeleteはSparsePCGC actual改善とleaf empirical gainの相関が弱い。
+        # 実改善stepでは delete_nll_gain<=0 の候補も多いため、正gainだけで
+        # hard maskすると改善候補を消してしまう。親nodeを空にしないvalid条件だけ残す。
+        delete_mask = delete_valid
+        add_mask = add_valid & (add_gain > threshold)
+        move_mask = move_valid & (move_gain > threshold)
+
+        if not bool((delete_mask | add_mask | move_mask).any().detach().item()):
             return out
-
-        best_op = best_op.to(device=device, dtype=torch.long)
-
-        if best_op.ndim == 1:
-            best_op = best_op.view(1, 1, -1)
-        elif best_op.ndim == 2:
-            best_op = best_op.unsqueeze(1)
-        elif best_op.ndim == 3:
-            if best_op.shape[1] != 1:
-                best_op = best_op[:, :1, :]
-        else:
-            return out
-
-        if best_op.shape[0] == 1 and B > 1:
-            best_op = best_op.expand(B, -1, -1).contiguous()
-
-        if best_op.shape[-1] > N:
-            best_op = best_op[:, :, :N]
-        elif best_op.shape[-1] < N and best_op.shape[-1] > 0:
-            pad = best_op[:, :, -1:].expand(B, 1, N - best_op.shape[-1])
-            best_op = torch.cat([best_op, pad], dim=2)
-        elif best_op.shape[-1] <= 0:
-            return out
-
-        def _fit_bool_mask(value):
-            if not torch.is_tensor(value):
-                return torch.ones((B, 1, N), device=device, dtype=torch.bool)
-
-            mask = value.to(device=device, dtype=torch.bool)
-
-            if mask.ndim == 1:
-                mask = mask.view(1, 1, -1)
-            elif mask.ndim == 2:
-                mask = mask.unsqueeze(1)
-            elif mask.ndim == 3:
-                if mask.shape[1] != 1:
-                    mask = mask[:, :1, :]
-            else:
-                return torch.ones((B, 1, N), device=device, dtype=torch.bool)
-
-            if mask.shape[0] == 1 and B > 1:
-                mask = mask.expand(B, -1, -1).contiguous()
-
-            if mask.shape[-1] > N:
-                mask = mask[:, :, :N]
-            elif mask.shape[-1] < N and mask.shape[-1] > 0:
-                pad = mask[:, :, -1:].expand(B, 1, N - mask.shape[-1])
-                mask = torch.cat([mask, pad], dim=2)
-            elif mask.shape[-1] <= 0:
-                return torch.ones((B, 1, N), device=device, dtype=torch.bool)
-
-            return mask
-
-        delete_valid = _fit_bool_mask(delete_valid)
-        add_valid = _fit_bool_mask(add_valid)
-        move_valid = _fit_bool_mask(move_valid)
-
-        delete_mask = (best_op == 1) & delete_valid
-        add_mask = (best_op == 2) & add_valid
-        move_mask = (best_op == 3) & move_valid
 
         out.update(
             {
                 "enabled": True,
-                "add_target_bias": add_target_bias.detach(),
-                "move_target_bias": move_target_bias.detach(),
-                "add_target_match_ratio": float(add_match.to(torch.float32).mean().detach().cpu()),
-                "move_target_match_ratio": float(move_match.to(torch.float32).mean().detach().cpu()),
-                "add_target_bias_mean": float(add_target_bias.detach().float().mean().cpu()),
-                "move_target_bias_mean": float(move_target_bias.detach().float().mean().cpu()),
+                "delete_mask": delete_mask,
+                "add_mask": add_mask,
+                "move_mask": move_mask,
             }
         )
         return out
-
-    def _leaf_pattern_operation_masks(self, structure, like_tensor):
-        """
-        leaf pattern診断は、候補集合を殺すhard maskには使わない。
-        delete/add/move の source/target には既に prior / bias として入っているため、
-        ここでは常に無効maskを返す。
-
-        理由:
-        best_operation_hint は SparsePCGC actual bit を直接最小化した結果ではなく、
-        現在点群内の parent-child occupancy pattern 頻度から作った heuristic である。
-        そのため、ここで候補をhardに消すと、actual圧縮損失として有効な操作まで
-        学習前に消える可能性がある。
-        """
-        B, _, N = like_tensor.shape
-        device = like_tensor.device
-
-        false_mask = torch.zeros((B, 1, N), device=device, dtype=torch.bool)
-
-        return {
-            "enabled": False,
-            "delete_mask": false_mask,
-            "add_mask": false_mask,
-            "move_mask": false_mask,
-        }
     
     def _context_voxel_step_and_offset(self, pts_xyz, coord_scale, octree_context):
         # 初期Octree/Subtreeメタデータがある場合は、そのglobal_qs/global_offsetを優先する。
@@ -1354,6 +1319,8 @@ class StructureRepairActuator(nn.Module):
         hard_threshold=0.0,
         voxel_cache=None,
         force_min_count=False,
+        max_hard_count=0,
+        allow_single_candidate=False,
     ):
         B, _, N = drop_scores.shape
         hard_drop = torch.zeros_like(drop_scores, dtype=torch.bool)
@@ -1394,19 +1361,23 @@ class StructureRepairActuator(nn.Module):
                 valid_inverse = inverse_all[finite_valid]
                 valid_scores = score_values[finite_valid]
                 voxel_count = int(torch.unique(valid_inverse, sorted=False).numel())
-            if voxel_count <= 1:
+            if voxel_count <= 1 and not bool(allow_single_candidate):
                 continue
             if threshold_cap_mode:
                 cap_count = int(math.ceil(float(max_drop_ratio) * float(voxel_count)))
-                drop_count = min(max(cap_count, 0), voxel_count - 1)
+                reserve = 0 if bool(allow_single_candidate) else 1
+                drop_count = min(max(cap_count, 0), voxel_count - reserve)
             else:
                 cap_count = int(round(float(max_drop_ratio) * float(voxel_count)))
                 target_count = int(round(float(target_drop_ratio) * float(voxel_count)))
-                if force_min_count and target_drop_ratio > 0.0:
+                if (force_min_count or bool(allow_single_candidate)) and target_drop_ratio > 0.0:
                     target_count = max(target_count, 1)
-                if force_min_count and max_drop_ratio > 0.0:
+                if (force_min_count or bool(allow_single_candidate)) and max_drop_ratio > 0.0:
                     cap_count = max(cap_count, 1)
-                drop_count = min(target_count, cap_count, voxel_count - 1)
+                reserve = 0 if bool(allow_single_candidate) else 1
+                drop_count = min(target_count, cap_count, voxel_count - reserve)
+            if int(max_hard_count) > 0:
+                drop_count = min(drop_count, int(max_hard_count))
             if drop_count <= 0:
                 continue
             if callable(scatter_reduce):
@@ -2244,6 +2215,8 @@ class StructureRepairActuator(nn.Module):
         leaf_delete_op_mask = leaf_operation_masks["delete_mask"]
         leaf_add_op_mask = leaf_operation_masks["add_mask"]
         leaf_move_op_mask = leaf_operation_masks["move_mask"]
+        actual_oracle_enabled = bool(leaf_operation_masks.get("actual_oracle_enabled", False))
+        actual_oracle_has_drop = bool(leaf_delete_op_mask.detach().any().item()) if actual_oracle_enabled else False
 
         child_slot_candidate_ratio = None
         if child_slot_mask is not None:
@@ -2272,6 +2245,13 @@ class StructureRepairActuator(nn.Module):
             add_enabled=add_enabled,
             move_enabled=disp_enabled,
         )
+        if actual_oracle_enabled:
+            if actual_oracle_has_drop and prune_enabled:
+                drop_operation_gate = torch.ones_like(drop_operation_gate)
+            else:
+                drop_operation_gate = torch.zeros_like(drop_operation_gate)
+            add_operation_gate = torch.zeros_like(add_operation_gate)
+            move_operation_gate = torch.zeros_like(move_operation_gate)
 
         if timing_enabled:
             _mark_runtime("setup")
@@ -2318,6 +2298,20 @@ class StructureRepairActuator(nn.Module):
             "repair_drop_amount_random_mix_end",
         )
         raw_learned_drop_ratio = learned_drop_ratio
+        drop_ratio_floor = min(
+            max(float(getattr(self.args, "repair_drop_ratio_floor", 0.0)), 0.0),
+            float(max_drop_ratio),
+        )
+        if self.training and prune_enabled and drop_ratio_floor > 0.0:
+            learned_drop_ratio_floored = torch.maximum(
+                learned_drop_ratio,
+                learned_drop_ratio.new_tensor(drop_ratio_floor),
+            )
+            learned_drop_ratio = (
+                learned_drop_ratio_floored.detach()
+                + learned_drop_ratio
+                - learned_drop_ratio.detach()
+            )
         learned_drop_ratio = learned_drop_ratio * drop_operation_gate
         learned_drop_ratio_for_ops = self._scale_amount_downstream_grad(
             learned_drop_ratio,
@@ -2452,6 +2446,24 @@ class StructureRepairActuator(nn.Module):
             drop_prob_direct = torch.zeros_like(drop_prob_direct)
             drop_prob_proxy = torch.zeros_like(drop_prob_proxy)
         drop_prob = self._voxel_mean_logits(drop_prob, voxel_coords, voxel_cache=voxel_cache).clamp(0.0, 1.0)
+        if actual_oracle_enabled:
+            oracle_drop_forward = leaf_delete_op_mask.to(device=drop_prob.device, dtype=drop_prob.dtype)
+            oracle_grad_eps = min(
+                max(float(getattr(self.args, "sparsepcgc_actual_oracle_where_grad_eps", 0.05)), 0.0),
+                0.20,
+            )
+            drop_prob = (
+                oracle_drop_forward.detach()
+                + oracle_grad_eps * (drop_prob - drop_prob.detach())
+            ).clamp(0.0, 1.0)
+            drop_prob_direct = (
+                oracle_drop_forward.detach()
+                + oracle_grad_eps * (drop_prob_direct - drop_prob_direct.detach())
+            ).clamp(0.0, 1.0)
+            drop_prob_proxy = (
+                oracle_drop_forward.detach()
+                + oracle_grad_eps * (drop_prob_proxy - drop_prob_proxy.detach())
+            )
         drop_prob_raw_for_amount = drop_prob
         delete_candidate_mask = selection_bool.clone()
         delete_max_points = int(getattr(self.args, "repair_delete_max_points_per_voxel", 8))
@@ -2597,6 +2609,8 @@ class StructureRepairActuator(nn.Module):
             hard_threshold=float(getattr(self.args, "repair_drop_hard_threshold", 0.5)),
             voxel_cache=voxel_cache,
             force_min_count=bool(getattr(self.args, "repair_force_min_drop_voxels", False)),
+            max_hard_count=int(getattr(self.args, "repair_max_hard_drop_voxels", 0)),
+            allow_single_candidate=bool(actual_oracle_enabled and actual_oracle_has_drop),
         )
         hard_drop = hard_drop_mask.to(dtype=pts_xyz.dtype)
         # Phase3: Pruneは点削除ではなく、対象点が属するoccupied voxelの削除候補として記録する。
@@ -3013,6 +3027,7 @@ class StructureRepairActuator(nn.Module):
             hard_threshold=float(getattr(self.args, "repair_move_hard_threshold", 0.5)),
             voxel_cache=voxel_cache,
             force_min_count=bool(getattr(self.args, "repair_force_min_move_voxels", False)),
+            max_hard_count=int(getattr(self.args, "repair_max_hard_move_voxels", 0)),
         )
         raw_hard_move_bool = raw_hard_move_mask.squeeze(1).detach().to(dtype=torch.bool)
 
@@ -3145,6 +3160,7 @@ class StructureRepairActuator(nn.Module):
             hard_threshold=float(getattr(self.args, "repair_move_hard_threshold", 0.5)),
             voxel_cache=voxel_cache,
             force_min_count=bool(getattr(self.args, "repair_force_min_move_voxels", False)),
+            max_hard_count=int(getattr(self.args, "repair_max_hard_move_voxels", 0)),
         )
         hard_move = hard_move_mask.to(dtype=pts_xyz.dtype)
         # Phase3: guard後に確定したHard Move sourceをVoxel編集状態用に保存する。

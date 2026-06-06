@@ -533,6 +533,294 @@ def _select_actual_gen_xyz_from_voxel_state(
         "restored_actual_xyz_max": restored_max,
     }
 
+
+def _restore_codec_xyz_from_global_voxels(args, coords_b3n, context, like_xyz):
+    if not torch.is_tensor(coords_b3n) or coords_b3n.ndim != 3 or coords_b3n.shape[1] != 3:
+        return None
+    meta = _full_cloud_canonical_meta(context)
+    if not meta:
+        meta = {}
+        if isinstance(context, dict):
+            for key in ("global_qs", "global_offset", "sparsepcgc_voxel_meta"):
+                if key in context:
+                    meta[key] = context[key]
+    if "effective_qs_tensor" in meta and torch.is_tensor(meta["effective_qs_tensor"]):
+        meta["effective_qs_tensor"] = meta["effective_qs_tensor"].detach().to(
+            device=like_xyz.device,
+            dtype=like_xyz.dtype,
+        )
+        meta["global_qs"] = meta["effective_qs_tensor"]
+    if "global_offset_tensor" in meta and torch.is_tensor(meta["global_offset_tensor"]):
+        meta["global_offset_tensor"] = meta["global_offset_tensor"].detach().to(
+            device=like_xyz.device,
+            dtype=like_xyz.dtype,
+        )
+        meta["global_offset"] = meta["global_offset_tensor"]
+    restored, _ = restore_points_from_voxel_coords(
+        coords_b3n.detach().to(device=like_xyz.device, dtype=torch.long),
+        meta=meta if meta else None,
+        args=args,
+        center=bool(getattr(args, "sparsepcgc_dequantize_center", False)),
+        unique=True,
+        dtype=like_xyz.dtype,
+        device=like_xyz.device,
+    )
+    return restored
+
+
+def _sparsepcgc_actual_oracle_candidate_indices(coords_n3, args, global_step, max_candidates):
+    if coords_n3.numel() <= 0 or int(max_candidates) <= 0:
+        return [], None, None
+
+    unique_coords, inverse = torch.unique(
+        coords_n3.to(dtype=torch.long),
+        dim=0,
+        sorted=True,
+        return_inverse=True,
+    )
+    unique_count = int(unique_coords.shape[0])
+    if unique_count <= 1:
+        return [], unique_coords, inverse
+
+    parent_coords = torch.div(unique_coords, 2, rounding_mode="floor")
+    unique_parents, parent_inverse = torch.unique(
+        parent_coords,
+        dim=0,
+        sorted=True,
+        return_inverse=True,
+    )
+    child_slot = (
+        (unique_coords[:, 0] & 1)
+        + 2 * (unique_coords[:, 1] & 1)
+        + 4 * (unique_coords[:, 2] & 1)
+    ).to(dtype=torch.long)
+    occupancy = torch.zeros(
+        (unique_parents.shape[0], 8),
+        device=coords_n3.device,
+        dtype=torch.bool,
+    )
+    occupancy[parent_inverse, child_slot] = True
+    parent_child_count = occupancy.sum(dim=1).to(dtype=torch.float32).index_select(0, parent_inverse)
+
+    min_children_after = max(int(getattr(args, "leaf_pattern_delete_min_children_after", 1)), 0)
+    valid = (parent_child_count - 1.0) >= float(min_children_after)
+    valid_idx = valid.nonzero(as_tuple=False).reshape(-1)
+    if valid_idx.numel() <= 0:
+        return [], unique_coords, inverse
+
+    pattern_weights = (2 ** torch.arange(8, device=coords_n3.device, dtype=torch.long)).view(1, 8)
+    parent_code_unique = (occupancy.to(dtype=torch.long) * pattern_weights).sum(dim=1).clamp(0, 255)
+    current_code = parent_code_unique.index_select(0, parent_inverse).clamp(0, 255)
+    smoothing = max(float(getattr(args, "leaf_pattern_candidate_smoothing", 1.0)), 0.0)
+    code_hist = torch.bincount(parent_code_unique, minlength=256).to(device=coords_n3.device, dtype=torch.float32)
+    code_prob = (code_hist + float(smoothing))
+    code_prob = code_prob / code_prob.sum().clamp_min(torch.finfo(torch.float32).eps)
+    code_nll = -torch.log2(code_prob.clamp_min(torch.finfo(torch.float32).eps))
+
+    bit_current = (1 << child_slot.clamp(0, 7)).to(device=coords_n3.device, dtype=torch.long)
+    delete_code = torch.bitwise_and(current_code, torch.bitwise_not(bit_current)).clamp(0, 255)
+    delete_gain = code_nll.index_select(0, current_code) - code_nll.index_select(0, delete_code)
+    parent_nll = code_nll.index_select(0, current_code)
+
+    selected = []
+    seen = set()
+
+    def _append_from_order(order_tensor):
+        nonlocal selected
+        for item in order_tensor.detach().cpu().tolist():
+            idx = int(item)
+            if idx in seen:
+                continue
+            if not bool(valid[idx].detach().cpu()):
+                continue
+            seen.add(idx)
+            selected.append(idx)
+            if len(selected) >= int(max_candidates):
+                break
+
+    valid_gain = delete_gain.index_select(0, valid_idx)
+    desc_order = valid_idx.index_select(0, torch.argsort(valid_gain, descending=True))
+    asc_order = valid_idx.index_select(0, torch.argsort(valid_gain, descending=False))
+    nll_order = valid_idx.index_select(
+        0,
+        torch.argsort(parent_nll.index_select(0, valid_idx), descending=True),
+    )
+    child_order = valid_idx.index_select(
+        0,
+        torch.argsort(parent_child_count.index_select(0, valid_idx), descending=True),
+    )
+
+    for order in (desc_order, asc_order, nll_order, child_order):
+        if len(selected) >= int(max_candidates):
+            break
+        _append_from_order(order)
+
+    if len(selected) < int(max_candidates) and valid_idx.numel() > 0:
+        # Deterministic shuffle: 同じstep/同じSubtreeでは再現性を保ちつつ、候補の偏りを避ける。
+        seed = int(global_step) * 1103515245 + unique_count * 12345
+        noise = (
+            (valid_idx.to(dtype=torch.long) * 2654435761 + int(seed))
+            & 0x7FFFFFFF
+        )
+        random_order = valid_idx.index_select(0, torch.argsort(noise))
+        _append_from_order(random_order)
+
+    return selected[: int(max_candidates)], unique_coords, inverse
+
+
+def _attach_sparsepcgc_actual_oracle_drop(
+    *,
+    args,
+    writer,
+    loss,
+    subtree_tree,
+    full_octree_context,
+    subtree_xyz,
+    cache_key,
+    global_step,
+):
+    debug = {
+        "enabled": False,
+        "used": False,
+        "candidate_count": 0,
+        "tested_count": 0,
+        "best_percent": 0.0,
+        "reason": "disabled",
+    }
+
+    if not bool(getattr(args, "sparsepcgc_actual_oracle_edit", False)):
+        return subtree_tree, full_octree_context, debug
+    if str(getattr(args, "compress", "")).strip().lower().replace("_", "").replace("-", "") != "sparsepcgc":
+        debug["reason"] = "not_sparsepcgc"
+        return subtree_tree, full_octree_context, debug
+
+    interval = max(int(getattr(args, "sparsepcgc_actual_oracle_interval", 1)), 1)
+    if (int(global_step) % interval) != 0:
+        debug["reason"] = "interval_skip"
+        return subtree_tree, full_octree_context, debug
+
+    max_candidates = max(int(getattr(args, "sparsepcgc_actual_oracle_max_candidates", 0)), 0)
+    if max_candidates <= 0:
+        debug["reason"] = "max_candidates_zero"
+        return subtree_tree, full_octree_context, debug
+
+    if not isinstance(subtree_tree, dict):
+        debug["reason"] = "subtree_tree_missing"
+        return subtree_tree, full_octree_context, debug
+
+    coords = subtree_tree.get("global_voxel_coords", None)
+    if not torch.is_tensor(coords):
+        debug["reason"] = "global_voxel_coords_missing"
+        return subtree_tree, full_octree_context, debug
+    if coords.ndim == 2:
+        coords = coords.transpose(0, 1).contiguous().unsqueeze(0) if coords.shape[-1] == 3 else coords.unsqueeze(0)
+    if coords.ndim != 3:
+        debug["reason"] = f"invalid_coords_ndim={coords.ndim}"
+        return subtree_tree, full_octree_context, debug
+    if coords.shape[1] != 3 and coords.shape[-1] == 3:
+        coords = coords.permute(0, 2, 1).contiguous()
+    if coords.ndim != 3 or coords.shape[1] != 3 or coords.shape[0] != 1:
+        debug["reason"] = f"invalid_coords_shape={tuple(coords.shape)}"
+        return subtree_tree, full_octree_context, debug
+
+    coords = coords.detach().to(device=subtree_xyz.device, dtype=torch.long)
+    coords_n3 = coords[0].transpose(0, 1).contiguous()
+    candidate_indices, unique_coords, inverse = _sparsepcgc_actual_oracle_candidate_indices(
+        coords_n3,
+        args,
+        global_step,
+        max_candidates,
+    )
+    debug["enabled"] = True
+    debug["candidate_count"] = int(0 if unique_coords is None else len(candidate_indices))
+
+    point_mask = torch.zeros((1, coords.shape[-1]), device=coords.device, dtype=torch.bool)
+    score = torch.zeros((1, coords.shape[-1]), device=coords.device, dtype=torch.float32)
+
+    if not candidate_indices or unique_coords is None or inverse is None:
+        debug["reason"] = "no_valid_delete_candidates"
+    else:
+        try:
+            cached_gt = loss._get_cached_actual_gt(cache_key)
+            if cached_gt is None:
+                cached_gt = loss._encode_actual_batch(args, subtree_xyz[:, :3, :])
+                loss._store_cached_actual_gt(cache_key, cached_gt)
+            base_bit = float(cached_gt.get("bit", 0.0))
+            if not math.isfinite(base_bit) or base_bit <= 0.0:
+                raise RuntimeError(f"invalid_base_bit={base_bit}")
+
+            best_idx = None
+            best_percent = 0.0
+            tested = 0
+            all_unique_idx = torch.arange(unique_coords.shape[0], device=coords.device, dtype=torch.long)
+            for unique_idx in candidate_indices:
+                unique_idx = int(unique_idx)
+                keep_unique = all_unique_idx != int(unique_idx)
+                if int(keep_unique.sum().item()) <= 0:
+                    continue
+                candidate_coords = unique_coords[keep_unique].transpose(0, 1).contiguous().unsqueeze(0)
+                candidate_xyz = _restore_codec_xyz_from_global_voxels(
+                    args,
+                    candidate_coords,
+                    full_octree_context if isinstance(full_octree_context, dict) else subtree_tree,
+                    subtree_xyz,
+                )
+                if candidate_xyz is None or candidate_xyz.shape[-1] <= 0:
+                    continue
+                stats = loss._encode_actual_batch(args, candidate_xyz)
+                tested += 1
+                cand_bit = float(stats.get("bit", 0.0))
+                cand_percent = 100.0 * (cand_bit - base_bit) / max(abs(base_bit), 1.0)
+                if best_idx is None or cand_percent < best_percent:
+                    best_idx = unique_idx
+                    best_percent = float(cand_percent)
+            debug["tested_count"] = int(tested)
+            debug["best_percent"] = float(best_percent)
+
+            min_improve = max(float(getattr(args, "sparsepcgc_actual_oracle_min_improve_percent", 0.0)), 0.0)
+            if best_idx is not None and best_percent < -min_improve:
+                point_mask[0] = inverse == int(best_idx)
+                score[0, point_mask[0]] = 1.0 + min(abs(float(best_percent)) / 10.0, 4.0)
+                debug["used"] = True
+                debug["reason"] = "actual_improving_drop_found"
+            else:
+                debug["reason"] = "no_actual_improving_candidate"
+        except Exception as exc:
+            debug["reason"] = f"oracle_error:{exc}"
+
+    oracle_enabled = bool(
+        debug["used"] or bool(getattr(args, "sparsepcgc_actual_oracle_force_no_edit", True))
+    )
+    patched_values = {
+        "actual_oracle_enabled": bool(oracle_enabled),
+        "actual_oracle_drop_mask": point_mask.detach(),
+        "actual_oracle_drop_score": score.detach(),
+        "actual_oracle_drop_used": bool(debug["used"]),
+        "actual_oracle_drop_best_percent": float(debug["best_percent"]),
+        "actual_oracle_drop_tested_count": int(debug["tested_count"]),
+        "actual_oracle_drop_reason": str(debug["reason"]),
+    }
+
+    patched_tree = dict(subtree_tree or {})
+    patched_tree.update(patched_values)
+    patched_context = dict(full_octree_context or {})
+    patched_context.update(patched_values)
+
+    if bool(getattr(args, "sparsepcgc_actual_oracle_log", True)) and writer is not None and hasattr(writer, "write"):
+        if bool(getattr(args, "_log_this_step", False)) or bool(debug["used"]):
+            writer.write(
+                "SparsePCGCActualOracle: "
+                f"enabled={bool(debug['enabled'])}, "
+                f"used={bool(debug['used'])}, "
+                f"candidates={int(debug['candidate_count'])}, "
+                f"tested={int(debug['tested_count'])}, "
+                f"best_percent={float(debug['best_percent']):.6f}, "
+                f"reason={debug['reason']}"
+            )
+
+    return patched_tree, patched_context, debug
+
+
 def _unwrap_train_model(model):
     # DataParallelで包まれている場合は中身のモデルを取り出す
     return model.module if hasattr(model, "module") else model
@@ -3078,6 +3366,26 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 device=input_xyz.device,
                             )
 
+                            oracle_depth = 0
+                            try:
+                                oracle_depth = int(subtree_ref["depth"][0].item())
+                            except Exception:
+                                oracle_depth = int(subtree_depth_meta.get("depth", 0))
+                            oracle_cache_key = (
+                                f"{cache_key}|subtree_depth={oracle_depth}|subtree_key={selected_key_int}"
+                            )
+                            oracle_subtree_xyz = input_xyz.index_select(2, selected_point_idx).contiguous()
+                            patched_subtree_tree, patched_full_context, oracle_debug = _attach_sparsepcgc_actual_oracle_drop(
+                                args=args,
+                                writer=writer,
+                                loss=loss,
+                                subtree_tree=patched_subtree_tree,
+                                full_octree_context=patched_full_context,
+                                subtree_xyz=oracle_subtree_xyz[:, :3, :],
+                                cache_key=oracle_cache_key,
+                                global_step=global_train_step,
+                            )
+
                             patched_subtree_trees[selected_key_int] = patched_subtree_tree
                             patched_full_octree_contexts[selected_key_int] = patched_full_context
 
@@ -3093,6 +3401,19 @@ def train(model, args, loss, writer, plot, notifier=None):
                             group_meta[selected_key_int]["canonical_full_points"] = int(
                                 patched_full_context["full_global_voxel_coords"].shape[-1]
                             )
+                            if isinstance(oracle_debug, dict):
+                                group_meta[selected_key_int]["actual_oracle_enabled"] = bool(
+                                    oracle_debug.get("enabled", False)
+                                )
+                                group_meta[selected_key_int]["actual_oracle_used"] = bool(
+                                    oracle_debug.get("used", False)
+                                )
+                                group_meta[selected_key_int]["actual_oracle_best_percent"] = float(
+                                    oracle_debug.get("best_percent", 0.0)
+                                )
+                                group_meta[selected_key_int]["actual_oracle_reason"] = str(
+                                    oracle_debug.get("reason", "")
+                                )
 
                         subtree_trees = patched_subtree_trees
                         full_octree_contexts = patched_full_octree_contexts

@@ -1705,6 +1705,7 @@ class Network(nn.Module):
                 "structural_voxel_key": structure_b.get("structural_voxel_key") if structure_b is not None else None,
                 "point_feature_voxel_key": structure_b.get("point_feature_voxel_key") if structure_b is not None else None,
                 "occupancy_nll_proxy_full": torch.cat(occupancy_nll_proxy_full_list, dim=0),
+                "leaf_pattern_diag": structure_b.get("leaf_pattern_diag") if structure_b is not None else None,
 
                 # Section2:
                 # sparse pathでは最後に処理したstructure_bのsummaryをdebugとして持つ。

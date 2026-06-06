@@ -597,10 +597,52 @@ def parse_pugan_args(parser, file_day, file_time):
         help='leaf pattern best_operation_hintでDelete/Add/Moveのsource候補をhard maskするか。圧縮損失最適化ではFalse推奨',
     )
     parser.add_argument(
+        '--leaf_pattern_operation_mask_gain_threshold',
+        default=0.02,
+        type=float,
+        help='leaf pattern operation maskで候補として残す最小NLL改善量',
+    )
+    parser.add_argument(
         '--leaf_pattern_target_direction_mask',
         default=False,
         type=str2bool,
         help='best_add_child_slot / best_move_target_child_slotでAdd/Move target候補をhard maskするか。通常はprior/biasだけ使うためFalse推奨',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_edit',
+        default=False,
+        type=str2bool,
+        help='Subtree forward前に少数のVoxel編集候補を実SparsePCGCで評価し、bit改善候補だけをActuatorへ渡す',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_interval',
+        default=1,
+        type=int,
+        help='actual oracle候補探索を何stepごとに行うか',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_max_candidates',
+        default=6,
+        type=int,
+        help='1 Subtreeあたり実SparsePCGCで試すPrune候補数の上限',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_min_improve_percent',
+        default=0.0,
+        type=float,
+        help='actual oracle候補を採択する最小改善率。0ならactual bitが少しでも下がった候補だけ採択',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_force_no_edit',
+        default=True,
+        type=str2bool,
+        help='actual oracle有効時に改善候補が見つからない場合、Add/Prune/Moveを全て止める',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_log',
+        default=True,
+        type=str2bool,
+        help='actual oracle候補探索の結果をstep logへ出す',
     )
     parser.add_argument('--allow_slow_knn_fallback', default=False, type=str2bool, help='pointops CUDAが使えない時に低速なtorch.cdist fallbackで継続するか')
     parser.add_argument('--encoder_pre_downsample_voxel_scale', default=1.0, type=float, help='qs由来のvoxelサイズの倍率')
@@ -741,6 +783,24 @@ def parse_pugan_args(parser, file_day, file_time):
         default=0.0,
         type=float,
         help='学習中にAdjustのHard実行割合が0へ潰れないようにする最小forward割合。backwardは元のlearned ratioへ流す',
+    )
+    parser.add_argument(
+        '--repair_drop_ratio_floor',
+        default=0.0,
+        type=float,
+        help='学習中にPruneのHard実行割合が0へ潰れないようにする最小forward割合。backwardは元のlearned ratioへ流す',
+    )
+    parser.add_argument(
+        '--repair_max_hard_drop_voxels',
+        default=0,
+        type=int,
+        help='1 forwardで実行するPrune hard voxel数の絶対上限。0ならratio上限のみ',
+    )
+    parser.add_argument(
+        '--repair_max_hard_move_voxels',
+        default=0,
+        type=int,
+        help='1 forwardで実行するMove hard source voxel数の絶対上限。0ならratio上限のみ',
     )
     parser.add_argument('--repair_move_warmup_steps', default=300, type=int, help='Adjust/Move実行上限を学習初期に徐々に上げるstep数')
     parser.add_argument('--repair_drop_hard_threshold', default=0.5, type=float, help='threshold_cap時に削除をhard化する最小score')
@@ -2293,6 +2353,7 @@ def parse_pugan_args(parser, file_day, file_time):
     args.operation_dead_grad_warn_threshold = max(float(getattr(args, "operation_dead_grad_warn_threshold", 1e-12)), 0.0)
     args.operation_dead_grad_warn_patience = max(int(getattr(args, "operation_dead_grad_warn_patience", 20)), 1)
     args.repair_add_ratio_floor = min(max(float(getattr(args, "repair_add_ratio_floor", 0.0)), 0.0), 0.05)
+    args.repair_drop_ratio_floor = min(max(float(getattr(args, "repair_drop_ratio_floor", 0.0)), 0.0), 0.05)
     args.repair_operation_gate_enabled = bool(getattr(args, "repair_operation_gate_enabled", True))
     args.repair_operation_gate_temperature = max(float(getattr(args, "repair_operation_gate_temperature", 1.0)), 1e-6)
     args.repair_operation_gate_hard_threshold = min(max(float(getattr(args, "repair_operation_gate_hard_threshold", 0.5)), 0.0), 1.0)
@@ -2304,6 +2365,16 @@ def parse_pugan_args(parser, file_day, file_time):
     args.repair_operation_gate_init_drop = min(max(float(getattr(args, "repair_operation_gate_init_drop", 0.50)), 1e-4), 1.0 - 1e-4)
     args.repair_operation_gate_init_add = min(max(float(getattr(args, "repair_operation_gate_init_add", 0.50)), 1e-4), 1.0 - 1e-4)
     args.repair_operation_gate_init_move = min(max(float(getattr(args, "repair_operation_gate_init_move", 0.50)), 1e-4), 1.0 - 1e-4)
+    args.repair_max_hard_drop_voxels = max(int(getattr(args, "repair_max_hard_drop_voxels", 0)), 0)
+    args.repair_max_hard_move_voxels = max(int(getattr(args, "repair_max_hard_move_voxels", 0)), 0)
+    args.sparsepcgc_actual_oracle_interval = max(
+        int(getattr(args, "sparsepcgc_actual_oracle_interval", 1)),
+        1,
+    )
+    args.sparsepcgc_actual_oracle_max_candidates = max(
+        int(getattr(args, "sparsepcgc_actual_oracle_max_candidates", 0)),
+        0,
+    )
     args.repair_force_min_drop_voxels = bool(getattr(args, "repair_force_min_drop_voxels", False))
     args.repair_force_min_add_voxels = bool(getattr(args, "repair_force_min_add_voxels", False))
     args.repair_force_min_move_voxels = bool(getattr(args, "repair_force_min_move_voxels", False))
@@ -2477,6 +2548,10 @@ def parse_pugan_args(parser, file_day, file_time):
             args.repair_operation_gate_hard_forward = False
         if not _cli_option_was_provided("--repair_output_voxel_restored_points"):
             args.repair_output_voxel_restored_points = True
+        if not _cli_option_was_provided("--leaf_pattern_operation_mask"):
+            args.leaf_pattern_operation_mask = True
+        if not _cli_option_was_provided("--leaf_pattern_target_direction_mask"):
+            args.leaf_pattern_target_direction_mask = True
         if not _cli_option_was_provided("--repair_add_pattern_prior_weight"):
             args.repair_add_pattern_prior_weight = 1.75
         if not _cli_option_was_provided("--repair_add_pair_pattern_prior_weight"):
@@ -2485,6 +2560,20 @@ def parse_pugan_args(parser, file_day, file_time):
             args.repair_move_pattern_prior_weight = 1.75
         if not _cli_option_was_provided("--repair_drop_pattern_prior_weight"):
             args.repair_drop_pattern_prior_weight = 1.25
+        if not _cli_option_was_provided("--repair_drop_hard_threshold"):
+            args.repair_drop_hard_threshold = 0.02
+        if not _cli_option_was_provided("--repair_drop_ratio_floor"):
+            args.repair_drop_ratio_floor = 0.002
+        if not _cli_option_was_provided("--repair_max_hard_drop_voxels"):
+            args.repair_max_hard_drop_voxels = 1
+        if not _cli_option_was_provided("--repair_max_hard_move_voxels"):
+            args.repair_max_hard_move_voxels = 1
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_edit"):
+            args.sparsepcgc_actual_oracle_edit = True
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_max_candidates"):
+            args.sparsepcgc_actual_oracle_max_candidates = 12
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_force_no_edit"):
+            args.sparsepcgc_actual_oracle_force_no_edit = True
         if not _cli_option_was_provided("--repair_add_min_expected_voxels"):
             args.repair_add_min_expected_voxels = 0.25
         if not _cli_option_was_provided("--repair_move_min_hard_expected_voxels"):
@@ -2494,7 +2583,7 @@ def parse_pugan_args(parser, file_day, file_time):
         if not _cli_option_was_provided("--compression_soft_rate_move_weight"):
             args.compression_soft_rate_move_weight = 0.05
         if not _cli_option_was_provided("--compression_soft_rate_prune_weight"):
-            args.compression_soft_rate_prune_weight = 0.25
+            args.compression_soft_rate_prune_weight = 0.05
         if not _cli_option_was_provided("--compression_soft_rate_proxy_grad_weight"):
             args.compression_soft_rate_proxy_grad_weight = max(
                 float(getattr(args, "compression_soft_rate_proxy_grad_weight", 0.05)),
@@ -2566,11 +2655,11 @@ def parse_pugan_args(parser, file_day, file_time):
             if not _cli_option_was_provided("--target_move_ratio"):
                 args.target_move_ratio = 0.0
             if not _cli_option_was_provided("--max_add_ratio"):
-                args.max_add_ratio = 0.30
+                args.max_add_ratio = 0.003
             if not _cli_option_was_provided("--max_drop_ratio"):
-                args.max_drop_ratio = 0.30
+                args.max_drop_ratio = 0.010
             if not _cli_option_was_provided("--max_move_ratio"):
-                args.max_move_ratio = 0.02
+                args.max_move_ratio = 0.005
             if not _cli_option_was_provided("--max_repair_ratio"):
                 args.max_repair_ratio = 0.30
             if not _cli_option_was_provided("--repair_operation_amount_direct_weight"):
@@ -2617,19 +2706,19 @@ def parse_pugan_args(parser, file_day, file_time):
         if not _cli_option_was_provided("--repair_add_weight_mode"):
             args.repair_add_weight_mode = "hard"
         if not _cli_option_was_provided("--repair_exploration_fraction"):
-            args.repair_exploration_fraction = 0.35
+            args.repair_exploration_fraction = 0.90
         if not _cli_option_was_provided("--repair_add_candidate_ratio_start"):
             args.repair_add_candidate_ratio_start = 0.10
         if not _cli_option_was_provided("--repair_add_candidate_ratio_end"):
             args.repair_add_candidate_ratio_end = 0.02
         if not _cli_option_was_provided("--repair_add_score_noise_start"):
-            args.repair_add_score_noise_start = 0.50
+            args.repair_add_score_noise_start = 0.20
         if not _cli_option_was_provided("--repair_add_score_noise_end"):
-            args.repair_add_score_noise_end = 0.0
+            args.repair_add_score_noise_end = 0.03
         if not _cli_option_was_provided("--repair_add_weight_random_mix_start"):
-            args.repair_add_weight_random_mix_start = 0.0 if args.sparsepcgc_disable_add else 0.10
+            args.repair_add_weight_random_mix_start = 0.0 if args.sparsepcgc_disable_add else 0.08
         if not _cli_option_was_provided("--repair_add_weight_random_mix_end"):
-            args.repair_add_weight_random_mix_end = 0.0
+            args.repair_add_weight_random_mix_end = 0.02
         if not _cli_option_was_provided("--repair_drop_amount_random_mix_start"):
             args.repair_drop_amount_random_mix_start = 0.10
         if not _cli_option_was_provided("--repair_drop_amount_random_mix_end"):
@@ -2649,11 +2738,11 @@ def parse_pugan_args(parser, file_day, file_time):
         if not _cli_option_was_provided("--repair_drop_score_noise_start"):
             args.repair_drop_score_noise_start = 0.35
         if not _cli_option_was_provided("--repair_drop_score_noise_end"):
-            args.repair_drop_score_noise_end = 0.0
+            args.repair_drop_score_noise_end = 0.05
         if not _cli_option_was_provided("--repair_drop_random_mix_start"):
-            args.repair_drop_random_mix_start = 0.65
+            args.repair_drop_random_mix_start = 0.25
         if not _cli_option_was_provided("--repair_drop_random_mix_end"):
-            args.repair_drop_random_mix_end = 0.0
+            args.repair_drop_random_mix_end = 0.03
         if not _cli_option_was_provided("--max_repair_qstep"):
             args.max_repair_qstep = max(float(getattr(args, "max_repair_qstep", 0.0)), 0.55)
         if not _cli_option_was_provided("--train_subtree_random_full_range"):
@@ -2738,15 +2827,15 @@ def parse_pugan_args(parser, file_day, file_time):
         if not _cli_option_was_provided("--repair_drop_score_noise_start"):
             args.repair_drop_score_noise_start = max(float(getattr(args, "repair_drop_score_noise_start", 0.0)), 0.35)
         if not _cli_option_was_provided("--repair_drop_score_noise_end"):
-            args.repair_drop_score_noise_end = 0.0
+            args.repair_drop_score_noise_end = max(float(getattr(args, "repair_drop_score_noise_end", 0.0)), 0.05)
         if not _cli_option_was_provided("--repair_drop_random_mix_start"):
-            args.repair_drop_random_mix_start = max(float(getattr(args, "repair_drop_random_mix_start", 0.0)), 0.35)
+            args.repair_drop_random_mix_start = max(float(getattr(args, "repair_drop_random_mix_start", 0.0)), 0.25)
         if not _cli_option_was_provided("--repair_drop_random_mix_end"):
-            args.repair_drop_random_mix_end = 0.0
+            args.repair_drop_random_mix_end = max(float(getattr(args, "repair_drop_random_mix_end", 0.0)), 0.03)
         if not _cli_option_was_provided("--repair_add_score_noise_start"):
-            args.repair_add_score_noise_start = max(float(getattr(args, "repair_add_score_noise_start", 0.0)), 0.25)
+            args.repair_add_score_noise_start = max(float(getattr(args, "repair_add_score_noise_start", 0.0)), 0.20)
         if not _cli_option_was_provided("--repair_add_score_noise_end"):
-            args.repair_add_score_noise_end = 0.0
+            args.repair_add_score_noise_end = max(float(getattr(args, "repair_add_score_noise_end", 0.0)), 0.03)
         if (not sparsepcgc_backend) and (not _cli_option_was_provided("--target_drop_ratio")):
             args.target_drop_ratio = min(float(getattr(args, "target_drop_ratio", 0.0)), 0.02)
         if (not sparsepcgc_backend) and (not _cli_option_was_provided("--max_drop_ratio")):
@@ -3023,6 +3112,7 @@ def parse_pugan_args(parser, file_day, file_time):
     args.repair_selection_mode = selection_mode
     args.repair_move_hard_threshold = min(max(float(getattr(args, "repair_move_hard_threshold", 0.5)), 0.0), 1.0)
     args.repair_drop_hard_threshold = min(max(float(getattr(args, "repair_drop_hard_threshold", 0.5)), 0.0), 1.0)
+    args.repair_drop_ratio_floor = min(max(float(getattr(args, "repair_drop_ratio_floor", 0.0)), 0.0), 0.05)
     args.repair_add_hard_threshold = min(max(float(getattr(args, "repair_add_hard_threshold", 0.5)), 0.0), 1.0)
     args.repair_quant_guard_weight = max(float(getattr(args, "repair_quant_guard_weight", 0.0)), 0.0)
     args.repair_local_guard_weight = max(float(getattr(args, "repair_local_guard_weight", 0.0)), 0.0)
@@ -3049,35 +3139,55 @@ def parse_pugan_args(parser, file_day, file_time):
     args.ckpt = _resolve_repo_or_cwd_path(args.ckpt)
     args.octattention_ckpt = _resolve_repo_or_cwd_path(args.octattention_ckpt)
     args.sparsepcgc_root = _resolve_repo_or_cwd_path(args.sparsepcgc_root)
-    args.repair_exploration_fraction = 1.0
+    if sparsepcgc_backend:
+        if not _cli_option_was_provided("--repair_exploration_fraction"):
+            args.repair_exploration_fraction = max(float(getattr(args, "repair_exploration_fraction", 0.0)), 0.90)
 
-    # Prune / Drop exploration
-    args.repair_drop_score_noise_start = 0.35
-    args.repair_drop_score_noise_end = 0.35
-    args.repair_drop_random_mix_start = 0.20
-    args.repair_drop_random_mix_end = 0.20
+        # Prune / Drop exploration. Keep a small tail, but do not keep heavy noise forever.
+        if not _cli_option_was_provided("--repair_drop_score_noise_start"):
+            args.repair_drop_score_noise_start = max(float(getattr(args, "repair_drop_score_noise_start", 0.0)), 0.35)
+        if not _cli_option_was_provided("--repair_drop_score_noise_end"):
+            args.repair_drop_score_noise_end = max(float(getattr(args, "repair_drop_score_noise_end", 0.0)), 0.05)
+        if not _cli_option_was_provided("--repair_drop_random_mix_start"):
+            args.repair_drop_random_mix_start = max(float(getattr(args, "repair_drop_random_mix_start", 0.0)), 0.25)
+        if not _cli_option_was_provided("--repair_drop_random_mix_end"):
+            args.repair_drop_random_mix_end = max(float(getattr(args, "repair_drop_random_mix_end", 0.0)), 0.03)
 
-    # Add exploration
-    args.repair_add_score_noise_start = 0.20
-    args.repair_add_score_noise_end = 0.20
-    args.repair_add_weight_random_mix_start = 0.08
-    args.repair_add_weight_random_mix_end = 0.08
+        # Add exploration.
+        if not _cli_option_was_provided("--repair_add_score_noise_start"):
+            args.repair_add_score_noise_start = max(float(getattr(args, "repair_add_score_noise_start", 0.0)), 0.20)
+        if not _cli_option_was_provided("--repair_add_score_noise_end"):
+            args.repair_add_score_noise_end = max(float(getattr(args, "repair_add_score_noise_end", 0.0)), 0.03)
+        if not _cli_option_was_provided("--repair_add_weight_random_mix_start"):
+            args.repair_add_weight_random_mix_start = max(float(getattr(args, "repair_add_weight_random_mix_start", 0.0)), 0.08)
+        if not _cli_option_was_provided("--repair_add_weight_random_mix_end"):
+            args.repair_add_weight_random_mix_end = max(float(getattr(args, "repair_add_weight_random_mix_end", 0.0)), 0.02)
 
-    # Amount exploration
-    args.repair_drop_amount_random_mix_start = 0.08
-    args.repair_drop_amount_random_mix_end = 0.08
-    args.repair_add_amount_random_mix_start = 0.08
-    args.repair_add_amount_random_mix_end = 0.08
+        # Amount exploration.
+        if not _cli_option_was_provided("--repair_drop_amount_random_mix_start"):
+            args.repair_drop_amount_random_mix_start = max(float(getattr(args, "repair_drop_amount_random_mix_start", 0.0)), 0.10)
+        if not _cli_option_was_provided("--repair_drop_amount_random_mix_end"):
+            args.repair_drop_amount_random_mix_end = max(float(getattr(args, "repair_drop_amount_random_mix_end", 0.0)), 0.02)
+        if not _cli_option_was_provided("--repair_add_amount_random_mix_start"):
+            args.repair_add_amount_random_mix_start = max(float(getattr(args, "repair_add_amount_random_mix_start", 0.0)), 0.08)
+        if not _cli_option_was_provided("--repair_add_amount_random_mix_end"):
+            args.repair_add_amount_random_mix_end = max(float(getattr(args, "repair_add_amount_random_mix_end", 0.0)), 0.02)
 
-    # Operation gate exploration
-    args.repair_operation_gate_random_mix_start = 0.08
-    args.repair_operation_gate_random_mix_end = 0.08
+        # Operation gate exploration.
+        if not _cli_option_was_provided("--repair_operation_gate_random_mix_start"):
+            args.repair_operation_gate_random_mix_start = max(float(getattr(args, "repair_operation_gate_random_mix_start", 0.0)), 0.12)
+        if not _cli_option_was_provided("--repair_operation_gate_random_mix_end"):
+            args.repair_operation_gate_random_mix_end = max(float(getattr(args, "repair_operation_gate_random_mix_end", 0.0)), 0.02)
 
-    # Move / Adjust exploration
-    args.repair_move_amount_random_mix_start = 0.05
-    args.repair_move_amount_random_mix_end = 0.05
-    args.repair_move_score_noise_start = 0.05
-    args.repair_move_score_noise_end = 0.05
+        # Move / Adjust exploration.
+        if not _cli_option_was_provided("--repair_move_amount_random_mix_start"):
+            args.repair_move_amount_random_mix_start = max(float(getattr(args, "repair_move_amount_random_mix_start", 0.0)), 0.05)
+        if not _cli_option_was_provided("--repair_move_amount_random_mix_end"):
+            args.repair_move_amount_random_mix_end = max(float(getattr(args, "repair_move_amount_random_mix_end", 0.0)), 0.01)
+        if not _cli_option_was_provided("--repair_move_score_noise_start"):
+            args.repair_move_score_noise_start = max(float(getattr(args, "repair_move_score_noise_start", 0.0)), 0.05)
+        if not _cli_option_was_provided("--repair_move_score_noise_end"):
+            args.repair_move_score_noise_end = max(float(getattr(args, "repair_move_score_noise_end", 0.0)), 0.01)
     args.sparsepcgc_ckptdir = _resolve_from_base_path(args.sparsepcgc_ckptdir, args.sparsepcgc_root)
     args.sparsepcgc_ckptdir_sr = _resolve_from_base_path(args.sparsepcgc_ckptdir_sr, args.sparsepcgc_root)
     args.sparsepcgc_ckptdir_ae = _resolve_from_base_path(args.sparsepcgc_ckptdir_ae, args.sparsepcgc_root)
