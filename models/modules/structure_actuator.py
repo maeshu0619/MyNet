@@ -229,6 +229,33 @@ class StructureRepairActuator(nn.Module):
 
         scale = max(float(getattr(self.args, "leaf_pattern_actuator_prior_scale", 2.0)), 1e-6)
 
+        if bool(leaf_diag.get("actual_oracle_enabled", False)):
+            delete_prior = self._fit_leaf_pattern_map(
+                leaf_diag.get("actual_oracle_drop_score", None),
+                like_tensor,
+            ).clamp_min(0.0).detach()
+            add_prior = self._fit_leaf_pattern_map(
+                leaf_diag.get("actual_oracle_add_score", None),
+                like_tensor,
+            ).clamp_min(0.0).detach()
+            move_prior = zero
+            best_prior = torch.maximum(delete_prior, add_prior)
+            out.update(
+                {
+                    "enabled": True,
+                    "delete_prior": delete_prior,
+                    "add_prior": add_prior,
+                    "move_prior": move_prior,
+                    "best_prior": best_prior,
+                    "delete_prior_mean": float(delete_prior.detach().float().mean().cpu()),
+                    "add_prior_mean": float(add_prior.detach().float().mean().cpu()),
+                    "move_prior_mean": 0.0,
+                    "best_prior_mean": float(best_prior.detach().float().mean().cpu()),
+                    "best_prior_max": float(best_prior.detach().float().max().cpu()),
+                }
+            )
+            return out
+
         delete_gain = self._fit_leaf_pattern_map(
             leaf_diag.get("delete_nll_gain", None),
             like_tensor,
@@ -448,9 +475,11 @@ class StructureRepairActuator(nn.Module):
             "move_mask": false_mask,
             "actual_oracle_enabled": False,
             "actual_oracle_drop_used": False,
+            "actual_oracle_add_used": False,
             "actual_oracle_drop_best_percent": 0.0,
             "actual_oracle_drop_tested_count": 0,
             "actual_oracle_drop_reason": "",
+            "actual_oracle_operation": "",
         }
 
         if not isinstance(structure, dict):
@@ -467,14 +496,19 @@ class StructureRepairActuator(nn.Module):
                 leaf_diag.get("actual_oracle_drop_mask", None),
                 like_tensor,
             ).to(dtype=torch.bool)
+            oracle_add_mask = self._fit_leaf_pattern_map(
+                leaf_diag.get("actual_oracle_add_mask", None),
+                like_tensor,
+            ).to(dtype=torch.bool)
             out.update(
                 {
                     "enabled": True,
                     "delete_mask": oracle_drop_mask,
-                    "add_mask": false_mask,
+                    "add_mask": oracle_add_mask,
                     "move_mask": false_mask,
                     "actual_oracle_enabled": True,
                     "actual_oracle_drop_used": bool(leaf_diag.get("actual_oracle_drop_used", False)),
+                    "actual_oracle_add_used": bool(leaf_diag.get("actual_oracle_add_used", False)),
                     "actual_oracle_drop_best_percent": float(
                         leaf_diag.get("actual_oracle_drop_best_percent", 0.0) or 0.0
                     ),
@@ -483,6 +517,9 @@ class StructureRepairActuator(nn.Module):
                     ),
                     "actual_oracle_drop_reason": str(
                         leaf_diag.get("actual_oracle_drop_reason", "")
+                    ),
+                    "actual_oracle_operation": str(
+                        leaf_diag.get("actual_oracle_operation", "")
                     ),
                 }
             )
@@ -2217,6 +2254,7 @@ class StructureRepairActuator(nn.Module):
         leaf_move_op_mask = leaf_operation_masks["move_mask"]
         actual_oracle_enabled = bool(leaf_operation_masks.get("actual_oracle_enabled", False))
         actual_oracle_has_drop = bool(leaf_delete_op_mask.detach().any().item()) if actual_oracle_enabled else False
+        actual_oracle_has_add = bool(leaf_add_op_mask.detach().any().item()) if actual_oracle_enabled else False
 
         child_slot_candidate_ratio = None
         if child_slot_mask is not None:
@@ -2250,7 +2288,10 @@ class StructureRepairActuator(nn.Module):
                 drop_operation_gate = torch.ones_like(drop_operation_gate)
             else:
                 drop_operation_gate = torch.zeros_like(drop_operation_gate)
-            add_operation_gate = torch.zeros_like(add_operation_gate)
+            if actual_oracle_has_add and add_enabled:
+                add_operation_gate = torch.ones_like(add_operation_gate)
+            else:
+                add_operation_gate = torch.zeros_like(add_operation_gate)
             move_operation_gate = torch.zeros_like(move_operation_gate)
 
         if timing_enabled:
@@ -3352,7 +3393,10 @@ class StructureRepairActuator(nn.Module):
         add_k, add_candidate_ratio = self._target_add_count(
             N,
             candidate_ratio_override=learned_add_ratio_value,
-            force_min_count=bool(getattr(self.args, "repair_force_min_add_voxels", False)),
+            force_min_count=(
+                bool(getattr(self.args, "repair_force_min_add_voxels", False))
+                or bool(actual_oracle_enabled and actual_oracle_has_add)
+            ),
         )
         add_ratio = pts_xyz.new_zeros(())
         add_ratio_loss = pts_xyz.new_zeros(())
@@ -3770,6 +3814,78 @@ class StructureRepairActuator(nn.Module):
         # 後段互換用の add_ratio は、古いゼロ初期値ではなく学習用のsoft実行率にする。
         # hard実行率は add_ratio_hard として別keyで保持する。
         add_ratio = add_ratio_soft
+        if actual_oracle_enabled and actual_oracle_has_add:
+            leaf_diag_for_oracle_add = structure.get("leaf_pattern_diag", {}) if isinstance(structure, dict) else {}
+            oracle_add_slots = self._fit_leaf_pattern_long_map(
+                leaf_diag_for_oracle_add.get("best_add_child_slot", None),
+                batch_size=B,
+                point_count=N,
+                device=pts_xyz.device,
+            )
+            oracle_add_source_mask = leaf_add_op_mask.squeeze(1).to(device=pts_xyz.device, dtype=torch.bool)
+            oracle_add_source_mask = oracle_add_source_mask & oracle_add_slots.ge(0) & oracle_add_slots.le(7)
+            if bool(oracle_add_source_mask.detach().any().item()):
+                max_oracle_add = max(
+                    int(getattr(self.args, "sparsepcgc_actual_oracle_max_selected_voxels", 4)),
+                    1,
+                )
+                oracle_target_lists = []
+                oracle_mask_lists = []
+                for b in range(B):
+                    source_idx_b = oracle_add_source_mask[b].nonzero(as_tuple=False).reshape(-1)
+                    if source_idx_b.numel() <= 0:
+                        oracle_target_lists.append(voxel_coords.new_empty((3, 0)))
+                        oracle_mask_lists.append(torch.zeros((0,), device=pts_xyz.device, dtype=torch.bool))
+                        continue
+                    source_idx_b = source_idx_b[:max_oracle_add]
+                    source_voxels_b = voxel_coords[b].index_select(1, source_idx_b).transpose(0, 1).contiguous()
+                    slots_b = oracle_add_slots[b].index_select(0, source_idx_b).to(dtype=torch.long)
+                    slot_bits_b = torch.stack(
+                        [
+                            slots_b & 1,
+                            (slots_b >> 1) & 1,
+                            (slots_b >> 2) & 1,
+                        ],
+                        dim=1,
+                    ).to(device=voxel_coords.device, dtype=torch.long)
+                    target_b = torch.div(source_voxels_b, 2, rounding_mode="floor") * 2 + slot_bits_b
+                    target_b = torch.unique(target_b, dim=0, sorted=True)
+                    if int(target_b.shape[0]) > max_oracle_add:
+                        target_b = target_b[:max_oracle_add]
+                    oracle_target_lists.append(target_b.transpose(0, 1).contiguous())
+                    oracle_mask_lists.append(torch.ones((target_b.shape[0],), device=pts_xyz.device, dtype=torch.bool))
+
+                max_targets = max((int(item.shape[1]) for item in oracle_target_lists), default=0)
+                if max_targets > 0:
+                    oracle_coords = voxel_coords.new_zeros((B, 3, max_targets))
+                    oracle_mask = torch.zeros((B, max_targets), device=pts_xyz.device, dtype=torch.bool)
+                    for b, coords_b in enumerate(oracle_target_lists):
+                        count_b = int(coords_b.shape[1])
+                        if count_b <= 0:
+                            continue
+                        oracle_coords[b, :, :count_b] = coords_b
+                        oracle_mask[b, :count_b] = True
+                    if voxel_edit_add_target_coords.shape[2] > 0:
+                        voxel_edit_add_target_coords = torch.cat(
+                            [voxel_edit_add_target_coords, oracle_coords.detach()],
+                            dim=2,
+                        )
+                        voxel_edit_add_target_mask = torch.cat(
+                            [voxel_edit_add_target_mask, oracle_mask.detach()],
+                            dim=1,
+                        )
+                    else:
+                        voxel_edit_add_target_coords = oracle_coords.detach()
+                        voxel_edit_add_target_mask = oracle_mask.detach()
+                    oracle_add_count = int(oracle_mask.detach().sum().item())
+                    add_count_value = max(add_count_value, oracle_add_count)
+                    add_effective_count_value = max(add_effective_count_value, oracle_add_count)
+                    add_target_voxel_count_value = max(add_target_voxel_count_value, oracle_add_count)
+                    add_ratio_hard = pts_xyz.new_tensor(
+                        float(oracle_add_count) / max(float(B * N), 1.0)
+                    )
+                    add_ratio_soft = torch.maximum(add_ratio_soft, add_ratio_hard.detach())
+                    add_ratio = add_ratio_soft
         if timing_enabled:
             _mark_runtime("add")
 
@@ -4967,6 +5083,11 @@ class StructureRepairActuator(nn.Module):
             "restored_xyz_debug": restored_xyz_debug,
             "restore_info": restore_info,
         }
+        if not bool(getattr(self.args, "retain_debug_tensors", False)):
+            self.debug_tensors = {
+                key: (value.detach() if torch.is_tensor(value) else value)
+                for key, value in self.debug_tensors.items()
+            }
         return pts_out, final_w, loss, {
             # Adjust Soft状態
             "learned_drop_ratio_requires_grad": pts_xyz.new_tensor(float(learned_drop_ratio.requires_grad)),

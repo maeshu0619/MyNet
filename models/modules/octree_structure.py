@@ -942,6 +942,41 @@ class OctreeStructureAnalysis(nn.Module):
                 neginf=0.0,
             )
 
+        def _fit_long_map(value, default=-1):
+            if not torch.is_tensor(value):
+                return torch.full((B, N), int(default), device=device, dtype=torch.long)
+
+            out = value.detach().to(device=device, dtype=torch.long)
+            if out.ndim == 1:
+                out = out.view(1, -1)
+            elif out.ndim == 2:
+                pass
+            elif out.ndim == 3:
+                if out.shape[1] == 1:
+                    out = out.squeeze(1)
+                elif out.shape[2] == 1:
+                    out = out.squeeze(2)
+                else:
+                    out = out[:, 0, :]
+            else:
+                return torch.full((B, N), int(default), device=device, dtype=torch.long)
+
+            if out.shape[0] == 1 and B > 1:
+                out = out.expand(B, -1).contiguous()
+            if out.shape[0] != B:
+                return torch.full((B, N), int(default), device=device, dtype=torch.long)
+
+            current_n = int(out.shape[1])
+            if current_n > N:
+                out = out[:, :N].contiguous()
+            elif current_n < N:
+                if current_n > 0:
+                    pad = out[:, -1:].expand(B, N - current_n)
+                    out = torch.cat([out, pad], dim=1).contiguous()
+                else:
+                    return torch.full((B, N), int(default), device=device, dtype=torch.long)
+            return out
+
         out = dict(leaf_pattern_diag)
         out["available"] = True
         out["reason"] = ""
@@ -965,6 +1000,39 @@ class OctreeStructureAnalysis(nn.Module):
         out["actual_oracle_drop_reason"] = str(
             source_tree.get("actual_oracle_drop_reason", "")
         )
+        out["actual_oracle_add_mask"] = _fit_map(
+            source_tree.get("actual_oracle_add_mask", None),
+            as_bool=True,
+        )
+        out["actual_oracle_add_score"] = _fit_map(
+            source_tree.get("actual_oracle_add_score", None),
+            as_bool=False,
+        )
+        oracle_add_slot = _fit_long_map(
+            source_tree.get("actual_oracle_best_add_child_slot", None),
+            default=-1,
+        )
+        out["actual_oracle_best_add_child_slot"] = oracle_add_slot
+        if bool(out["actual_oracle_add_mask"].any().detach().cpu()):
+            base_add_slot = out.get("best_add_child_slot", None)
+            if torch.is_tensor(base_add_slot):
+                base_add_slot = base_add_slot.detach().to(device=device, dtype=torch.long)
+                if base_add_slot.ndim == 3:
+                    base_add_slot = base_add_slot.squeeze(1) if base_add_slot.shape[1] == 1 else base_add_slot[:, 0, :]
+                if base_add_slot.ndim == 1:
+                    base_add_slot = base_add_slot.view(1, -1)
+                if base_add_slot.shape[0] == 1 and B > 1:
+                    base_add_slot = base_add_slot.expand(B, -1).contiguous()
+                if base_add_slot.shape[0] == B and base_add_slot.shape[1] >= N:
+                    base_add_slot = base_add_slot[:, :N].contiguous()
+                else:
+                    base_add_slot = torch.full((B, N), -1, device=device, dtype=torch.long)
+            else:
+                base_add_slot = torch.full((B, N), -1, device=device, dtype=torch.long)
+            add_mask = out["actual_oracle_add_mask"].to(device=device, dtype=torch.bool)
+            out["best_add_child_slot"] = torch.where(add_mask, oracle_add_slot, base_add_slot).detach()
+        out["actual_oracle_add_used"] = bool(source_tree.get("actual_oracle_add_used", False))
+        out["actual_oracle_operation"] = str(source_tree.get("actual_oracle_operation", ""))
         return out
 
     def _leaf_pattern_feature_channels(self, leaf_pattern_diag, like_tensor):

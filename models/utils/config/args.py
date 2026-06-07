@@ -6,8 +6,8 @@ from cfgs.utils import str2bool
 
 # sparsepcgc_move_existing_target_only
 
-pretrained_date = "20260601" 
-pretrained_time = "150718"
+pretrained_date = "20260606"
+pretrained_time = "181743"
 
 surrogate_date = "20260524"
 surrogate_time = "230456"
@@ -20,7 +20,7 @@ method_com = "SparsePCGC"
 # method_com = "G-PCC"
 method_name = "Mine"
 
-model_name = "best"
+model_name = "best_loss_joint"
 
 # dataname = "8i"
 # dataname = "MVUB"
@@ -624,7 +624,31 @@ def parse_pugan_args(parser, file_day, file_time):
         '--sparsepcgc_actual_oracle_max_candidates',
         default=6,
         type=int,
-        help='1 Subtreeあたり実SparsePCGCで試すPrune候補数の上限',
+        help='1 Subtreeあたり実SparsePCGCで試すAdd/Prune候補数の合計上限',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_add_candidate_ratio',
+        default=0.50,
+        type=float,
+        help='actual oracle候補予算のうちAdd候補へ割り当てる割合',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_max_selected_voxels',
+        default=4,
+        type=int,
+        help='actual oracleで改善した候補をActuatorへ同時に渡す最大Voxel数',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_allow_add',
+        default=True,
+        type=str2bool,
+        help='actual oracle候補探索でAddを試す',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_allow_prune',
+        default=True,
+        type=str2bool,
+        help='actual oracle候補探索でPruneを試す',
     )
     parser.add_argument(
         '--sparsepcgc_actual_oracle_min_improve_percent',
@@ -2375,6 +2399,16 @@ def parse_pugan_args(parser, file_day, file_time):
         int(getattr(args, "sparsepcgc_actual_oracle_max_candidates", 0)),
         0,
     )
+    args.sparsepcgc_actual_oracle_add_candidate_ratio = min(
+        max(float(getattr(args, "sparsepcgc_actual_oracle_add_candidate_ratio", 0.50)), 0.0),
+        1.0,
+    )
+    args.sparsepcgc_actual_oracle_max_selected_voxels = max(
+        int(getattr(args, "sparsepcgc_actual_oracle_max_selected_voxels", 4)),
+        1,
+    )
+    args.sparsepcgc_actual_oracle_allow_add = bool(getattr(args, "sparsepcgc_actual_oracle_allow_add", True))
+    args.sparsepcgc_actual_oracle_allow_prune = bool(getattr(args, "sparsepcgc_actual_oracle_allow_prune", True))
     args.repair_force_min_drop_voxels = bool(getattr(args, "repair_force_min_drop_voxels", False))
     args.repair_force_min_add_voxels = bool(getattr(args, "repair_force_min_add_voxels", False))
     args.repair_force_min_move_voxels = bool(getattr(args, "repair_force_min_move_voxels", False))

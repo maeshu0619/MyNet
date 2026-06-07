@@ -668,6 +668,102 @@ def _sparsepcgc_actual_oracle_candidate_indices(coords_n3, args, global_step, ma
     return selected[: int(max_candidates)], unique_coords, inverse
 
 
+def _sparsepcgc_actual_oracle_add_candidates(unique_coords, args, global_step, max_candidates):
+    if unique_coords is None or unique_coords.numel() <= 0 or int(max_candidates) <= 0:
+        return []
+
+    unique_coords = unique_coords.to(dtype=torch.long)
+    parent_coords = torch.div(unique_coords, 2, rounding_mode="floor")
+    unique_parents, parent_inverse = torch.unique(
+        parent_coords,
+        dim=0,
+        sorted=True,
+        return_inverse=True,
+    )
+    if unique_parents.numel() <= 0:
+        return []
+
+    child_slot = (
+        (unique_coords[:, 0] & 1)
+        + 2 * (unique_coords[:, 1] & 1)
+        + 4 * (unique_coords[:, 2] & 1)
+    ).to(dtype=torch.long)
+    occupancy = torch.zeros(
+        (unique_parents.shape[0], 8),
+        device=unique_coords.device,
+        dtype=torch.bool,
+    )
+    occupancy[parent_inverse, child_slot] = True
+
+    empty_parent_idx, empty_slot = (~occupancy).nonzero(as_tuple=True)
+    if empty_parent_idx.numel() <= 0:
+        return []
+
+    pattern_weights = (2 ** torch.arange(8, device=unique_coords.device, dtype=torch.long)).view(1, 8)
+    parent_code = (occupancy.to(dtype=torch.long) * pattern_weights).sum(dim=1).clamp(0, 255)
+    smoothing = max(float(getattr(args, "leaf_pattern_candidate_smoothing", 1.0)), 0.0)
+    code_hist = torch.bincount(parent_code, minlength=256).to(device=unique_coords.device, dtype=torch.float32)
+    code_prob = (code_hist + float(smoothing))
+    code_prob = code_prob / code_prob.sum().clamp_min(torch.finfo(torch.float32).eps)
+    code_nll = -torch.log2(code_prob.clamp_min(torch.finfo(torch.float32).eps))
+
+    add_bit = (1 << empty_slot.clamp(0, 7)).to(dtype=torch.long)
+    current_code = parent_code.index_select(0, empty_parent_idx)
+    add_code = torch.bitwise_or(current_code, add_bit).clamp(0, 255)
+    add_gain = code_nll.index_select(0, current_code) - code_nll.index_select(0, add_code)
+    parent_nll = code_nll.index_select(0, current_code)
+
+    selected = []
+    seen = set()
+
+    def _child_bits(slot):
+        slot = int(slot)
+        return unique_coords.new_tensor([slot & 1, (slot >> 1) & 1, (slot >> 2) & 1])
+
+    def _append_from_flat_order(order_tensor):
+        nonlocal selected
+        for item in order_tensor.detach().cpu().tolist():
+            flat_idx = int(item)
+            parent_idx = int(empty_parent_idx[flat_idx].detach().cpu())
+            target_slot = int(empty_slot[flat_idx].detach().cpu())
+            key = (parent_idx, target_slot)
+            if key in seen:
+                continue
+
+            src_candidates = (parent_inverse == parent_idx).nonzero(as_tuple=False).reshape(-1)
+            if src_candidates.numel() <= 0:
+                continue
+            target_coord = unique_parents[parent_idx] * 2 + _child_bits(target_slot)
+            dist = (unique_coords.index_select(0, src_candidates) - target_coord.view(1, 3)).abs().sum(dim=1)
+            source_unique_idx = int(src_candidates[int(torch.argmin(dist).detach().cpu())].detach().cpu())
+
+            seen.add(key)
+            selected.append(
+                {
+                    "source_unique_idx": source_unique_idx,
+                    "target_child_slot": target_slot,
+                    "target_coord": target_coord.detach().clone(),
+                    "score_hint": float(add_gain[flat_idx].detach().cpu()),
+                }
+            )
+            if len(selected) >= int(max_candidates):
+                break
+
+    flat_idx = torch.arange(empty_parent_idx.numel(), device=unique_coords.device, dtype=torch.long)
+    gain_order = flat_idx.index_select(0, torch.argsort(add_gain, descending=True))
+    nll_order = flat_idx.index_select(0, torch.argsort(parent_nll, descending=True))
+    seed = int(global_step) * 1664525 + int(unique_coords.shape[0]) * 1013904223
+    noise = ((flat_idx * 2654435761 + int(seed)) & 0x7FFFFFFF)
+    random_order = flat_idx.index_select(0, torch.argsort(noise))
+
+    for order in (gain_order, nll_order, random_order):
+        if len(selected) >= int(max_candidates):
+            break
+        _append_from_flat_order(order)
+
+    return selected[: int(max_candidates)]
+
+
 def _attach_sparsepcgc_actual_oracle_drop(
     *,
     args,
@@ -725,20 +821,43 @@ def _attach_sparsepcgc_actual_oracle_drop(
 
     coords = coords.detach().to(device=subtree_xyz.device, dtype=torch.long)
     coords_n3 = coords[0].transpose(0, 1).contiguous()
+    add_candidate_ratio = min(
+        max(float(getattr(args, "sparsepcgc_actual_oracle_add_candidate_ratio", 0.50)), 0.0),
+        1.0,
+    )
+    add_budget = int(round(float(max_candidates) * add_candidate_ratio))
+    add_budget = min(max(add_budget, 0), max_candidates)
+    drop_budget = max_candidates - add_budget
+    if not bool(getattr(args, "sparsepcgc_actual_oracle_allow_add", True)):
+        drop_budget = max_candidates
+        add_budget = 0
+    if not bool(getattr(args, "sparsepcgc_actual_oracle_allow_prune", True)):
+        add_budget = max_candidates
+        drop_budget = 0
+
     candidate_indices, unique_coords, inverse = _sparsepcgc_actual_oracle_candidate_indices(
         coords_n3,
         args,
         global_step,
-        max_candidates,
+        drop_budget,
+    )
+    add_candidates = _sparsepcgc_actual_oracle_add_candidates(
+        unique_coords,
+        args,
+        global_step,
+        add_budget,
     )
     debug["enabled"] = True
-    debug["candidate_count"] = int(0 if unique_coords is None else len(candidate_indices))
+    debug["candidate_count"] = int(len(candidate_indices) + len(add_candidates))
 
     point_mask = torch.zeros((1, coords.shape[-1]), device=coords.device, dtype=torch.bool)
     score = torch.zeros((1, coords.shape[-1]), device=coords.device, dtype=torch.float32)
+    add_point_mask = torch.zeros((1, coords.shape[-1]), device=coords.device, dtype=torch.bool)
+    add_score = torch.zeros((1, coords.shape[-1]), device=coords.device, dtype=torch.float32)
+    add_child_slot = torch.full((1, coords.shape[-1]), -1, device=coords.device, dtype=torch.long)
 
-    if not candidate_indices or unique_coords is None or inverse is None:
-        debug["reason"] = "no_valid_delete_candidates"
+    if (not candidate_indices and not add_candidates) or unique_coords is None or inverse is None:
+        debug["reason"] = "no_valid_actual_oracle_candidates"
     else:
         try:
             cached_gt = loss._get_cached_actual_gt(cache_key)
@@ -749,7 +868,7 @@ def _attach_sparsepcgc_actual_oracle_drop(
             if not math.isfinite(base_bit) or base_bit <= 0.0:
                 raise RuntimeError(f"invalid_base_bit={base_bit}")
 
-            best_idx = None
+            improving = []
             best_percent = 0.0
             tested = 0
             all_unique_idx = torch.arange(unique_coords.shape[0], device=coords.device, dtype=torch.long)
@@ -771,18 +890,161 @@ def _attach_sparsepcgc_actual_oracle_drop(
                 tested += 1
                 cand_bit = float(stats.get("bit", 0.0))
                 cand_percent = 100.0 * (cand_bit - base_bit) / max(abs(base_bit), 1.0)
-                if best_idx is None or cand_percent < best_percent:
-                    best_idx = unique_idx
+                if cand_percent < best_percent:
                     best_percent = float(cand_percent)
+                min_improve = max(float(getattr(args, "sparsepcgc_actual_oracle_min_improve_percent", 0.0)), 0.0)
+                if cand_percent < -min_improve:
+                    improving.append(
+                        {
+                            "op": "drop",
+                            "unique_idx": unique_idx,
+                            "percent": float(cand_percent),
+                        }
+                    )
+
+            for add_candidate in add_candidates:
+                target_coord = add_candidate.get("target_coord", None)
+                if not torch.is_tensor(target_coord):
+                    continue
+                target_coord = target_coord.to(device=unique_coords.device, dtype=torch.long).view(1, 3)
+                candidate_coords = torch.cat([unique_coords, target_coord], dim=0)
+                candidate_coords = torch.unique(candidate_coords, dim=0, sorted=True)
+                if int(candidate_coords.shape[0]) <= int(unique_coords.shape[0]):
+                    continue
+                candidate_xyz = _restore_codec_xyz_from_global_voxels(
+                    args,
+                    candidate_coords.transpose(0, 1).contiguous().unsqueeze(0),
+                    full_octree_context if isinstance(full_octree_context, dict) else subtree_tree,
+                    subtree_xyz,
+                )
+                if candidate_xyz is None or candidate_xyz.shape[-1] <= 0:
+                    continue
+                stats = loss._encode_actual_batch(args, candidate_xyz)
+                tested += 1
+                cand_bit = float(stats.get("bit", 0.0))
+                cand_percent = 100.0 * (cand_bit - base_bit) / max(abs(base_bit), 1.0)
+                if cand_percent < best_percent:
+                    best_percent = float(cand_percent)
+                min_improve = max(float(getattr(args, "sparsepcgc_actual_oracle_min_improve_percent", 0.0)), 0.0)
+                if cand_percent < -min_improve:
+                    improving.append(
+                        {
+                            "op": "add",
+                            "source_unique_idx": int(add_candidate["source_unique_idx"]),
+                            "target_child_slot": int(add_candidate["target_child_slot"]),
+                            "target_coord": target_coord.detach().clone(),
+                            "percent": float(cand_percent),
+                        }
+                    )
             debug["tested_count"] = int(tested)
             debug["best_percent"] = float(best_percent)
 
-            min_improve = max(float(getattr(args, "sparsepcgc_actual_oracle_min_improve_percent", 0.0)), 0.0)
-            if best_idx is not None and best_percent < -min_improve:
-                point_mask[0] = inverse == int(best_idx)
-                score[0, point_mask[0]] = 1.0 + min(abs(float(best_percent)) / 10.0, 4.0)
-                debug["used"] = True
-                debug["reason"] = "actual_improving_drop_found"
+            if improving:
+                improving = sorted(improving, key=lambda item: float(item["percent"]))
+                max_selected = max(int(getattr(args, "sparsepcgc_actual_oracle_max_selected_voxels", 4)), 1)
+                selected_drop = 0
+                selected_add = 0
+                dropped_unique = set()
+                selected_add_sources = set()
+                selected_add_targets = []
+                current_combo_percent = 0.0
+
+                def _combo_coords(drop_set, add_targets):
+                    keep_unique = torch.ones((unique_coords.shape[0],), device=coords.device, dtype=torch.bool)
+                    if drop_set:
+                        drop_idx = torch.as_tensor(sorted(drop_set), device=coords.device, dtype=torch.long)
+                        keep_unique[drop_idx] = False
+                    combo = unique_coords[keep_unique]
+                    if add_targets:
+                        combo = torch.cat(
+                            [combo]
+                            + [
+                                target.to(device=coords.device, dtype=torch.long).view(1, 3)
+                                for target in add_targets
+                            ],
+                            dim=0,
+                        )
+                        combo = torch.unique(combo, dim=0, sorted=True)
+                    return combo
+
+                for item in improving:
+                    if selected_drop + selected_add >= max_selected:
+                        break
+                    strength = 1.0 + min(abs(float(item["percent"])) / 10.0, 4.0)
+                    if item["op"] == "drop":
+                        unique_idx = int(item["unique_idx"])
+                        if unique_idx in selected_add_sources:
+                            continue
+                        trial_drop = set(dropped_unique)
+                        trial_drop.add(unique_idx)
+                        trial_coords = _combo_coords(trial_drop, selected_add_targets)
+                        if int(trial_coords.shape[0]) <= 0:
+                            continue
+                        trial_xyz = _restore_codec_xyz_from_global_voxels(
+                            args,
+                            trial_coords.transpose(0, 1).contiguous().unsqueeze(0),
+                            full_octree_context if isinstance(full_octree_context, dict) else subtree_tree,
+                            subtree_xyz,
+                        )
+                        if trial_xyz is None or trial_xyz.shape[-1] <= 0:
+                            continue
+                        trial_stats = loss._encode_actual_batch(args, trial_xyz)
+                        tested += 1
+                        trial_bit = float(trial_stats.get("bit", 0.0))
+                        trial_percent = 100.0 * (trial_bit - base_bit) / max(abs(base_bit), 1.0)
+                        if trial_percent >= current_combo_percent:
+                            continue
+                        current_combo_percent = float(trial_percent)
+                        dropped_unique.add(unique_idx)
+                        mask = inverse == unique_idx
+                        point_mask[0] |= mask
+                        score[0, mask] = max(float(strength), float(score[0, mask].max().detach().cpu()) if bool(mask.any().detach().cpu()) else 0.0)
+                        selected_drop += 1
+                    elif item["op"] == "add":
+                        source_unique_idx = int(item["source_unique_idx"])
+                        if source_unique_idx in dropped_unique:
+                            continue
+                        target_coord_item = item.get("target_coord", None)
+                        if not torch.is_tensor(target_coord_item):
+                            continue
+                        trial_targets = list(selected_add_targets) + [target_coord_item.detach().clone()]
+                        trial_coords = _combo_coords(dropped_unique, trial_targets)
+                        trial_xyz = _restore_codec_xyz_from_global_voxels(
+                            args,
+                            trial_coords.transpose(0, 1).contiguous().unsqueeze(0),
+                            full_octree_context if isinstance(full_octree_context, dict) else subtree_tree,
+                            subtree_xyz,
+                        )
+                        if trial_xyz is None or trial_xyz.shape[-1] <= 0:
+                            continue
+                        trial_stats = loss._encode_actual_batch(args, trial_xyz)
+                        tested += 1
+                        trial_bit = float(trial_stats.get("bit", 0.0))
+                        trial_percent = 100.0 * (trial_bit - base_bit) / max(abs(base_bit), 1.0)
+                        if trial_percent >= current_combo_percent:
+                            continue
+                        current_combo_percent = float(trial_percent)
+                        mask = inverse == source_unique_idx
+                        add_point_mask[0] |= mask
+                        add_score[0, mask] = max(float(strength), float(add_score[0, mask].max().detach().cpu()) if bool(mask.any().detach().cpu()) else 0.0)
+                        add_child_slot[0, mask] = int(item["target_child_slot"])
+                        selected_add_sources.add(source_unique_idx)
+                        selected_add_targets.append(target_coord_item.detach().clone())
+                        selected_add += 1
+
+                debug["tested_count"] = int(tested)
+                debug["best_percent"] = float(min(best_percent, current_combo_percent))
+                debug["used"] = bool(selected_drop > 0 or selected_add > 0)
+                debug["selected_drop_count"] = int(selected_drop)
+                debug["selected_add_count"] = int(selected_add)
+                if not debug["used"]:
+                    debug["reason"] = "no_actual_improving_combo_candidate"
+                elif selected_drop > 0 and selected_add > 0:
+                    debug["reason"] = "actual_improving_drop_add_found"
+                elif selected_add > 0:
+                    debug["reason"] = "actual_improving_add_found"
+                else:
+                    debug["reason"] = "actual_improving_drop_found"
             else:
                 debug["reason"] = "no_actual_improving_candidate"
         except Exception as exc:
@@ -799,6 +1061,11 @@ def _attach_sparsepcgc_actual_oracle_drop(
         "actual_oracle_drop_best_percent": float(debug["best_percent"]),
         "actual_oracle_drop_tested_count": int(debug["tested_count"]),
         "actual_oracle_drop_reason": str(debug["reason"]),
+        "actual_oracle_add_mask": add_point_mask.detach(),
+        "actual_oracle_add_score": add_score.detach(),
+        "actual_oracle_best_add_child_slot": add_child_slot.detach(),
+        "actual_oracle_add_used": bool(add_point_mask.any().detach().cpu()),
+        "actual_oracle_operation": str(debug["reason"]),
     }
 
     patched_tree = dict(subtree_tree or {})
@@ -815,6 +1082,8 @@ def _attach_sparsepcgc_actual_oracle_drop(
                 f"candidates={int(debug['candidate_count'])}, "
                 f"tested={int(debug['tested_count'])}, "
                 f"best_percent={float(debug['best_percent']):.6f}, "
+                f"selected_drop={int(debug.get('selected_drop_count', 0))}, "
+                f"selected_add={int(debug.get('selected_add_count', 0))}, "
                 f"reason={debug['reason']}"
             )
 
