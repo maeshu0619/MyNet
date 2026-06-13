@@ -990,12 +990,29 @@ class OctreeStructureAnalysis(nn.Module):
             source_tree.get("actual_oracle_drop_score", None),
             as_bool=False,
         )
+        out["actual_oracle_drop_bad_mask"] = _fit_map(
+            source_tree.get("actual_oracle_drop_bad_mask", None),
+            as_bool=True,
+        )
+        out["actual_oracle_drop_bad_score"] = _fit_map(
+            source_tree.get("actual_oracle_drop_bad_score", None),
+            as_bool=False,
+        )
         out["actual_oracle_drop_used"] = bool(source_tree.get("actual_oracle_drop_used", False))
         out["actual_oracle_drop_best_percent"] = float(
             source_tree.get("actual_oracle_drop_best_percent", 0.0) or 0.0
         )
         out["actual_oracle_drop_tested_count"] = int(
             source_tree.get("actual_oracle_drop_tested_count", 0) or 0
+        )
+        out["actual_oracle_bad_candidate_count"] = int(
+            source_tree.get("actual_oracle_bad_candidate_count", 0) or 0
+        )
+        out["actual_oracle_improving_candidate_count"] = int(
+            source_tree.get("actual_oracle_improving_candidate_count", 0) or 0
+        )
+        out["actual_oracle_combo_extra_count"] = int(
+            source_tree.get("actual_oracle_combo_extra_count", 0) or 0
         )
         out["actual_oracle_drop_reason"] = str(
             source_tree.get("actual_oracle_drop_reason", "")
@@ -1013,6 +1030,18 @@ class OctreeStructureAnalysis(nn.Module):
             default=-1,
         )
         out["actual_oracle_best_add_child_slot"] = oracle_add_slot
+        out["actual_oracle_add_bad_mask"] = _fit_map(
+            source_tree.get("actual_oracle_add_bad_mask", None),
+            as_bool=True,
+        )
+        out["actual_oracle_add_bad_score"] = _fit_map(
+            source_tree.get("actual_oracle_add_bad_score", None),
+            as_bool=False,
+        )
+        out["actual_oracle_bad_add_child_slot"] = _fit_long_map(
+            source_tree.get("actual_oracle_bad_add_child_slot", None),
+            default=-1,
+        )
         if bool(out["actual_oracle_add_mask"].any().detach().cpu()):
             base_add_slot = out.get("best_add_child_slot", None)
             if torch.is_tensor(base_add_slot):
@@ -1032,6 +1061,39 @@ class OctreeStructureAnalysis(nn.Module):
             add_mask = out["actual_oracle_add_mask"].to(device=device, dtype=torch.bool)
             out["best_add_child_slot"] = torch.where(add_mask, oracle_add_slot, base_add_slot).detach()
         out["actual_oracle_add_used"] = bool(source_tree.get("actual_oracle_add_used", False))
+        override_coords = source_tree.get("actual_oracle_override_final_voxel_coords", None)
+        if torch.is_tensor(override_coords):
+            override_coords = override_coords.detach().to(device=device, dtype=torch.long)
+            if override_coords.ndim == 2:
+                override_coords = (
+                    override_coords.transpose(0, 1).contiguous().unsqueeze(0)
+                    if override_coords.shape[-1] == 3
+                    else override_coords.unsqueeze(0)
+                )
+            elif override_coords.ndim == 3 and override_coords.shape[1] != 3 and override_coords.shape[-1] == 3:
+                override_coords = override_coords.permute(0, 2, 1).contiguous()
+            if override_coords.ndim == 3 and override_coords.shape[1] == 3:
+                out["actual_oracle_override_final_voxel_coords"] = override_coords
+                out["actual_oracle_override_move_count"] = int(
+                    source_tree.get("actual_oracle_override_move_count", 0) or 0
+                )
+        move_mask = source_tree.get("actual_oracle_move_mask", None)
+        if torch.is_tensor(move_mask):
+            out["actual_oracle_move_mask"] = move_mask.detach().to(device=device)
+            move_score = source_tree.get("actual_oracle_move_score", None)
+            if torch.is_tensor(move_score):
+                out["actual_oracle_move_score"] = move_score.detach().to(device=device)
+            out["actual_oracle_move_used"] = bool(source_tree.get("actual_oracle_override_move_count", 0) or 0)
+        out["actual_oracle_edit_record_bits"] = float(
+            source_tree.get("actual_oracle_edit_record_bits", 0.0) or 0.0
+        )
+        out["actual_oracle_best_edit_record_bits"] = float(
+            source_tree.get("actual_oracle_best_edit_record_bits", 0.0) or 0.0
+        )
+        out["actual_oracle_raw_percent"] = float(source_tree.get("actual_oracle_raw_percent", 0.0) or 0.0)
+        out["actual_oracle_best_raw_percent"] = float(
+            source_tree.get("actual_oracle_best_raw_percent", 0.0) or 0.0
+        )
         out["actual_oracle_operation"] = str(source_tree.get("actual_oracle_operation", ""))
         return out
 

@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+
+build/
+dist/
+*.egg-info/
+*.so
+*.o
+*.egg
+
+.ninja_deps
+.ninja_log
+build.ninja
+lock

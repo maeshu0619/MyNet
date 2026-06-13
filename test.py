@@ -28,13 +28,10 @@ from models.utils.testing.utils import (
     _adapt_encoder_state_dict_for_sparse_input,
     _adapt_model_state_dict_for_sparse_input,
     _adapt_state_dict_to_model_shapes,
-    _aggregate_structure_debug_chunks,
     _compute_drop_hardening,
     _downsample_input_batch,
     _run_named_inference_mode,
-    _summarize_hardening_counts,
     _summarize_point_edits,
-    _write_structure_decision_debug,
 )
 from record.write import Writing
 
@@ -66,20 +63,6 @@ def _to_int(value, default=0):
 
 def _ratio(count, denom):
     return float(count) / max(float(denom), 1.0)
-
-
-def _sparsepcgc_unique_count(points_3n, args):
-    if points_3n is None or points_3n.numel() == 0:
-        return 0
-    voxel_size = max(float(getattr(args, "sparsepcgc_voxel_size", 1.0)), 1e-9)
-    pos_q = max(int(getattr(args, "sparsepcgc_pos_quantscale", 1)), 1)
-    coords = torch.round(points_3n[:3, :].transpose(0, 1).contiguous().to(torch.float32) / voxel_size)
-    if pos_q > 1:
-        coords = torch.round(coords / float(pos_q))
-    coords = coords.to(torch.long)
-    if coords.numel() == 0:
-        return 0
-    return int(torch.unique(coords, dim=0).shape[0])
 
 
 _VOXEL_TEST_STAGES = ("input_gt", "model_output_raw", "saved_pre_write", "saved_ply")
@@ -338,13 +321,6 @@ def _save_output_points(args, step, input_path, gen_pts):
     if not ok:
         raise RuntimeError(f"write_ply returned False: {output_path}")
     return str(output_path)
-
-
-def _runtime_value(runtime_timing, *names):
-    for name in names:
-        if name in runtime_timing:
-            return _to_float(runtime_timing[name])
-    return 0.0
 
 
 def _load_state_payload(path):

@@ -45,8 +45,7 @@ class Network(nn.Module):
         self.last_encoder_debug = {} # 直近Forward時のEncoder関連デバッグ情報を保存する辞書を初期化
         self.last_actuator_soft_terms = {} # 直近Forward時の微分可能な点操作proxyを保存する辞書
         self.last_runtime_timing = {} # 直近Forward時の実行時間計測結果を保存する辞書を初期化
-        # self._configure_non_encoder_batchnorm() # Encoder以外の構造系モジュールに含まれるBatchNormの設定を変更する
-        
+
         """モジュールセットアップ"""
         self.encoder = PointTransformer(self.args) # 特徴抽出器
         self.structure_analyzer = OctreeStructureAnalysis(self.args, self.writer) # Octree構造解析モジュールの作成
@@ -74,21 +73,6 @@ class Network(nn.Module):
         # self.prun_module = self.cost_attributor
         # self.adding_module = self.policy_module
         # self.disp_module = self.actuator
-
-    def _configure_non_encoder_batchnorm(self): # Encoder以外のBatchNorm設定を調整するための補助関数
-        if bool(getattr(self.args, "module_bn_use_running_stats", False)):
-            return
-        changed = 0
-        for root in (self.cost_attributor, self.policy_module, self.actuator):
-            for module in root.modules():
-                if isinstance(module, nn.modules.batchnorm._BatchNorm):
-                    module.track_running_stats = False
-                    module.running_mean = None
-                    module.running_var = None
-                    module.num_batches_tracked = None
-                    changed += 1
-        if changed > 0 and self.writer is not None and hasattr(self.writer, "write"):
-            self.writer.write(f"Structure modules use per-batch BatchNorm stats ({changed} layers).")
 
     def train(self, mode: bool = True): # Encoderを訓練対象から外すためにPyTorchのtrain()を上書き
         super().train(mode)
@@ -2536,6 +2520,13 @@ class Network(nn.Module):
                     "raw_learned_drop_ratio": _actuator_scalar("raw_learned_drop_ratio"),
                     "raw_learned_add_ratio": _actuator_scalar("raw_learned_add_ratio"),
                     "raw_learned_move_ratio": _actuator_scalar("raw_learned_move_ratio"),
+                    "operation_gate_oracle_loss": _actuator_scalar("operation_gate_oracle_loss"),
+                    "actual_oracle_candidate_where_loss": _actuator_scalar("actual_oracle_candidate_where_loss"),
+                    "actual_oracle_bad_candidate_count": int(actuator_stats.get("actual_oracle_bad_candidate_count", 0)),
+                    "actual_oracle_improving_candidate_count": int(actuator_stats.get("actual_oracle_improving_candidate_count", 0)),
+                    "actual_oracle_combo_extra_count": int(actuator_stats.get("actual_oracle_combo_extra_count", 0)),
+                    "actual_oracle_drop_bad_count": int(actuator_stats.get("actual_oracle_drop_bad_count", 0)),
+                    "actual_oracle_add_bad_count": int(actuator_stats.get("actual_oracle_add_bad_count", 0)),
                     "operation_amount_consistency_loss": float(actuator_stats.get("operation_amount_consistency_loss", pts_xyz.new_zeros(())).detach().cpu()),
                     "operation_entropy": float(actuator_stats.get("operation_entropy", pts_xyz.new_zeros(())).detach().cpu()),
                     "operation_prob_floor_applied": bool(actuator_stats.get("operation_prob_floor_applied", False)),

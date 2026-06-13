@@ -78,6 +78,8 @@ def log_compression_stats(writer, step, num_steps, comp_debug):
         f"actual_bit:{float(comp_debug.get('gt_actual_bit', float('nan'))):.6f}"
         f"->{float(comp_debug.get('gen_actual_bit', float('nan'))):.6f}, "
         f"actual_bit_percent={float(comp_debug.get('actual_total_bit_percent', comp_debug.get('total_bit', 0.0))):.6f}, "
+        f"actual_raw_percent={float(comp_debug.get('actual_raw_percent', comp_debug.get('actual_total_bit_percent', 0.0))):.6f}, "
+        f"edit_record_bits={float(comp_debug.get('actual_edit_record_bits', 0.0)):.3f}, "
         f"codec_points={int(comp_debug.get('gt_points', 0))}->{int(comp_debug.get('gen_points', 0))}, "
         f"unique_coords={int(comp_debug.get('gt_unique_coord_count', 0))}->{int(comp_debug.get('gen_unique_coord_count', 0))}, "
         f"actual_encode_time={float(comp_debug.get('actual_encode_time_total', 0.0)):.4f}s"

@@ -6,14 +6,14 @@ from cfgs.utils import str2bool
 
 # sparsepcgc_move_existing_target_only
 
-pretrained_date = "20260606"
-pretrained_time = "181743"
+pretrained_date = "20260607"
+pretrained_time = "153350"
 
-surrogate_date = "20260524"
-surrogate_time = "230456"
+surrogate_date = "20260606"
+surrogate_time = "181743"
 
-model_date = "20260524"
-model_time = "230456"
+model_date = "20260607"
+model_time = "153350"
 
 # method_com = "OctAttention"
 method_com = "SparsePCGC"
@@ -80,20 +80,6 @@ def _data_subset_dir(split: str, data_name: str = dataname, subset_name: str = d
 def _cli_option_was_provided(option_name: str) -> bool:
     prefix = f"{option_name}="
     return any(arg == option_name or arg.startswith(prefix) for arg in sys.argv[1:])
-
-
-def _discover_latest_pretrained_checkpoint(model_stem: str = model_name) -> str:
-    candidates = []
-    candidates.extend(_LOG_ROOT.glob(f"*/MyNetwork_train/pretrained/*/{model_stem}.pth"))
-    candidates.extend(_LOG_ROOT.glob(f"*/MyNetwork_train/checkpoints/*/{model_stem}.pth"))
-    candidates.extend(_PRETRAINED_ROOT.glob(f"*/*/{model_stem}.pth"))
-    candidates.extend(_LEGACY_PRETRAINED_ROOT.glob(f"*/*/{model_stem}.pth"))
-    existing = [candidate for candidate in candidates if candidate.is_file()]
-    if existing:
-        latest = max(existing, key=lambda path: path.stat().st_mtime)
-        return str(latest.resolve())
-    fallback = _PRETRAINED_ROOT / pretrained_date / f"{pretrained_time}_{method_com}" / f"{model_stem}.pth"
-    return str(fallback.resolve())
 
 
 def _default_checkpoint_path() -> str:
@@ -177,6 +163,10 @@ def _parse_csv_floats(raw_value):
     if not text:
         return []
     return [float(item.strip()) for item in text.split(",") if item.strip()]
+
+
+def _clamp_float(raw_value, lower, upper):
+    return min(max(float(raw_value), float(lower)), float(upper))
 
 
 def _compress_key(raw_value: str) -> str:
@@ -639,6 +629,156 @@ def parse_pugan_args(parser, file_day, file_time):
         help='actual oracleで改善した候補をActuatorへ同時に渡す最大Voxel数',
     )
     parser.add_argument(
+        '--sparsepcgc_actual_oracle_combo_validate_max_extra',
+        default=2,
+        type=int,
+        help='actual oracleで単独改善候補の組み合わせを追加検証する最大actual呼び出し数',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_bad_min_percent',
+        default=0.0,
+        type=float,
+        help='actual oracleで悪化候補としてActuatorへ負例教師を渡す最小actual bit悪化率',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_candidate_where_weight',
+        default=1.0,
+        type=float,
+        help='actual oracleのgood/bad候補をWhere補助損失へ入れる内部倍率',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_use_outcome_memory',
+        default=True,
+        type=str2bool,
+        help='actual oracleで実測したpattern変換の良否をEMAメモリ化し、次Step以降の候補生成へ反映する',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_memory_weight',
+        default=0.75,
+        type=float,
+        help='actual oracle候補rankingへ過去の実測EMAを反映する重み',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_memory_ema',
+        default=0.20,
+        type=float,
+        help='actual oracle候補メモリのEMA更新率',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_memory_score_scale',
+        default=0.5,
+        type=float,
+        help='actual oracle候補メモリでbit変化率をranking bonusへ写すスケール',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_memory_skip_bad',
+        default=True,
+        type=str2bool,
+        help='過去に悪化が安定して観測されたpattern変換を候補から外す',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_memory_bad_min_count',
+        default=2,
+        type=int,
+        help='候補メモリでbad patternとしてskipするために必要な最小観測回数',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_memory_bad_skip_percent',
+        default=0.0,
+        type=float,
+        help='候補メモリでbad skipするEMA bit変化率の閾値',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_memory_max_entries',
+        default=4096,
+        type=int,
+        help='actual oracle候補メモリの最大エントリ数',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_memory_fill_if_exhausted',
+        default=True,
+        type=str2bool,
+        help='過去bad候補しか残らない場合も探索候補を補充し、oracle候補枯れを防ぐ',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_joint_candidate_max',
+        default=1,
+        type=int,
+        help='Add単体/Prune単体とは別に直接検証するAdd+Prune同時候補数',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_group_candidate_max',
+        default=4,
+        type=int,
+        help='単独候補が弱い場合に直接検証するmulti-Add/multi-Prune group候補数',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_group_voxels',
+        default=16,
+        type=int,
+        help='group候補で同時に編集する最大Voxel数',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_group_size_list',
+        default='4,16',
+        type=str,
+        help='group候補で実SparsePCGC検証する同時編集Voxel数。例: 4,16',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_parent_prune_candidate_max',
+        default=2,
+        type=int,
+        help='同一leaf親node配下を丸ごとPruneする候補を何個actual検証するか',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_parent_prune_min_voxels',
+        default=2,
+        type=int,
+        help='parent prune候補に必要な親node内の最小occupied leaf voxel数',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_parent_prune_max_voxels',
+        default=8,
+        type=int,
+        help='parent prune候補で一度に削る最大occupied leaf voxel数',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_pattern_plan_candidate_max',
+        default=2,
+        type=int,
+        help='親occupancy codeを頻出codeへ寄せるGreedy pattern plan候補を何個actual検証するか',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_pattern_plan_target_topk',
+        default=16,
+        type=int,
+        help='pattern planで目標にする頻出occupancy codeの上位数',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_pattern_plan_max_edits',
+        default=16,
+        type=int,
+        help='pattern plan 1候補で同時に行うAdd/Pruneの最大Voxel数',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_pattern_plan_multi_parent_max',
+        default=8,
+        type=int,
+        help='multi-parent pattern plan 1候補で同じ頻出occupancy codeへ寄せる最大親node数',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_pattern_plan_min_nll_gain',
+        default=0.0,
+        type=float,
+        help='pattern plan候補として採用する最小occupancy-code NLL改善量',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_pattern_plan_edit_penalty',
+        default=0.02,
+        type=float,
+        help='pattern plan候補rankingで編集数へかける軽いペナルティ',
+    )
+    parser.add_argument(
         '--sparsepcgc_actual_oracle_allow_add',
         default=True,
         type=str2bool,
@@ -649,6 +789,120 @@ def parse_pugan_args(parser, file_day, file_time):
         default=True,
         type=str2bool,
         help='actual oracle候補探索でPruneを試す',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_allow_subtree_move',
+        default=True,
+        type=str2bool,
+        help='actual oracle候補探索でcoarse child slot配下のSubtree移動を試す',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_subtree_move_candidate_max',
+        default=1,
+        type=int,
+        help='1 stepで実SparsePCGC検証するSubtree移動候補数',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_subtree_move_interval',
+        default=4,
+        type=int,
+        help='Subtree移動候補を何stepごとに実SparsePCGC検証するか',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_subtree_move_level_shifts',
+        default='1',
+        type=str,
+        help='Subtree移動候補のleaf voxel単位ブロックshift。1なら2^1 voxel幅のchild subtreeを移す',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_subtree_move_min_voxels',
+        default=4,
+        type=int,
+        help='Subtree移動候補に必要な最小occupied voxel数',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_subtree_move_max_voxels',
+        default=64,
+        type=int,
+        help='Subtree移動候補で一度に動かすoccupied voxel数上限',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_subtree_move_size_weight',
+        default=0.02,
+        type=float,
+        help='Subtree移動候補rankingで移動voxel数へ与える軽い重み',
+    )
+    parser.add_argument(
+        '--repair_subtree_move_source_init_prob',
+        default=0.02,
+        type=float,
+        help='大規模Subtree Move専用source headの初期選択確率',
+    )
+    parser.add_argument(
+        '--repair_subtree_move_source_prior_weight',
+        default=1.0,
+        type=float,
+        help='大規模Subtree Move専用source headをMove source scoreへ混ぜる重み',
+    )
+    parser.add_argument(
+        '--sparsepcgc_edit_record_bits_enabled',
+        default=True,
+        type=str2bool,
+        help='編集後点群を元形状へ戻すための編集記録bitを圧縮目的関数に含める',
+    )
+    parser.add_argument(
+        '--sparsepcgc_edit_record_bit_scale',
+        default=1.0,
+        type=float,
+        help='推定編集記録bitの目的関数反映倍率。1.0で全量を加算する',
+    )
+    parser.add_argument(
+        '--sparsepcgc_edit_record_train_curriculum',
+        default=True,
+        type=str2bool,
+        help='train.py中だけ編集記録bitの反映倍率を段階的に上げ、初期no-op崩壊を防ぐ',
+    )
+    parser.add_argument(
+        '--sparsepcgc_edit_record_train_start_scale',
+        default=0.0,
+        type=float,
+        help='編集記録bitカリキュラム開始時のsparsepcgc_edit_record_bit_scaleに対する倍率',
+    )
+    parser.add_argument(
+        '--sparsepcgc_edit_record_train_end_scale',
+        default=1.0,
+        type=float,
+        help='編集記録bitカリキュラム終了時のsparsepcgc_edit_record_bit_scaleに対する倍率',
+    )
+    parser.add_argument(
+        '--sparsepcgc_edit_record_train_warmup_steps',
+        default=3000,
+        type=int,
+        help='編集記録bitカリキュラムを満額へ到達させるまでのtrain step数',
+    )
+    parser.add_argument(
+        '--sparsepcgc_edit_record_base_bits',
+        default=8.0,
+        type=float,
+        help='各編集記録パケットの固定ヘッダbit見積もり',
+    )
+    parser.add_argument(
+        '--sparsepcgc_edit_record_count_bits_min',
+        default=4,
+        type=int,
+        help='編集個数を記録するための最小bit数',
+    )
+    parser.add_argument(
+        '--sparsepcgc_edit_record_leaf_address_bits_min',
+        default=10,
+        type=int,
+        help='葉Voxel編集1個の位置指定に使う最小bit数。node index + child slot相当の下限',
+    )
+    parser.add_argument(
+        '--sparsepcgc_edit_record_subtree_move_bits_min',
+        default=16,
+        type=int,
+        help='Subtree Move 1個の移動指定に使う最小bit数',
     )
     parser.add_argument(
         '--sparsepcgc_actual_oracle_min_improve_percent',
@@ -966,6 +1220,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--repair_drop_where_actuator_weight', default=0.03, type=float, help='Prune Where scoreへ直接かけるActuator補助損失重み')
     parser.add_argument('--repair_add_where_actuator_weight', default=0.3, type=float, help='Add Where scoreへ直接かけるActuator補助損失重み')
     parser.add_argument('--repair_move_where_actuator_weight', default=0.03, type=float, help='Move Where scoreまたは方向へ直接かけるActuator補助損失重み')
+    parser.add_argument('--repair_operation_gate_oracle_weight', default=0.1, type=float, help='actual oracle good/bad教師でoperation gateを学習する補助損失重み')
     # Actuatorにおける点操作のAmount
     parser.add_argument('--repair_operation_amount_consistency_weight', default=0.0, type=float, help='学習済み操作割合と実soft操作率を一致させる補助損失重み')
     parser.add_argument('--repair_operation_amount_direct_weight', default=0.0, type=float, help='learned操作割合を目標割合へ近づける直接補助損失。圧縮主目的では弱く使う')
@@ -1594,6 +1849,16 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--train_patch_subset_sampling', default='coverage_cycle', type=str, help='subtree subset学習の選択方法(coverage_cycle)')
     parser.add_argument('--train_patch_subset_log', default=True, type=str2bool, help='subtree subset学習の選択状況をログ出力するか')
     parser.add_argument('--train_subtree_stat_log_limit', default=16, type=int, help='SubtreeSelectionログでOctree統計を計算する最大subtree数')
+    parser.add_argument('--sparsepcgc_subtree_potential_priority', default=True, type=str2bool, help='SparsePCGC訓練時、actual oracle前にleaf occupancy pattern potentialが高いSubtreeを優先選択する')
+    parser.add_argument('--sparsepcgc_subtree_potential_max_scan', default=64, type=int, help='potential priorityで1stepに軽量スコア計算するSubtree候補数上限')
+    parser.add_argument('--sparsepcgc_subtree_potential_topk', default=4, type=int, help='potential上位候補のうち決定的に巡回選択する候補数')
+    parser.add_argument('--sparsepcgc_subtree_potential_candidate_topk', default=4, type=int, help='各Subtreeのpotential計算で合算するAdd/Prune候補数')
+    parser.add_argument('--sparsepcgc_subtree_potential_drop_weight', default=1.0, type=float, help='Subtree potentialにおけるPrune候補スコア重み')
+    parser.add_argument('--sparsepcgc_subtree_potential_add_weight', default=1.0, type=float, help='Subtree potentialにおけるAdd候補スコア重み')
+    parser.add_argument('--sparsepcgc_subtree_potential_size_weight', default=0.02, type=float, help='Subtree potentialに少しだけ加えるvoxel数安定項')
+    parser.add_argument('--sparsepcgc_subtree_potential_efficiency_weight', default=2.0, type=float, help='少ないVoxel編集でleaf occupancy patternを改善できるSubtreeを優先する重み')
+    parser.add_argument('--sparsepcgc_subtree_potential_small_tree_weight', default=0.25, type=float, help='SparsePCGCの固定的なbit段差が出やすい小さめSubtreeを軽く優先する重み')
+    parser.add_argument('--sparsepcgc_subtree_potential_random_mix', default=0.0, type=float, help='Subtree potential優先時にも探索のためランダム選択へ回す割合')
     parser.add_argument('--num_workers', default=4, type=int, help='データローダのワーカー数')
     parser.add_argument('--pin_memory', default=True, type=str2bool, help='CPU→GPU転送高速化のためメモリ固定するか')
     parser.add_argument('--persistent_workers', default=True, type=str2bool, help='ワーカーを維持するか')
@@ -1716,6 +1981,7 @@ def parse_pugan_args(parser, file_day, file_time):
     args.repair_drop_where_actuator_weight = max(float(getattr(args, "repair_drop_where_actuator_weight", 0.1)), 0.0)
     args.repair_add_where_actuator_weight = max(float(getattr(args, "repair_add_where_actuator_weight", 0.3)), 0.0)
     args.repair_move_where_actuator_weight = max(float(getattr(args, "repair_move_where_actuator_weight", 0.3)), 0.0)
+    args.repair_operation_gate_oracle_weight = max(float(getattr(args, "repair_operation_gate_oracle_weight", 0.1)), 0.0)
     args.repair_where_downstream_grad_min_scale = max(
         float(getattr(args, "repair_where_downstream_grad_min_scale", 0.05)),
         1e-4,
@@ -2407,8 +2673,222 @@ def parse_pugan_args(parser, file_day, file_time):
         int(getattr(args, "sparsepcgc_actual_oracle_max_selected_voxels", 4)),
         1,
     )
+    args.sparsepcgc_actual_oracle_combo_validate_max_extra = max(
+        int(getattr(args, "sparsepcgc_actual_oracle_combo_validate_max_extra", 2)),
+        0,
+    )
+    args.sparsepcgc_actual_oracle_bad_min_percent = float(
+        getattr(args, "sparsepcgc_actual_oracle_bad_min_percent", 0.0)
+    )
+    args.sparsepcgc_actual_oracle_candidate_where_weight = max(
+        float(getattr(args, "sparsepcgc_actual_oracle_candidate_where_weight", 1.0)),
+        0.0,
+    )
+    args.sparsepcgc_actual_oracle_use_outcome_memory = bool(
+        getattr(args, "sparsepcgc_actual_oracle_use_outcome_memory", True)
+    )
+    args.sparsepcgc_actual_oracle_memory_weight = max(
+        float(getattr(args, "sparsepcgc_actual_oracle_memory_weight", 0.75)),
+        0.0,
+    )
+    args.sparsepcgc_actual_oracle_memory_ema = min(
+        max(float(getattr(args, "sparsepcgc_actual_oracle_memory_ema", 0.20)), 1e-4),
+        1.0,
+    )
+    args.sparsepcgc_actual_oracle_memory_score_scale = max(
+        float(getattr(args, "sparsepcgc_actual_oracle_memory_score_scale", 0.5)),
+        1e-6,
+    )
+    args.sparsepcgc_actual_oracle_memory_skip_bad = bool(
+        getattr(args, "sparsepcgc_actual_oracle_memory_skip_bad", True)
+    )
+    args.sparsepcgc_actual_oracle_memory_bad_min_count = max(
+        int(getattr(args, "sparsepcgc_actual_oracle_memory_bad_min_count", 2)),
+        1,
+    )
+    args.sparsepcgc_actual_oracle_memory_bad_skip_percent = float(
+        getattr(args, "sparsepcgc_actual_oracle_memory_bad_skip_percent", 0.0)
+    )
+    args.sparsepcgc_actual_oracle_memory_max_entries = max(
+        int(getattr(args, "sparsepcgc_actual_oracle_memory_max_entries", 4096)),
+        128,
+    )
+    args.sparsepcgc_actual_oracle_memory_fill_if_exhausted = bool(
+        getattr(args, "sparsepcgc_actual_oracle_memory_fill_if_exhausted", True)
+    )
+    args.sparsepcgc_actual_oracle_joint_candidate_max = max(
+        int(getattr(args, "sparsepcgc_actual_oracle_joint_candidate_max", 1)),
+        0,
+    )
+    args.sparsepcgc_actual_oracle_group_candidate_max = max(
+        int(getattr(args, "sparsepcgc_actual_oracle_group_candidate_max", 2)),
+        0,
+    )
+    args.sparsepcgc_actual_oracle_group_voxels = max(
+        int(getattr(args, "sparsepcgc_actual_oracle_group_voxels", 4)),
+        2,
+    )
+    raw_oracle_group_sizes = getattr(args, "sparsepcgc_actual_oracle_group_size_list", "4,16")
+    if isinstance(raw_oracle_group_sizes, str):
+        oracle_group_sizes = []
+        for item in raw_oracle_group_sizes.replace(";", ",").split(","):
+            item = item.strip()
+            if not item:
+                continue
+            try:
+                oracle_group_sizes.append(int(float(item)))
+            except ValueError:
+                continue
+    elif isinstance(raw_oracle_group_sizes, (list, tuple)):
+        oracle_group_sizes = []
+        for item in raw_oracle_group_sizes:
+            try:
+                oracle_group_sizes.append(int(float(item)))
+            except (TypeError, ValueError):
+                continue
+    else:
+        oracle_group_sizes = []
+    if not oracle_group_sizes:
+        oracle_group_sizes = [args.sparsepcgc_actual_oracle_group_voxels]
+    args.sparsepcgc_actual_oracle_group_size_list = sorted(
+        {
+            min(
+                max(int(size), 2),
+                int(args.sparsepcgc_actual_oracle_group_voxels),
+            )
+            for size in oracle_group_sizes
+            if int(size) >= 2
+        }
+    ) or [int(args.sparsepcgc_actual_oracle_group_voxels)]
+    args.sparsepcgc_actual_oracle_parent_prune_candidate_max = max(
+        int(getattr(args, "sparsepcgc_actual_oracle_parent_prune_candidate_max", 2)),
+        0,
+    )
+    args.sparsepcgc_actual_oracle_parent_prune_min_voxels = max(
+        int(getattr(args, "sparsepcgc_actual_oracle_parent_prune_min_voxels", 2)),
+        1,
+    )
+    args.sparsepcgc_actual_oracle_parent_prune_max_voxels = max(
+        int(getattr(args, "sparsepcgc_actual_oracle_parent_prune_max_voxels", 8)),
+        args.sparsepcgc_actual_oracle_parent_prune_min_voxels,
+    )
+    args.sparsepcgc_actual_oracle_pattern_plan_candidate_max = max(
+        int(getattr(args, "sparsepcgc_actual_oracle_pattern_plan_candidate_max", 2)),
+        0,
+    )
+    args.sparsepcgc_actual_oracle_pattern_plan_target_topk = max(
+        int(getattr(args, "sparsepcgc_actual_oracle_pattern_plan_target_topk", 16)),
+        1,
+    )
+    args.sparsepcgc_actual_oracle_pattern_plan_max_edits = max(
+        int(getattr(args, "sparsepcgc_actual_oracle_pattern_plan_max_edits", 16)),
+        1,
+    )
+    args.sparsepcgc_actual_oracle_pattern_plan_multi_parent_max = max(
+        int(getattr(args, "sparsepcgc_actual_oracle_pattern_plan_multi_parent_max", 8)),
+        1,
+    )
+    args.sparsepcgc_actual_oracle_pattern_plan_min_nll_gain = float(
+        getattr(args, "sparsepcgc_actual_oracle_pattern_plan_min_nll_gain", 0.0)
+    )
+    args.sparsepcgc_actual_oracle_pattern_plan_edit_penalty = max(
+        float(getattr(args, "sparsepcgc_actual_oracle_pattern_plan_edit_penalty", 0.02)),
+        0.0,
+    )
     args.sparsepcgc_actual_oracle_allow_add = bool(getattr(args, "sparsepcgc_actual_oracle_allow_add", True))
     args.sparsepcgc_actual_oracle_allow_prune = bool(getattr(args, "sparsepcgc_actual_oracle_allow_prune", True))
+    args.sparsepcgc_actual_oracle_allow_subtree_move = bool(
+        getattr(args, "sparsepcgc_actual_oracle_allow_subtree_move", True)
+    )
+    args.sparsepcgc_actual_oracle_subtree_move_candidate_max = max(
+        int(getattr(args, "sparsepcgc_actual_oracle_subtree_move_candidate_max", 1)),
+        0,
+    )
+    args.sparsepcgc_actual_oracle_subtree_move_interval = max(
+        int(getattr(args, "sparsepcgc_actual_oracle_subtree_move_interval", 4)),
+        1,
+    )
+    raw_subtree_move_shifts = getattr(args, "sparsepcgc_actual_oracle_subtree_move_level_shifts", "1")
+    if isinstance(raw_subtree_move_shifts, str):
+        subtree_move_shifts = []
+        for item in raw_subtree_move_shifts.replace(";", ",").split(","):
+            item = item.strip()
+            if not item:
+                continue
+            try:
+                subtree_move_shifts.append(int(float(item)))
+            except ValueError:
+                continue
+    elif isinstance(raw_subtree_move_shifts, (list, tuple)):
+        subtree_move_shifts = []
+        for item in raw_subtree_move_shifts:
+            try:
+                subtree_move_shifts.append(int(float(item)))
+            except (TypeError, ValueError):
+                continue
+    else:
+        subtree_move_shifts = []
+    args.sparsepcgc_actual_oracle_subtree_move_level_shifts = sorted(
+        {min(max(int(value), 1), 6) for value in subtree_move_shifts if int(value) >= 1}
+    ) or [1]
+    args.sparsepcgc_actual_oracle_subtree_move_min_voxels = max(
+        int(getattr(args, "sparsepcgc_actual_oracle_subtree_move_min_voxels", 4)),
+        1,
+    )
+    args.sparsepcgc_actual_oracle_subtree_move_max_voxels = max(
+        int(getattr(args, "sparsepcgc_actual_oracle_subtree_move_max_voxels", 64)),
+        args.sparsepcgc_actual_oracle_subtree_move_min_voxels,
+    )
+    args.sparsepcgc_actual_oracle_subtree_move_size_weight = max(
+        float(getattr(args, "sparsepcgc_actual_oracle_subtree_move_size_weight", 0.02)),
+        0.0,
+    )
+    args.repair_subtree_move_source_init_prob = min(
+        max(float(getattr(args, "repair_subtree_move_source_init_prob", 0.02)), 1e-4),
+        1.0 - 1e-4,
+    )
+    args.repair_subtree_move_source_prior_weight = max(
+        float(getattr(args, "repair_subtree_move_source_prior_weight", 1.0)),
+        0.0,
+    )
+    args.sparsepcgc_edit_record_bits_enabled = bool(
+        getattr(args, "sparsepcgc_edit_record_bits_enabled", True)
+    )
+    args.sparsepcgc_edit_record_bit_scale = max(
+        float(getattr(args, "sparsepcgc_edit_record_bit_scale", 1.0)),
+        0.0,
+    )
+    args.sparsepcgc_edit_record_train_curriculum = bool(
+        getattr(args, "sparsepcgc_edit_record_train_curriculum", True)
+    )
+    args.sparsepcgc_edit_record_train_start_scale = max(
+        float(getattr(args, "sparsepcgc_edit_record_train_start_scale", 0.0)),
+        0.0,
+    )
+    args.sparsepcgc_edit_record_train_end_scale = max(
+        float(getattr(args, "sparsepcgc_edit_record_train_end_scale", 1.0)),
+        0.0,
+    )
+    args.sparsepcgc_edit_record_train_warmup_steps = max(
+        int(getattr(args, "sparsepcgc_edit_record_train_warmup_steps", 3000)),
+        1,
+    )
+    args.sparsepcgc_edit_record_base_bits = max(
+        float(getattr(args, "sparsepcgc_edit_record_base_bits", 8.0)),
+        0.0,
+    )
+    args.sparsepcgc_edit_record_count_bits_min = max(
+        int(getattr(args, "sparsepcgc_edit_record_count_bits_min", 4)),
+        1,
+    )
+    args.sparsepcgc_edit_record_leaf_address_bits_min = max(
+        int(getattr(args, "sparsepcgc_edit_record_leaf_address_bits_min", 10)),
+        1,
+    )
+    args.sparsepcgc_edit_record_subtree_move_bits_min = max(
+        int(getattr(args, "sparsepcgc_edit_record_subtree_move_bits_min", 16)),
+        1,
+    )
     args.repair_force_min_drop_voxels = bool(getattr(args, "repair_force_min_drop_voxels", False))
     args.repair_force_min_add_voxels = bool(getattr(args, "repair_force_min_add_voxels", False))
     args.repair_force_min_move_voxels = bool(getattr(args, "repair_force_min_move_voxels", False))
@@ -2599,15 +3079,53 @@ def parse_pugan_args(parser, file_day, file_time):
         if not _cli_option_was_provided("--repair_drop_ratio_floor"):
             args.repair_drop_ratio_floor = 0.002
         if not _cli_option_was_provided("--repair_max_hard_drop_voxels"):
-            args.repair_max_hard_drop_voxels = 1
+            args.repair_max_hard_drop_voxels = 16
         if not _cli_option_was_provided("--repair_max_hard_move_voxels"):
             args.repair_max_hard_move_voxels = 1
         if not _cli_option_was_provided("--sparsepcgc_actual_oracle_edit"):
             args.sparsepcgc_actual_oracle_edit = True
         if not _cli_option_was_provided("--sparsepcgc_actual_oracle_max_candidates"):
             args.sparsepcgc_actual_oracle_max_candidates = 12
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_max_selected_voxels"):
+            args.sparsepcgc_actual_oracle_max_selected_voxels = 16
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_combo_validate_max_extra"):
+            args.sparsepcgc_actual_oracle_combo_validate_max_extra = 2
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_group_candidate_max"):
+            args.sparsepcgc_actual_oracle_group_candidate_max = 4
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_group_voxels"):
+            args.sparsepcgc_actual_oracle_group_voxels = 16
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_group_size_list"):
+            args.sparsepcgc_actual_oracle_group_size_list = [4, 16]
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_parent_prune_candidate_max"):
+            args.sparsepcgc_actual_oracle_parent_prune_candidate_max = 2
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_parent_prune_min_voxels"):
+            args.sparsepcgc_actual_oracle_parent_prune_min_voxels = 2
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_parent_prune_max_voxels"):
+            args.sparsepcgc_actual_oracle_parent_prune_max_voxels = 8
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_pattern_plan_candidate_max"):
+            args.sparsepcgc_actual_oracle_pattern_plan_candidate_max = 2
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_pattern_plan_target_topk"):
+            args.sparsepcgc_actual_oracle_pattern_plan_target_topk = 16
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_pattern_plan_max_edits"):
+            args.sparsepcgc_actual_oracle_pattern_plan_max_edits = 16
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_pattern_plan_multi_parent_max"):
+            args.sparsepcgc_actual_oracle_pattern_plan_multi_parent_max = 8
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_pattern_plan_min_nll_gain"):
+            args.sparsepcgc_actual_oracle_pattern_plan_min_nll_gain = 0.0
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_pattern_plan_edit_penalty"):
+            args.sparsepcgc_actual_oracle_pattern_plan_edit_penalty = 0.02
         if not _cli_option_was_provided("--sparsepcgc_actual_oracle_force_no_edit"):
             args.sparsepcgc_actual_oracle_force_no_edit = True
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_allow_subtree_move"):
+            args.sparsepcgc_actual_oracle_allow_subtree_move = True
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_subtree_move_candidate_max"):
+            args.sparsepcgc_actual_oracle_subtree_move_candidate_max = 2
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_subtree_move_interval"):
+            args.sparsepcgc_actual_oracle_subtree_move_interval = 2
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_subtree_move_level_shifts"):
+            args.sparsepcgc_actual_oracle_subtree_move_level_shifts = [1, 2]
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_subtree_move_max_voxels"):
+            args.sparsepcgc_actual_oracle_subtree_move_max_voxels = 512
         if not _cli_option_was_provided("--repair_add_min_expected_voxels"):
             args.repair_add_min_expected_voxels = 0.25
         if not _cli_option_was_provided("--repair_move_min_hard_expected_voxels"):
@@ -3000,22 +3518,59 @@ def parse_pugan_args(parser, file_day, file_time):
     args.train_subtree_random_full_range = bool(getattr(args, "train_subtree_random_full_range", True))
     args.train_subtree_min_points = max(int(getattr(args, "train_subtree_min_points", 1)), 1)
     args.train_subtree_stat_log_limit = max(int(getattr(args, "train_subtree_stat_log_limit", 16)), 0)
-    args.target_add_ratio = min(max(float(getattr(args, "target_add_ratio", 0.0)), 0.0), 0.95)
-    args.target_drop_ratio = min(max(float(getattr(args, "target_drop_ratio", 0.0)), 0.0), 0.95)
-    args.target_repair_ratio = min(max(float(getattr(args, "target_repair_ratio", 0.0)), 0.0), 0.95)
-    args.max_repair_ratio = min(max(float(getattr(args, "max_repair_ratio", args.target_repair_ratio)), args.target_repair_ratio), 1.0)
-    args.target_move_ratio = min(max(float(getattr(args, "target_move_ratio", args.target_repair_ratio)), 0.0), 0.95)
-
+    args.sparsepcgc_subtree_potential_priority = bool(
+        getattr(args, "sparsepcgc_subtree_potential_priority", True)
+    )
+    args.sparsepcgc_subtree_potential_max_scan = max(
+        int(getattr(args, "sparsepcgc_subtree_potential_max_scan", 64)),
+        1,
+    )
+    args.sparsepcgc_subtree_potential_topk = max(
+        int(getattr(args, "sparsepcgc_subtree_potential_topk", 4)),
+        1,
+    )
+    args.sparsepcgc_subtree_potential_candidate_topk = max(
+        int(getattr(args, "sparsepcgc_subtree_potential_candidate_topk", 4)),
+        1,
+    )
+    args.sparsepcgc_subtree_potential_drop_weight = max(
+        float(getattr(args, "sparsepcgc_subtree_potential_drop_weight", 1.0)),
+        0.0,
+    )
+    args.sparsepcgc_subtree_potential_add_weight = max(
+        float(getattr(args, "sparsepcgc_subtree_potential_add_weight", 1.0)),
+        0.0,
+    )
+    args.sparsepcgc_subtree_potential_size_weight = max(
+        float(getattr(args, "sparsepcgc_subtree_potential_size_weight", 0.02)),
+        0.0,
+    )
+    args.sparsepcgc_subtree_potential_efficiency_weight = max(
+        float(getattr(args, "sparsepcgc_subtree_potential_efficiency_weight", 2.0)),
+        0.0,
+    )
+    args.sparsepcgc_subtree_potential_small_tree_weight = max(
+        float(getattr(args, "sparsepcgc_subtree_potential_small_tree_weight", 0.25)),
+        0.0,
+    )
+    args.sparsepcgc_subtree_potential_random_mix = min(
+        max(float(getattr(args, "sparsepcgc_subtree_potential_random_mix", 0.0)), 0.0),
+        1.0,
+    )
     amount_cap = 0.30
 
-    args.target_add_ratio = min(max(float(getattr(args, "target_add_ratio", 0.0)), 0.0), amount_cap)
-    args.max_add_ratio = min(max(float(getattr(args, "max_add_ratio", amount_cap)), 0.0), amount_cap)
-
-    args.target_drop_ratio = min(max(float(getattr(args, "target_drop_ratio", 0.0)), 0.0), amount_cap)
-    args.max_drop_ratio = min(max(float(getattr(args, "max_drop_ratio", amount_cap)), 0.0), amount_cap)
-
-    args.target_move_ratio = min(max(float(getattr(args, "target_move_ratio", 0.0)), 0.0), amount_cap)
-    args.max_move_ratio = min(max(float(getattr(args, "max_move_ratio", amount_cap)), 0.0), amount_cap)
+    args.target_add_ratio = _clamp_float(getattr(args, "target_add_ratio", 0.0), 0.0, amount_cap)
+    args.max_add_ratio = _clamp_float(getattr(args, "max_add_ratio", amount_cap), 0.0, amount_cap)
+    args.target_drop_ratio = _clamp_float(getattr(args, "target_drop_ratio", 0.0), 0.0, amount_cap)
+    args.max_drop_ratio = _clamp_float(getattr(args, "max_drop_ratio", amount_cap), 0.0, amount_cap)
+    args.target_repair_ratio = _clamp_float(getattr(args, "target_repair_ratio", 0.0), 0.0, 0.95)
+    args.max_repair_ratio = _clamp_float(
+        getattr(args, "max_repair_ratio", args.target_repair_ratio),
+        args.target_repair_ratio,
+        1.0,
+    )
+    args.target_move_ratio = _clamp_float(getattr(args, "target_move_ratio", 0.0), 0.0, amount_cap)
+    args.max_move_ratio = _clamp_float(getattr(args, "max_move_ratio", amount_cap), 0.0, amount_cap)
 
     args.repair_move_ratio_floor = min(
         max(float(getattr(args, "repair_move_ratio_floor", 0.0)), 0.0),
@@ -3026,14 +3581,7 @@ def parse_pugan_args(parser, file_day, file_time):
     # ============================================================
     # SparsePCGCのactual bit悪化は、大規模Moveによるoccupancy pattern破壊が主因である。
     # そのため、ユーザがCLIで明示した場合を除き、Move上限と探索を強く抑制する。
-    compress_key_for_move = (
-        str(getattr(args, "compress", ""))
-        .strip()
-        .lower()
-        .replace("-", "")
-        .replace("_", "")
-        .replace(" ", "")
-    )
+    compress_key_for_move = _compress_key(getattr(args, "compress", ""))
 
     if compress_key_for_move == "sparsepcgc":
         if not _cli_option_was_provided("--max_move_ratio"):
@@ -3125,14 +3673,7 @@ def parse_pugan_args(parser, file_day, file_time):
         float(getattr(args, "sparsepcgc_exact_bits_loss_weight", 0.0)),
         0.0,
     )
-    compress_key_for_occupancy = (
-        str(getattr(args, "compress", ""))
-        .strip()
-        .lower()
-        .replace("-", "")
-        .replace("_", "")
-        .replace(" ", "")
-    )
+    compress_key_for_occupancy = _compress_key(getattr(args, "compress", ""))
     if (
         compress_key_for_occupancy == "sparsepcgc"
         and not _cli_option_was_provided("--enable_sparsepcgc_occupancy_debug")

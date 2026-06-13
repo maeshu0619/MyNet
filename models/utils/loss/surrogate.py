@@ -976,6 +976,9 @@ class SurrogateCompressionLossMixin:
         local_proxy_replay_stored = False
         gen_points = int(gen_xyz.shape[-1])
         gen_actual_bit = float("nan")
+        gen_total_bit_with_edit_record = float("nan")
+        actual_edit_record_bits = 0.0
+        actual_raw_percent_value = 0.0
         cached_gt = None
         if not self._surrogate_state_is_finite():
             self._reset_compression_surrogate("non-finite params before inference")
@@ -994,7 +997,26 @@ class SurrogateCompressionLossMixin:
                 timing["actual_encode"] = time.time() - actual_t0
                 timing_cursor = time.time()
             teacher_codec = str(stats_gen.get("codec", cached_gt.get("codec", "octattention"))).strip().lower()
-            actual_bit_percent = self._relative_percent(float(stats_gen["bit"]), float(cached_gt["bit"]))
+            actual_edit_record_bits = 0.0
+            voxel_state = getattr(args, "_last_actuator_voxel_state", None)
+            if (
+                str(teacher_codec).strip().lower() == "sparsepcgc"
+                and bool(getattr(args, "sparsepcgc_edit_record_bits_enabled", True))
+                and isinstance(voxel_state, dict)
+            ):
+                try:
+                    actual_edit_record_bits = float(voxel_state.get("estimated_edit_record_bits", 0.0) or 0.0)
+                except Exception:
+                    actual_edit_record_bits = 0.0
+                if not math.isfinite(actual_edit_record_bits):
+                    actual_edit_record_bits = 0.0
+                actual_edit_record_bits = max(actual_edit_record_bits, 0.0)
+            raw_gen_bit = float(stats_gen["bit"])
+            gen_total_bit_with_edit_record = raw_gen_bit + actual_edit_record_bits
+            stats_for_target = dict(stats_gen)
+            stats_for_target["bit"] = float(gen_total_bit_with_edit_record)
+            actual_raw_percent_value = self._relative_percent(raw_gen_bit, float(cached_gt["bit"]))
+            actual_bit_percent = self._relative_percent(gen_total_bit_with_edit_record, float(cached_gt["bit"]))
             actual_bpp_percent = self._relative_percent(float(stats_gen["bpp"]), float(cached_gt["bpp"]))
             actual_single_percent = self._relative_percent(
                 float(stats_gen["single"]),
@@ -1006,7 +1028,7 @@ class SurrogateCompressionLossMixin:
                 float(cached_gt["node"]),
                 ref_min=1.0,
             )
-            target_debug = self._surrogate_target_from_actual(args, stats_gen, cached_gt, gen_xyz.device)
+            target_debug = self._surrogate_target_from_actual(args, stats_for_target, cached_gt, gen_xyz.device)
             target = target_debug["target"]
             target_raw_percent_value = float(actual_bit_percent)
             target_train_percent_value = float(target_debug["train_value"])
@@ -1046,6 +1068,8 @@ class SurrogateCompressionLossMixin:
                     "backend_label": self._surrogate_backend_label(args, teacher_codec),
                     "teacher_codec": teacher_codec,
                     "actual_bit_percent": float(actual_bit_percent),
+                    "actual_raw_percent": float(actual_raw_percent_value),
+                    "actual_edit_record_bits": float(actual_edit_record_bits),
                     "actual_bpp_percent": float(actual_bpp_percent),
                     "actual_single_percent": float(actual_single_percent),
                     "actual_node_percent": float(actual_node_percent),
@@ -1059,6 +1083,7 @@ class SurrogateCompressionLossMixin:
                     "gen_points": int(gen_points),
                     "gt_actual_bit": float(cached_gt["bit"]),
                     "gen_actual_bit": float(gen_actual_bit),
+                    "gen_total_bit_with_edit_record": float(gen_total_bit_with_edit_record),
                     "gt_actual_encode_time": float(cached_gt.get("encode_time", 0.0)),
                     "gen_actual_encode_time": float(stats_gen.get("encode_time", 0.0)),
                     "gt_unique_coord_count": int(cached_gt.get("unique_coord_count", cached_gt.get("point_count", 0))),
@@ -1136,6 +1161,11 @@ class SurrogateCompressionLossMixin:
             target_percent_value = float(target_entry.get("target_bit_percent", actual_bit_percent))
             gen_points = int(target_entry.get("gen_points", gen_points))
             gen_actual_bit = float(target_entry.get("gen_actual_bit", float("nan")))
+            gen_total_bit_with_edit_record = float(
+                target_entry.get("gen_total_bit_with_edit_record", gen_actual_bit)
+            )
+            actual_edit_record_bits = float(target_entry.get("actual_edit_record_bits", 0.0) or 0.0)
+            actual_raw_percent_value = float(target_entry.get("actual_raw_percent", actual_bit_percent))
             stale_hit = "stale" in str(target_cache_hit).lower()
             actual_value_source = "stale_target" if stale_hit else "target_cache"
             if bool(getattr(args, "_surrogate_pretrain_active", False)) and not bool(
@@ -1733,9 +1763,11 @@ class SurrogateCompressionLossMixin:
             "bpp": float(actual_bpp_percent),
             "gt_points": int(cached_gt["point_count"]),
             "gen_points": gen_points,
-            "gt_actual_bit": float(cached_gt["bit"]),
-            "gen_actual_bit": gen_actual_bit,
-            "gt_actual_encode_time": float(cached_gt.get("encode_time", 0.0)),
+                "gt_actual_bit": float(cached_gt["bit"]),
+                "gen_actual_bit": gen_actual_bit,
+                "gen_total_bit_with_edit_record": float(gen_total_bit_with_edit_record),
+                "actual_edit_record_bits": float(actual_edit_record_bits),
+                "gt_actual_encode_time": float(cached_gt.get("encode_time", 0.0)),
             "gen_actual_encode_time": float(stats_gen.get("encode_time", 0.0)) if stats_gen is not None else 0.0,
             "actual_encode_time_total": float(cached_gt.get("encode_time", 0.0))
             + (float(stats_gen.get("encode_time", 0.0)) if stats_gen is not None else 0.0),
@@ -1743,9 +1775,10 @@ class SurrogateCompressionLossMixin:
             "gen_unique_coord_count": int(
                 stats_gen.get("unique_coord_count", stats_gen.get("point_count", gen_points))
             ) if stats_gen is not None else int(target_entry.get("gen_unique_coord_count", gen_points)) if target_entry is not None else gen_points,
-            "actual_total_bit_percent": self._scalar(actual_bit_percent_t),
-            "actual_target": self._scalar(actual_bit_percent_t),
-            "actual_raw_percent": float(target_raw_percent_value),
+                "actual_total_bit_percent": self._scalar(actual_bit_percent_t),
+                "actual_target": self._scalar(actual_bit_percent_t),
+                "actual_raw_percent": float(actual_raw_percent_value),
+                "actual_target_percent_with_edit_record": float(target_raw_percent_value),
             "actual_clamped_percent": float(target_clamped_percent_value),
             "actual_forward_value": self._scalar(actual_bit_percent_t),
             "forward_display_value": self._scalar(main_loss.detach()),

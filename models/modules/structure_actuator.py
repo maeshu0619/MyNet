@@ -8,7 +8,6 @@ from models.utils.pointcloud.sparsepcgc_voxel import (
     restore_points_from_voxel_coords,
     sparsepcgc_effective_qs_value,
     sparsepcgc_effective_qs_tensor,
-    sparsepcgc_voxel_size_tensor,
 )
 
 class StructureRepairActuator(nn.Module):
@@ -70,6 +69,13 @@ class StructureRepairActuator(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv1d(hidden_dim, 3, 1),
         )
+        self.subtree_move_source_head = nn.Sequential(
+            nn.Conv1d(in_channels, hidden_dim, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(hidden_dim, hidden_dim, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(hidden_dim, 1, 1),
+        )
         # Pruneの実行量をActuator特徴から推定し、削除割合も学習対象にする。
         self.drop_amount_head = nn.Conv1d(in_channels, 1, 1)
         # Addの実行量をActuator特徴から推定し、固定比率に張り付かないようにする。
@@ -83,6 +89,7 @@ class StructureRepairActuator(nn.Module):
         nn.init.zeros_(self.add_voxel_head[-1].weight)
         nn.init.zeros_(self.add_voxel_head[-1].bias)
         nn.init.zeros_(self.operation_gate_head[-1].weight)
+        nn.init.zeros_(self.subtree_move_source_head[-1].weight)
         nn.init.normal_(self.drop_amount_head.weight, mean=0.0, std=1e-3)
         nn.init.normal_(self.add_amount_head.weight, mean=0.0, std=1e-3)
         nn.init.normal_(self.move_amount_head.weight, mean=0.0, std=1e-3)
@@ -109,6 +116,14 @@ class StructureRepairActuator(nn.Module):
         nn.init.constant_(self.operation_gate_head[-1].bias[0], init_gate_bias[0])
         nn.init.constant_(self.operation_gate_head[-1].bias[1], init_gate_bias[1])
         nn.init.constant_(self.operation_gate_head[-1].bias[2], init_gate_bias[2])
+        init_subtree_move = min(
+            max(float(getattr(self.args, "repair_subtree_move_source_init_prob", 0.02)), 1e-4),
+            1.0 - 1e-4,
+        )
+        nn.init.constant_(
+            self.subtree_move_source_head[-1].bias,
+            math.log(init_subtree_move / max(1.0 - init_subtree_move, 1e-6)),
+        )
         nn.init.constant_(self.drop_amount_head.bias, 0.0)
         nn.init.constant_(self.add_amount_head.bias, 0.0)
         nn.init.constant_(self.move_amount_head.bias, 0.0)
@@ -476,10 +491,18 @@ class StructureRepairActuator(nn.Module):
             "actual_oracle_enabled": False,
             "actual_oracle_drop_used": False,
             "actual_oracle_add_used": False,
+            "actual_oracle_move_used": False,
             "actual_oracle_drop_best_percent": 0.0,
             "actual_oracle_drop_tested_count": 0,
+            "actual_oracle_bad_candidate_count": 0,
+            "actual_oracle_improving_candidate_count": 0,
+            "actual_oracle_combo_extra_count": 0,
             "actual_oracle_drop_reason": "",
             "actual_oracle_operation": "",
+            "actual_oracle_drop_bad_mask": false_mask,
+            "actual_oracle_add_bad_mask": false_mask,
+            "actual_oracle_drop_bad_score": false_mask.to(dtype=like_tensor.dtype),
+            "actual_oracle_add_bad_score": false_mask.to(dtype=like_tensor.dtype),
         }
 
         if not isinstance(structure, dict):
@@ -500,20 +523,50 @@ class StructureRepairActuator(nn.Module):
                 leaf_diag.get("actual_oracle_add_mask", None),
                 like_tensor,
             ).to(dtype=torch.bool)
+            oracle_move_mask = self._fit_leaf_pattern_map(
+                leaf_diag.get("actual_oracle_move_mask", None),
+                like_tensor,
+            ).to(dtype=torch.bool)
+            oracle_drop_bad_mask = self._fit_leaf_pattern_map(
+                leaf_diag.get("actual_oracle_drop_bad_mask", None),
+                like_tensor,
+            ).to(dtype=torch.bool)
+            oracle_add_bad_mask = self._fit_leaf_pattern_map(
+                leaf_diag.get("actual_oracle_add_bad_mask", None),
+                like_tensor,
+            ).to(dtype=torch.bool)
+            oracle_drop_bad_score = self._fit_leaf_pattern_map(
+                leaf_diag.get("actual_oracle_drop_bad_score", None),
+                like_tensor,
+            )
+            oracle_add_bad_score = self._fit_leaf_pattern_map(
+                leaf_diag.get("actual_oracle_add_bad_score", None),
+                like_tensor,
+            )
             out.update(
                 {
                     "enabled": True,
                     "delete_mask": oracle_drop_mask,
                     "add_mask": oracle_add_mask,
-                    "move_mask": false_mask,
+                    "move_mask": oracle_move_mask,
                     "actual_oracle_enabled": True,
                     "actual_oracle_drop_used": bool(leaf_diag.get("actual_oracle_drop_used", False)),
                     "actual_oracle_add_used": bool(leaf_diag.get("actual_oracle_add_used", False)),
+                    "actual_oracle_move_used": bool(leaf_diag.get("actual_oracle_move_used", False)),
                     "actual_oracle_drop_best_percent": float(
                         leaf_diag.get("actual_oracle_drop_best_percent", 0.0) or 0.0
                     ),
                     "actual_oracle_drop_tested_count": int(
                         leaf_diag.get("actual_oracle_drop_tested_count", 0) or 0
+                    ),
+                    "actual_oracle_bad_candidate_count": int(
+                        leaf_diag.get("actual_oracle_bad_candidate_count", 0) or 0
+                    ),
+                    "actual_oracle_improving_candidate_count": int(
+                        leaf_diag.get("actual_oracle_improving_candidate_count", 0) or 0
+                    ),
+                    "actual_oracle_combo_extra_count": int(
+                        leaf_diag.get("actual_oracle_combo_extra_count", 0) or 0
                     ),
                     "actual_oracle_drop_reason": str(
                         leaf_diag.get("actual_oracle_drop_reason", "")
@@ -521,6 +574,10 @@ class StructureRepairActuator(nn.Module):
                     "actual_oracle_operation": str(
                         leaf_diag.get("actual_oracle_operation", "")
                     ),
+                    "actual_oracle_drop_bad_mask": oracle_drop_bad_mask & (~oracle_drop_mask),
+                    "actual_oracle_add_bad_mask": oracle_add_bad_mask & (~oracle_add_mask),
+                    "actual_oracle_drop_bad_score": oracle_drop_bad_score,
+                    "actual_oracle_add_bad_score": oracle_add_bad_score,
                 }
             )
             return out
@@ -691,13 +748,6 @@ class StructureRepairActuator(nn.Module):
     @staticmethod
     def _voxel_coords(pts_xyz, voxel_step):
         return torch.round(pts_xyz / voxel_step.clamp_min(1e-9)).to(torch.long)
-
-    def _sparsepcgc_voxel_size(self, pts_xyz, coord_scale):
-        return sparsepcgc_voxel_size_tensor(
-            pts_xyz,
-            args=self.args,
-            coord_scale=coord_scale,
-        ).clamp_min(1e-9)
 
     def _sparsepcgc_quantized_coords(self, pts_xyz, coord_scale, fallback_voxel_step=None, global_offset=None):
         compress_key = (
@@ -1305,47 +1355,6 @@ class StructureRepairActuator(nn.Module):
 
         return unique_mask
 
-    @staticmethod
-    def _voxel_max_scores(scores, inverse, voxel_count):
-        voxel_scores = scores.new_full((voxel_count,), -1.0e6)
-        scatter_reduce = getattr(voxel_scores, "scatter_reduce_", None)
-        if callable(scatter_reduce):
-            scatter_reduce(0, inverse, scores, reduce="amax", include_self=True)
-            return voxel_scores
-        for voxel_id in range(int(voxel_count)):
-            mask = inverse == voxel_id
-            if bool(mask.any().item()):
-                voxel_scores[voxel_id] = scores[mask].max()
-        return voxel_scores
-
-    @classmethod
-    def _top_voxel_indices_by_score(cls, scores, inverse, voxel_count, drop_count):
-        voxel_scores = cls._voxel_max_scores(scores, inverse, voxel_count)
-        if int(drop_count) <= 0:
-            return torch.empty((0,), device=scores.device, dtype=torch.long)
-        if bool((voxel_scores > -1.0e6).all().item()):
-            return torch.topk(voxel_scores, k=drop_count, largest=True, sorted=False).indices
-        order = torch.argsort(scores.detach(), descending=True)
-        sorted_voxels = inverse.index_select(0, order).detach().cpu().tolist()
-        selected = []
-        seen = set()
-        for voxel_id in sorted_voxels:
-            voxel_id = int(voxel_id)
-            if voxel_id in seen:
-                continue
-            seen.add(voxel_id)
-            selected.append(voxel_id)
-            if len(selected) >= drop_count:
-                break
-        if len(selected) < drop_count:
-            for voxel_id in range(int(voxel_count)):
-                if voxel_id in seen:
-                    continue
-                selected.append(voxel_id)
-                if len(selected) >= drop_count:
-                    break
-        return torch.as_tensor(selected, device=scores.device, dtype=torch.long)
-
     def _hard_voxel_drop_mask(
         self,
         voxel_coords,
@@ -1443,58 +1452,6 @@ class StructureRepairActuator(nn.Module):
             selected_points = self._isin_voxel_ids(inverse_all, selected_voxel_idx)
             hard_drop[b, 0] = selected_points
         return hard_drop
-
-    def _hard_point_topk_mask(
-        self,
-        scores,
-        target_ratio,
-        selection_mask=None,
-        exclude_mask=None,
-        hard_threshold=0.0,
-    ):
-        B, _, N = scores.shape
-        hard_mask = torch.zeros_like(scores, dtype=torch.bool)
-        if N <= 0 or float(target_ratio) <= 0.0:
-            return hard_mask
-        threshold_cap_mode = self._threshold_cap_mode()
-        if selection_mask is None:
-            valid_all = torch.ones((B, N), device=scores.device, dtype=torch.bool)
-        else:
-            valid_all = selection_mask.squeeze(1) if selection_mask.ndim == 3 else selection_mask
-            valid_all = valid_all.to(device=scores.device, dtype=torch.bool)
-        if exclude_mask is not None:
-            exclude = exclude_mask.squeeze(1) if exclude_mask.ndim == 3 else exclude_mask
-            valid_all = valid_all & (~exclude.to(device=scores.device, dtype=torch.bool))
-        for b in range(B):
-            score_values = scores[b, 0].detach()
-            valid = valid_all[b] & torch.isfinite(score_values) & (score_values > 0.0)
-            valid_count = int(valid.sum().item())
-            if valid_count <= 0:
-                continue
-            count = int(round(float(target_ratio) * float(valid_count)))
-            if threshold_cap_mode:
-                count = min(max(count, 0), valid_count)
-            else:
-                count = min(max(count, 1), valid_count)
-            if count <= 0:
-                continue
-            mask_value = torch.finfo(scores.dtype).min
-            masked_scores = score_values.masked_fill(~valid, mask_value)
-            idx = torch.topk(masked_scores, k=count, largest=True, sorted=False).indices
-            if threshold_cap_mode:
-                idx_scores = score_values.index_select(0, idx)
-                idx = idx[idx_scores >= float(hard_threshold)]
-                if idx.numel() <= 0:
-                    continue
-            hard_mask[b, 0, idx] = True
-        return hard_mask
-
-    @staticmethod
-    def _clip_vector(delta, max_norm):
-        floor = 1e-4 if delta.dtype in (torch.float16, torch.bfloat16) else float(torch.finfo(delta.dtype).tiny)
-        norm = torch.linalg.norm(delta, dim=1, keepdim=True).clamp_min(floor)
-        scale = (max_norm / norm).clamp_max(1.0)
-        return delta * scale
 
     @staticmethod
     def _priority_topk_gate(priority, target_ratio, tau):
@@ -1805,12 +1762,6 @@ class StructureRepairActuator(nn.Module):
             max_ratio = float(getattr(self.args, "max_add_ratio", 0.30))
         return min(max(max_ratio, 0.0), 0.30)
 
-    def _target_add_ratio_value(self):
-        if self._sparsepcgc_add_experiment_active():
-            ratio = max(float(getattr(self.args, "sparsepcgc_add_target_ratio", 0.001)), 0.0)
-            return ratio * self._sparsepcgc_add_warmup()
-        return max(float(getattr(self.args, "target_add_ratio", 0.01)), 0.0)
-
     def _sparsepcgc_add_warmup(self):
         steps = max(int(getattr(self.args, "sparsepcgc_add_warmup_steps", 0)), 0)
         if steps <= 0:
@@ -1889,24 +1840,6 @@ class StructureRepairActuator(nn.Module):
         if point_mask is not None:
             mask = mask * point_mask.to(device=values.device, dtype=values.dtype)
         return mask
-
-    @staticmethod
-    def _mask_add_scores(add_scores, selection_mask, keep_prob=None, keep_threshold=0.0):
-        if selection_mask is None:
-            valid = torch.ones_like(add_scores, dtype=torch.bool)
-        else:
-            valid = selection_mask.squeeze(1) if selection_mask.ndim == 3 else selection_mask
-            valid = valid.to(device=add_scores.device, dtype=torch.bool)
-        if keep_prob is not None and float(keep_threshold) > 0.0:
-            keep = keep_prob.squeeze(1) if keep_prob.ndim == 3 else keep_prob
-            keep = keep.to(device=add_scores.device, dtype=add_scores.dtype)
-            valid = valid & (keep.detach() >= float(keep_threshold))
-        mask_value = torch.finfo(add_scores.dtype).min
-        masked = add_scores.masked_fill(~valid, mask_value)
-        all_invalid = ~valid.any(dim=1)
-        if bool(all_invalid.any().item()):
-            masked = torch.where(all_invalid[:, None], add_scores, masked)
-        return masked
 
     def _operation_amount_logit(self, actuator_features, head):
         # amount head の raw logit を返す。
@@ -2255,6 +2188,25 @@ class StructureRepairActuator(nn.Module):
         actual_oracle_enabled = bool(leaf_operation_masks.get("actual_oracle_enabled", False))
         actual_oracle_has_drop = bool(leaf_delete_op_mask.detach().any().item()) if actual_oracle_enabled else False
         actual_oracle_has_add = bool(leaf_add_op_mask.detach().any().item()) if actual_oracle_enabled else False
+        actual_oracle_has_move = bool(leaf_move_op_mask.detach().any().item()) if actual_oracle_enabled else False
+        actual_oracle_drop_bad_mask = leaf_operation_masks.get(
+            "actual_oracle_drop_bad_mask",
+            torch.zeros_like(leaf_delete_op_mask, dtype=torch.bool),
+        ).to(device=pts_xyz.device, dtype=torch.bool)
+        actual_oracle_add_bad_mask = leaf_operation_masks.get(
+            "actual_oracle_add_bad_mask",
+            torch.zeros_like(leaf_add_op_mask, dtype=torch.bool),
+        ).to(device=pts_xyz.device, dtype=torch.bool)
+        actual_oracle_drop_bad_score = leaf_operation_masks.get(
+            "actual_oracle_drop_bad_score",
+            torch.zeros_like(leaf_delete_op_mask, dtype=pts_xyz.dtype),
+        ).to(device=pts_xyz.device, dtype=pts_xyz.dtype)
+        actual_oracle_add_bad_score = leaf_operation_masks.get(
+            "actual_oracle_add_bad_score",
+            torch.zeros_like(leaf_add_op_mask, dtype=pts_xyz.dtype),
+        ).to(device=pts_xyz.device, dtype=pts_xyz.dtype)
+        actual_oracle_has_bad_drop = bool(actual_oracle_drop_bad_mask.detach().any().item()) if actual_oracle_enabled else False
+        actual_oracle_has_bad_add = bool(actual_oracle_add_bad_mask.detach().any().item()) if actual_oracle_enabled else False
 
         child_slot_candidate_ratio = None
         if child_slot_mask is not None:
@@ -2292,7 +2244,10 @@ class StructureRepairActuator(nn.Module):
                 add_operation_gate = torch.ones_like(add_operation_gate)
             else:
                 add_operation_gate = torch.zeros_like(add_operation_gate)
-            move_operation_gate = torch.zeros_like(move_operation_gate)
+            if actual_oracle_has_move and disp_enabled:
+                move_operation_gate = torch.ones_like(move_operation_gate)
+            else:
+                move_operation_gate = torch.zeros_like(move_operation_gate)
 
         if timing_enabled:
             _mark_runtime("setup")
@@ -2641,18 +2596,27 @@ class StructureRepairActuator(nn.Module):
             * (soft_drop_where_grad_base - soft_drop_where_grad_base.detach())
         )
 
-        hard_drop_mask = self._hard_voxel_drop_mask(
-            voxel_coords,
-            drop_prob,
-            target_drop_ratio=learned_drop_ratio_value,
-            max_drop_ratio=learned_drop_ratio_value,
-            selection_mask=delete_candidate_mask.unsqueeze(1),
-            hard_threshold=float(getattr(self.args, "repair_drop_hard_threshold", 0.5)),
-            voxel_cache=voxel_cache,
-            force_min_count=bool(getattr(self.args, "repair_force_min_drop_voxels", False)),
-            max_hard_count=int(getattr(self.args, "repair_max_hard_drop_voxels", 0)),
-            allow_single_candidate=bool(actual_oracle_enabled and actual_oracle_has_drop),
-        )
+        if actual_oracle_enabled and actual_oracle_has_drop:
+            # The actual SparsePCGC oracle already measured these voxel edits and
+            # found them improving.  Do not let the still-learning amount ratio
+            # shrink a multi-voxel oracle edit back to one voxel.
+            hard_drop_mask = (
+                leaf_delete_op_mask.to(device=pts_xyz.device, dtype=torch.bool)
+                & delete_candidate_mask.unsqueeze(1)
+            )
+        else:
+            hard_drop_mask = self._hard_voxel_drop_mask(
+                voxel_coords,
+                drop_prob,
+                target_drop_ratio=learned_drop_ratio_value,
+                max_drop_ratio=learned_drop_ratio_value,
+                selection_mask=delete_candidate_mask.unsqueeze(1),
+                hard_threshold=float(getattr(self.args, "repair_drop_hard_threshold", 0.5)),
+                voxel_cache=voxel_cache,
+                force_min_count=bool(getattr(self.args, "repair_force_min_drop_voxels", False)),
+                max_hard_count=int(getattr(self.args, "repair_max_hard_drop_voxels", 0)),
+                allow_single_candidate=False,
+            )
         hard_drop = hard_drop_mask.to(dtype=pts_xyz.dtype)
         # Phase3: Pruneは点削除ではなく、対象点が属するoccupied voxelの削除候補として記録する。
         voxel_edit_drop_mask = hard_drop_mask.detach().squeeze(1).to(dtype=torch.bool)
@@ -2721,6 +2685,17 @@ class StructureRepairActuator(nn.Module):
             _mark_runtime("delete")
 
         move_score = (repair_gate * (1.0 - hard_drop)).clamp(0.0, 1.0)
+        subtree_move_source_logit = self.subtree_move_source_head(actuator_features)
+        subtree_move_source_logit = self._scale_where_downstream_grad(
+            subtree_move_source_logit,
+            op_name="move",
+        )
+        subtree_move_source_logit = self._voxel_mean_logits(
+            subtree_move_source_logit,
+            voxel_coords,
+            voxel_cache=voxel_cache,
+        )
+        subtree_move_source_prob = torch.sigmoid(subtree_move_source_logit).clamp(0.0, 1.0)
         move_source_prior = torch.sigmoid(
             (
                 0.70 * p_comp
@@ -2764,6 +2739,19 @@ class StructureRepairActuator(nn.Module):
                 * move_pattern_source_prior
             ).clamp(0.0, 1.0) * (1.0 - hard_drop),
         )
+        subtree_move_source_weight = max(
+            float(getattr(self.args, "repair_subtree_move_source_prior_weight", 1.0)),
+            0.0,
+        )
+        if subtree_move_source_weight > 0.0:
+            move_score = torch.maximum(
+                move_score,
+                (
+                    subtree_move_source_weight
+                    * subtree_move_source_prob
+                    * (1.0 - hard_drop)
+                ).clamp(0.0, 1.0),
+            )
         # targetなしAmount学習では、Moveの実行量をtarget_move_ratioへ寄せない。
         # max_move_ratioだけを0〜30%の探索上限として使う。
         target_move_ratio = 0.0
@@ -3943,6 +3931,62 @@ class StructureRepairActuator(nn.Module):
                 for _ in range(B)
             ]
 
+        actual_oracle_override_move_count_value = 0
+        leaf_diag_for_override = structure.get("leaf_pattern_diag", {}) if isinstance(structure, dict) else {}
+        actual_oracle_edit_record_bits_value = 0.0
+        actual_oracle_raw_percent_value = 0.0
+        if isinstance(leaf_diag_for_override, dict):
+            actual_oracle_edit_record_bits_value = max(
+                float(leaf_diag_for_override.get("actual_oracle_edit_record_bits", 0.0) or 0.0),
+                0.0,
+            )
+            actual_oracle_raw_percent_value = float(
+                leaf_diag_for_override.get("actual_oracle_raw_percent", 0.0) or 0.0
+            )
+        override_final_voxel_coords = (
+            leaf_diag_for_override.get("actual_oracle_override_final_voxel_coords", None)
+            if isinstance(leaf_diag_for_override, dict)
+            else None
+        )
+        if actual_oracle_enabled and torch.is_tensor(override_final_voxel_coords):
+            override_coords = override_final_voxel_coords.detach().to(device=pts_xyz.device, dtype=torch.long)
+            if override_coords.ndim == 2:
+                override_coords = (
+                    override_coords.transpose(0, 1).contiguous().unsqueeze(0)
+                    if override_coords.shape[-1] == 3
+                    else override_coords.unsqueeze(0)
+                )
+            elif override_coords.ndim == 3 and override_coords.shape[1] != 3 and override_coords.shape[-1] == 3:
+                override_coords = override_coords.permute(0, 2, 1).contiguous()
+            if override_coords.ndim == 3 and override_coords.shape[1] == 3 and override_coords.shape[-1] > 0:
+                if override_coords.shape[0] == 1 and B > 1:
+                    override_coords = override_coords.expand(B, -1, -1).contiguous()
+                if override_coords.shape[0] == B:
+                    actual_oracle_override_move_count_value = max(
+                        int(leaf_diag_for_override.get("actual_oracle_override_move_count", 0) or 0),
+                        0,
+                    )
+                    voxel_edit_final_coords = override_coords
+                    voxel_edit_final_weights = pts_xyz.new_ones((B, 1, int(override_coords.shape[-1])))
+                    voxel_edit_valid_mask = torch.ones(
+                        (B, int(override_coords.shape[-1])),
+                        device=pts_xyz.device,
+                        dtype=torch.bool,
+                    )
+                    voxel_edit_debug_list = [
+                        {
+                            "initial_count": int(voxel_coords.shape[-1]),
+                            "drop_count": 0,
+                            "add_count": 0,
+                            "move_count": int(actual_oracle_override_move_count_value),
+                            "same_voxel_move_rejected": 0,
+                            "existing_target_rejected": 0,
+                            "duplicate_target_rejected": 0,
+                            "final_count": int(override_coords.shape[-1]),
+                        }
+                        for _ in range(B)
+                    ]
+
         voxel_edit_initial_count_value = int(sum(item.get("initial_count", 0) for item in voxel_edit_debug_list))
         voxel_edit_final_count_value = int(sum(item.get("final_count", 0) for item in voxel_edit_debug_list))
         voxel_edit_drop_count_value = int(sum(item.get("drop_count", 0) for item in voxel_edit_debug_list))
@@ -3987,6 +4031,27 @@ class StructureRepairActuator(nn.Module):
         )
         same_voxel_adjust_count_value = int(same_voxel_move_mask.detach().sum().item())
         moved_different_voxel_count_value = int(moved_different_voxel_mask.detach().sum().item())
+        if actual_oracle_override_move_count_value > 0:
+            move_source_voxel_count_value = max(
+                int(move_source_voxel_count_value),
+                int(actual_oracle_override_move_count_value),
+            )
+            move_target_voxel_count_value = max(
+                int(move_target_voxel_count_value),
+                int(actual_oracle_override_move_count_value),
+            )
+            move_source_emptied_voxel_count_value = max(
+                int(move_source_emptied_voxel_count_value),
+                int(actual_oracle_override_move_count_value),
+            )
+            move_target_new_voxel_count_value = max(
+                int(move_target_new_voxel_count_value),
+                int(actual_oracle_override_move_count_value),
+            )
+            moved_different_voxel_count_value = max(
+                int(moved_different_voxel_count_value),
+                int(actual_oracle_override_move_count_value),
+            )
         hard_drop_count_value = int(hard_drop.detach().sum().item())
         hard_move_count_value = int(hard_move.detach().sum().item())
         raw_hard_move_count_value = int(raw_hard_move_bool.detach().sum().item())
@@ -4345,6 +4410,147 @@ class StructureRepairActuator(nn.Module):
                     add_where_pred.float(),
                     add_where_target.float(),
                 )
+
+        # ------------------------------------------------------------
+        # Actual SparsePCGC oracle candidate supervision
+        # ------------------------------------------------------------
+        # Forward編集は「actualで改善確認済み」の候補だけに限定する。
+        # ただし、実Codecで悪化した候補もwhere/gateの負例として学習へ入れる。
+        # これにより悪化編集を実際に出力してL_comを壊さず、
+        # Actuatorは「選ぶべき候補」と「避けるべき候補」の両方を覚えられる。
+        operation_gate_oracle_loss = pts_xyz.new_zeros(())
+        actual_oracle_drop_bad_count_value = 0
+        actual_oracle_add_bad_count_value = 0
+        actual_oracle_candidate_where_loss = pts_xyz.new_zeros(())
+        if actual_oracle_enabled:
+            oracle_candidate_weight = max(
+                float(getattr(self.args, "sparsepcgc_actual_oracle_candidate_where_weight", 1.0)),
+                0.0,
+            )
+
+            def _oracle_where_bce(pred, good_mask, bad_mask, bad_score):
+                good_mask = good_mask.to(device=pred.device, dtype=torch.bool)
+                bad_mask = bad_mask.to(device=pred.device, dtype=torch.bool) & (~good_mask)
+                valid = good_mask | bad_mask
+                if not bool(valid.detach().any().item()):
+                    return pred.new_zeros(()), 0
+                target = good_mask.to(device=pred.device, dtype=pred.dtype)
+                weight = torch.ones_like(pred, dtype=pred.dtype)
+                if torch.is_tensor(bad_score):
+                    weight = weight + bad_mask.to(dtype=pred.dtype) * bad_score.to(
+                        device=pred.device,
+                        dtype=pred.dtype,
+                    ).clamp(0.0, 5.0)
+                pred_safe = torch.nan_to_num(
+                    pred,
+                    nan=0.5,
+                    posinf=1.0,
+                    neginf=0.0,
+                ).clamp(eps, 1.0 - eps)
+                with torch.cuda.amp.autocast(enabled=False):
+                    raw = torch.nn.functional.binary_cross_entropy(
+                        pred_safe.float(),
+                        target.float(),
+                        reduction="none",
+                    )
+                valid_f = valid.to(device=raw.device, dtype=raw.dtype)
+                denom = (valid_f * weight.float()).sum().clamp_min(1.0)
+                loss_value = (raw * valid_f * weight.float()).sum() / denom
+                return loss_value.to(dtype=pred.dtype), int(bad_mask.detach().sum().item())
+
+            if prune_enabled and (actual_oracle_has_drop or actual_oracle_has_bad_drop):
+                drop_model_pred = torch.sigmoid(learned_drop_logit / drop_proxy_tau)
+                drop_oracle_loss, actual_oracle_drop_bad_count_value = _oracle_where_bce(
+                    drop_model_pred,
+                    leaf_delete_op_mask,
+                    actual_oracle_drop_bad_mask,
+                    actual_oracle_drop_bad_score,
+                )
+                drop_where_actuator_loss = drop_where_actuator_loss + oracle_candidate_weight * drop_oracle_loss
+                actual_oracle_candidate_where_loss = actual_oracle_candidate_where_loss + drop_oracle_loss
+
+            if add_enabled and (actual_oracle_has_add or actual_oracle_has_bad_add):
+                oracle_add_logit = self.add_head(actuator_features)
+                oracle_add_logit = self._scale_where_downstream_grad(
+                    oracle_add_logit,
+                    op_name="add",
+                )
+                oracle_add_logit = self._voxel_mean_logits(
+                    oracle_add_logit,
+                    voxel_coords,
+                    voxel_cache=voxel_cache,
+                )
+                add_model_pred = torch.sigmoid(oracle_add_logit)
+                add_oracle_loss, actual_oracle_add_bad_count_value = _oracle_where_bce(
+                    add_model_pred,
+                    leaf_add_op_mask,
+                    actual_oracle_add_bad_mask,
+                    actual_oracle_add_bad_score,
+                )
+                add_where_actuator_loss = add_where_actuator_loss + oracle_candidate_weight * add_oracle_loss
+                actual_oracle_candidate_where_loss = actual_oracle_candidate_where_loss + add_oracle_loss
+
+            if disp_enabled and actual_oracle_has_move:
+                move_model_pred = torch.nan_to_num(
+                    move_score,
+                    nan=0.0,
+                    posinf=1.0,
+                    neginf=0.0,
+                ).clamp(0.0, 1.0)
+                move_oracle_loss, _move_bad_count = _oracle_where_bce(
+                    move_model_pred,
+                    leaf_move_op_mask,
+                    torch.zeros_like(leaf_move_op_mask, dtype=torch.bool),
+                    torch.zeros_like(leaf_move_op_mask, dtype=pts_xyz.dtype),
+                )
+                move_amount_supervision_loss = (
+                    move_amount_supervision_loss + oracle_candidate_weight * move_oracle_loss
+                )
+                actual_oracle_candidate_where_loss = actual_oracle_candidate_where_loss + move_oracle_loss
+                subtree_move_oracle_pred = torch.nan_to_num(
+                    subtree_move_source_prob,
+                    nan=0.0,
+                    posinf=1.0,
+                    neginf=0.0,
+                ).clamp(0.0, 1.0)
+                subtree_move_oracle_loss, _subtree_move_bad_count = _oracle_where_bce(
+                    subtree_move_oracle_pred,
+                    leaf_move_op_mask,
+                    torch.zeros_like(leaf_move_op_mask, dtype=torch.bool),
+                    torch.zeros_like(leaf_move_op_mask, dtype=pts_xyz.dtype),
+                )
+                move_where_actuator_loss = (
+                    move_where_actuator_loss + oracle_candidate_weight * subtree_move_oracle_loss
+                )
+                actual_oracle_candidate_where_loss = (
+                    actual_oracle_candidate_where_loss + subtree_move_oracle_loss
+                )
+
+            gate_known = operation_gate_prob.new_tensor(
+                [
+                    1.0 if (actual_oracle_has_drop or actual_oracle_has_bad_drop) else 0.0,
+                    1.0 if (actual_oracle_has_add or actual_oracle_has_bad_add) else 0.0,
+                    1.0 if actual_oracle_has_move else 0.0,
+                ]
+            ).view(1, 3, 1)
+            gate_target = operation_gate_prob.new_tensor(
+                [
+                    1.0 if actual_oracle_has_drop else 0.0,
+                    1.0 if actual_oracle_has_add else 0.0,
+                    1.0 if actual_oracle_has_move else 0.0,
+                ]
+            ).view(1, 3, 1)
+            gate_pred = torch.sigmoid(operation_gate_logit).clamp(eps, 1.0 - eps)
+            with torch.cuda.amp.autocast(enabled=False):
+                gate_loss_raw = torch.nn.functional.binary_cross_entropy(
+                    gate_pred.float(),
+                    gate_target.expand_as(gate_pred).float(),
+                    reduction="none",
+                )
+            gate_known = gate_known.expand_as(gate_loss_raw).float()
+            operation_gate_oracle_loss = (
+                gate_loss_raw * gate_known
+            ).sum() / gate_known.sum().clamp_min(1.0)
         # ============================================================
         # L_actuator に入る補助損失の finite 化
         # ============================================================
@@ -4396,6 +4602,8 @@ class StructureRepairActuator(nn.Module):
         drop_where_actuator_loss = _finite_actuator_loss(drop_where_actuator_loss)
         add_where_actuator_loss = _finite_actuator_loss(add_where_actuator_loss)
         move_where_actuator_loss = _finite_actuator_loss(move_where_actuator_loss)
+        operation_gate_oracle_loss = _finite_actuator_loss(operation_gate_oracle_loss)
+        actual_oracle_candidate_where_loss = _finite_actuator_loss(actual_oracle_candidate_where_loss)
 
         drop_amount_supervision_loss = _finite_actuator_loss(drop_amount_supervision_loss)
         drop_amount_soft_consistency_loss = _finite_actuator_loss(drop_amount_soft_consistency_loss)
@@ -4431,6 +4639,7 @@ class StructureRepairActuator(nn.Module):
             + float(getattr(self.args, "repair_drop_where_actuator_weight", 0.1)) * drop_where_actuator_loss
             + float(getattr(self.args, "repair_add_where_actuator_weight", 0.1)) * add_where_actuator_loss
             + float(getattr(self.args, "repair_move_where_actuator_weight", 0.1)) * move_where_actuator_loss
+            + float(getattr(self.args, "repair_operation_gate_oracle_weight", 0.1)) * operation_gate_oracle_loss
             # 量headは補助損失ではなく、主に圧縮損失で操作量を学習させる。
             # ここは勾配を完全に死なせないための弱い足場に留める。
             + float(getattr(self.args, "repair_drop_amount_supervision_weight", 0.001)) * drop_amount_supervision_loss
@@ -4721,8 +4930,8 @@ class StructureRepairActuator(nn.Module):
                     f"final_voxel_update_mode=state_update_from_initial_voxels, "
                     f"final_voxel_recomputed_from_pts_out=False, "
                     f"initial_voxel_point_count={int(voxel_coords.shape[2])}, "
-                    f"final_voxel_point_count={int(final_voxel_coords.shape[2])}, "
-                    f"final_voxel_added_slots={int(final_voxel_coords.shape[2] - voxel_coords.shape[2])}"
+                    f"final_voxel_point_count={int(voxel_edit_final_coords.shape[2])}, "
+                    f"final_voxel_added_slots={int(voxel_edit_final_coords.shape[2] - voxel_coords.shape[2])}"
                 )
         # SparsePCGC/Voxel modeでは、Actuatorの公開出力もoccupied voxel状態から復元する。
         # 点ごとのsoft座標差分はproxy勾配用に内部で使うだけで、出力点群にはしない。
@@ -4883,6 +5092,25 @@ class StructureRepairActuator(nn.Module):
             "drop_operation_gate": drop_operation_gate.detach().mean(),
             "add_operation_gate": add_operation_gate.detach().mean(),
             "move_operation_gate": move_operation_gate.detach().mean(),
+            "operation_gate_oracle_loss": operation_gate_oracle_loss.detach(),
+            "actual_oracle_candidate_where_loss": actual_oracle_candidate_where_loss.detach(),
+            "actual_oracle_bad_candidate_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_bad_candidate_count", 0))
+            ).detach(),
+            "actual_oracle_improving_candidate_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_improving_candidate_count", 0))
+            ).detach(),
+            "actual_oracle_combo_extra_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_combo_extra_count", 0))
+            ).detach(),
+            "actual_oracle_drop_bad_count": pts_xyz.new_tensor(float(actual_oracle_drop_bad_count_value)).detach(),
+            "actual_oracle_add_bad_count": pts_xyz.new_tensor(float(actual_oracle_add_bad_count_value)).detach(),
+            "actual_oracle_edit_record_bits": pts_xyz.new_tensor(
+                float(actual_oracle_edit_record_bits_value)
+            ).detach(),
+            "actual_oracle_raw_percent": pts_xyz.new_tensor(
+                float(actual_oracle_raw_percent_value)
+            ).detach(),
             "raw_learned_drop_ratio": raw_learned_drop_ratio.mean().detach(),
             "raw_learned_add_ratio": raw_learned_add_ratio.mean().detach(),
             "raw_learned_move_ratio": raw_learned_move_ratio.mean().detach(),
@@ -4980,6 +5208,8 @@ class StructureRepairActuator(nn.Module):
                 move_ratio_soft.detach() - move_ratio_hard.detach()
             ).abs(),
             "move_source_prior_mean": move_source_prior.mean().detach(),
+            "subtree_move_source_prob_mean": subtree_move_source_prob.mean().detach(),
+            "subtree_move_source_prob_max": subtree_move_source_prob.amax().detach() if subtree_move_source_prob.numel() > 0 else pts_xyz.new_zeros(()).detach(),
             "adjusted_point_count": pts_xyz.new_tensor(float(hard_move_count_value)).detach(),
             "adjusted_point_rate": pts_xyz.new_tensor(float(adjusted_point_rate_value)).detach(),
             "raw_hard_move_count_before_sparsepcgc_guard": pts_xyz.new_tensor(float(raw_hard_move_count_value)).detach(),
@@ -5225,6 +5455,15 @@ class StructureRepairActuator(nn.Module):
             "drop_operation_gate": drop_operation_gate.mean(),
             "add_operation_gate": add_operation_gate.mean(),
             "move_operation_gate": move_operation_gate.mean(),
+            "operation_gate_oracle_loss": operation_gate_oracle_loss.detach(),
+            "actual_oracle_candidate_where_loss": actual_oracle_candidate_where_loss.detach(),
+            "actual_oracle_bad_candidate_count": int(leaf_operation_masks.get("actual_oracle_bad_candidate_count", 0)),
+            "actual_oracle_improving_candidate_count": int(leaf_operation_masks.get("actual_oracle_improving_candidate_count", 0)),
+            "actual_oracle_combo_extra_count": int(leaf_operation_masks.get("actual_oracle_combo_extra_count", 0)),
+            "actual_oracle_drop_bad_count": actual_oracle_drop_bad_count_value,
+            "actual_oracle_add_bad_count": actual_oracle_add_bad_count_value,
+            "actual_oracle_edit_record_bits": float(actual_oracle_edit_record_bits_value),
+            "actual_oracle_raw_percent": float(actual_oracle_raw_percent_value),
             "raw_learned_drop_ratio": raw_learned_drop_ratio.mean(),
             "raw_learned_add_ratio": raw_learned_add_ratio.mean(),
             "raw_learned_move_ratio": raw_learned_move_ratio.mean(),
@@ -5317,6 +5556,8 @@ class StructureRepairActuator(nn.Module):
                 move_ratio_soft.detach() - move_ratio_hard.detach()
             ).abs(),
             "soft_activity_loss": soft_activity_loss,
+            "subtree_move_source_prob_mean": subtree_move_source_prob.mean(),
+            "subtree_move_source_prob_max": subtree_move_source_prob.amax() if subtree_move_source_prob.numel() > 0 else pts_xyz.new_zeros(()),
             "move_direction_ce": move_direction_ce,
             "add_direction_ce": add_direction_ce,
             "temperature": float(operation_temperature),
@@ -5439,6 +5680,8 @@ class StructureRepairActuator(nn.Module):
             "voxel_edit_duplicate_target_rejected": voxel_edit_duplicate_target_rejected_value,
             "voxel_edit_child_slot_rejected": voxel_edit_child_slot_rejected_value,
             "voxel_edit_empty_target_rejected": voxel_edit_empty_target_rejected_value,
+            "estimated_edit_record_bits": float(actual_oracle_edit_record_bits_value),
+            "estimated_edit_record_raw_percent": float(actual_oracle_raw_percent_value),
             "canonical_voxel_coords_before": canonical_voxel_coords_before,
             # Phase7-2: full-context / full-cloud correctionへ渡す微分可能なsoft編集量。
             # hard mask / final_voxel_coords.long() ではなく、既存のsoft probability / score / amountを使う。

@@ -394,16 +394,6 @@ class PlotMaker():
             self._recent_metric_abs[idx].append(abs(value))
             self._trim_recent_history(idx)
 
-    @staticmethod
-    def _format_threshold(value):
-        try:
-            numeric = float(value)
-        except (TypeError, ValueError):
-            return "n/a"
-        if not math.isfinite(numeric):
-            return "n/a"
-        return f"{numeric:.6g}"
-
     def _detect_step_outlier(self, values):
         finite_metrics = [(idx, value) for idx, value in enumerate(values) if value is not None]
         if not finite_metrics:

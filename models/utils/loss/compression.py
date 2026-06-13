@@ -1,3 +1,4 @@
+import math
 import time
 
 import numpy as np
@@ -1246,7 +1247,22 @@ class CompressionLossMixin:
         backend_label = f"{codec_name}_actual_ste" if use_proxy_surrogate else f"{codec_name}_actual"
         gt_bit = float(cached_gt["bit"])
         gen_bit = float(stats_gen["bit"])
-        loss_bit_ratio = self._relative_ratio(gen_bit, gt_bit)
+        edit_record_bits = 0.0
+        if (
+            self._is_sparsepcgc_context(args)
+            and bool(getattr(args, "sparsepcgc_edit_record_bits_enabled", True))
+            and isinstance(voxel_state, dict)
+        ):
+            try:
+                edit_record_bits = float(voxel_state.get("estimated_edit_record_bits", 0.0) or 0.0)
+            except Exception:
+                edit_record_bits = 0.0
+            if not math.isfinite(edit_record_bits):
+                edit_record_bits = 0.0
+            edit_record_bits = max(edit_record_bits, 0.0)
+        gen_total_bit = gen_bit + edit_record_bits
+        raw_loss_bit_percent = 100.0 * self._relative_ratio(gen_bit, gt_bit)
+        loss_bit_ratio = self._relative_ratio(gen_total_bit, gt_bit)
         loss_bit_percent = 100.0 * loss_bit_ratio
 
         L_com_hard = gen_xyz.new_tensor(loss_bit_percent)
@@ -1432,9 +1448,16 @@ class CompressionLossMixin:
             ),
             "actual_used_voxel_restored_points": bool(getattr(args, "_current_actual_uses_voxel_restored", False)),
             "actual_input_points": int(stats_gen.get("point_count", 0)),
-            "actual_total_bits": gen_bit,
-            "actual_bpp": float(stats_gen.get("bpp", 0.0)),
-            "actual_delta_percent": loss_bit_percent,
+                "actual_total_bits": gen_total_bit,
+                "actual_raw_bits": gen_bit,
+                "actual_edit_record_bits": edit_record_bits,
+                "actual_edit_record_percent": self._relative_percent(
+                    gen_bit + edit_record_bits,
+                    gen_bit,
+                    ref_min=1.0,
+                ),
+                "actual_bpp": float(stats_gen.get("bpp", 0.0)),
+                "actual_delta_percent": loss_bit_percent,
             "actual_occupancy_nll": float(stats_gen.get("octree_occupancy_nll", 0.0)),
             "actual_node_count": float(stats_gen.get("node", 0.0)),
             "actual_single_child_count": float(stats_gen.get("single", 0.0)),
@@ -1444,13 +1467,16 @@ class CompressionLossMixin:
             "gt_unique_coord_count": int(cached_gt.get("unique_coord_count", cached_gt.get("point_count", 0))),
             "gen_unique_coord_count": int(stats_gen.get("unique_coord_count", stats_gen.get("point_count", 0))),
             "gt_actual_bit": gt_bit,
-            "gen_actual_bit": gen_bit,
-            "actual_total_bit_percent": loss_bit_percent,
-            "actual_value_is_fresh": True,
+                "gen_actual_bit": gen_bit,
+                "gen_total_bit_with_edit_record": gen_total_bit,
+                "actual_total_bit_percent": loss_bit_percent,
+                "actual_raw_percent": raw_loss_bit_percent,
+                "actual_value_is_fresh": True,
             "actual_value_source": "actual_codec",
             "rate_proxy_before": gt_bit,
-            "rate_proxy_after": gen_bit,
-            "rate_proxy_delta": loss_bit_percent,
+                "rate_proxy_after": gen_total_bit,
+                "rate_proxy_after_raw": gen_bit,
+                "rate_proxy_delta": loss_bit_percent,
             "node_delta": float(stats_gen["node"]) - float(cached_gt["node"]),
             "single_delta": float(stats_gen["single"]) - float(cached_gt["single"]),
             "proxy_surrogate": proxy_debug,
@@ -1482,9 +1508,12 @@ class CompressionLossMixin:
             proxy_bit_percent = float(proxy_debug["loss_bit"]) if proxy_debug is not None else float("nan")
             self.last_compression_debug.update(
                 {
-                    "actual_sparsepcgc_bit": gen_bit,
-                    "actual_sparsepcgc_gt_bit": gt_bit,
-                    "actual_sparsepcgc_bit_delta": gen_bit - gt_bit,
+                        "actual_sparsepcgc_bit": gen_bit,
+                        "actual_sparsepcgc_total_bit_with_edit_record": gen_total_bit,
+                        "actual_sparsepcgc_edit_record_bits": edit_record_bits,
+                        "actual_sparsepcgc_gt_bit": gt_bit,
+                        "actual_sparsepcgc_bit_delta": gen_total_bit - gt_bit,
+                        "actual_sparsepcgc_raw_bit_delta": gen_bit - gt_bit,
                     "proxy_sparsepcgc_bit": proxy_bit_percent,
                     "proxy_sparsepcgc_bit_percent": proxy_bit_percent,
                     "proxy_actual_bit_gap": float("nan"),
