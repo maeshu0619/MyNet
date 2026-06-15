@@ -1886,6 +1886,159 @@ def _sparsepcgc_fast_diagnostic_prune_indices(unique_coords, full_coords, args):
     return [int(v) for v in local_indices.detach().cpu().tolist()], debug
 
 
+def _sparsepcgc_fast_diagnostic_add_candidates(unique_coords, full_coords, args):
+    if (
+        not bool(getattr(args, "sparsepcgc_fast_diagnostic_add_teacher", True))
+        or unique_coords is None
+        or full_coords is None
+        or not torch.is_tensor(unique_coords)
+        or not torch.is_tensor(full_coords)
+        or unique_coords.numel() <= 0
+        or full_coords.numel() <= 0
+    ):
+        return [], {}
+    max_local = max(int(getattr(args, "sparsepcgc_fast_diagnostic_add_max_local_voxels", 8)), 0)
+    if max_local <= 0:
+        return [], {"diagnostic": "dense_hole_add", "reason": "disabled_by_budget"}
+
+    unique_coords = _sparsepcgc_coords_to_n3(unique_coords)
+    full_coords = _sparsepcgc_coords_to_n3(full_coords)
+    if unique_coords is None or full_coords is None:
+        return [], {}
+    unique_coords = torch.unique(unique_coords.to(dtype=torch.long), dim=0, sorted=True)
+    full_coords = torch.unique(full_coords.to(device=unique_coords.device, dtype=torch.long), dim=0, sorted=True)
+    if int(unique_coords.shape[0]) <= 0 or int(full_coords.shape[0]) <= 8:
+        return [], {}
+
+    threshold = min(
+        max(int(getattr(args, "sparsepcgc_fast_diagnostic_add_neighbor_threshold", 5)), 1),
+        6,
+    )
+    offsets = torch.tensor(
+        [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)],
+        device=full_coords.device,
+        dtype=torch.long,
+    )
+    query = (full_coords[:, None, :] + offsets.view(1, -1, 3)).reshape(-1, 3)
+    unique_query, inverse_query = torch.unique(query, dim=0, sorted=True, return_inverse=True)
+    query_counts = torch.bincount(inverse_query, minlength=int(unique_query.shape[0])).to(
+        device=full_coords.device,
+        dtype=torch.long,
+    )
+
+    combined = torch.cat([unique_query, full_coords], dim=0)
+    mins = combined.amin(dim=0)
+    span = (combined.amax(dim=0) - mins + 1).clamp_min(1)
+
+    def _keys(values):
+        shifted = values - mins
+        return shifted[:, 0] * span[1] * span[2] + shifted[:, 1] * span[2] + shifted[:, 2]
+
+    full_keys = torch.unique(_keys(full_coords), sorted=True)
+    query_keys = _keys(unique_query)
+    pos = torch.searchsorted(full_keys, query_keys)
+    in_bounds = pos < full_keys.numel()
+    safe_pos = pos.clamp(max=max(int(full_keys.numel()) - 1, 0))
+    occupied = in_bounds & (full_keys[safe_pos] == query_keys)
+    empty_coords = unique_query[~occupied]
+    empty_counts = query_counts[~occupied]
+    dense_mask = empty_counts >= int(threshold)
+    global_add_count = int(dense_mask.detach().sum().cpu())
+    if global_add_count <= 0:
+        return [], {
+            "diagnostic": "dense_hole_add",
+            "threshold": int(threshold),
+            "global_add_count": 0,
+            "full_count": int(full_coords.shape[0]),
+        }
+
+    target_coords = empty_coords[dense_mask]
+    target_counts = empty_counts[dense_mask]
+    local_parent = torch.div(unique_coords, 2, rounding_mode="floor")
+    unique_parent, parent_inverse = torch.unique(local_parent, dim=0, sorted=True, return_inverse=True)
+    parent_child_slot = (
+        (unique_coords[:, 0] & 1)
+        + 2 * (unique_coords[:, 1] & 1)
+        + 4 * (unique_coords[:, 2] & 1)
+    ).to(dtype=torch.long)
+    occupancy = torch.zeros((unique_parent.shape[0], 8), device=unique_coords.device, dtype=torch.bool)
+    occupancy[parent_inverse, parent_child_slot] = True
+
+    target_parent = torch.div(target_coords, 2, rounding_mode="floor")
+    parent_combined = torch.cat([target_parent, unique_parent], dim=0)
+    parent_mins = parent_combined.amin(dim=0)
+    parent_span = (parent_combined.amax(dim=0) - parent_mins + 1).clamp_min(1)
+
+    def _parent_keys(values):
+        shifted = values - parent_mins
+        return shifted[:, 0] * parent_span[1] * parent_span[2] + shifted[:, 1] * parent_span[2] + shifted[:, 2]
+
+    unique_parent_keys = torch.unique(_parent_keys(unique_parent), sorted=True)
+    target_parent_keys = _parent_keys(target_parent)
+    parent_pos = torch.searchsorted(unique_parent_keys, target_parent_keys)
+    parent_in_bounds = parent_pos < unique_parent_keys.numel()
+    safe_parent_pos = parent_pos.clamp(max=max(int(unique_parent_keys.numel()) - 1, 0))
+    local_mask = parent_in_bounds & (unique_parent_keys[safe_parent_pos] == target_parent_keys)
+    local_count = int(local_mask.detach().sum().cpu())
+    if local_count <= 0:
+        return [], {
+            "diagnostic": "dense_hole_add",
+            "threshold": int(threshold),
+            "global_add_count": int(global_add_count),
+            "local_add_count": 0,
+            "full_count": int(full_coords.shape[0]),
+        }
+
+    local_target_idx = local_mask.nonzero(as_tuple=False).reshape(-1)
+    local_order = local_target_idx.index_select(
+        0,
+        torch.argsort(target_counts.index_select(0, local_target_idx), descending=True),
+    )
+    selected = []
+    used_sources = set()
+    used_targets = set()
+    for target_idx_raw in local_order.detach().cpu().tolist():
+        target_idx = int(target_idx_raw)
+        parent_idx = int(safe_parent_pos[target_idx].detach().cpu())
+        target_coord = target_coords[target_idx].to(device=unique_coords.device, dtype=torch.long)
+        target_slot = int(
+            ((target_coord[0] & 1) + 2 * (target_coord[1] & 1) + 4 * (target_coord[2] & 1)).detach().cpu()
+        )
+        key = (int(parent_idx), int(target_slot))
+        if key in used_targets or bool(occupancy[parent_idx, target_slot].detach().cpu()):
+            continue
+        source_candidates = (parent_inverse == int(parent_idx)).nonzero(as_tuple=False).reshape(-1)
+        if source_candidates.numel() <= 0:
+            continue
+        dist = (unique_coords.index_select(0, source_candidates) - target_coord.view(1, 3)).abs().sum(dim=1)
+        source_unique_idx = int(source_candidates[int(torch.argmin(dist).detach().cpu())].detach().cpu())
+        if source_unique_idx in used_sources:
+            continue
+        used_sources.add(source_unique_idx)
+        used_targets.add(key)
+        selected.append(
+            {
+                "source_unique_idx": source_unique_idx,
+                "target_child_slot": target_slot,
+                "target_coord": target_coord.detach().clone(),
+                "score_hint": float(target_counts[target_idx].detach().cpu()),
+            }
+        )
+        if len(selected) >= int(max_local):
+            break
+
+    debug = {
+        "diagnostic": "dense_hole_add",
+        "threshold": int(threshold),
+        "global_add_count": int(global_add_count),
+        "local_add_count": int(len(selected)),
+        "full_count": int(full_coords.shape[0]),
+        "global_add_ratio": float(global_add_count) / max(float(full_coords.shape[0]), 1.0),
+        "local_add_ratio": float(len(selected)) / max(float(unique_coords.shape[0]), 1.0),
+    }
+    return selected, debug
+
+
 def _sparsepcgc_actual_oracle_subtree_move_candidates(unique_coords, args, global_step, max_candidates, base_proxy_bits=None):
     if unique_coords is None or unique_coords.numel() <= 0 or int(max_candidates) <= 0:
         return []
@@ -2619,11 +2772,18 @@ def _attach_sparsepcgc_actual_oracle_drop(
 
     fast_diagnostic_indices = []
     fast_diagnostic_debug = {}
+    fast_diagnostic_add_items = []
+    fast_diagnostic_add_debug = {}
     if fast_diagnostic_enabled and isinstance(full_octree_context, dict):
         fast_full_coords = full_octree_context.get("full_global_voxel_coords", None)
         if not torch.is_tensor(fast_full_coords):
             fast_full_coords = full_eval_coords
         fast_diagnostic_indices, fast_diagnostic_debug = _sparsepcgc_fast_diagnostic_prune_indices(
+            unique_coords,
+            fast_full_coords,
+            args,
+        )
+        fast_diagnostic_add_items, fast_diagnostic_add_debug = _sparsepcgc_fast_diagnostic_add_candidates(
             unique_coords,
             fast_full_coords,
             args,
@@ -2635,13 +2795,20 @@ def _attach_sparsepcgc_actual_oracle_drop(
         debug["fast_diagnostic_local_drop_count"] = int(fast_diagnostic_debug.get("local_drop_count", 0) or 0)
         debug["fast_diagnostic_full_drop_ratio"] = float(fast_diagnostic_debug.get("global_drop_ratio", 0.0) or 0.0)
         debug["fast_diagnostic_local_drop_ratio"] = float(fast_diagnostic_debug.get("local_drop_ratio", 0.0) or 0.0)
+        debug["fast_diagnostic_add_name"] = str(fast_diagnostic_add_debug.get("diagnostic", ""))
+        debug["fast_diagnostic_add_threshold"] = int(fast_diagnostic_add_debug.get("threshold", 0) or 0)
+        debug["fast_diagnostic_full_add_count"] = int(fast_diagnostic_add_debug.get("global_add_count", 0) or 0)
+        debug["fast_diagnostic_local_add_count"] = int(fast_diagnostic_add_debug.get("local_add_count", 0) or 0)
+        debug["fast_diagnostic_full_add_ratio"] = float(fast_diagnostic_add_debug.get("global_add_ratio", 0.0) or 0.0)
+        debug["fast_diagnostic_local_add_ratio"] = float(fast_diagnostic_add_debug.get("local_add_ratio", 0.0) or 0.0)
     else:
         debug["fast_diagnostic_enabled"] = False
 
     def _apply_fast_diagnostic_teacher():
-        if not fast_diagnostic_indices:
+        if not fast_diagnostic_indices and not fast_diagnostic_add_items:
             return False
         selected_indices = [int(v) for v in fast_diagnostic_indices]
+        selected_index_set = set(selected_indices)
         strength = 1.0 + min(float(len(selected_indices)) / max(float(unique_coords.shape[0]), 1.0) * 100.0, 4.0)
         for unique_idx in selected_indices:
             if unique_idx < 0 or unique_idx >= int(unique_coords.shape[0]):
@@ -2652,24 +2819,86 @@ def _attach_sparsepcgc_actual_oracle_drop(
             point_mask[0, point_indices] = True
             score[0, point_indices] = float(strength)
         selected_drop = int(point_mask.detach().sum().cpu())
-        if selected_drop <= 0:
+
+        selected_add_items = []
+        add_strength = 1.0 + min(
+            float(len(fast_diagnostic_add_items)) / max(float(unique_coords.shape[0]), 1.0) * 100.0,
+            2.0,
+        )
+        for add_item in fast_diagnostic_add_items:
+            source_unique_idx = int(add_item.get("source_unique_idx", -1))
+            target_slot = int(add_item.get("target_child_slot", -1))
+            target_coord = add_item.get("target_coord", None)
+            if (
+                source_unique_idx < 0
+                or source_unique_idx >= int(unique_coords.shape[0])
+                or source_unique_idx in selected_index_set
+                or target_slot < 0
+                or target_slot > 7
+                or not torch.is_tensor(target_coord)
+            ):
+                continue
+            point_indices = (inverse == int(source_unique_idx)).nonzero(as_tuple=False).reshape(-1)
+            if point_indices.numel() <= 0:
+                continue
+            add_point_mask[0, point_indices] = True
+            add_score[0, point_indices] = torch.maximum(
+                add_score[0, point_indices],
+                add_score.new_full((int(point_indices.numel()),), float(add_strength)),
+            )
+            add_child_slot[0, point_indices] = int(target_slot)
+            selected_add_items.append(
+                {
+                    "source_unique_idx": int(source_unique_idx),
+                    "target_child_slot": int(target_slot),
+                    "target_coord": target_coord.to(device=unique_coords.device, dtype=torch.long).view(1, 3),
+                }
+            )
+        selected_add = int(add_point_mask.detach().sum().cpu())
+        if selected_drop <= 0 and selected_add <= 0:
             return False
         keep_for_proxy = torch.ones((unique_coords.shape[0],), device=unique_coords.device, dtype=torch.bool)
-        keep_for_proxy[torch.as_tensor(selected_indices, device=unique_coords.device, dtype=torch.long)] = False
+        if selected_indices:
+            keep_for_proxy[torch.as_tensor(selected_indices, device=unique_coords.device, dtype=torch.long)] = False
+        edited_for_proxy = unique_coords[keep_for_proxy]
+        if selected_add_items:
+            add_coords_for_proxy = torch.cat([item["target_coord"] for item in selected_add_items], dim=0)
+            edited_for_proxy = torch.unique(torch.cat([edited_for_proxy, add_coords_for_proxy], dim=0), dim=0, sorted=True)
         proxy_bits, proxy_percent = _sparsepcgc_proxy_delta_percent(
-            unique_coords[keep_for_proxy],
+            edited_for_proxy,
             args,
             base_proxy_bits,
         )
+        edit_record_bits = _sparsepcgc_edit_record_total_bits(
+            args,
+            int(unique_coords.shape[0]),
+            drop_count=len(selected_indices),
+            add_count=len(selected_add_items),
+        )
+        geometry_percent = _sparsepcgc_geometry_penalty_percent(
+            args,
+            int(unique_coords.shape[0]),
+            drop_count=len(selected_indices),
+            add_count=len(selected_add_items),
+        )
         debug["used"] = True
-        debug["reason"] = "fast_diagnostic_axis_neighbor_prune"
-        debug["generated_candidate_count"] = int(debug.get("generated_candidate_count", 0)) + 1
-        debug["accepted_candidate_count"] = 1
+        if selected_drop > 0 and selected_add > 0:
+            debug["reason"] = "fast_diagnostic_axis_neighbor_prune+dense_hole_add"
+        elif selected_add > 0:
+            debug["reason"] = "fast_diagnostic_dense_hole_add"
+        else:
+            debug["reason"] = "fast_diagnostic_axis_neighbor_prune"
+        debug["generated_candidate_count"] = int(debug.get("generated_candidate_count", 0)) + int(bool(selected_indices)) + int(bool(fast_diagnostic_add_items))
+        debug["accepted_candidate_count"] = int(selected_drop > 0) + int(selected_add > 0)
         debug["accepted_prune_count"] = int(selected_drop)
+        debug["accepted_add_count"] = int(selected_add)
         debug["selected_drop_count"] = int(selected_drop)
+        debug["selected_add_count"] = int(selected_add)
         debug["best_percent"] = float(proxy_percent)
         debug["best_proxy_percent"] = float(proxy_percent)
         debug["selected_proxy_percent"] = float(proxy_percent)
+        debug["selected_edit_record_bits"] = float(edit_record_bits)
+        debug["selected_geometry_percent"] = float(geometry_percent)
         if not actual_validate_this_step:
             debug["actual_oracle_time"] = 0.0
             debug["tested_count"] = 0
@@ -4291,6 +4520,10 @@ def _attach_sparsepcgc_actual_oracle_drop(
         "actual_oracle_fast_diagnostic_local_drop_count": int(debug.get("fast_diagnostic_local_drop_count", 0) or 0),
         "actual_oracle_fast_diagnostic_full_drop_ratio": float(debug.get("fast_diagnostic_full_drop_ratio", 0.0) or 0.0),
         "actual_oracle_fast_diagnostic_local_drop_ratio": float(debug.get("fast_diagnostic_local_drop_ratio", 0.0) or 0.0),
+        "actual_oracle_fast_diagnostic_full_add_count": int(debug.get("fast_diagnostic_full_add_count", 0) or 0),
+        "actual_oracle_fast_diagnostic_local_add_count": int(debug.get("fast_diagnostic_local_add_count", 0) or 0),
+        "actual_oracle_fast_diagnostic_full_add_ratio": float(debug.get("fast_diagnostic_full_add_ratio", 0.0) or 0.0),
+        "actual_oracle_fast_diagnostic_local_add_ratio": float(debug.get("fast_diagnostic_local_add_ratio", 0.0) or 0.0),
         "actual_oracle_operation": str(debug["reason"]),
     }
 
@@ -4330,6 +4563,10 @@ def _attach_sparsepcgc_actual_oracle_drop(
                 f"fast_diag_thr={int(debug.get('fast_diagnostic_threshold', 0))}, "
                 f"fast_diag_full_drop={int(debug.get('fast_diagnostic_full_drop_count', 0))}, "
                 f"fast_diag_local_drop={int(debug.get('fast_diagnostic_local_drop_count', 0))}, "
+                f"fast_diag_add={str(debug.get('fast_diagnostic_add_name', ''))}, "
+                f"fast_diag_add_thr={int(debug.get('fast_diagnostic_add_threshold', 0))}, "
+                f"fast_diag_full_add={int(debug.get('fast_diagnostic_full_add_count', 0))}, "
+                f"fast_diag_local_add={int(debug.get('fast_diagnostic_local_add_count', 0))}, "
                 f"macro_prune_tested={int(debug.get('macro_prune_tested_count', 0))}, "
                 f"macro_prune_improving={int(debug.get('macro_prune_improving_count', 0))}, "
                 f"macro_best={float(debug.get('macro_prune_best_percent', 0.0)):.6f}, "

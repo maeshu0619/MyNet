@@ -676,6 +676,18 @@ class StructureRepairActuator(nn.Module):
                     "actual_oracle_fast_diagnostic_local_drop_ratio": float(
                         leaf_diag.get("actual_oracle_fast_diagnostic_local_drop_ratio", 0.0) or 0.0
                     ),
+                    "actual_oracle_fast_diagnostic_full_add_count": int(
+                        leaf_diag.get("actual_oracle_fast_diagnostic_full_add_count", 0) or 0
+                    ),
+                    "actual_oracle_fast_diagnostic_local_add_count": int(
+                        leaf_diag.get("actual_oracle_fast_diagnostic_local_add_count", 0) or 0
+                    ),
+                    "actual_oracle_fast_diagnostic_full_add_ratio": float(
+                        leaf_diag.get("actual_oracle_fast_diagnostic_full_add_ratio", 0.0) or 0.0
+                    ),
+                    "actual_oracle_fast_diagnostic_local_add_ratio": float(
+                        leaf_diag.get("actual_oracle_fast_diagnostic_local_add_ratio", 0.0) or 0.0
+                    ),
                     "actual_oracle_drop_reason": str(
                         leaf_diag.get("actual_oracle_drop_reason", "")
                     ),
@@ -4591,10 +4603,45 @@ class StructureRepairActuator(nn.Module):
                 loss_value = (raw * valid_f * weight.float()).sum() / denom
                 return loss_value.to(dtype=pred.dtype), int(bad_mask.detach().sum().item())
 
+            def _oracle_where_bce_logits(logit, good_mask, bad_mask, bad_score):
+                good_mask = good_mask.to(device=logit.device, dtype=torch.bool)
+                bad_mask = bad_mask.to(device=logit.device, dtype=torch.bool) & (~good_mask)
+                valid = good_mask | bad_mask
+                if not bool(valid.detach().any().item()):
+                    return logit.new_zeros(()), 0
+                target = good_mask.to(device=logit.device, dtype=logit.dtype)
+                weight = torch.ones_like(logit, dtype=logit.dtype)
+                if torch.is_tensor(bad_score):
+                    weight = weight + bad_mask.to(dtype=logit.dtype) * bad_score.to(
+                        device=logit.device,
+                        dtype=logit.dtype,
+                    ).clamp(0.0, 5.0)
+                safe_logit = torch.nan_to_num(
+                    logit,
+                    nan=0.0,
+                    posinf=30.0,
+                    neginf=-30.0,
+                )
+                logit_clip = max(
+                    float(getattr(self.args, "sparsepcgc_actual_oracle_candidate_logit_clip", 20.0)),
+                    1.0,
+                )
+                clipped_logit = safe_logit.clamp(-float(logit_clip), float(logit_clip))
+                safe_logit = safe_logit + (clipped_logit - safe_logit).detach()
+                with torch.cuda.amp.autocast(enabled=False):
+                    raw = torch.nn.functional.binary_cross_entropy_with_logits(
+                        safe_logit.float(),
+                        target.float(),
+                        reduction="none",
+                    )
+                valid_f = valid.to(device=raw.device, dtype=raw.dtype)
+                denom = (valid_f * weight.float()).sum().clamp_min(1.0)
+                loss_value = (raw * valid_f * weight.float()).sum() / denom
+                return loss_value.to(dtype=logit.dtype), int(bad_mask.detach().sum().item())
+
             if prune_enabled and (actual_oracle_has_drop or actual_oracle_has_bad_drop):
-                drop_model_pred = torch.sigmoid(learned_drop_logit / drop_proxy_tau)
-                drop_oracle_loss, actual_oracle_drop_bad_count_value = _oracle_where_bce(
-                    drop_model_pred,
+                drop_oracle_loss, actual_oracle_drop_bad_count_value = _oracle_where_bce_logits(
+                    learned_drop_logit / drop_proxy_tau,
                     leaf_delete_op_mask,
                     actual_oracle_drop_bad_mask,
                     actual_oracle_drop_bad_score,
@@ -4613,9 +4660,8 @@ class StructureRepairActuator(nn.Module):
                     voxel_coords,
                     voxel_cache=voxel_cache,
                 )
-                add_model_pred = torch.sigmoid(oracle_add_logit)
-                add_oracle_loss, actual_oracle_add_bad_count_value = _oracle_where_bce(
-                    add_model_pred,
+                add_oracle_loss, actual_oracle_add_bad_count_value = _oracle_where_bce_logits(
+                    oracle_add_logit,
                     leaf_add_op_mask,
                     actual_oracle_add_bad_mask,
                     actual_oracle_add_bad_score,

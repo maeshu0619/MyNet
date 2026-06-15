@@ -6,14 +6,14 @@ from cfgs.utils import str2bool
 
 # sparsepcgc_move_existing_target_only
 
-pretrained_date = "20260607"
-pretrained_time = "153350"
+pretrained_date = "20260615"
+pretrained_time = "145436"
 
 surrogate_date = "20260606"
 surrogate_time = "181743"
 
-model_date = "20260607"
-model_time = "153350"
+model_date = "20260615"
+model_time = "145436"
 
 # method_com = "OctAttention"
 method_com = "SparsePCGC"
@@ -647,6 +647,12 @@ def parse_pugan_args(parser, file_day, file_time):
         help='actual oracleのgood/bad候補をWhere補助損失へ入れる内部倍率',
     )
     parser.add_argument(
+        '--sparsepcgc_actual_oracle_candidate_logit_clip',
+        default=20.0,
+        type=float,
+        help='actual oracle where logits BCEのforward clip幅。勾配はstraight-throughで保持する',
+    )
+    parser.add_argument(
         '--sparsepcgc_actual_oracle_use_outcome_memory',
         default=True,
         type=str2bool,
@@ -1065,6 +1071,24 @@ def parse_pugan_args(parser, file_day, file_time):
         default=1,
         type=int,
         help='高速診断teacherを採択するために必要なsubtree内候補voxel数',
+    )
+    parser.add_argument(
+        '--sparsepcgc_fast_diagnostic_add_teacher',
+        default=True,
+        type=str2bool,
+        help='actual検証step以外で、密なhole fill Addを高速診断teacherに含める',
+    )
+    parser.add_argument(
+        '--sparsepcgc_fast_diagnostic_add_neighbor_threshold',
+        default=6,
+        type=int,
+        help='6近傍occupied数がこの値以上のempty voxelを高速Add診断候補にする',
+    )
+    parser.add_argument(
+        '--sparsepcgc_fast_diagnostic_add_max_local_voxels',
+        default=2,
+        type=int,
+        help='高速診断teacherが1 subtreeでAdd教師にする最大voxel数',
     )
     parser.add_argument(
         '--sparsepcgc_actual_oracle_log',
@@ -2841,6 +2865,10 @@ def parse_pugan_args(parser, file_day, file_time):
         float(getattr(args, "sparsepcgc_actual_oracle_candidate_where_weight", 1.0)),
         0.0,
     )
+    args.sparsepcgc_actual_oracle_candidate_logit_clip = max(
+        float(getattr(args, "sparsepcgc_actual_oracle_candidate_logit_clip", 20.0)),
+        1.0,
+    )
     args.sparsepcgc_actual_oracle_use_outcome_memory = bool(
         getattr(args, "sparsepcgc_actual_oracle_use_outcome_memory", True)
     )
@@ -3946,6 +3974,17 @@ def parse_pugan_args(parser, file_day, file_time):
     args.sparsepcgc_fast_diagnostic_min_local_voxels = max(
         int(getattr(args, "sparsepcgc_fast_diagnostic_min_local_voxels", 1)),
         1,
+    )
+    args.sparsepcgc_fast_diagnostic_add_teacher = bool(
+        getattr(args, "sparsepcgc_fast_diagnostic_add_teacher", True)
+    )
+    args.sparsepcgc_fast_diagnostic_add_neighbor_threshold = min(
+        max(int(getattr(args, "sparsepcgc_fast_diagnostic_add_neighbor_threshold", 6)), 1),
+        6,
+    )
+    args.sparsepcgc_fast_diagnostic_add_max_local_voxels = max(
+        int(getattr(args, "sparsepcgc_fast_diagnostic_add_max_local_voxels", 2)),
+        0,
     )
     args.sparsepcgc_codec_proxy_weight = max(float(getattr(args, "sparsepcgc_codec_proxy_weight", 2.0)), 0.0)
     args.sparsepcgc_codec_proxy_smoothing = max(

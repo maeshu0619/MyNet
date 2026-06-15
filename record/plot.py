@@ -856,7 +856,6 @@ class PlotMaker():
         key_to_index = {key: index for index, key in enumerate(self.metric_keys)}
         surrogate_idx = key_to_index.get("compression")
         actual_idx = key_to_index.get("actual_compression")
-        ratio_idx = key_to_index.get("actual_compression_ratio")
         if surrogate_idx is None or actual_idx is None:
             return
         plotted = False
@@ -872,13 +871,32 @@ class PlotMaker():
                 line, = ax.plot(plot_x, plot_values, marker="o", linewidth=2, markersize=3, color=color, label=label)
                 handles.append(line)
                 plotted = True
-        ratio_ax = None
+        if not plotted:
+            ax.text(0.5, 0.5, "no compression data", ha="center", va="center", transform=ax.transAxes, alpha=0.7)
+        ax.axhline(0.0, color="black", linewidth=0.7, alpha=0.4)
+        ax.set_xlabel(xl)
+        ax.set_ylabel("Delta [%]")
+        ax.set_title("Surrogate vs Actual Compression Delta")
+        if handles:
+            ax.legend(handles=handles, loc="best")
+        ax.grid(True, alpha=0.35)
+        if len(x_history) >= 2:
+            ax.set_xlim(min(x_history), max(x_history))
+            try:
+                from matplotlib.ticker import MaxNLocator
+                ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+            except Exception:
+                pass
+
+    def _plot_actual_ratio_axis(self, ax, loss_history, x_history, xl):
+        key_to_index = {key: index for index, key in enumerate(self.metric_keys)}
+        ratio_idx = key_to_index.get("actual_compression_ratio")
+        plotted = False
         if ratio_idx is not None and ratio_idx < len(loss_history):
             ratio_values = self._plot_values(loss_history[ratio_idx])
             ratio_x, ratio_values = self._downsample_series(list(x_history), ratio_values)
             if any(math.isfinite(value) for value in ratio_values):
-                ratio_ax = ax.twinx()
-                line, = ratio_ax.plot(
+                ax.plot(
                     ratio_x,
                     ratio_values,
                     marker="o",
@@ -887,28 +905,21 @@ class PlotMaker():
                     color="tab:green",
                     label="Actual Ratio",
                 )
-                ratio_ax.axhline(100.0, color="tab:green", linewidth=0.7, alpha=0.35)
-                ratio_ax.set_ylabel("Ratio [%]")
-                handles.append(line)
                 plotted = True
         if not plotted:
-            ax.text(0.5, 0.5, "no compression data", ha="center", va="center", transform=ax.transAxes, alpha=0.7)
-        ax.axhline(0.0, color="black", linewidth=0.7, alpha=0.4)
+            ax.text(0.5, 0.5, "no actual ratio data", ha="center", va="center", transform=ax.transAxes, alpha=0.7)
+        ax.axhline(100.0, color="black", linewidth=0.7, alpha=0.4)
         ax.set_xlabel(xl)
-        ax.set_ylabel("Delta [%]")
-        ax.set_title("Surrogate/Actual Delta and Actual Ratio")
-        if handles:
-            ax.legend(handles=handles, loc="best")
+        ax.set_ylabel("Ratio [%]")
+        ax.set_title("Actual Codec Ratio (100*Mine/GT)")
+        if plotted:
+            ax.legend(loc="best")
         ax.grid(True, alpha=0.35)
         if len(x_history) >= 2:
             ax.set_xlim(min(x_history), max(x_history))
-            if ratio_ax is not None:
-                ratio_ax.set_xlim(min(x_history), max(x_history))
             try:
                 from matplotlib.ticker import MaxNLocator
                 ax.xaxis.set_major_locator(MaxNLocator(integer=True))
-                if ratio_ax is not None:
-                    ratio_ax.xaxis.set_major_locator(MaxNLocator(integer=True))
             except Exception:
                 pass
 
@@ -945,7 +956,7 @@ class PlotMaker():
                 os.makedirs(save_dir_full, exist_ok=True)
 
             is_compression_group = self.group_title[group_idx] == "compression"
-            axis_count = len(group) + (1 if is_compression_group else 0)
+            axis_count = len(group) + (2 if is_compression_group else 0)
             fig, axes = plot_mod.subplots(axis_count, 1, figsize=(self.x_len, self.y_len * axis_count))
 
             if axis_count == 1:
@@ -953,9 +964,10 @@ class PlotMaker():
 
             axis_offset = 0
             if is_compression_group:
-                # Surrogateと実codecの圧縮差を同じ軸に重ね、圧縮グループの先頭で確認できるようにする。
+                # 従来のdelta比較と新しいratio表示を同じPNG内の別サブプロットに分ける。
                 self._plot_compression_compare_axis(axes[0], loss_history, x_history, xl)
-                axis_offset = 1
+                self._plot_actual_ratio_axis(axes[1], loss_history, x_history, xl)
+                axis_offset = 2
 
             for ax, loss_idx in zip(axes[axis_offset:], group):
                 epochs = list(x_history)

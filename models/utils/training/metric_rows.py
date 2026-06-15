@@ -606,6 +606,13 @@ def build_operation_metric_row(
     )
     if actual_oracle_fast_diagnostic_used and actual_oracle_fast_diagnostic_local_count <= 0:
         actual_oracle_fast_diagnostic_local_count = actual_oracle_accepted_prune_count
+    actual_oracle_fast_diagnostic_local_add_count = case_int(
+        structure_debug.get("actual_oracle_fast_diagnostic_local_add_count", 0)
+    )
+    if actual_oracle_fast_diagnostic_used and actual_oracle_fast_diagnostic_local_add_count <= 0:
+        actual_oracle_fast_diagnostic_local_add_count = case_int(
+            structure_debug.get("actual_oracle_accepted_add_count", 0)
+        )
     return {
         "global_step": int(global_step) + 1,
         "episode": int(episode) + 1,
@@ -672,6 +679,10 @@ def build_operation_metric_row(
         "actual_oracle_fast_diagnostic_local_drop_count": actual_oracle_fast_diagnostic_local_count,
         "actual_oracle_fast_diagnostic_full_drop_ratio": case_float(structure_debug.get("actual_oracle_fast_diagnostic_full_drop_ratio", 0.0), 0.0),
         "actual_oracle_fast_diagnostic_local_drop_ratio": case_float(structure_debug.get("actual_oracle_fast_diagnostic_local_drop_ratio", 0.0), 0.0),
+        "actual_oracle_fast_diagnostic_full_add_count": case_int(structure_debug.get("actual_oracle_fast_diagnostic_full_add_count", 0)),
+        "actual_oracle_fast_diagnostic_local_add_count": actual_oracle_fast_diagnostic_local_add_count,
+        "actual_oracle_fast_diagnostic_full_add_ratio": case_float(structure_debug.get("actual_oracle_fast_diagnostic_full_add_ratio", 0.0), 0.0),
+        "actual_oracle_fast_diagnostic_local_add_ratio": case_float(structure_debug.get("actual_oracle_fast_diagnostic_local_add_ratio", 0.0), 0.0),
         "raw_learned_drop_ratio": case_float(structure_debug.get("raw_learned_drop_ratio", float("nan")), float("nan")),
         "raw_learned_add_ratio": case_float(structure_debug.get("raw_learned_add_ratio", float("nan")), float("nan")),
         "raw_learned_move_ratio": case_float(structure_debug.get("raw_learned_move_ratio", float("nan")), float("nan")),

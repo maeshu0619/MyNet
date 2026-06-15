@@ -1030,6 +1030,8 @@ class OctreeStructureAnalysis(nn.Module):
             "actual_oracle_context_pattern_candidate_count",
             "actual_oracle_eval_count",
             "actual_oracle_eval_max",
+            "actual_oracle_fast_diagnostic_full_add_count",
+            "actual_oracle_fast_diagnostic_local_add_count",
         ):
             out[key] = int(source_tree.get(key, 0) or 0)
         for key in (
@@ -1040,6 +1042,8 @@ class OctreeStructureAnalysis(nn.Module):
             "actual_oracle_geometry_percent",
             "actual_oracle_original_actual_bits",
             "actual_oracle_edited_actual_bits",
+            "actual_oracle_fast_diagnostic_full_add_ratio",
+            "actual_oracle_fast_diagnostic_local_add_ratio",
         ):
             out[key] = float(source_tree.get(key, 0.0) or 0.0)
         out["actual_oracle_drop_reason"] = str(
