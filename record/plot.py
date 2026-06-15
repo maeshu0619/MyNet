@@ -2,7 +2,8 @@
 loss: 全損失
 geom: 幾何損失
 compression: Surrogateが予測したtotal-bit差百分率
-actual_compression: 実codecで測ったtotal-bit差百分率
+	actual_compression: 実codecで測ったtotal-bit差百分率
+	actual_compression_ratio: 実codecで測った100*Mine/GT百分率
 attr: 原因分解損失
 policy: 修復ポリシー損失
 single: single-child 指標の変化率
@@ -49,7 +50,7 @@ class PlotMaker():
         else:
             log_root = os.path.abspath(os.path.expanduser(str(log_root)))
         self.save_dir = os.path.join(log_root, self.args.date, f"MyNetwork_train/{args.compress}")
-        self.num_loss = 15 # 実圧縮percent列を追加したmetric総数
+        self.num_loss = 16 # 実圧縮percent列とratio列を追加したmetric総数
         self.x_len = 10
         self.y_len = 4
         self.step_loss_his = [[] for _ in range(self.num_loss)]
@@ -196,7 +197,8 @@ class PlotMaker():
             "_repair",
             "_sur_train",
             "_sur_bit_err",
-            "_sur_mean_err"
+            "_sur_mean_err",
+            "_actual_ratio",
         ]
         self.title = [
             "Loss", 
@@ -213,7 +215,8 @@ class PlotMaker():
             "Loss of Structure Repair Actuator",
             "Surrogate Teacher Fit Loss (SmoothL1)",
             "Surrogate Bit Prediction Error (%)",
-            "Surrogate Mean Prediction Error (bit/node/single/bpn, %)"
+            "Surrogate Mean Prediction Error (bit/node/single/bpn, %)",
+            "Actual Codec Ratio (100*Mine/GT)",
         ]
         self.metric_keys = [
             "loss",
@@ -231,6 +234,7 @@ class PlotMaker():
             "surrogate_train",
             "surrogate_bit_error",
             "surrogate_mean_error",
+            "actual_compression_ratio",
         ]
         self.latest_episode_loss = None
         self.step_plot_skipped = 0
@@ -852,9 +856,11 @@ class PlotMaker():
         key_to_index = {key: index for index, key in enumerate(self.metric_keys)}
         surrogate_idx = key_to_index.get("compression")
         actual_idx = key_to_index.get("actual_compression")
+        ratio_idx = key_to_index.get("actual_compression_ratio")
         if surrogate_idx is None or actual_idx is None:
             return
         plotted = False
+        handles = []
         series = [
             ("Surrogate", loss_history[surrogate_idx], "tab:blue"),
             ("Actual", loss_history[actual_idx], "tab:orange"),
@@ -863,22 +869,46 @@ class PlotMaker():
             plot_values = self._plot_values(values)
             plot_x, plot_values = self._downsample_series(list(x_history), plot_values)
             if any(math.isfinite(value) for value in plot_values):
-                ax.plot(plot_x, plot_values, marker="o", linewidth=2, markersize=3, color=color, label=label)
+                line, = ax.plot(plot_x, plot_values, marker="o", linewidth=2, markersize=3, color=color, label=label)
+                handles.append(line)
+                plotted = True
+        ratio_ax = None
+        if ratio_idx is not None and ratio_idx < len(loss_history):
+            ratio_values = self._plot_values(loss_history[ratio_idx])
+            ratio_x, ratio_values = self._downsample_series(list(x_history), ratio_values)
+            if any(math.isfinite(value) for value in ratio_values):
+                ratio_ax = ax.twinx()
+                line, = ratio_ax.plot(
+                    ratio_x,
+                    ratio_values,
+                    marker="o",
+                    linewidth=2,
+                    markersize=3,
+                    color="tab:green",
+                    label="Actual Ratio",
+                )
+                ratio_ax.axhline(100.0, color="tab:green", linewidth=0.7, alpha=0.35)
+                ratio_ax.set_ylabel("Ratio [%]")
+                handles.append(line)
                 plotted = True
         if not plotted:
             ax.text(0.5, 0.5, "no compression data", ha="center", va="center", transform=ax.transAxes, alpha=0.7)
         ax.axhline(0.0, color="black", linewidth=0.7, alpha=0.4)
         ax.set_xlabel(xl)
         ax.set_ylabel("Delta [%]")
-        ax.set_title("Surrogate vs Actual Compression Delta")
-        if plotted:
-            ax.legend(loc="best")
+        ax.set_title("Surrogate/Actual Delta and Actual Ratio")
+        if handles:
+            ax.legend(handles=handles, loc="best")
         ax.grid(True, alpha=0.35)
         if len(x_history) >= 2:
             ax.set_xlim(min(x_history), max(x_history))
+            if ratio_ax is not None:
+                ratio_ax.set_xlim(min(x_history), max(x_history))
             try:
                 from matplotlib.ticker import MaxNLocator
                 ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+                if ratio_ax is not None:
+                    ratio_ax.xaxis.set_major_locator(MaxNLocator(integer=True))
             except Exception:
                 pass
 

@@ -222,6 +222,38 @@ def actual_compression_plot_metric(loss_obj, device):
     return metric_tensor(actual_value, device) # plot/CSVに渡せるscalar tensorへ正規化する
 
 
+def actual_compression_ratio_plot_metric(loss_obj, device):
+    comp_debug = getattr(loss_obj, "last_compression_debug", {}) or {}
+    if "surrogate_teacher_is_actual" in comp_debug and not bool(comp_debug.get("surrogate_teacher_is_actual", False)):
+        return None
+
+    gt_bits = comp_debug.get("gt_actual_bit", comp_debug.get("gt_bit_abs", None))
+    gen_bits = comp_debug.get(
+        "gen_total_bit_with_edit_record",
+        comp_debug.get("gen_actual_bit", comp_debug.get("actual_total_bits", None)),
+    )
+    try:
+        gt_bits = float(gt_bits)
+        gen_bits = float(gen_bits)
+    except (TypeError, ValueError):
+        gt_bits = float("nan")
+        gen_bits = float("nan")
+
+    if math.isfinite(gt_bits) and gt_bits > 0.0 and math.isfinite(gen_bits):
+        return metric_tensor(100.0 * gen_bits / gt_bits, device)
+
+    actual_value = comp_debug.get("actual_total_bit_percent", None)
+    if actual_value is None:
+        return None
+    try:
+        actual_value = float(actual_value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(actual_value):
+        return None
+    return metric_tensor(100.0 + actual_value, device)
+
+
 def surrogate_compression_plot_metric(loss_obj, fallback_value, device):
     comp_debug = getattr(loss_obj, "last_compression_debug", {}) or {} # 直近Stepの圧縮debug辞書を取り出す
     surrogate_value = comp_debug.get("surrogate_pred_bit", comp_debug.get("rate_proxy_delta", None)) # Surrogateが予測した(Mine-GT)*100/GTを取り出す

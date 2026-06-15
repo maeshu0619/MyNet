@@ -715,6 +715,293 @@ def _sparsepcgc_objective_percent_with_edit_record(args, raw_bit, base_bit, edit
     return float(raw_percent), float(billed_percent)
 
 
+def _sparsepcgc_codec_proxy_neighbor_count(coords_n3):
+    if coords_n3 is None or coords_n3.numel() <= 0:
+        return torch.zeros((0,), device=coords_n3.device if torch.is_tensor(coords_n3) else "cpu", dtype=torch.long)
+    offsets = torch.tensor(
+        [
+            (dx, dy, dz)
+            for dx in (-1, 0, 1)
+            for dy in (-1, 0, 1)
+            for dz in (-1, 0, 1)
+            if not (dx == 0 and dy == 0 and dz == 0)
+        ],
+        device=coords_n3.device,
+        dtype=torch.long,
+    )
+    query = (coords_n3[:, None, :] + offsets.view(1, -1, 3)).reshape(-1, 3)
+    combined = torch.cat([coords_n3, query], dim=0)
+    mins = combined.amin(dim=0)
+    span = (combined.amax(dim=0) - mins + 1).clamp_min(1)
+
+    def _keys(values):
+        shifted = values - mins
+        return shifted[:, 0] * span[1] * span[2] + shifted[:, 1] * span[2] + shifted[:, 2]
+
+    occupied_keys = torch.unique(_keys(coords_n3), sorted=True)
+    query_keys = _keys(query)
+    pos = torch.searchsorted(occupied_keys, query_keys)
+    in_bounds = pos < occupied_keys.numel()
+    safe_pos = pos.clamp(max=max(int(occupied_keys.numel()) - 1, 0))
+    found = in_bounds & (occupied_keys[safe_pos] == query_keys)
+    return found.view(coords_n3.shape[0], -1).sum(dim=1).to(dtype=torch.long)
+
+
+def _sparsepcgc_axis_neighbor_count(coords_n3):
+    if coords_n3 is None or coords_n3.numel() <= 0:
+        return torch.zeros((0,), device=coords_n3.device if torch.is_tensor(coords_n3) else "cpu", dtype=torch.long)
+    offsets = torch.tensor(
+        [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)],
+        device=coords_n3.device,
+        dtype=torch.long,
+    )
+    query = (coords_n3[:, None, :] + offsets.view(1, -1, 3)).reshape(-1, 3)
+    combined = torch.cat([coords_n3, query], dim=0)
+    mins = combined.amin(dim=0)
+    span = (combined.amax(dim=0) - mins + 1).clamp_min(1)
+
+    def _keys(values):
+        shifted = values - mins
+        return shifted[:, 0] * span[1] * span[2] + shifted[:, 1] * span[2] + shifted[:, 2]
+
+    occupied_keys = torch.unique(_keys(coords_n3), sorted=True)
+    query_keys = _keys(query)
+    pos = torch.searchsorted(occupied_keys, query_keys)
+    in_bounds = pos < occupied_keys.numel()
+    safe_pos = pos.clamp(max=max(int(occupied_keys.numel()) - 1, 0))
+    found = in_bounds & (occupied_keys[safe_pos] == query_keys)
+    return found.view(coords_n3.shape[0], -1).sum(dim=1).to(dtype=torch.long)
+
+
+def _sparsepcgc_codec_proxy_profile(unique_coords, args):
+    """
+    Lightweight codec-aware proxy used only for greedy teacher ranking.
+
+    SparsePCGC codes occupancy labels predicted from multiscale sparse-tensor
+    context, so this proxy estimates per-node occupancy NLL from local context
+    buckets instead of global 8-bit child-pattern frequency alone.  The actual
+    encoder remains the final accept/reject gate.
+    """
+    if unique_coords is None or not torch.is_tensor(unique_coords) or unique_coords.numel() <= 0:
+        device = unique_coords.device if torch.is_tensor(unique_coords) else torch.device("cpu")
+        return {
+            "enabled": False,
+            "reason": "empty",
+            "base_proxy_bits": 0.0,
+            "leaf_occupied_bits": torch.zeros((0,), device=device, dtype=torch.float32),
+            "leaf_occ_prob": torch.zeros((0,), device=device, dtype=torch.float32),
+            "leaf_add_delta_bits": None,
+            "leaf_empty_rate": None,
+            "leaf_occupied_rate": None,
+            "low_prob_occupied_count": 0,
+            "high_rate_mppov_count": 0,
+            "single_child_chain_count": 0,
+            "context_pattern_candidate_count": 0,
+        }
+
+    coords = torch.unique(unique_coords.detach().to(dtype=torch.long), dim=0, sorted=True)
+    device = coords.device
+    smoothing = max(float(getattr(args, "sparsepcgc_codec_proxy_smoothing", 1.0)), 1e-6)
+    low_prob_threshold = min(
+        max(float(getattr(args, "sparsepcgc_proxy_low_prob_threshold", 0.15)), 1e-6),
+        1.0 - 1e-6,
+    )
+    high_rate_threshold = max(float(getattr(args, "sparsepcgc_proxy_high_rate_bit_threshold", 2.0)), 0.0)
+    max_levels = max(int(getattr(args, "sparsepcgc_codec_proxy_max_levels", 16)), 1)
+
+    total_bits = 0.0
+    single_child_chain_count = 0
+    context_pattern_candidate_count = 0
+    leaf_occupied_bits = torch.zeros((coords.shape[0],), device=device, dtype=torch.float32)
+    leaf_occ_prob = torch.ones((coords.shape[0],), device=device, dtype=torch.float32)
+    leaf_empty_rate = None
+    leaf_occupied_rate = None
+    leaf_add_delta_bits = None
+
+    current = coords
+    eps = 1e-12
+    for level in range(max_levels):
+        if current.numel() <= 0 or int(current.shape[0]) <= 1:
+            break
+        parent_coords = torch.div(current, 2, rounding_mode="floor")
+        unique_parents, parent_inverse = torch.unique(
+            parent_coords,
+            dim=0,
+            sorted=True,
+            return_inverse=True,
+        )
+        parent_count = int(unique_parents.shape[0])
+        if parent_count <= 0:
+            break
+        child_slot = (
+            (current[:, 0] & 1)
+            + 2 * (current[:, 1] & 1)
+            + 4 * (current[:, 2] & 1)
+        ).to(dtype=torch.long)
+        occupancy = torch.zeros((parent_count, 8), device=device, dtype=torch.bool)
+        occupancy[parent_inverse, child_slot] = True
+        child_count = occupancy.sum(dim=1).to(dtype=torch.long)
+        single_child_chain_count += int((child_count == 1).sum().detach().cpu())
+        context_pattern_candidate_count += int(parent_count)
+
+        parent_slot = (
+            (unique_parents[:, 0] & 1)
+            + 2 * (unique_parents[:, 1] & 1)
+            + 4 * (unique_parents[:, 2] & 1)
+        ).to(dtype=torch.long)
+        neighbor_count = _sparsepcgc_codec_proxy_neighbor_count(unique_parents)
+        neighbor_bucket = neighbor_count.clamp(0, 6)
+        child_bucket = child_count.clamp(0, 8)
+        context_id = (
+            int(level) * 4096
+            + parent_slot * 256
+            + neighbor_bucket * 32
+            + child_bucket
+        ).to(dtype=torch.long)
+
+        context_stats = {}
+        occupancy_cpu = occupancy.detach().cpu()
+        for parent_idx, ctx_value in enumerate(context_id.detach().cpu().tolist()):
+            item = context_stats.get(int(ctx_value))
+            if item is None:
+                item = {"total": 0, "occ": [0] * 8}
+                context_stats[int(ctx_value)] = item
+            item["total"] += 1
+            row = occupancy_cpu[parent_idx]
+            for slot in range(8):
+                if bool(row[slot]):
+                    item["occ"][slot] += 1
+
+        parent_slot_prob = torch.empty((parent_count, 8), device=device, dtype=torch.float32)
+        for parent_idx, ctx_value in enumerate(context_id.detach().cpu().tolist()):
+            item = context_stats[int(ctx_value)]
+            denom = float(item["total"]) + 2.0 * smoothing
+            probs = [
+                min(max((float(item["occ"][slot]) + smoothing) / denom, eps), 1.0 - eps)
+                for slot in range(8)
+            ]
+            parent_slot_prob[parent_idx] = torch.tensor(probs, device=device, dtype=torch.float32)
+
+        occupied_rate = -torch.log2(parent_slot_prob.clamp_min(eps))
+        empty_rate = -torch.log2((1.0 - parent_slot_prob).clamp_min(eps))
+        level_rate = torch.where(occupancy, occupied_rate, empty_rate).sum()
+        total_bits += float(level_rate.detach().cpu())
+
+        if level == 0:
+            leaf_occupied_bits = occupied_rate[parent_inverse, child_slot].detach().clone()
+            leaf_occ_prob = parent_slot_prob[parent_inverse, child_slot].detach().clone()
+            leaf_empty_rate = empty_rate.detach().clone()
+            leaf_occupied_rate = occupied_rate.detach().clone()
+            leaf_add_delta_bits = (occupied_rate - empty_rate).detach().clone()
+
+        current = unique_parents
+
+    low_prob_occupied_count = int((leaf_occ_prob < float(low_prob_threshold)).sum().detach().cpu())
+    high_rate_mppov_count = int((leaf_occupied_bits > float(high_rate_threshold)).sum().detach().cpu())
+    return {
+        "enabled": True,
+        "reason": "ok",
+        "base_proxy_bits": float(total_bits),
+        "leaf_occupied_bits": leaf_occupied_bits,
+        "leaf_occ_prob": leaf_occ_prob,
+        "leaf_add_delta_bits": leaf_add_delta_bits,
+        "leaf_empty_rate": leaf_empty_rate,
+        "leaf_occupied_rate": leaf_occupied_rate,
+        "low_prob_occupied_count": int(low_prob_occupied_count),
+        "high_rate_mppov_count": int(high_rate_mppov_count),
+        "single_child_chain_count": int(single_child_chain_count),
+        "context_pattern_candidate_count": int(context_pattern_candidate_count),
+    }
+
+
+def _sparsepcgc_codec_proxy_bits(unique_coords, args):
+    return float(_sparsepcgc_codec_proxy_profile(unique_coords, args).get("base_proxy_bits", 0.0))
+
+
+def _sparsepcgc_proxy_delta_percent(candidate_coords, args, base_proxy_bits):
+    base_proxy_bits = max(abs(float(base_proxy_bits)), 1.0)
+    cand_bits = _sparsepcgc_codec_proxy_bits(candidate_coords, args)
+    return float(cand_bits), float(100.0 * (cand_bits - base_proxy_bits) / base_proxy_bits)
+
+
+def _sparsepcgc_coord_key_set(coords_n3):
+    if coords_n3 is None or not torch.is_tensor(coords_n3) or coords_n3.numel() <= 0:
+        return set()
+    coords_cpu = torch.unique(coords_n3.detach().to(dtype=torch.long), dim=0, sorted=True).cpu()
+    return {tuple(int(v) for v in row) for row in coords_cpu.tolist()}
+
+
+def _sparsepcgc_coords_to_n3(coords):
+    if coords is None or not torch.is_tensor(coords) or coords.numel() <= 0:
+        return None
+    if coords.ndim == 3 and coords.shape[1] == 3:
+        return coords[0].transpose(0, 1).contiguous()
+    if coords.ndim == 3 and coords.shape[-1] == 3:
+        return coords[0].contiguous()
+    if coords.ndim == 2 and coords.shape[0] == 3:
+        return coords.transpose(0, 1).contiguous()
+    if coords.ndim == 2 and coords.shape[-1] == 3:
+        return coords.contiguous()
+    return None
+
+
+def _sparsepcgc_fast_diag_global_drop_set(full_coords_b3n, args):
+    if (
+        full_coords_b3n is None
+        or not torch.is_tensor(full_coords_b3n)
+        or full_coords_b3n.numel() <= 0
+    ):
+        return set(), {"available": False, "reason": "coords_missing"}
+    full_coords = _sparsepcgc_coords_to_n3(full_coords_b3n)
+    if full_coords is None:
+        return set(), {"available": False, "reason": f"invalid_shape={tuple(full_coords_b3n.shape)}"}
+    full_coords = torch.unique(full_coords.detach().to(dtype=torch.long), dim=0, sorted=True)
+    if int(full_coords.shape[0]) <= 8:
+        return set(), {"available": False, "reason": "too_few_voxels", "full_count": int(full_coords.shape[0])}
+
+    threshold = max(int(getattr(args, "sparsepcgc_fast_diagnostic_neighbor_threshold", 3)), 1)
+    axis_neigh = _sparsepcgc_axis_neighbor_count(full_coords).to(device=full_coords.device, dtype=torch.long)
+    drop_coords = full_coords[axis_neigh < int(threshold)]
+    drop_set = _sparsepcgc_coord_key_set(drop_coords)
+    return drop_set, {
+        "available": True,
+        "reason": "ok",
+        "threshold": int(threshold),
+        "full_count": int(full_coords.shape[0]),
+        "global_drop_count": int(len(drop_set)),
+        "global_drop_ratio": float(len(drop_set)) / max(float(full_coords.shape[0]), 1.0),
+    }
+
+
+def _sparsepcgc_fast_diag_local_count(coords_n3, global_drop_set):
+    if not global_drop_set or coords_n3 is None or not torch.is_tensor(coords_n3) or coords_n3.numel() <= 0:
+        return 0, 0.0
+    coords_set = _sparsepcgc_coord_key_set(coords_n3)
+    if not coords_set:
+        return 0, 0.0
+    local_count = sum(1 for key in coords_set if key in global_drop_set)
+    return int(local_count), float(local_count) / max(float(len(coords_set)), 1.0)
+
+
+def _sparsepcgc_geometry_penalty_percent(
+    args,
+    unique_count,
+    *,
+    drop_count=0,
+    add_count=0,
+    move_count=0,
+    level_shift=1,
+):
+    lambda_geom = max(float(getattr(args, "sparsepcgc_actual_oracle_geometry_lambda", 0.05)), 0.0)
+    if lambda_geom <= 0.0:
+        return 0.0
+    unique_count = max(int(unique_count), 1)
+    edit_mass = float(max(int(drop_count), 0) + max(int(add_count), 0))
+    if int(move_count) > 0:
+        edit_mass += float(max(int(move_count), 0)) * math.sqrt(max(float(level_shift), 1.0))
+    return float(lambda_geom * 100.0 * edit_mass / float(unique_count))
+
+
 def _sparsepcgc_subtree_leaf_pattern_potential(coords_n3, args):
     """
     Cheap pre-oracle score for choosing a train Subtree.
@@ -789,12 +1076,39 @@ def _sparsepcgc_subtree_leaf_pattern_potential(coords_n3, args):
         if add_values.numel() > 0:
             add_score = float(torch.topk(add_values, k=min(topk, int(add_values.numel()))).values.sum().detach().cpu())
 
+    neigh = _sparsepcgc_codec_proxy_neighbor_count(unique_coords).to(device=device, dtype=torch.float32)
+    density_score = neigh + parent_child_count * 0.5
+    macro_ratio = min(
+        max(float(getattr(args, "sparsepcgc_subtree_potential_macro_ratio", 0.20)), 0.0),
+        0.80,
+    )
+    macro_drop_n = min(max(int(math.ceil(float(unique_count) * macro_ratio)), 1), unique_count - 1)
+    density_order = torch.argsort(density_score, descending=False)
+    low_density_idx = density_order[:macro_drop_n]
+    density_mean = density_score.mean()
+    low_density_mean = density_score.index_select(0, low_density_idx).mean()
+    macro_density_score = float(
+        torch.relu(density_mean - low_density_mean).detach().cpu()
+    ) * math.sqrt(float(macro_drop_n))
+    try:
+        proxy_bits = float(_sparsepcgc_codec_proxy_bits(unique_coords, args))
+    except Exception:
+        proxy_bits = 0.0
+    proxy_rate_score = proxy_bits / math.sqrt(max(float(unique_count), 1.0))
+
     drop_weight = max(float(getattr(args, "sparsepcgc_subtree_potential_drop_weight", 1.0)), 0.0)
     add_weight = max(float(getattr(args, "sparsepcgc_subtree_potential_add_weight", 1.0)), 0.0)
+    macro_weight = max(float(getattr(args, "sparsepcgc_subtree_potential_macro_weight", 1.0)), 0.0)
+    proxy_rate_weight = max(float(getattr(args, "sparsepcgc_subtree_potential_proxy_rate_weight", 0.02)), 0.0)
     size_weight = max(float(getattr(args, "sparsepcgc_subtree_potential_size_weight", 0.02)), 0.0)
     efficiency_weight = max(float(getattr(args, "sparsepcgc_subtree_potential_efficiency_weight", 2.0)), 0.0)
     small_tree_weight = max(float(getattr(args, "sparsepcgc_subtree_potential_small_tree_weight", 0.25)), 0.0)
-    base_score = drop_weight * drop_score + add_weight * add_score
+    base_score = (
+        drop_weight * drop_score
+        + add_weight * add_score
+        + macro_weight * macro_density_score
+        + proxy_rate_weight * proxy_rate_score
+    )
     edit_efficiency = base_score / math.sqrt(max(float(unique_count), 1.0))
     small_tree_score = 1.0 / math.sqrt(max(float(unique_count), 1.0))
     score = (
@@ -809,6 +1123,9 @@ def _sparsepcgc_subtree_leaf_pattern_potential(coords_n3, args):
         "parents": parent_count,
         "drop_score": float(drop_score),
         "add_score": float(add_score),
+        "macro_density_score": float(macro_density_score),
+        "proxy_rate_score": float(proxy_rate_score),
+        "proxy_bits": float(proxy_bits),
         "edit_efficiency": float(edit_efficiency),
     }
 
@@ -836,6 +1153,9 @@ def _select_sparsepcgc_potential_subtree_key(
         full_coords = full_cloud_canonical_context.get("global_voxel_coords", None)
     if not torch.is_tensor(full_coords) or full_coords.ndim != 3 or full_coords.shape[1] != 3:
         return None, {"enabled": True, "reason": "coords_missing"}
+    fast_diag_drop_set, fast_diag_global = _sparsepcgc_fast_diag_global_drop_set(full_coords, args)
+    fast_diag_weight = max(float(getattr(args, "sparsepcgc_subtree_potential_fast_diag_weight", 50.0)), 0.0)
+    fast_diag_min_count = max(int(getattr(args, "sparsepcgc_subtree_potential_fast_diag_min_count", 1)), 0)
 
     group_by_key = {int(key): point_idx for key, point_idx in candidate_groups}
     pool_keys = [int(key) for key in candidate_subtree_keys.detach().cpu().tolist()]
@@ -863,6 +1183,19 @@ def _select_sparsepcgc_potential_subtree_key(
                 continue
             coords_n3 = full_coords[0].index_select(1, idx).transpose(0, 1).contiguous()
             score, detail = _sparsepcgc_subtree_leaf_pattern_potential(coords_n3, args)
+            fast_local_count, fast_local_ratio = _sparsepcgc_fast_diag_local_count(coords_n3, fast_diag_drop_set)
+            if fast_local_count >= fast_diag_min_count and fast_diag_weight > 0.0:
+                fast_score = fast_diag_weight * float(fast_local_count) / math.sqrt(max(float(coords_n3.shape[0]), 1.0))
+                score += float(fast_score)
+            else:
+                fast_score = 0.0
+            if isinstance(detail, dict):
+                detail = dict(detail)
+                detail["fast_diag_local_count"] = int(fast_local_count)
+                detail["fast_diag_local_ratio"] = float(fast_local_ratio)
+                detail["fast_diag_score"] = float(fast_score)
+                detail["fast_diag_global_drop_count"] = int(fast_diag_global.get("global_drop_count", 0) or 0)
+                detail["fast_diag_global_drop_ratio"] = float(fast_diag_global.get("global_drop_ratio", 0.0) or 0.0)
             scored.append((float(score), int(key), detail))
 
     if not scored:
@@ -877,6 +1210,8 @@ def _select_sparsepcgc_potential_subtree_key(
         chosen_rank = seed_value % len(scored)
     else:
         topk = min(max(int(getattr(args, "sparsepcgc_subtree_potential_topk", 4)), 1), len(scored))
+        if isinstance(scored[0][2], dict) and int(scored[0][2].get("fast_diag_local_count", 0) or 0) > 0:
+            topk = 1
         chosen_rank = seed_value % topk
 
     chosen_score, chosen_key, chosen_detail = scored[chosen_rank]
@@ -893,11 +1228,29 @@ def _select_sparsepcgc_potential_subtree_key(
         "random": bool(use_random),
         "drop_score": float(chosen_detail.get("drop_score", 0.0)) if isinstance(chosen_detail, dict) else 0.0,
         "add_score": float(chosen_detail.get("add_score", 0.0)) if isinstance(chosen_detail, dict) else 0.0,
+        "macro_density_score": (
+            float(chosen_detail.get("macro_density_score", 0.0)) if isinstance(chosen_detail, dict) else 0.0
+        ),
+        "proxy_rate_score": (
+            float(chosen_detail.get("proxy_rate_score", 0.0)) if isinstance(chosen_detail, dict) else 0.0
+        ),
+        "proxy_bits": float(chosen_detail.get("proxy_bits", 0.0)) if isinstance(chosen_detail, dict) else 0.0,
+        "fast_diag_local_count": (
+            int(chosen_detail.get("fast_diag_local_count", 0) or 0) if isinstance(chosen_detail, dict) else 0
+        ),
+        "fast_diag_local_ratio": (
+            float(chosen_detail.get("fast_diag_local_ratio", 0.0) or 0.0) if isinstance(chosen_detail, dict) else 0.0
+        ),
+        "fast_diag_score": (
+            float(chosen_detail.get("fast_diag_score", 0.0) or 0.0) if isinstance(chosen_detail, dict) else 0.0
+        ),
+        "fast_diag_global_drop_count": int(fast_diag_global.get("global_drop_count", 0) or 0),
+        "fast_diag_global_drop_ratio": float(fast_diag_global.get("global_drop_ratio", 0.0) or 0.0),
     }
     return selected, meta
 
 
-def _sparsepcgc_actual_oracle_candidate_indices(coords_n3, args, global_step, max_candidates):
+def _sparsepcgc_actual_oracle_candidate_indices(coords_n3, args, global_step, max_candidates, proxy_profile=None):
     if coords_n3.numel() <= 0 or int(max_candidates) <= 0:
         return [], None, None
 
@@ -950,6 +1303,14 @@ def _sparsepcgc_actual_oracle_candidate_indices(coords_n3, args, global_step, ma
     delete_code = torch.bitwise_and(current_code, torch.bitwise_not(bit_current)).clamp(0, 255)
     delete_gain = code_nll.index_select(0, current_code) - code_nll.index_select(0, delete_code)
     parent_nll = code_nll.index_select(0, current_code)
+    if not isinstance(proxy_profile, dict) or not bool(proxy_profile.get("enabled", False)):
+        proxy_profile = _sparsepcgc_codec_proxy_profile(unique_coords, args)
+    proxy_weight = max(float(getattr(args, "sparsepcgc_codec_proxy_weight", 2.0)), 0.0)
+    leaf_occupied_bits = proxy_profile.get("leaf_occupied_bits", None)
+    if torch.is_tensor(leaf_occupied_bits) and leaf_occupied_bits.numel() == unique_count:
+        proxy_drop_gain = leaf_occupied_bits.to(device=delete_gain.device, dtype=delete_gain.dtype)
+    else:
+        proxy_drop_gain = torch.zeros_like(delete_gain)
 
     selected = []
     seen = set()
@@ -999,13 +1360,18 @@ def _sparsepcgc_actual_oracle_candidate_indices(coords_n3, args, global_step, ma
                     "unique_idx": idx,
                     "memory_key": key,
                     "memory_seen": bool(seen_memory),
-                    "score_hint": float(delete_gain[idx].detach().cpu()),
+                    "score_hint": float(scored_gain[idx].detach().cpu()),
+                    "proxy_delta_bits_hint": float(-proxy_drop_gain[idx].detach().cpu()),
                 }
             )
             if len(selected) >= int(max_candidates):
                 break
 
-    scored_gain = delete_gain + float(memory_weight) * memory_bonus.to(device=delete_gain.device, dtype=delete_gain.dtype)
+    scored_gain = (
+        delete_gain
+        + float(proxy_weight) * proxy_drop_gain
+        + float(memory_weight) * memory_bonus.to(device=delete_gain.device, dtype=delete_gain.dtype)
+    )
     valid_gain = scored_gain.index_select(0, order_valid)
     desc_order = order_valid.index_select(0, torch.argsort(valid_gain, descending=True))
     asc_order = order_valid.index_select(0, torch.argsort(valid_gain, descending=False))
@@ -1050,7 +1416,7 @@ def _sparsepcgc_actual_oracle_candidate_indices(coords_n3, args, global_step, ma
     return selected[: int(max_candidates)], unique_coords, inverse
 
 
-def _sparsepcgc_actual_oracle_add_candidates(unique_coords, args, global_step, max_candidates):
+def _sparsepcgc_actual_oracle_add_candidates(unique_coords, args, global_step, max_candidates, proxy_profile=None):
     if unique_coords is None or unique_coords.numel() <= 0 or int(max_candidates) <= 0:
         return []
 
@@ -1094,6 +1460,17 @@ def _sparsepcgc_actual_oracle_add_candidates(unique_coords, args, global_step, m
     add_code = torch.bitwise_or(current_code, add_bit).clamp(0, 255)
     add_gain = code_nll.index_select(0, current_code) - code_nll.index_select(0, add_code)
     parent_nll = code_nll.index_select(0, current_code)
+    if not isinstance(proxy_profile, dict) or not bool(proxy_profile.get("enabled", False)):
+        proxy_profile = _sparsepcgc_codec_proxy_profile(unique_coords, args)
+    proxy_weight = max(float(getattr(args, "sparsepcgc_codec_proxy_weight", 2.0)), 0.0)
+    leaf_add_delta_bits = proxy_profile.get("leaf_add_delta_bits", None)
+    if torch.is_tensor(leaf_add_delta_bits) and leaf_add_delta_bits.ndim == 2:
+        proxy_add_gain = -leaf_add_delta_bits.to(device=add_gain.device, dtype=add_gain.dtype)[
+            empty_parent_idx,
+            empty_slot,
+        ]
+    else:
+        proxy_add_gain = torch.zeros_like(add_gain)
     memory_weight = max(float(getattr(args, "sparsepcgc_actual_oracle_memory_weight", 0.75)), 0.0)
     memory_bonus = torch.zeros_like(add_gain, dtype=torch.float32)
     memory_bad = torch.zeros_like(add_gain, dtype=torch.bool)
@@ -1148,7 +1525,8 @@ def _sparsepcgc_actual_oracle_add_candidates(unique_coords, args, global_step, m
                     "source_unique_idx": source_unique_idx,
                     "target_child_slot": target_slot,
                     "target_coord": target_coord.detach().clone(),
-                    "score_hint": float(add_gain[flat_idx].detach().cpu()),
+                    "score_hint": float(scored_add_gain[flat_idx].detach().cpu()),
+                    "proxy_delta_bits_hint": float((-proxy_add_gain[flat_idx]).detach().cpu()),
                     "memory_key": memory_key,
                     "memory_seen": bool(seen_memory),
                 }
@@ -1160,7 +1538,11 @@ def _sparsepcgc_actual_oracle_add_candidates(unique_coords, args, global_step, m
     filtered_flat_idx = flat_idx[~memory_bad]
     if filtered_flat_idx.numel() <= 0:
         filtered_flat_idx = flat_idx
-    scored_add_gain = add_gain + float(memory_weight) * memory_bonus.to(device=add_gain.device, dtype=add_gain.dtype)
+    scored_add_gain = (
+        add_gain
+        + float(proxy_weight) * proxy_add_gain
+        + float(memory_weight) * memory_bonus.to(device=add_gain.device, dtype=add_gain.dtype)
+    )
     gain_order = filtered_flat_idx.index_select(
         0,
         torch.argsort(scored_add_gain.index_select(0, filtered_flat_idx), descending=True),
@@ -1193,7 +1575,318 @@ def _sparsepcgc_actual_oracle_add_candidates(unique_coords, args, global_step, m
     return selected[: int(max_candidates)]
 
 
-def _sparsepcgc_actual_oracle_subtree_move_candidates(unique_coords, args, global_step, max_candidates):
+def _sparsepcgc_parse_float_list(raw_value, default_values):
+    if isinstance(raw_value, str):
+        values = []
+        for item in raw_value.replace(";", ",").split(","):
+            item = item.strip()
+            if not item:
+                continue
+            try:
+                values.append(float(item))
+            except ValueError:
+                continue
+        return values or list(default_values)
+    if isinstance(raw_value, (list, tuple)):
+        values = []
+        for item in raw_value:
+            try:
+                values.append(float(item))
+            except (TypeError, ValueError):
+                continue
+        return values or list(default_values)
+    return list(default_values)
+
+
+def _sparsepcgc_actual_oracle_macro_prune_candidates(
+    unique_coords,
+    args,
+    max_candidates,
+    proxy_profile=None,
+    base_proxy_bits=None,
+):
+    if unique_coords is None or unique_coords.numel() <= 0 or int(max_candidates) <= 0:
+        return []
+    unique_coords = torch.unique(unique_coords.to(dtype=torch.long), dim=0, sorted=True)
+    unique_count = int(unique_coords.shape[0])
+    if unique_count <= 8:
+        return []
+
+    ratios = _sparsepcgc_parse_float_list(
+        getattr(args, "sparsepcgc_actual_oracle_macro_prune_ratios", "0.05,0.10,0.15,0.20"),
+        [0.05, 0.10, 0.15, 0.20],
+    )
+    max_ratio = min(
+        max(float(getattr(args, "sparsepcgc_actual_oracle_macro_prune_max_ratio", 0.20)), 0.0),
+        0.95,
+    )
+    ratios = sorted({min(max(float(ratio), 0.0), max_ratio) for ratio in ratios if float(ratio) > 0.0})
+    if not ratios:
+        return []
+
+    min_voxels = max(int(getattr(args, "sparsepcgc_actual_oracle_macro_prune_min_voxels", 8)), 1)
+    max_voxels = max(int(getattr(args, "sparsepcgc_actual_oracle_macro_prune_max_voxels", 512)), min_voxels)
+    neigh = _sparsepcgc_codec_proxy_neighbor_count(unique_coords).to(device=unique_coords.device, dtype=torch.float32)
+    parent = torch.div(unique_coords, 2, rounding_mode="floor")
+    _unique_parent, parent_inverse = torch.unique(parent, dim=0, sorted=True, return_inverse=True)
+    parent_pop = torch.bincount(parent_inverse, minlength=int(_unique_parent.shape[0])).to(
+        device=unique_coords.device,
+        dtype=torch.float32,
+    )
+    parent_pop_leaf = parent_pop.index_select(0, parent_inverse)
+    if proxy_profile is not None and torch.is_tensor(proxy_profile.get("leaf_occupied_bits", None)):
+        leaf_bits = proxy_profile["leaf_occupied_bits"].to(device=unique_coords.device, dtype=torch.float32)
+        if leaf_bits.numel() != unique_count:
+            leaf_bits = torch.zeros((unique_count,), device=unique_coords.device, dtype=torch.float32)
+    else:
+        leaf_bits = torch.zeros((unique_count,), device=unique_coords.device, dtype=torch.float32)
+    leaf_bits_norm = leaf_bits / leaf_bits.detach().mean().clamp_min(1e-6)
+
+    # Probe結果では「低密度voxelをまとまった割合で落とす」候補がactual bitを安定して下げた。
+    # codec priority候補とは別に、単純な密度rank候補を必ずactual検証へ入れる。
+    density_score = neigh + parent_pop_leaf * 0.5
+    density_order = torch.argsort(density_score, descending=False)
+
+    # High priority means cheap geometry removal and expensive occupancy coding:
+    # isolated leaves, small parent populations, and high context NLL.
+    codec_drop_priority = (
+        (3.0 - neigh).clamp_min(0.0) * 1.50
+        + (3.0 - parent_pop_leaf).clamp_min(0.0) * 0.75
+        + leaf_bits_norm.clamp_min(0.0)
+    )
+    codec_order = torch.argsort(codec_drop_priority, descending=True)
+    if base_proxy_bits is None:
+        base_proxy_bits = _sparsepcgc_codec_proxy_bits(unique_coords, args)
+
+    candidates = []
+    seen_masks = set()
+
+    def _append_candidate(ratio, drop_order, variant):
+        drop_count = int(math.ceil(float(unique_count) * float(ratio)))
+        drop_count = min(max(drop_count, min_voxels), max_voxels, unique_count - 1)
+        if drop_count <= 0:
+            return
+        drop_idx = drop_order[:drop_count].to(device=unique_coords.device, dtype=torch.long)
+        mask_key = tuple(sorted(int(v) for v in drop_idx.detach().cpu().tolist()))
+        if mask_key in seen_masks:
+            return
+        seen_masks.add(mask_key)
+        keep = torch.ones((unique_count,), device=unique_coords.device, dtype=torch.bool)
+        keep[drop_idx] = False
+        candidate_coords = torch.unique(unique_coords[keep], dim=0, sorted=True)
+        if int(candidate_coords.shape[0]) <= 0:
+            return
+        proxy_bits, proxy_percent = _sparsepcgc_proxy_delta_percent(
+            candidate_coords,
+            args,
+            base_proxy_bits,
+        )
+        if str(variant) == "density":
+            priority_gain = float((-density_score).index_select(0, drop_idx).mean().detach().cpu())
+            variant_bonus = 100.0
+        else:
+            priority_gain = float(codec_drop_priority.index_select(0, drop_idx).mean().detach().cpu())
+            variant_bonus = 0.0
+        score = (
+            variant_bonus
+            + 10.0 * float(drop_count) / max(float(unique_count), 1.0)
+            + priority_gain
+            - max(float(getattr(args, "sparsepcgc_codec_proxy_weight", 2.0)), 0.0) * float(proxy_percent)
+        )
+        candidates.append(
+            {
+                "op": "macro_prune",
+                "variant": str(variant),
+                "unique_indices": [int(v) for v in drop_idx.detach().cpu().tolist()],
+                "candidate_coords": candidate_coords.detach().clone(),
+                "drop_count": int(drop_count),
+                "drop_ratio": float(drop_count) / max(float(unique_count), 1.0),
+                "score": float(score),
+                "proxy_percent": float(proxy_percent),
+                "proxy_bits": float(proxy_bits),
+            }
+        )
+
+    for ratio in sorted(ratios, reverse=True):
+        _append_candidate(ratio, density_order, "density")
+    for ratio in sorted(ratios, reverse=True):
+        _append_candidate(ratio, codec_order, "codec")
+
+    candidates = sorted(candidates, key=lambda item: float(item.get("score", 0.0)), reverse=True)
+    return candidates[: int(max_candidates)]
+
+
+def _sparsepcgc_actual_oracle_full_cloud_macro_prune_candidates(full_coords, args, max_candidates):
+    if full_coords is None or not torch.is_tensor(full_coords) or full_coords.numel() <= 0 or int(max_candidates) <= 0:
+        return []
+    full_coords = torch.unique(full_coords.to(dtype=torch.long), dim=0, sorted=True)
+    full_count = int(full_coords.shape[0])
+    if full_count <= 8:
+        return []
+
+    ratios = _sparsepcgc_parse_float_list(
+        getattr(args, "sparsepcgc_actual_oracle_full_cloud_macro_prune_ratios", "0.02,0.05"),
+        [0.02, 0.05],
+    )
+    max_ratio = min(
+        max(float(getattr(args, "sparsepcgc_actual_oracle_full_cloud_macro_prune_max_ratio", 0.05)), 0.0),
+        0.50,
+    )
+    ratios = sorted({min(max(float(ratio), 0.0), max_ratio) for ratio in ratios if float(ratio) > 0.0}, reverse=True)
+    if not ratios:
+        return []
+
+    min_voxels = max(int(getattr(args, "sparsepcgc_actual_oracle_full_cloud_macro_prune_min_voxels", 128)), 1)
+    max_voxels = max(
+        int(getattr(args, "sparsepcgc_actual_oracle_full_cloud_macro_prune_max_voxels", 20000)),
+        min_voxels,
+    )
+    candidates = []
+    axis_neigh = _sparsepcgc_axis_neighbor_count(full_coords).to(device=full_coords.device, dtype=torch.long)
+    thresholds = _sparsepcgc_parse_float_list(
+        getattr(args, "sparsepcgc_actual_oracle_full_cloud_prune_neighbor_thresholds", "3"),
+        [3.0],
+    )
+    for threshold_raw in sorted({int(float(value)) for value in thresholds if int(float(value)) > 0}):
+        keep = axis_neigh >= int(threshold_raw)
+        drop_count = int((~keep).sum().detach().cpu())
+        if drop_count < min_voxels or drop_count > max_voxels or drop_count >= full_count:
+            continue
+        candidate_coords = torch.unique(full_coords[keep], dim=0, sorted=True)
+        if int(candidate_coords.shape[0]) <= 0:
+            continue
+        candidates.append(
+            {
+                "op": "full_cloud_neighbor_prune",
+                "variant": f"axis_neighbor_lt_{int(threshold_raw)}",
+                "candidate_coords": candidate_coords.detach().clone(),
+                "drop_coords": full_coords[~keep].detach().clone(),
+                "drop_count": int(drop_count),
+                "drop_ratio": float(drop_count) / max(float(full_count), 1.0),
+                "score": float(100.0 - int(threshold_raw)),
+            }
+        )
+        if len(candidates) >= int(max_candidates):
+            return candidates[: int(max_candidates)]
+
+    neigh = _sparsepcgc_codec_proxy_neighbor_count(full_coords).to(device=full_coords.device, dtype=torch.float32)
+    parent = torch.div(full_coords, 2, rounding_mode="floor")
+    unique_parent, parent_inverse = torch.unique(parent, dim=0, sorted=True, return_inverse=True)
+    parent_pop = torch.bincount(parent_inverse, minlength=int(unique_parent.shape[0])).to(
+        device=full_coords.device,
+        dtype=torch.float32,
+    )
+    parent_pop_leaf = parent_pop.index_select(0, parent_inverse)
+    density_score = neigh + parent_pop_leaf * 0.5
+    order = torch.argsort(density_score, descending=False)
+
+    seen_counts = set()
+    for ratio in ratios:
+        drop_count = int(math.ceil(float(full_count) * float(ratio)))
+        drop_count = min(max(drop_count, min_voxels), max_voxels, full_count - 1)
+        if drop_count <= 0 or drop_count in seen_counts:
+            continue
+        seen_counts.add(drop_count)
+        drop_idx = order[:drop_count].to(device=full_coords.device, dtype=torch.long)
+        keep = torch.ones((full_count,), device=full_coords.device, dtype=torch.bool)
+        keep[drop_idx] = False
+        candidate_coords = torch.unique(full_coords[keep], dim=0, sorted=True)
+        if int(candidate_coords.shape[0]) <= 0:
+            continue
+        low_density = float(density_score.index_select(0, drop_idx).mean().detach().cpu())
+        candidates.append(
+            {
+                "op": "full_cloud_macro_prune",
+                "candidate_coords": candidate_coords.detach().clone(),
+                "drop_coords": full_coords.index_select(0, drop_idx).detach().clone(),
+                "drop_count": int(drop_count),
+                "drop_ratio": float(drop_count) / max(float(full_count), 1.0),
+                "score": float(-low_density + 10.0 * float(drop_count) / max(float(full_count), 1.0)),
+            }
+        )
+    return candidates[: int(max_candidates)]
+
+
+def _sparsepcgc_fast_diagnostic_prune_indices(unique_coords, full_coords, args):
+    if (
+        unique_coords is None
+        or full_coords is None
+        or not torch.is_tensor(unique_coords)
+        or not torch.is_tensor(full_coords)
+        or unique_coords.numel() <= 0
+        or full_coords.numel() <= 0
+    ):
+        return [], {}
+    unique_coords = _sparsepcgc_coords_to_n3(unique_coords)
+    full_coords = _sparsepcgc_coords_to_n3(full_coords)
+    if unique_coords is None or full_coords is None:
+        return [], {}
+    unique_coords = torch.unique(unique_coords.to(dtype=torch.long), dim=0, sorted=True)
+    full_coords = torch.unique(full_coords.to(device=unique_coords.device, dtype=torch.long), dim=0, sorted=True)
+    if int(unique_coords.shape[0]) <= 0 or int(full_coords.shape[0]) <= 8:
+        return [], {}
+
+    threshold = max(int(getattr(args, "sparsepcgc_fast_diagnostic_neighbor_threshold", 3)), 1)
+    min_local = max(int(getattr(args, "sparsepcgc_fast_diagnostic_min_local_voxels", 1)), 1)
+    max_local = max(int(getattr(args, "sparsepcgc_fast_diagnostic_max_local_voxels", 512)), min_local)
+    axis_neigh = _sparsepcgc_axis_neighbor_count(full_coords).to(device=full_coords.device, dtype=torch.long)
+    drop_mask = axis_neigh < int(threshold)
+    global_drop_count = int(drop_mask.detach().sum().cpu())
+    if global_drop_count <= 0:
+        return [], {
+            "diagnostic": "axis_neighbor_prune",
+            "threshold": int(threshold),
+            "global_drop_count": 0,
+            "full_count": int(full_coords.shape[0]),
+        }
+
+    drop_coords = full_coords[drop_mask]
+    full_mins = torch.minimum(unique_coords.amin(dim=0), drop_coords.amin(dim=0))
+    full_maxs = torch.maximum(unique_coords.amax(dim=0), drop_coords.amax(dim=0))
+    span = (full_maxs - full_mins + 1).clamp_min(1)
+
+    def _keys(values):
+        shifted = values - full_mins
+        return shifted[:, 0] * span[1] * span[2] + shifted[:, 1] * span[2] + shifted[:, 2]
+
+    drop_keys = torch.unique(_keys(drop_coords), sorted=True)
+    unique_keys = _keys(unique_coords)
+    pos = torch.searchsorted(drop_keys, unique_keys)
+    in_bounds = pos < drop_keys.numel()
+    safe_pos = pos.clamp(max=max(int(drop_keys.numel()) - 1, 0))
+    local_mask = in_bounds & (drop_keys[safe_pos] == unique_keys)
+    local_indices = local_mask.nonzero(as_tuple=False).reshape(-1)
+    local_count = int(local_indices.numel())
+    if local_count < min_local:
+        return [], {
+            "diagnostic": "axis_neighbor_prune",
+            "threshold": int(threshold),
+            "global_drop_count": int(global_drop_count),
+            "full_count": int(full_coords.shape[0]),
+            "local_drop_count": int(local_count),
+            "reason": "below_min_local",
+        }
+
+    if local_count > max_local:
+        local_coords = unique_coords.index_select(0, local_indices)
+        local_axis = _sparsepcgc_axis_neighbor_count(local_coords).to(device=unique_coords.device, dtype=torch.long)
+        order = torch.argsort(local_axis, descending=False)
+        local_indices = local_indices.index_select(0, order[:max_local])
+        local_count = int(local_indices.numel())
+
+    debug = {
+        "diagnostic": "axis_neighbor_prune",
+        "threshold": int(threshold),
+        "global_drop_count": int(global_drop_count),
+        "full_count": int(full_coords.shape[0]),
+        "local_drop_count": int(local_count),
+        "global_drop_ratio": float(global_drop_count) / max(float(full_coords.shape[0]), 1.0),
+        "local_drop_ratio": float(local_count) / max(float(unique_coords.shape[0]), 1.0),
+    }
+    return [int(v) for v in local_indices.detach().cpu().tolist()], debug
+
+
+def _sparsepcgc_actual_oracle_subtree_move_candidates(unique_coords, args, global_step, max_candidates, base_proxy_bits=None):
     if unique_coords is None or unique_coords.numel() <= 0 or int(max_candidates) <= 0:
         return []
 
@@ -1222,6 +1915,9 @@ def _sparsepcgc_actual_oracle_subtree_move_candidates(unique_coords, args, globa
     smoothing = max(float(getattr(args, "leaf_pattern_candidate_smoothing", 1.0)), 0.0)
     memory_weight = max(float(getattr(args, "sparsepcgc_actual_oracle_memory_weight", 0.75)), 0.0)
     size_weight = max(float(getattr(args, "sparsepcgc_actual_oracle_subtree_move_size_weight", 0.02)), 0.0)
+    proxy_weight = max(float(getattr(args, "sparsepcgc_codec_proxy_weight", 2.0)), 0.0)
+    if base_proxy_bits is None:
+        base_proxy_bits = _sparsepcgc_codec_proxy_bits(unique_coords, args)
     pattern_weights = (2 ** torch.arange(8, device=unique_coords.device, dtype=torch.long)).view(1, 8)
 
     candidates = []
@@ -1311,8 +2007,14 @@ def _sparsepcgc_actual_oracle_subtree_move_candidates(unique_coords, args, globa
                     source_unique_indices = source_mask.nonzero(as_tuple=False).reshape(-1)
 
                     gain = float((code_nll[code] - code_nll[int(target_code)]).detach().cpu())
+                    _cand_proxy_bits, proxy_percent = _sparsepcgc_proxy_delta_percent(
+                        transformed_unique,
+                        args,
+                        base_proxy_bits,
+                    )
                     score = (
                         gain
+                        - proxy_weight * float(proxy_percent)
                         + size_weight * math.log1p(float(moved_count))
                         + memory_weight * float(bonus)
                     )
@@ -1329,6 +2031,7 @@ def _sparsepcgc_actual_oracle_subtree_move_candidates(unique_coords, args, globa
                             "target_code": int(target_code),
                             "score": float(score),
                             "nll_gain": float(gain),
+                            "proxy_percent": float(proxy_percent),
                             "memory_key": key,
                             "memory_seen": bool(seen_memory),
                         }
@@ -1338,7 +2041,7 @@ def _sparsepcgc_actual_oracle_subtree_move_candidates(unique_coords, args, globa
     return candidates[: int(max_candidates)]
 
 
-def _sparsepcgc_actual_oracle_pattern_plan_candidates(unique_coords, args, global_step, max_candidates):
+def _sparsepcgc_actual_oracle_pattern_plan_candidates(unique_coords, args, global_step, max_candidates, base_proxy_bits=None):
     if unique_coords is None or unique_coords.numel() <= 0 or int(max_candidates) <= 0:
         return []
 
@@ -1375,6 +2078,9 @@ def _sparsepcgc_actual_oracle_pattern_plan_candidates(unique_coords, args, globa
     min_gain = float(getattr(args, "sparsepcgc_actual_oracle_pattern_plan_min_nll_gain", 0.0))
     edit_penalty = max(float(getattr(args, "sparsepcgc_actual_oracle_pattern_plan_edit_penalty", 0.02)), 0.0)
     memory_weight = max(float(getattr(args, "sparsepcgc_actual_oracle_memory_weight", 0.75)), 0.0)
+    proxy_weight = max(float(getattr(args, "sparsepcgc_codec_proxy_weight", 2.0)), 0.0)
+    if base_proxy_bits is None:
+        base_proxy_bits = _sparsepcgc_codec_proxy_bits(unique_coords, args)
 
     popular_codes = torch.argsort(code_prob, descending=True)
     popular_codes = [int(code) for code in popular_codes.detach().cpu().tolist() if int(code) > 0][:target_topk]
@@ -1466,7 +2172,17 @@ def _sparsepcgc_actual_oracle_pattern_plan_candidates(unique_coords, args, globa
             if int(transformed.shape[0]) <= 0:
                 continue
 
-            score = gain + memory_weight * float(bonus) - edit_penalty * float(edit_count)
+            _cand_proxy_bits, proxy_percent = _sparsepcgc_proxy_delta_percent(
+                transformed,
+                args,
+                base_proxy_bits,
+            )
+            score = (
+                gain
+                - proxy_weight * float(proxy_percent)
+                + memory_weight * float(bonus)
+                - edit_penalty * float(edit_count)
+            )
             candidates.append(
                 {
                     "op": "pattern_plan",
@@ -1480,6 +2196,7 @@ def _sparsepcgc_actual_oracle_pattern_plan_candidates(unique_coords, args, globa
                     "target_code": int(target_code),
                     "score": float(score),
                     "nll_gain": float(gain),
+                    "proxy_percent": float(proxy_percent),
                     "memory_key": key,
                     "memory_seen": bool(seen_memory),
                 }
@@ -1608,7 +2325,17 @@ def _sparsepcgc_actual_oracle_pattern_plan_candidates(unique_coords, args, globa
             if int(transformed.shape[0]) <= 0:
                 continue
 
-            score = total_gain + memory_weight * float(bonus) - edit_penalty * float(total_edits)
+            _cand_proxy_bits, proxy_percent = _sparsepcgc_proxy_delta_percent(
+                transformed,
+                args,
+                base_proxy_bits,
+            )
+            score = (
+                total_gain
+                - proxy_weight * float(proxy_percent)
+                + memory_weight * float(bonus)
+                - edit_penalty * float(total_edits)
+            )
             candidates.append(
                 {
                     "op": "pattern_plan",
@@ -1622,6 +2349,7 @@ def _sparsepcgc_actual_oracle_pattern_plan_candidates(unique_coords, args, globa
                     "target_code": int(target_code),
                     "score": float(score),
                     "nll_gain": float(total_gain),
+                    "proxy_percent": float(proxy_percent),
                     "memory_key": key,
                     "memory_seen": bool(seen_memory),
                     "multi_parent_count": int(len(selected_plans)),
@@ -1630,6 +2358,38 @@ def _sparsepcgc_actual_oracle_pattern_plan_candidates(unique_coords, args, globa
 
     candidates = sorted(candidates, key=lambda item: float(item["score"]), reverse=True)
     return candidates[: int(max_candidates)]
+
+
+def _sparsepcgc_splice_subtree_coords_into_full_cloud(full_coords_b3n, subtree_coords_n3, candidate_coords_n3):
+    if not torch.is_tensor(full_coords_b3n) or not torch.is_tensor(subtree_coords_n3) or not torch.is_tensor(candidate_coords_n3):
+        return None
+    if full_coords_b3n.ndim == 2:
+        full_coords_b3n = (
+            full_coords_b3n.transpose(0, 1).contiguous().unsqueeze(0)
+            if full_coords_b3n.shape[-1] == 3
+            else full_coords_b3n.unsqueeze(0)
+        )
+    if full_coords_b3n.ndim != 3 or full_coords_b3n.shape[1] != 3 or full_coords_b3n.shape[0] != 1:
+        return None
+    device = candidate_coords_n3.device
+    full_coords = torch.unique(
+        full_coords_b3n[0].transpose(0, 1).contiguous().to(device=device, dtype=torch.long),
+        dim=0,
+        sorted=True,
+    )
+    subtree_coords = torch.unique(subtree_coords_n3.to(device=device, dtype=torch.long), dim=0, sorted=True)
+    candidate_coords = torch.unique(candidate_coords_n3.to(device=device, dtype=torch.long), dim=0, sorted=True)
+    if full_coords.numel() <= 0 or subtree_coords.numel() <= 0 or candidate_coords.numel() <= 0:
+        return None
+
+    remove_keys = {tuple(int(v) for v in row) for row in subtree_coords.detach().cpu().tolist()}
+    keep_mask_cpu = [tuple(int(v) for v in row) not in remove_keys for row in full_coords.detach().cpu().tolist()]
+    keep_mask = torch.as_tensor(keep_mask_cpu, device=device, dtype=torch.bool)
+    spliced = torch.cat([full_coords[keep_mask], candidate_coords], dim=0)
+    spliced = torch.unique(spliced, dim=0, sorted=True)
+    if int(spliced.shape[0]) <= 0:
+        return None
+    return spliced
 
 
 def _attach_sparsepcgc_actual_oracle_drop(
@@ -1670,6 +2430,29 @@ def _attach_sparsepcgc_actual_oracle_drop(
         "best_edit_record_bits": 0.0,
         "selected_raw_percent": 0.0,
         "selected_edit_record_bits": 0.0,
+        "original_actual_bits": 0.0,
+        "edited_actual_bits": 0.0,
+        "delta_actual_percent": 0.0,
+        "best_actual_percent": 0.0,
+        "best_proxy_percent": 0.0,
+        "selected_proxy_percent": 0.0,
+        "selected_geometry_percent": 0.0,
+        "generated_candidate_count": 0,
+        "accepted_candidate_count": 0,
+        "accepted_prune_count": 0,
+        "accepted_add_count": 0,
+        "accepted_adjust_count": 0,
+        "accepted_subtree_move_count": 0,
+        "accepted_parent_collapse_count": 0,
+        "accepted_pattern_canonicalize_count": 0,
+        "noop_label_count": 0,
+        "noop_label_weight": float(getattr(args, "sparsepcgc_actual_oracle_noop_weight", 0.02)),
+        "high_rate_mppov_count": 0,
+        "low_prob_occupied_count": 0,
+        "single_child_chain_count": 0,
+        "context_pattern_candidate_count": 0,
+        "actual_oracle_time": 0.0,
+        "actual_eval_max": 0,
         "edit_record_effective_scale": float(sparsepcgc_effective_edit_record_bit_scale(args)),
         "reason": "disabled",
     }
@@ -1683,7 +2466,9 @@ def _attach_sparsepcgc_actual_oracle_drop(
         return subtree_tree, full_octree_context, debug
 
     interval = max(int(getattr(args, "sparsepcgc_actual_oracle_interval", 1)), 1)
-    if (int(global_step) % interval) != 0:
+    actual_validate_this_step = ((int(global_step) + 1) % interval) == 0
+    fast_diagnostic_enabled = bool(getattr(args, "sparsepcgc_fast_diagnostic_teacher", True))
+    if (not actual_validate_this_step) and (not fast_diagnostic_enabled):
         debug["reason"] = "interval_skip"
         return subtree_tree, full_octree_context, debug
 
@@ -1740,11 +2525,25 @@ def _attach_sparsepcgc_actual_oracle_drop(
         if bool(getattr(args, "sparsepcgc_actual_oracle_allow_add", True)):
             add_pool_budget = max(add_pool_budget, group_pool_voxels)
 
+    base_unique_coords_for_proxy, _base_inverse_for_proxy = torch.unique(
+        coords_n3.to(dtype=torch.long),
+        dim=0,
+        sorted=True,
+        return_inverse=True,
+    )
+    proxy_profile = _sparsepcgc_codec_proxy_profile(base_unique_coords_for_proxy, args)
+    base_proxy_bits = float(proxy_profile.get("base_proxy_bits", 0.0) or 0.0)
+    debug["high_rate_mppov_count"] = int(proxy_profile.get("high_rate_mppov_count", 0) or 0)
+    debug["low_prob_occupied_count"] = int(proxy_profile.get("low_prob_occupied_count", 0) or 0)
+    debug["single_child_chain_count"] = int(proxy_profile.get("single_child_chain_count", 0) or 0)
+    debug["context_pattern_candidate_count"] = int(proxy_profile.get("context_pattern_candidate_count", 0) or 0)
+
     candidate_pool, unique_coords, inverse = _sparsepcgc_actual_oracle_candidate_indices(
         coords_n3,
         args,
         global_step,
         drop_pool_budget,
+        proxy_profile=proxy_profile,
     )
     if unique_coords is None or inverse is None:
         unique_coords, inverse = torch.unique(
@@ -1753,17 +2552,57 @@ def _attach_sparsepcgc_actual_oracle_drop(
             sorted=True,
             return_inverse=True,
         )
+        proxy_profile = _sparsepcgc_codec_proxy_profile(unique_coords, args)
+        base_proxy_bits = float(proxy_profile.get("base_proxy_bits", 0.0) or 0.0)
     candidate_indices = candidate_pool[:drop_budget]
     add_candidate_pool = _sparsepcgc_actual_oracle_add_candidates(
         unique_coords,
         args,
         global_step,
         add_pool_budget,
+        proxy_profile=proxy_profile,
     )
     add_candidates = add_candidate_pool[:add_budget]
     debug["enabled"] = True
     debug["candidate_count"] = int(len(candidate_indices) + len(add_candidates))
     debug["candidate_pool_count"] = int(len(candidate_pool) + len(add_candidate_pool))
+    debug["generated_candidate_count"] = int(debug["candidate_pool_count"])
+
+    full_eval_coords = None
+    oracle_eval_scope = "subtree_local"
+    if bool(getattr(args, "sparsepcgc_actual_oracle_eval_full_cloud_splice", True)) and isinstance(full_octree_context, dict):
+        spliced_base = _sparsepcgc_splice_subtree_coords_into_full_cloud(
+            full_octree_context.get("full_global_voxel_coords", None),
+            unique_coords,
+            unique_coords,
+        )
+        if torch.is_tensor(spliced_base) and int(spliced_base.shape[0]) > 0:
+            full_eval_coords = spliced_base.detach()
+            oracle_eval_scope = "full_cloud_splice"
+    debug["actual_eval_scope"] = str(oracle_eval_scope)
+    debug["actual_eval_full_coord_count"] = int(full_eval_coords.shape[0]) if torch.is_tensor(full_eval_coords) else 0
+
+    def _oracle_actual_eval_coords(local_candidate_coords):
+        if torch.is_tensor(full_eval_coords):
+            spliced = _sparsepcgc_splice_subtree_coords_into_full_cloud(
+                full_octree_context.get("full_global_voxel_coords", None) if isinstance(full_octree_context, dict) else None,
+                unique_coords,
+                local_candidate_coords,
+            )
+            if torch.is_tensor(spliced) and int(spliced.shape[0]) > 0:
+                return spliced
+        return local_candidate_coords
+
+    def _oracle_actual_eval_xyz(local_candidate_coords):
+        eval_coords = _oracle_actual_eval_coords(local_candidate_coords)
+        return _restore_codec_xyz_from_global_voxels(
+            args,
+            eval_coords.transpose(0, 1).contiguous().unsqueeze(0),
+            full_octree_context if isinstance(full_octree_context, dict) else subtree_tree,
+            subtree_xyz,
+        )
+
+    edit_record_unique_count = int(full_eval_coords.shape[0]) if torch.is_tensor(full_eval_coords) else int(unique_coords.shape[0])
 
     point_mask = torch.zeros((1, coords.shape[-1]), device=coords.device, dtype=torch.bool)
     score = torch.zeros((1, coords.shape[-1]), device=coords.device, dtype=torch.float32)
@@ -1778,19 +2617,98 @@ def _attach_sparsepcgc_actual_oracle_drop(
     bad_add_score = torch.zeros((1, coords.shape[-1]), device=coords.device, dtype=torch.float32)
     bad_add_child_slot = torch.full((1, coords.shape[-1]), -1, device=coords.device, dtype=torch.long)
 
-    if (not candidate_pool and not add_candidate_pool) or unique_coords is None or inverse is None:
+    fast_diagnostic_indices = []
+    fast_diagnostic_debug = {}
+    if fast_diagnostic_enabled and isinstance(full_octree_context, dict):
+        fast_full_coords = full_octree_context.get("full_global_voxel_coords", None)
+        if not torch.is_tensor(fast_full_coords):
+            fast_full_coords = full_eval_coords
+        fast_diagnostic_indices, fast_diagnostic_debug = _sparsepcgc_fast_diagnostic_prune_indices(
+            unique_coords,
+            fast_full_coords,
+            args,
+        )
+        debug["fast_diagnostic_enabled"] = True
+        debug["fast_diagnostic_name"] = str(fast_diagnostic_debug.get("diagnostic", ""))
+        debug["fast_diagnostic_threshold"] = int(fast_diagnostic_debug.get("threshold", 0) or 0)
+        debug["fast_diagnostic_full_drop_count"] = int(fast_diagnostic_debug.get("global_drop_count", 0) or 0)
+        debug["fast_diagnostic_local_drop_count"] = int(fast_diagnostic_debug.get("local_drop_count", 0) or 0)
+        debug["fast_diagnostic_full_drop_ratio"] = float(fast_diagnostic_debug.get("global_drop_ratio", 0.0) or 0.0)
+        debug["fast_diagnostic_local_drop_ratio"] = float(fast_diagnostic_debug.get("local_drop_ratio", 0.0) or 0.0)
+    else:
+        debug["fast_diagnostic_enabled"] = False
+
+    def _apply_fast_diagnostic_teacher():
+        if not fast_diagnostic_indices:
+            return False
+        selected_indices = [int(v) for v in fast_diagnostic_indices]
+        strength = 1.0 + min(float(len(selected_indices)) / max(float(unique_coords.shape[0]), 1.0) * 100.0, 4.0)
+        for unique_idx in selected_indices:
+            if unique_idx < 0 or unique_idx >= int(unique_coords.shape[0]):
+                continue
+            point_indices = (inverse == int(unique_idx)).nonzero(as_tuple=False).reshape(-1)
+            if point_indices.numel() <= 0:
+                continue
+            point_mask[0, point_indices] = True
+            score[0, point_indices] = float(strength)
+        selected_drop = int(point_mask.detach().sum().cpu())
+        if selected_drop <= 0:
+            return False
+        keep_for_proxy = torch.ones((unique_coords.shape[0],), device=unique_coords.device, dtype=torch.bool)
+        keep_for_proxy[torch.as_tensor(selected_indices, device=unique_coords.device, dtype=torch.long)] = False
+        proxy_bits, proxy_percent = _sparsepcgc_proxy_delta_percent(
+            unique_coords[keep_for_proxy],
+            args,
+            base_proxy_bits,
+        )
+        debug["used"] = True
+        debug["reason"] = "fast_diagnostic_axis_neighbor_prune"
+        debug["generated_candidate_count"] = int(debug.get("generated_candidate_count", 0)) + 1
+        debug["accepted_candidate_count"] = 1
+        debug["accepted_prune_count"] = int(selected_drop)
+        debug["selected_drop_count"] = int(selected_drop)
+        debug["best_percent"] = float(proxy_percent)
+        debug["best_proxy_percent"] = float(proxy_percent)
+        debug["selected_proxy_percent"] = float(proxy_percent)
+        if not actual_validate_this_step:
+            debug["actual_oracle_time"] = 0.0
+            debug["tested_count"] = 0
+            debug["actual_eval_max"] = 0
+        debug["fast_diagnostic_used"] = True
+        debug["fast_diagnostic_proxy_bits"] = float(proxy_bits)
+        debug["fast_diagnostic_proxy_percent"] = float(proxy_percent)
+        return True
+
+    if not actual_validate_this_step:
+        if not _apply_fast_diagnostic_teacher():
+            debug["reason"] = "interval_skip_no_fast_diagnostic_candidate"
+    elif (not candidate_pool and not add_candidate_pool) or unique_coords is None or inverse is None:
         debug["reason"] = "no_valid_actual_oracle_candidates"
     else:
+        oracle_time_start = time.time()
+        actual_eval_max = max(
+            int(getattr(args, "sparsepcgc_actual_oracle_actual_eval_max", max_candidates)),
+            0,
+        )
+        if actual_eval_max <= 0:
+            actual_eval_max = max_candidates
+        debug["actual_eval_max"] = int(actual_eval_max)
+        single_eval_fraction = min(
+            max(float(getattr(args, "sparsepcgc_actual_oracle_single_eval_fraction", 0.50)), 0.0),
+            1.0,
+        )
+        single_eval_max = max(1, int(math.ceil(float(actual_eval_max) * single_eval_fraction)))
+        single_eval_max = min(int(single_eval_max), int(actual_eval_max))
+        debug["single_eval_max"] = int(single_eval_max)
+
+        def _actual_budget_exhausted(tested_count):
+            return int(tested_count) >= int(actual_eval_max)
+
         try:
             oracle_base_cache_key = f"{cache_key or ''}|sparsepcgc_actual_oracle_voxel_base"
             cached_gt = loss._get_cached_actual_gt(oracle_base_cache_key)
             if cached_gt is None:
-                base_xyz = _restore_codec_xyz_from_global_voxels(
-                    args,
-                    unique_coords.transpose(0, 1).contiguous().unsqueeze(0),
-                    full_octree_context if isinstance(full_octree_context, dict) else subtree_tree,
-                    subtree_xyz,
-                )
+                base_xyz = _oracle_actual_eval_xyz(unique_coords)
                 if base_xyz is None or base_xyz.shape[-1] <= 0:
                     base_xyz = subtree_xyz[:, :3, :]
                 cached_gt = loss._encode_actual_batch(args, base_xyz)
@@ -1798,32 +2716,42 @@ def _attach_sparsepcgc_actual_oracle_drop(
             base_bit = float(cached_gt.get("bit", 0.0))
             if not math.isfinite(base_bit) or base_bit <= 0.0:
                 raise RuntimeError(f"invalid_base_bit={base_bit}")
+            debug["original_actual_bits"] = float(base_bit)
 
             improving = []
             best_percent = 0.0
             best_raw_percent = 0.0
+            best_actual_percent = 0.0
+            best_proxy_percent = 0.0
             best_edit_record_bits = 0.0
+            best_edited_actual_bits = float(base_bit)
             tested = 0
+            single_tested = 0
             bad_candidate_count = 0
             improving_candidate_count = 0
             bad_min_percent = float(getattr(args, "sparsepcgc_actual_oracle_bad_min_percent", 0.0))
             all_unique_idx = torch.arange(unique_coords.shape[0], device=coords.device, dtype=torch.long)
             unique_count = int(unique_coords.shape[0])
 
-            def _candidate_objective(raw_bit, edit_record_bits):
-                return _sparsepcgc_objective_percent_with_edit_record(
+            def _candidate_objective(raw_bit, edit_record_bits, geometry_percent=0.0):
+                raw_percent, billed_percent = _sparsepcgc_objective_percent_with_edit_record(
                     args,
                     raw_bit,
                     base_bit,
                     edit_record_bits,
                 )
+                return raw_percent, billed_percent, float(billed_percent + float(geometry_percent))
 
-            def _update_best(raw_percent, billed_percent, edit_record_bits):
-                nonlocal best_percent, best_raw_percent, best_edit_record_bits
-                if float(billed_percent) < float(best_percent):
-                    best_percent = float(billed_percent)
+            def _update_best(raw_percent, actual_percent, objective_percent, edit_record_bits, raw_bit, proxy_percent):
+                nonlocal best_percent, best_raw_percent, best_actual_percent
+                nonlocal best_edit_record_bits, best_edited_actual_bits, best_proxy_percent
+                if float(objective_percent) < float(best_percent):
+                    best_percent = float(objective_percent)
                     best_raw_percent = float(raw_percent)
+                    best_actual_percent = float(actual_percent)
                     best_edit_record_bits = float(edit_record_bits)
+                    best_edited_actual_bits = float(raw_bit)
+                    best_proxy_percent = float(proxy_percent)
 
             def _oracle_strength(percent, *, bad=False):
                 if bad:
@@ -1832,7 +2760,12 @@ def _attach_sparsepcgc_actual_oracle_drop(
                     value = abs(float(percent))
                 return 1.0 + min(value / 10.0, 4.0)
 
+            def _single_budget_exhausted():
+                return int(single_tested) >= int(single_eval_max)
+
             for drop_candidate in candidate_indices:
+                if _actual_budget_exhausted(tested) or _single_budget_exhausted():
+                    break
                 if isinstance(drop_candidate, dict):
                     unique_idx = int(drop_candidate.get("unique_idx", -1))
                     drop_memory_key = str(drop_candidate.get("memory_key", ""))
@@ -1844,26 +2777,36 @@ def _attach_sparsepcgc_actual_oracle_drop(
                 keep_unique = all_unique_idx != int(unique_idx)
                 if int(keep_unique.sum().item()) <= 0:
                     continue
-                candidate_coords = unique_coords[keep_unique].transpose(0, 1).contiguous().unsqueeze(0)
-                candidate_xyz = _restore_codec_xyz_from_global_voxels(
-                    args,
-                    candidate_coords,
-                    full_octree_context if isinstance(full_octree_context, dict) else subtree_tree,
-                    subtree_xyz,
-                )
+                candidate_coords = unique_coords[keep_unique]
+                candidate_xyz = _oracle_actual_eval_xyz(candidate_coords)
                 if candidate_xyz is None or candidate_xyz.shape[-1] <= 0:
                     continue
                 stats = loss._encode_actual_batch(args, candidate_xyz)
                 tested += 1
+                single_tested += 1
                 cand_bit = float(stats.get("bit", 0.0))
                 edit_record_bits = _sparsepcgc_edit_record_total_bits(
                     args,
-                    unique_count,
+                    edit_record_unique_count,
                     drop_count=1,
                 )
-                raw_percent, cand_percent = _candidate_objective(cand_bit, edit_record_bits)
+                proxy_bits, proxy_percent = _sparsepcgc_proxy_delta_percent(
+                    unique_coords[keep_unique],
+                    args,
+                    base_proxy_bits,
+                )
+                geometry_percent = _sparsepcgc_geometry_penalty_percent(
+                    args,
+                    edit_record_unique_count,
+                    drop_count=1,
+                )
+                raw_percent, actual_percent, cand_percent = _candidate_objective(
+                    cand_bit,
+                    edit_record_bits,
+                    geometry_percent,
+                )
                 _sparsepcgc_actual_oracle_update_memory(args, drop_memory_key, cand_percent)
-                _update_best(raw_percent, cand_percent, edit_record_bits)
+                _update_best(raw_percent, actual_percent, cand_percent, edit_record_bits, cand_bit, proxy_percent)
                 min_improve = max(float(getattr(args, "sparsepcgc_actual_oracle_min_improve_percent", 0.0)), 0.0)
                 if cand_percent < -min_improve:
                     improving_candidate_count += 1
@@ -1873,6 +2816,10 @@ def _attach_sparsepcgc_actual_oracle_drop(
                             "unique_idx": unique_idx,
                             "percent": float(cand_percent),
                             "raw_percent": float(raw_percent),
+                            "actual_percent": float(actual_percent),
+                            "proxy_percent": float(proxy_percent),
+                            "proxy_bits": float(proxy_bits),
+                            "geometry_percent": float(geometry_percent),
                             "edit_record_bits": float(edit_record_bits),
                             "memory_key": drop_memory_key,
                             "score_hint": float(drop_candidate.get("score_hint", 0.0)) if isinstance(drop_candidate, dict) else 0.0,
@@ -1890,6 +2837,8 @@ def _attach_sparsepcgc_actual_oracle_drop(
                         )
 
             for add_candidate in add_candidates:
+                if _actual_budget_exhausted(tested) or _single_budget_exhausted():
+                    break
                 target_coord = add_candidate.get("target_coord", None)
                 if not torch.is_tensor(target_coord):
                     continue
@@ -1898,26 +2847,36 @@ def _attach_sparsepcgc_actual_oracle_drop(
                 candidate_coords = torch.unique(candidate_coords, dim=0, sorted=True)
                 if int(candidate_coords.shape[0]) <= int(unique_coords.shape[0]):
                     continue
-                candidate_xyz = _restore_codec_xyz_from_global_voxels(
-                    args,
-                    candidate_coords.transpose(0, 1).contiguous().unsqueeze(0),
-                    full_octree_context if isinstance(full_octree_context, dict) else subtree_tree,
-                    subtree_xyz,
-                )
+                candidate_xyz = _oracle_actual_eval_xyz(candidate_coords)
                 if candidate_xyz is None or candidate_xyz.shape[-1] <= 0:
                     continue
                 stats = loss._encode_actual_batch(args, candidate_xyz)
                 tested += 1
+                single_tested += 1
                 cand_bit = float(stats.get("bit", 0.0))
                 edit_record_bits = _sparsepcgc_edit_record_total_bits(
                     args,
-                    unique_count,
+                    edit_record_unique_count,
                     add_count=1,
                 )
-                raw_percent, cand_percent = _candidate_objective(cand_bit, edit_record_bits)
+                proxy_bits, proxy_percent = _sparsepcgc_proxy_delta_percent(
+                    candidate_coords,
+                    args,
+                    base_proxy_bits,
+                )
+                geometry_percent = _sparsepcgc_geometry_penalty_percent(
+                    args,
+                    edit_record_unique_count,
+                    add_count=1,
+                )
+                raw_percent, actual_percent, cand_percent = _candidate_objective(
+                    cand_bit,
+                    edit_record_bits,
+                    geometry_percent,
+                )
                 add_memory_key = str(add_candidate.get("memory_key", ""))
                 _sparsepcgc_actual_oracle_update_memory(args, add_memory_key, cand_percent)
-                _update_best(raw_percent, cand_percent, edit_record_bits)
+                _update_best(raw_percent, actual_percent, cand_percent, edit_record_bits, cand_bit, proxy_percent)
                 min_improve = max(float(getattr(args, "sparsepcgc_actual_oracle_min_improve_percent", 0.0)), 0.0)
                 if cand_percent < -min_improve:
                     improving_candidate_count += 1
@@ -1929,6 +2888,10 @@ def _attach_sparsepcgc_actual_oracle_drop(
                             "target_coord": target_coord.detach().clone(),
                             "percent": float(cand_percent),
                             "raw_percent": float(raw_percent),
+                            "actual_percent": float(actual_percent),
+                            "proxy_percent": float(proxy_percent),
+                            "proxy_bits": float(proxy_bits),
+                            "geometry_percent": float(geometry_percent),
                             "edit_record_bits": float(edit_record_bits),
                             "memory_key": add_memory_key,
                             "score_hint": float(add_candidate.get("score_hint", 0.0)),
@@ -1955,10 +2918,254 @@ def _attach_sparsepcgc_actual_oracle_drop(
             parent_prune_improving_count = 0
             pattern_plan_tested = 0
             pattern_plan_improving_count = 0
+            full_cloud_macro_tested = 0
+            full_cloud_macro_improving_count = 0
+            full_cloud_macro_best_percent = float("inf")
+            full_cloud_macro_best_ratio = 0.0
+            full_cloud_macro_best_drop_count = 0
+            full_cloud_macro_max = max(
+                int(getattr(args, "sparsepcgc_actual_oracle_full_cloud_macro_prune_candidate_max", 1)),
+                0,
+            )
+            if not torch.is_tensor(full_eval_coords):
+                full_cloud_macro_max = 0
+            macro_prune_tested = 0
+            macro_prune_improving_count = 0
+            macro_prune_best_percent = float("inf")
+            macro_prune_best_ratio = 0.0
+            macro_prune_best_drop_count = 0
+            macro_prune_best_variant = ""
+            macro_prune_best_proxy_percent = 0.0
+            macro_prune_max = max(
+                int(getattr(args, "sparsepcgc_actual_oracle_macro_prune_candidate_max", 2)),
+                0,
+            )
             max_joint_candidates = max(
                 int(getattr(args, "sparsepcgc_actual_oracle_joint_candidate_max", 1)),
                 0,
             )
+            group_candidate_max = max(
+                int(getattr(args, "sparsepcgc_actual_oracle_group_candidate_max", 2)),
+                0,
+            )
+            parent_prune_max = max(
+                int(getattr(args, "sparsepcgc_actual_oracle_parent_prune_candidate_max", 2)),
+                0,
+            )
+            pattern_plan_max = max(
+                int(getattr(args, "sparsepcgc_actual_oracle_pattern_plan_candidate_max", 2)),
+                0,
+            )
+            subtree_move_tested = 0
+            subtree_move_improving_count = 0
+            subtree_move_interval = max(
+                int(getattr(args, "sparsepcgc_actual_oracle_subtree_move_interval", 4)),
+                1,
+            )
+            subtree_move_allowed_this_step = (
+                bool(getattr(args, "sparsepcgc_actual_oracle_allow_subtree_move", True))
+                and (int(global_step) % subtree_move_interval) == 0
+            )
+            subtree_move_max = max(
+                int(getattr(args, "sparsepcgc_actual_oracle_subtree_move_candidate_max", 2)),
+                0,
+            )
+            if not subtree_move_allowed_this_step:
+                subtree_move_max = 0
+
+            complex_eval_budget = max(int(actual_eval_max) - int(single_eval_max), 0)
+            full_cloud_macro_eval_limit = min(full_cloud_macro_max, complex_eval_budget)
+            remaining_complex_budget = max(complex_eval_budget - full_cloud_macro_eval_limit, 0)
+            macro_prune_eval_limit = min(macro_prune_max, remaining_complex_budget)
+            remaining_complex_budget = max(remaining_complex_budget - macro_prune_eval_limit, 0)
+            joint_eval_limit = min(max_joint_candidates, 1 if complex_eval_budget > 0 else 0)
+            joint_eval_limit = min(joint_eval_limit, remaining_complex_budget)
+            remaining_complex_budget = max(remaining_complex_budget - joint_eval_limit, 0)
+            parent_prune_eval_limit = min(parent_prune_max, 1 if remaining_complex_budget > 0 else 0)
+            remaining_complex_budget = max(remaining_complex_budget - parent_prune_eval_limit, 0)
+            pattern_plan_eval_limit = min(pattern_plan_max, 1 if remaining_complex_budget > 0 else 0)
+            remaining_complex_budget = max(remaining_complex_budget - pattern_plan_eval_limit, 0)
+            subtree_move_eval_limit = min(subtree_move_max, 1 if remaining_complex_budget > 0 else 0)
+            remaining_complex_budget = max(remaining_complex_budget - subtree_move_eval_limit, 0)
+            group_eval_limit = min(group_candidate_max, remaining_complex_budget)
+            if (
+                group_eval_limit <= 0
+                and complex_eval_budget > 0
+                and (
+                    full_cloud_macro_eval_limit
+                    + macro_prune_eval_limit
+                    + joint_eval_limit
+                    + parent_prune_eval_limit
+                    + pattern_plan_eval_limit
+                    + subtree_move_eval_limit
+                ) <= 0
+            ):
+                group_eval_limit = min(group_candidate_max, complex_eval_budget)
+            debug["full_cloud_macro_eval_max"] = int(full_cloud_macro_eval_limit)
+            debug["macro_prune_eval_max"] = int(macro_prune_eval_limit)
+            debug["joint_eval_max"] = int(joint_eval_limit)
+            debug["group_eval_max"] = int(group_eval_limit)
+            debug["parent_prune_eval_max"] = int(parent_prune_eval_limit)
+            debug["pattern_plan_eval_max"] = int(pattern_plan_eval_limit)
+            debug["subtree_move_eval_max"] = int(subtree_move_eval_limit)
+            if full_cloud_macro_eval_limit > 0 and torch.is_tensor(full_eval_coords):
+                full_macro_candidates = _sparsepcgc_actual_oracle_full_cloud_macro_prune_candidates(
+                    full_eval_coords,
+                    args,
+                    full_cloud_macro_max,
+                )
+                debug["generated_candidate_count"] = int(debug.get("generated_candidate_count", 0)) + int(len(full_macro_candidates))
+                min_improve = max(float(getattr(args, "sparsepcgc_actual_oracle_min_improve_percent", 0.0)), 0.0)
+                for full_macro_item in full_macro_candidates:
+                    if _actual_budget_exhausted(tested) or full_cloud_macro_tested >= full_cloud_macro_eval_limit:
+                        break
+                    candidate_coords = full_macro_item.get("candidate_coords", None)
+                    drop_coords = full_macro_item.get("drop_coords", None)
+                    if not torch.is_tensor(candidate_coords) or not torch.is_tensor(drop_coords):
+                        continue
+                    drop_key_set = {tuple(int(v) for v in row) for row in drop_coords.detach().cpu().tolist()}
+                    local_unique_indices = [
+                        int(idx)
+                        for idx, row in enumerate(unique_coords.detach().cpu().tolist())
+                        if tuple(int(v) for v in row) in drop_key_set
+                    ]
+                    if not local_unique_indices:
+                        continue
+                    candidate_xyz = _restore_codec_xyz_from_global_voxels(
+                        args,
+                        candidate_coords.transpose(0, 1).contiguous().unsqueeze(0),
+                        full_octree_context if isinstance(full_octree_context, dict) else subtree_tree,
+                        subtree_xyz,
+                    )
+                    if candidate_xyz is None or candidate_xyz.shape[-1] <= 0:
+                        continue
+                    stats = loss._encode_actual_batch(args, candidate_xyz)
+                    tested += 1
+                    full_cloud_macro_tested += 1
+                    cand_bit = float(stats.get("bit", 0.0))
+                    full_drop_count = int(full_macro_item.get("drop_count", len(drop_key_set)))
+                    edit_record_bits = _sparsepcgc_edit_record_total_bits(
+                        args,
+                        edit_record_unique_count,
+                        drop_count=full_drop_count,
+                    )
+                    keep_local = torch.ones((unique_coords.shape[0],), device=unique_coords.device, dtype=torch.bool)
+                    keep_local[torch.as_tensor(local_unique_indices, device=unique_coords.device, dtype=torch.long)] = False
+                    local_candidate_coords = torch.unique(unique_coords[keep_local], dim=0, sorted=True)
+                    proxy_bits, proxy_percent = _sparsepcgc_proxy_delta_percent(
+                        local_candidate_coords,
+                        args,
+                        base_proxy_bits,
+                    )
+                    geometry_percent = _sparsepcgc_geometry_penalty_percent(
+                        args,
+                        edit_record_unique_count,
+                        drop_count=full_drop_count,
+                    )
+                    raw_percent, actual_percent, cand_percent = _candidate_objective(
+                        cand_bit,
+                        edit_record_bits,
+                        geometry_percent,
+                    )
+                    if float(cand_percent) < float(full_cloud_macro_best_percent):
+                        full_cloud_macro_best_percent = float(cand_percent)
+                        full_cloud_macro_best_ratio = float(full_macro_item.get("drop_ratio", 0.0))
+                        full_cloud_macro_best_drop_count = int(full_drop_count)
+                    _update_best(raw_percent, actual_percent, cand_percent, edit_record_bits, cand_bit, proxy_percent)
+                    if cand_percent < -min_improve:
+                        full_cloud_macro_improving_count += 1
+                        improving_candidate_count += 1
+                        improving.append(
+                            {
+                                "op": "macro_prune",
+                                "unique_indices": local_unique_indices,
+                                "percent": float(cand_percent),
+                                "raw_percent": float(raw_percent),
+                                "actual_percent": float(actual_percent),
+                                "proxy_percent": float(proxy_percent),
+                                "proxy_bits": float(proxy_bits),
+                                "geometry_percent": float(geometry_percent),
+                                "edit_record_bits": float(edit_record_bits),
+                                "edited_actual_bits": float(cand_bit),
+                                "full_cloud_drop_count": int(full_drop_count),
+                            }
+                        )
+                    elif cand_percent >= bad_min_percent:
+                        bad_candidate_count += 1
+            if macro_prune_max > 0:
+                macro_candidates = _sparsepcgc_actual_oracle_macro_prune_candidates(
+                    unique_coords,
+                    args,
+                    macro_prune_max,
+                    proxy_profile=proxy_profile,
+                    base_proxy_bits=base_proxy_bits,
+                )
+                debug["generated_candidate_count"] = int(debug.get("generated_candidate_count", 0)) + int(len(macro_candidates))
+                min_improve = max(float(getattr(args, "sparsepcgc_actual_oracle_min_improve_percent", 0.0)), 0.0)
+                for macro_item in macro_candidates:
+                    if _actual_budget_exhausted(tested) or macro_prune_tested >= macro_prune_eval_limit:
+                        break
+                    candidate_coords = macro_item.get("candidate_coords", None)
+                    if not torch.is_tensor(candidate_coords):
+                        continue
+                    candidate_xyz = _oracle_actual_eval_xyz(candidate_coords)
+                    if candidate_xyz is None or candidate_xyz.shape[-1] <= 0:
+                        continue
+                    stats = loss._encode_actual_batch(args, candidate_xyz)
+                    tested += 1
+                    macro_prune_tested += 1
+                    cand_bit = float(stats.get("bit", 0.0))
+                    unique_indices = [int(v) for v in macro_item.get("unique_indices", [])]
+                    edit_record_bits = _sparsepcgc_edit_record_total_bits(
+                        args,
+                        edit_record_unique_count,
+                        drop_count=len(unique_indices),
+                    )
+                    proxy_bits, proxy_percent = _sparsepcgc_proxy_delta_percent(
+                        candidate_coords,
+                        args,
+                        base_proxy_bits,
+                    )
+                    geometry_percent = _sparsepcgc_geometry_penalty_percent(
+                        args,
+                        edit_record_unique_count,
+                        drop_count=len(unique_indices),
+                    )
+                    raw_percent, actual_percent, cand_percent = _candidate_objective(
+                        cand_bit,
+                        edit_record_bits,
+                        geometry_percent,
+                    )
+                    if float(cand_percent) < float(macro_prune_best_percent):
+                        macro_prune_best_percent = float(cand_percent)
+                        macro_prune_best_ratio = float(macro_item.get("drop_ratio", 0.0))
+                        macro_prune_best_drop_count = int(len(unique_indices))
+                        macro_prune_best_variant = str(macro_item.get("variant", ""))
+                        macro_prune_best_proxy_percent = float(proxy_percent)
+                    _update_best(raw_percent, actual_percent, cand_percent, edit_record_bits, cand_bit, proxy_percent)
+                    if cand_percent < -min_improve:
+                        macro_prune_improving_count += 1
+                        improving_candidate_count += 1
+                        improving.append(
+                            {
+                                "op": "macro_prune",
+                                "unique_indices": unique_indices,
+                                "percent": float(cand_percent),
+                                "raw_percent": float(raw_percent),
+                                "actual_percent": float(actual_percent),
+                                "proxy_percent": float(proxy_percent),
+                                "proxy_bits": float(proxy_bits),
+                                "geometry_percent": float(geometry_percent),
+                                "edit_record_bits": float(edit_record_bits),
+                                "edited_actual_bits": float(cand_bit),
+                            }
+                        )
+                    elif cand_percent >= bad_min_percent:
+                        bad_candidate_count += 1
+                        for unique_idx in unique_indices:
+                            mask = inverse == int(unique_idx)
+                            if bool(mask.any().detach().cpu()):
+                                bad_drop_point_mask[0] |= mask
             if max_joint_candidates > 0 and candidate_indices and add_candidates:
                 pair_candidates = []
                 for drop_candidate in candidate_indices:
@@ -2002,19 +3209,17 @@ def _attach_sparsepcgc_actual_oracle_drop(
                             }
                         )
                 pair_candidates = sorted(pair_candidates, key=lambda item: float(item["score"]), reverse=True)
+                debug["generated_candidate_count"] = int(debug.get("generated_candidate_count", 0)) + int(len(pair_candidates))
                 for pair_item in pair_candidates[:max_joint_candidates]:
+                    if _actual_budget_exhausted(tested) or joint_tested >= joint_eval_limit:
+                        break
                     keep_unique = all_unique_idx != int(pair_item["drop_unique_idx"])
                     if int(keep_unique.sum().item()) <= 0:
                         continue
                     target_coord = pair_item["target_coord"].to(device=unique_coords.device, dtype=torch.long).view(1, 3)
                     candidate_coords = torch.cat([unique_coords[keep_unique], target_coord], dim=0)
                     candidate_coords = torch.unique(candidate_coords, dim=0, sorted=True)
-                    candidate_xyz = _restore_codec_xyz_from_global_voxels(
-                        args,
-                        candidate_coords.transpose(0, 1).contiguous().unsqueeze(0),
-                        full_octree_context if isinstance(full_octree_context, dict) else subtree_tree,
-                        subtree_xyz,
-                    )
+                    candidate_xyz = _oracle_actual_eval_xyz(candidate_coords)
                     if candidate_xyz is None or candidate_xyz.shape[-1] <= 0:
                         continue
                     stats = loss._encode_actual_batch(args, candidate_xyz)
@@ -2023,13 +3228,28 @@ def _attach_sparsepcgc_actual_oracle_drop(
                     cand_bit = float(stats.get("bit", 0.0))
                     edit_record_bits = _sparsepcgc_edit_record_total_bits(
                         args,
-                        unique_count,
+                        edit_record_unique_count,
                         drop_count=1,
                         add_count=1,
                     )
-                    raw_percent, cand_percent = _candidate_objective(cand_bit, edit_record_bits)
+                    proxy_bits, proxy_percent = _sparsepcgc_proxy_delta_percent(
+                        candidate_coords,
+                        args,
+                        base_proxy_bits,
+                    )
+                    geometry_percent = _sparsepcgc_geometry_penalty_percent(
+                        args,
+                        edit_record_unique_count,
+                        drop_count=1,
+                        add_count=1,
+                    )
+                    raw_percent, actual_percent, cand_percent = _candidate_objective(
+                        cand_bit,
+                        edit_record_bits,
+                        geometry_percent,
+                    )
                     _sparsepcgc_actual_oracle_update_memory(args, pair_item["pair_memory_key"], cand_percent)
-                    _update_best(raw_percent, cand_percent, edit_record_bits)
+                    _update_best(raw_percent, actual_percent, cand_percent, edit_record_bits, cand_bit, proxy_percent)
                     min_improve = max(float(getattr(args, "sparsepcgc_actual_oracle_min_improve_percent", 0.0)), 0.0)
                     if cand_percent < -min_improve:
                         joint_improving_count += 1
@@ -2043,6 +3263,10 @@ def _attach_sparsepcgc_actual_oracle_drop(
                                 "target_coord": target_coord.detach().clone(),
                                 "percent": float(cand_percent),
                                 "raw_percent": float(raw_percent),
+                                "actual_percent": float(actual_percent),
+                                "proxy_percent": float(proxy_percent),
+                                "proxy_bits": float(proxy_bits),
+                                "geometry_percent": float(geometry_percent),
                                 "edit_record_bits": float(edit_record_bits),
                                 "memory_key": str(pair_item["pair_memory_key"]),
                             }
@@ -2050,10 +3274,6 @@ def _attach_sparsepcgc_actual_oracle_drop(
                     elif cand_percent >= bad_min_percent:
                         bad_candidate_count += 1
 
-            group_candidate_max = max(
-                int(getattr(args, "sparsepcgc_actual_oracle_group_candidate_max", 2)),
-                0,
-            )
             group_voxels = max(
                 int(getattr(args, "sparsepcgc_actual_oracle_group_voxels", 4)),
                 2,
@@ -2123,7 +3343,7 @@ def _attach_sparsepcgc_actual_oracle_drop(
             used_drop_group_sizes = set()
             used_add_group_sizes = set()
             for requested_group_size in group_size_values:
-                if group_candidates_used >= group_candidate_max:
+                if group_candidates_used >= group_eval_limit:
                     break
 
                 drop_group_size = min(int(requested_group_size), len(group_drop_indices_all), max_group_voxels)
@@ -2131,20 +3351,18 @@ def _attach_sparsepcgc_actual_oracle_drop(
                     group_candidate_max > 0
                     and drop_group_size >= 2
                     and drop_group_size not in used_drop_group_sizes
-                    and group_candidates_used < group_candidate_max
+                    and group_candidates_used < group_eval_limit
                 ):
                     used_drop_group_sizes.add(drop_group_size)
+                    debug["generated_candidate_count"] = int(debug.get("generated_candidate_count", 0)) + 1
+                    if _actual_budget_exhausted(tested):
+                        break
                     group_drop_indices = group_drop_indices_all[:drop_group_size]
                     keep_unique = torch.ones((unique_coords.shape[0],), device=coords.device, dtype=torch.bool)
                     keep_unique[torch.as_tensor(group_drop_indices, device=coords.device, dtype=torch.long)] = False
                     if int(keep_unique.sum().item()) > 0:
-                        candidate_coords = unique_coords[keep_unique].transpose(0, 1).contiguous().unsqueeze(0)
-                        candidate_xyz = _restore_codec_xyz_from_global_voxels(
-                            args,
-                            candidate_coords,
-                            full_octree_context if isinstance(full_octree_context, dict) else subtree_tree,
-                            subtree_xyz,
-                        )
+                        candidate_coords = unique_coords[keep_unique]
+                        candidate_xyz = _oracle_actual_eval_xyz(candidate_coords)
                         if candidate_xyz is not None and candidate_xyz.shape[-1] > 0:
                             stats = loss._encode_actual_batch(args, candidate_xyz)
                             tested += 1
@@ -2153,11 +3371,25 @@ def _attach_sparsepcgc_actual_oracle_drop(
                             cand_bit = float(stats.get("bit", 0.0))
                             edit_record_bits = _sparsepcgc_edit_record_total_bits(
                                 args,
-                                unique_count,
+                                edit_record_unique_count,
                                 drop_count=len(group_drop_indices),
                             )
-                            raw_percent, cand_percent = _candidate_objective(cand_bit, edit_record_bits)
-                            _update_best(raw_percent, cand_percent, edit_record_bits)
+                            proxy_bits, proxy_percent = _sparsepcgc_proxy_delta_percent(
+                                unique_coords[keep_unique],
+                                args,
+                                base_proxy_bits,
+                            )
+                            geometry_percent = _sparsepcgc_geometry_penalty_percent(
+                                args,
+                                edit_record_unique_count,
+                                drop_count=len(group_drop_indices),
+                            )
+                            raw_percent, actual_percent, cand_percent = _candidate_objective(
+                                cand_bit,
+                                edit_record_bits,
+                                geometry_percent,
+                            )
+                            _update_best(raw_percent, actual_percent, cand_percent, edit_record_bits, cand_bit, proxy_percent)
                             if cand_percent < -min_improve:
                                 group_improving_count += 1
                                 improving_candidate_count += 1
@@ -2167,6 +3399,10 @@ def _attach_sparsepcgc_actual_oracle_drop(
                                         "unique_indices": list(group_drop_indices),
                                         "percent": float(cand_percent),
                                         "raw_percent": float(raw_percent),
+                                        "actual_percent": float(actual_percent),
+                                        "proxy_percent": float(proxy_percent),
+                                        "proxy_bits": float(proxy_bits),
+                                        "geometry_percent": float(geometry_percent),
                                         "edit_record_bits": float(edit_record_bits),
                                     }
                                 )
@@ -2182,9 +3418,12 @@ def _attach_sparsepcgc_actual_oracle_drop(
                     group_candidate_max > 0
                     and add_group_size >= 2
                     and add_group_size not in used_add_group_sizes
-                    and group_candidates_used < group_candidate_max
+                    and group_candidates_used < group_eval_limit
                 ):
                     used_add_group_sizes.add(add_group_size)
+                    debug["generated_candidate_count"] = int(debug.get("generated_candidate_count", 0)) + 1
+                    if _actual_budget_exhausted(tested):
+                        break
                     group_add_items = group_add_items_all[:add_group_size]
                     target_coords = [
                         item["target_coord"].to(device=unique_coords.device, dtype=torch.long).view(1, 3)
@@ -2193,12 +3432,7 @@ def _attach_sparsepcgc_actual_oracle_drop(
                     candidate_coords = torch.cat([unique_coords] + target_coords, dim=0)
                     candidate_coords = torch.unique(candidate_coords, dim=0, sorted=True)
                     if int(candidate_coords.shape[0]) > int(unique_coords.shape[0]):
-                        candidate_xyz = _restore_codec_xyz_from_global_voxels(
-                            args,
-                            candidate_coords.transpose(0, 1).contiguous().unsqueeze(0),
-                            full_octree_context if isinstance(full_octree_context, dict) else subtree_tree,
-                            subtree_xyz,
-                        )
+                        candidate_xyz = _oracle_actual_eval_xyz(candidate_coords)
                         if candidate_xyz is not None and candidate_xyz.shape[-1] > 0:
                             stats = loss._encode_actual_batch(args, candidate_xyz)
                             tested += 1
@@ -2207,11 +3441,25 @@ def _attach_sparsepcgc_actual_oracle_drop(
                             cand_bit = float(stats.get("bit", 0.0))
                             edit_record_bits = _sparsepcgc_edit_record_total_bits(
                                 args,
-                                unique_count,
+                                edit_record_unique_count,
                                 add_count=len(group_add_items),
                             )
-                            raw_percent, cand_percent = _candidate_objective(cand_bit, edit_record_bits)
-                            _update_best(raw_percent, cand_percent, edit_record_bits)
+                            proxy_bits, proxy_percent = _sparsepcgc_proxy_delta_percent(
+                                candidate_coords,
+                                args,
+                                base_proxy_bits,
+                            )
+                            geometry_percent = _sparsepcgc_geometry_penalty_percent(
+                                args,
+                                edit_record_unique_count,
+                                add_count=len(group_add_items),
+                            )
+                            raw_percent, actual_percent, cand_percent = _candidate_objective(
+                                cand_bit,
+                                edit_record_bits,
+                                geometry_percent,
+                            )
+                            _update_best(raw_percent, actual_percent, cand_percent, edit_record_bits, cand_bit, proxy_percent)
                             if cand_percent < -min_improve:
                                 group_improving_count += 1
                                 improving_candidate_count += 1
@@ -2227,6 +3475,10 @@ def _attach_sparsepcgc_actual_oracle_drop(
                                         "target_coords": torch.cat(target_coords, dim=0).detach().clone(),
                                         "percent": float(cand_percent),
                                         "raw_percent": float(raw_percent),
+                                        "actual_percent": float(actual_percent),
+                                        "proxy_percent": float(proxy_percent),
+                                        "proxy_bits": float(proxy_bits),
+                                        "geometry_percent": float(geometry_percent),
                                         "edit_record_bits": float(edit_record_bits),
                                     }
                                 )
@@ -2238,10 +3490,6 @@ def _attach_sparsepcgc_actual_oracle_drop(
                                     if bool(mask.any().detach().cpu()):
                                         bad_add_point_mask[0] |= mask
 
-            parent_prune_max = max(
-                int(getattr(args, "sparsepcgc_actual_oracle_parent_prune_candidate_max", 2)),
-                0,
-            )
             if parent_prune_max > 0 and unique_count > 1:
                 parent_coords = torch.div(unique_coords, 2, rounding_mode="floor")
                 unique_parents, parent_inverse = torch.unique(
@@ -2300,7 +3548,12 @@ def _attach_sparsepcgc_actual_oracle_drop(
                         )
                         parent_items.append((float(parent_score), int(parent_idx), key, bool(seen_memory), int(drop_count)))
                     parent_items.sort(key=lambda item: item[0], reverse=True)
+                    debug["generated_candidate_count"] = int(debug.get("generated_candidate_count", 0)) + int(
+                        min(parent_prune_max, len(parent_items))
+                    )
                     for _score, parent_idx, parent_key, _seen_memory, drop_count in parent_items[:parent_prune_max]:
+                        if _actual_budget_exhausted(tested) or parent_prune_tested >= parent_prune_eval_limit:
+                            break
                         parent_drop_indices = (parent_inverse == int(parent_idx)).nonzero(as_tuple=False).reshape(-1)
                         if int(parent_drop_indices.numel()) != int(drop_count):
                             continue
@@ -2308,13 +3561,8 @@ def _attach_sparsepcgc_actual_oracle_drop(
                         keep_unique[parent_drop_indices] = False
                         if int(keep_unique.sum().item()) <= 0:
                             continue
-                        candidate_coords = unique_coords[keep_unique].transpose(0, 1).contiguous().unsqueeze(0)
-                        candidate_xyz = _restore_codec_xyz_from_global_voxels(
-                            args,
-                            candidate_coords,
-                            full_octree_context if isinstance(full_octree_context, dict) else subtree_tree,
-                            subtree_xyz,
-                        )
+                        candidate_coords = unique_coords[keep_unique]
+                        candidate_xyz = _oracle_actual_eval_xyz(candidate_coords)
                         if candidate_xyz is None or candidate_xyz.shape[-1] <= 0:
                             continue
                         stats = loss._encode_actual_batch(args, candidate_xyz)
@@ -2323,21 +3571,39 @@ def _attach_sparsepcgc_actual_oracle_drop(
                         cand_bit = float(stats.get("bit", 0.0))
                         edit_record_bits = _sparsepcgc_edit_record_total_bits(
                             args,
-                            unique_count,
+                            edit_record_unique_count,
                             drop_count=int(parent_drop_indices.numel()),
                         )
-                        raw_percent, cand_percent = _candidate_objective(cand_bit, edit_record_bits)
+                        proxy_bits, proxy_percent = _sparsepcgc_proxy_delta_percent(
+                            unique_coords[keep_unique],
+                            args,
+                            base_proxy_bits,
+                        )
+                        geometry_percent = _sparsepcgc_geometry_penalty_percent(
+                            args,
+                            edit_record_unique_count,
+                            drop_count=int(parent_drop_indices.numel()),
+                        )
+                        raw_percent, actual_percent, cand_percent = _candidate_objective(
+                            cand_bit,
+                            edit_record_bits,
+                            geometry_percent,
+                        )
                         _sparsepcgc_actual_oracle_update_memory(args, parent_key, cand_percent)
-                        _update_best(raw_percent, cand_percent, edit_record_bits)
+                        _update_best(raw_percent, actual_percent, cand_percent, edit_record_bits, cand_bit, proxy_percent)
                         if cand_percent < -min_improve:
                             parent_prune_improving_count += 1
                             improving_candidate_count += 1
                             improving.append(
                                 {
-                                    "op": "drop_group",
+                                    "op": "parent_collapse",
                                     "unique_indices": [int(v) for v in parent_drop_indices.detach().cpu().tolist()],
                                     "percent": float(cand_percent),
                                     "raw_percent": float(raw_percent),
+                                    "actual_percent": float(actual_percent),
+                                    "proxy_percent": float(proxy_percent),
+                                    "proxy_bits": float(proxy_bits),
+                                    "geometry_percent": float(geometry_percent),
                                     "edit_record_bits": float(edit_record_bits),
                                     "memory_key": parent_key,
                                 }
@@ -2349,27 +3615,22 @@ def _attach_sparsepcgc_actual_oracle_drop(
                                 if bool(mask.any().detach().cpu()):
                                     bad_drop_point_mask[0] |= mask
 
-            pattern_plan_max = max(
-                int(getattr(args, "sparsepcgc_actual_oracle_pattern_plan_candidate_max", 2)),
-                0,
-            )
             if pattern_plan_max > 0:
                 pattern_candidates = _sparsepcgc_actual_oracle_pattern_plan_candidates(
                     unique_coords,
                     args,
                     global_step,
                     pattern_plan_max,
+                    base_proxy_bits=base_proxy_bits,
                 )
+                debug["generated_candidate_count"] = int(debug.get("generated_candidate_count", 0)) + int(len(pattern_candidates))
                 for plan_item in pattern_candidates:
+                    if _actual_budget_exhausted(tested) or pattern_plan_tested >= pattern_plan_eval_limit:
+                        break
                     candidate_coords = plan_item.get("transformed_coords", None)
                     if not torch.is_tensor(candidate_coords):
                         continue
-                    candidate_xyz = _restore_codec_xyz_from_global_voxels(
-                        args,
-                        candidate_coords.transpose(0, 1).contiguous().unsqueeze(0),
-                        full_octree_context if isinstance(full_octree_context, dict) else subtree_tree,
-                        subtree_xyz,
-                    )
+                    candidate_xyz = _oracle_actual_eval_xyz(candidate_coords)
                     if candidate_xyz is None or candidate_xyz.shape[-1] <= 0:
                         continue
                     stats = loss._encode_actual_batch(args, candidate_xyz)
@@ -2380,14 +3641,29 @@ def _attach_sparsepcgc_actual_oracle_drop(
                     add_items = list(plan_item.get("add_items", []) or [])
                     edit_record_bits = _sparsepcgc_edit_record_total_bits(
                         args,
-                        unique_count,
+                        edit_record_unique_count,
                         drop_count=len(drop_indices),
                         add_count=len(add_items),
                     )
-                    raw_percent, cand_percent = _candidate_objective(cand_bit, edit_record_bits)
+                    proxy_bits, proxy_percent = _sparsepcgc_proxy_delta_percent(
+                        candidate_coords,
+                        args,
+                        base_proxy_bits,
+                    )
+                    geometry_percent = _sparsepcgc_geometry_penalty_percent(
+                        args,
+                        edit_record_unique_count,
+                        drop_count=len(drop_indices),
+                        add_count=len(add_items),
+                    )
+                    raw_percent, actual_percent, cand_percent = _candidate_objective(
+                        cand_bit,
+                        edit_record_bits,
+                        geometry_percent,
+                    )
                     plan_memory_key = str(plan_item.get("memory_key", ""))
                     _sparsepcgc_actual_oracle_update_memory(args, plan_memory_key, cand_percent)
-                    _update_best(raw_percent, cand_percent, edit_record_bits)
+                    _update_best(raw_percent, actual_percent, cand_percent, edit_record_bits, cand_bit, proxy_percent)
                     if cand_percent < -min_improve:
                         pattern_plan_improving_count += 1
                         improving_candidate_count += 1
@@ -2399,6 +3675,10 @@ def _attach_sparsepcgc_actual_oracle_drop(
                                 "final_coords": candidate_coords.detach().clone(),
                                 "percent": float(cand_percent),
                                 "raw_percent": float(raw_percent),
+                                "actual_percent": float(actual_percent),
+                                "proxy_percent": float(proxy_percent),
+                                "proxy_bits": float(proxy_bits),
+                                "geometry_percent": float(geometry_percent),
                                 "edit_record_bits": float(edit_record_bits),
                                 "memory_key": plan_memory_key,
                                 "score_hint": float(plan_item.get("score", 0.0)),
@@ -2421,32 +3701,22 @@ def _attach_sparsepcgc_actual_oracle_drop(
                                 if 0 <= target_slot <= 7:
                                     bad_add_child_slot[0, mask] = target_slot
 
-            subtree_move_tested = 0
-            subtree_move_improving_count = 0
-            subtree_move_interval = max(
-                int(getattr(args, "sparsepcgc_actual_oracle_subtree_move_interval", 4)),
-                1,
-            )
-            if (
-                bool(getattr(args, "sparsepcgc_actual_oracle_allow_subtree_move", True))
-                and (int(global_step) % subtree_move_interval) == 0
-            ):
+            if subtree_move_allowed_this_step:
                 subtree_move_candidates = _sparsepcgc_actual_oracle_subtree_move_candidates(
                     unique_coords,
                     args,
                     global_step,
-                    max(int(getattr(args, "sparsepcgc_actual_oracle_subtree_move_candidate_max", 2)), 0),
+                    subtree_move_max,
+                    base_proxy_bits=base_proxy_bits,
                 )
+                debug["generated_candidate_count"] = int(debug.get("generated_candidate_count", 0)) + int(len(subtree_move_candidates))
                 for move_item in subtree_move_candidates:
+                    if _actual_budget_exhausted(tested) or subtree_move_tested >= subtree_move_eval_limit:
+                        break
                     candidate_coords = move_item.get("transformed_coords", None)
                     if not torch.is_tensor(candidate_coords):
                         continue
-                    candidate_xyz = _restore_codec_xyz_from_global_voxels(
-                        args,
-                        candidate_coords.transpose(0, 1).contiguous().unsqueeze(0),
-                        full_octree_context if isinstance(full_octree_context, dict) else subtree_tree,
-                        subtree_xyz,
-                    )
+                    candidate_xyz = _oracle_actual_eval_xyz(candidate_coords)
                     if candidate_xyz is None or candidate_xyz.shape[-1] <= 0:
                         continue
                     stats = loss._encode_actual_batch(args, candidate_xyz)
@@ -2455,14 +3725,29 @@ def _attach_sparsepcgc_actual_oracle_drop(
                     cand_bit = float(stats.get("bit", 0.0))
                     edit_record_bits = _sparsepcgc_edit_record_total_bits(
                         args,
-                        unique_count,
+                        edit_record_unique_count,
                         subtree_move_count=int(move_item.get("moved_count", 0)),
                         subtree_move_level_shift=int(move_item.get("level_shift", 1)),
                     )
-                    raw_percent, cand_percent = _candidate_objective(cand_bit, edit_record_bits)
+                    proxy_bits, proxy_percent = _sparsepcgc_proxy_delta_percent(
+                        candidate_coords,
+                        args,
+                        base_proxy_bits,
+                    )
+                    geometry_percent = _sparsepcgc_geometry_penalty_percent(
+                        args,
+                        edit_record_unique_count,
+                        move_count=int(move_item.get("moved_count", 0)),
+                        level_shift=int(move_item.get("level_shift", 1)),
+                    )
+                    raw_percent, actual_percent, cand_percent = _candidate_objective(
+                        cand_bit,
+                        edit_record_bits,
+                        geometry_percent,
+                    )
                     move_memory_key = str(move_item.get("memory_key", ""))
                     _sparsepcgc_actual_oracle_update_memory(args, move_memory_key, cand_percent)
-                    _update_best(raw_percent, cand_percent, edit_record_bits)
+                    _update_best(raw_percent, actual_percent, cand_percent, edit_record_bits, cand_bit, proxy_percent)
                     if cand_percent < -min_improve:
                         subtree_move_improving_count += 1
                         improving_candidate_count += 1
@@ -2477,6 +3762,10 @@ def _attach_sparsepcgc_actual_oracle_drop(
                                 "target_slot": int(move_item.get("target_slot", -1)),
                                 "percent": float(cand_percent),
                                 "raw_percent": float(raw_percent),
+                                "actual_percent": float(actual_percent),
+                                "proxy_percent": float(proxy_percent),
+                                "proxy_bits": float(proxy_bits),
+                                "geometry_percent": float(geometry_percent),
                                 "edit_record_bits": float(edit_record_bits),
                                 "memory_key": move_memory_key,
                             }
@@ -2494,6 +3783,22 @@ def _attach_sparsepcgc_actual_oracle_drop(
             debug["improving_candidate_count"] = int(improving_candidate_count)
             debug["joint_tested_count"] = int(joint_tested)
             debug["joint_improving_count"] = int(joint_improving_count)
+            debug["full_cloud_macro_tested_count"] = int(full_cloud_macro_tested)
+            debug["full_cloud_macro_improving_count"] = int(full_cloud_macro_improving_count)
+            debug["full_cloud_macro_best_percent"] = (
+                float(full_cloud_macro_best_percent) if math.isfinite(float(full_cloud_macro_best_percent)) else 0.0
+            )
+            debug["full_cloud_macro_best_ratio"] = float(full_cloud_macro_best_ratio)
+            debug["full_cloud_macro_best_drop_count"] = int(full_cloud_macro_best_drop_count)
+            debug["macro_prune_tested_count"] = int(macro_prune_tested)
+            debug["macro_prune_improving_count"] = int(macro_prune_improving_count)
+            debug["macro_prune_best_percent"] = (
+                float(macro_prune_best_percent) if math.isfinite(float(macro_prune_best_percent)) else 0.0
+            )
+            debug["macro_prune_best_ratio"] = float(macro_prune_best_ratio)
+            debug["macro_prune_best_drop_count"] = int(macro_prune_best_drop_count)
+            debug["macro_prune_best_variant"] = str(macro_prune_best_variant)
+            debug["macro_prune_best_proxy_percent"] = float(macro_prune_best_proxy_percent)
             debug["group_tested_count"] = int(group_tested)
             debug["group_improving_count"] = int(group_improving_count)
             debug["pattern_plan_tested_count"] = int(pattern_plan_tested)
@@ -2518,7 +3823,13 @@ def _attach_sparsepcgc_actual_oracle_drop(
                 override_final_voxel_coords = None
                 current_combo_percent = 0.0
                 selected_raw_percent = 0.0
+                selected_actual_percent = 0.0
+                selected_proxy_percent = 0.0
+                selected_geometry_percent = 0.0
+                selected_edited_actual_bits = float(base_bit)
                 selected_edit_record_bits = 0.0
+                accepted_parent_collapse_count = 0
+                accepted_pattern_canonicalize_count = 0
 
                 def _combo_coords(drop_set, add_targets):
                     keep_unique = torch.ones((unique_coords.shape[0],), device=coords.device, dtype=torch.bool)
@@ -2564,6 +3875,14 @@ def _attach_sparsepcgc_actual_oracle_drop(
                     selected_add_targets.append(target_coord_item.detach().clone())
                     selected_add += 1
 
+                def _item_edited_actual_bits(item):
+                    if not isinstance(item, dict):
+                        return float(base_bit)
+                    if "edited_actual_bits" in item:
+                        return float(item.get("edited_actual_bits", base_bit))
+                    raw_percent_value = float(item.get("raw_percent", 0.0) or 0.0)
+                    return float(base_bit * (1.0 + raw_percent_value / 100.0))
+
                 for item in improving:
                     if selected_move > 0:
                         break
@@ -2582,6 +3901,10 @@ def _attach_sparsepcgc_actual_oracle_drop(
                         selected_move = int(item.get("moved_count", 0))
                         current_combo_percent = float(item["percent"])
                         selected_raw_percent = float(item.get("raw_percent", item["percent"]))
+                        selected_actual_percent = float(item.get("actual_percent", item["percent"]))
+                        selected_proxy_percent = float(item.get("proxy_percent", 0.0))
+                        selected_geometry_percent = float(item.get("geometry_percent", 0.0))
+                        selected_edited_actual_bits = _item_edited_actual_bits(item)
                         selected_edit_record_bits = float(item.get("edit_record_bits", 0.0))
                         source_unique_indices = item.get("source_unique_indices", None)
                         if torch.is_tensor(source_unique_indices):
@@ -2607,8 +3930,13 @@ def _attach_sparsepcgc_actual_oracle_drop(
                             continue
                         if len(drop_indices) + len(add_items) > max_selected:
                             continue
+                        accepted_pattern_canonicalize_count = 1
                         current_combo_percent = float(item["percent"])
                         selected_raw_percent = float(item.get("raw_percent", item["percent"]))
+                        selected_actual_percent = float(item.get("actual_percent", item["percent"]))
+                        selected_proxy_percent = float(item.get("proxy_percent", 0.0))
+                        selected_geometry_percent = float(item.get("geometry_percent", 0.0))
+                        selected_edited_actual_bits = _item_edited_actual_bits(item)
                         selected_edit_record_bits = float(item.get("edit_record_bits", 0.0))
                         for unique_idx in drop_indices:
                             _mark_drop(int(unique_idx), strength)
@@ -2638,6 +3966,10 @@ def _attach_sparsepcgc_actual_oracle_drop(
                             continue
                         current_combo_percent = float(item["percent"])
                         selected_raw_percent = float(item.get("raw_percent", item["percent"]))
+                        selected_actual_percent = float(item.get("actual_percent", item["percent"]))
+                        selected_proxy_percent = float(item.get("proxy_percent", 0.0))
+                        selected_geometry_percent = float(item.get("geometry_percent", 0.0))
+                        selected_edited_actual_bits = _item_edited_actual_bits(item)
                         selected_edit_record_bits = float(item.get("edit_record_bits", 0.0))
                         _mark_drop(unique_idx, strength)
                         _mark_add(
@@ -2648,14 +3980,20 @@ def _attach_sparsepcgc_actual_oracle_drop(
                         )
                         continue
 
-                    if op_name == "drop_group":
+                    if op_name in {"drop_group", "parent_collapse", "macro_prune"}:
                         if selected_drop + selected_add > 0:
                             continue
                         unique_indices = [int(v) for v in item.get("unique_indices", [])]
                         if not unique_indices:
                             continue
+                        if op_name == "parent_collapse":
+                            accepted_parent_collapse_count = 1
                         current_combo_percent = float(item["percent"])
                         selected_raw_percent = float(item.get("raw_percent", item["percent"]))
+                        selected_actual_percent = float(item.get("actual_percent", item["percent"]))
+                        selected_proxy_percent = float(item.get("proxy_percent", 0.0))
+                        selected_geometry_percent = float(item.get("geometry_percent", 0.0))
+                        selected_edited_actual_bits = _item_edited_actual_bits(item)
                         selected_edit_record_bits = float(item.get("edit_record_bits", 0.0))
                         for unique_idx in unique_indices[:max_selected]:
                             if selected_drop + selected_add >= max_selected:
@@ -2673,6 +4011,10 @@ def _attach_sparsepcgc_actual_oracle_drop(
                             continue
                         current_combo_percent = float(item["percent"])
                         selected_raw_percent = float(item.get("raw_percent", item["percent"]))
+                        selected_actual_percent = float(item.get("actual_percent", item["percent"]))
+                        selected_proxy_percent = float(item.get("proxy_percent", 0.0))
+                        selected_geometry_percent = float(item.get("geometry_percent", 0.0))
+                        selected_edited_actual_bits = _item_edited_actual_bits(item)
                         selected_edit_record_bits = float(item.get("edit_record_bits", 0.0))
                         target_coords = target_coords.to(device=coords.device, dtype=torch.long).view(-1, 3)
                         for local_idx, source_unique_idx in enumerate(source_indices):
@@ -2695,22 +4037,23 @@ def _attach_sparsepcgc_actual_oracle_drop(
                         if selected_drop + selected_add == 0:
                             current_combo_percent = float(item["percent"])
                             selected_raw_percent = float(item.get("raw_percent", item["percent"]))
+                            selected_actual_percent = float(item.get("actual_percent", item["percent"]))
+                            selected_proxy_percent = float(item.get("proxy_percent", 0.0))
+                            selected_geometry_percent = float(item.get("geometry_percent", 0.0))
+                            selected_edited_actual_bits = _item_edited_actual_bits(item)
                             selected_edit_record_bits = float(item.get("edit_record_bits", 0.0))
                             _mark_drop(unique_idx, strength)
                             continue
                         if combo_extra_count >= combo_validate_max_extra:
+                            continue
+                        if _actual_budget_exhausted(tested):
                             continue
                         trial_drop = set(dropped_unique)
                         trial_drop.add(unique_idx)
                         trial_coords = _combo_coords(trial_drop, selected_add_targets)
                         if int(trial_coords.shape[0]) <= 0:
                             continue
-                        trial_xyz = _restore_codec_xyz_from_global_voxels(
-                            args,
-	                            trial_coords.transpose(0, 1).contiguous().unsqueeze(0),
-	                            full_octree_context if isinstance(full_octree_context, dict) else subtree_tree,
-	                            subtree_xyz,
-	                        )
+                        trial_xyz = _oracle_actual_eval_xyz(trial_coords)
                         if trial_xyz is None or trial_xyz.shape[-1] <= 0:
                             continue
                         trial_stats = loss._encode_actual_batch(args, trial_xyz)
@@ -2719,18 +4062,34 @@ def _attach_sparsepcgc_actual_oracle_drop(
                         trial_bit = float(trial_stats.get("bit", 0.0))
                         trial_edit_record_bits = _sparsepcgc_edit_record_total_bits(
                             args,
-                            unique_count,
+                            edit_record_unique_count,
                             drop_count=len(trial_drop),
                             add_count=len(selected_add_targets),
                         )
-                        trial_raw_percent, trial_percent = _candidate_objective(
+                        trial_proxy_bits, trial_proxy_percent = _sparsepcgc_proxy_delta_percent(
+                            trial_coords,
+                            args,
+                            base_proxy_bits,
+                        )
+                        trial_geometry_percent = _sparsepcgc_geometry_penalty_percent(
+                            args,
+                            edit_record_unique_count,
+                            drop_count=len(trial_drop),
+                            add_count=len(selected_add_targets),
+                        )
+                        trial_raw_percent, trial_actual_percent, trial_percent = _candidate_objective(
                             trial_bit,
                             trial_edit_record_bits,
+                            trial_geometry_percent,
                         )
                         if trial_percent >= current_combo_percent:
                             continue
                         current_combo_percent = float(trial_percent)
                         selected_raw_percent = float(trial_raw_percent)
+                        selected_actual_percent = float(trial_actual_percent)
+                        selected_proxy_percent = float(trial_proxy_percent)
+                        selected_geometry_percent = float(trial_geometry_percent)
+                        selected_edited_actual_bits = float(trial_bit)
                         selected_edit_record_bits = float(trial_edit_record_bits)
                         _mark_drop(unique_idx, strength)
                     elif op_name == "add":
@@ -2743,6 +4102,10 @@ def _attach_sparsepcgc_actual_oracle_drop(
                         if selected_drop + selected_add == 0:
                             current_combo_percent = float(item["percent"])
                             selected_raw_percent = float(item.get("raw_percent", item["percent"]))
+                            selected_actual_percent = float(item.get("actual_percent", item["percent"]))
+                            selected_proxy_percent = float(item.get("proxy_percent", 0.0))
+                            selected_geometry_percent = float(item.get("geometry_percent", 0.0))
+                            selected_edited_actual_bits = _item_edited_actual_bits(item)
                             selected_edit_record_bits = float(item.get("edit_record_bits", 0.0))
                             _mark_add(
                                 source_unique_idx,
@@ -2753,14 +4116,11 @@ def _attach_sparsepcgc_actual_oracle_drop(
                             continue
                         if combo_extra_count >= combo_validate_max_extra:
                             continue
+                        if _actual_budget_exhausted(tested):
+                            continue
                         trial_targets = list(selected_add_targets) + [target_coord_item.detach().clone()]
                         trial_coords = _combo_coords(dropped_unique, trial_targets)
-                        trial_xyz = _restore_codec_xyz_from_global_voxels(
-                            args,
-	                            trial_coords.transpose(0, 1).contiguous().unsqueeze(0),
-	                            full_octree_context if isinstance(full_octree_context, dict) else subtree_tree,
-	                            subtree_xyz,
-	                        )
+                        trial_xyz = _oracle_actual_eval_xyz(trial_coords)
                         if trial_xyz is None or trial_xyz.shape[-1] <= 0:
                             continue
                         trial_stats = loss._encode_actual_batch(args, trial_xyz)
@@ -2769,18 +4129,34 @@ def _attach_sparsepcgc_actual_oracle_drop(
                         trial_bit = float(trial_stats.get("bit", 0.0))
                         trial_edit_record_bits = _sparsepcgc_edit_record_total_bits(
                             args,
-                            unique_count,
+                            edit_record_unique_count,
                             drop_count=len(dropped_unique),
                             add_count=len(trial_targets),
                         )
-                        trial_raw_percent, trial_percent = _candidate_objective(
+                        trial_proxy_bits, trial_proxy_percent = _sparsepcgc_proxy_delta_percent(
+                            trial_coords,
+                            args,
+                            base_proxy_bits,
+                        )
+                        trial_geometry_percent = _sparsepcgc_geometry_penalty_percent(
+                            args,
+                            edit_record_unique_count,
+                            drop_count=len(dropped_unique),
+                            add_count=len(trial_targets),
+                        )
+                        trial_raw_percent, trial_actual_percent, trial_percent = _candidate_objective(
                             trial_bit,
                             trial_edit_record_bits,
+                            trial_geometry_percent,
                         )
                         if trial_percent >= current_combo_percent:
                             continue
                         current_combo_percent = float(trial_percent)
                         selected_raw_percent = float(trial_raw_percent)
+                        selected_actual_percent = float(trial_actual_percent)
+                        selected_proxy_percent = float(trial_proxy_percent)
+                        selected_geometry_percent = float(trial_geometry_percent)
+                        selected_edited_actual_bits = float(trial_bit)
                         selected_edit_record_bits = float(trial_edit_record_bits)
                         _mark_add(
                             source_unique_idx,
@@ -2796,7 +4172,18 @@ def _attach_sparsepcgc_actual_oracle_drop(
                 debug["selected_drop_count"] = int(selected_drop)
                 debug["selected_add_count"] = int(selected_add)
                 debug["selected_move_count"] = int(selected_move)
+                debug["accepted_candidate_count"] = int(1 if debug["used"] else 0)
+                debug["accepted_prune_count"] = int(selected_drop)
+                debug["accepted_add_count"] = int(selected_add)
+                debug["accepted_adjust_count"] = 0
+                debug["accepted_subtree_move_count"] = int(1 if selected_move > 0 else 0)
+                debug["accepted_parent_collapse_count"] = int(accepted_parent_collapse_count)
+                debug["accepted_pattern_canonicalize_count"] = int(accepted_pattern_canonicalize_count)
                 debug["selected_raw_percent"] = float(selected_raw_percent)
+                debug["delta_actual_percent"] = float(selected_actual_percent)
+                debug["selected_proxy_percent"] = float(selected_proxy_percent)
+                debug["selected_geometry_percent"] = float(selected_geometry_percent)
+                debug["edited_actual_bits"] = float(selected_edited_actual_bits)
                 debug["selected_edit_record_bits"] = float(selected_edit_record_bits)
                 if override_final_voxel_coords is not None:
                     debug["override_final_voxel_coords"] = override_final_voxel_coords.detach().clone()
@@ -2813,8 +4200,29 @@ def _attach_sparsepcgc_actual_oracle_drop(
                     debug["reason"] = "actual_improving_drop_found"
             else:
                 debug["reason"] = "no_actual_improving_candidate"
+            debug["tested_count"] = int(tested)
+            debug["best_percent"] = float(best_percent)
+            debug["best_raw_percent"] = float(best_raw_percent)
+            debug["best_actual_percent"] = float(best_actual_percent)
+            debug["best_proxy_percent"] = float(best_proxy_percent)
+            debug["best_edit_record_bits"] = float(best_edit_record_bits)
+            debug["best_edited_actual_bits"] = float(best_edited_actual_bits)
+            if (
+                not bool(debug.get("used", False))
+                and bool(getattr(args, "sparsepcgc_actual_oracle_force_no_edit", False))
+                and float(getattr(args, "sparsepcgc_actual_oracle_noop_weight", 0.0)) > 0.0
+            ):
+                debug["noop_label_count"] = int(unique_count)
+                debug["noop_label_weight"] = float(getattr(args, "sparsepcgc_actual_oracle_noop_weight", 0.0))
+            debug["actual_oracle_time"] = float(time.time() - oracle_time_start)
         except Exception as exc:
             debug["reason"] = f"oracle_error:{exc}"
+            debug["actual_oracle_time"] = float(time.time() - oracle_time_start)
+
+    if actual_validate_this_step and (not bool(debug.get("used", False))) and fast_diagnostic_indices:
+        previous_reason = str(debug.get("reason", ""))
+        if _apply_fast_diagnostic_teacher():
+            debug["reason"] = f"fast_diagnostic_after_actual_reject:{previous_reason}"
 
     oracle_enabled = bool(
         debug["used"] or bool(getattr(args, "sparsepcgc_actual_oracle_force_no_edit", True))
@@ -2825,12 +4233,31 @@ def _attach_sparsepcgc_actual_oracle_drop(
         "actual_oracle_drop_score": score.detach(),
         "actual_oracle_drop_bad_mask": bad_drop_point_mask.detach(),
         "actual_oracle_drop_bad_score": bad_drop_score.detach(),
-        "actual_oracle_drop_used": bool(debug["used"]),
+        "actual_oracle_drop_used": bool(point_mask.any().detach().cpu()),
         "actual_oracle_drop_best_percent": float(debug["best_percent"]),
         "actual_oracle_drop_tested_count": int(debug["tested_count"]),
         "actual_oracle_bad_candidate_count": int(debug["bad_candidate_count"]),
         "actual_oracle_improving_candidate_count": int(debug["improving_candidate_count"]),
         "actual_oracle_combo_extra_count": int(debug["combo_extra_count"]),
+        "actual_oracle_generated_candidate_count": int(debug.get("generated_candidate_count", debug.get("candidate_pool_count", 0))),
+        "actual_oracle_accepted_candidate_count": int(debug.get("accepted_candidate_count", 0)),
+        "actual_oracle_accepted_prune_count": int(debug.get("accepted_prune_count", 0)),
+        "actual_oracle_accepted_add_count": int(debug.get("accepted_add_count", 0)),
+        "actual_oracle_accepted_adjust_count": int(debug.get("accepted_adjust_count", 0)),
+        "actual_oracle_accepted_subtree_move_count": int(debug.get("accepted_subtree_move_count", 0)),
+        "actual_oracle_accepted_parent_collapse_count": int(debug.get("accepted_parent_collapse_count", 0)),
+        "actual_oracle_accepted_pattern_canonicalize_count": int(debug.get("accepted_pattern_canonicalize_count", 0)),
+        "actual_oracle_noop_label_count": int(debug.get("noop_label_count", 0)),
+        "actual_oracle_noop_label_weight": float(debug.get("noop_label_weight", 0.0)),
+        "actual_oracle_high_rate_mppov_count": int(debug.get("high_rate_mppov_count", 0)),
+        "actual_oracle_low_prob_occupied_count": int(debug.get("low_prob_occupied_count", 0)),
+        "actual_oracle_single_child_chain_count": int(debug.get("single_child_chain_count", 0)),
+        "actual_oracle_context_pattern_candidate_count": int(debug.get("context_pattern_candidate_count", 0)),
+        "actual_oracle_eval_count": int(debug.get("tested_count", 0)),
+        "actual_oracle_eval_max": int(debug.get("actual_eval_max", 0)),
+        "actual_oracle_eval_scope": str(debug.get("actual_eval_scope", "")),
+        "actual_oracle_eval_full_coord_count": int(debug.get("actual_eval_full_coord_count", 0)),
+        "actual_oracle_time": float(debug.get("actual_oracle_time", 0.0)),
         "actual_oracle_drop_reason": str(debug["reason"]),
         "actual_oracle_add_mask": add_point_mask.detach(),
         "actual_oracle_add_score": add_score.detach(),
@@ -2841,6 +4268,7 @@ def _attach_sparsepcgc_actual_oracle_drop(
         "actual_oracle_add_bad_score": bad_add_score.detach(),
         "actual_oracle_bad_add_child_slot": bad_add_child_slot.detach(),
         "actual_oracle_add_used": bool(add_point_mask.any().detach().cpu()),
+        "actual_oracle_move_used": bool(move_point_mask.any().detach().cpu()),
         "actual_oracle_override_final_voxel_coords": (
             debug["override_final_voxel_coords"].detach()
             if torch.is_tensor(debug.get("override_final_voxel_coords", None))
@@ -2851,6 +4279,18 @@ def _attach_sparsepcgc_actual_oracle_drop(
         "actual_oracle_best_edit_record_bits": float(debug.get("best_edit_record_bits", 0.0) or 0.0),
         "actual_oracle_raw_percent": float(debug.get("selected_raw_percent", 0.0) or 0.0),
         "actual_oracle_best_raw_percent": float(debug.get("best_raw_percent", 0.0) or 0.0),
+        "actual_oracle_delta_actual_percent": float(debug.get("delta_actual_percent", 0.0) or 0.0),
+        "actual_oracle_best_actual_percent": float(debug.get("best_actual_percent", 0.0) or 0.0),
+        "actual_oracle_proxy_percent": float(debug.get("selected_proxy_percent", 0.0) or 0.0),
+        "actual_oracle_best_proxy_percent": float(debug.get("best_proxy_percent", 0.0) or 0.0),
+        "actual_oracle_geometry_percent": float(debug.get("selected_geometry_percent", 0.0) or 0.0),
+        "actual_oracle_original_actual_bits": float(debug.get("original_actual_bits", 0.0) or 0.0),
+        "actual_oracle_edited_actual_bits": float(debug.get("edited_actual_bits", 0.0) or 0.0),
+        "actual_oracle_fast_diagnostic_used": bool(debug.get("fast_diagnostic_used", False)),
+        "actual_oracle_fast_diagnostic_full_drop_count": int(debug.get("fast_diagnostic_full_drop_count", 0) or 0),
+        "actual_oracle_fast_diagnostic_local_drop_count": int(debug.get("fast_diagnostic_local_drop_count", 0) or 0),
+        "actual_oracle_fast_diagnostic_full_drop_ratio": float(debug.get("fast_diagnostic_full_drop_ratio", 0.0) or 0.0),
+        "actual_oracle_fast_diagnostic_local_drop_ratio": float(debug.get("fast_diagnostic_local_drop_ratio", 0.0) or 0.0),
         "actual_oracle_operation": str(debug["reason"]),
     }
 
@@ -2868,7 +4308,35 @@ def _attach_sparsepcgc_actual_oracle_drop(
                 f"candidates={int(debug['candidate_count'])}, "
                 f"candidate_pool={int(debug.get('candidate_pool_count', debug['candidate_count']))}, "
                 f"tested={int(debug['tested_count'])}, "
+                f"eval_max={int(debug.get('actual_eval_max', 0))}, "
+                f"eval_scope={str(debug.get('actual_eval_scope', ''))}, "
+                f"eval_full_coords={int(debug.get('actual_eval_full_coord_count', 0))}, "
+                f"single_eval_max={int(debug.get('single_eval_max', 0))}, "
+                f"macro_eval_max={int(debug.get('macro_prune_eval_max', 0))}, "
+                f"joint_eval_max={int(debug.get('joint_eval_max', 0))}, "
+                f"group_eval_max={int(debug.get('group_eval_max', 0))}, "
+                f"parent_eval_max={int(debug.get('parent_prune_eval_max', 0))}, "
+                f"pattern_eval_max={int(debug.get('pattern_plan_eval_max', 0))}, "
+                f"subtree_eval_max={int(debug.get('subtree_move_eval_max', 0))}, "
                 f"combo_extra={int(debug.get('combo_extra_count', 0))}, "
+                f"full_macro_eval_max={int(debug.get('full_cloud_macro_eval_max', 0))}, "
+                f"full_macro_tested={int(debug.get('full_cloud_macro_tested_count', 0))}, "
+                f"full_macro_improving={int(debug.get('full_cloud_macro_improving_count', 0))}, "
+                f"full_macro_best={float(debug.get('full_cloud_macro_best_percent', 0.0)):.6f}, "
+                f"full_macro_best_ratio={float(debug.get('full_cloud_macro_best_ratio', 0.0)):.4f}, "
+                f"full_macro_best_drop={int(debug.get('full_cloud_macro_best_drop_count', 0))}, "
+                f"fast_diag_used={bool(debug.get('fast_diagnostic_used', False))}, "
+                f"fast_diag={str(debug.get('fast_diagnostic_name', ''))}, "
+                f"fast_diag_thr={int(debug.get('fast_diagnostic_threshold', 0))}, "
+                f"fast_diag_full_drop={int(debug.get('fast_diagnostic_full_drop_count', 0))}, "
+                f"fast_diag_local_drop={int(debug.get('fast_diagnostic_local_drop_count', 0))}, "
+                f"macro_prune_tested={int(debug.get('macro_prune_tested_count', 0))}, "
+                f"macro_prune_improving={int(debug.get('macro_prune_improving_count', 0))}, "
+                f"macro_best={float(debug.get('macro_prune_best_percent', 0.0)):.6f}, "
+                f"macro_best_ratio={float(debug.get('macro_prune_best_ratio', 0.0)):.4f}, "
+                f"macro_best_drop={int(debug.get('macro_prune_best_drop_count', 0))}, "
+                f"macro_best_variant={str(debug.get('macro_prune_best_variant', ''))}, "
+                f"macro_best_proxy={float(debug.get('macro_prune_best_proxy_percent', 0.0)):.6f}, "
                 f"joint_tested={int(debug.get('joint_tested_count', 0))}, "
                 f"joint_improving={int(debug.get('joint_improving_count', 0))}, "
                 f"group_tested={int(debug.get('group_tested_count', 0))}, "
@@ -2881,15 +4349,32 @@ def _attach_sparsepcgc_actual_oracle_drop(
                 f"subtree_move_improving={int(debug.get('subtree_move_improving_count', 0))}, "
                 f"improving={int(debug.get('improving_candidate_count', 0))}, "
                 f"bad={int(debug.get('bad_candidate_count', 0))}, "
+                f"accepted={int(debug.get('accepted_candidate_count', 0))}, "
+                f"noop_labels={int(debug.get('noop_label_count', 0))}, "
+                f"noop_weight={float(debug.get('noop_label_weight', 0.0)):.4f}, "
+                f"high_rate_mppov={int(debug.get('high_rate_mppov_count', 0))}, "
+                f"low_prob_occ={int(debug.get('low_prob_occupied_count', 0))}, "
+                f"single_chain={int(debug.get('single_child_chain_count', 0))}, "
+                f"context_pattern={int(debug.get('context_pattern_candidate_count', 0))}, "
                 f"memory={len(getattr(args, '_sparsepcgc_actual_oracle_outcome_memory', {}) or {})}, "
+                f"orig_bits={float(debug.get('original_actual_bits', 0.0)):.3f}, "
+                f"edited_bits={float(debug.get('edited_actual_bits', 0.0)):.3f}, "
+                f"delta_actual={float(debug.get('delta_actual_percent', 0.0)):.6f}, "
+                f"delta_proxy={float(debug.get('selected_proxy_percent', 0.0)):.6f}, "
+                f"geometry={float(debug.get('selected_geometry_percent', 0.0)):.6f}, "
                 f"best_percent={float(debug['best_percent']):.6f}, "
                 f"best_raw_percent={float(debug.get('best_raw_percent', 0.0)):.6f}, "
+                f"best_actual_percent={float(debug.get('best_actual_percent', 0.0)):.6f}, "
+                f"best_proxy_percent={float(debug.get('best_proxy_percent', 0.0)):.6f}, "
                 f"selected_raw_percent={float(debug.get('selected_raw_percent', 0.0)):.6f}, "
                 f"edit_record_bits={float(debug.get('selected_edit_record_bits', 0.0)):.3f}, "
                 f"edit_record_scale={float(debug.get('edit_record_effective_scale', 0.0)):.4f}, "
                 f"selected_drop={int(debug.get('selected_drop_count', 0))}, "
                 f"selected_add={int(debug.get('selected_add_count', 0))}, "
                 f"selected_move={int(debug.get('selected_move_count', 0))}, "
+                f"accepted_parent_collapse={int(debug.get('accepted_parent_collapse_count', 0))}, "
+                f"accepted_pattern_canonicalize={int(debug.get('accepted_pattern_canonicalize_count', 0))}, "
+                f"oracle_time={float(debug.get('actual_oracle_time', 0.0)):.4f}s, "
                 f"reason={debug['reason']}"
             )
 
@@ -5536,6 +7021,10 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 f"best={float(subtree_potential_select_meta.get('best_score', 0.0)):.4f}, "
                                 f"drop={float(subtree_potential_select_meta.get('drop_score', 0.0)):.4f}, "
                                 f"add={float(subtree_potential_select_meta.get('add_score', 0.0)):.4f}, "
+                                f"macro={float(subtree_potential_select_meta.get('macro_density_score', 0.0)):.4f}, "
+                                f"proxy_rate={float(subtree_potential_select_meta.get('proxy_rate_score', 0.0)):.4f}, "
+                                f"fast_diag_local={int(subtree_potential_select_meta.get('fast_diag_local_count', 0))}, "
+                                f"fast_diag_global={int(subtree_potential_select_meta.get('fast_diag_global_drop_count', 0))}, "
                                 f"random={bool(subtree_potential_select_meta.get('random', False))})"
                             )
                         writer.write(
@@ -7634,8 +9123,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                     epoch_metric_sums = new_metric_sums(L.device, plot.num_loss) # Epoch内で初めのStepなら損失累積器を作る
                 surrogate_compression_metric = surrogate_compression_plot_metric(loss, L_com, L.device) # Surrogate予測の(Mine-GT)*100/GTを通常plotへ渡す
                 actual_compression_metric = actual_compression_plot_metric(loss, L.device) # 実codecで測った(Mine-GT)*100/GTを通常plotへ渡す
+                actual_compression_ratio_metric = actual_compression_ratio_plot_metric(loss, L.device) # 実codecで測った100*Mine/GTを通常plotへ渡す
                 surrogate_metrics = surrogate_plot_metrics(loss) # Surrogate教師学習の誤差系列を通常plotへ渡す
-                metric_values = [ L, L_geom, surrogate_compression_metric, actual_compression_metric, L_attr, L_policy, loss_single, loss_nodes, Lp_out, La_fit, La_rep, L_actuator, *surrogate_metrics] # plot列順にStep損失をまとめる
+                metric_values = [ L, L_geom, surrogate_compression_metric, actual_compression_metric, L_attr, L_policy, loss_single, loss_nodes, Lp_out, La_fit, La_rep, L_actuator, *surrogate_metrics, actual_compression_ratio_metric] # plot列順にStep損失をまとめる
                 add_metric_sums( epoch_metric_sums, metric_values, L.device) # 現在Stepの損失値をEpoch累積器へ加算
                 if episode_metric_sums is None:
                     episode_metric_sums = new_metric_sums(L.device, plot.num_loss) # Episode内で初めのEpochなら損失累積器を作る

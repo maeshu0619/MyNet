@@ -2714,6 +2714,41 @@ class Network(nn.Module):
                     "exact_teacher_uses_full_context": bool(getattr(self.args, "_current_exact_teacher_uses_full_context", False)),
                     "exact_teacher_fallback_reason": str(getattr(self.args, "_current_exact_teacher_fallback_reason", "")),
                 }
+                for key in (
+                    "actual_oracle_bad_candidate_count",
+                    "actual_oracle_improving_candidate_count",
+                    "actual_oracle_combo_extra_count",
+                    "actual_oracle_generated_candidate_count",
+                    "actual_oracle_accepted_candidate_count",
+                    "actual_oracle_accepted_prune_count",
+                    "actual_oracle_accepted_add_count",
+                    "actual_oracle_accepted_adjust_count",
+                    "actual_oracle_accepted_subtree_move_count",
+                    "actual_oracle_accepted_parent_collapse_count",
+                    "actual_oracle_accepted_pattern_canonicalize_count",
+                    "actual_oracle_noop_label_count",
+                    "actual_oracle_high_rate_mppov_count",
+                    "actual_oracle_low_prob_occupied_count",
+                    "actual_oracle_single_child_chain_count",
+                    "actual_oracle_context_pattern_candidate_count",
+                    "actual_oracle_eval_count",
+                    "actual_oracle_eval_max",
+                ):
+                    self.last_structure_debug[key] = int(round(_actuator_scalar(key, 0.0)))
+                for key in (
+                    "actual_oracle_noop_label_weight",
+                    "actual_oracle_time",
+                    "actual_oracle_edit_record_bits",
+                    "actual_oracle_raw_percent",
+                    "actual_oracle_delta_actual_percent",
+                    "actual_oracle_proxy_percent",
+                    "actual_oracle_geometry_percent",
+                    "actual_oracle_original_actual_bits",
+                    "actual_oracle_edited_actual_bits",
+                    "operation_entropy_loss",
+                    "operation_entropy_weight_effective",
+                ):
+                    self.last_structure_debug[key] = _actuator_scalar(key, 0.0)
         else:
             self.last_structure_debug = {
                 "network_voxel_node_input_requested": bool(node_voxel_debug.get("network_voxel_node_input_requested", False)),

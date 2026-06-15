@@ -16,6 +16,19 @@ def build_compression_metric_row(
     L_com,
 ):
     actual_delta = case_float(comp_debug.get("actual_total_bit_percent", float("nan")), float("nan"))
+    gt_actual_bits = case_float(comp_debug.get("gt_actual_bit", comp_debug.get("gt_bit_abs", float("nan"))), float("nan"))
+    gen_actual_bits = case_float(
+        comp_debug.get(
+            "gen_total_bit_with_edit_record",
+            comp_debug.get("gen_actual_bit", comp_debug.get("actual_total_bits", float("nan"))),
+        ),
+        float("nan"),
+    )
+    actual_ratio = float("nan")
+    if math.isfinite(gt_actual_bits) and gt_actual_bits > 0.0 and math.isfinite(gen_actual_bits):
+        actual_ratio = 100.0 * gen_actual_bits / gt_actual_bits
+    elif math.isfinite(actual_delta):
+        actual_ratio = 100.0 + actual_delta
     fresh_actual = is_fresh_actual(args, comp_debug)
     cached_actual = math.isfinite(actual_delta) and not fresh_actual
     return {
@@ -30,6 +43,7 @@ def build_compression_metric_row(
         "fresh_actual": bool(fresh_actual),
         "cached_actual": bool(cached_actual),
         "actual_total_bit_percent": actual_delta if math.isfinite(actual_delta) else None,
+        "actual_total_bit_ratio_percent": actual_ratio if math.isfinite(actual_ratio) else None,
         "actual_total_bit_percent_fresh": actual_delta if fresh_actual else None,
         "actual_total_bit_percent_cached": actual_delta if cached_actual else None,
         "actual_raw_percent": case_float(comp_debug.get("actual_raw_percent", actual_delta), float("nan")),
@@ -570,6 +584,28 @@ def build_operation_metric_row(
     active_before = case_int(comp_debug.get("sparsepcgc_before_active_coords", 0))
     active_after = case_int(comp_debug.get("sparsepcgc_after_active_coords", 0))
     level_debug = structure_debug.get("octree_level_debug") or []
+    actual_oracle_accepted_candidate_count = case_int(structure_debug.get("actual_oracle_accepted_candidate_count", 0))
+    actual_oracle_accepted_prune_count = case_int(structure_debug.get("actual_oracle_accepted_prune_count", 0))
+    actual_oracle_eval_count = case_int(structure_debug.get("actual_oracle_eval_count", 0))
+    actual_oracle_time = case_float(structure_debug.get("actual_oracle_time", 0.0), 0.0)
+    actual_oracle_delta_actual = case_float(structure_debug.get("actual_oracle_delta_actual_percent", float("nan")), float("nan"))
+    actual_oracle_proxy = case_float(structure_debug.get("actual_oracle_proxy_percent", float("nan")), float("nan"))
+    fast_diagnostic_used_fallback = (
+        actual_oracle_accepted_candidate_count > 0
+        and actual_oracle_accepted_prune_count > 0
+        and actual_oracle_eval_count == 0
+        and abs(actual_oracle_time) <= 1e-9
+        and (not math.isfinite(actual_oracle_delta_actual) or abs(actual_oracle_delta_actual) <= 1e-9)
+        and math.isfinite(actual_oracle_proxy)
+    )
+    actual_oracle_fast_diagnostic_used = bool(
+        structure_debug.get("actual_oracle_fast_diagnostic_used", False)
+    ) or bool(fast_diagnostic_used_fallback)
+    actual_oracle_fast_diagnostic_local_count = case_int(
+        structure_debug.get("actual_oracle_fast_diagnostic_local_drop_count", 0)
+    )
+    if actual_oracle_fast_diagnostic_used and actual_oracle_fast_diagnostic_local_count <= 0:
+        actual_oracle_fast_diagnostic_local_count = actual_oracle_accepted_prune_count
     return {
         "global_step": int(global_step) + 1,
         "episode": int(episode) + 1,
@@ -597,10 +633,45 @@ def build_operation_metric_row(
         "actual_oracle_bad_candidate_count": case_int(structure_debug.get("actual_oracle_bad_candidate_count", 0)),
         "actual_oracle_improving_candidate_count": case_int(structure_debug.get("actual_oracle_improving_candidate_count", 0)),
         "actual_oracle_combo_extra_count": case_int(structure_debug.get("actual_oracle_combo_extra_count", 0)),
+        "actual_oracle_generated_candidate_count": case_int(structure_debug.get("actual_oracle_generated_candidate_count", 0)),
+        "actual_oracle_accepted_candidate_count": actual_oracle_accepted_candidate_count,
+        "actual_oracle_accepted_generated_ratio": (
+            case_float(structure_debug.get("actual_oracle_accepted_candidate_count", 0), 0.0)
+            / max(case_float(structure_debug.get("actual_oracle_generated_candidate_count", 0), 0.0), 1.0)
+        ),
+        "actual_oracle_noop_label_count": case_int(structure_debug.get("actual_oracle_noop_label_count", 0)),
+        "actual_oracle_noop_label_weight": case_float(structure_debug.get("actual_oracle_noop_label_weight", 0.0), 0.0),
+        "actual_oracle_accepted_prune_count": actual_oracle_accepted_prune_count,
+        "actual_oracle_accepted_add_count": case_int(structure_debug.get("actual_oracle_accepted_add_count", 0)),
+        "actual_oracle_accepted_adjust_count": case_int(structure_debug.get("actual_oracle_accepted_adjust_count", 0)),
+        "actual_oracle_accepted_subtree_move_count": case_int(structure_debug.get("actual_oracle_accepted_subtree_move_count", 0)),
+        "actual_oracle_accepted_parent_collapse_count": case_int(structure_debug.get("actual_oracle_accepted_parent_collapse_count", 0)),
+        "actual_oracle_accepted_pattern_canonicalize_count": case_int(structure_debug.get("actual_oracle_accepted_pattern_canonicalize_count", 0)),
+        "actual_oracle_high_rate_mppov_count": case_int(structure_debug.get("actual_oracle_high_rate_mppov_count", 0)),
+        "actual_oracle_low_prob_occupied_count": case_int(structure_debug.get("actual_oracle_low_prob_occupied_count", 0)),
+        "actual_oracle_single_child_chain_count": case_int(structure_debug.get("actual_oracle_single_child_chain_count", 0)),
+        "actual_oracle_context_pattern_candidate_count": case_int(structure_debug.get("actual_oracle_context_pattern_candidate_count", 0)),
+        "actual_oracle_eval_count": actual_oracle_eval_count,
+        "actual_oracle_eval_max": case_int(structure_debug.get("actual_oracle_eval_max", 0)),
+        "actual_oracle_time": actual_oracle_time,
         "actual_oracle_drop_bad_count": case_int(structure_debug.get("actual_oracle_drop_bad_count", 0)),
         "actual_oracle_add_bad_count": case_int(structure_debug.get("actual_oracle_add_bad_count", 0)),
         "actual_oracle_edit_record_bits": case_float(structure_debug.get("actual_oracle_edit_record_bits", 0.0), 0.0),
         "actual_oracle_raw_percent": case_float(structure_debug.get("actual_oracle_raw_percent", float("nan")), float("nan")),
+        "actual_oracle_delta_actual_percent": actual_oracle_delta_actual,
+        "actual_oracle_proxy_percent": actual_oracle_proxy,
+        "actual_oracle_geometry_percent": case_float(structure_debug.get("actual_oracle_geometry_percent", float("nan")), float("nan")),
+        "actual_oracle_original_actual_bits": case_float(structure_debug.get("actual_oracle_original_actual_bits", float("nan")), float("nan")),
+        "actual_oracle_edited_actual_bits": case_float(structure_debug.get("actual_oracle_edited_actual_bits", float("nan")), float("nan")),
+        "actual_oracle_proxy_actual_gap": (
+            actual_oracle_proxy
+            - actual_oracle_delta_actual
+        ),
+        "actual_oracle_fast_diagnostic_used": actual_oracle_fast_diagnostic_used,
+        "actual_oracle_fast_diagnostic_full_drop_count": case_int(structure_debug.get("actual_oracle_fast_diagnostic_full_drop_count", 0)),
+        "actual_oracle_fast_diagnostic_local_drop_count": actual_oracle_fast_diagnostic_local_count,
+        "actual_oracle_fast_diagnostic_full_drop_ratio": case_float(structure_debug.get("actual_oracle_fast_diagnostic_full_drop_ratio", 0.0), 0.0),
+        "actual_oracle_fast_diagnostic_local_drop_ratio": case_float(structure_debug.get("actual_oracle_fast_diagnostic_local_drop_ratio", 0.0), 0.0),
         "raw_learned_drop_ratio": case_float(structure_debug.get("raw_learned_drop_ratio", float("nan")), float("nan")),
         "raw_learned_add_ratio": case_float(structure_debug.get("raw_learned_add_ratio", float("nan")), float("nan")),
         "raw_learned_move_ratio": case_float(structure_debug.get("raw_learned_move_ratio", float("nan")), float("nan")),
@@ -747,6 +818,8 @@ def build_operation_metric_row(
         "exploration_noise": case_float(structure_debug.get("exploration_noise", structure_debug.get("move_score_noise", float("nan"))), float("nan")),
         "operation_regularization": case_float(structure_debug.get("operation_regularization", structure_debug.get("operation_amount_consistency_loss", float("nan"))), float("nan")),
         "operation_entropy": case_float(structure_debug.get("operation_entropy", float("nan")), float("nan")),
+        "operation_entropy_loss": case_float(structure_debug.get("operation_entropy_loss", float("nan")), float("nan")),
+        "operation_entropy_weight_effective": case_float(structure_debug.get("operation_entropy_weight_effective", float("nan")), float("nan")),
         "operation_prob_floor_applied": bool(structure_debug.get("operation_prob_floor_applied", False)),
         "exploration_alive": bool(case_float(structure_debug.get("exploration_noise", 0.0), 0.0) > 0.0 or case_float(structure_debug.get("operation_entropy", 0.0), 0.0) > 0.0),
         "operation_entropy_moving_avg": case_float(comp_debug.get("operation_entropy_moving_avg", float("nan")), float("nan")),

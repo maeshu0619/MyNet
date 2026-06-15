@@ -1014,6 +1014,34 @@ class OctreeStructureAnalysis(nn.Module):
         out["actual_oracle_combo_extra_count"] = int(
             source_tree.get("actual_oracle_combo_extra_count", 0) or 0
         )
+        for key in (
+            "actual_oracle_generated_candidate_count",
+            "actual_oracle_accepted_candidate_count",
+            "actual_oracle_accepted_prune_count",
+            "actual_oracle_accepted_add_count",
+            "actual_oracle_accepted_adjust_count",
+            "actual_oracle_accepted_subtree_move_count",
+            "actual_oracle_accepted_parent_collapse_count",
+            "actual_oracle_accepted_pattern_canonicalize_count",
+            "actual_oracle_noop_label_count",
+            "actual_oracle_high_rate_mppov_count",
+            "actual_oracle_low_prob_occupied_count",
+            "actual_oracle_single_child_chain_count",
+            "actual_oracle_context_pattern_candidate_count",
+            "actual_oracle_eval_count",
+            "actual_oracle_eval_max",
+        ):
+            out[key] = int(source_tree.get(key, 0) or 0)
+        for key in (
+            "actual_oracle_noop_label_weight",
+            "actual_oracle_time",
+            "actual_oracle_delta_actual_percent",
+            "actual_oracle_proxy_percent",
+            "actual_oracle_geometry_percent",
+            "actual_oracle_original_actual_bits",
+            "actual_oracle_edited_actual_bits",
+        ):
+            out[key] = float(source_tree.get(key, 0.0) or 0.0)
         out["actual_oracle_drop_reason"] = str(
             source_tree.get("actual_oracle_drop_reason", "")
         )

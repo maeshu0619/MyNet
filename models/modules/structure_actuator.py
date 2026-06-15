@@ -497,6 +497,33 @@ class StructureRepairActuator(nn.Module):
             "actual_oracle_bad_candidate_count": 0,
             "actual_oracle_improving_candidate_count": 0,
             "actual_oracle_combo_extra_count": 0,
+            "actual_oracle_generated_candidate_count": 0,
+            "actual_oracle_accepted_candidate_count": 0,
+            "actual_oracle_accepted_prune_count": 0,
+            "actual_oracle_accepted_add_count": 0,
+            "actual_oracle_accepted_adjust_count": 0,
+            "actual_oracle_accepted_subtree_move_count": 0,
+            "actual_oracle_accepted_parent_collapse_count": 0,
+            "actual_oracle_accepted_pattern_canonicalize_count": 0,
+            "actual_oracle_noop_label_count": 0,
+            "actual_oracle_noop_label_weight": 0.0,
+            "actual_oracle_high_rate_mppov_count": 0,
+            "actual_oracle_low_prob_occupied_count": 0,
+            "actual_oracle_single_child_chain_count": 0,
+            "actual_oracle_context_pattern_candidate_count": 0,
+            "actual_oracle_eval_count": 0,
+            "actual_oracle_eval_max": 0,
+            "actual_oracle_time": 0.0,
+            "actual_oracle_delta_actual_percent": 0.0,
+            "actual_oracle_proxy_percent": 0.0,
+            "actual_oracle_geometry_percent": 0.0,
+            "actual_oracle_original_actual_bits": 0.0,
+            "actual_oracle_edited_actual_bits": 0.0,
+            "actual_oracle_fast_diagnostic_used": False,
+            "actual_oracle_fast_diagnostic_full_drop_count": 0,
+            "actual_oracle_fast_diagnostic_local_drop_count": 0,
+            "actual_oracle_fast_diagnostic_full_drop_ratio": 0.0,
+            "actual_oracle_fast_diagnostic_local_drop_ratio": 0.0,
             "actual_oracle_drop_reason": "",
             "actual_oracle_operation": "",
             "actual_oracle_drop_bad_mask": false_mask,
@@ -567,6 +594,87 @@ class StructureRepairActuator(nn.Module):
                     ),
                     "actual_oracle_combo_extra_count": int(
                         leaf_diag.get("actual_oracle_combo_extra_count", 0) or 0
+                    ),
+                    "actual_oracle_generated_candidate_count": int(
+                        leaf_diag.get("actual_oracle_generated_candidate_count", 0) or 0
+                    ),
+                    "actual_oracle_accepted_candidate_count": int(
+                        leaf_diag.get("actual_oracle_accepted_candidate_count", 0) or 0
+                    ),
+                    "actual_oracle_accepted_prune_count": int(
+                        leaf_diag.get("actual_oracle_accepted_prune_count", 0) or 0
+                    ),
+                    "actual_oracle_accepted_add_count": int(
+                        leaf_diag.get("actual_oracle_accepted_add_count", 0) or 0
+                    ),
+                    "actual_oracle_accepted_adjust_count": int(
+                        leaf_diag.get("actual_oracle_accepted_adjust_count", 0) or 0
+                    ),
+                    "actual_oracle_accepted_subtree_move_count": int(
+                        leaf_diag.get("actual_oracle_accepted_subtree_move_count", 0) or 0
+                    ),
+                    "actual_oracle_accepted_parent_collapse_count": int(
+                        leaf_diag.get("actual_oracle_accepted_parent_collapse_count", 0) or 0
+                    ),
+                    "actual_oracle_accepted_pattern_canonicalize_count": int(
+                        leaf_diag.get("actual_oracle_accepted_pattern_canonicalize_count", 0) or 0
+                    ),
+                    "actual_oracle_noop_label_count": int(
+                        leaf_diag.get("actual_oracle_noop_label_count", 0) or 0
+                    ),
+                    "actual_oracle_noop_label_weight": float(
+                        leaf_diag.get("actual_oracle_noop_label_weight", 0.0) or 0.0
+                    ),
+                    "actual_oracle_high_rate_mppov_count": int(
+                        leaf_diag.get("actual_oracle_high_rate_mppov_count", 0) or 0
+                    ),
+                    "actual_oracle_low_prob_occupied_count": int(
+                        leaf_diag.get("actual_oracle_low_prob_occupied_count", 0) or 0
+                    ),
+                    "actual_oracle_single_child_chain_count": int(
+                        leaf_diag.get("actual_oracle_single_child_chain_count", 0) or 0
+                    ),
+                    "actual_oracle_context_pattern_candidate_count": int(
+                        leaf_diag.get("actual_oracle_context_pattern_candidate_count", 0) or 0
+                    ),
+                    "actual_oracle_eval_count": int(
+                        leaf_diag.get("actual_oracle_eval_count", 0) or 0
+                    ),
+                    "actual_oracle_eval_max": int(
+                        leaf_diag.get("actual_oracle_eval_max", 0) or 0
+                    ),
+                    "actual_oracle_time": float(
+                        leaf_diag.get("actual_oracle_time", 0.0) or 0.0
+                    ),
+                    "actual_oracle_delta_actual_percent": float(
+                        leaf_diag.get("actual_oracle_delta_actual_percent", 0.0) or 0.0
+                    ),
+                    "actual_oracle_proxy_percent": float(
+                        leaf_diag.get("actual_oracle_proxy_percent", 0.0) or 0.0
+                    ),
+                    "actual_oracle_geometry_percent": float(
+                        leaf_diag.get("actual_oracle_geometry_percent", 0.0) or 0.0
+                    ),
+                    "actual_oracle_original_actual_bits": float(
+                        leaf_diag.get("actual_oracle_original_actual_bits", 0.0) or 0.0
+                    ),
+                    "actual_oracle_edited_actual_bits": float(
+                        leaf_diag.get("actual_oracle_edited_actual_bits", 0.0) or 0.0
+                    ),
+                    "actual_oracle_fast_diagnostic_used": bool(
+                        leaf_diag.get("actual_oracle_fast_diagnostic_used", False)
+                    ),
+                    "actual_oracle_fast_diagnostic_full_drop_count": int(
+                        leaf_diag.get("actual_oracle_fast_diagnostic_full_drop_count", 0) or 0
+                    ),
+                    "actual_oracle_fast_diagnostic_local_drop_count": int(
+                        leaf_diag.get("actual_oracle_fast_diagnostic_local_drop_count", 0) or 0
+                    ),
+                    "actual_oracle_fast_diagnostic_full_drop_ratio": float(
+                        leaf_diag.get("actual_oracle_fast_diagnostic_full_drop_ratio", 0.0) or 0.0
+                    ),
+                    "actual_oracle_fast_diagnostic_local_drop_ratio": float(
+                        leaf_diag.get("actual_oracle_fast_diagnostic_local_drop_ratio", 0.0) or 0.0
                     ),
                     "actual_oracle_drop_reason": str(
                         leaf_diag.get("actual_oracle_drop_reason", "")
@@ -4280,11 +4388,36 @@ class StructureRepairActuator(nn.Module):
             + add_hard_soft_consistency_loss
         )
 
-        operation_ratio_vec = torch.stack(
-            [drop_ratio, move_ratio_soft, add_ratio_soft]
-        ).clamp_min(0.0)
+        if torch.is_tensor(operation_gate_prob) and operation_gate_prob.ndim >= 3:
+            operation_ratio_vec = operation_gate_prob.float().mean(dim=(0, 2)).clamp_min(0.0)
+        else:
+            operation_ratio_vec = torch.stack(
+                [drop_ratio, move_ratio_soft, add_ratio_soft]
+            ).clamp_min(0.0)
         operation_ratio_prob = operation_ratio_vec / operation_ratio_vec.sum().clamp_min(1e-6)
         operation_entropy = -(operation_ratio_prob * operation_ratio_prob.clamp_min(1e-6).log()).sum()
+        operation_entropy_weight_raw = max(
+            float(getattr(self.args, "repair_operation_entropy_weight", 0.0)),
+            0.0,
+        )
+        operation_entropy_warmup_steps = max(
+            int(getattr(self.args, "repair_operation_entropy_warmup_steps", 0)),
+            0,
+        )
+        if operation_entropy_weight_raw > 0.0 and operation_entropy_warmup_steps > 0:
+            train_step_for_entropy = max(int(getattr(self.args, "_global_train_step", 0)), 0)
+            operation_entropy_phase = max(
+                1.0 - float(train_step_for_entropy) / float(operation_entropy_warmup_steps),
+                0.0,
+            )
+        elif operation_entropy_weight_raw > 0.0:
+            operation_entropy_phase = 1.0
+        else:
+            operation_entropy_phase = 0.0
+        operation_entropy_weight_effective = operation_entropy_weight_raw * operation_entropy_phase
+        operation_entropy_loss = -operation_entropy.new_tensor(
+            float(operation_entropy_weight_effective)
+        ) * operation_entropy
         soft_activity_loss = (
             drop_prob.mean()
             + learned_drop_prob
@@ -4594,6 +4727,7 @@ class StructureRepairActuator(nn.Module):
         operation_amount_consistency_loss = _finite_actuator_loss(operation_amount_consistency_loss)
         operation_amount_direct_loss = _finite_actuator_loss(operation_amount_direct_loss)
         operation_amount_logit_loss = _finite_actuator_loss(operation_amount_logit_loss)
+        operation_entropy_loss = _finite_actuator_loss(operation_entropy_loss)
         soft_activity_loss = _finite_actuator_loss(soft_activity_loss)
 
         move_direction_ce = _finite_actuator_loss(move_direction_ce)
@@ -4633,6 +4767,7 @@ class StructureRepairActuator(nn.Module):
             + float(getattr(self.args, "repair_operation_amount_consistency_weight", 0.01)) * operation_amount_consistency_loss
             + float(getattr(self.args, "repair_operation_amount_direct_weight", 0.01)) * operation_amount_direct_loss
             + float(getattr(self.args, "repair_operation_amount_logit_weight", 1e-4)) * operation_amount_logit_loss
+            + operation_entropy_loss
             + float(getattr(self.args, "repair_soft_activity_weight", 1e-3)) * soft_activity_loss
             + float(getattr(self.args, "repair_move_direction_ce_weight", 1e-3)) * move_direction_ce
             + float(getattr(self.args, "repair_add_direction_ce_weight", 1e-3)) * add_direction_ce
@@ -5103,6 +5238,57 @@ class StructureRepairActuator(nn.Module):
             "actual_oracle_combo_extra_count": pts_xyz.new_tensor(
                 float(leaf_operation_masks.get("actual_oracle_combo_extra_count", 0))
             ).detach(),
+            "actual_oracle_generated_candidate_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_generated_candidate_count", 0))
+            ).detach(),
+            "actual_oracle_accepted_candidate_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_accepted_candidate_count", 0))
+            ).detach(),
+            "actual_oracle_accepted_prune_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_accepted_prune_count", 0))
+            ).detach(),
+            "actual_oracle_accepted_add_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_accepted_add_count", 0))
+            ).detach(),
+            "actual_oracle_accepted_adjust_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_accepted_adjust_count", 0))
+            ).detach(),
+            "actual_oracle_accepted_subtree_move_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_accepted_subtree_move_count", 0))
+            ).detach(),
+            "actual_oracle_accepted_parent_collapse_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_accepted_parent_collapse_count", 0))
+            ).detach(),
+            "actual_oracle_accepted_pattern_canonicalize_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_accepted_pattern_canonicalize_count", 0))
+            ).detach(),
+            "actual_oracle_noop_label_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_noop_label_count", 0))
+            ).detach(),
+            "actual_oracle_noop_label_weight": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_noop_label_weight", 0.0))
+            ).detach(),
+            "actual_oracle_high_rate_mppov_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_high_rate_mppov_count", 0))
+            ).detach(),
+            "actual_oracle_low_prob_occupied_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_low_prob_occupied_count", 0))
+            ).detach(),
+            "actual_oracle_single_child_chain_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_single_child_chain_count", 0))
+            ).detach(),
+            "actual_oracle_context_pattern_candidate_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_context_pattern_candidate_count", 0))
+            ).detach(),
+            "actual_oracle_eval_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_eval_count", 0))
+            ).detach(),
+            "actual_oracle_eval_max": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_eval_max", 0))
+            ).detach(),
+            "actual_oracle_time": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_time", 0.0))
+            ).detach(),
             "actual_oracle_drop_bad_count": pts_xyz.new_tensor(float(actual_oracle_drop_bad_count_value)).detach(),
             "actual_oracle_add_bad_count": pts_xyz.new_tensor(float(actual_oracle_add_bad_count_value)).detach(),
             "actual_oracle_edit_record_bits": pts_xyz.new_tensor(
@@ -5110,6 +5296,36 @@ class StructureRepairActuator(nn.Module):
             ).detach(),
             "actual_oracle_raw_percent": pts_xyz.new_tensor(
                 float(actual_oracle_raw_percent_value)
+            ).detach(),
+            "actual_oracle_delta_actual_percent": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_delta_actual_percent", 0.0))
+            ).detach(),
+            "actual_oracle_proxy_percent": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_proxy_percent", 0.0))
+            ).detach(),
+            "actual_oracle_geometry_percent": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_geometry_percent", 0.0))
+            ).detach(),
+            "actual_oracle_original_actual_bits": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_original_actual_bits", 0.0))
+            ).detach(),
+            "actual_oracle_edited_actual_bits": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_edited_actual_bits", 0.0))
+            ).detach(),
+            "actual_oracle_fast_diagnostic_used": pts_xyz.new_tensor(
+                float(bool(leaf_operation_masks.get("actual_oracle_fast_diagnostic_used", False)))
+            ).detach(),
+            "actual_oracle_fast_diagnostic_full_drop_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_fast_diagnostic_full_drop_count", 0))
+            ).detach(),
+            "actual_oracle_fast_diagnostic_local_drop_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_fast_diagnostic_local_drop_count", 0))
+            ).detach(),
+            "actual_oracle_fast_diagnostic_full_drop_ratio": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_fast_diagnostic_full_drop_ratio", 0.0))
+            ).detach(),
+            "actual_oracle_fast_diagnostic_local_drop_ratio": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_fast_diagnostic_local_drop_ratio", 0.0))
             ).detach(),
             "raw_learned_drop_ratio": raw_learned_drop_ratio.mean().detach(),
             "raw_learned_add_ratio": raw_learned_add_ratio.mean().detach(),
@@ -5145,6 +5361,10 @@ class StructureRepairActuator(nn.Module):
             "learned_move_ratio_std": learned_move_ratio.detach().float().std(unbiased=False),
             "operation_amount_consistency_loss": operation_amount_consistency_loss.detach(),
             "operation_entropy": operation_entropy.detach(),
+            "operation_entropy_loss": operation_entropy_loss.detach(),
+            "operation_entropy_weight_effective": pts_xyz.new_tensor(
+                float(operation_entropy_weight_effective)
+            ).detach(),
             "soft_activity_loss": soft_activity_loss.detach(),
             "move_direction_ce": move_direction_ce.detach(),
             "add_direction_ce": add_direction_ce.detach(),
@@ -5460,10 +5680,91 @@ class StructureRepairActuator(nn.Module):
             "actual_oracle_bad_candidate_count": int(leaf_operation_masks.get("actual_oracle_bad_candidate_count", 0)),
             "actual_oracle_improving_candidate_count": int(leaf_operation_masks.get("actual_oracle_improving_candidate_count", 0)),
             "actual_oracle_combo_extra_count": int(leaf_operation_masks.get("actual_oracle_combo_extra_count", 0)),
+            "actual_oracle_generated_candidate_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_generated_candidate_count", 0))
+            ).detach(),
+            "actual_oracle_accepted_candidate_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_accepted_candidate_count", 0))
+            ).detach(),
+            "actual_oracle_accepted_prune_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_accepted_prune_count", 0))
+            ).detach(),
+            "actual_oracle_accepted_add_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_accepted_add_count", 0))
+            ).detach(),
+            "actual_oracle_accepted_adjust_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_accepted_adjust_count", 0))
+            ).detach(),
+            "actual_oracle_accepted_subtree_move_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_accepted_subtree_move_count", 0))
+            ).detach(),
+            "actual_oracle_accepted_parent_collapse_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_accepted_parent_collapse_count", 0))
+            ).detach(),
+            "actual_oracle_accepted_pattern_canonicalize_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_accepted_pattern_canonicalize_count", 0))
+            ).detach(),
+            "actual_oracle_noop_label_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_noop_label_count", 0))
+            ).detach(),
+            "actual_oracle_noop_label_weight": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_noop_label_weight", 0.0))
+            ).detach(),
+            "actual_oracle_high_rate_mppov_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_high_rate_mppov_count", 0))
+            ).detach(),
+            "actual_oracle_low_prob_occupied_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_low_prob_occupied_count", 0))
+            ).detach(),
+            "actual_oracle_single_child_chain_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_single_child_chain_count", 0))
+            ).detach(),
+            "actual_oracle_context_pattern_candidate_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_context_pattern_candidate_count", 0))
+            ).detach(),
+            "actual_oracle_eval_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_eval_count", 0))
+            ).detach(),
+            "actual_oracle_eval_max": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_eval_max", 0))
+            ).detach(),
+            "actual_oracle_time": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_time", 0.0))
+            ).detach(),
             "actual_oracle_drop_bad_count": actual_oracle_drop_bad_count_value,
             "actual_oracle_add_bad_count": actual_oracle_add_bad_count_value,
             "actual_oracle_edit_record_bits": float(actual_oracle_edit_record_bits_value),
             "actual_oracle_raw_percent": float(actual_oracle_raw_percent_value),
+            "actual_oracle_delta_actual_percent": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_delta_actual_percent", 0.0))
+            ).detach(),
+            "actual_oracle_proxy_percent": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_proxy_percent", 0.0))
+            ).detach(),
+            "actual_oracle_geometry_percent": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_geometry_percent", 0.0))
+            ).detach(),
+            "actual_oracle_original_actual_bits": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_original_actual_bits", 0.0))
+            ).detach(),
+            "actual_oracle_edited_actual_bits": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_edited_actual_bits", 0.0))
+            ).detach(),
+            "actual_oracle_fast_diagnostic_used": pts_xyz.new_tensor(
+                float(bool(leaf_operation_masks.get("actual_oracle_fast_diagnostic_used", False)))
+            ).detach(),
+            "actual_oracle_fast_diagnostic_full_drop_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_fast_diagnostic_full_drop_count", 0))
+            ).detach(),
+            "actual_oracle_fast_diagnostic_local_drop_count": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_fast_diagnostic_local_drop_count", 0))
+            ).detach(),
+            "actual_oracle_fast_diagnostic_full_drop_ratio": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_fast_diagnostic_full_drop_ratio", 0.0))
+            ).detach(),
+            "actual_oracle_fast_diagnostic_local_drop_ratio": pts_xyz.new_tensor(
+                float(leaf_operation_masks.get("actual_oracle_fast_diagnostic_local_drop_ratio", 0.0))
+            ).detach(),
             "raw_learned_drop_ratio": raw_learned_drop_ratio.mean(),
             "raw_learned_add_ratio": raw_learned_add_ratio.mean(),
             "raw_learned_move_ratio": raw_learned_move_ratio.mean(),
@@ -5526,6 +5827,10 @@ class StructureRepairActuator(nn.Module):
             "learned_move_ratio_std": learned_move_ratio.float().std(unbiased=False),
             "operation_amount_consistency_loss": operation_amount_consistency_loss,
             "operation_entropy": operation_entropy,
+            "operation_entropy_loss": operation_entropy_loss,
+            "operation_entropy_weight_effective": pts_xyz.new_tensor(
+                float(operation_entropy_weight_effective)
+            ),
             "move_ratio_soft": move_ratio_soft.detach(),
             "move_ratio_hard": move_ratio_hard.detach(),
             "move_ratio_soft_batch_mean": move_ratio_soft_batch.detach().mean(),

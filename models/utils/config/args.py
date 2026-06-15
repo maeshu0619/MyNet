@@ -725,6 +725,72 @@ def parse_pugan_args(parser, file_day, file_time):
         help='group候補で実SparsePCGC検証する同時編集Voxel数。例: 4,16',
     )
     parser.add_argument(
+        '--sparsepcgc_actual_oracle_macro_prune_candidate_max',
+        default=4,
+        type=int,
+        help='低密度leafを5-30%%程度まとめてPruneするmacro候補を何個actual検証するか',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_macro_prune_ratios',
+        default='0.05,0.10,0.20,0.30',
+        type=str,
+        help='macro density pruneで試す削除Voxel割合',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_macro_prune_max_ratio',
+        default=0.30,
+        type=float,
+        help='macro density pruneで一度に削除してよい最大Voxel割合',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_macro_prune_min_voxels',
+        default=8,
+        type=int,
+        help='macro density prune候補の最小削除Voxel数',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_macro_prune_max_voxels',
+        default=512,
+        type=int,
+        help='macro density prune候補の最大削除Voxel数',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_full_cloud_macro_prune_candidate_max',
+        default=1,
+        type=int,
+        help='full-cloud全体の低密度macro prune候補を何個actual検証するか',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_full_cloud_macro_prune_ratios',
+        default='0.02,0.05',
+        type=str,
+        help='full-cloud macro pruneで試す削除Voxel割合',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_full_cloud_prune_neighbor_thresholds',
+        default='3',
+        type=str,
+        help='full-cloud macroで6近傍数がthreshold未満のvoxelをpruneする候補しきい値',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_full_cloud_macro_prune_max_ratio',
+        default=0.05,
+        type=float,
+        help='full-cloud macro pruneで一度に削除してよい最大Voxel割合',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_full_cloud_macro_prune_min_voxels',
+        default=128,
+        type=int,
+        help='full-cloud macro prune候補の最小削除Voxel数',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_full_cloud_macro_prune_max_voxels',
+        default=20000,
+        type=int,
+        help='full-cloud macro prune候補の最大削除Voxel数',
+    )
+    parser.add_argument(
         '--sparsepcgc_actual_oracle_parent_prune_candidate_max',
         default=2,
         type=int,
@@ -911,10 +977,94 @@ def parse_pugan_args(parser, file_day, file_time):
         help='actual oracle候補を採択する最小改善率。0ならactual bitが少しでも下がった候補だけ採択',
     )
     parser.add_argument(
-        '--sparsepcgc_actual_oracle_force_no_edit',
+        '--sparsepcgc_actual_oracle_actual_eval_max',
+        default=8,
+        type=int,
+        help='1 stepでactual SparsePCGCへ回す候補数の上限。proxy上位Kだけをactual検証する',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_eval_full_cloud_splice',
         default=True,
         type=str2bool,
+        help='Subtree候補をfull cloudに差し戻したactual SparsePCGC bit差分で検証する',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_single_eval_fraction',
+        default=0.25,
+        type=float,
+        help='actual検証予算のうち単一Add/Prune候補へ使う最大割合。残りをparent/pattern/subtree候補へ残す',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_geometry_lambda',
+        default=0.05,
+        type=float,
+        help='Greedy teacher採択時のgeometry edit量ペナルティ係数',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_noop_weight',
+        default=0.0,
+        type=float,
+        help='actual改善候補が無いsampleをno-op教師として数える場合の診断用重み。既定ではno-op大量正例化を避ける',
+    )
+    parser.add_argument(
+        '--sparsepcgc_codec_proxy_weight',
+        default=2.0,
+        type=float,
+        help='Greedy teacher候補排序でcontext-aware SparsePCGC proxy ΔRへ掛ける重み',
+    )
+    parser.add_argument(
+        '--sparsepcgc_codec_proxy_smoothing',
+        default=1.0,
+        type=float,
+        help='context-aware SparsePCGC proxyのoccupancy確率推定に使うLaplace smoothing',
+    )
+    parser.add_argument(
+        '--sparsepcgc_codec_proxy_max_levels',
+        default=16,
+        type=int,
+        help='context-aware SparsePCGC proxyで評価するmultiscale階層数上限',
+    )
+    parser.add_argument(
+        '--sparsepcgc_proxy_low_prob_threshold',
+        default=0.15,
+        type=float,
+        help='low-prob occupied MP-POV候補として数えるproxy occupancy probability閾値',
+    )
+    parser.add_argument(
+        '--sparsepcgc_proxy_high_rate_bit_threshold',
+        default=2.0,
+        type=float,
+        help='high-rate MP-POV候補として数えるoccupied -log2(p)閾値',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_force_no_edit',
+        default=False,
+        type=str2bool,
         help='actual oracle有効時に改善候補が見つからない場合、Add/Prune/Moveを全て止める',
+    )
+    parser.add_argument(
+        '--sparsepcgc_fast_diagnostic_teacher',
+        default=True,
+        type=str2bool,
+        help='actual検証step以外で、full-cloudのOctree診断から高速なPrune教師を作る',
+    )
+    parser.add_argument(
+        '--sparsepcgc_fast_diagnostic_neighbor_threshold',
+        default=3,
+        type=int,
+        help='6近傍数がこの値未満のoccupied voxelを高速Prune診断候補にする',
+    )
+    parser.add_argument(
+        '--sparsepcgc_fast_diagnostic_max_local_voxels',
+        default=512,
+        type=int,
+        help='高速診断teacherが1 subtreeで削除教師にする最大voxel数',
+    )
+    parser.add_argument(
+        '--sparsepcgc_fast_diagnostic_min_local_voxels',
+        default=1,
+        type=int,
+        help='高速診断teacherを採択するために必要なsubtree内候補voxel数',
     )
     parser.add_argument(
         '--sparsepcgc_actual_oracle_log',
@@ -1012,6 +1162,8 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--repair_drop_soft_proxy_tau', default=3.0, type=float, help='Prune soft proxyでdrop logit飽和を避けるための温度')
     parser.add_argument('--repair_drop_direct_target_weight', default=5.0, type=float, help='drop soft proxyを目標削除率へ近づける正則化重み')
     parser.add_argument('--repair_drop_entropy_weight', default=0.01, type=float, help='drop soft proxyのエントロピー正則化重み')
+    parser.add_argument('--repair_operation_entropy_weight', default=0.02, type=float, help='初期stepでoperation分布のentropyを最大化しno-op早期飽和を抑える重み')
+    parser.add_argument('--repair_operation_entropy_warmup_steps', default=500, type=int, help='operation entropy lossを0へ減衰させるstep数')
     parser.add_argument('--repair_add_ratio_weight', default=4.0, type=float, help='点追加割合制御損失の重み')
     parser.add_argument('--repair_add_shape_guard_weight', default=0.5, type=float, help='形状保持点の近傍に追加しすぎない正則化')
     parser.add_argument('--repair_add_offset_weight', default=0.25, type=float, help='追加点オフセットの正則化')
@@ -1855,10 +2007,15 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--sparsepcgc_subtree_potential_candidate_topk', default=4, type=int, help='各Subtreeのpotential計算で合算するAdd/Prune候補数')
     parser.add_argument('--sparsepcgc_subtree_potential_drop_weight', default=1.0, type=float, help='Subtree potentialにおけるPrune候補スコア重み')
     parser.add_argument('--sparsepcgc_subtree_potential_add_weight', default=1.0, type=float, help='Subtree potentialにおけるAdd候補スコア重み')
+    parser.add_argument('--sparsepcgc_subtree_potential_macro_ratio', default=0.20, type=float, help='Subtree potentialで低密度macro prune余地を見る削除割合')
+    parser.add_argument('--sparsepcgc_subtree_potential_macro_weight', default=1.0, type=float, help='Subtree potentialにおける低密度macro prune余地の重み')
+    parser.add_argument('--sparsepcgc_subtree_potential_proxy_rate_weight', default=0.02, type=float, help='Subtree potentialにおけるproxy rate/voxel項の重み')
     parser.add_argument('--sparsepcgc_subtree_potential_size_weight', default=0.02, type=float, help='Subtree potentialに少しだけ加えるvoxel数安定項')
     parser.add_argument('--sparsepcgc_subtree_potential_efficiency_weight', default=2.0, type=float, help='少ないVoxel編集でleaf occupancy patternを改善できるSubtreeを優先する重み')
     parser.add_argument('--sparsepcgc_subtree_potential_small_tree_weight', default=0.25, type=float, help='SparsePCGCの固定的なbit段差が出やすい小さめSubtreeを軽く優先する重み')
     parser.add_argument('--sparsepcgc_subtree_potential_random_mix', default=0.0, type=float, help='Subtree potential優先時にも探索のためランダム選択へ回す割合')
+    parser.add_argument('--sparsepcgc_subtree_potential_fast_diag_weight', default=50.0, type=float, help='full-cloud低6近傍voxelを含むSubtreeを優先する重み')
+    parser.add_argument('--sparsepcgc_subtree_potential_fast_diag_min_count', default=1, type=int, help='fast diagnosticで優先するSubtree内の最小候補voxel数')
     parser.add_argument('--num_workers', default=4, type=int, help='データローダのワーカー数')
     parser.add_argument('--pin_memory', default=True, type=str2bool, help='CPU→GPU転送高速化のためメモリ固定するか')
     parser.add_argument('--persistent_workers', default=True, type=str2bool, help='ワーカーを維持するか')
@@ -2760,6 +2917,38 @@ def parse_pugan_args(parser, file_day, file_time):
             if int(size) >= 2
         }
     ) or [int(args.sparsepcgc_actual_oracle_group_voxels)]
+    args.sparsepcgc_actual_oracle_macro_prune_candidate_max = max(
+        int(getattr(args, "sparsepcgc_actual_oracle_macro_prune_candidate_max", 4)),
+        0,
+    )
+    args.sparsepcgc_actual_oracle_macro_prune_max_ratio = min(
+        max(float(getattr(args, "sparsepcgc_actual_oracle_macro_prune_max_ratio", 0.30)), 0.0),
+        0.95,
+    )
+    args.sparsepcgc_actual_oracle_macro_prune_min_voxels = max(
+        int(getattr(args, "sparsepcgc_actual_oracle_macro_prune_min_voxels", 8)),
+        1,
+    )
+    args.sparsepcgc_actual_oracle_macro_prune_max_voxels = max(
+        int(getattr(args, "sparsepcgc_actual_oracle_macro_prune_max_voxels", 512)),
+        args.sparsepcgc_actual_oracle_macro_prune_min_voxels,
+    )
+    args.sparsepcgc_actual_oracle_full_cloud_macro_prune_candidate_max = max(
+        int(getattr(args, "sparsepcgc_actual_oracle_full_cloud_macro_prune_candidate_max", 1)),
+        0,
+    )
+    args.sparsepcgc_actual_oracle_full_cloud_macro_prune_max_ratio = min(
+        max(float(getattr(args, "sparsepcgc_actual_oracle_full_cloud_macro_prune_max_ratio", 0.05)), 0.0),
+        0.50,
+    )
+    args.sparsepcgc_actual_oracle_full_cloud_macro_prune_min_voxels = max(
+        int(getattr(args, "sparsepcgc_actual_oracle_full_cloud_macro_prune_min_voxels", 128)),
+        1,
+    )
+    args.sparsepcgc_actual_oracle_full_cloud_macro_prune_max_voxels = max(
+        int(getattr(args, "sparsepcgc_actual_oracle_full_cloud_macro_prune_max_voxels", 20000)),
+        args.sparsepcgc_actual_oracle_full_cloud_macro_prune_min_voxels,
+    )
     args.sparsepcgc_actual_oracle_parent_prune_candidate_max = max(
         int(getattr(args, "sparsepcgc_actual_oracle_parent_prune_candidate_max", 2)),
         0,
@@ -3086,8 +3275,26 @@ def parse_pugan_args(parser, file_day, file_time):
             args.sparsepcgc_actual_oracle_edit = True
         if not _cli_option_was_provided("--sparsepcgc_actual_oracle_max_candidates"):
             args.sparsepcgc_actual_oracle_max_candidates = 12
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_actual_eval_max"):
+            args.sparsepcgc_actual_oracle_actual_eval_max = 2
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_interval"):
+            args.sparsepcgc_actual_oracle_interval = 64
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_eval_full_cloud_splice"):
+            args.sparsepcgc_actual_oracle_eval_full_cloud_splice = True
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_single_eval_fraction"):
+            args.sparsepcgc_actual_oracle_single_eval_fraction = 0.25
+        if not _cli_option_was_provided("--sparsepcgc_codec_proxy_weight"):
+            args.sparsepcgc_codec_proxy_weight = 2.0
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_geometry_lambda"):
+            args.sparsepcgc_actual_oracle_geometry_lambda = 0.05
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_noop_weight"):
+            args.sparsepcgc_actual_oracle_noop_weight = 0.0
+        if not _cli_option_was_provided("--repair_operation_entropy_weight"):
+            args.repair_operation_entropy_weight = 0.02
+        if not _cli_option_was_provided("--repair_operation_entropy_warmup_steps"):
+            args.repair_operation_entropy_warmup_steps = 500
         if not _cli_option_was_provided("--sparsepcgc_actual_oracle_max_selected_voxels"):
-            args.sparsepcgc_actual_oracle_max_selected_voxels = 16
+            args.sparsepcgc_actual_oracle_max_selected_voxels = 512
         if not _cli_option_was_provided("--sparsepcgc_actual_oracle_combo_validate_max_extra"):
             args.sparsepcgc_actual_oracle_combo_validate_max_extra = 2
         if not _cli_option_was_provided("--sparsepcgc_actual_oracle_group_candidate_max"):
@@ -3096,6 +3303,28 @@ def parse_pugan_args(parser, file_day, file_time):
             args.sparsepcgc_actual_oracle_group_voxels = 16
         if not _cli_option_was_provided("--sparsepcgc_actual_oracle_group_size_list"):
             args.sparsepcgc_actual_oracle_group_size_list = [4, 16]
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_macro_prune_candidate_max"):
+            args.sparsepcgc_actual_oracle_macro_prune_candidate_max = 4
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_macro_prune_ratios"):
+            args.sparsepcgc_actual_oracle_macro_prune_ratios = "0.05,0.10,0.20,0.30"
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_macro_prune_max_ratio"):
+            args.sparsepcgc_actual_oracle_macro_prune_max_ratio = 0.30
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_macro_prune_min_voxels"):
+            args.sparsepcgc_actual_oracle_macro_prune_min_voxels = 8
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_macro_prune_max_voxels"):
+            args.sparsepcgc_actual_oracle_macro_prune_max_voxels = 512
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_full_cloud_macro_prune_candidate_max"):
+            args.sparsepcgc_actual_oracle_full_cloud_macro_prune_candidate_max = 1
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_full_cloud_macro_prune_ratios"):
+            args.sparsepcgc_actual_oracle_full_cloud_macro_prune_ratios = "0.02,0.05"
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_full_cloud_prune_neighbor_thresholds"):
+            args.sparsepcgc_actual_oracle_full_cloud_prune_neighbor_thresholds = "3"
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_full_cloud_macro_prune_max_ratio"):
+            args.sparsepcgc_actual_oracle_full_cloud_macro_prune_max_ratio = 0.05
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_full_cloud_macro_prune_min_voxels"):
+            args.sparsepcgc_actual_oracle_full_cloud_macro_prune_min_voxels = 128
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_full_cloud_macro_prune_max_voxels"):
+            args.sparsepcgc_actual_oracle_full_cloud_macro_prune_max_voxels = 20000
         if not _cli_option_was_provided("--sparsepcgc_actual_oracle_parent_prune_candidate_max"):
             args.sparsepcgc_actual_oracle_parent_prune_candidate_max = 2
         if not _cli_option_was_provided("--sparsepcgc_actual_oracle_parent_prune_min_voxels"):
@@ -3115,7 +3344,15 @@ def parse_pugan_args(parser, file_day, file_time):
         if not _cli_option_was_provided("--sparsepcgc_actual_oracle_pattern_plan_edit_penalty"):
             args.sparsepcgc_actual_oracle_pattern_plan_edit_penalty = 0.02
         if not _cli_option_was_provided("--sparsepcgc_actual_oracle_force_no_edit"):
-            args.sparsepcgc_actual_oracle_force_no_edit = True
+            args.sparsepcgc_actual_oracle_force_no_edit = False
+        if not _cli_option_was_provided("--sparsepcgc_fast_diagnostic_teacher"):
+            args.sparsepcgc_fast_diagnostic_teacher = True
+        if not _cli_option_was_provided("--sparsepcgc_fast_diagnostic_neighbor_threshold"):
+            args.sparsepcgc_fast_diagnostic_neighbor_threshold = 3
+        if not _cli_option_was_provided("--sparsepcgc_fast_diagnostic_max_local_voxels"):
+            args.sparsepcgc_fast_diagnostic_max_local_voxels = args.sparsepcgc_actual_oracle_max_selected_voxels
+        if not _cli_option_was_provided("--sparsepcgc_fast_diagnostic_min_local_voxels"):
+            args.sparsepcgc_fast_diagnostic_min_local_voxels = 1
         if not _cli_option_was_provided("--sparsepcgc_actual_oracle_allow_subtree_move"):
             args.sparsepcgc_actual_oracle_allow_subtree_move = True
         if not _cli_option_was_provided("--sparsepcgc_actual_oracle_subtree_move_candidate_max"):
@@ -3541,6 +3778,18 @@ def parse_pugan_args(parser, file_day, file_time):
         float(getattr(args, "sparsepcgc_subtree_potential_add_weight", 1.0)),
         0.0,
     )
+    args.sparsepcgc_subtree_potential_macro_ratio = min(
+        max(float(getattr(args, "sparsepcgc_subtree_potential_macro_ratio", 0.20)), 0.0),
+        0.80,
+    )
+    args.sparsepcgc_subtree_potential_macro_weight = max(
+        float(getattr(args, "sparsepcgc_subtree_potential_macro_weight", 1.0)),
+        0.0,
+    )
+    args.sparsepcgc_subtree_potential_proxy_rate_weight = max(
+        float(getattr(args, "sparsepcgc_subtree_potential_proxy_rate_weight", 0.02)),
+        0.0,
+    )
     args.sparsepcgc_subtree_potential_size_weight = max(
         float(getattr(args, "sparsepcgc_subtree_potential_size_weight", 0.02)),
         0.0,
@@ -3556,6 +3805,14 @@ def parse_pugan_args(parser, file_day, file_time):
     args.sparsepcgc_subtree_potential_random_mix = min(
         max(float(getattr(args, "sparsepcgc_subtree_potential_random_mix", 0.0)), 0.0),
         1.0,
+    )
+    args.sparsepcgc_subtree_potential_fast_diag_weight = max(
+        float(getattr(args, "sparsepcgc_subtree_potential_fast_diag_weight", 50.0)),
+        0.0,
+    )
+    args.sparsepcgc_subtree_potential_fast_diag_min_count = max(
+        int(getattr(args, "sparsepcgc_subtree_potential_fast_diag_min_count", 1)),
+        0,
     )
     amount_cap = 0.30
 
@@ -3653,6 +3910,57 @@ def parse_pugan_args(parser, file_day, file_time):
         max(float(getattr(args, "sparsepcgc_occupancy_low_prob_threshold", 0.1)), 1e-6),
         1.0,
     )
+    args.sparsepcgc_actual_oracle_actual_eval_max = max(
+        int(getattr(args, "sparsepcgc_actual_oracle_actual_eval_max", 8)),
+        0,
+    )
+    args.sparsepcgc_actual_oracle_eval_full_cloud_splice = bool(
+        getattr(args, "sparsepcgc_actual_oracle_eval_full_cloud_splice", True)
+    )
+    args.sparsepcgc_actual_oracle_single_eval_fraction = min(
+        max(float(getattr(args, "sparsepcgc_actual_oracle_single_eval_fraction", 0.25)), 0.0),
+        1.0,
+    )
+    args.sparsepcgc_actual_oracle_geometry_lambda = max(
+        float(getattr(args, "sparsepcgc_actual_oracle_geometry_lambda", 0.05)),
+        0.0,
+    )
+    args.sparsepcgc_actual_oracle_noop_weight = min(
+        max(float(getattr(args, "sparsepcgc_actual_oracle_noop_weight", 0.02)), 0.0),
+        1.0,
+    )
+    args.sparsepcgc_actual_oracle_force_no_edit = bool(
+        getattr(args, "sparsepcgc_actual_oracle_force_no_edit", False)
+    )
+    args.sparsepcgc_fast_diagnostic_teacher = bool(
+        getattr(args, "sparsepcgc_fast_diagnostic_teacher", True)
+    )
+    args.sparsepcgc_fast_diagnostic_neighbor_threshold = max(
+        int(getattr(args, "sparsepcgc_fast_diagnostic_neighbor_threshold", 3)),
+        1,
+    )
+    args.sparsepcgc_fast_diagnostic_max_local_voxels = max(
+        int(getattr(args, "sparsepcgc_fast_diagnostic_max_local_voxels", 512)),
+        1,
+    )
+    args.sparsepcgc_fast_diagnostic_min_local_voxels = max(
+        int(getattr(args, "sparsepcgc_fast_diagnostic_min_local_voxels", 1)),
+        1,
+    )
+    args.sparsepcgc_codec_proxy_weight = max(float(getattr(args, "sparsepcgc_codec_proxy_weight", 2.0)), 0.0)
+    args.sparsepcgc_codec_proxy_smoothing = max(
+        float(getattr(args, "sparsepcgc_codec_proxy_smoothing", 1.0)),
+        1e-6,
+    )
+    args.sparsepcgc_codec_proxy_max_levels = max(int(getattr(args, "sparsepcgc_codec_proxy_max_levels", 16)), 1)
+    args.sparsepcgc_proxy_low_prob_threshold = min(
+        max(float(getattr(args, "sparsepcgc_proxy_low_prob_threshold", 0.15)), 1e-6),
+        1.0 - 1e-6,
+    )
+    args.sparsepcgc_proxy_high_rate_bit_threshold = max(
+        float(getattr(args, "sparsepcgc_proxy_high_rate_bit_threshold", 2.0)),
+        0.0,
+    )
     args.enable_sparsepcgc_exact_occupancy_teacher = bool(getattr(args, "enable_sparsepcgc_exact_occupancy_teacher", False))
     args.sparsepcgc_exact_occupancy_interval = max(
         int(getattr(args, "sparsepcgc_exact_occupancy_interval", 1)),
@@ -3694,6 +4002,8 @@ def parse_pugan_args(parser, file_day, file_time):
     args.repair_drop_soft_proxy_tau = max(float(getattr(args, "repair_drop_soft_proxy_tau", 8.0)), 1e-6)
     args.repair_drop_direct_target_weight = max(float(getattr(args, "repair_drop_direct_target_weight", 5.0)), 0.0)
     args.repair_drop_entropy_weight = max(float(getattr(args, "repair_drop_entropy_weight", 0.01)), 0.0)
+    args.repair_operation_entropy_weight = max(float(getattr(args, "repair_operation_entropy_weight", 0.02)), 0.0)
+    args.repair_operation_entropy_warmup_steps = max(int(getattr(args, "repair_operation_entropy_warmup_steps", 500)), 0)
     args.repair_add_weight_mode = str(getattr(args, "repair_add_weight_mode", "hard")).strip().lower()
     if args.repair_add_weight_mode not in {"hard", "soft"}:
         raise ValueError("--repair_add_weight_mode must be hard or soft")
