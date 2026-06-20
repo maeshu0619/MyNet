@@ -14,6 +14,7 @@ import argparse
 import hashlib
 import math
 import csv
+import numpy as np
 from cfgs.utils import str2bool
 import multiprocessing as mp
 from collections import OrderedDict
@@ -681,6 +682,18 @@ def _sparsepcgc_edit_record_subtree_move_bits(args, unique_count, move_count, le
         int(getattr(args, "sparsepcgc_edit_record_subtree_move_bits_min", 16)),
     )
     return float(base_bits + count_bits + transform_bits)
+
+
+def _sparsepcgc_edit_record_structured_prune_bits(args, unique_count, block_size, drop_ratio):
+    if not bool(getattr(args, "sparsepcgc_edit_record_bits_enabled", True)):
+        return 0.0
+    base_bits = max(float(getattr(args, "sparsepcgc_edit_record_base_bits", 8.0)), 0.0)
+    transform_bits = max(
+        int(getattr(args, "sparsepcgc_edit_record_structured_prune_bits_min", 32)),
+        _ceil_log2_int(max(int(unique_count), 1)) + _ceil_log2_int(max(int(block_size), 2)) + 16,
+    )
+    raw_bits = float(base_bits + transform_bits)
+    return float(raw_bits * sparsepcgc_effective_edit_record_bit_scale(args))
 
 
 def _sparsepcgc_edit_record_total_bits(
@@ -1719,7 +1732,10 @@ def _sparsepcgc_actual_oracle_macro_prune_candidates(
 def _sparsepcgc_actual_oracle_full_cloud_macro_prune_candidates(full_coords, args, max_candidates):
     if full_coords is None or not torch.is_tensor(full_coords) or full_coords.numel() <= 0 or int(max_candidates) <= 0:
         return []
-    full_coords = torch.unique(full_coords.to(dtype=torch.long), dim=0, sorted=True)
+    # full_eval_coords comes from the canonical full-cloud voxel context and is
+    # already unique. Re-running torch.unique over 0.7M+ rows dominated teacher
+    # generation on 8i sequences.
+    full_coords = full_coords.to(dtype=torch.long).contiguous()
     full_count = int(full_coords.shape[0])
     if full_count <= 8:
         return []
@@ -1742,6 +1758,88 @@ def _sparsepcgc_actual_oracle_full_cloud_macro_prune_candidates(full_coords, arg
         min_voxels,
     )
     candidates = []
+    block_sizes = [
+        max(int(round(value)), 2)
+        for value in _sparsepcgc_parse_float_list(
+            getattr(args, "sparsepcgc_actual_oracle_full_cloud_subtree_block_sizes", "32"),
+            [32.0],
+        )
+    ]
+    subtree_ratios = _sparsepcgc_parse_float_list(
+        getattr(args, "sparsepcgc_actual_oracle_full_cloud_subtree_prune_ratios", "0.10,0.20,0.30"),
+        [0.10, 0.20, 0.30],
+    )
+    target_ratio = min(
+        max(float(getattr(args, "sparsepcgc_actual_oracle_full_cloud_subtree_target_ratio", 0.20)), 0.0),
+        max_ratio,
+    )
+    for block_size in sorted(set(block_sizes)):
+        full_coords_cpu = full_coords.detach().to(device="cpu", dtype=torch.long).numpy()
+        block_coords_cpu = np.floor_divide(full_coords_cpu, int(block_size))
+        unique_blocks_cpu, block_inverse_cpu, block_counts_cpu = np.unique(
+            block_coords_cpu,
+            axis=0,
+            return_inverse=True,
+            return_counts=True,
+        )
+        if int(unique_blocks_cpu.shape[0]) <= 1:
+            continue
+        block_order_cpu = np.argsort(block_counts_cpu, kind="stable")
+        cumulative_counts_cpu = np.cumsum(block_counts_cpu[block_order_cpu], dtype=np.int64)
+        ordered_subtree_ratios = sorted(
+            subtree_ratios,
+            key=lambda value: abs(float(value) - float(target_ratio)),
+        )
+        for ratio_raw in ordered_subtree_ratios:
+            ratio = min(max(float(ratio_raw), 0.0), max_ratio)
+            if ratio <= 0.0:
+                continue
+            target_drop = min(
+                max(int(math.ceil(float(full_count) * ratio)), min_voxels),
+                max_voxels,
+                full_count - 1,
+            )
+            take = int(np.searchsorted(cumulative_counts_cpu, int(target_drop), side="left")) + 1
+            take = min(max(take, 1), int(block_order_cpu.size) - 1)
+            drop_blocks_cpu = block_order_cpu[:take]
+            drop_block_mask_cpu = np.zeros((unique_blocks_cpu.shape[0],), dtype=np.bool_)
+            drop_block_mask_cpu[drop_blocks_cpu] = True
+            drop_mask_cpu = drop_block_mask_cpu[block_inverse_cpu]
+            drop_count = int(np.count_nonzero(drop_mask_cpu))
+            if drop_count < min_voxels or drop_count > max_voxels or drop_count >= full_count:
+                continue
+            drop_mask = torch.from_numpy(drop_mask_cpu).to(device=full_coords.device)
+            candidate_coords = full_coords[~drop_mask].contiguous()
+            actual_ratio = float(drop_count) / max(float(full_count), 1.0)
+            candidates.append(
+                {
+                    "op": "full_cloud_subtree_prune",
+                    "variant": f"block_{int(block_size)}_ratio_{actual_ratio:.6f}",
+                    "candidate_coords": candidate_coords.detach().clone(),
+                    "drop_coords": full_coords[drop_mask].detach().clone(),
+                    "drop_count": int(drop_count),
+                    "drop_block_count": int(take),
+                    "drop_block_coords": torch.from_numpy(
+                        unique_blocks_cpu[drop_blocks_cpu].copy()
+                    ).to(device=full_coords.device, dtype=torch.long),
+                    "block_size": int(block_size),
+                    "drop_ratio": float(actual_ratio),
+                    "score": float(10000.0 - 1000.0 * abs(actual_ratio - target_ratio)),
+                }
+            )
+            if len(candidates) >= int(max_candidates):
+                break
+        if len(candidates) >= int(max_candidates):
+            break
+
+    # Structured subtree candidates are intentionally ranked above scattered
+    # voxel heuristics and already fill the proxy top-K budget. Avoid the much
+    # more expensive full-cloud neighbor/parent scans when they cannot possibly
+    # reach actual evaluation.
+    if len(candidates) >= int(max_candidates):
+        candidates = sorted(candidates, key=lambda item: float(item.get("score", 0.0)), reverse=True)
+        return candidates[: int(max_candidates)]
+
     axis_neigh = _sparsepcgc_axis_neighbor_count(full_coords).to(device=full_coords.device, dtype=torch.long)
     thresholds = _sparsepcgc_parse_float_list(
         getattr(args, "sparsepcgc_actual_oracle_full_cloud_prune_neighbor_thresholds", "3"),
@@ -1766,8 +1864,6 @@ def _sparsepcgc_actual_oracle_full_cloud_macro_prune_candidates(full_coords, arg
                 "score": float(100.0 - int(threshold_raw)),
             }
         )
-        if len(candidates) >= int(max_candidates):
-            return candidates[: int(max_candidates)]
 
     neigh = _sparsepcgc_codec_proxy_neighbor_count(full_coords).to(device=full_coords.device, dtype=torch.float32)
     parent = torch.div(full_coords, 2, rounding_mode="floor")
@@ -1804,6 +1900,7 @@ def _sparsepcgc_actual_oracle_full_cloud_macro_prune_candidates(full_coords, arg
                 "score": float(-low_density + 10.0 * float(drop_count) / max(float(full_count), 1.0)),
             }
         )
+    candidates = sorted(candidates, key=lambda item: float(item.get("score", 0.0)), reverse=True)
     return candidates[: int(max_candidates)]
 
 
@@ -1827,14 +1924,58 @@ def _sparsepcgc_fast_diagnostic_prune_indices(unique_coords, full_coords, args):
         return [], {}
 
     threshold = max(int(getattr(args, "sparsepcgc_fast_diagnostic_neighbor_threshold", 3)), 1)
+    mode = str(getattr(args, "sparsepcgc_fast_diagnostic_prune_mode", "axis_threshold")).strip().lower()
+    if mode not in {"axis_threshold", "density_ratio", "hybrid"}:
+        mode = "axis_threshold"
+    target_global_ratio = min(
+        max(float(getattr(args, "sparsepcgc_fast_diagnostic_target_global_ratio", 0.05)), 0.0),
+        0.30,
+    )
+    target_local_ratio = min(
+        max(float(getattr(args, "sparsepcgc_fast_diagnostic_target_local_ratio", 0.05)), 0.0),
+        0.30,
+    )
+    parent_weight = max(
+        float(getattr(args, "sparsepcgc_fast_diagnostic_density_parent_weight", 0.5)),
+        0.0,
+    )
     min_local = max(int(getattr(args, "sparsepcgc_fast_diagnostic_min_local_voxels", 1)), 1)
     max_local = max(int(getattr(args, "sparsepcgc_fast_diagnostic_max_local_voxels", 512)), min_local)
+
+    def _density_score(coords_n3):
+        axis = _sparsepcgc_axis_neighbor_count(coords_n3).to(device=coords_n3.device, dtype=torch.float32)
+        parent = torch.div(coords_n3, 2, rounding_mode="floor")
+        unique_parent, parent_inverse = torch.unique(parent, dim=0, sorted=True, return_inverse=True)
+        parent_pop = torch.bincount(parent_inverse, minlength=int(unique_parent.shape[0])).to(
+            device=coords_n3.device,
+            dtype=torch.float32,
+        )
+        parent_pop_leaf = parent_pop.index_select(0, parent_inverse)
+        return axis + float(parent_weight) * parent_pop_leaf
+
     axis_neigh = _sparsepcgc_axis_neighbor_count(full_coords).to(device=full_coords.device, dtype=torch.long)
-    drop_mask = axis_neigh < int(threshold)
+    axis_drop_mask = axis_neigh < int(threshold)
+    density_drop_mask = torch.zeros_like(axis_drop_mask, dtype=torch.bool)
+    density_score = _density_score(full_coords)
+    if mode in {"density_ratio", "hybrid"} and target_global_ratio > 0.0:
+        full_count = int(full_coords.shape[0])
+        density_count = int(math.ceil(float(full_count) * float(target_global_ratio)))
+        density_count = min(max(density_count, 1), max(full_count - 1, 1))
+        density_order = torch.argsort(density_score, descending=False)
+        density_drop_mask[density_order[:density_count]] = True
+
+    if mode == "axis_threshold":
+        drop_mask = axis_drop_mask
+    elif mode == "hybrid":
+        drop_mask = axis_drop_mask | density_drop_mask
+    else:
+        drop_mask = density_drop_mask
+
     global_drop_count = int(drop_mask.detach().sum().cpu())
     if global_drop_count <= 0:
         return [], {
-            "diagnostic": "axis_neighbor_prune",
+            "diagnostic": "density_ratio_prune" if mode != "axis_threshold" else "axis_neighbor_prune",
+            "mode": str(mode),
             "threshold": int(threshold),
             "global_drop_count": 0,
             "full_count": int(full_coords.shape[0]),
@@ -1857,9 +1998,32 @@ def _sparsepcgc_fast_diagnostic_prune_indices(unique_coords, full_coords, args):
     local_mask = in_bounds & (drop_keys[safe_pos] == unique_keys)
     local_indices = local_mask.nonzero(as_tuple=False).reshape(-1)
     local_count = int(local_indices.numel())
+
+    local_density = _density_score(unique_coords)
+    desired_local_count = local_count
+    if mode in {"density_ratio", "hybrid"} and target_local_ratio > 0.0:
+        desired_local_count = int(math.ceil(float(unique_coords.shape[0]) * float(target_local_ratio)))
+        desired_local_count = min(max(desired_local_count, min_local), max_local, max(int(unique_coords.shape[0]) - 1, 1))
+        if (
+            local_count < desired_local_count
+            and bool(getattr(args, "sparsepcgc_fast_diagnostic_density_backfill_local", True))
+        ):
+            selected = torch.zeros((int(unique_coords.shape[0]),), device=unique_coords.device, dtype=torch.bool)
+            if local_count > 0:
+                selected[local_indices] = True
+            local_order = torch.argsort(local_density, descending=False)
+            need = max(int(desired_local_count) - int(local_count), 0)
+            if need > 0:
+                backfill = local_order[~selected.index_select(0, local_order)][:need]
+                if backfill.numel() > 0:
+                    local_indices = torch.cat([local_indices, backfill.to(device=local_indices.device)], dim=0)
+                    local_indices = torch.unique(local_indices, sorted=True)
+                    local_count = int(local_indices.numel())
+
     if local_count < min_local:
         return [], {
-            "diagnostic": "axis_neighbor_prune",
+            "diagnostic": "density_ratio_prune" if mode != "axis_threshold" else "axis_neighbor_prune",
+            "mode": str(mode),
             "threshold": int(threshold),
             "global_drop_count": int(global_drop_count),
             "full_count": int(full_coords.shape[0]),
@@ -1867,21 +2031,28 @@ def _sparsepcgc_fast_diagnostic_prune_indices(unique_coords, full_coords, args):
             "reason": "below_min_local",
         }
 
-    if local_count > max_local:
-        local_coords = unique_coords.index_select(0, local_indices)
-        local_axis = _sparsepcgc_axis_neighbor_count(local_coords).to(device=unique_coords.device, dtype=torch.long)
-        order = torch.argsort(local_axis, descending=False)
-        local_indices = local_indices.index_select(0, order[:max_local])
+    local_limit = int(max_local)
+    if mode in {"density_ratio", "hybrid"} and target_local_ratio > 0.0:
+        local_limit = min(local_limit, int(desired_local_count))
+    if local_count > local_limit:
+        selected_density = local_density.index_select(0, local_indices)
+        order = torch.argsort(selected_density, descending=False)
+        local_indices = local_indices.index_select(0, order[:local_limit])
         local_count = int(local_indices.numel())
 
     debug = {
-        "diagnostic": "axis_neighbor_prune",
+        "diagnostic": "density_ratio_prune" if mode != "axis_threshold" else "axis_neighbor_prune",
+        "mode": str(mode),
         "threshold": int(threshold),
         "global_drop_count": int(global_drop_count),
         "full_count": int(full_coords.shape[0]),
         "local_drop_count": int(local_count),
         "global_drop_ratio": float(global_drop_count) / max(float(full_coords.shape[0]), 1.0),
         "local_drop_ratio": float(local_count) / max(float(unique_coords.shape[0]), 1.0),
+        "target_global_ratio": float(target_global_ratio),
+        "target_local_ratio": float(target_local_ratio),
+        "density_parent_weight": float(parent_weight),
+        "desired_local_count": int(desired_local_count),
     }
     return [int(v) for v in local_indices.detach().cpu().tolist()], debug
 
@@ -1897,7 +2068,7 @@ def _sparsepcgc_fast_diagnostic_add_candidates(unique_coords, full_coords, args)
         or full_coords.numel() <= 0
     ):
         return [], {}
-    max_local = max(int(getattr(args, "sparsepcgc_fast_diagnostic_add_max_local_voxels", 8)), 0)
+    max_local = max(int(getattr(args, "sparsepcgc_fast_diagnostic_add_max_local_voxels", 4)), 0)
     if max_local <= 0:
         return [], {"diagnostic": "dense_hole_add", "reason": "disabled_by_budget"}
 
@@ -1911,7 +2082,7 @@ def _sparsepcgc_fast_diagnostic_add_candidates(unique_coords, full_coords, args)
         return [], {}
 
     threshold = min(
-        max(int(getattr(args, "sparsepcgc_fast_diagnostic_add_neighbor_threshold", 5)), 1),
+        max(int(getattr(args, "sparsepcgc_fast_diagnostic_add_neighbor_threshold", 6)), 1),
         6,
     )
     offsets = torch.tensor(
@@ -2578,6 +2749,10 @@ def _attach_sparsepcgc_actual_oracle_drop(
         "selected_move_count": 0,
         "override_final_voxel_coords": None,
         "override_move_count": 0,
+        "override_drop_count": 0,
+        "override_subtree_prune_count": 0,
+        "override_scope": "",
+        "cached_edited_actual_stats": None,
         "best_percent": 0.0,
         "best_raw_percent": 0.0,
         "best_edit_record_bits": 0.0,
@@ -2618,11 +2793,19 @@ def _attach_sparsepcgc_actual_oracle_drop(
         debug["reason"] = "not_sparsepcgc"
         return subtree_tree, full_octree_context, debug
 
-    interval = max(int(getattr(args, "sparsepcgc_actual_oracle_interval", 1)), 1)
-    actual_validate_this_step = ((int(global_step) + 1) % interval) == 0
+    interval = int(getattr(args, "sparsepcgc_actual_oracle_interval", 1))
+    actual_validate_this_step = interval > 0 and ((int(global_step) + 1) % interval) == 0
     fast_diagnostic_enabled = bool(getattr(args, "sparsepcgc_fast_diagnostic_teacher", True))
+    fast_diagnostic_unvalidated_teacher = bool(
+        getattr(args, "sparsepcgc_fast_diagnostic_allow_unvalidated_teacher", False)
+    )
     if (not actual_validate_this_step) and (not fast_diagnostic_enabled):
         debug["reason"] = "interval_skip"
+        return subtree_tree, full_octree_context, debug
+    if (not actual_validate_this_step) and fast_diagnostic_enabled and (not fast_diagnostic_unvalidated_teacher):
+        debug["reason"] = "interval_skip_fast_diagnostic_requires_full_actual"
+        debug["fast_diagnostic_enabled"] = True
+        debug["fast_diagnostic_unvalidated_teacher_allowed"] = False
         return subtree_tree, full_octree_context, debug
 
     max_candidates = max(int(getattr(args, "sparsepcgc_actual_oracle_max_candidates", 0)), 0)
@@ -2678,44 +2861,50 @@ def _attach_sparsepcgc_actual_oracle_drop(
         if bool(getattr(args, "sparsepcgc_actual_oracle_allow_add", True)):
             add_pool_budget = max(add_pool_budget, group_pool_voxels)
 
-    base_unique_coords_for_proxy, _base_inverse_for_proxy = torch.unique(
+    unique_coords, inverse = torch.unique(
         coords_n3.to(dtype=torch.long),
         dim=0,
         sorted=True,
         return_inverse=True,
     )
-    proxy_profile = _sparsepcgc_codec_proxy_profile(base_unique_coords_for_proxy, args)
-    base_proxy_bits = float(proxy_profile.get("base_proxy_bits", 0.0) or 0.0)
-    debug["high_rate_mppov_count"] = int(proxy_profile.get("high_rate_mppov_count", 0) or 0)
-    debug["low_prob_occupied_count"] = int(proxy_profile.get("low_prob_occupied_count", 0) or 0)
-    debug["single_child_chain_count"] = int(proxy_profile.get("single_child_chain_count", 0) or 0)
-    debug["context_pattern_candidate_count"] = int(proxy_profile.get("context_pattern_candidate_count", 0) or 0)
+    proxy_profile = {
+        "enabled": False,
+        "reason": "skipped_fast_diagnostic_only",
+        "base_proxy_bits": 0.0,
+    }
+    base_proxy_bits = 0.0
+    candidate_pool = []
+    candidate_indices = []
+    add_candidate_pool = []
+    add_candidates = []
 
-    candidate_pool, unique_coords, inverse = _sparsepcgc_actual_oracle_candidate_indices(
-        coords_n3,
-        args,
-        global_step,
-        drop_pool_budget,
-        proxy_profile=proxy_profile,
-    )
-    if unique_coords is None or inverse is None:
-        unique_coords, inverse = torch.unique(
-            coords_n3.to(dtype=torch.long),
-            dim=0,
-            sorted=True,
-            return_inverse=True,
-        )
+    if actual_validate_this_step:
         proxy_profile = _sparsepcgc_codec_proxy_profile(unique_coords, args)
         base_proxy_bits = float(proxy_profile.get("base_proxy_bits", 0.0) or 0.0)
-    candidate_indices = candidate_pool[:drop_budget]
-    add_candidate_pool = _sparsepcgc_actual_oracle_add_candidates(
-        unique_coords,
-        args,
-        global_step,
-        add_pool_budget,
-        proxy_profile=proxy_profile,
-    )
-    add_candidates = add_candidate_pool[:add_budget]
+        debug["high_rate_mppov_count"] = int(proxy_profile.get("high_rate_mppov_count", 0) or 0)
+        debug["low_prob_occupied_count"] = int(proxy_profile.get("low_prob_occupied_count", 0) or 0)
+        debug["single_child_chain_count"] = int(proxy_profile.get("single_child_chain_count", 0) or 0)
+        debug["context_pattern_candidate_count"] = int(proxy_profile.get("context_pattern_candidate_count", 0) or 0)
+
+        candidate_pool, unique_coords_from_pool, inverse_from_pool = _sparsepcgc_actual_oracle_candidate_indices(
+            coords_n3,
+            args,
+            global_step,
+            drop_pool_budget,
+            proxy_profile=proxy_profile,
+        )
+        if unique_coords_from_pool is not None and inverse_from_pool is not None:
+            unique_coords = unique_coords_from_pool
+            inverse = inverse_from_pool
+        candidate_indices = candidate_pool[:drop_budget]
+        add_candidate_pool = _sparsepcgc_actual_oracle_add_candidates(
+            unique_coords,
+            args,
+            global_step,
+            add_pool_budget,
+            proxy_profile=proxy_profile,
+        )
+        add_candidates = add_candidate_pool[:add_budget]
     debug["enabled"] = True
     debug["candidate_count"] = int(len(candidate_indices) + len(add_candidates))
     debug["candidate_pool_count"] = int(len(candidate_pool) + len(add_candidate_pool))
@@ -2734,6 +2923,16 @@ def _attach_sparsepcgc_actual_oracle_drop(
             oracle_eval_scope = "full_cloud_splice"
     debug["actual_eval_scope"] = str(oracle_eval_scope)
     debug["actual_eval_full_coord_count"] = int(full_eval_coords.shape[0]) if torch.is_tensor(full_eval_coords) else 0
+    full_cloud_teacher_required = bool(
+        getattr(args, "sparsepcgc_require_full_cloud_actual_teacher", True)
+    )
+    missing_full_cloud_teacher_eval = bool(
+        actual_validate_this_step
+        and full_cloud_teacher_required
+        and str(oracle_eval_scope) != "full_cloud_splice"
+    )
+    debug["full_cloud_teacher_required"] = bool(full_cloud_teacher_required)
+    debug["full_cloud_teacher_eval_available"] = not bool(missing_full_cloud_teacher_eval)
 
     def _oracle_actual_eval_coords(local_candidate_coords):
         if torch.is_tensor(full_eval_coords):
@@ -2857,6 +3056,7 @@ def _attach_sparsepcgc_actual_oracle_drop(
         selected_add = int(add_point_mask.detach().sum().cpu())
         if selected_drop <= 0 and selected_add <= 0:
             return False
+        generated_fast_count = int(len(selected_indices) + len(fast_diagnostic_add_items))
         keep_for_proxy = torch.ones((unique_coords.shape[0],), device=unique_coords.device, dtype=torch.bool)
         if selected_indices:
             keep_for_proxy[torch.as_tensor(selected_indices, device=unique_coords.device, dtype=torch.long)] = False
@@ -2864,11 +3064,21 @@ def _attach_sparsepcgc_actual_oracle_drop(
         if selected_add_items:
             add_coords_for_proxy = torch.cat([item["target_coord"] for item in selected_add_items], dim=0)
             edited_for_proxy = torch.unique(torch.cat([edited_for_proxy, add_coords_for_proxy], dim=0), dim=0, sorted=True)
-        proxy_bits, proxy_percent = _sparsepcgc_proxy_delta_percent(
-            edited_for_proxy,
-            args,
-            base_proxy_bits,
+        skip_fast_proxy_eval = bool(
+            (not actual_validate_this_step)
+            and getattr(args, "sparsepcgc_fast_diagnostic_skip_proxy_eval", True)
         )
+        if skip_fast_proxy_eval:
+            before_count = max(float(unique_coords.shape[0]), 1.0)
+            after_count = float(edited_for_proxy.shape[0])
+            proxy_bits = float(after_count)
+            proxy_percent = float(100.0 * (after_count - before_count) / before_count)
+        else:
+            proxy_bits, proxy_percent = _sparsepcgc_proxy_delta_percent(
+                edited_for_proxy,
+                args,
+                base_proxy_bits,
+            )
         edit_record_bits = _sparsepcgc_edit_record_total_bits(
             args,
             int(unique_coords.shape[0]),
@@ -2883,12 +3093,14 @@ def _attach_sparsepcgc_actual_oracle_drop(
         )
         debug["used"] = True
         if selected_drop > 0 and selected_add > 0:
-            debug["reason"] = "fast_diagnostic_axis_neighbor_prune+dense_hole_add"
+            debug["reason"] = f"fast_diagnostic_{debug.get('fast_diagnostic_name', 'prune')}+dense_hole_add"
         elif selected_add > 0:
             debug["reason"] = "fast_diagnostic_dense_hole_add"
         else:
-            debug["reason"] = "fast_diagnostic_axis_neighbor_prune"
-        debug["generated_candidate_count"] = int(debug.get("generated_candidate_count", 0)) + int(bool(selected_indices)) + int(bool(fast_diagnostic_add_items))
+            debug["reason"] = f"fast_diagnostic_{debug.get('fast_diagnostic_name', 'prune')}"
+        debug["candidate_count"] = max(int(debug.get("candidate_count", 0)), int(generated_fast_count))
+        debug["candidate_pool_count"] = max(int(debug.get("candidate_pool_count", 0)), int(generated_fast_count))
+        debug["generated_candidate_count"] = max(int(debug.get("generated_candidate_count", 0)), int(generated_fast_count))
         debug["accepted_candidate_count"] = int(selected_drop > 0) + int(selected_add > 0)
         debug["accepted_prune_count"] = int(selected_drop)
         debug["accepted_add_count"] = int(selected_add)
@@ -2904,17 +3116,29 @@ def _attach_sparsepcgc_actual_oracle_drop(
             debug["tested_count"] = 0
             debug["actual_eval_max"] = 0
         debug["fast_diagnostic_used"] = True
+        debug["fast_diagnostic_proxy_eval_skipped"] = bool(skip_fast_proxy_eval)
         debug["fast_diagnostic_proxy_bits"] = float(proxy_bits)
         debug["fast_diagnostic_proxy_percent"] = float(proxy_percent)
         return True
 
-    if not actual_validate_this_step:
+    if missing_full_cloud_teacher_eval:
+        debug["reason"] = "full_cloud_splice_missing_for_required_teacher"
+        debug["tested_count"] = 0
+        debug["actual_eval_max"] = 0
+        debug["actual_oracle_time"] = 0.0
+    elif not actual_validate_this_step:
         if not _apply_fast_diagnostic_teacher():
             debug["reason"] = "interval_skip_no_fast_diagnostic_candidate"
     elif (not candidate_pool and not add_candidate_pool) or unique_coords is None or inverse is None:
         debug["reason"] = "no_valid_actual_oracle_candidates"
     else:
         oracle_time_start = time.time()
+        if (
+            bool(getattr(args, "sparsepcgc_actual_oracle_release_cuda_cache", False))
+            and torch.cuda.is_available()
+        ):
+            torch.cuda.empty_cache()
+            debug["released_main_cuda_cache"] = True
         actual_eval_max = max(
             int(getattr(args, "sparsepcgc_actual_oracle_actual_eval_max", max_candidates)),
             0,
@@ -2926,22 +3150,44 @@ def _attach_sparsepcgc_actual_oracle_drop(
             max(float(getattr(args, "sparsepcgc_actual_oracle_single_eval_fraction", 0.50)), 0.0),
             1.0,
         )
-        single_eval_max = max(1, int(math.ceil(float(actual_eval_max) * single_eval_fraction)))
-        single_eval_max = min(int(single_eval_max), int(actual_eval_max))
+        prioritize_full_cloud_macro = bool(
+            getattr(args, "sparsepcgc_actual_oracle_prioritize_full_cloud_macro", True)
+            and torch.is_tensor(full_eval_coords)
+            and int(getattr(args, "sparsepcgc_actual_oracle_full_cloud_macro_prune_candidate_max", 0)) > 0
+        )
+        if prioritize_full_cloud_macro:
+            single_eval_max = 0
+        else:
+            single_eval_max = max(1, int(math.ceil(float(actual_eval_max) * single_eval_fraction)))
+            single_eval_max = min(int(single_eval_max), int(actual_eval_max))
         debug["single_eval_max"] = int(single_eval_max)
+        debug["prioritize_full_cloud_macro"] = bool(prioritize_full_cloud_macro)
 
         def _actual_budget_exhausted(tested_count):
             return int(tested_count) >= int(actual_eval_max)
 
         try:
-            oracle_base_cache_key = f"{cache_key or ''}|sparsepcgc_actual_oracle_voxel_base"
+            full_cloud_cache_key = str(
+                full_octree_context.get("actual_oracle_full_cloud_cache_key", "")
+                if isinstance(full_octree_context, dict)
+                else ""
+            )
+            oracle_base_cache_key = (
+                full_cloud_cache_key
+                if full_cloud_cache_key and torch.is_tensor(full_eval_coords)
+                else f"{cache_key or ''}|sparsepcgc_actual_oracle_voxel_base"
+            )
             cached_gt = loss._get_cached_actual_gt(oracle_base_cache_key)
+            base_encode_start = time.time()
+            base_cache_hit = cached_gt is not None
             if cached_gt is None:
                 base_xyz = _oracle_actual_eval_xyz(unique_coords)
                 if base_xyz is None or base_xyz.shape[-1] <= 0:
                     base_xyz = subtree_xyz[:, :3, :]
                 cached_gt = loss._encode_actual_batch(args, base_xyz)
                 loss._store_cached_actual_gt(oracle_base_cache_key, cached_gt)
+            debug["original_actual_cache_hit"] = bool(base_cache_hit)
+            debug["original_actual_encode_time"] = float(time.time() - base_encode_start)
             base_bit = float(cached_gt.get("bit", 0.0))
             if not math.isfinite(base_bit) or base_bit <= 0.0:
                 raise RuntimeError(f"invalid_base_bit={base_bit}")
@@ -3238,11 +3484,13 @@ def _attach_sparsepcgc_actual_oracle_drop(
             debug["pattern_plan_eval_max"] = int(pattern_plan_eval_limit)
             debug["subtree_move_eval_max"] = int(subtree_move_eval_limit)
             if full_cloud_macro_eval_limit > 0 and torch.is_tensor(full_eval_coords):
+                full_macro_generate_start = time.time()
                 full_macro_candidates = _sparsepcgc_actual_oracle_full_cloud_macro_prune_candidates(
                     full_eval_coords,
                     args,
                     full_cloud_macro_max,
                 )
+                debug["full_cloud_macro_generate_time"] = float(time.time() - full_macro_generate_start)
                 debug["generated_candidate_count"] = int(debug.get("generated_candidate_count", 0)) + int(len(full_macro_candidates))
                 min_improve = max(float(getattr(args, "sparsepcgc_actual_oracle_min_improve_percent", 0.0)), 0.0)
                 for full_macro_item in full_macro_candidates:
@@ -3252,14 +3500,37 @@ def _attach_sparsepcgc_actual_oracle_drop(
                     drop_coords = full_macro_item.get("drop_coords", None)
                     if not torch.is_tensor(candidate_coords) or not torch.is_tensor(drop_coords):
                         continue
-                    drop_key_set = {tuple(int(v) for v in row) for row in drop_coords.detach().cpu().tolist()}
-                    local_unique_indices = [
-                        int(idx)
-                        for idx, row in enumerate(unique_coords.detach().cpu().tolist())
-                        if tuple(int(v) for v in row) in drop_key_set
-                    ]
+                    local_map_start = time.time()
+                    if str(full_macro_item.get("op", "")) == "full_cloud_subtree_prune":
+                        drop_block_coords = full_macro_item.get("drop_block_coords", None)
+                        block_size = max(int(full_macro_item.get("block_size", 32)), 2)
+                        if not torch.is_tensor(drop_block_coords):
+                            continue
+                        drop_block_key_set = {
+                            tuple(int(v) for v in row)
+                            for row in drop_block_coords.detach().cpu().tolist()
+                        }
+                        local_blocks = torch.div(unique_coords, block_size, rounding_mode="floor")
+                        local_unique_indices = [
+                            int(idx)
+                            for idx, row in enumerate(local_blocks.detach().cpu().tolist())
+                            if tuple(int(v) for v in row) in drop_block_key_set
+                        ]
+                        drop_key_set = None
+                    else:
+                        drop_key_set = {tuple(int(v) for v in row) for row in drop_coords.detach().cpu().tolist()}
+                        local_unique_indices = [
+                            int(idx)
+                            for idx, row in enumerate(unique_coords.detach().cpu().tolist())
+                            if tuple(int(v) for v in row) in drop_key_set
+                        ]
+                    debug["full_cloud_macro_local_map_time"] = float(
+                        debug.get("full_cloud_macro_local_map_time", 0.0)
+                        + (time.time() - local_map_start)
+                    )
                     if not local_unique_indices:
                         continue
+                    restore_start = time.time()
                     candidate_xyz = _restore_codec_xyz_from_global_voxels(
                         args,
                         candidate_coords.transpose(0, 1).contiguous().unsqueeze(0),
@@ -3268,23 +3539,54 @@ def _attach_sparsepcgc_actual_oracle_drop(
                     )
                     if candidate_xyz is None or candidate_xyz.shape[-1] <= 0:
                         continue
+                    debug["full_cloud_macro_restore_time"] = float(
+                        debug.get("full_cloud_macro_restore_time", 0.0)
+                        + (time.time() - restore_start)
+                    )
+                    candidate_encode_wall_start = time.time()
                     stats = loss._encode_actual_batch(args, candidate_xyz)
+                    debug["candidate_actual_wall_time"] = float(
+                        debug.get("candidate_actual_wall_time", 0.0)
+                        + (time.time() - candidate_encode_wall_start)
+                    )
+                    debug["candidate_actual_encode_time"] = float(
+                        debug.get("candidate_actual_encode_time", 0.0)
+                        + float(stats.get("encode_time", 0.0) or 0.0)
+                    )
                     tested += 1
                     full_cloud_macro_tested += 1
                     cand_bit = float(stats.get("bit", 0.0))
-                    full_drop_count = int(full_macro_item.get("drop_count", len(drop_key_set)))
-                    edit_record_bits = _sparsepcgc_edit_record_total_bits(
-                        args,
-                        edit_record_unique_count,
-                        drop_count=full_drop_count,
+                    full_drop_count = int(
+                        full_macro_item.get(
+                            "drop_count",
+                            len(drop_key_set) if drop_key_set is not None else 0,
+                        )
                     )
+                    if str(full_macro_item.get("op", "")) == "full_cloud_subtree_prune":
+                        edit_record_bits = _sparsepcgc_edit_record_structured_prune_bits(
+                            args,
+                            edit_record_unique_count,
+                            int(full_macro_item.get("block_size", 32)),
+                            float(full_macro_item.get("drop_ratio", 0.0)),
+                        )
+                    else:
+                        edit_record_bits = _sparsepcgc_edit_record_total_bits(
+                            args,
+                            edit_record_unique_count,
+                            drop_count=full_drop_count,
+                        )
                     keep_local = torch.ones((unique_coords.shape[0],), device=unique_coords.device, dtype=torch.bool)
                     keep_local[torch.as_tensor(local_unique_indices, device=unique_coords.device, dtype=torch.long)] = False
                     local_candidate_coords = torch.unique(unique_coords[keep_local], dim=0, sorted=True)
+                    local_proxy_start = time.time()
                     proxy_bits, proxy_percent = _sparsepcgc_proxy_delta_percent(
                         local_candidate_coords,
                         args,
                         base_proxy_bits,
+                    )
+                    debug["full_cloud_macro_local_proxy_time"] = float(
+                        debug.get("full_cloud_macro_local_proxy_time", 0.0)
+                        + (time.time() - local_proxy_start)
                     )
                     geometry_percent = _sparsepcgc_geometry_penalty_percent(
                         args,
@@ -3306,7 +3608,7 @@ def _attach_sparsepcgc_actual_oracle_drop(
                         improving_candidate_count += 1
                         improving.append(
                             {
-                                "op": "macro_prune",
+                                "op": str(full_macro_item.get("op", "macro_prune")),
                                 "unique_indices": local_unique_indices,
                                 "percent": float(cand_percent),
                                 "raw_percent": float(raw_percent),
@@ -3317,11 +3619,17 @@ def _attach_sparsepcgc_actual_oracle_drop(
                                 "edit_record_bits": float(edit_record_bits),
                                 "edited_actual_bits": float(cand_bit),
                                 "full_cloud_drop_count": int(full_drop_count),
+                                "drop_block_count": int(full_macro_item.get("drop_block_count", 0)),
+                                "block_size": int(full_macro_item.get("block_size", 0)),
+                                "drop_ratio": float(full_macro_item.get("drop_ratio", 0.0)),
+                                "override_final_voxel_coords": candidate_coords.detach().clone(),
+                                "override_scope": "full_cloud",
+                                "actual_stats": dict(stats),
                             }
                         )
                     elif cand_percent >= bad_min_percent:
                         bad_candidate_count += 1
-            if macro_prune_max > 0:
+            if macro_prune_eval_limit > 0:
                 macro_candidates = _sparsepcgc_actual_oracle_macro_prune_candidates(
                     unique_coords,
                     args,
@@ -3395,7 +3703,7 @@ def _attach_sparsepcgc_actual_oracle_drop(
                             mask = inverse == int(unique_idx)
                             if bool(mask.any().detach().cpu()):
                                 bad_drop_point_mask[0] |= mask
-            if max_joint_candidates > 0 and candidate_indices and add_candidates:
+            if joint_eval_limit > 0 and candidate_indices and add_candidates:
                 pair_candidates = []
                 for drop_candidate in candidate_indices:
                     drop_unique_idx = int(
@@ -3719,7 +4027,7 @@ def _attach_sparsepcgc_actual_oracle_drop(
                                     if bool(mask.any().detach().cpu()):
                                         bad_add_point_mask[0] |= mask
 
-            if parent_prune_max > 0 and unique_count > 1:
+            if parent_prune_eval_limit > 0 and unique_count > 1:
                 parent_coords = torch.div(unique_coords, 2, rounding_mode="floor")
                 unique_parents, parent_inverse = torch.unique(
                     parent_coords,
@@ -3844,7 +4152,7 @@ def _attach_sparsepcgc_actual_oracle_drop(
                                 if bool(mask.any().detach().cpu()):
                                     bad_drop_point_mask[0] |= mask
 
-            if pattern_plan_max > 0:
+            if pattern_plan_eval_limit > 0:
                 pattern_candidates = _sparsepcgc_actual_oracle_pattern_plan_candidates(
                     unique_coords,
                     args,
@@ -3930,7 +4238,7 @@ def _attach_sparsepcgc_actual_oracle_drop(
                                 if 0 <= target_slot <= 7:
                                     bad_add_child_slot[0, mask] = target_slot
 
-            if subtree_move_allowed_this_step:
+            if subtree_move_eval_limit > 0:
                 subtree_move_candidates = _sparsepcgc_actual_oracle_subtree_move_candidates(
                     unique_coords,
                     args,
@@ -4036,6 +4344,7 @@ def _attach_sparsepcgc_actual_oracle_drop(
             debug["parent_prune_improving_count"] = int(parent_prune_improving_count)
 
             if improving:
+                improving_selection_start = time.time()
                 improving = sorted(improving, key=lambda item: float(item["percent"]))
                 max_selected = max(int(getattr(args, "sparsepcgc_actual_oracle_max_selected_voxels", 4)), 1)
                 combo_validate_max_extra = max(
@@ -4050,6 +4359,9 @@ def _attach_sparsepcgc_actual_oracle_drop(
                 selected_add_sources = set()
                 selected_add_targets = []
                 override_final_voxel_coords = None
+                override_drop_count = 0
+                override_subtree_prune_count = 0
+                override_scope = ""
                 current_combo_percent = 0.0
                 selected_raw_percent = 0.0
                 selected_actual_percent = 0.0
@@ -4089,6 +4401,41 @@ def _attach_sparsepcgc_actual_oracle_drop(
                             float(score[0, mask].max().detach().cpu()),
                         )
                     selected_drop += 1
+
+                def _mark_drop_many(unique_indices, strength):
+                    nonlocal selected_drop
+                    if not unique_indices:
+                        return
+                    valid_indices = sorted(
+                        {
+                            int(value)
+                            for value in unique_indices
+                            if 0 <= int(value) < int(unique_coords.shape[0])
+                            and int(value) not in dropped_unique
+                        }
+                    )
+                    if not valid_indices:
+                        return
+                    index_tensor = torch.as_tensor(
+                        valid_indices,
+                        device=inverse.device,
+                        dtype=torch.long,
+                    )
+                    selected_unique_mask = torch.zeros(
+                        (unique_coords.shape[0],),
+                        device=inverse.device,
+                        dtype=torch.bool,
+                    )
+                    selected_unique_mask[index_tensor] = True
+                    mask = selected_unique_mask.index_select(0, inverse)
+                    point_mask[0] |= mask
+                    score[0] = torch.where(
+                        mask,
+                        torch.maximum(score[0], score[0].new_full(score[0].shape, float(strength))),
+                        score[0],
+                    )
+                    dropped_unique.update(valid_indices)
+                    selected_drop += len(valid_indices)
 
                 def _mark_add(source_unique_idx, target_child_slot, target_coord_item, strength):
                     nonlocal selected_add
@@ -4209,14 +4556,30 @@ def _attach_sparsepcgc_actual_oracle_drop(
                         )
                         continue
 
-                    if op_name in {"drop_group", "parent_collapse", "macro_prune"}:
+                    if op_name in {
+                        "drop_group",
+                        "parent_collapse",
+                        "macro_prune",
+                        "full_cloud_subtree_prune",
+                    }:
                         if selected_drop + selected_add > 0:
                             continue
                         unique_indices = [int(v) for v in item.get("unique_indices", [])]
                         if not unique_indices:
                             continue
-                        if op_name == "parent_collapse":
+                        if op_name in {"parent_collapse", "full_cloud_subtree_prune"}:
                             accepted_parent_collapse_count = 1
+                        if op_name == "full_cloud_subtree_prune":
+                            final_coords_item = item.get("override_final_voxel_coords", None)
+                            if not torch.is_tensor(final_coords_item):
+                                continue
+                            override_final_voxel_coords = final_coords_item.detach().clone()
+                            override_drop_count = int(item.get("full_cloud_drop_count", 0) or 0)
+                            override_subtree_prune_count = int(item.get("drop_block_count", 0) or 0)
+                            override_scope = str(item.get("override_scope", "full_cloud"))
+                            actual_stats_item = item.get("actual_stats", None)
+                            if isinstance(actual_stats_item, dict):
+                                debug["cached_edited_actual_stats"] = dict(actual_stats_item)
                         current_combo_percent = float(item["percent"])
                         selected_raw_percent = float(item.get("raw_percent", item["percent"]))
                         selected_actual_percent = float(item.get("actual_percent", item["percent"]))
@@ -4224,10 +4587,8 @@ def _attach_sparsepcgc_actual_oracle_drop(
                         selected_geometry_percent = float(item.get("geometry_percent", 0.0))
                         selected_edited_actual_bits = _item_edited_actual_bits(item)
                         selected_edit_record_bits = float(item.get("edit_record_bits", 0.0))
-                        for unique_idx in unique_indices[:max_selected]:
-                            if selected_drop + selected_add >= max_selected:
-                                break
-                            _mark_drop(unique_idx, strength)
+                        remaining = max(max_selected - selected_drop - selected_add, 0)
+                        _mark_drop_many(unique_indices[:remaining], strength)
                         continue
 
                     if op_name == "add_group":
@@ -4417,6 +4778,10 @@ def _attach_sparsepcgc_actual_oracle_drop(
                 if override_final_voxel_coords is not None:
                     debug["override_final_voxel_coords"] = override_final_voxel_coords.detach().clone()
                     debug["override_move_count"] = int(selected_move)
+                    debug["override_drop_count"] = int(override_drop_count)
+                    debug["override_subtree_prune_count"] = int(override_subtree_prune_count)
+                    debug["override_scope"] = str(override_scope)
+                debug["improving_selection_time"] = float(time.time() - improving_selection_start)
                 if not debug["used"]:
                     debug["reason"] = "no_actual_improving_combo_candidate"
                 elif selected_move > 0:
@@ -4448,7 +4813,12 @@ def _attach_sparsepcgc_actual_oracle_drop(
             debug["reason"] = f"oracle_error:{exc}"
             debug["actual_oracle_time"] = float(time.time() - oracle_time_start)
 
-    if actual_validate_this_step and (not bool(debug.get("used", False))) and fast_diagnostic_indices:
+    if (
+        actual_validate_this_step
+        and (not bool(debug.get("used", False)))
+        and fast_diagnostic_indices
+        and bool(getattr(args, "sparsepcgc_actual_oracle_fast_fallback_after_reject", False))
+    ):
         previous_reason = str(debug.get("reason", ""))
         if _apply_fast_diagnostic_teacher():
             debug["reason"] = f"fast_diagnostic_after_actual_reject:{previous_reason}"
@@ -4486,7 +4856,13 @@ def _attach_sparsepcgc_actual_oracle_drop(
         "actual_oracle_eval_max": int(debug.get("actual_eval_max", 0)),
         "actual_oracle_eval_scope": str(debug.get("actual_eval_scope", "")),
         "actual_oracle_eval_full_coord_count": int(debug.get("actual_eval_full_coord_count", 0)),
+        "actual_oracle_full_cloud_teacher_required": bool(debug.get("full_cloud_teacher_required", False)),
+        "actual_oracle_full_cloud_teacher_eval_available": bool(debug.get("full_cloud_teacher_eval_available", False)),
         "actual_oracle_time": float(debug.get("actual_oracle_time", 0.0)),
+        "actual_oracle_original_actual_cache_hit": bool(debug.get("original_actual_cache_hit", False)),
+        "actual_oracle_original_actual_encode_time": float(debug.get("original_actual_encode_time", 0.0) or 0.0),
+        "actual_oracle_candidate_actual_encode_time": float(debug.get("candidate_actual_encode_time", 0.0) or 0.0),
+        "actual_oracle_released_main_cuda_cache": bool(debug.get("released_main_cuda_cache", False)),
         "actual_oracle_drop_reason": str(debug["reason"]),
         "actual_oracle_add_mask": add_point_mask.detach(),
         "actual_oracle_add_score": add_score.detach(),
@@ -4504,6 +4880,16 @@ def _attach_sparsepcgc_actual_oracle_drop(
             else None
         ),
         "actual_oracle_override_move_count": int(debug.get("override_move_count", 0) or 0),
+        "actual_oracle_override_drop_count": int(debug.get("override_drop_count", 0) or 0),
+        "actual_oracle_override_subtree_prune_count": int(
+            debug.get("override_subtree_prune_count", 0) or 0
+        ),
+        "actual_oracle_override_scope": str(debug.get("override_scope", "") or ""),
+        "actual_oracle_cached_edited_actual_stats": (
+            dict(debug["cached_edited_actual_stats"])
+            if isinstance(debug.get("cached_edited_actual_stats", None), dict)
+            else None
+        ),
         "actual_oracle_edit_record_bits": float(debug.get("selected_edit_record_bits", 0.0) or 0.0),
         "actual_oracle_best_edit_record_bits": float(debug.get("best_edit_record_bits", 0.0) or 0.0),
         "actual_oracle_raw_percent": float(debug.get("selected_raw_percent", 0.0) or 0.0),
@@ -4524,6 +4910,28 @@ def _attach_sparsepcgc_actual_oracle_drop(
         "actual_oracle_fast_diagnostic_local_add_count": int(debug.get("fast_diagnostic_local_add_count", 0) or 0),
         "actual_oracle_fast_diagnostic_full_add_ratio": float(debug.get("fast_diagnostic_full_add_ratio", 0.0) or 0.0),
         "actual_oracle_fast_diagnostic_local_add_ratio": float(debug.get("fast_diagnostic_local_add_ratio", 0.0) or 0.0),
+        "actual_oracle_joint_tested_count": int(debug.get("joint_tested_count", 0) or 0),
+        "actual_oracle_joint_improving_count": int(debug.get("joint_improving_count", 0) or 0),
+        "actual_oracle_group_tested_count": int(debug.get("group_tested_count", 0) or 0),
+        "actual_oracle_group_improving_count": int(debug.get("group_improving_count", 0) or 0),
+        "actual_oracle_full_cloud_macro_tested_count": int(debug.get("full_cloud_macro_tested_count", 0) or 0),
+        "actual_oracle_full_cloud_macro_improving_count": int(debug.get("full_cloud_macro_improving_count", 0) or 0),
+        "actual_oracle_full_cloud_macro_best_percent": float(debug.get("full_cloud_macro_best_percent", 0.0) or 0.0),
+        "actual_oracle_full_cloud_macro_best_ratio": float(debug.get("full_cloud_macro_best_ratio", 0.0) or 0.0),
+        "actual_oracle_full_cloud_macro_best_drop_count": int(debug.get("full_cloud_macro_best_drop_count", 0) or 0),
+        "actual_oracle_macro_prune_tested_count": int(debug.get("macro_prune_tested_count", 0) or 0),
+        "actual_oracle_macro_prune_improving_count": int(debug.get("macro_prune_improving_count", 0) or 0),
+        "actual_oracle_macro_prune_best_percent": float(debug.get("macro_prune_best_percent", 0.0) or 0.0),
+        "actual_oracle_macro_prune_best_ratio": float(debug.get("macro_prune_best_ratio", 0.0) or 0.0),
+        "actual_oracle_macro_prune_best_drop_count": int(debug.get("macro_prune_best_drop_count", 0) or 0),
+        "actual_oracle_macro_prune_best_variant": str(debug.get("macro_prune_best_variant", "")),
+        "actual_oracle_macro_prune_best_proxy_percent": float(debug.get("macro_prune_best_proxy_percent", 0.0) or 0.0),
+        "actual_oracle_parent_prune_tested_count": int(debug.get("parent_prune_tested_count", 0) or 0),
+        "actual_oracle_parent_prune_improving_count": int(debug.get("parent_prune_improving_count", 0) or 0),
+        "actual_oracle_pattern_plan_tested_count": int(debug.get("pattern_plan_tested_count", 0) or 0),
+        "actual_oracle_pattern_plan_improving_count": int(debug.get("pattern_plan_improving_count", 0) or 0),
+        "actual_oracle_subtree_move_tested_count": int(debug.get("subtree_move_tested_count", 0) or 0),
+        "actual_oracle_subtree_move_improving_count": int(debug.get("subtree_move_improving_count", 0) or 0),
         "actual_oracle_operation": str(debug["reason"]),
     }
 
@@ -4612,10 +5020,86 @@ def _attach_sparsepcgc_actual_oracle_drop(
                 f"accepted_parent_collapse={int(debug.get('accepted_parent_collapse_count', 0))}, "
                 f"accepted_pattern_canonicalize={int(debug.get('accepted_pattern_canonicalize_count', 0))}, "
                 f"oracle_time={float(debug.get('actual_oracle_time', 0.0)):.4f}s, "
+                f"macro_gen_time={float(debug.get('full_cloud_macro_generate_time', 0.0)):.4f}s, "
+                f"macro_map_time={float(debug.get('full_cloud_macro_local_map_time', 0.0)):.4f}s, "
+                f"candidate_wall_time={float(debug.get('candidate_actual_wall_time', 0.0)):.4f}s, "
+                f"local_proxy_time={float(debug.get('full_cloud_macro_local_proxy_time', 0.0)):.4f}s, "
+                f"selection_time={float(debug.get('improving_selection_time', 0.0)):.4f}s, "
                 f"reason={debug['reason']}"
             )
 
     return patched_tree, patched_context, debug
+
+
+def _copy_sparsepcgc_actual_oracle_debug_for_metrics(target, debug):
+    if not isinstance(target, dict) or not isinstance(debug, dict):
+        return target
+    target.update(
+        {
+            "actual_oracle_enabled": bool(debug.get("enabled", False)),
+            "actual_oracle_used": bool(debug.get("used", False)),
+            "actual_oracle_generated_candidate_count": int(debug.get("generated_candidate_count", debug.get("candidate_pool_count", 0)) or 0),
+            "actual_oracle_accepted_candidate_count": int(debug.get("accepted_candidate_count", 0) or 0),
+            "actual_oracle_accepted_prune_count": int(debug.get("accepted_prune_count", 0) or 0),
+            "actual_oracle_accepted_add_count": int(debug.get("accepted_add_count", 0) or 0),
+            "actual_oracle_accepted_adjust_count": int(debug.get("accepted_adjust_count", 0) or 0),
+            "actual_oracle_accepted_subtree_move_count": int(debug.get("accepted_subtree_move_count", 0) or 0),
+            "actual_oracle_accepted_parent_collapse_count": int(debug.get("accepted_parent_collapse_count", 0) or 0),
+            "actual_oracle_accepted_pattern_canonicalize_count": int(debug.get("accepted_pattern_canonicalize_count", 0) or 0),
+            "actual_oracle_noop_label_count": int(debug.get("noop_label_count", 0) or 0),
+            "actual_oracle_noop_label_weight": float(debug.get("noop_label_weight", 0.0) or 0.0),
+            "actual_oracle_high_rate_mppov_count": int(debug.get("high_rate_mppov_count", 0) or 0),
+            "actual_oracle_low_prob_occupied_count": int(debug.get("low_prob_occupied_count", 0) or 0),
+            "actual_oracle_single_child_chain_count": int(debug.get("single_child_chain_count", 0) or 0),
+            "actual_oracle_context_pattern_candidate_count": int(debug.get("context_pattern_candidate_count", 0) or 0),
+            "actual_oracle_eval_count": int(debug.get("tested_count", 0) or 0),
+            "actual_oracle_eval_max": int(debug.get("actual_eval_max", 0) or 0),
+            "actual_oracle_eval_scope": str(debug.get("actual_eval_scope", "")),
+            "actual_oracle_eval_full_coord_count": int(debug.get("actual_eval_full_coord_count", 0) or 0),
+            "actual_oracle_full_cloud_teacher_required": bool(debug.get("full_cloud_teacher_required", False)),
+            "actual_oracle_full_cloud_teacher_eval_available": bool(debug.get("full_cloud_teacher_eval_available", False)),
+            "actual_oracle_time": float(debug.get("actual_oracle_time", 0.0) or 0.0),
+            "actual_oracle_original_actual_cache_hit": bool(debug.get("original_actual_cache_hit", False)),
+            "actual_oracle_original_actual_encode_time": float(debug.get("original_actual_encode_time", 0.0) or 0.0),
+            "actual_oracle_candidate_actual_encode_time": float(debug.get("candidate_actual_encode_time", 0.0) or 0.0),
+            "actual_oracle_released_main_cuda_cache": bool(debug.get("released_main_cuda_cache", False)),
+            "actual_oracle_edit_record_bits": float(debug.get("selected_edit_record_bits", 0.0) or 0.0),
+            "actual_oracle_best_edit_record_bits": float(debug.get("best_edit_record_bits", 0.0) or 0.0),
+            "actual_oracle_raw_percent": float(debug.get("selected_raw_percent", 0.0) or 0.0),
+            "actual_oracle_best_raw_percent": float(debug.get("best_raw_percent", 0.0) or 0.0),
+            "actual_oracle_delta_actual_percent": float(debug.get("delta_actual_percent", 0.0) or 0.0),
+            "actual_oracle_best_actual_percent": float(debug.get("best_actual_percent", 0.0) or 0.0),
+            "actual_oracle_proxy_percent": float(debug.get("selected_proxy_percent", 0.0) or 0.0),
+            "actual_oracle_best_proxy_percent": float(debug.get("best_proxy_percent", 0.0) or 0.0),
+            "actual_oracle_geometry_percent": float(debug.get("selected_geometry_percent", 0.0) or 0.0),
+            "actual_oracle_original_actual_bits": float(debug.get("original_actual_bits", 0.0) or 0.0),
+            "actual_oracle_edited_actual_bits": float(debug.get("edited_actual_bits", 0.0) or 0.0),
+            "actual_oracle_joint_tested_count": int(debug.get("joint_tested_count", 0) or 0),
+            "actual_oracle_joint_improving_count": int(debug.get("joint_improving_count", 0) or 0),
+            "actual_oracle_group_tested_count": int(debug.get("group_tested_count", 0) or 0),
+            "actual_oracle_group_improving_count": int(debug.get("group_improving_count", 0) or 0),
+            "actual_oracle_full_cloud_macro_tested_count": int(debug.get("full_cloud_macro_tested_count", 0) or 0),
+            "actual_oracle_full_cloud_macro_improving_count": int(debug.get("full_cloud_macro_improving_count", 0) or 0),
+            "actual_oracle_full_cloud_macro_best_percent": float(debug.get("full_cloud_macro_best_percent", 0.0) or 0.0),
+            "actual_oracle_full_cloud_macro_best_ratio": float(debug.get("full_cloud_macro_best_ratio", 0.0) or 0.0),
+            "actual_oracle_full_cloud_macro_best_drop_count": int(debug.get("full_cloud_macro_best_drop_count", 0) or 0),
+            "actual_oracle_macro_prune_tested_count": int(debug.get("macro_prune_tested_count", 0) or 0),
+            "actual_oracle_macro_prune_improving_count": int(debug.get("macro_prune_improving_count", 0) or 0),
+            "actual_oracle_macro_prune_best_percent": float(debug.get("macro_prune_best_percent", 0.0) or 0.0),
+            "actual_oracle_macro_prune_best_ratio": float(debug.get("macro_prune_best_ratio", 0.0) or 0.0),
+            "actual_oracle_macro_prune_best_drop_count": int(debug.get("macro_prune_best_drop_count", 0) or 0),
+            "actual_oracle_macro_prune_best_variant": str(debug.get("macro_prune_best_variant", "")),
+            "actual_oracle_macro_prune_best_proxy_percent": float(debug.get("macro_prune_best_proxy_percent", 0.0) or 0.0),
+            "actual_oracle_parent_prune_tested_count": int(debug.get("parent_prune_tested_count", 0) or 0),
+            "actual_oracle_parent_prune_improving_count": int(debug.get("parent_prune_improving_count", 0) or 0),
+            "actual_oracle_pattern_plan_tested_count": int(debug.get("pattern_plan_tested_count", 0) or 0),
+            "actual_oracle_pattern_plan_improving_count": int(debug.get("pattern_plan_improving_count", 0) or 0),
+            "actual_oracle_subtree_move_tested_count": int(debug.get("subtree_move_tested_count", 0) or 0),
+            "actual_oracle_subtree_move_improving_count": int(debug.get("subtree_move_improving_count", 0) or 0),
+            "actual_oracle_operation": str(debug.get("reason", "")),
+        }
+    )
+    return target
 
 
 def _unwrap_train_model(model):
@@ -6925,12 +7409,15 @@ def train(model, args, loss, writer, plot, notifier=None):
                 args._global_train_step = int(global_train_step) # 現在の累積Step番号を保存
                 args._current_sample_name = os.path.basename(str(file_path)) # teacher/debugログに点群ファイル名を残す
                 args._current_teacher_scope = "full_cloud" # このStepのteacherが全点群か局所subtreeかをLoss側へ伝える初期値
+                args._sparsepcgc_full_cloud_actual_primary_active = False
                 args._log_this_step = False
                 sparsepcgc_csv_debug = ( str(getattr(args, "compress", "")).strip().lower().replace("-", "").replace("_", "") == "sparsepcgc" and bool(getattr(args, "save_compression_metric_csv", True))) # Sparse PCGC専用ログ
                 operation_csv_debug = bool( getattr(args, "save_operation_metric_csv", getattr(args, "save_operation_metrics_csv", True))) # 点操作メトリクスCSVを保存するか判定し、点移動量や追加/削除などのDebug収集条件に使用
                 args._collect_sparsepcgc_debug = bool(sparsepcgc_csv_debug and should_collect_sparsepcgc_hard_debug(args, log_this_step=log_this_step, profile_this_step=profile_this_step, global_step=global_train_step)) # SparsePCGCの重いhard統計は毎Stepではなく診断間隔だけ収集する
                 args._collect_structure_debug = bool( log_this_step or profile_this_step or operation_csv_debug or sparsepcgc_add_experiment_active(args))
                 detail_log_this_step = False
+                step_timing_breakdown = {}
+                step_actual_oracle_metric_debug = {}
 
                 """学習設定"""
                 if timing_enabled and use_cuda and torch.cuda.is_available(): # GPU計測のためのリセット
@@ -6958,11 +7445,13 @@ def train(model, args, loss, writer, plot, notifier=None):
                 # このStepで使う唯一の voxel 座標系を full cloud から一度だけ作る。
                 # Subtree / full anchor / actual / proxy / debug は必ずこれを基準にする。
                 # ============================================================
+                full_cloud_canonical_start = time.time()
                 full_cloud_canonical_context = _build_full_cloud_octree_context_for_train(
                     input_xyz[:, :3, :],
                     args,
                     coord_scale=None,
                 )
+                step_timing_breakdown["full_cloud_canonical_build_time"] = float(time.time() - full_cloud_canonical_start)
 
                 try:
                     setattr(args, "_full_cloud_canonical_context", full_cloud_canonical_context)
@@ -7040,6 +7529,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                     subtree_depth_meta["depth_after_floor"] = int(requested_subtree_depth)
 
                     min_subtree_points = max(int(getattr(args, "train_subtree_min_points", 1)), 1)
+                    subtree_group_build_start = time.time()
                     subtree_group_state = build_octree_subtree_groups_with_retry(
                         input_xyz,
                         args,
@@ -7047,6 +7537,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                         min_subtree_points,
                         allow_largest_fallback=True,
                     )
+                    step_timing_breakdown["subtree_group_build_time"] = float(time.time() - subtree_group_build_start)
                     # subtree_depth_meta = sample_train_subtree_depth( input_xyz, args, global_step=global_train_step, cache_key=cache_key) # Octree深度の決定
                     # subtree_depth_meta, requested_subtree_depth = maybe_raise_subtree_depth_for_large_input( subtree_depth_meta, raw_pts_num, args) # 大点群時は点を捨てずにSubtree深度だけ1段階浅くする
                     # requested_subtree_depth = int(requested_subtree_depth) # 調整後のSubtree深度を整数で取り出す
@@ -7077,6 +7568,15 @@ def train(model, args, loss, writer, plot, notifier=None):
                     actual_eligible_subtree_count = int(len(eligible_groups)) # 条件を満たしたSubtreeを数える
                     min_points_miss = bool(total_subtree_count > 0 and not eligible_groups and min_subtree_points > 1) # Subtree自体はあるが、最小点数条件を満たすSubtreeがないかを判定する
                     candidate_groups = eligible_groups or list(subtree_group_state.get("groups", [])) or all_groups # 学習に使う候補Subtree集合を決める
+                    max_subtree_points = max(int(getattr(args, "train_subtree_max_points", 0)), 0)
+                    if max_subtree_points > 0:
+                        bounded_candidate_groups = [
+                            (subtree_key, point_idx)
+                            for subtree_key, point_idx in candidate_groups
+                            if int(point_idx.numel()) <= max_subtree_points
+                        ]
+                        if bounded_candidate_groups:
+                            candidate_groups = bounded_candidate_groups
                     candidate_subtree_keys = all_subtree_keys.new_tensor( # 候補SubtreeのKeyを元のSubtree Keyと同じテンソルとして作る
                         [subtree_key for subtree_key, _ in candidate_groups],
                         dtype=all_subtree_keys.dtype,
@@ -7100,6 +7600,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                     selected_subtree_keys = candidate_subtree_keys # 初期状態では候補Subtreeを全て選択対象にする
                     subtree_potential_select_meta = {"enabled": False, "reason": "not_evaluated"}
                     if eligible_subtree_count > 0 and selected_subtree_for_grad:
+                        subtree_potential_start = time.time()
                         potential_selected_keys, subtree_potential_select_meta = _select_sparsepcgc_potential_subtree_key(
                             candidate_groups,
                             candidate_subtree_keys,
@@ -7108,6 +7609,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                             global_train_step,
                             cache_key,
                         )
+                        step_timing_breakdown["subtree_potential_select_time"] = float(time.time() - subtree_potential_start)
                         if torch.is_tensor(potential_selected_keys) and int(potential_selected_keys.numel()) > 0:
                             selected_subtree_keys = potential_selected_keys
                         else:
@@ -7174,6 +7676,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                             oracle_cache_key = (
                                 f"{cache_key}|subtree_depth={oracle_depth}|subtree_key={selected_key_int}"
                             )
+                            patched_full_context["actual_oracle_full_cloud_cache_key"] = str(cache_key)
                             oracle_subtree_xyz = input_xyz.index_select(2, selected_point_idx).contiguous()
                             patched_subtree_tree, patched_full_context, oracle_debug = _attach_sparsepcgc_actual_oracle_drop(
                                 args=args,
@@ -7186,8 +7689,29 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 global_step=global_train_step,
                             )
 
+                            # A full-cloud structured candidate is the final output teacher, while
+                            # the selected subtree only receives the intersecting local drop mask.
+                            # Applying full-cloud coordinates inside the shadow subtree would mix
+                            # coordinate scopes and duplicate the entire cloud in that forward.
+                            if str(oracle_debug.get("override_scope", "")) == "full_cloud":
+                                full_cloud_canonical_context = dict(full_cloud_canonical_context)
+                                for oracle_key, oracle_value in patched_full_context.items():
+                                    if oracle_key.startswith("actual_oracle_"):
+                                        full_cloud_canonical_context[oracle_key] = oracle_value
+                                patched_subtree_tree = dict(patched_subtree_tree)
+                                for oracle_key in (
+                                    "actual_oracle_override_final_voxel_coords",
+                                    "actual_oracle_override_move_count",
+                                    "actual_oracle_override_drop_count",
+                                    "actual_oracle_override_subtree_prune_count",
+                                    "actual_oracle_override_scope",
+                                ):
+                                    patched_subtree_tree.pop(oracle_key, None)
+
                             patched_subtree_trees[selected_key_int] = patched_subtree_tree
                             patched_full_octree_contexts[selected_key_int] = patched_full_context
+                            if isinstance(oracle_debug, dict) and oracle_debug:
+                                step_actual_oracle_metric_debug = dict(oracle_debug)
 
                             if selected_key_int in group_meta:
                                 group_meta[selected_key_int] = dict(group_meta[selected_key_int])
@@ -7218,6 +7742,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                         subtree_trees = patched_subtree_trees
                         full_octree_contexts = patched_full_octree_contexts
                         t2 = time.time()
+                        step_timing_breakdown["selected_metadata_oracle_time"] = float(t2 - t1)
                         # print(t2-t1)
                     else:
                         subtree_trees = {}
@@ -7310,6 +7835,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                     full_cloud_anchor_no_grad_reason = ""
                     full_cloud_anchor_shadow_train_active = False
                     full_cloud_anchor_debug_snapshot = {}
+                    full_cloud_primary_override_debug = {}
+                    full_cloud_geometry_teacher_debug = {}
+                    full_cloud_anchor_runtime_timing = {}
 
                     """モデルの実行"""
                     prev_log_flag = getattr(args, "_log_this_step", False)
@@ -7317,6 +7845,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                         args._log_this_step = bool(getattr(args, "verbose_step_logs", False) and detail_log_this_step) # このSubtree処理内で詳細ログを出すか否か決定
                         if is_anchor_step:
                             """全点群の場合"""
+                            full_cloud_anchor_block_start = time.time()
                             args._current_teacher_scope = "full_cloud" # full-cloud anchorでは実圧縮teacherも全点群基準として記録する
                             args._current_teacher_anchor_reason = str(anchor_reason) # full-cloudになった理由をteacherログへ渡す
                             args._current_exact_teacher_mode = "full_cloud" # exact occupancy teacherは全点群基準で走らせる
@@ -7382,6 +7911,12 @@ def train(model, args, loss, writer, plot, notifier=None):
                                     full_octree_context=full_octree_context,
                                     octree_input_mode="full_cloud",
                                 )
+                            try:
+                                full_cloud_anchor_runtime_timing = dict(
+                                    getattr(model.module if hasattr(model, "module") else model, "last_runtime_timing", {}) or {}
+                                )
+                            except Exception:
+                                full_cloud_anchor_runtime_timing = {}
                             if final_w is not None and not torch.isfinite(final_w).all(): # final重みにNanやinfが混ざっていないか確認
                                 writer.write( "Warning: final_w contains NaN/Inf. " "It will be sanitized before point-edit summary and losses.")
                                 final_w = torch.nan_to_num(final_w, nan=0.0, posinf=1.0, neginf=0.0) # 変換
@@ -7452,6 +7987,41 @@ def train(model, args, loss, writer, plot, notifier=None):
                                         full_octree_context=full_octree_context,
                                         octree_input_mode="full_cloud",
                                     )
+                                    if (
+                                        isinstance(step_actual_oracle_metric_debug, dict)
+                                        and bool(step_actual_oracle_metric_debug.get("used", False))
+                                        and str(step_actual_oracle_metric_debug.get("override_scope", "")) == "full_cloud"
+                                    ):
+                                        billed_percent = finite_float_or_none(
+                                            step_actual_oracle_metric_debug.get("delta_actual_percent", None)
+                                        )
+                                        edit_record_bits = max(
+                                            float(step_actual_oracle_metric_debug.get("selected_edit_record_bits", 0.0) or 0.0),
+                                            0.0,
+                                        )
+                                        if billed_percent is not None:
+                                            billed_tensor = L_com.new_tensor(float(billed_percent))
+                                            L_com = billed_tensor + (L_com - L_com.detach())
+                                            loss_bit = billed_tensor + (loss_bit - loss_bit.detach())
+                                            billed_debug = dict(getattr(loss, "last_compression_debug", {}) or {})
+                                            billed_debug.update(
+                                                {
+                                                    "total_bit": float(billed_percent),
+                                                    "actual_total_bit_percent": float(billed_percent),
+                                                    "actual_bit_percent": float(billed_percent),
+                                                    "actual_delta_percent": float(billed_percent),
+                                                    "actual_edit_record_bits": float(edit_record_bits),
+                                                    "actual_total_bits": float(
+                                                        step_actual_oracle_metric_debug.get("edited_actual_bits", 0.0) or 0.0
+                                                    )
+                                                    + float(edit_record_bits),
+                                                    "gen_total_bit_with_edit_record": float(
+                                                        step_actual_oracle_metric_debug.get("edited_actual_bits", 0.0) or 0.0
+                                                    )
+                                                    + float(edit_record_bits),
+                                                }
+                                            )
+                                            loss.last_compression_debug = billed_debug
                                     base_model_for_correction = model.module if hasattr(model, "module") else model
                                     full_cloud_debug_for_correction = dict(getattr(loss, "last_compression_debug", {}) or {})
                                     full_cloud_correction_state, last_full_cloud_correction_update_debug = update_full_cloud_actual_correction_state(
@@ -7502,6 +8072,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                                     "full-cloud actual/correction state updated; "
                                     "resetting differentiable losses and running selected subtree with grad."
                                 )
+                            step_timing_breakdown["full_cloud_anchor_block_time"] = float(
+                                time.time() - full_cloud_anchor_block_start
+                            )
                         if (not is_anchor_step) or full_cloud_anchor_shadow_train_active:
                             """Subtreeの場合"""
                             if full_cloud_anchor_shadow_train_active:
@@ -7811,6 +8384,48 @@ def train(model, args, loss, writer, plot, notifier=None):
                                     setattr(args, "_full_cloud_actual_correction_state", full_cloud_correction_state)
                                 except Exception:
                                     pass
+                                if bool(getattr(args, "sparsepcgc_full_cloud_actual_primary", True)):
+                                    full_cloud_primary_value = finite_float_or_none(
+                                        full_cloud_anchor_debug_snapshot.get(
+                                            "actual_total_bit_percent",
+                                            full_cloud_anchor_debug_snapshot.get("actual_bit_percent", None),
+                                        )
+                                    )
+                                    subtree_primary_value = finite_float_or_none(
+                                        last_subtree_actual_debug_for_correction.get(
+                                            "actual_total_bit_percent",
+                                            last_subtree_actual_debug_for_correction.get("total_bit", None),
+                                        )
+                                    )
+                                    if (
+                                        full_cloud_primary_value is not None
+                                        and torch.is_tensor(L_com)
+                                    ):
+                                        full_cloud_primary_tensor = L_com.new_tensor(float(full_cloud_primary_value))
+                                        L_com = full_cloud_primary_tensor + (L_com - L_com.detach())
+                                        if torch.is_tensor(loss_bit):
+                                            loss_bit = full_cloud_primary_tensor + (loss_bit - loss_bit.detach())
+                                        full_cloud_primary_override_debug = {
+                                            "full_cloud_actual_primary_used": True,
+                                            "full_cloud_actual_primary_forward_value": float(full_cloud_primary_value),
+                                            "full_cloud_actual_primary_subtree_forward_before": (
+                                                float(subtree_primary_value) if subtree_primary_value is not None else None
+                                            ),
+                                            "full_cloud_actual_primary_grad_source": "shadow_subtree_ste",
+                                            "full_cloud_actual_primary_requires_grad": bool(L_com.requires_grad),
+                                            "full_cloud_actual_primary_grad_fn": (
+                                                type(L_com.grad_fn).__name__ if getattr(L_com, "grad_fn", None) is not None else ""
+                                            ),
+                                        }
+                                        try:
+                                            args._sparsepcgc_full_cloud_actual_primary_active = True
+                                        except Exception:
+                                            pass
+                                    else:
+                                        full_cloud_primary_override_debug = {
+                                            "full_cloud_actual_primary_used": False,
+                                            "full_cloud_actual_primary_reason": "missing_full_cloud_value_or_lcom_tensor",
+                                        }
 
                     finally:
                         args._log_this_step = prev_log_flag
@@ -7844,6 +8459,32 @@ def train(model, args, loss, writer, plot, notifier=None):
                     loss.last_compression_debug = comp_debug_for_noise # ノイズ情報を追記した圧縮Debug辞書をLossに保存しなおす
 
                 """圧縮損失の合成"""
+                if (
+                    torch.is_tensor(L_geom)
+                    and isinstance(step_actual_oracle_metric_debug, dict)
+                    and bool(step_actual_oracle_metric_debug.get("used", False))
+                    and str(step_actual_oracle_metric_debug.get("override_scope", "")) == "full_cloud"
+                ):
+                    oracle_geometry_percent = finite_float_or_none(
+                        step_actual_oracle_metric_debug.get("selected_geometry_percent", None)
+                    )
+                    geometry_before = finite_float_or_none(L_geom)
+                    if oracle_geometry_percent is not None and geometry_before is not None:
+                        geometry_grad_scale = min(
+                            1.0,
+                            max(abs(float(oracle_geometry_percent)), 1e-3)
+                            / max(abs(float(geometry_before)), 1e-3),
+                        )
+                        L_geom = L_geom.new_tensor(float(oracle_geometry_percent)) + geometry_grad_scale * (
+                            L_geom - L_geom.detach()
+                        )
+                        full_cloud_geometry_teacher_debug = {
+                            "full_cloud_geometry_teacher_used": True,
+                            "full_cloud_geometry_teacher_value": float(oracle_geometry_percent),
+                            "full_cloud_geometry_shadow_before": float(geometry_before),
+                            "full_cloud_geometry_grad_scale": float(geometry_grad_scale),
+                        }
+
                 # compression loss側で作られた微分可能な内訳を取得する。
                 # Phase7-2のfull-context subtree deltaをここへ追加するため、
                 # termsを使う前に必ず初期化する。
@@ -7894,6 +8535,32 @@ def train(model, args, loss, writer, plot, notifier=None):
                     posinf=0.0,
                     neginf=0.0,
                 )
+                compression_tensor_debug = {
+                    "compression_loss_tensor_value": finite_float_or_none(L_com),
+                    "compression_loss_requires_grad": bool(torch.is_tensor(L_com) and L_com.requires_grad),
+                    "compression_loss_grad_fn": (
+                        type(L_com.grad_fn).__name__
+                        if torch.is_tensor(L_com) and getattr(L_com, "grad_fn", None) is not None
+                        else ""
+                    ),
+                    "compression_objective_tensor_value": finite_float_or_none(L_com_objective),
+                    "compression_objective_requires_grad": bool(
+                        torch.is_tensor(L_com_objective) and L_com_objective.requires_grad
+                    ),
+                    "compression_objective_grad_fn": (
+                        type(L_com_objective.grad_fn).__name__
+                        if torch.is_tensor(L_com_objective) and getattr(L_com_objective, "grad_fn", None) is not None
+                        else ""
+                    ),
+                    "loss_bit_tensor_value": finite_float_or_none(loss_bit),
+                    "loss_bit_requires_grad": bool(torch.is_tensor(loss_bit) and loss_bit.requires_grad),
+                    "loss_bit_grad_fn": (
+                        type(loss_bit.grad_fn).__name__
+                        if torch.is_tensor(loss_bit) and getattr(loss_bit, "grad_fn", None) is not None
+                        else ""
+                    ),
+                }
+                compression_tensor_debug.update(full_cloud_geometry_teacher_debug)
 
                 """形状損失を合成"""
                 legacy_L_downstream = (
@@ -8413,6 +9080,23 @@ def train(model, args, loss, writer, plot, notifier=None):
                 # Phase7-4:
                 # ablation modeと短時間判定用summaryをcomp_debugへ集約する。
                 _phase7_add_ablation_summary_to_comp_debug(args, comp_debug)
+                if isinstance(step_timing_breakdown, dict) and step_timing_breakdown:
+                    comp_debug.update(step_timing_breakdown)
+                    comp_debug["octree_build_time"] = float(
+                        step_timing_breakdown.get("full_cloud_canonical_build_time", 0.0)
+                        + step_timing_breakdown.get("subtree_group_build_time", 0.0)
+                        + step_timing_breakdown.get("subtree_potential_select_time", 0.0)
+                        + step_timing_breakdown.get("selected_metadata_oracle_time", 0.0)
+                    )
+                if isinstance(full_cloud_anchor_runtime_timing, dict) and full_cloud_anchor_runtime_timing:
+                    comp_debug["full_cloud_anchor_runtime_timing"] = dict(full_cloud_anchor_runtime_timing)
+                    for runtime_key, runtime_value in full_cloud_anchor_runtime_timing.items():
+                        try:
+                            comp_debug[f"full_cloud_anchor_runtime_{runtime_key}"] = float(runtime_value)
+                        except Exception:
+                            pass
+                if isinstance(step_actual_oracle_metric_debug, dict) and step_actual_oracle_metric_debug:
+                    _copy_sparsepcgc_actual_oracle_debug_for_metrics(comp_debug, step_actual_oracle_metric_debug)
                 if isinstance(full_cloud_anchor_debug_snapshot, dict) and full_cloud_anchor_debug_snapshot:
                     comp_debug["full_cloud_anchor_shadow_train_requested"] = bool(full_cloud_anchor_shadow_train_requested)
                     comp_debug["full_cloud_anchor_shadow_train_used"] = bool(full_cloud_anchor_shadow_train_active)
@@ -8433,6 +9117,69 @@ def train(model, args, loss, writer, plot, notifier=None):
                     comp_debug["full_cloud_anchor_point_count_after"] = full_cloud_anchor_debug_snapshot.get("point_count_after", None)
                     comp_debug["full_cloud_anchor_unique_coord_before"] = full_cloud_anchor_debug_snapshot.get("unique_coord_before", None)
                     comp_debug["full_cloud_anchor_unique_coord_after"] = full_cloud_anchor_debug_snapshot.get("unique_coord_after", None)
+                    if full_cloud_primary_override_debug:
+                        comp_debug.update(full_cloud_primary_override_debug)
+                    if bool(comp_debug.get("full_cloud_actual_primary_used", False)):
+                        subtree_actual_before = finite_float_or_none(
+                            comp_debug.get("actual_total_bit_percent", comp_debug.get("total_bit", None))
+                        )
+                        full_actual_primary_value = finite_float_or_none(
+                            comp_debug.get("full_cloud_actual_primary_forward_value", None)
+                        )
+                        if full_actual_primary_value is not None:
+                            comp_debug["subtree_actual_bit_percent"] = (
+                                float(subtree_actual_before) if subtree_actual_before is not None else None
+                            )
+                            comp_debug["subtree_teacher_percent"] = (
+                                float(subtree_actual_before) if subtree_actual_before is not None else None
+                            )
+                            for anchor_key, output_key in (
+                                ("gt_actual_bit", "gt_actual_bit"),
+                                ("gen_actual_bit", "gen_actual_bit"),
+                                ("gt_bit_abs", "gt_bit_abs"),
+                                ("gen_bit_abs", "gen_bit_abs"),
+                                ("actual_total_bits", "actual_total_bits"),
+                                ("gen_total_bit_with_edit_record", "gen_total_bit_with_edit_record"),
+                                ("actual_raw_percent", "actual_raw_percent"),
+                                ("actual_edit_record_bits", "actual_edit_record_bits"),
+                                ("gt_actual_encode_time", "gt_actual_encode_time"),
+                                ("gen_actual_encode_time", "gen_actual_encode_time"),
+                                ("actual_encode_time_total", "actual_encode_time_total"),
+                                ("point_count_before", "point_count_before"),
+                                ("point_count_after", "point_count_after"),
+                                ("unique_coord_before", "unique_coord_before"),
+                                ("unique_coord_after", "unique_coord_after"),
+                            ):
+                                if anchor_key in full_cloud_anchor_debug_snapshot:
+                                    comp_debug[output_key] = full_cloud_anchor_debug_snapshot.get(anchor_key)
+                            comp_debug["local_proxy_percent"] = comp_debug.get(
+                                "proxy_total_bit_percent",
+                                comp_debug.get("surrogate_total_bit_percent", None),
+                            )
+                            comp_debug["full_cloud_actual_bit_percent"] = float(full_actual_primary_value)
+                            comp_debug["full_cloud_actual_percent"] = float(full_actual_primary_value)
+                            comp_debug["actual_total_bit_percent"] = float(full_actual_primary_value)
+                            comp_debug["actual_bit_percent"] = float(full_actual_primary_value)
+                            if subtree_actual_before is not None:
+                                comp_debug["full_vs_subtree_actual_gap"] = float(full_actual_primary_value) - float(subtree_actual_before)
+                                comp_debug["sign_match_subtree_full"] = bool(
+                                    (float(full_actual_primary_value) <= 0.0 and float(subtree_actual_before) <= 0.0)
+                                    or (float(full_actual_primary_value) >= 0.0 and float(subtree_actual_before) >= 0.0)
+                                )
+                            proxy_value_for_match = finite_float_or_none(comp_debug.get("local_proxy_percent", None))
+                            if proxy_value_for_match is not None:
+                                comp_debug["proxy_full_actual_gap"] = float(proxy_value_for_match) - float(full_actual_primary_value)
+                                comp_debug["sign_match_proxy_full"] = bool(
+                                    (float(full_actual_primary_value) <= 0.0 and float(proxy_value_for_match) <= 0.0)
+                                    or (float(full_actual_primary_value) >= 0.0 and float(proxy_value_for_match) >= 0.0)
+                                )
+                            comp_debug["actual_value_source"] = "fresh_full_cloud_primary_ste"
+                            comp_debug["actual_value_is_fresh"] = True
+                            comp_debug["actual_scope"] = "full_cloud"
+                            comp_debug["teacher_scope"] = "full_cloud_primary"
+                            comp_debug["full_cloud_teacher_used"] = True
+                    elif full_cloud_primary_override_debug:
+                        comp_debug.update(full_cloud_primary_override_debug)
 
 
                 if cp_debug: # Compression Primaryモード用のDebug情報が存在するか判定
@@ -8461,6 +9208,38 @@ def train(model, args, loss, writer, plot, notifier=None):
                         and full_cloud_correction_loss.requires_grad
                     )
 
+                if isinstance(compression_tensor_debug, dict):
+                    compression_tensor_debug.update(
+                        {
+                            "compression_loss_tensor_value": finite_float_or_none(L_com),
+                            "compression_loss_requires_grad": bool(torch.is_tensor(L_com) and L_com.requires_grad),
+                            "compression_loss_grad_fn": (
+                                type(L_com.grad_fn).__name__
+                                if torch.is_tensor(L_com) and getattr(L_com, "grad_fn", None) is not None
+                                else ""
+                            ),
+                            "compression_objective_tensor_value": finite_float_or_none(L_com_objective),
+                            "compression_objective_requires_grad": bool(
+                                torch.is_tensor(L_com_objective) and L_com_objective.requires_grad
+                            ),
+                            "compression_objective_grad_fn": (
+                                type(L_com_objective.grad_fn).__name__
+                                if torch.is_tensor(L_com_objective) and getattr(L_com_objective, "grad_fn", None) is not None
+                                else ""
+                            ),
+                            "loss_bit_tensor_value": finite_float_or_none(loss_bit),
+                            "loss_bit_requires_grad": bool(torch.is_tensor(loss_bit) and loss_bit.requires_grad),
+                            "loss_bit_grad_fn": (
+                                type(loss_bit.grad_fn).__name__
+                                if torch.is_tensor(loss_bit) and getattr(loss_bit, "grad_fn", None) is not None
+                                else ""
+                            ),
+                        }
+                    )
+                    comp_debug.update(compression_tensor_debug)
+                    if compression_tensor_debug.get("compression_objective_tensor_value") is not None:
+                        comp_debug["compression_objective"] = compression_tensor_debug.get("compression_objective_tensor_value")
+                        comp_debug["lcom_objective"] = compression_tensor_debug.get("compression_objective_tensor_value")
 
                 if isinstance(full_cloud_correction_state, dict):
                     comp_debug.update(
@@ -8484,6 +9263,13 @@ def train(model, args, loss, writer, plot, notifier=None):
 
                 base_model = model.module if hasattr(model, "module") else model # DataParallelで包まれている場合は中身のモデルを取り出す
                 structure_debug = getattr(base_model, "last_structure_debug", {}) or {} # モデル内部で記録された構造解析・構造修復のDebug情報を取得
+                if isinstance(structure_debug, dict):
+                    structure_debug = dict(structure_debug)
+                    structure_debug["actual_oracle_full_cloud_teacher_required"] = bool(
+                        getattr(args, "sparsepcgc_require_full_cloud_actual_teacher", True)
+                    )
+                    if isinstance(step_actual_oracle_metric_debug, dict) and step_actual_oracle_metric_debug:
+                        _copy_sparsepcgc_actual_oracle_debug_for_metrics(structure_debug, step_actual_oracle_metric_debug)
                 # ============================================================
                 # Phase5:
                 # Network内部のNode/Voxel・aggregation整合性をtrain.py側で監査する。
@@ -8969,6 +9755,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                     if "exact_occupancy_ste_grad_used" in comp_debug:
                         compression_metric_row["training_exact_occupancy_ste_grad_used"] = comp_debug["exact_occupancy_ste_grad_used"]
                 operation_metric_row = build_operation_metric_row( args, global_step=global_train_step, episode=episode, epoch=epoch, step=step, stage=current_stage, comp_debug=comp_debug, structure_debug=structure_debug, edit_stats=train_edit_stats) # 点操作StepCSVに書き込む1行を作る
+                operation_metric_row["actual_oracle_full_cloud_teacher_required"] = bool(
+                    getattr(args, "sparsepcgc_require_full_cloud_actual_teacher", True)
+                )
 
                 """ログ"""
                 if log_this_step:

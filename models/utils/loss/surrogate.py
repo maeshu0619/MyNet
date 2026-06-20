@@ -103,6 +103,8 @@ class SurrogateCompressionLossMixin:
 
     @staticmethod
     def _safe_log_bit_ratio(before_bits, after_bits):
+        if before_bits is None or after_bits is None:
+            return float("nan")
         before_bits = float(before_bits)
         after_bits = float(after_bits)
         if not (math.isfinite(before_bits) and math.isfinite(after_bits)) or before_bits <= 0.0 or after_bits <= 0.0:
@@ -949,13 +951,13 @@ class SurrogateCompressionLossMixin:
         pretrain_teacher_type = str(
             getattr(args, "_surrogate_pretrain_teacher_type", getattr(args, "surrogate_pretrain_subtree_teacher_type", ""))
         ).strip().lower()
-        local_proxy_teacher = bool(
+        pretrain_local_proxy_teacher = bool(
             getattr(args, "_surrogate_pretrain_active", False)
             and pretrain_mode in {"subtree", "hybrid"}
             and pretrain_teacher_type == "local_proxy"
             and not bool(refresh_actual_gen)
         )
-        if local_proxy_teacher:
+        if pretrain_local_proxy_teacher:
             target_entry = None
             target_cache_hit = "local_proxy"
         actual_bit_percent = 0.0
@@ -980,10 +982,25 @@ class SurrogateCompressionLossMixin:
         actual_edit_record_bits = 0.0
         actual_raw_percent_value = 0.0
         cached_gt = None
+        local_proxy_rate_target_value = float("nan")
+        local_proxy_aux_target_value = float("nan")
+        local_proxy_rate_error = ""
         if not self._surrogate_state_is_finite():
             self._reset_compression_surrogate("non-finite params before inference")
 
         teacher_refreshed = bool(inputs_finite and self._should_refresh_surrogate_teacher(args, target_entry, refresh_actual_gen))
+        local_proxy_teacher = bool(
+            pretrain_local_proxy_teacher
+            or (
+                inputs_finite
+                and need_sparse_aux
+                and not teacher_refreshed
+                and target_entry is None
+                and bool(getattr(args, "sparsepcgc_surrogate_local_proxy_on_target_miss", True))
+            )
+        )
+        if local_proxy_teacher and target_cache_hit == "miss":
+            target_cache_hit = "local_proxy"
         if teacher_refreshed:
             actual_t0 = time.time() if timing_enabled else 0.0
             cached_gt = self._get_cached_actual_gt(cache_key)
@@ -1121,13 +1138,42 @@ class SurrogateCompressionLossMixin:
                 "point_count": int(gt_xyz.shape[-1]),
                 "codec": teacher_codec,
             }
-            local_proxy_target = (
+            local_aux_target = (
                 aux_node_weight * soft_node_percent.to(device=gen_xyz.device, dtype=torch.float32)
                 + aux_single_weight * soft_single_percent.to(device=gen_xyz.device, dtype=torch.float32)
                 + float(getattr(args, "com_sparsepcgc", 0.0))
                 * sparse_terms["loss"].to(device=gen_xyz.device, dtype=torch.float32)
             ).detach()
-            local_proxy_target = local_proxy_target.reshape(-1).mean().reshape(1, 1)
+            local_aux_target = local_aux_target.reshape(-1).mean().reshape(())
+            local_proxy_aux_target_value = self._scalar(local_aux_target)
+            local_rate_target = None
+            try:
+                _, proxy_loss_bit, _, _, _, _ = self._get_compression_loss_proxy(
+                    args,
+                    gen_xyz=gen_xyz,
+                    gt_xyz=gt_xyz,
+                    final_w=final_w,
+                    cache_key=cache_key,
+                    run_grad_probe=False,
+                    actual_gen_xyz=actual_gen_xyz,
+                    subtree_tree=subtree_tree,
+                    full_octree_context=full_octree_context,
+                    octree_input_mode=octree_input_mode,
+                )
+                if torch.is_tensor(proxy_loss_bit):
+                    local_rate_target = proxy_loss_bit.to(device=gen_xyz.device, dtype=torch.float32).reshape(-1).mean().detach()
+                    local_proxy_rate_target_value = self._scalar(local_rate_target)
+            except Exception as exc:
+                local_proxy_rate_error = f"{type(exc).__name__}: {str(exc)[:240]}"
+                self._log_surrogate_event(f"local proxy rate target failed; using aux-only target. error={local_proxy_rate_error}")
+            if local_rate_target is not None and self._all_finite(local_rate_target):
+                local_proxy_target = (
+                    float(getattr(args, "sparsepcgc_surrogate_local_proxy_rate_weight", 1.0)) * local_rate_target
+                    + float(getattr(args, "sparsepcgc_surrogate_local_proxy_aux_weight", 0.25)) * local_aux_target
+                )
+            else:
+                local_proxy_target = local_aux_target
+            local_proxy_target = local_proxy_target.reshape(1, 1)
             if not self._all_finite(local_proxy_target):
                 local_proxy_target = gen_xyz.new_zeros((1, 1), dtype=torch.float32)
             target = local_proxy_target
@@ -1297,7 +1343,17 @@ class SurrogateCompressionLossMixin:
 
         surrogate_bit_percent = pred.reshape(-1).mean() if pred.numel() > 0 else x_soft.new_zeros(())
         surrogate_raw_percent = pred_raw.reshape(-1).mean() if pred_raw.numel() > 0 else x_soft.new_zeros(())
+        forward_teacher_percent_value = float(actual_bit_percent)
+        forward_teacher_source = str(actual_value_source)
+        if actual_value_source == "local_proxy":
+            forward_teacher_percent_value = float(target_percent_value)
+            forward_teacher_source = "local_proxy_target"
+        if not math.isfinite(forward_teacher_percent_value):
+            forward_teacher_percent_value = 0.0
+            forward_teacher_source = f"{forward_teacher_source}_nonfinite_zero"
+
         actual_bit_percent_t = gen_xyz.new_tensor(float(actual_bit_percent), dtype=torch.float32)
+        forward_teacher_percent_t = gen_xyz.new_tensor(float(forward_teacher_percent_value), dtype=torch.float32)
         pred_percent = surrogate_bit_percent.detach().reshape(())
         pred_raw_percent = surrogate_raw_percent.detach().reshape(())
         target_percent = pred_percent.new_tensor(float(target_percent_value)).detach().reshape(())
@@ -1420,8 +1476,8 @@ class SurrogateCompressionLossMixin:
             )
             surrogate_loss_for_grad_weighted = gen_xyz.new_zeros(())
 
-            # actual_bit_percent_t は実Codec教師値なので、Networkへ勾配を返さない
-            main_loss = actual_bit_percent_t.detach()
+            # forward教師値は実Codec値またはmissing時のlocal proxy値。Networkへ直接勾配は返さない。
+            main_loss = forward_teacher_percent_t.detach()
         else:
             # ============================================================
             # 従来モード：Surrogate/soft proxyの勾配をNetworkへ返す
@@ -1433,16 +1489,16 @@ class SurrogateCompressionLossMixin:
             if forward_mode == "teacher_ste":
                 surrogate_loss = surrogate_bit_percent if inputs_finite else None
                 if surrogate_loss is None:
-                    main_loss = actual_bit_percent_t
+                    main_loss = forward_teacher_percent_t
                 else:
-                    main_loss = actual_bit_percent_t + surrogate_weight * (
+                    main_loss = forward_teacher_percent_t + surrogate_weight * (
                         surrogate_loss - surrogate_loss.detach()
                     )
             else:
                 main_loss = (
                     float(main_grad_scale) * surrogate_bit_percent
                     if inputs_finite
-                    else actual_bit_percent_t
+                    else forward_teacher_percent_t
                 )
 
         main_loss = main_loss + soft_rate_proxy_ste + soft_prune_rate_ste
@@ -1590,10 +1646,10 @@ class SurrogateCompressionLossMixin:
         # detachするのは、実Codec教師値 hard と Surrogate確認用項だけである。
         # ============================================================
         if detach_surrogate_from_network:
-            stored_hard = actual_bit_percent_t.detach()
+            stored_hard = forward_teacher_percent_t.detach()
             stored_surrogate = gen_xyz.new_zeros(())
         else:
-            stored_hard = actual_bit_percent_t
+            stored_hard = forward_teacher_percent_t
             stored_surrogate = surrogate_loss_for_grad_weighted
 
         stored_main = main_loss
@@ -1780,7 +1836,14 @@ class SurrogateCompressionLossMixin:
                 "actual_raw_percent": float(actual_raw_percent_value),
                 "actual_target_percent_with_edit_record": float(target_raw_percent_value),
             "actual_clamped_percent": float(target_clamped_percent_value),
-            "actual_forward_value": self._scalar(actual_bit_percent_t),
+            "actual_forward_value": self._scalar(forward_teacher_percent_t),
+            "actual_forward_source": str(forward_teacher_source),
+            "compression_forward_teacher_percent": float(forward_teacher_percent_value),
+            "compression_forward_teacher_source": str(forward_teacher_source),
+            "local_proxy_target_percent": float(target_percent_value) if actual_value_source == "local_proxy" else None,
+            "local_proxy_rate_target_percent": None if not math.isfinite(local_proxy_rate_target_value) else float(local_proxy_rate_target_value),
+            "local_proxy_aux_target_percent": None if not math.isfinite(local_proxy_aux_target_value) else float(local_proxy_aux_target_value),
+            "local_proxy_rate_error": str(local_proxy_rate_error),
             "forward_display_value": self._scalar(main_loss.detach()),
             "final_L_com_value": self._scalar(L_com.detach()),
             "surrogate_pred": self._scalar(surrogate_bit_percent.detach()),

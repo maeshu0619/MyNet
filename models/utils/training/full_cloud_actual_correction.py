@@ -446,7 +446,8 @@ def build_full_cloud_actual_correction_loss(
         debug["full_cloud_corr_loss_reason"] = "soft_operation_terms_have_no_grad"
         return zero, debug
 
-    correction_loss = severity.detach() * penalty
+    operation_scale = max(float(getattr(args, "full_cloud_actual_correction_operation_scale", 100.0)), 0.0)
+    correction_loss = severity.detach() * penalty * float(operation_scale)
 
     debug.update(
         {
@@ -468,6 +469,7 @@ def build_full_cloud_actual_correction_loss(
             "full_cloud_corr_move_weight": float(getattr(args, "full_cloud_actual_correction_move_weight", 1.0)),
             "full_cloud_corr_add_weight": float(getattr(args, "full_cloud_actual_correction_add_weight", 0.5)),
             "full_cloud_corr_drop_weight": float(getattr(args, "full_cloud_actual_correction_drop_weight", 0.0)),
+            "full_cloud_corr_operation_scale": float(operation_scale),
             "full_cloud_corr_penalty_requires_grad": bool(torch.is_tensor(penalty) and penalty.requires_grad),
             "full_cloud_corr_loss_enabled": bool(getattr(args, "full_cloud_actual_correction_loss_enable", False)),
             "full_cloud_corr_ema_full_vs_subtree_gap": _state_get_float(correction_state, "ema_full_vs_subtree_gap", 0.0),

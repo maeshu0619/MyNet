@@ -70,7 +70,11 @@ def build_compression_primary_loss(
     # compression_primaryの学習信号はsurrogate/proxy/soft auxのtensorだけから作る。
     # debugやCSVの.item()済み値はcheckpoint/log/teacher用であり、backward対象にしない。
     L_sparsepcgc = as_scalar_loss_tensor(terms.get("sparsepcgc", None))
-    main_source, L_com_main = select_compression_primary_main(terms, L_com)
+    if bool(getattr(args, "_sparsepcgc_full_cloud_actual_primary_active", False)) and torch.is_tensor(L_com):
+        main_source = "full_cloud_actual_primary_lcom"
+        L_com_main = as_scalar_loss_tensor(L_com)
+    else:
+        main_source, L_com_main = select_compression_primary_main(terms, L_com)
     if uses_actual_total_bit_objective(args):
         # actual/surrogate系ではL_com直結と圧縮内訳を半々で混ぜた主目的にする。
         L_com_main = compose_train_compression_main(args, terms, L_com_main, zero_like_loss(L_com_main))

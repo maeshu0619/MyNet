@@ -1109,6 +1109,15 @@ class OctreeStructureAnalysis(nn.Module):
                 out["actual_oracle_override_move_count"] = int(
                     source_tree.get("actual_oracle_override_move_count", 0) or 0
                 )
+                out["actual_oracle_override_drop_count"] = int(
+                    source_tree.get("actual_oracle_override_drop_count", 0) or 0
+                )
+                out["actual_oracle_override_subtree_prune_count"] = int(
+                    source_tree.get("actual_oracle_override_subtree_prune_count", 0) or 0
+                )
+                out["actual_oracle_override_scope"] = str(
+                    source_tree.get("actual_oracle_override_scope", "") or ""
+                )
         move_mask = source_tree.get("actual_oracle_move_mask", None)
         if torch.is_tensor(move_mask):
             out["actual_oracle_move_mask"] = move_mask.detach().to(device=device)

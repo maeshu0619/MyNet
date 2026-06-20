@@ -6,14 +6,14 @@ from cfgs.utils import str2bool
 
 # sparsepcgc_move_existing_target_only
 
-pretrained_date = "20260615"
-pretrained_time = "145436"
+pretrained_date = "20260617"
+pretrained_time = "145838"
 
-surrogate_date = "20260606"
-surrogate_time = "181743"
+surrogate_date = "20260617"
+surrogate_time = "145838"
 
-model_date = "20260615"
-model_time = "145436"
+model_date = "20260617"
+model_time = "145838"
 
 # method_com = "OctAttention"
 method_com = "SparsePCGC"
@@ -22,11 +22,11 @@ method_name = "Mine"
 
 model_name = "best_loss_joint"
 
-# dataname = "8i"
+dataname = "8i"
 # dataname = "MVUB"
-dataname = "UVG"
+# dataname = "UVG"
 
-# dataset_name = "longdress"
+dataset_name = "longdress"
 # dataset_name = "loot"
 # dataset_name = "redandblack"
 # dataset_name = "soldier"
@@ -37,7 +37,7 @@ dataname = "UVG"
 # dataset_name = "ricardo"
 # dataset_name = "sarah"
 
-dataset_name = "BlueBackpack"
+# dataset_name = "BlueBackpack"
 # dataset_name = "CasualSquat"
 # dataset_name = "ElegantDance"
 # dataset_name = "Gymnast"
@@ -653,6 +653,18 @@ def parse_pugan_args(parser, file_day, file_time):
         help='actual oracle where logits BCEのforward clip幅。勾配はstraight-throughで保持する',
     )
     parser.add_argument(
+        '--sparsepcgc_actual_oracle_amount_weight',
+        default=0.05,
+        type=float,
+        help='actual oracleが採択したPrune/Add voxel数をAmount headへ教師付けする補助損失重み',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_amount_logit_weight',
+        default=0.25,
+        type=float,
+        help='actual oracle採択量をAmount head raw logitへ直接教師付けする内部重み',
+    )
+    parser.add_argument(
         '--sparsepcgc_actual_oracle_use_outcome_memory',
         default=True,
         type=str2bool,
@@ -765,6 +777,30 @@ def parse_pugan_args(parser, file_day, file_time):
         default=1,
         type=int,
         help='full-cloud全体の低密度macro prune候補を何個actual検証するか',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_prioritize_full_cloud_macro',
+        default=True,
+        type=str2bool,
+        help='actual候補予算が1件でも単一voxelよりfull-cloud structured subtree候補を優先する',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_full_cloud_subtree_block_sizes',
+        default='32',
+        type=str,
+        help='full-cloud structured subtree pruneのcoarse block size候補',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_full_cloud_subtree_prune_ratios',
+        default='0.10,0.20,0.30',
+        type=str,
+        help='full-cloud structured subtree pruneで段階評価する削除割合',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_full_cloud_subtree_target_ratio',
+        default=0.20,
+        type=float,
+        help='actual予算が1件のとき優先するstructured subtree prune割合',
     )
     parser.add_argument(
         '--sparsepcgc_actual_oracle_full_cloud_macro_prune_ratios',
@@ -977,6 +1013,12 @@ def parse_pugan_args(parser, file_day, file_time):
         help='Subtree Move 1個の移動指定に使う最小bit数',
     )
     parser.add_argument(
+        '--sparsepcgc_edit_record_structured_prune_bits_min',
+        default=32,
+        type=int,
+        help='決定的なfull-cloud structured prune変換のblock size/ratio指定bit下限',
+    )
+    parser.add_argument(
         '--sparsepcgc_actual_oracle_min_improve_percent',
         default=0.0,
         type=float,
@@ -993,6 +1035,18 @@ def parse_pugan_args(parser, file_day, file_time):
         default=True,
         type=str2bool,
         help='Subtree候補をfull cloudに差し戻したactual SparsePCGC bit差分で検証する',
+    )
+    parser.add_argument(
+        '--sparsepcgc_full_cloud_actual_primary',
+        default=True,
+        type=str2bool,
+        help='Subtree shadow train中もfull-cloud actual bit差分を圧縮主損失のforward値とログ主値に使う',
+    )
+    parser.add_argument(
+        '--sparsepcgc_require_full_cloud_actual_teacher',
+        default=True,
+        type=str2bool,
+        help='actual oracle教師採択をfull-cloud splice actual検証済み候補だけに制限する',
     )
     parser.add_argument(
         '--sparsepcgc_actual_oracle_single_eval_fraction',
@@ -1050,15 +1104,51 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--sparsepcgc_fast_diagnostic_teacher',
-        default=True,
+        default=False,
         type=str2bool,
-        help='actual検証step以外で、full-cloudのOctree診断から高速なPrune教師を作る',
+        help='actual検証step以外で、full-cloudのOctree診断から高速なPrune教師を作る。SparsePCGCではfull-cloud actual未検証教師を避けるため既定False',
+    )
+    parser.add_argument(
+        '--sparsepcgc_fast_diagnostic_allow_unvalidated_teacher',
+        default=False,
+        type=str2bool,
+        help='高速診断をfull-cloud actual未検証のまま教師採択するか。通常はFalseにしてproxy候補生成だけに使う',
     )
     parser.add_argument(
         '--sparsepcgc_fast_diagnostic_neighbor_threshold',
         default=3,
         type=int,
         help='6近傍数がこの値未満のoccupied voxelを高速Prune診断候補にする',
+    )
+    parser.add_argument(
+        '--sparsepcgc_fast_diagnostic_prune_mode',
+        default='axis_threshold',
+        type=str,
+        help='高速Prune教師の生成方法(axis_threshold/density_ratio/hybrid)',
+    )
+    parser.add_argument(
+        '--sparsepcgc_fast_diagnostic_target_global_ratio',
+        default=0.05,
+        type=float,
+        help='density_ratio高速Pruneでfull-cloud下位密度候補にするvoxel比率',
+    )
+    parser.add_argument(
+        '--sparsepcgc_fast_diagnostic_target_local_ratio',
+        default=0.05,
+        type=float,
+        help='density_ratio高速Pruneで1 subtree内に教師として残す最大目標voxel比率',
+    )
+    parser.add_argument(
+        '--sparsepcgc_fast_diagnostic_density_parent_weight',
+        default=0.5,
+        type=float,
+        help='高速Prune密度scoreに足す同一parent child数の重み',
+    )
+    parser.add_argument(
+        '--sparsepcgc_fast_diagnostic_density_backfill_local',
+        default=True,
+        type=str2bool,
+        help='full-cloud下位密度候補がsubtree内で不足した時にlocal下位密度から補充する',
     )
     parser.add_argument(
         '--sparsepcgc_fast_diagnostic_max_local_voxels',
@@ -1086,7 +1176,7 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--sparsepcgc_fast_diagnostic_add_max_local_voxels',
-        default=2,
+        default=4,
         type=int,
         help='高速診断teacherが1 subtreeでAdd教師にする最大voxel数',
     )
@@ -1095,6 +1185,12 @@ def parse_pugan_args(parser, file_day, file_time):
         default=True,
         type=str2bool,
         help='actual oracle候補探索の結果をstep logへ出す',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_fast_fallback_after_reject',
+        default=False,
+        type=str2bool,
+        help='actual oracleで改善候補が無いstepにproxy高速診断教師へfallbackする',
     )
     parser.add_argument('--allow_slow_knn_fallback', default=False, type=str2bool, help='pointops CUDAが使えない時に低速なtorch.cdist fallbackで継続するか')
     parser.add_argument('--encoder_pre_downsample_voxel_scale', default=1.0, type=float, help='qs由来のvoxelサイズの倍率')
@@ -1584,6 +1680,9 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--sparsepcgc_tmp_dir', default='', type=str, help='SparsePCGC teacher用一時ディレクトリ（空なら/dev/shm優先）')
     parser.add_argument('--sparsepcgc_timeout', default=600.0, type=float, help='SparsePCGC teacherの1リクエスト待ち時間（秒）')
     parser.add_argument('--sparsepcgc_skip_decode', default=True, type=str2bool, help='SparsePCGC teacherで復号を省略してbitだけ計測するか')
+    parser.add_argument('--sparsepcgc_actual_gt_disk_cache', default=False, type=str2bool, help='静的GTの実SparsePCGC統計をcodec条件付きで永続cacheするか')
+    parser.add_argument('--sparsepcgc_actual_gt_disk_cache_dir', default=str((_DATA_ROOT / 'cache' / 'sparsepcgc_actual_gt').resolve()), type=str, help='実SparsePCGC GT統計の永続cache先')
+    parser.add_argument('--sparsepcgc_actual_oracle_release_cuda_cache', default=False, type=str2bool, help='actual oracle直前にmyNet側の未使用CUDA予約領域を解放するか（同期コストが大きいため既定False）')
     parser.add_argument(
         '--sparsepcgc_worker_gpu_stats',
         default=True,
@@ -1676,6 +1775,9 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--compression_surrogate_replay_steps', default=1, type=int, help='実圧縮を呼ばないstepでもreplay教師でSurrogateを更新する回数')
     parser.add_argument('--compression_surrogate_replay_batch', default=8, type=int, help='Surrogate replay学習のbatch数')
     parser.add_argument('--compression_surrogate_replay_entries', default=512, type=int, help='Surrogate replay bufferの最大件数')
+    parser.add_argument('--sparsepcgc_surrogate_local_proxy_on_target_miss', default=True, type=str2bool, help='SparsePCGC surrogateでactual教師を取れないstepはSparsePCGC aux proxyをlocal teacherとして使い、圧縮主損失が0に落ちるのを避ける')
+    parser.add_argument('--sparsepcgc_surrogate_local_proxy_rate_weight', default=1.0, type=float, help='target miss時local proxy teacherへ入れるrate proxy bit差分の重み')
+    parser.add_argument('--sparsepcgc_surrogate_local_proxy_aux_weight', default=0.25, type=float, help='target miss時local proxy teacherへ入れるSparsePCGC aux差分の重み')
     parser.add_argument('--compression_surrogate_forward_mode', default='teacher_ste', type=str, help='surrogate損失のforward値(surrogate/teacher_ste)')
     parser.add_argument(
         '--detach_surrogate_from_network',
@@ -1864,7 +1966,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--sparsepcgc_target_duplicate_penalty_weight', default=0.0, type=float, help='同じtarget voxelへ複数Adjustするsoft penalty重み')
     parser.add_argument('--enable_sparsepcgc_occupancy_debug', default=False, type=str2bool, help='SparsePCGC本体の候補occupancy確率/label/bit推定ログをactual評価時だけ取得する')
     parser.add_argument('--sparsepcgc_occupancy_low_prob_threshold', default=0.1, type=float, help='SparsePCGC候補occupancyのtrue側確率を低確率とみなす閾値')
-    parser.add_argument('--enable_sparsepcgc_exact_occupancy_teacher', default=True, type=str2bool, help='SparsePCGC本体定義のexact occupancy teacherログを有効化する')
+    parser.add_argument('--enable_sparsepcgc_exact_occupancy_teacher', default=False, type=str2bool, help='SparsePCGC本体定義のexact occupancy teacherログを有効化する')
     parser.add_argument('--sparsepcgc_exact_occupancy_interval', default=1, type=int, help='exact occupancy teacherを呼ぶStep間隔。0以下なら無効')
     parser.add_argument('--sparsepcgc_exact_teacher_mode', default='auto', type=str, help='exact teacherの基準(full_cloud/global_subtree/local_subtree/auto)')
     parser.add_argument('--enable_sparsepcgc_exact_occupancy_loss', default=False, type=str2bool, help='exact occupancy teacher由来の追加loss候補を有効化する')
@@ -2037,6 +2139,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--sparsepcgc_subtree_potential_size_weight', default=0.02, type=float, help='Subtree potentialに少しだけ加えるvoxel数安定項')
     parser.add_argument('--sparsepcgc_subtree_potential_efficiency_weight', default=2.0, type=float, help='少ないVoxel編集でleaf occupancy patternを改善できるSubtreeを優先する重み')
     parser.add_argument('--sparsepcgc_subtree_potential_small_tree_weight', default=0.25, type=float, help='SparsePCGCの固定的なbit段差が出やすい小さめSubtreeを軽く優先する重み')
+    parser.add_argument('--train_subtree_max_points', default=0, type=int, help='勾配用に選択するSubtreeの点数上限（0で無制限、full-cloud actual評価には影響しない）')
     parser.add_argument('--sparsepcgc_subtree_potential_random_mix', default=0.0, type=float, help='Subtree potential優先時にも探索のためランダム選択へ回す割合')
     parser.add_argument('--sparsepcgc_subtree_potential_fast_diag_weight', default=50.0, type=float, help='full-cloud低6近傍voxelを含むSubtreeを優先する重み')
     parser.add_argument('--sparsepcgc_subtree_potential_fast_diag_min_count', default=1, type=int, help='fast diagnosticで優先するSubtree内の最小候補voxel数')
@@ -2491,6 +2594,17 @@ def parse_pugan_args(parser, file_day, file_time):
     args.compression_surrogate_reuse_last_target = bool(
         getattr(args, "compression_surrogate_reuse_last_target", True)
     )
+    args.sparsepcgc_surrogate_local_proxy_on_target_miss = bool(
+        getattr(args, "sparsepcgc_surrogate_local_proxy_on_target_miss", True)
+    )
+    args.sparsepcgc_surrogate_local_proxy_rate_weight = max(
+        float(getattr(args, "sparsepcgc_surrogate_local_proxy_rate_weight", 1.0)),
+        0.0,
+    )
+    args.sparsepcgc_surrogate_local_proxy_aux_weight = max(
+        float(getattr(args, "sparsepcgc_surrogate_local_proxy_aux_weight", 0.25)),
+        0.0,
+    )
     args.compression_surrogate_replay_steps = max(
         int(getattr(args, "compression_surrogate_replay_steps", 0)),
         0,
@@ -2840,7 +2954,7 @@ def parse_pugan_args(parser, file_day, file_time):
     args.repair_max_hard_move_voxels = max(int(getattr(args, "repair_max_hard_move_voxels", 0)), 0)
     args.sparsepcgc_actual_oracle_interval = max(
         int(getattr(args, "sparsepcgc_actual_oracle_interval", 1)),
-        1,
+        0,
     )
     args.sparsepcgc_actual_oracle_max_candidates = max(
         int(getattr(args, "sparsepcgc_actual_oracle_max_candidates", 0)),
@@ -2868,6 +2982,14 @@ def parse_pugan_args(parser, file_day, file_time):
     args.sparsepcgc_actual_oracle_candidate_logit_clip = max(
         float(getattr(args, "sparsepcgc_actual_oracle_candidate_logit_clip", 20.0)),
         1.0,
+    )
+    args.sparsepcgc_actual_oracle_amount_weight = max(
+        float(getattr(args, "sparsepcgc_actual_oracle_amount_weight", 0.05)),
+        0.0,
+    )
+    args.sparsepcgc_actual_oracle_amount_logit_weight = max(
+        float(getattr(args, "sparsepcgc_actual_oracle_amount_logit_weight", 0.25)),
+        0.0,
     )
     args.sparsepcgc_actual_oracle_use_outcome_memory = bool(
         getattr(args, "sparsepcgc_actual_oracle_use_outcome_memory", True)
@@ -2964,6 +3086,13 @@ def parse_pugan_args(parser, file_day, file_time):
     args.sparsepcgc_actual_oracle_full_cloud_macro_prune_candidate_max = max(
         int(getattr(args, "sparsepcgc_actual_oracle_full_cloud_macro_prune_candidate_max", 1)),
         0,
+    )
+    args.sparsepcgc_actual_oracle_prioritize_full_cloud_macro = bool(
+        getattr(args, "sparsepcgc_actual_oracle_prioritize_full_cloud_macro", True)
+    )
+    args.sparsepcgc_actual_oracle_full_cloud_subtree_target_ratio = min(
+        max(float(getattr(args, "sparsepcgc_actual_oracle_full_cloud_subtree_target_ratio", 0.20)), 0.0),
+        0.95,
     )
     args.sparsepcgc_actual_oracle_full_cloud_macro_prune_max_ratio = min(
         max(float(getattr(args, "sparsepcgc_actual_oracle_full_cloud_macro_prune_max_ratio", 0.05)), 0.0),
@@ -3106,6 +3235,10 @@ def parse_pugan_args(parser, file_day, file_time):
         int(getattr(args, "sparsepcgc_edit_record_subtree_move_bits_min", 16)),
         1,
     )
+    args.sparsepcgc_edit_record_structured_prune_bits_min = max(
+        int(getattr(args, "sparsepcgc_edit_record_structured_prune_bits_min", 32)),
+        1,
+    )
     args.repair_force_min_drop_voxels = bool(getattr(args, "repair_force_min_drop_voxels", False))
     args.repair_force_min_add_voxels = bool(getattr(args, "repair_force_min_add_voxels", False))
     args.repair_force_min_move_voxels = bool(getattr(args, "repair_force_min_move_voxels", False))
@@ -3193,18 +3326,22 @@ def parse_pugan_args(parser, file_day, file_time):
         if not _cli_option_was_provided("--checkpoint_actual_source"):
             args.checkpoint_actual_source = "full_cloud"
         if not _cli_option_was_provided("--train_full_cloud_actual_interval"):
-            args.train_full_cloud_actual_interval = 64
+            args.train_full_cloud_actual_interval = 1
+        if not _cli_option_was_provided("--sparsepcgc_full_cloud_actual_primary"):
+            args.sparsepcgc_full_cloud_actual_primary = True
+        if not _cli_option_was_provided("--sparsepcgc_require_full_cloud_actual_teacher"):
+            args.sparsepcgc_require_full_cloud_actual_teacher = True
         if not _cli_option_was_provided("--surrogate_step"):
             args.surrogate_step = max(int(getattr(args, "surrogate_step", 0)), 0)
         if args.compression_loss_backend.endswith("_surrogate") and not _cli_option_was_provided("--disable_actual_codec_during_train"):
             # SparsePCGC surrogateは実SparsePCGC bit教師が必要なので、既定ではactual teacherを止めない。
             args.disable_actual_codec_during_train = False
         if args.compression_loss_backend.endswith("_surrogate") and not _cli_option_was_provided("--surrogate_update_on_teacher_refresh_only"):
-            # replay更新も許可し、teacher refresh以外のStepでもSurrogateを継続fitさせる。
-            args.surrogate_update_on_teacher_refresh_only = False
+            # SparsePCGCはactual teacherを毎Step取るため、teacher refresh時だけSurrogateを軽く合わせる。
+            args.surrogate_update_on_teacher_refresh_only = True
         if args.compression_loss_backend.endswith("_surrogate") and not _cli_option_was_provided("--compression_surrogate_replay_steps"):
-            # fresh teacherがないStepでもreplay教師で模倣学習を進める。
-            args.compression_surrogate_replay_steps = max(int(getattr(args, "compression_surrogate_replay_steps", 0)), 2)
+            # actual teacherを毎Step取る設計ではreplay更新は重複なので止める。
+            args.compression_surrogate_replay_steps = 0
         if args.compression_loss_backend.endswith("_surrogate") and not _cli_option_was_provided("--surrogate_pretrain_actual_refresh_interval"):
             # 事前学習中はSparsePCGC teacherを毎Step更新し、ゼロ/ stale教師だけの学習を避ける。
             args.surrogate_pretrain_actual_refresh_interval = 1
@@ -3215,7 +3352,7 @@ def parse_pugan_args(parser, file_day, file_time):
             # forward値はteacher_steのactual bitを保ち、backwardだけsurrogate予測を使う。
             args.detach_surrogate_from_network = False
         if not _cli_option_was_provided("--compression_surrogate_refresh_interval"):
-            # Surrogate lossは毎Step使うが、実SparsePCGC教師の再計測は高コストなので既定では8Step間隔にする。
+            # SparsePCGCの圧縮損失は必ず実Codec値で測る。速度はactual以外の更新回数を削って稼ぐ。
             args.compression_surrogate_refresh_interval = 1 if args.compression_loss_backend.endswith("_surrogate") else max(int(getattr(args, "compression_surrogate_refresh_interval", 0)), 50)
         if not _cli_option_was_provided("--lr_scheduler_enabled"):
             # ActualCompressionGuardとStepLRの二重LR低下を避けるため、SparsePCGC実験ではStepLRを既定で止める。
@@ -3225,9 +3362,9 @@ def parse_pugan_args(parser, file_day, file_time):
         if not _cli_option_was_provided("--train_subtree_anchor_on_min_points_miss"):
             args.train_subtree_anchor_on_min_points_miss = True
         if not _cli_option_was_provided("--compression_surrogate_train_steps"):
-            args.compression_surrogate_train_steps = max(args.compression_surrogate_train_steps, 4)
+            args.compression_surrogate_train_steps = 1 if args.compression_loss_backend.endswith("_surrogate") else max(args.compression_surrogate_train_steps, 4)
         if not _cli_option_was_provided("--compression_surrogate_warmup_steps"):
-            args.compression_surrogate_warmup_steps = max(args.compression_surrogate_warmup_steps, 4)
+            args.compression_surrogate_warmup_steps = 1 if args.compression_loss_backend.endswith("_surrogate") else max(args.compression_surrogate_warmup_steps, 4)
         if not _cli_option_was_provided("--compression_surrogate_aux_node_weight"):
             args.compression_surrogate_aux_node_weight = 0.0
         if not _cli_option_was_provided("--compression_surrogate_aux_single_weight"):
@@ -3296,7 +3433,7 @@ def parse_pugan_args(parser, file_day, file_time):
         if not _cli_option_was_provided("--repair_drop_ratio_floor"):
             args.repair_drop_ratio_floor = 0.002
         if not _cli_option_was_provided("--repair_max_hard_drop_voxels"):
-            args.repair_max_hard_drop_voxels = 16
+            args.repair_max_hard_drop_voxels = 20000
         if not _cli_option_was_provided("--repair_max_hard_move_voxels"):
             args.repair_max_hard_move_voxels = 1
         if not _cli_option_was_provided("--sparsepcgc_actual_oracle_edit"):
@@ -3304,9 +3441,13 @@ def parse_pugan_args(parser, file_day, file_time):
         if not _cli_option_was_provided("--sparsepcgc_actual_oracle_max_candidates"):
             args.sparsepcgc_actual_oracle_max_candidates = 12
         if not _cli_option_was_provided("--sparsepcgc_actual_oracle_actual_eval_max"):
-            args.sparsepcgc_actual_oracle_actual_eval_max = 2
+            args.sparsepcgc_actual_oracle_actual_eval_max = 1
         if not _cli_option_was_provided("--sparsepcgc_actual_oracle_interval"):
-            args.sparsepcgc_actual_oracle_interval = 64
+            args.sparsepcgc_actual_oracle_interval = 1
+        if not _cli_option_was_provided("--sparsepcgc_actual_gt_disk_cache"):
+            args.sparsepcgc_actual_gt_disk_cache = True
+        if not _cli_option_was_provided("--sparsepcgc_edit_record_train_start_scale"):
+            args.sparsepcgc_edit_record_train_start_scale = 1.0
         if not _cli_option_was_provided("--sparsepcgc_actual_oracle_eval_full_cloud_splice"):
             args.sparsepcgc_actual_oracle_eval_full_cloud_splice = True
         if not _cli_option_was_provided("--sparsepcgc_actual_oracle_single_eval_fraction"):
@@ -3322,7 +3463,13 @@ def parse_pugan_args(parser, file_day, file_time):
         if not _cli_option_was_provided("--repair_operation_entropy_warmup_steps"):
             args.repair_operation_entropy_warmup_steps = 500
         if not _cli_option_was_provided("--sparsepcgc_actual_oracle_max_selected_voxels"):
-            args.sparsepcgc_actual_oracle_max_selected_voxels = 512
+            args.sparsepcgc_actual_oracle_max_selected_voxels = 20000
+        if not _cli_option_was_provided("--sparsepcgc_subtree_potential_max_scan"):
+            args.sparsepcgc_subtree_potential_max_scan = 24
+        if not _cli_option_was_provided("--train_subtree_max_points"):
+            args.train_subtree_max_points = 4096
+        if not _cli_option_was_provided("--sparsepcgc_subtree_potential_topk"):
+            args.sparsepcgc_subtree_potential_topk = 2
         if not _cli_option_was_provided("--sparsepcgc_actual_oracle_combo_validate_max_extra"):
             args.sparsepcgc_actual_oracle_combo_validate_max_extra = 2
         if not _cli_option_was_provided("--sparsepcgc_actual_oracle_group_candidate_max"):
@@ -3334,9 +3481,9 @@ def parse_pugan_args(parser, file_day, file_time):
         if not _cli_option_was_provided("--sparsepcgc_actual_oracle_macro_prune_candidate_max"):
             args.sparsepcgc_actual_oracle_macro_prune_candidate_max = 4
         if not _cli_option_was_provided("--sparsepcgc_actual_oracle_macro_prune_ratios"):
-            args.sparsepcgc_actual_oracle_macro_prune_ratios = "0.05,0.10,0.20,0.30"
+            args.sparsepcgc_actual_oracle_macro_prune_ratios = "0.005,0.01,0.02,0.05"
         if not _cli_option_was_provided("--sparsepcgc_actual_oracle_macro_prune_max_ratio"):
-            args.sparsepcgc_actual_oracle_macro_prune_max_ratio = 0.30
+            args.sparsepcgc_actual_oracle_macro_prune_max_ratio = 0.05
         if not _cli_option_was_provided("--sparsepcgc_actual_oracle_macro_prune_min_voxels"):
             args.sparsepcgc_actual_oracle_macro_prune_min_voxels = 8
         if not _cli_option_was_provided("--sparsepcgc_actual_oracle_macro_prune_max_voxels"):
@@ -3344,15 +3491,15 @@ def parse_pugan_args(parser, file_day, file_time):
         if not _cli_option_was_provided("--sparsepcgc_actual_oracle_full_cloud_macro_prune_candidate_max"):
             args.sparsepcgc_actual_oracle_full_cloud_macro_prune_candidate_max = 1
         if not _cli_option_was_provided("--sparsepcgc_actual_oracle_full_cloud_macro_prune_ratios"):
-            args.sparsepcgc_actual_oracle_full_cloud_macro_prune_ratios = "0.02,0.05"
+            args.sparsepcgc_actual_oracle_full_cloud_macro_prune_ratios = "0.20"
         if not _cli_option_was_provided("--sparsepcgc_actual_oracle_full_cloud_prune_neighbor_thresholds"):
             args.sparsepcgc_actual_oracle_full_cloud_prune_neighbor_thresholds = "3"
         if not _cli_option_was_provided("--sparsepcgc_actual_oracle_full_cloud_macro_prune_max_ratio"):
-            args.sparsepcgc_actual_oracle_full_cloud_macro_prune_max_ratio = 0.05
+            args.sparsepcgc_actual_oracle_full_cloud_macro_prune_max_ratio = 0.30
         if not _cli_option_was_provided("--sparsepcgc_actual_oracle_full_cloud_macro_prune_min_voxels"):
             args.sparsepcgc_actual_oracle_full_cloud_macro_prune_min_voxels = 128
         if not _cli_option_was_provided("--sparsepcgc_actual_oracle_full_cloud_macro_prune_max_voxels"):
-            args.sparsepcgc_actual_oracle_full_cloud_macro_prune_max_voxels = 20000
+            args.sparsepcgc_actual_oracle_full_cloud_macro_prune_max_voxels = 300000
         if not _cli_option_was_provided("--sparsepcgc_actual_oracle_parent_prune_candidate_max"):
             args.sparsepcgc_actual_oracle_parent_prune_candidate_max = 2
         if not _cli_option_was_provided("--sparsepcgc_actual_oracle_parent_prune_min_voxels"):
@@ -3374,9 +3521,19 @@ def parse_pugan_args(parser, file_day, file_time):
         if not _cli_option_was_provided("--sparsepcgc_actual_oracle_force_no_edit"):
             args.sparsepcgc_actual_oracle_force_no_edit = False
         if not _cli_option_was_provided("--sparsepcgc_fast_diagnostic_teacher"):
-            args.sparsepcgc_fast_diagnostic_teacher = True
+            args.sparsepcgc_fast_diagnostic_teacher = False
         if not _cli_option_was_provided("--sparsepcgc_fast_diagnostic_neighbor_threshold"):
             args.sparsepcgc_fast_diagnostic_neighbor_threshold = 3
+        if not _cli_option_was_provided("--sparsepcgc_fast_diagnostic_prune_mode"):
+            args.sparsepcgc_fast_diagnostic_prune_mode = "axis_threshold"
+        if not _cli_option_was_provided("--sparsepcgc_fast_diagnostic_target_global_ratio"):
+            args.sparsepcgc_fast_diagnostic_target_global_ratio = 0.05
+        if not _cli_option_was_provided("--sparsepcgc_fast_diagnostic_target_local_ratio"):
+            args.sparsepcgc_fast_diagnostic_target_local_ratio = 0.05
+        if not _cli_option_was_provided("--sparsepcgc_fast_diagnostic_density_parent_weight"):
+            args.sparsepcgc_fast_diagnostic_density_parent_weight = 0.5
+        if not _cli_option_was_provided("--sparsepcgc_fast_diagnostic_density_backfill_local"):
+            args.sparsepcgc_fast_diagnostic_density_backfill_local = True
         if not _cli_option_was_provided("--sparsepcgc_fast_diagnostic_max_local_voxels"):
             args.sparsepcgc_fast_diagnostic_max_local_voxels = args.sparsepcgc_actual_oracle_max_selected_voxels
         if not _cli_option_was_provided("--sparsepcgc_fast_diagnostic_min_local_voxels"):
@@ -3472,9 +3629,9 @@ def parse_pugan_args(parser, file_day, file_time):
             if not _cli_option_was_provided("--target_move_ratio"):
                 args.target_move_ratio = 0.0
             if not _cli_option_was_provided("--max_add_ratio"):
-                args.max_add_ratio = 0.003
+                args.max_add_ratio = 0.006
             if not _cli_option_was_provided("--max_drop_ratio"):
-                args.max_drop_ratio = 0.010
+                args.max_drop_ratio = 0.030
             if not _cli_option_was_provided("--max_move_ratio"):
                 args.max_move_ratio = 0.005
             if not _cli_option_was_provided("--max_repair_ratio"):
@@ -3605,9 +3762,9 @@ def parse_pugan_args(parser, file_day, file_time):
             args.compression_surrogate_aux_node_weight = 0.0
         if not _cli_option_was_provided("--compression_surrogate_aux_single_weight"):
             args.compression_surrogate_aux_single_weight = 0.0
-        if not _cli_option_was_provided("--compression_surrogate_train_steps"):
+        if (not sparsepcgc_backend) and not _cli_option_was_provided("--compression_surrogate_train_steps"):
             args.compression_surrogate_train_steps = max(args.compression_surrogate_train_steps, 4)
-        if not _cli_option_was_provided("--compression_surrogate_warmup_steps"):
+        if (not sparsepcgc_backend) and not _cli_option_was_provided("--compression_surrogate_warmup_steps"):
             args.compression_surrogate_warmup_steps = max(args.compression_surrogate_warmup_steps, 4)
         if (not sparsepcgc_backend) and not _cli_option_was_provided("--repair_move_require_empty_target"):
             args.repair_move_require_empty_target = False
@@ -3715,6 +3872,12 @@ def parse_pugan_args(parser, file_day, file_time):
     args.train_full_cloud_actual_interval = int(getattr(args, "train_full_cloud_actual_interval", 0))
     if args.train_full_cloud_actual_interval < 0:
         raise ValueError("--train_full_cloud_actual_interval must be >= 0")
+    args.sparsepcgc_full_cloud_actual_primary = bool(
+        getattr(args, "sparsepcgc_full_cloud_actual_primary", True)
+    )
+    args.sparsepcgc_require_full_cloud_actual_teacher = bool(
+        getattr(args, "sparsepcgc_require_full_cloud_actual_teacher", True)
+    )
     args.train_full_cloud_val_frames = max(int(getattr(args, "train_full_cloud_val_frames", 5)), 0)
     args.train_subtree_full_cloud_prob = float(getattr(args, "train_subtree_full_cloud_prob", 0.0))
     if not 0.0 <= args.train_subtree_full_cloud_prob <= 1.0:
@@ -3782,6 +3945,7 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     args.train_subtree_random_full_range = bool(getattr(args, "train_subtree_random_full_range", True))
     args.train_subtree_min_points = max(int(getattr(args, "train_subtree_min_points", 1)), 1)
+    args.train_subtree_max_points = max(int(getattr(args, "train_subtree_max_points", 0)), 0)
     args.train_subtree_stat_log_limit = max(int(getattr(args, "train_subtree_stat_log_limit", 16)), 0)
     args.sparsepcgc_subtree_potential_priority = bool(
         getattr(args, "sparsepcgc_subtree_potential_priority", True)
@@ -3960,12 +4124,39 @@ def parse_pugan_args(parser, file_day, file_time):
     args.sparsepcgc_actual_oracle_force_no_edit = bool(
         getattr(args, "sparsepcgc_actual_oracle_force_no_edit", False)
     )
+    args.sparsepcgc_actual_oracle_fast_fallback_after_reject = bool(
+        getattr(args, "sparsepcgc_actual_oracle_fast_fallback_after_reject", False)
+    )
     args.sparsepcgc_fast_diagnostic_teacher = bool(
         getattr(args, "sparsepcgc_fast_diagnostic_teacher", True)
+    )
+    args.sparsepcgc_fast_diagnostic_allow_unvalidated_teacher = bool(
+        getattr(args, "sparsepcgc_fast_diagnostic_allow_unvalidated_teacher", False)
     )
     args.sparsepcgc_fast_diagnostic_neighbor_threshold = max(
         int(getattr(args, "sparsepcgc_fast_diagnostic_neighbor_threshold", 3)),
         1,
+    )
+    fast_diag_prune_mode = str(
+        getattr(args, "sparsepcgc_fast_diagnostic_prune_mode", "density_ratio")
+    ).strip().lower()
+    if fast_diag_prune_mode not in {"axis_threshold", "density_ratio", "hybrid"}:
+        fast_diag_prune_mode = "density_ratio"
+    args.sparsepcgc_fast_diagnostic_prune_mode = fast_diag_prune_mode
+    args.sparsepcgc_fast_diagnostic_target_global_ratio = min(
+        max(float(getattr(args, "sparsepcgc_fast_diagnostic_target_global_ratio", 0.05)), 0.0),
+        0.30,
+    )
+    args.sparsepcgc_fast_diagnostic_target_local_ratio = min(
+        max(float(getattr(args, "sparsepcgc_fast_diagnostic_target_local_ratio", 0.05)), 0.0),
+        0.30,
+    )
+    args.sparsepcgc_fast_diagnostic_density_parent_weight = max(
+        float(getattr(args, "sparsepcgc_fast_diagnostic_density_parent_weight", 0.5)),
+        0.0,
+    )
+    args.sparsepcgc_fast_diagnostic_density_backfill_local = bool(
+        getattr(args, "sparsepcgc_fast_diagnostic_density_backfill_local", True)
     )
     args.sparsepcgc_fast_diagnostic_max_local_voxels = max(
         int(getattr(args, "sparsepcgc_fast_diagnostic_max_local_voxels", 512)),
@@ -3983,7 +4174,7 @@ def parse_pugan_args(parser, file_day, file_time):
         6,
     )
     args.sparsepcgc_fast_diagnostic_add_max_local_voxels = max(
-        int(getattr(args, "sparsepcgc_fast_diagnostic_add_max_local_voxels", 2)),
+        int(getattr(args, "sparsepcgc_fast_diagnostic_add_max_local_voxels", 4)),
         0,
     )
     args.sparsepcgc_codec_proxy_weight = max(float(getattr(args, "sparsepcgc_codec_proxy_weight", 2.0)), 0.0)
@@ -4020,12 +4211,6 @@ def parse_pugan_args(parser, file_day, file_time):
         float(getattr(args, "sparsepcgc_exact_bits_loss_weight", 0.0)),
         0.0,
     )
-    compress_key_for_occupancy = _compress_key(getattr(args, "compress", ""))
-    if (
-        compress_key_for_occupancy == "sparsepcgc"
-        and not _cli_option_was_provided("--enable_sparsepcgc_occupancy_debug")
-    ):
-        args.enable_sparsepcgc_occupancy_debug = True
     selection_mode = str(getattr(args, "repair_selection_mode", "target")).strip().lower().replace("-", "_")
     if selection_mode in {"cap", "optional", "threshold", "thresholdcap"}:
         selection_mode = "threshold_cap"

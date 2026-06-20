@@ -56,13 +56,28 @@ def _coords_to_xyz(coords_n3: torch.Tensor, meta, args):
 def _neighbor_count(coords_n3: torch.Tensor) -> torch.Tensor:
     if coords_n3.numel() <= 0:
         return torch.empty((0,), device=coords_n3.device, dtype=torch.long)
-    coord_set = {tuple(int(v) for v in row) for row in coords_n3.detach().cpu().tolist()}
-    out = []
-    offsets = [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)]
-    for row in coords_n3.detach().cpu().tolist():
-        x, y, z = (int(row[0]), int(row[1]), int(row[2]))
-        out.append(sum((x + dx, y + dy, z + dz) in coord_set for dx, dy, dz in offsets))
-    return torch.as_tensor(out, device=coords_n3.device, dtype=torch.long)
+    coords_n3 = torch.unique(coords_n3.to(dtype=torch.long), dim=0, sorted=True)
+    mins = coords_n3.amin(dim=0) - 1
+    span = (coords_n3.amax(dim=0) - mins + 2).clamp_min(1)
+
+    def _keys(values):
+        shifted = values - mins
+        return shifted[:, 0] * span[1] * span[2] + shifted[:, 1] * span[2] + shifted[:, 2]
+
+    occupied_keys = torch.unique(_keys(coords_n3), sorted=True)
+    offsets = torch.tensor(
+        [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)],
+        device=coords_n3.device,
+        dtype=torch.long,
+    )
+    counts = torch.zeros((coords_n3.shape[0],), device=coords_n3.device, dtype=torch.long)
+    for offset in offsets:
+        query_keys = _keys(coords_n3 + offset)
+        positions = torch.searchsorted(occupied_keys, query_keys)
+        in_bounds = positions < occupied_keys.numel()
+        safe_positions = positions.clamp(max=max(int(occupied_keys.numel()) - 1, 0))
+        counts += (in_bounds & (occupied_keys[safe_positions] == query_keys)).to(dtype=torch.long)
+    return counts
 
 
 def _parent_child_popcount(coords_n3: torch.Tensor, block: int = 2):
@@ -113,6 +128,53 @@ def _hole_fill_candidates(coords_n3: torch.Tensor, max_add: int = 10000):
         add_coords = empty.index_select(0, order[:add_count])
         cand = torch.unique(torch.cat([coords_n3, add_coords], dim=0), dim=0, sorted=True)
         rows.append((f"fill_holes_top_{ratio:.4f}", cand))
+    return rows
+
+
+def _parent_hole_fill_candidates(coords_n3: torch.Tensor):
+    if coords_n3.numel() <= 0:
+        return []
+    coords_n3 = torch.unique(coords_n3.to(dtype=torch.long), dim=0, sorted=True)
+    parent = torch.div(coords_n3, 2, rounding_mode="floor")
+    unique_parent, inverse = torch.unique(parent, dim=0, sorted=True, return_inverse=True)
+    slots = (
+        (coords_n3[:, 0] & 1)
+        + 2 * (coords_n3[:, 1] & 1)
+        + 4 * (coords_n3[:, 2] & 1)
+    ).to(dtype=torch.long)
+    occupancy = torch.zeros((unique_parent.shape[0], 8), device=coords_n3.device, dtype=torch.bool)
+    occupancy[inverse, slots] = True
+    parent_pop = occupancy.sum(dim=1)
+    parent_order = torch.argsort(parent_pop, descending=True)
+    child_offsets = torch.tensor(
+        [(0, 0, 0), (1, 0, 0), (0, 1, 0), (1, 1, 0), (0, 0, 1), (1, 0, 1), (0, 1, 1), (1, 1, 1)],
+        device=coords_n3.device,
+        dtype=torch.long,
+    )
+    targets = []
+    for parent_idx in parent_order:
+        pop = int(parent_pop[parent_idx].item())
+        if pop < 6:
+            break
+        missing_slots = (~occupancy[parent_idx]).nonzero(as_tuple=False).reshape(-1)
+        if missing_slots.numel() <= 0:
+            continue
+        targets.append(unique_parent[parent_idx].view(1, 3) * 2 + child_offsets.index_select(0, missing_slots))
+    if not targets:
+        return []
+    target_coords = torch.unique(torch.cat(targets, dim=0), dim=0, sorted=True)
+    rows = []
+    n = int(coords_n3.shape[0])
+    for ratio in (0.001, 0.0025, 0.005, 0.01):
+        add_count = min(max(1, int(math.ceil(n * ratio))), int(target_coords.shape[0]))
+        if add_count <= 0:
+            continue
+        candidate = torch.unique(
+            torch.cat([coords_n3, target_coords[:add_count]], dim=0),
+            dim=0,
+            sorted=True,
+        )
+        rows.append((f"fill_parent_holes_{ratio:.4f}", candidate))
     return rows
 
 
@@ -169,13 +231,78 @@ def transform_candidates(coords_n3: torch.Tensor, *, max_keep: int = 50000):
     # Deterministic rate-distortion style top density keep.
     density_score = neigh.to(dtype=torch.float32) + parent_pop.to(dtype=torch.float32) * 0.5
     order = torch.argsort(density_score, descending=True)
-    for keep_ratio in (0.95, 0.90, 0.80, 0.70, 0.50):
+    for keep_ratio in (0.995, 0.99, 0.98, 0.95, 0.90, 0.80, 0.70, 0.50):
         keep_n = max(1, int(math.ceil(n * keep_ratio)))
         keep_idx = order[:keep_n]
         cand = torch.unique(coords_n3.index_select(0, keep_idx), dim=0, sorted=True)
         if 0 < int(cand.shape[0]) <= max_keep:
             candidates.append((f"keep_density_top_{keep_ratio:.2f}", cand))
 
+    return candidates
+
+
+def macro_rate_candidates(
+    coords_n3: torch.Tensor,
+    *,
+    include_add: bool = False,
+    include_prune: bool = True,
+):
+    coords_n3 = torch.unique(coords_n3.to(dtype=torch.long), dim=0, sorted=True)
+    candidates = [("original", coords_n3)]
+    if int(coords_n3.shape[0]) <= 8:
+        return candidates
+    if include_prune:
+        neigh = _neighbor_count(coords_n3)
+        parent_pop, _unique_parent, _inverse_parent, _parent_counts = _parent_child_popcount(coords_n3, block=2)
+        density_score = neigh.to(dtype=torch.float32) + 0.5 * parent_pop.to(dtype=torch.float32)
+        order = torch.argsort(density_score, descending=True)
+        for keep_ratio in (0.995, 0.99, 0.98, 0.95):
+            keep_n = max(1, int(math.ceil(int(coords_n3.shape[0]) * keep_ratio)))
+            candidates.append(
+                (
+                    f"keep_density_top_{keep_ratio:.3f}",
+                    torch.unique(coords_n3.index_select(0, order[:keep_n]), dim=0, sorted=True),
+                )
+            )
+    if include_add:
+        candidates.extend(_parent_hole_fill_candidates(coords_n3))
+    return candidates
+
+
+def subtree_prune_candidates(
+    coords_n3: torch.Tensor,
+    *,
+    block_size: int = 32,
+    drop_ratios=(0.005, 0.01, 0.02, 0.05),
+):
+    coords_n3 = torch.unique(coords_n3.to(dtype=torch.long), dim=0, sorted=True)
+    candidates = [("original", coords_n3)]
+    if int(coords_n3.shape[0]) <= 8:
+        return candidates
+    block_size = max(int(block_size), 2)
+    block_coords = torch.div(coords_n3, block_size, rounding_mode="floor")
+    unique_blocks, inverse = torch.unique(block_coords, dim=0, sorted=True, return_inverse=True)
+    counts = torch.bincount(inverse, minlength=int(unique_blocks.shape[0]))
+    block_order = torch.argsort(counts, descending=False)
+    n = int(coords_n3.shape[0])
+    for drop_ratio in drop_ratios:
+        drop_ratio = min(max(float(drop_ratio), 0.0), 0.95)
+        if drop_ratio <= 0.0:
+            continue
+        target_drop = max(1, int(math.ceil(n * drop_ratio)))
+        cumulative = torch.cumsum(counts.index_select(0, block_order), dim=0)
+        take = int(torch.searchsorted(cumulative, cumulative.new_tensor(target_drop)).item()) + 1
+        take = min(max(take, 1), int(block_order.numel()) - 1)
+        drop_blocks = block_order[:take]
+        drop_block_mask = torch.zeros((unique_blocks.shape[0],), device=coords_n3.device, dtype=torch.bool)
+        drop_block_mask[drop_blocks] = True
+        keep = ~drop_block_mask.index_select(0, inverse)
+        candidates.append(
+            (
+                f"prune_subtree_block_{block_size}_ratio_{drop_ratio:.3f}",
+                torch.unique(coords_n3[keep], dim=0, sorted=True),
+            )
+        )
     return candidates
 
 
@@ -188,6 +315,12 @@ def main() -> int:
     parser.add_argument("--blocks-per-file", type=int, default=0)
     parser.add_argument("--min-block-voxels", type=int, default=256)
     parser.add_argument("--max-block-voxels", type=int, default=4096)
+    parser.add_argument("--macro-only", action="store_true")
+    parser.add_argument("--include-add", action="store_true")
+    parser.add_argument("--add-only", action="store_true")
+    parser.add_argument("--subtree-prune-only", action="store_true")
+    parser.add_argument("--subtree-block-size", type=int, default=32)
+    parser.add_argument("--subtree-drop-ratios", type=str, default="0.005,0.01,0.02,0.05")
     cli = parser.parse_args()
 
     old_argv = sys.argv
@@ -234,7 +367,25 @@ def main() -> int:
 
             for scope, scoped_coords in coord_sets:
                 rows = []
-                for name, cand_coords in transform_candidates(scoped_coords, max_keep=cli.max_input_voxels):
+                if bool(cli.subtree_prune_only):
+                    candidate_sets = subtree_prune_candidates(
+                        scoped_coords,
+                        block_size=int(cli.subtree_block_size),
+                        drop_ratios=tuple(
+                            float(value.strip())
+                            for value in str(cli.subtree_drop_ratios).split(",")
+                            if value.strip()
+                        ),
+                    )
+                elif bool(cli.macro_only):
+                    candidate_sets = macro_rate_candidates(
+                        scoped_coords,
+                        include_add=bool(cli.include_add or cli.add_only),
+                        include_prune=not bool(cli.add_only),
+                    )
+                else:
+                    candidate_sets = transform_candidates(scoped_coords, max_keep=cli.max_input_voxels)
+                for name, cand_coords in candidate_sets:
                     if len(rows) >= int(cli.max_evals_per_file):
                         break
                     cand_xyz = _coords_to_xyz(cand_coords, meta, args)

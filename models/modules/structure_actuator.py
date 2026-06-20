@@ -1964,9 +1964,21 @@ class StructureRepairActuator(nn.Module):
     def _operation_amount_logit(self, actuator_features, head):
         # amount head の raw logit を返す。
         # ratio化後の sigmoid が飽和しても、logit側には直接勾配を残す。
-        pooled = actuator_features.mean(dim=2, keepdim=True)
+        mean_feat = actuator_features.mean(dim=2, keepdim=True)
+        max_feat = actuator_features.amax(dim=2, keepdim=True)
+        if actuator_features.shape[2] > 1:
+            std_feat = actuator_features.std(dim=2, keepdim=True, unbiased=False)
+        else:
+            std_feat = torch.zeros_like(mean_feat)
+        pooled = (
+            mean_feat
+            + float(getattr(self.args, "repair_amount_pool_std_weight", 0.50)) * std_feat
+            + float(getattr(self.args, "repair_amount_pool_max_weight", 0.25)) * max_feat
+        )
         scale = float(getattr(self.args, "repair_operation_amount_logit_scale", 6.0))
-        return torch.nan_to_num(head(pooled), nan=0.0, posinf=scale, neginf=-scale)
+        raw_logit = torch.nan_to_num(head(pooled), nan=0.0, posinf=scale, neginf=-scale)
+        bounded_logit = scale * torch.tanh(raw_logit / max(scale, 1e-6))
+        return raw_logit + (bounded_logit - raw_logit).detach()
 
     def _target_ratio_logit(self, target_ratio, max_ratio, like_tensor):
         # target_ratio / max_ratio を logit 空間へ写像する。
@@ -1983,6 +1995,23 @@ class StructureRepairActuator(nn.Module):
         )
         target_prob = target_prob.clamp(1e-4, target_prob_max)
         return torch.log(target_prob / (1.0 - target_prob))
+
+    def _actual_oracle_amount_bce_loss(self, learned_ratio, target_ratio, max_ratio):
+        # actual oracleが採択した編集量をAmount headへ返すための損失。
+        # 小さいratio同士のMSEは勾配が弱すぎるため、max_ratioで正規化したBCEを使う。
+        if max_ratio <= 0.0:
+            return learned_ratio.new_zeros(())
+        pred_prob = (learned_ratio / float(max_ratio)).clamp(1e-4, 1.0 - 1e-4)
+        if not torch.is_tensor(target_ratio):
+            target_ratio = learned_ratio.new_tensor(float(target_ratio))
+        target_prob = target_ratio.to(device=learned_ratio.device, dtype=learned_ratio.dtype) / float(max_ratio)
+        target_prob = target_prob.clamp(0.0, 1.0 - 1e-4)
+        target_prob = target_prob.expand_as(pred_prob)
+        loss = -(
+            target_prob.detach() * pred_prob.log()
+            + (1.0 - target_prob.detach()) * torch.log1p(-pred_prob)
+        )
+        return torch.nan_to_num(loss.mean(), nan=0.0, posinf=0.0, neginf=0.0)
 
     def forward(
         self,
@@ -2442,6 +2471,10 @@ class StructureRepairActuator(nn.Module):
 
         drop_amount_supervision_loss = pts_xyz.new_zeros(())
         drop_amount_soft_consistency_loss = pts_xyz.new_zeros(())
+        actual_oracle_drop_amount_loss = pts_xyz.new_zeros(())
+        actual_oracle_add_amount_loss = pts_xyz.new_zeros(())
+        actual_oracle_drop_amount_logit_loss = pts_xyz.new_zeros(())
+        actual_oracle_add_amount_logit_loss = pts_xyz.new_zeros(())
 
         soft_drop_budget = pts_xyz.new_zeros((B, 1, 1))
         valid_delete_voxel_count = pts_xyz.new_ones((B, 1, 1))
@@ -2795,6 +2828,29 @@ class StructureRepairActuator(nn.Module):
         drop_amount_supervision_loss = (
             drop_ratio_hard_batch.detach() - learned_drop_ratio
         ).pow(2).mean()
+        if bool((drop_ratio_hard_batch.detach() > 0.0).any().item()) and max_drop_ratio > 0.0:
+            actual_oracle_drop_amount_loss = self._actual_oracle_amount_bce_loss(
+                learned_drop_ratio,
+                drop_ratio_hard_batch.detach(),
+                max_drop_ratio,
+            )
+            drop_amount_logit_for_oracle = self._operation_amount_logit(
+                actuator_features,
+                self.drop_amount_head,
+            ).mean()
+            drop_amount_target_logit_for_oracle = self._target_ratio_logit(
+                drop_ratio_hard_batch.detach().mean(),
+                max_drop_ratio,
+                learned_drop_ratio,
+            ).detach()
+            actual_oracle_drop_amount_logit_loss = (
+                drop_amount_logit_for_oracle - drop_amount_target_logit_for_oracle
+            ).pow(2)
+            actual_oracle_drop_amount_loss = (
+                actual_oracle_drop_amount_loss
+                + float(getattr(self.args, "sparsepcgc_actual_oracle_amount_logit_weight", 0.25))
+                * actual_oracle_drop_amount_logit_loss
+            )
 
         # Soft削除量と learned_drop_ratio の整合性も補助的に見る。
         drop_amount_soft_consistency_loss = (
@@ -3994,6 +4050,29 @@ class StructureRepairActuator(nn.Module):
                     )
                     add_ratio_soft = torch.maximum(add_ratio_soft, add_ratio_hard.detach())
                     add_ratio = add_ratio_soft
+        if bool((add_ratio_hard.detach() > 0.0).any().item()) and max_add_ratio_value > 0.0:
+            actual_oracle_add_amount_loss = self._actual_oracle_amount_bce_loss(
+                learned_add_ratio,
+                add_ratio_hard.detach(),
+                max_add_ratio_value,
+            )
+            add_amount_logit_for_oracle = self._operation_amount_logit(
+                actuator_features,
+                self.add_amount_head,
+            ).mean()
+            add_amount_target_logit_for_oracle = self._target_ratio_logit(
+                add_ratio_hard.detach(),
+                max_add_ratio_value,
+                learned_add_ratio,
+            ).detach()
+            actual_oracle_add_amount_logit_loss = (
+                add_amount_logit_for_oracle - add_amount_target_logit_for_oracle
+            ).pow(2)
+            actual_oracle_add_amount_loss = (
+                actual_oracle_add_amount_loss
+                + float(getattr(self.args, "sparsepcgc_actual_oracle_amount_logit_weight", 0.25))
+                * actual_oracle_add_amount_logit_loss
+            )
         if timing_enabled:
             _mark_runtime("add")
 
@@ -4052,6 +4131,8 @@ class StructureRepairActuator(nn.Module):
             ]
 
         actual_oracle_override_move_count_value = 0
+        actual_oracle_override_drop_count_value = 0
+        actual_oracle_override_subtree_prune_count_value = 0
         leaf_diag_for_override = structure.get("leaf_pattern_diag", {}) if isinstance(structure, dict) else {}
         actual_oracle_edit_record_bits_value = 0.0
         actual_oracle_raw_percent_value = 0.0
@@ -4086,6 +4167,20 @@ class StructureRepairActuator(nn.Module):
                         int(leaf_diag_for_override.get("actual_oracle_override_move_count", 0) or 0),
                         0,
                     )
+                    actual_oracle_override_drop_count_value = max(
+                        int(leaf_diag_for_override.get("actual_oracle_override_drop_count", 0) or 0),
+                        0,
+                    )
+                    actual_oracle_override_subtree_prune_count_value = max(
+                        int(
+                            leaf_diag_for_override.get(
+                                "actual_oracle_override_subtree_prune_count",
+                                0,
+                            )
+                            or 0
+                        ),
+                        0,
+                    )
                     voxel_edit_final_coords = override_coords
                     voxel_edit_final_weights = pts_xyz.new_ones((B, 1, int(override_coords.shape[-1])))
                     voxel_edit_valid_mask = torch.ones(
@@ -4096,13 +4191,16 @@ class StructureRepairActuator(nn.Module):
                     voxel_edit_debug_list = [
                         {
                             "initial_count": int(voxel_coords.shape[-1]),
-                            "drop_count": 0,
+                            "drop_count": int(actual_oracle_override_drop_count_value),
                             "add_count": 0,
                             "move_count": int(actual_oracle_override_move_count_value),
                             "same_voxel_move_rejected": 0,
                             "existing_target_rejected": 0,
                             "duplicate_target_rejected": 0,
                             "final_count": int(override_coords.shape[-1]),
+                            "subtree_prune_count": int(
+                                actual_oracle_override_subtree_prune_count_value
+                            ),
                         }
                         for _ in range(B)
                     ]
@@ -4791,6 +4889,13 @@ class StructureRepairActuator(nn.Module):
         move_amount_soft_consistency_loss = _finite_actuator_loss(move_amount_soft_consistency_loss)
         add_amount_supervision_loss = _finite_actuator_loss(add_amount_supervision_loss)
         add_amount_soft_consistency_loss = _finite_actuator_loss(add_amount_soft_consistency_loss)
+        actual_oracle_drop_amount_loss = _finite_actuator_loss(actual_oracle_drop_amount_loss)
+        actual_oracle_add_amount_loss = _finite_actuator_loss(actual_oracle_add_amount_loss)
+        actual_oracle_drop_amount_logit_loss = _finite_actuator_loss(actual_oracle_drop_amount_logit_loss)
+        actual_oracle_add_amount_logit_loss = _finite_actuator_loss(actual_oracle_add_amount_logit_loss)
+        actual_oracle_amount_supervision_loss = (
+            actual_oracle_drop_amount_loss + actual_oracle_add_amount_loss
+        )
 
         loss = (
             edit_reg
@@ -4829,6 +4934,8 @@ class StructureRepairActuator(nn.Module):
             + float(getattr(self.args, "repair_move_amount_soft_consistency_weight", 0.0005)) * move_amount_soft_consistency_loss
             + float(getattr(self.args, "repair_add_amount_supervision_weight", 0.001)) * add_amount_supervision_loss
             + float(getattr(self.args, "repair_add_amount_soft_consistency_weight", 0.0005)) * add_amount_soft_consistency_loss
+            + float(getattr(self.args, "sparsepcgc_actual_oracle_amount_weight", 0.05))
+            * actual_oracle_amount_supervision_loss
         )
         loss = torch.nan_to_num(
             loss,
@@ -5250,6 +5357,11 @@ class StructureRepairActuator(nn.Module):
             "add_ratio_hard": add_ratio_hard.detach(),
             "add_amount_supervision_loss": add_amount_supervision_loss.detach(),
             "add_amount_soft_consistency_loss": add_amount_soft_consistency_loss.detach(),
+            "actual_oracle_drop_amount_loss": actual_oracle_drop_amount_loss.detach(),
+            "actual_oracle_add_amount_loss": actual_oracle_add_amount_loss.detach(),
+            "actual_oracle_drop_amount_logit_loss": actual_oracle_drop_amount_logit_loss.detach(),
+            "actual_oracle_add_amount_logit_loss": actual_oracle_add_amount_logit_loss.detach(),
+            "actual_oracle_amount_supervision_loss": actual_oracle_amount_supervision_loss.detach(),
             "add_soft_budget_mean": soft_add_budget.detach().mean(),
             "add_soft_pair_sum": soft_add_pair.detach().sum(),
             "add_hard_pair_sum": hard_add_pair.detach().sum(),
@@ -5699,6 +5811,11 @@ class StructureRepairActuator(nn.Module):
             "add_ratio_hard": add_ratio_hard.detach(),
             "add_amount_supervision_loss": add_amount_supervision_loss.detach(),
             "add_amount_soft_consistency_loss": add_amount_soft_consistency_loss.detach(),
+            "actual_oracle_drop_amount_loss": actual_oracle_drop_amount_loss.detach(),
+            "actual_oracle_add_amount_loss": actual_oracle_add_amount_loss.detach(),
+            "actual_oracle_drop_amount_logit_loss": actual_oracle_drop_amount_logit_loss.detach(),
+            "actual_oracle_add_amount_logit_loss": actual_oracle_add_amount_logit_loss.detach(),
+            "actual_oracle_amount_supervision_loss": actual_oracle_amount_supervision_loss.detach(),
             "add_soft_budget_mean": soft_add_budget.detach().mean(),
             "add_soft_pair_sum": soft_add_pair.detach().sum(),
             "add_hard_pair_sum": hard_add_pair.detach().sum(),

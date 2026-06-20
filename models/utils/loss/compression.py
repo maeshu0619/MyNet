@@ -1,4 +1,7 @@
+import hashlib
+import json
 import math
+import os
 import time
 
 import numpy as np
@@ -548,10 +551,22 @@ class CompressionLossMixin:
         if not self.gt_cache_enabled or not cache_key:
             return None
         cache_entry = self.actual_gt_cache.get(cache_key)
-        if cache_entry is None:
-            return None
-        self.actual_gt_cache.move_to_end(cache_key)
-        return dict(cache_entry)
+        if cache_entry is not None:
+            self.actual_gt_cache.move_to_end(cache_key)
+            return dict(cache_entry)
+        disk_path = self._actual_gt_disk_cache_path(cache_key)
+        if disk_path:
+            try:
+                with open(disk_path, "r", encoding="utf-8") as handle:
+                    payload = json.load(handle)
+                stats = payload.get("stats", None)
+                if payload.get("fingerprint") == self._actual_gt_cache_fingerprint(cache_key) and isinstance(stats, dict):
+                    self.actual_gt_cache[cache_key] = dict(stats)
+                    self.actual_gt_cache.move_to_end(cache_key)
+                    return dict(stats)
+            except (OSError, ValueError, TypeError):
+                pass
+        return None
 
     def _store_cached_actual_gt(self, cache_key, cache_entry):
         if not self.gt_cache_enabled or not cache_key or self.gt_cache_max_entries <= 0:
@@ -560,6 +575,63 @@ class CompressionLossMixin:
         self.actual_gt_cache.move_to_end(cache_key)
         while len(self.actual_gt_cache) > self.gt_cache_max_entries:
             self.actual_gt_cache.popitem(last=False)
+        disk_path = self._actual_gt_disk_cache_path(cache_key)
+        if disk_path:
+            serializable_stats = {}
+            for key, value in dict(cache_entry).items():
+                if isinstance(value, float):
+                    if math.isfinite(value):
+                        serializable_stats[str(key)] = value
+                elif isinstance(value, (str, bool, int)) or value is None:
+                    serializable_stats[str(key)] = value
+                elif isinstance(value, np.generic):
+                    scalar = value.item()
+                    if not isinstance(scalar, float) or math.isfinite(scalar):
+                        serializable_stats[str(key)] = scalar
+            payload = {
+                "fingerprint": self._actual_gt_cache_fingerprint(cache_key),
+                "stats": serializable_stats,
+            }
+            try:
+                os.makedirs(os.path.dirname(disk_path), exist_ok=True)
+                temp_path = f"{disk_path}.{os.getpid()}.tmp"
+                with open(temp_path, "w", encoding="utf-8") as handle:
+                    json.dump(payload, handle, sort_keys=True, allow_nan=False)
+                os.replace(temp_path, disk_path)
+            except (OSError, ValueError, TypeError):
+                try:
+                    if 'temp_path' in locals() and os.path.exists(temp_path):
+                        os.unlink(temp_path)
+                except OSError:
+                    pass
+
+    def _actual_gt_cache_fingerprint(self, cache_key):
+        args = self.args
+        source_path = str(cache_key).split("|", 1)[0]
+        try:
+            source_stat = os.stat(source_path)
+            source_identity = f"{source_stat.st_size}:{source_stat.st_mtime_ns}"
+        except OSError:
+            source_identity = "missing"
+        return "|".join(
+            [
+                str(cache_key),
+                source_identity,
+                str(getattr(args, "sparsepcgc_mode", "dense_lossless")),
+                str(getattr(args, "sparsepcgc_ckptdir", "")),
+                str(float(getattr(args, "sparsepcgc_voxel_size", 1.0))),
+                str(int(getattr(args, "sparsepcgc_pos_quantscale", 1))),
+            ]
+        )
+
+    def _actual_gt_disk_cache_path(self, cache_key):
+        if not bool(getattr(self.args, "sparsepcgc_actual_gt_disk_cache", False)):
+            return ""
+        root = str(getattr(self.args, "sparsepcgc_actual_gt_disk_cache_dir", "")).strip()
+        if not root:
+            return ""
+        digest = hashlib.sha1(self._actual_gt_cache_fingerprint(cache_key).encode("utf-8")).hexdigest()
+        return os.path.join(os.path.expanduser(root), f"{digest}.json")
 
     def _get_actual_encoder(self, args):
         backend = self._compression_loss_backend(args)
@@ -839,12 +911,13 @@ class CompressionLossMixin:
 
     def _attach_octree_aux_stats(self, args, pts_3n, stats):
         codec_name = str(stats.get("codec", getattr(self, "actual_encoder_codec_key", "octattention"))).strip().lower()
-        need_aux = (
-            bool(getattr(args, "compression_octree_stat_force", True))
-            or float(stats.get("node", 0.0)) <= 0.0
-            or float(stats.get("single", 0.0)) <= 0.0
-            or codec_name in {"sparsepcgc", "gpcc", "draco"}
-        )
+        node_value = float(stats.get("node", 0.0))
+        single_value = float(stats.get("single", -1.0))
+        # SparsePCGC/G-PCC/Draco wrappers already return codec-side node and
+        # single-child counts. Rebuilding the complete octree here duplicated
+        # the same work and dominated 8i step time. The local calculation is a
+        # fallback only when those codec statistics are unavailable.
+        need_aux = node_value <= 0.0 or single_value < 0.0
         if not need_aux:
             stats.setdefault("octree_node", float(stats.get("node", 0.0)))
             stats.setdefault("octree_single", float(stats.get("single", 0.0)))
@@ -1241,8 +1314,27 @@ class CompressionLossMixin:
             cached_gt = self._encode_actual_batch(args, gt_xyz)
             self._store_cached_actual_gt(cache_key, cached_gt)
 
-        # actual codec評価は評価指標なので、train用の量子化ノイズを入れないclean編集点群を使う。
-        stats_gen = self._encode_actual_batch(args, actual_xyz, final_w=actual_final_w)
+        # The full-cloud oracle has already encoded this exact accepted override.
+        # Reuse that result once in the immediately following full-cloud loss;
+        # every step still performs a real candidate encode and records actual bits.
+        cached_oracle_stats = (
+            full_octree_context.get("actual_oracle_cached_edited_actual_stats", None)
+            if isinstance(full_octree_context, dict)
+            and str(octree_input_mode).strip().lower() == "full_cloud"
+            and str(full_octree_context.get("actual_oracle_override_scope", "")) == "full_cloud"
+            else None
+        )
+        expected_actual_points = int(actual_xyz.shape[-1]) if torch.is_tensor(actual_xyz) else -1
+        actual_gen_cache_hit = bool(
+            isinstance(cached_oracle_stats, dict)
+            and int(cached_oracle_stats.get("point_count", -2)) == expected_actual_points
+            and float(cached_oracle_stats.get("bit", 0.0)) > 0.0
+        )
+        if actual_gen_cache_hit:
+            stats_gen = dict(cached_oracle_stats)
+        else:
+            # actual codec評価は評価指標なので、train用の量子化ノイズを入れないclean編集点群を使う。
+            stats_gen = self._encode_actual_batch(args, actual_xyz, final_w=actual_final_w)
         codec_name = str(stats_gen.get("codec", cached_gt.get("codec", "octattention"))).strip().lower()
         backend_label = f"{codec_name}_actual_ste" if use_proxy_surrogate else f"{codec_name}_actual"
         gt_bit = float(cached_gt["bit"])
@@ -1260,6 +1352,19 @@ class CompressionLossMixin:
             if not math.isfinite(edit_record_bits):
                 edit_record_bits = 0.0
             edit_record_bits = max(edit_record_bits, 0.0)
+        if (
+            self._is_sparsepcgc_context(args)
+            and bool(getattr(args, "sparsepcgc_edit_record_bits_enabled", True))
+            and isinstance(full_octree_context, dict)
+        ):
+            try:
+                context_edit_record_bits = float(
+                    full_octree_context.get("actual_oracle_edit_record_bits", 0.0) or 0.0
+                )
+            except (TypeError, ValueError):
+                context_edit_record_bits = 0.0
+            if math.isfinite(context_edit_record_bits):
+                edit_record_bits = max(edit_record_bits, context_edit_record_bits, 0.0)
         gen_total_bit = gen_bit + edit_record_bits
         raw_loss_bit_percent = 100.0 * self._relative_ratio(gen_bit, gt_bit)
         loss_bit_ratio = self._relative_ratio(gen_total_bit, gt_bit)
@@ -1448,6 +1553,7 @@ class CompressionLossMixin:
             ),
             "actual_used_voxel_restored_points": bool(getattr(args, "_current_actual_uses_voxel_restored", False)),
             "actual_input_points": int(stats_gen.get("point_count", 0)),
+            "actual_gen_oracle_cache_hit": bool(actual_gen_cache_hit),
                 "actual_total_bits": gen_total_bit,
                 "actual_raw_bits": gen_bit,
                 "actual_edit_record_bits": edit_record_bits,
