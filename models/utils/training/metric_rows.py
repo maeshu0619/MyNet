@@ -760,6 +760,17 @@ def build_operation_metric_row(
         "actual_oracle_pattern_plan_improving_count": case_int(structure_debug.get("actual_oracle_pattern_plan_improving_count", 0)),
         "actual_oracle_subtree_move_tested_count": case_int(structure_debug.get("actual_oracle_subtree_move_tested_count", 0)),
         "actual_oracle_subtree_move_improving_count": case_int(structure_debug.get("actual_oracle_subtree_move_improving_count", 0)),
+        "actual_oracle_apply_teacher_actions": bool(
+            structure_debug.get("actual_oracle_apply_teacher_actions", False)
+        ),
+        "codec_prune_prior_enabled": bool(structure_debug.get("codec_prune_prior_enabled", False)),
+        "codec_prune_prior_phase": case_float(structure_debug.get("codec_prune_prior_phase", 0.0), 0.0),
+        "codec_prune_prior_ratio": case_float(structure_debug.get("codec_prune_prior_ratio", 0.0), 0.0),
+        "codec_prune_prior_block_size": case_int(structure_debug.get("codec_prune_prior_block_size", 0), 0),
+        "codec_prune_prior_block_count_mean": case_float(
+            structure_debug.get("codec_prune_prior_block_count_mean", 0.0),
+            0.0,
+        ),
         "parent_collapse_grad_norm": case_float((getattr(args, "_last_grad_flow", {}) or {}).get("parent_collapse_grad_norm", float("nan")), float("nan")),
         "parent_collapse_grad_status": str((getattr(args, "_last_grad_flow", {}) or {}).get("parent_collapse_grad_status", "not_implemented_or_no_grad")),
         "pattern_canonicalize_grad_norm": case_float((getattr(args, "_last_grad_flow", {}) or {}).get("pattern_canonicalize_grad_norm", float("nan")), float("nan")),

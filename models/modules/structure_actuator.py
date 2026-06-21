@@ -1614,6 +1614,95 @@ class StructureRepairActuator(nn.Module):
         return hard_drop
 
     @staticmethod
+    def _codec_prune_block_prior(voxel_coords, block_size):
+        """Rank points by sparse coarse-block occupancy without fixing the action."""
+        batch_size, _, point_count = voxel_coords.shape
+        prior = torch.zeros(
+            (batch_size, 1, point_count),
+            device=voxel_coords.device,
+            dtype=torch.float32,
+        )
+        block_counts = []
+        for batch_idx in range(batch_size):
+            coords = voxel_coords[batch_idx].transpose(0, 1).contiguous().to(dtype=torch.long)
+            if coords.numel() <= 0:
+                block_counts.append(0)
+                continue
+            blocks = torch.div(coords, int(block_size), rounding_mode="floor")
+            unique_blocks, inverse = torch.unique(blocks, dim=0, sorted=True, return_inverse=True)
+            counts = torch.bincount(inverse, minlength=int(unique_blocks.shape[0])).float()
+            order = torch.argsort(counts, descending=False)
+            rank = torch.empty_like(counts)
+            if int(order.numel()) > 1:
+                rank_values = torch.linspace(1.0, 0.0, int(order.numel()), device=counts.device)
+                rank[order] = rank_values
+            else:
+                rank.fill_(1.0)
+            prior[batch_idx, 0] = rank.index_select(0, inverse)
+            block_counts.append(int(unique_blocks.shape[0]))
+        return prior, block_counts
+
+    @staticmethod
+    def _hard_codec_block_drop_mask(
+        voxel_coords,
+        point_scores,
+        *,
+        block_size,
+        target_drop_ratio,
+        selection_mask=None,
+        max_hard_count=0,
+    ):
+        """Select complete coarse blocks without exceeding the point budget."""
+        batch_size, _, point_count = voxel_coords.shape
+        hard_drop = torch.zeros(
+            (batch_size, 1, point_count),
+            device=voxel_coords.device,
+            dtype=torch.bool,
+        )
+        ratio = min(max(float(target_drop_ratio), 0.0), 1.0)
+        if ratio <= 0.0 or point_count <= 0:
+            return hard_drop
+        if selection_mask is None:
+            selection = torch.ones(
+                (batch_size, point_count),
+                device=voxel_coords.device,
+                dtype=torch.bool,
+            )
+        else:
+            selection = selection_mask.squeeze(1) if selection_mask.ndim == 3 else selection_mask
+            selection = selection.to(device=voxel_coords.device, dtype=torch.bool)
+
+        for batch_idx in range(batch_size):
+            valid_idx = selection[batch_idx].nonzero(as_tuple=False).reshape(-1)
+            valid_count = int(valid_idx.numel())
+            if valid_count <= 0:
+                continue
+            budget = int(math.floor(float(valid_count) * ratio))
+            if int(max_hard_count) > 0:
+                budget = min(budget, int(max_hard_count))
+            if budget <= 0:
+                continue
+            coords = voxel_coords[batch_idx].index_select(1, valid_idx).transpose(0, 1).contiguous().long()
+            blocks = torch.div(coords, int(block_size), rounding_mode="floor")
+            unique_blocks, inverse = torch.unique(blocks, dim=0, sorted=True, return_inverse=True)
+            block_count = int(unique_blocks.shape[0])
+            counts = torch.bincount(inverse, minlength=block_count).long()
+            scores = point_scores[batch_idx, 0].index_select(0, valid_idx).detach().float()
+            score_sum = torch.zeros((block_count,), device=scores.device, dtype=scores.dtype)
+            score_sum.scatter_add_(0, inverse, scores)
+            block_scores = score_sum / counts.to(dtype=scores.dtype).clamp_min(1.0)
+            order = torch.argsort(block_scores, descending=True)
+            cumulative = torch.cumsum(counts.index_select(0, order), dim=0)
+            take = int((cumulative <= int(budget)).sum().item())
+            if take <= 0:
+                continue
+            selected_blocks = torch.zeros((block_count,), device=coords.device, dtype=torch.bool)
+            selected_blocks[order[:take]] = True
+            selected_local = selected_blocks.index_select(0, inverse)
+            hard_drop[batch_idx, 0, valid_idx[selected_local]] = True
+        return hard_drop
+
+    @staticmethod
     def _priority_topk_gate(priority, target_ratio, tau):
         B, _, N = priority.shape
         if N <= 0:
@@ -2375,6 +2464,12 @@ class StructureRepairActuator(nn.Module):
         leaf_add_op_mask = leaf_operation_masks["add_mask"]
         leaf_move_op_mask = leaf_operation_masks["move_mask"]
         actual_oracle_enabled = bool(leaf_operation_masks.get("actual_oracle_enabled", False))
+        actual_oracle_apply_teacher_actions = bool(
+            getattr(self.args, "sparsepcgc_actual_oracle_apply_teacher_actions", False)
+        )
+        hard_leaf_operation_mask_enabled = bool(leaf_operation_masks.get("enabled", False)) and (
+            (not actual_oracle_enabled) or actual_oracle_apply_teacher_actions
+        )
         actual_oracle_has_drop = bool(leaf_delete_op_mask.detach().any().item()) if actual_oracle_enabled else False
         actual_oracle_has_add = bool(leaf_add_op_mask.detach().any().item()) if actual_oracle_enabled else False
         actual_oracle_has_move = bool(leaf_move_op_mask.detach().any().item()) if actual_oracle_enabled else False
@@ -2405,6 +2500,17 @@ class StructureRepairActuator(nn.Module):
         actual_oracle_has_bad_drop = bool(actual_oracle_drop_bad_mask.detach().any().item()) if actual_oracle_enabled else False
         actual_oracle_has_bad_add = bool(actual_oracle_add_bad_mask.detach().any().item()) if actual_oracle_enabled else False
         actual_oracle_has_bad_move = bool(actual_oracle_move_bad_mask.detach().any().item()) if actual_oracle_enabled else False
+        require_actual_gate_non_prune = bool(
+            getattr(self.args, "sparsepcgc_actual_gate_non_prune", True)
+        )
+        hard_add_actual_allowed = (
+            (not require_actual_gate_non_prune)
+            or (actual_oracle_enabled and actual_oracle_has_add)
+        )
+        hard_move_actual_allowed = (
+            (not require_actual_gate_non_prune)
+            or (actual_oracle_enabled and actual_oracle_has_move)
+        )
         actual_oracle_add_direction_index = leaf_operation_masks.get(
             "actual_oracle_best_add_direction_index",
             torch.full_like(leaf_add_op_mask, -1, dtype=torch.long),
@@ -2449,7 +2555,7 @@ class StructureRepairActuator(nn.Module):
             add_enabled=add_enabled,
             move_enabled=disp_enabled,
         )
-        if actual_oracle_enabled:
+        if actual_oracle_enabled and actual_oracle_apply_teacher_actions:
             if actual_oracle_has_drop and prune_enabled:
                 drop_operation_gate = torch.ones_like(drop_operation_gate)
             else:
@@ -2465,6 +2571,58 @@ class StructureRepairActuator(nn.Module):
 
         if timing_enabled:
             _mark_runtime("setup")
+
+        codec_prune_prior_enabled = bool(
+            prune_enabled and getattr(self.args, "sparsepcgc_codec_prune_prior", False)
+        )
+        configured_codec_prior_block_size = int(
+            getattr(self.args, "sparsepcgc_codec_prune_prior_block_size", 0)
+        )
+        if configured_codec_prior_block_size > 0:
+            codec_prune_prior_block_size = configured_codec_prior_block_size
+        else:
+            dataset_key = str(getattr(self.args, "dataname", "")).strip().lower()
+            codec_prune_prior_block_size = 64 if dataset_key == "8i" else 32
+        codec_prune_prior_ratio = min(
+            max(float(getattr(self.args, "sparsepcgc_codec_prune_prior_ratio", 0.05)), 0.0),
+            0.30,
+        )
+        codec_prune_prior_warmup_steps = max(
+            int(getattr(self.args, "sparsepcgc_codec_prune_prior_warmup_steps", 200)),
+            0,
+        )
+        current_train_step = max(int(getattr(self.args, "_global_train_step", 0)), 0)
+        codec_prune_prior_phase = 0.0
+        if codec_prune_prior_enabled and self.training and codec_prune_prior_warmup_steps > 0:
+            codec_prune_prior_phase = max(
+                1.0 - float(current_train_step) / float(codec_prune_prior_warmup_steps),
+                0.0,
+            )
+        codec_prune_prior_score = torch.zeros(
+            (B, 1, N),
+            device=pts_xyz.device,
+            dtype=pts_xyz.dtype,
+        )
+        codec_prune_prior_block_counts = [0 for _ in range(B)]
+        if codec_prune_prior_enabled:
+            codec_prune_prior_score, codec_prune_prior_block_counts = self._codec_prune_block_prior(
+                voxel_coords,
+                codec_prune_prior_block_size,
+            )
+            codec_prune_prior_score = codec_prune_prior_score.to(
+                device=pts_xyz.device,
+                dtype=pts_xyz.dtype,
+            )
+        if codec_prune_prior_phase > 0.0:
+            warm_drop_gate = torch.maximum(
+                drop_operation_gate,
+                drop_operation_gate.new_tensor(codec_prune_prior_phase),
+            )
+            drop_operation_gate = (
+                warm_drop_gate.detach()
+                + drop_operation_gate
+                - drop_operation_gate.detach()
+            )
 
         delete_prior = (
             0.95 * p_outlier
@@ -2523,6 +2681,18 @@ class StructureRepairActuator(nn.Module):
                 - learned_drop_ratio.detach()
             )
         learned_drop_ratio = learned_drop_ratio * drop_operation_gate
+        codec_prune_prior_active_ratio = min(
+            codec_prune_prior_ratio * codec_prune_prior_phase,
+            float(max_drop_ratio),
+        )
+        if codec_prune_prior_active_ratio > 0.0:
+            prior_drop_ratio = learned_drop_ratio.new_tensor(codec_prune_prior_active_ratio)
+            prior_drop_ratio_forward = torch.maximum(learned_drop_ratio, prior_drop_ratio)
+            learned_drop_ratio = (
+                prior_drop_ratio_forward.detach()
+                + learned_drop_ratio
+                - learned_drop_ratio.detach()
+            )
         learned_drop_ratio_for_ops = self._scale_amount_downstream_grad(
             learned_drop_ratio,
             op_name="drop",
@@ -2586,6 +2756,16 @@ class StructureRepairActuator(nn.Module):
             learned_drop_logit,
             op_name="drop",
         )
+
+        codec_prune_prior_logit_weight = max(
+            float(getattr(self.args, "sparsepcgc_codec_prune_prior_logit_weight", 6.0)),
+            0.0,
+        )
+        if codec_prune_prior_phase > 0.0 and codec_prune_prior_logit_weight > 0.0:
+            codec_prior_logit = (
+                2.0 * codec_prune_prior_score - 1.0
+            ) * codec_prune_prior_logit_weight * codec_prune_prior_phase
+            learned_drop_logit = learned_drop_logit + codec_prior_logit.detach()
 
         if self.training and drop_score_noise > 0.0:
             learned_drop_logit = learned_drop_logit + torch.randn_like(learned_drop_logit) * drop_score_noise
@@ -2662,7 +2842,19 @@ class StructureRepairActuator(nn.Module):
             drop_prob_direct = torch.zeros_like(drop_prob_direct)
             drop_prob_proxy = torch.zeros_like(drop_prob_proxy)
         drop_prob = self._voxel_mean_logits(drop_prob, voxel_coords, voxel_cache=voxel_cache).clamp(0.0, 1.0)
-        if actual_oracle_enabled:
+        if codec_prune_prior_phase > 0.0 and codec_prune_prior_logit_weight > 0.0:
+            codec_prior_prob = torch.sigmoid(codec_prior_logit)
+            codec_prior_forward = (
+                codec_prune_prior_phase * codec_prior_prob
+                + (1.0 - codec_prune_prior_phase) * drop_prob
+            )
+            drop_prob = codec_prior_forward.detach() + drop_prob - drop_prob.detach()
+            codec_prior_direct = (
+                codec_prune_prior_phase * codec_prior_prob
+                + (1.0 - codec_prune_prior_phase) * drop_prob_direct
+            )
+            drop_prob_direct = codec_prior_direct.detach() + drop_prob_direct - drop_prob_direct.detach()
+        if actual_oracle_enabled and actual_oracle_apply_teacher_actions:
             oracle_drop_forward = leaf_delete_op_mask.to(device=drop_prob.device, dtype=drop_prob.dtype)
             oracle_grad_eps = min(
                 max(float(getattr(self.args, "sparsepcgc_actual_oracle_where_grad_eps", 0.05)), 0.0),
@@ -2690,7 +2882,7 @@ class StructureRepairActuator(nn.Module):
 
         # leaf pattern診断がDeleteを推奨したnode/voxelだけをDelete source候補にする。
         # これにより、圧縮率改善と無関係なDeleteを候補集合から除外する。
-        if bool(leaf_operation_masks.get("enabled", False)):
+        if hard_leaf_operation_mask_enabled:
             delete_candidate_mask = delete_candidate_mask & leaf_delete_op_mask.squeeze(1)
         delete_candidate_weight = delete_candidate_mask.unsqueeze(1).to(dtype=drop_prob.dtype)
 
@@ -2816,7 +3008,7 @@ class StructureRepairActuator(nn.Module):
             * (soft_drop_where_grad_base - soft_drop_where_grad_base.detach())
         )
 
-        if actual_oracle_enabled and actual_oracle_has_drop:
+        if actual_oracle_enabled and actual_oracle_apply_teacher_actions and actual_oracle_has_drop:
             # The full-cloud teacher may intersect one selected subtree almost
             # completely. Cap the local hard application so a useful global
             # teacher cannot erase 90-100% of the shadow geometry.
@@ -2847,6 +3039,15 @@ class StructureRepairActuator(nn.Module):
                 force_min_count=False,
                 max_hard_count=int(getattr(self.args, "repair_max_hard_drop_voxels", 0)),
                 allow_single_candidate=False,
+            )
+        elif codec_prune_prior_phase > 0.0:
+            hard_drop_mask = self._hard_codec_block_drop_mask(
+                voxel_coords,
+                drop_prob,
+                block_size=codec_prune_prior_block_size,
+                target_drop_ratio=learned_drop_ratio_value,
+                selection_mask=delete_candidate_mask.unsqueeze(1),
+                max_hard_count=int(getattr(self.args, "repair_max_hard_drop_voxels", 0)),
             )
         else:
             hard_drop_mask = self._hard_voxel_drop_mask(
@@ -3086,7 +3287,11 @@ class StructureRepairActuator(nn.Module):
         soft_move_voxel_sum = pts_xyz.new_zeros(())
         hard_move_voxel_sum = pts_xyz.new_zeros(())
         # hard選択個数は整数なので、学習比率の値だけを使って選択数へ変換する。
-        move_target_ratio = float(learned_move_ratio.detach().mean().cpu()) if disp_enabled else 0.0
+        move_target_ratio = (
+            float(learned_move_ratio.detach().mean().cpu())
+            if disp_enabled and hard_move_actual_allowed
+            else 0.0
+        )
         require_empty_move = bool(getattr(self.args, "repair_move_require_empty_target", True))
         prefer_occupied_move = bool(getattr(self.args, "repair_move_prefer_occupied_target", False)) and not require_empty_move
         sparse_empty_guard = bool(
@@ -3148,7 +3353,7 @@ class StructureRepairActuator(nn.Module):
         base_move_candidate_mask = base_move_candidate_mask & has_valid_move_target.squeeze(1).to(dtype=torch.bool)
 
         # leaf pattern診断がMoveを推奨したnode/voxelだけをMove source候補にする。
-        if bool(leaf_operation_masks.get("enabled", False)):
+        if hard_leaf_operation_mask_enabled:
             base_move_candidate_mask = base_move_candidate_mask & leaf_move_op_mask.squeeze(1)
 
         move_candidate_mask = base_move_candidate_mask
@@ -3652,10 +3857,14 @@ class StructureRepairActuator(nn.Module):
         learned_add_ratio_value = float(learned_add_ratio.detach().mean().cpu()) if add_enabled else 0.0
         add_k, add_candidate_ratio = self._target_add_count(
             N,
-            candidate_ratio_override=learned_add_ratio_value,
+            candidate_ratio_override=(learned_add_ratio_value if hard_add_actual_allowed else 0.0),
             force_min_count=(
-                bool(getattr(self.args, "repair_force_min_add_voxels", False))
-                or bool(actual_oracle_enabled and actual_oracle_has_add)
+                bool(getattr(self.args, "repair_force_min_add_voxels", False) and hard_add_actual_allowed)
+                or bool(
+                    actual_oracle_enabled
+                    and actual_oracle_apply_teacher_actions
+                    and actual_oracle_has_add
+                )
             ),
         )
         add_ratio = pts_xyz.new_zeros(())
@@ -3768,7 +3977,7 @@ class StructureRepairActuator(nn.Module):
                 base_valid = base_valid & (keep_prob.detach().squeeze(1) >= keep_threshold)
 
             # leaf pattern診断がAddを推奨したnode/voxelだけをAdd source候補にする。
-            if bool(leaf_operation_masks.get("enabled", False)):
+            if hard_leaf_operation_mask_enabled:
                 base_valid = base_valid & leaf_add_op_mask.squeeze(1)
             valid_pair = empty_target_mask & base_valid.unsqueeze(2)
             if (
@@ -4074,7 +4283,7 @@ class StructureRepairActuator(nn.Module):
         # 後段互換用の add_ratio は、古いゼロ初期値ではなく学習用のsoft実行率にする。
         # hard実行率は add_ratio_hard として別keyで保持する。
         add_ratio = add_ratio_soft
-        if actual_oracle_enabled and actual_oracle_has_add:
+        if actual_oracle_enabled and actual_oracle_apply_teacher_actions and actual_oracle_has_add:
             leaf_diag_for_oracle_add = structure.get("leaf_pattern_diag", {}) if isinstance(structure, dict) else {}
             oracle_add_slots = self._fit_leaf_pattern_long_map(
                 leaf_diag_for_oracle_add.get("best_add_child_slot", None),
@@ -4278,7 +4487,11 @@ class StructureRepairActuator(nn.Module):
             if isinstance(leaf_diag_for_override, dict)
             else None
         )
-        if actual_oracle_enabled and torch.is_tensor(override_final_voxel_coords):
+        if (
+            actual_oracle_enabled
+            and actual_oracle_apply_teacher_actions
+            and torch.is_tensor(override_final_voxel_coords)
+        ):
             override_coords = override_final_voxel_coords.detach().to(device=pts_xyz.device, dtype=torch.long)
             if override_coords.ndim == 2:
                 override_coords = (
@@ -5716,6 +5929,20 @@ class StructureRepairActuator(nn.Module):
             "actual_oracle_fast_diagnostic_local_drop_ratio": pts_xyz.new_tensor(
                 float(leaf_operation_masks.get("actual_oracle_fast_diagnostic_local_drop_ratio", 0.0))
             ).detach(),
+            "actual_oracle_apply_teacher_actions": pts_xyz.new_tensor(
+                float(actual_oracle_apply_teacher_actions)
+            ).detach(),
+            "codec_prune_prior_enabled": pts_xyz.new_tensor(
+                float(codec_prune_prior_enabled)
+            ).detach(),
+            "codec_prune_prior_phase": pts_xyz.new_tensor(codec_prune_prior_phase).detach(),
+            "codec_prune_prior_ratio": pts_xyz.new_tensor(codec_prune_prior_active_ratio).detach(),
+            "codec_prune_prior_block_size": pts_xyz.new_tensor(
+                float(codec_prune_prior_block_size)
+            ).detach(),
+            "codec_prune_prior_block_count_mean": pts_xyz.new_tensor(
+                float(sum(codec_prune_prior_block_counts)) / max(float(len(codec_prune_prior_block_counts)), 1.0)
+            ).detach(),
             "raw_learned_drop_ratio": raw_learned_drop_ratio.mean().detach(),
             "raw_learned_add_ratio": raw_learned_add_ratio.mean().detach(),
             "raw_learned_move_ratio": raw_learned_move_ratio.mean().detach(),
@@ -6167,6 +6394,16 @@ class StructureRepairActuator(nn.Module):
             "actual_oracle_fast_diagnostic_local_drop_ratio": pts_xyz.new_tensor(
                 float(leaf_operation_masks.get("actual_oracle_fast_diagnostic_local_drop_ratio", 0.0))
             ).detach(),
+            "actual_oracle_apply_teacher_actions": pts_xyz.new_tensor(
+                float(actual_oracle_apply_teacher_actions)
+            ),
+            "codec_prune_prior_enabled": pts_xyz.new_tensor(float(codec_prune_prior_enabled)),
+            "codec_prune_prior_phase": pts_xyz.new_tensor(codec_prune_prior_phase),
+            "codec_prune_prior_ratio": pts_xyz.new_tensor(codec_prune_prior_active_ratio),
+            "codec_prune_prior_block_size": pts_xyz.new_tensor(float(codec_prune_prior_block_size)),
+            "codec_prune_prior_block_count_mean": pts_xyz.new_tensor(
+                float(sum(codec_prune_prior_block_counts)) / max(float(len(codec_prune_prior_block_counts)), 1.0)
+            ),
             "raw_learned_drop_ratio": raw_learned_drop_ratio.mean(),
             "raw_learned_add_ratio": raw_learned_add_ratio.mean(),
             "raw_learned_move_ratio": raw_learned_move_ratio.mean(),

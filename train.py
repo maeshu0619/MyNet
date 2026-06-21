@@ -1813,22 +1813,6 @@ def _sparsepcgc_actual_oracle_full_cloud_macro_prune_candidates(
             continue
         block_order_cpu = np.argsort(block_counts_cpu, kind="stable")
         cumulative_counts_cpu = np.cumsum(block_counts_cpu[block_order_cpu], dtype=np.int64)
-        teacher_block_ids_cpu = np.empty((0,), dtype=np.int64)
-        if torch.is_tensor(teacher_coords) and teacher_coords.numel() > 0:
-            teacher_coords_cpu = teacher_coords.detach().to(device="cpu", dtype=torch.long).numpy()
-            teacher_blocks_cpu = np.unique(
-                np.floor_divide(teacher_coords_cpu, int(block_size)),
-                axis=0,
-            )
-            teacher_block_keys = {tuple(int(v) for v in row) for row in teacher_blocks_cpu.tolist()}
-            teacher_block_ids_cpu = np.asarray(
-                [
-                    idx
-                    for idx, row in enumerate(unique_blocks_cpu.tolist())
-                    if tuple(int(v) for v in row) in teacher_block_keys
-                ],
-                dtype=np.int64,
-            )
         ordered_subtree_ratios = sorted(
             subtree_ratios,
             key=lambda value: abs(float(value) - float(target_ratio)),
@@ -1845,13 +1829,6 @@ def _sparsepcgc_actual_oracle_full_cloud_macro_prune_candidates(
             take = int(np.searchsorted(cumulative_counts_cpu, int(target_drop), side="left")) + 1
             take = min(max(take, 1), int(block_order_cpu.size) - 1)
             drop_blocks_cpu = block_order_cpu[:take].copy()
-            if teacher_block_ids_cpu.size > 0 and not np.isin(drop_blocks_cpu, teacher_block_ids_cpu).any():
-                # Keep the global low-density plan intact except for one block,
-                # so the selected shadow subtree receives an exact teacher too.
-                teacher_counts = block_counts_cpu[teacher_block_ids_cpu]
-                teacher_block_id = int(teacher_block_ids_cpu[int(np.argmin(teacher_counts))])
-                drop_blocks_cpu[-1] = teacher_block_id
-                drop_blocks_cpu = np.unique(drop_blocks_cpu)
             drop_block_mask_cpu = np.zeros((unique_blocks_cpu.shape[0],), dtype=np.bool_)
             drop_block_mask_cpu[drop_blocks_cpu] = True
             drop_mask_cpu = drop_block_mask_cpu[block_inverse_cpu]
@@ -7973,7 +7950,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                             # coordinate scopes and duplicate the entire cloud in that forward.
                             if str(oracle_debug.get("override_scope", "")) == "full_cloud":
                                 apply_full_override = bool(
-                                    getattr(args, "sparsepcgc_actual_oracle_apply_full_override", True)
+                                    getattr(args, "sparsepcgc_actual_oracle_apply_full_override", False)
                                 )
                                 if apply_full_override:
                                     full_cloud_canonical_context = dict(full_cloud_canonical_context)
@@ -8273,7 +8250,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                                         octree_input_mode="full_cloud",
                                     )
                                     if (
-                                        bool(getattr(args, "sparsepcgc_actual_oracle_apply_full_override", True))
+                                        bool(getattr(args, "sparsepcgc_actual_oracle_apply_full_override", False))
                                         and
                                         isinstance(step_actual_oracle_metric_debug, dict)
                                         and bool(step_actual_oracle_metric_debug.get("used", False))
@@ -8798,7 +8775,7 @@ def train(model, args, loss, writer, plot, notifier=None):
 
                 """圧縮損失の合成"""
                 if (
-                    bool(getattr(args, "sparsepcgc_actual_oracle_apply_full_override", True))
+                    bool(getattr(args, "sparsepcgc_actual_oracle_apply_full_override", False))
                     and
                     torch.is_tensor(L_geom)
                     and isinstance(step_actual_oracle_metric_debug, dict)
@@ -9528,6 +9505,25 @@ def train(model, args, loss, writer, plot, notifier=None):
                             comp_debug["full_cloud_teacher_used"] = True
                     elif full_cloud_primary_override_debug:
                         comp_debug.update(full_cloud_primary_override_debug)
+
+                oracle_actions_applied = bool(
+                    getattr(args, "sparsepcgc_actual_oracle_apply_teacher_actions", False)
+                    or getattr(args, "sparsepcgc_actual_oracle_apply_full_override", False)
+                )
+                policy_full_actual = finite_float_or_none(
+                    comp_debug.get(
+                        "full_cloud_actual_bit_percent",
+                        comp_debug.get("actual_total_bit_percent", None),
+                    )
+                )
+                if (
+                    not oracle_actions_applied
+                    and policy_full_actual is not None
+                    and str(comp_debug.get("actual_scope", "")) == "full_cloud"
+                ):
+                    comp_debug["policy_full_cloud_actual_bit_percent"] = float(policy_full_actual)
+                    comp_debug["oracle_full_cloud_override_used"] = False
+                    comp_debug["policy_action_source"] = "network_actuator"
 
 
                 if cp_debug: # Compression Primaryモード用のDebug情報が存在するか判定

@@ -2539,6 +2539,20 @@ class Network(nn.Module):
                     "actual_oracle_scheduled_operation": str(
                         actuator_stats.get("actual_oracle_scheduled_operation", "")
                     ),
+                    "actual_oracle_apply_teacher_actions": bool(
+                        _actuator_scalar("actual_oracle_apply_teacher_actions") > 0.5
+                    ),
+                    "codec_prune_prior_enabled": bool(
+                        _actuator_scalar("codec_prune_prior_enabled") > 0.5
+                    ),
+                    "codec_prune_prior_phase": _actuator_scalar("codec_prune_prior_phase"),
+                    "codec_prune_prior_ratio": _actuator_scalar("codec_prune_prior_ratio"),
+                    "codec_prune_prior_block_size": int(
+                        round(_actuator_scalar("codec_prune_prior_block_size"))
+                    ),
+                    "codec_prune_prior_block_count_mean": _actuator_scalar(
+                        "codec_prune_prior_block_count_mean"
+                    ),
                     "operation_amount_consistency_loss": float(actuator_stats.get("operation_amount_consistency_loss", pts_xyz.new_zeros(())).detach().cpu()),
                     "operation_entropy": float(actuator_stats.get("operation_entropy", pts_xyz.new_zeros(())).detach().cpu()),
                     "operation_prob_floor_applied": bool(actuator_stats.get("operation_prob_floor_applied", False)),

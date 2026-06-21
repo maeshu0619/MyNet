@@ -293,16 +293,20 @@ def subtree_prune_candidates(
         cumulative = torch.cumsum(counts.index_select(0, block_order), dim=0)
         take = int(torch.searchsorted(cumulative, cumulative.new_tensor(target_drop)).item()) + 1
         take = min(max(take, 1), int(block_order.numel()) - 1)
-        drop_blocks = block_order[:take]
-        drop_block_mask = torch.zeros((unique_blocks.shape[0],), device=coords_n3.device, dtype=torch.bool)
-        drop_block_mask[drop_blocks] = True
-        keep = ~drop_block_mask.index_select(0, inverse)
-        candidates.append(
-            (
-                f"prune_subtree_block_{block_size}_ratio_{drop_ratio:.3f}",
-                torch.unique(coords_n3[keep], dim=0, sorted=True),
+        take_values = [("ceil", take)]
+        if take > 1 and int(cumulative[take - 1].item()) > target_drop:
+            take_values.insert(0, ("floor", take - 1))
+        for boundary, take_value in take_values:
+            drop_blocks = block_order[:take_value]
+            drop_block_mask = torch.zeros((unique_blocks.shape[0],), device=coords_n3.device, dtype=torch.bool)
+            drop_block_mask[drop_blocks] = True
+            keep = ~drop_block_mask.index_select(0, inverse)
+            candidates.append(
+                (
+                    f"prune_subtree_block_{block_size}_{boundary}_ratio_{drop_ratio:.3f}",
+                    torch.unique(coords_n3[keep], dim=0, sorted=True),
+                )
             )
-        )
     return candidates
 
 
@@ -310,7 +314,12 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--files", nargs="+", required=True)
     parser.add_argument("--max-evals-per-file", type=int, default=18)
-    parser.add_argument("--max-input-voxels", type=int, default=6000)
+    parser.add_argument(
+        "--max-input-voxels",
+        type=int,
+        default=0,
+        help="0はfull cloudを維持する。正数は明示的な診断用subsample上限。",
+    )
     parser.add_argument("--block-size", type=int, default=0)
     parser.add_argument("--blocks-per-file", type=int, default=0)
     parser.add_argument("--min-block-voxels", type=int, default=256)
@@ -342,10 +351,15 @@ def main() -> int:
         for file_path in cli.files:
             xyz = torch.as_tensor(load_ply(file_path, return_color=False), dtype=torch.float32)
             coords, meta = _unique_coords(xyz, args)
-            if int(coords.shape[0]) > cli.max_input_voxels:
+            original_coord_count = int(coords.shape[0])
+            subsampled = bool(
+                int(cli.max_input_voxels) > 0
+                and original_coord_count > int(cli.max_input_voxels)
+            )
+            if subsampled:
                 step = max(1, int(math.ceil(int(coords.shape[0]) / float(cli.max_input_voxels))))
                 coords = coords[::step].contiguous()
-            coord_sets = [("full", coords)]
+            coord_sets = [("subsampled" if subsampled else "full", coords)]
             if int(cli.block_size) > 0 and int(cli.blocks_per_file) > 0:
                 block = int(cli.block_size)
                 block_coords = torch.div(coords, block, rounding_mode="floor")
@@ -412,6 +426,9 @@ def main() -> int:
                 payload = {
                     "file": str(file_path),
                     "scope": scope,
+                    "subsampled": subsampled,
+                    "original_voxels": original_coord_count,
+                    "evaluated_voxels": int(scoped_coords.shape[0]),
                     "base": rows[0],
                     "best": best,
                     "all": rows,
