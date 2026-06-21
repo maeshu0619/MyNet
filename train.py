@@ -393,9 +393,10 @@ def _select_actual_gen_xyz_from_voxel_state(
 
     require_state = bool(getattr(args, "voxel_restored_actual_require_state", False))
 
-    def _fallback(reason):
-        if require_state:
+    def _fallback(reason, *, allow_even_if_required=False):
+        if require_state and not allow_even_if_required:
             raise RuntimeError(f"{prefix}: {reason}")
+
         original_min, original_max = _phase7_tensor_range(fallback_xyz)
         return fallback_xyz, {
             "used": False,
@@ -476,9 +477,30 @@ def _select_actual_gen_xyz_from_voxel_state(
 
     for b in range(coords.shape[0]):
         valid_b = valid_mask[b]
+
+        if valid_b.ndim != 1 or valid_b.numel() != coords.shape[2]:
+            return _fallback(
+                f"invalid_final_voxel_valid_mask_shape={tuple(valid_mask.shape)}, "
+                f"coords_shape={tuple(coords.shape)}"
+            )
+
+        valid_count_b = int(valid_b.detach().bool().sum().cpu())
+        if valid_count_b <= 0:
+            if writer is not None and hasattr(writer, "write") and bool(getattr(args, "_log_this_step", True)):
+                writer.write(
+                    f"{prefix}: fallback=True, "
+                    f"reason=empty_valid_final_voxel_coords, "
+                    f"batch={b}, "
+                    f"coords_shape={tuple(coords.shape)}, "
+                    f"valid_mask_shape={tuple(valid_mask.shape)}"
+                )
+
+            return _fallback(
+                "empty_valid_final_voxel_coords",
+                allow_even_if_required=True,
+            )
+
         coords_b = coords[b:b + 1, :, valid_b]
-        if coords_b.shape[-1] <= 0:
-            return _fallback("empty_valid_final_voxel_coords")
 
         meta_b = dict(meta)
         if "effective_qs_tensor" in meta_b and torch.is_tensor(meta_b["effective_qs_tensor"]):
@@ -8217,14 +8239,59 @@ def train(model, args, loss, writer, plot, notifier=None):
                                             and not voxel_restored_actual_debug.get("fallback", False)
                                         )
 
-                                        # voxel state 復元に成功した場合は、proxy側も actual 側も同じ点群を使う。
-                                        # 復元に失敗した場合は既存挙動へfallbackする。
                                         subtree_compression_source_xyz = subtree_voxel_state_xyz
 
-                                        # voxel state 復元点群はすでに Prune/Add/Move 反映後の occupied voxel 集合である。
-                                        # ここへ final_w_sub_loss をさらに渡すと、Prune が二重反映される危険がある。
-                                        # fallback時だけ従来の final_w_sub_loss を使う。
-                                        final_w_sub_compression = None if subtree_voxel_state_used else final_w_sub_loss
+                                        # ============================================================
+                                        # 空点群ガード:
+                                        # voxel復元失敗後の fallback_xyz まで空の場合、
+                                        # surrogate/proxy 圧縮損失へ N=0 点群を渡すと amax/argmax で落ちる。
+                                        # この場合は圧縮損失用だけ original subtree 入力へ退避する。
+                                        # geometry loss は上で gen_subtree_xyz に対して計算済みなので変更しない。
+                                        # ============================================================
+                                        compression_source_empty = (
+                                            (not torch.is_tensor(subtree_compression_source_xyz))
+                                            or subtree_compression_source_xyz.ndim != 3
+                                            or subtree_compression_source_xyz.shape[1] < 3
+                                            or subtree_compression_source_xyz.shape[-1] <= 0
+                                        )
+
+                                        if compression_source_empty:
+                                            if writer is not None and hasattr(writer, "write") and bool(getattr(args, "_log_this_step", True)):
+                                                writer.write(
+                                                    "SubtreeCompressionInputGuard: "
+                                                    "fallback=True, "
+                                                    "reason=empty_subtree_compression_source, "
+                                                    f"voxel_state_used={bool(subtree_voxel_state_used)}, "
+                                                    f"gen_subtree_shape={tuple(gen_subtree_xyz.shape) if torch.is_tensor(gen_subtree_xyz) else None}, "
+                                                    f"subtree_xyz_shape={tuple(subtree_xyz[:, :3, :].shape) if torch.is_tensor(subtree_xyz) else None}"
+                                                )
+
+                                            # 圧縮損失用だけ安全な非空点群に戻す。
+                                            # detachしておくことで、この退避経路から不自然な勾配を返さない。
+                                            subtree_compression_source_xyz = subtree_xyz[:, :3, :].detach()
+
+                                            # actual_gen_xyz 側も空にしない。
+                                            subtree_voxel_state_xyz = subtree_compression_source_xyz
+
+                                            # このstepは voxel state を使った圧縮評価ではない扱いにする。
+                                            subtree_voxel_state_used = False
+
+                                            # final_w が全0だと、ここでも再び空扱いになる可能性がある。
+                                            # そのため空点群退避時は final_w を圧縮損失へ渡さない。
+                                            final_w_sub_compression = None
+
+                                            if isinstance(voxel_restored_actual_debug, dict):
+                                                voxel_restored_actual_debug["fallback"] = True
+                                                voxel_restored_actual_debug["reason"] = "empty_subtree_compression_source_guard"
+                                                voxel_restored_actual_debug["actual_input_source"] = "original_subtree_xyz_empty_guard"
+                                                voxel_restored_actual_debug["subtree_proxy_uses_voxel_state"] = False
+                                                voxel_restored_actual_debug["subtree_actual_uses_voxel_state"] = False
+                                                voxel_restored_actual_debug["subtree_final_w_disabled_for_voxel_state"] = True
+                                        else:
+                                            # voxel state 復元点群はすでに Prune/Add/Move 反映後の occupied voxel 集合である。
+                                            # ここへ final_w_sub_loss をさらに渡すと、Prune が二重反映される危険がある。
+                                            # fallback時だけ従来の final_w_sub_loss を使う。
+                                            final_w_sub_compression = None if subtree_voxel_state_used else final_w_sub_loss
 
                                         compression_subtree_xyz, noise_debug_sub = prepare_compression_points(
                                             subtree_compression_source_xyz,
