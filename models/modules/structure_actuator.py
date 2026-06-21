@@ -526,10 +526,17 @@ class StructureRepairActuator(nn.Module):
             "actual_oracle_fast_diagnostic_local_drop_ratio": 0.0,
             "actual_oracle_drop_reason": "",
             "actual_oracle_operation": "",
+            "actual_oracle_scheduled_operation": "",
             "actual_oracle_drop_bad_mask": false_mask,
             "actual_oracle_add_bad_mask": false_mask,
+            "actual_oracle_move_bad_mask": false_mask,
             "actual_oracle_drop_bad_score": false_mask.to(dtype=like_tensor.dtype),
             "actual_oracle_add_bad_score": false_mask.to(dtype=like_tensor.dtype),
+            "actual_oracle_move_bad_score": false_mask.to(dtype=like_tensor.dtype),
+            "actual_oracle_best_add_direction_index": torch.full_like(false_mask, -1, dtype=torch.long),
+            "actual_oracle_bad_add_direction_index": torch.full_like(false_mask, -1, dtype=torch.long),
+            "actual_oracle_move_direction_index": torch.full_like(false_mask, -1, dtype=torch.long),
+            "actual_oracle_move_bad_direction_index": torch.full_like(false_mask, -1, dtype=torch.long),
         }
 
         if not isinstance(structure, dict):
@@ -562,6 +569,10 @@ class StructureRepairActuator(nn.Module):
                 leaf_diag.get("actual_oracle_add_bad_mask", None),
                 like_tensor,
             ).to(dtype=torch.bool)
+            oracle_move_bad_mask = self._fit_leaf_pattern_map(
+                leaf_diag.get("actual_oracle_move_bad_mask", None),
+                like_tensor,
+            ).to(dtype=torch.bool)
             oracle_drop_bad_score = self._fit_leaf_pattern_map(
                 leaf_diag.get("actual_oracle_drop_bad_score", None),
                 like_tensor,
@@ -570,6 +581,26 @@ class StructureRepairActuator(nn.Module):
                 leaf_diag.get("actual_oracle_add_bad_score", None),
                 like_tensor,
             )
+            oracle_move_bad_score = self._fit_leaf_pattern_map(
+                leaf_diag.get("actual_oracle_move_bad_score", None),
+                like_tensor,
+            )
+            oracle_add_direction_index = self._fit_leaf_pattern_map(
+                leaf_diag.get("actual_oracle_best_add_direction_index", None),
+                like_tensor,
+            ).to(dtype=torch.long)
+            oracle_bad_add_direction_index = self._fit_leaf_pattern_map(
+                leaf_diag.get("actual_oracle_bad_add_direction_index", None),
+                like_tensor,
+            ).to(dtype=torch.long)
+            oracle_move_direction_index = self._fit_leaf_pattern_map(
+                leaf_diag.get("actual_oracle_move_direction_index", None),
+                like_tensor,
+            ).to(dtype=torch.long)
+            oracle_bad_move_direction_index = self._fit_leaf_pattern_map(
+                leaf_diag.get("actual_oracle_move_bad_direction_index", None),
+                like_tensor,
+            ).to(dtype=torch.long)
             out.update(
                 {
                     "enabled": True,
@@ -694,10 +725,19 @@ class StructureRepairActuator(nn.Module):
                     "actual_oracle_operation": str(
                         leaf_diag.get("actual_oracle_operation", "")
                     ),
+                    "actual_oracle_scheduled_operation": str(
+                        leaf_diag.get("actual_oracle_scheduled_operation", "")
+                    ),
                     "actual_oracle_drop_bad_mask": oracle_drop_bad_mask & (~oracle_drop_mask),
                     "actual_oracle_add_bad_mask": oracle_add_bad_mask & (~oracle_add_mask),
+                    "actual_oracle_move_bad_mask": oracle_move_bad_mask & (~oracle_move_mask),
                     "actual_oracle_drop_bad_score": oracle_drop_bad_score,
                     "actual_oracle_add_bad_score": oracle_add_bad_score,
+                    "actual_oracle_move_bad_score": oracle_move_bad_score,
+                    "actual_oracle_best_add_direction_index": oracle_add_direction_index,
+                    "actual_oracle_bad_add_direction_index": oracle_bad_add_direction_index,
+                    "actual_oracle_move_direction_index": oracle_move_direction_index,
+                    "actual_oracle_move_bad_direction_index": oracle_bad_move_direction_index,
                 }
             )
             return out
@@ -2346,6 +2386,10 @@ class StructureRepairActuator(nn.Module):
             "actual_oracle_add_bad_mask",
             torch.zeros_like(leaf_add_op_mask, dtype=torch.bool),
         ).to(device=pts_xyz.device, dtype=torch.bool)
+        actual_oracle_move_bad_mask = leaf_operation_masks.get(
+            "actual_oracle_move_bad_mask",
+            torch.zeros_like(leaf_move_op_mask, dtype=torch.bool),
+        ).to(device=pts_xyz.device, dtype=torch.bool)
         actual_oracle_drop_bad_score = leaf_operation_masks.get(
             "actual_oracle_drop_bad_score",
             torch.zeros_like(leaf_delete_op_mask, dtype=pts_xyz.dtype),
@@ -2354,8 +2398,29 @@ class StructureRepairActuator(nn.Module):
             "actual_oracle_add_bad_score",
             torch.zeros_like(leaf_add_op_mask, dtype=pts_xyz.dtype),
         ).to(device=pts_xyz.device, dtype=pts_xyz.dtype)
+        actual_oracle_move_bad_score = leaf_operation_masks.get(
+            "actual_oracle_move_bad_score",
+            torch.zeros_like(leaf_move_op_mask, dtype=pts_xyz.dtype),
+        ).to(device=pts_xyz.device, dtype=pts_xyz.dtype)
         actual_oracle_has_bad_drop = bool(actual_oracle_drop_bad_mask.detach().any().item()) if actual_oracle_enabled else False
         actual_oracle_has_bad_add = bool(actual_oracle_add_bad_mask.detach().any().item()) if actual_oracle_enabled else False
+        actual_oracle_has_bad_move = bool(actual_oracle_move_bad_mask.detach().any().item()) if actual_oracle_enabled else False
+        actual_oracle_add_direction_index = leaf_operation_masks.get(
+            "actual_oracle_best_add_direction_index",
+            torch.full_like(leaf_add_op_mask, -1, dtype=torch.long),
+        ).to(device=pts_xyz.device, dtype=torch.long)
+        actual_oracle_bad_add_direction_index = leaf_operation_masks.get(
+            "actual_oracle_bad_add_direction_index",
+            torch.full_like(leaf_add_op_mask, -1, dtype=torch.long),
+        ).to(device=pts_xyz.device, dtype=torch.long)
+        actual_oracle_move_direction_index = leaf_operation_masks.get(
+            "actual_oracle_move_direction_index",
+            torch.full_like(leaf_move_op_mask, -1, dtype=torch.long),
+        ).to(device=pts_xyz.device, dtype=torch.long)
+        actual_oracle_bad_move_direction_index = leaf_operation_masks.get(
+            "actual_oracle_move_bad_direction_index",
+            torch.full_like(leaf_move_op_mask, -1, dtype=torch.long),
+        ).to(device=pts_xyz.device, dtype=torch.long)
 
         child_slot_candidate_ratio = None
         if child_slot_mask is not None:
@@ -2473,8 +2538,10 @@ class StructureRepairActuator(nn.Module):
         drop_amount_soft_consistency_loss = pts_xyz.new_zeros(())
         actual_oracle_drop_amount_loss = pts_xyz.new_zeros(())
         actual_oracle_add_amount_loss = pts_xyz.new_zeros(())
+        actual_oracle_move_amount_loss = pts_xyz.new_zeros(())
         actual_oracle_drop_amount_logit_loss = pts_xyz.new_zeros(())
         actual_oracle_add_amount_logit_loss = pts_xyz.new_zeros(())
+        actual_oracle_move_amount_logit_loss = pts_xyz.new_zeros(())
 
         soft_drop_budget = pts_xyz.new_zeros((B, 1, 1))
         valid_delete_voxel_count = pts_xyz.new_ones((B, 1, 1))
@@ -2750,12 +2817,36 @@ class StructureRepairActuator(nn.Module):
         )
 
         if actual_oracle_enabled and actual_oracle_has_drop:
-            # The actual SparsePCGC oracle already measured these voxel edits and
-            # found them improving.  Do not let the still-learning amount ratio
-            # shrink a multi-voxel oracle edit back to one voxel.
-            hard_drop_mask = (
-                leaf_delete_op_mask.to(device=pts_xyz.device, dtype=torch.bool)
-                & delete_candidate_mask.unsqueeze(1)
+            # The full-cloud teacher may intersect one selected subtree almost
+            # completely. Cap the local hard application so a useful global
+            # teacher cannot erase 90-100% of the shadow geometry.
+            oracle_local_cap = min(
+                float(max_drop_ratio),
+                max(
+                    float(
+                        getattr(
+                            self.args,
+                            "sparsepcgc_actual_oracle_local_max_drop_ratio",
+                            0.05,
+                        )
+                    ),
+                    0.0,
+                ),
+            )
+            hard_drop_mask = self._hard_voxel_drop_mask(
+                voxel_coords,
+                drop_prob,
+                target_drop_ratio=oracle_local_cap,
+                max_drop_ratio=oracle_local_cap,
+                selection_mask=(
+                    leaf_delete_op_mask.to(device=pts_xyz.device, dtype=torch.bool)
+                    & delete_candidate_mask.unsqueeze(1)
+                ),
+                hard_threshold=float(getattr(self.args, "repair_drop_hard_threshold", 0.5)),
+                voxel_cache=voxel_cache,
+                force_min_count=False,
+                max_hard_count=int(getattr(self.args, "repair_max_hard_drop_voxels", 0)),
+                allow_single_candidate=False,
             )
         else:
             hard_drop_mask = self._hard_voxel_drop_mask(
@@ -2828,10 +2919,15 @@ class StructureRepairActuator(nn.Module):
         drop_amount_supervision_loss = (
             drop_ratio_hard_batch.detach() - learned_drop_ratio
         ).pow(2).mean()
-        if bool((drop_ratio_hard_batch.detach() > 0.0).any().item()) and max_drop_ratio > 0.0:
+        if (actual_oracle_has_drop or actual_oracle_has_bad_drop) and max_drop_ratio > 0.0:
+            drop_oracle_target_ratio = (
+                drop_ratio_hard_batch.detach()
+                if actual_oracle_has_drop
+                else torch.zeros_like(drop_ratio_hard_batch)
+            )
             actual_oracle_drop_amount_loss = self._actual_oracle_amount_bce_loss(
-                learned_drop_ratio,
-                drop_ratio_hard_batch.detach(),
+                raw_learned_drop_ratio,
+                drop_oracle_target_ratio,
                 max_drop_ratio,
             )
             drop_amount_logit_for_oracle = self._operation_amount_logit(
@@ -2839,9 +2935,9 @@ class StructureRepairActuator(nn.Module):
                 self.drop_amount_head,
             ).mean()
             drop_amount_target_logit_for_oracle = self._target_ratio_logit(
-                drop_ratio_hard_batch.detach().mean(),
+                drop_oracle_target_ratio.mean(),
                 max_drop_ratio,
-                learned_drop_ratio,
+                raw_learned_drop_ratio,
             ).detach()
             actual_oracle_drop_amount_logit_loss = (
                 drop_amount_logit_for_oracle - drop_amount_target_logit_for_oracle
@@ -4050,10 +4146,15 @@ class StructureRepairActuator(nn.Module):
                     )
                     add_ratio_soft = torch.maximum(add_ratio_soft, add_ratio_hard.detach())
                     add_ratio = add_ratio_soft
-        if bool((add_ratio_hard.detach() > 0.0).any().item()) and max_add_ratio_value > 0.0:
+        if (actual_oracle_has_add or actual_oracle_has_bad_add) and max_add_ratio_value > 0.0:
+            add_oracle_target_ratio = (
+                add_ratio_hard.detach()
+                if actual_oracle_has_add
+                else torch.zeros_like(add_ratio_hard)
+            )
             actual_oracle_add_amount_loss = self._actual_oracle_amount_bce_loss(
-                learned_add_ratio,
-                add_ratio_hard.detach(),
+                raw_learned_add_ratio,
+                add_oracle_target_ratio,
                 max_add_ratio_value,
             )
             add_amount_logit_for_oracle = self._operation_amount_logit(
@@ -4061,9 +4162,9 @@ class StructureRepairActuator(nn.Module):
                 self.add_amount_head,
             ).mean()
             add_amount_target_logit_for_oracle = self._target_ratio_logit(
-                add_ratio_hard.detach(),
+                add_oracle_target_ratio,
                 max_add_ratio_value,
-                learned_add_ratio,
+                raw_learned_add_ratio,
             ).detach()
             actual_oracle_add_amount_logit_loss = (
                 add_amount_logit_for_oracle - add_amount_target_logit_for_oracle
@@ -4072,6 +4173,34 @@ class StructureRepairActuator(nn.Module):
                 actual_oracle_add_amount_loss
                 + float(getattr(self.args, "sparsepcgc_actual_oracle_amount_logit_weight", 0.25))
                 * actual_oracle_add_amount_logit_loss
+            )
+        if (actual_oracle_has_move or actual_oracle_has_bad_move) and raw_max_move_ratio > 0.0:
+            move_oracle_target_ratio = (
+                leaf_move_op_mask.to(dtype=pts_xyz.dtype).mean()
+                if actual_oracle_has_move
+                else pts_xyz.new_zeros(())
+            ).clamp(0.0, raw_max_move_ratio)
+            actual_oracle_move_amount_loss = self._actual_oracle_amount_bce_loss(
+                raw_learned_move_ratio,
+                move_oracle_target_ratio,
+                raw_max_move_ratio,
+            )
+            move_amount_logit_for_oracle = self._operation_amount_logit(
+                actuator_features,
+                self.move_amount_head,
+            ).mean()
+            move_amount_target_logit_for_oracle = self._target_ratio_logit(
+                move_oracle_target_ratio,
+                raw_max_move_ratio,
+                raw_learned_move_ratio,
+            ).detach()
+            actual_oracle_move_amount_logit_loss = (
+                move_amount_logit_for_oracle - move_amount_target_logit_for_oracle
+            ).pow(2)
+            actual_oracle_move_amount_loss = (
+                actual_oracle_move_amount_loss
+                + float(getattr(self.args, "sparsepcgc_actual_oracle_amount_logit_weight", 0.25))
+                * actual_oracle_move_amount_logit_loss
             )
         if timing_enabled:
             _mark_runtime("add")
@@ -4664,7 +4793,9 @@ class StructureRepairActuator(nn.Module):
         operation_gate_oracle_loss = pts_xyz.new_zeros(())
         actual_oracle_drop_bad_count_value = 0
         actual_oracle_add_bad_count_value = 0
+        actual_oracle_move_bad_count_value = 0
         actual_oracle_candidate_where_loss = pts_xyz.new_zeros(())
+        actual_oracle_direction_supervision_loss = pts_xyz.new_zeros(())
         if actual_oracle_enabled:
             oracle_candidate_weight = max(
                 float(getattr(self.args, "sparsepcgc_actual_oracle_candidate_where_weight", 1.0)),
@@ -4737,6 +4868,38 @@ class StructureRepairActuator(nn.Module):
                 loss_value = (raw * valid_f * weight.float()).sum() / denom
                 return loss_value.to(dtype=logit.dtype), int(bad_mask.detach().sum().item())
 
+            def _oracle_direction_loss(logits, good_mask, good_index, bad_mask, bad_index):
+                class_count = int(logits.shape[1])
+                good_index = good_index.to(device=logits.device, dtype=torch.long)
+                bad_mask = bad_mask.to(device=logits.device, dtype=torch.bool)
+                good_valid = (
+                    good_mask.to(device=logits.device, dtype=torch.bool)
+                    & (good_index >= 0)
+                    & (good_index < class_count)
+                )
+                bad_valid = bad_mask & (~good_valid)
+                if not bool((good_valid | bad_valid).detach().any().item()):
+                    return logits.new_zeros(())
+                safe_logits = torch.nan_to_num(logits, nan=0.0, posinf=20.0, neginf=-20.0)
+                good_logit = safe_logits.gather(1, good_index.clamp(0, class_count - 1))
+                # A rejected direction suppresses the currently preferred direction,
+                # leaving the remaining empty-neighbor directions available to explore.
+                bad_logit = safe_logits.amax(dim=1, keepdim=True)
+                with torch.cuda.amp.autocast(enabled=False):
+                    good_raw = torch.nn.functional.binary_cross_entropy_with_logits(
+                        good_logit.float(),
+                        torch.ones_like(good_logit, dtype=torch.float32),
+                        reduction="none",
+                    )
+                    bad_raw = torch.nn.functional.binary_cross_entropy_with_logits(
+                        bad_logit.float(),
+                        torch.zeros_like(bad_logit, dtype=torch.float32),
+                        reduction="none",
+                    )
+                valid = good_valid | bad_valid
+                raw = good_raw * good_valid.float() + bad_raw * bad_valid.float()
+                return (raw.sum() / valid.float().sum().clamp_min(1.0)).to(dtype=logits.dtype)
+
             if prune_enabled and (actual_oracle_has_drop or actual_oracle_has_bad_drop):
                 drop_oracle_loss, actual_oracle_drop_bad_count_value = _oracle_where_bce_logits(
                     learned_drop_logit / drop_proxy_tau,
@@ -4766,48 +4929,99 @@ class StructureRepairActuator(nn.Module):
                 )
                 add_where_actuator_loss = add_where_actuator_loss + oracle_candidate_weight * add_oracle_loss
                 actual_oracle_candidate_where_loss = actual_oracle_candidate_where_loss + add_oracle_loss
+                oracle_add_direction_logits = self.add_voxel_head(actuator_features)
+                oracle_add_direction_logits = self._scale_where_downstream_grad(
+                    oracle_add_direction_logits,
+                    op_name="add",
+                )
+                oracle_add_direction_logits = self._voxel_mean_logits(
+                    oracle_add_direction_logits,
+                    voxel_coords,
+                    voxel_cache=voxel_cache,
+                )
+                if actual_oracle_has_bad_add and not actual_oracle_has_add:
+                    bad_direction_mask = actual_oracle_add_bad_mask.to(
+                        device=oracle_add_direction_logits.device,
+                        dtype=oracle_add_direction_logits.dtype,
+                    )
+                    bad_direction_logit = oracle_add_direction_logits.amax(dim=1, keepdim=True)
+                    add_direction_oracle_loss = (
+                        torch.nn.functional.softplus(bad_direction_logit.float())
+                        * bad_direction_mask.float()
+                    ).sum() / bad_direction_mask.float().sum().clamp_min(1.0)
+                    add_direction_oracle_loss = add_direction_oracle_loss.to(
+                        dtype=oracle_add_direction_logits.dtype
+                    )
+                else:
+                    add_direction_oracle_loss = _oracle_direction_loss(
+                        oracle_add_direction_logits,
+                        leaf_add_op_mask,
+                        actual_oracle_add_direction_index,
+                        actual_oracle_add_bad_mask,
+                        actual_oracle_bad_add_direction_index,
+                    )
+                add_direction_oracle_loss = (
+                    float(getattr(self.args, "sparsepcgc_actual_oracle_direction_weight", 1.0))
+                    * add_direction_oracle_loss
+                )
+                add_where_actuator_loss = (
+                    add_where_actuator_loss + oracle_candidate_weight * add_direction_oracle_loss
+                )
+                actual_oracle_candidate_where_loss = (
+                    actual_oracle_candidate_where_loss + add_direction_oracle_loss
+                )
+                actual_oracle_direction_supervision_loss = (
+                    actual_oracle_direction_supervision_loss + add_direction_oracle_loss
+                )
 
-            if disp_enabled and actual_oracle_has_move:
-                move_model_pred = torch.nan_to_num(
-                    move_score,
-                    nan=0.0,
-                    posinf=1.0,
-                    neginf=0.0,
-                ).clamp(0.0, 1.0)
-                move_oracle_loss, _move_bad_count = _oracle_where_bce(
-                    move_model_pred,
+            if disp_enabled and (actual_oracle_has_move or actual_oracle_has_bad_move):
+                subtree_move_oracle_loss, actual_oracle_move_bad_count_value = _oracle_where_bce_logits(
+                    subtree_move_source_logit,
                     leaf_move_op_mask,
-                    torch.zeros_like(leaf_move_op_mask, dtype=torch.bool),
-                    torch.zeros_like(leaf_move_op_mask, dtype=pts_xyz.dtype),
-                )
-                move_amount_supervision_loss = (
-                    move_amount_supervision_loss + oracle_candidate_weight * move_oracle_loss
-                )
-                actual_oracle_candidate_where_loss = actual_oracle_candidate_where_loss + move_oracle_loss
-                subtree_move_oracle_pred = torch.nan_to_num(
-                    subtree_move_source_prob,
-                    nan=0.0,
-                    posinf=1.0,
-                    neginf=0.0,
-                ).clamp(0.0, 1.0)
-                subtree_move_oracle_loss, _subtree_move_bad_count = _oracle_where_bce(
-                    subtree_move_oracle_pred,
-                    leaf_move_op_mask,
-                    torch.zeros_like(leaf_move_op_mask, dtype=torch.bool),
-                    torch.zeros_like(leaf_move_op_mask, dtype=pts_xyz.dtype),
+                    actual_oracle_move_bad_mask,
+                    actual_oracle_move_bad_score,
                 )
                 move_where_actuator_loss = (
                     move_where_actuator_loss + oracle_candidate_weight * subtree_move_oracle_loss
                 )
+                oracle_move_direction_logits = self.move_voxel_head(actuator_features)
+                oracle_move_direction_logits = self._scale_where_downstream_grad(
+                    oracle_move_direction_logits,
+                    op_name="move",
+                )
+                oracle_move_direction_logits = self._voxel_mean_logits(
+                    oracle_move_direction_logits,
+                    voxel_coords,
+                    voxel_cache=voxel_cache,
+                )
+                move_direction_oracle_loss = _oracle_direction_loss(
+                    oracle_move_direction_logits,
+                    leaf_move_op_mask,
+                    actual_oracle_move_direction_index,
+                    actual_oracle_move_bad_mask,
+                    actual_oracle_bad_move_direction_index,
+                )
+                move_direction_oracle_loss = (
+                    float(getattr(self.args, "sparsepcgc_actual_oracle_direction_weight", 1.0))
+                    * move_direction_oracle_loss
+                )
+                move_where_actuator_loss = (
+                    move_where_actuator_loss + oracle_candidate_weight * move_direction_oracle_loss
+                )
                 actual_oracle_candidate_where_loss = (
-                    actual_oracle_candidate_where_loss + subtree_move_oracle_loss
+                    actual_oracle_candidate_where_loss
+                    + subtree_move_oracle_loss
+                    + move_direction_oracle_loss
+                )
+                actual_oracle_direction_supervision_loss = (
+                    actual_oracle_direction_supervision_loss + move_direction_oracle_loss
                 )
 
             gate_known = operation_gate_prob.new_tensor(
                 [
                     1.0 if (actual_oracle_has_drop or actual_oracle_has_bad_drop) else 0.0,
                     1.0 if (actual_oracle_has_add or actual_oracle_has_bad_add) else 0.0,
-                    1.0 if actual_oracle_has_move else 0.0,
+                    1.0 if (actual_oracle_has_move or actual_oracle_has_bad_move) else 0.0,
                 ]
             ).view(1, 3, 1)
             gate_target = operation_gate_prob.new_tensor(
@@ -4882,6 +5096,9 @@ class StructureRepairActuator(nn.Module):
         move_where_actuator_loss = _finite_actuator_loss(move_where_actuator_loss)
         operation_gate_oracle_loss = _finite_actuator_loss(operation_gate_oracle_loss)
         actual_oracle_candidate_where_loss = _finite_actuator_loss(actual_oracle_candidate_where_loss)
+        actual_oracle_direction_supervision_loss = _finite_actuator_loss(
+            actual_oracle_direction_supervision_loss
+        )
 
         drop_amount_supervision_loss = _finite_actuator_loss(drop_amount_supervision_loss)
         drop_amount_soft_consistency_loss = _finite_actuator_loss(drop_amount_soft_consistency_loss)
@@ -4891,10 +5108,14 @@ class StructureRepairActuator(nn.Module):
         add_amount_soft_consistency_loss = _finite_actuator_loss(add_amount_soft_consistency_loss)
         actual_oracle_drop_amount_loss = _finite_actuator_loss(actual_oracle_drop_amount_loss)
         actual_oracle_add_amount_loss = _finite_actuator_loss(actual_oracle_add_amount_loss)
+        actual_oracle_move_amount_loss = _finite_actuator_loss(actual_oracle_move_amount_loss)
         actual_oracle_drop_amount_logit_loss = _finite_actuator_loss(actual_oracle_drop_amount_logit_loss)
         actual_oracle_add_amount_logit_loss = _finite_actuator_loss(actual_oracle_add_amount_logit_loss)
+        actual_oracle_move_amount_logit_loss = _finite_actuator_loss(actual_oracle_move_amount_logit_loss)
         actual_oracle_amount_supervision_loss = (
-            actual_oracle_drop_amount_loss + actual_oracle_add_amount_loss
+            actual_oracle_drop_amount_loss
+            + actual_oracle_add_amount_loss
+            + actual_oracle_move_amount_loss
         )
 
         loss = (
@@ -4936,6 +5157,8 @@ class StructureRepairActuator(nn.Module):
             + float(getattr(self.args, "repair_add_amount_soft_consistency_weight", 0.0005)) * add_amount_soft_consistency_loss
             + float(getattr(self.args, "sparsepcgc_actual_oracle_amount_weight", 0.05))
             * actual_oracle_amount_supervision_loss
+            + float(getattr(self.args, "sparsepcgc_actual_oracle_direction_loss_weight", 0.01))
+            * actual_oracle_direction_supervision_loss
         )
         loss = torch.nan_to_num(
             loss,
@@ -5359,6 +5582,7 @@ class StructureRepairActuator(nn.Module):
             "add_amount_soft_consistency_loss": add_amount_soft_consistency_loss.detach(),
             "actual_oracle_drop_amount_loss": actual_oracle_drop_amount_loss.detach(),
             "actual_oracle_add_amount_loss": actual_oracle_add_amount_loss.detach(),
+            "actual_oracle_move_amount_loss": actual_oracle_move_amount_loss.detach(),
             "actual_oracle_drop_amount_logit_loss": actual_oracle_drop_amount_logit_loss.detach(),
             "actual_oracle_add_amount_logit_loss": actual_oracle_add_amount_logit_loss.detach(),
             "actual_oracle_amount_supervision_loss": actual_oracle_amount_supervision_loss.detach(),
@@ -5387,6 +5611,7 @@ class StructureRepairActuator(nn.Module):
             "move_operation_gate": move_operation_gate.detach().mean(),
             "operation_gate_oracle_loss": operation_gate_oracle_loss.detach(),
             "actual_oracle_candidate_where_loss": actual_oracle_candidate_where_loss.detach(),
+            "actual_oracle_direction_supervision_loss": actual_oracle_direction_supervision_loss.detach(),
             "actual_oracle_bad_candidate_count": pts_xyz.new_tensor(
                 float(leaf_operation_masks.get("actual_oracle_bad_candidate_count", 0))
             ).detach(),
@@ -5449,6 +5674,12 @@ class StructureRepairActuator(nn.Module):
             ).detach(),
             "actual_oracle_drop_bad_count": pts_xyz.new_tensor(float(actual_oracle_drop_bad_count_value)).detach(),
             "actual_oracle_add_bad_count": pts_xyz.new_tensor(float(actual_oracle_add_bad_count_value)).detach(),
+            "actual_oracle_move_bad_count": pts_xyz.new_tensor(float(actual_oracle_move_bad_count_value)).detach(),
+            "actual_oracle_drop_reason": str(leaf_operation_masks.get("actual_oracle_drop_reason", "")),
+            "actual_oracle_operation": str(leaf_operation_masks.get("actual_oracle_operation", "")),
+            "actual_oracle_scheduled_operation": str(
+                leaf_operation_masks.get("actual_oracle_scheduled_operation", "")
+            ),
             "actual_oracle_edit_record_bits": pts_xyz.new_tensor(
                 float(actual_oracle_edit_record_bits_value)
             ).detach(),
@@ -5813,6 +6044,7 @@ class StructureRepairActuator(nn.Module):
             "add_amount_soft_consistency_loss": add_amount_soft_consistency_loss.detach(),
             "actual_oracle_drop_amount_loss": actual_oracle_drop_amount_loss.detach(),
             "actual_oracle_add_amount_loss": actual_oracle_add_amount_loss.detach(),
+            "actual_oracle_move_amount_loss": actual_oracle_move_amount_loss.detach(),
             "actual_oracle_drop_amount_logit_loss": actual_oracle_drop_amount_logit_loss.detach(),
             "actual_oracle_add_amount_logit_loss": actual_oracle_add_amount_logit_loss.detach(),
             "actual_oracle_amount_supervision_loss": actual_oracle_amount_supervision_loss.detach(),
@@ -5840,6 +6072,7 @@ class StructureRepairActuator(nn.Module):
             "move_operation_gate": move_operation_gate.mean(),
             "operation_gate_oracle_loss": operation_gate_oracle_loss.detach(),
             "actual_oracle_candidate_where_loss": actual_oracle_candidate_where_loss.detach(),
+            "actual_oracle_direction_supervision_loss": actual_oracle_direction_supervision_loss.detach(),
             "actual_oracle_bad_candidate_count": int(leaf_operation_masks.get("actual_oracle_bad_candidate_count", 0)),
             "actual_oracle_improving_candidate_count": int(leaf_operation_masks.get("actual_oracle_improving_candidate_count", 0)),
             "actual_oracle_combo_extra_count": int(leaf_operation_masks.get("actual_oracle_combo_extra_count", 0)),
@@ -5896,6 +6129,12 @@ class StructureRepairActuator(nn.Module):
             ).detach(),
             "actual_oracle_drop_bad_count": actual_oracle_drop_bad_count_value,
             "actual_oracle_add_bad_count": actual_oracle_add_bad_count_value,
+            "actual_oracle_move_bad_count": actual_oracle_move_bad_count_value,
+            "actual_oracle_drop_reason": str(leaf_operation_masks.get("actual_oracle_drop_reason", "")),
+            "actual_oracle_operation": str(leaf_operation_masks.get("actual_oracle_operation", "")),
+            "actual_oracle_scheduled_operation": str(
+                leaf_operation_masks.get("actual_oracle_scheduled_operation", "")
+            ),
             "actual_oracle_edit_record_bits": float(actual_oracle_edit_record_bits_value),
             "actual_oracle_raw_percent": float(actual_oracle_raw_percent_value),
             "actual_oracle_delta_actual_percent": pts_xyz.new_tensor(

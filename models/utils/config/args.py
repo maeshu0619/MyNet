@@ -22,11 +22,11 @@ method_name = "Mine"
 
 model_name = "best_loss_joint"
 
-dataname = "8i"
+# dataname = "8i"
 # dataname = "MVUB"
-# dataname = "UVG"
+dataname = "UVG"
 
-dataset_name = "longdress"
+# dataset_name = "longdress"
 # dataset_name = "loot"
 # dataset_name = "redandblack"
 # dataset_name = "soldier"
@@ -37,7 +37,7 @@ dataset_name = "longdress"
 # dataset_name = "ricardo"
 # dataset_name = "sarah"
 
-# dataset_name = "BlueBackpack"
+dataset_name = "BlueBackpack"
 # dataset_name = "CasualSquat"
 # dataset_name = "ElegantDance"
 # dataset_name = "Gymnast"
@@ -647,6 +647,18 @@ def parse_pugan_args(parser, file_day, file_time):
         help='actual oracleのgood/bad候補をWhere補助損失へ入れる内部倍率',
     )
     parser.add_argument(
+        '--sparsepcgc_actual_oracle_direction_weight',
+        default=1.0,
+        type=float,
+        help='actual oracleのAdd/Move方向ranking損失に掛ける倍率',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_direction_loss_weight',
+        default=0.01,
+        type=float,
+        help='actual Add/Move方向教師をActuator総損失へ直接加える重み',
+    )
+    parser.add_argument(
         '--sparsepcgc_actual_oracle_candidate_logit_clip',
         default=20.0,
         type=float,
@@ -784,6 +796,39 @@ def parse_pugan_args(parser, file_day, file_time):
         type=str2bool,
         help='actual候補予算が1件でも単一voxelよりfull-cloud structured subtree候補を優先する',
     )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_operation_cycle',
+        default='add,move',
+        type=str,
+        help='補助actual probeで交互に評価するoperation順。full-cloud Prune teacherは別枠で毎Step測る',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_aux_probe_interval',
+        default=6,
+        type=int,
+        help='毎Stepのfull-cloud Pruneに加え、Add/Move候補をactual評価する間隔。0で無効',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_apply_full_override',
+        default=True,
+        type=str2bool,
+        help='actualで改善確認済みのfull-cloud候補を最終出力へ適用するか。Network単独actual値は別途ログする',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_local_max_drop_ratio',
+        default=0.05,
+        type=float,
+        help='oracle Prune教師をshadow subtreeへ適用するときのhard削除率上限',
+    )
+    parser.add_argument(
+        '--repair_balance_operation_head_grads',
+        default=True,
+        type=str2bool,
+        help='actual教師がある操作のWhere/Amount head勾配を同一目標normへ整える',
+    )
+    parser.add_argument('--repair_operation_head_grad_target', default=1.0, type=float)
+    parser.add_argument('--repair_operation_head_grad_min_scale', default=1e-4, type=float)
+    parser.add_argument('--repair_operation_head_grad_max_scale', default=100000.0, type=float)
     parser.add_argument(
         '--sparsepcgc_actual_oracle_full_cloud_subtree_block_sizes',
         default='32',
@@ -1444,7 +1489,7 @@ def parse_pugan_args(parser, file_day, file_time):
     # 圧縮損失における点操作のWhere
     parser.add_argument('--repair_where_downstream_grad_scale', default=1.0, type=float, help='Where scoreから実際の点操作へ向かう下流勾配だけを調整する倍率。forward値は変えず、backwardだけ変える')
     parser.add_argument('--repair_drop_where_downstream_grad_scale', default=0.004, type=float, help='Prune Where scoreから実際の削除操作へ向かう下流勾配だけを強める倍率')
-    parser.add_argument('--repair_add_where_downstream_grad_scale', default=0.01, type=float, help='Add Where scoreから実際の追加操作へ向かう下流勾配だけを弱める倍率')
+    parser.add_argument('--repair_add_where_downstream_grad_scale', default=1.0, type=float, help='Add Where scoreから実際の追加操作へ向かう下流勾配倍率')
     parser.add_argument('--repair_move_where_downstream_grad_scale', default=1.0, type=float, help='Move Where scoreから実際の移動操作へ向かう下流勾配だけを強める倍率')
     parser.add_argument(
         '--repair_where_downstream_grad_min_scale',
@@ -2979,6 +3024,14 @@ def parse_pugan_args(parser, file_day, file_time):
         float(getattr(args, "sparsepcgc_actual_oracle_candidate_where_weight", 1.0)),
         0.0,
     )
+    args.sparsepcgc_actual_oracle_direction_weight = max(
+        float(getattr(args, "sparsepcgc_actual_oracle_direction_weight", 1.0)),
+        0.0,
+    )
+    args.sparsepcgc_actual_oracle_direction_loss_weight = max(
+        float(getattr(args, "sparsepcgc_actual_oracle_direction_loss_weight", 0.01)),
+        0.0,
+    )
     args.sparsepcgc_actual_oracle_candidate_logit_clip = max(
         float(getattr(args, "sparsepcgc_actual_oracle_candidate_logit_clip", 20.0)),
         1.0,
@@ -3089,6 +3142,35 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     args.sparsepcgc_actual_oracle_prioritize_full_cloud_macro = bool(
         getattr(args, "sparsepcgc_actual_oracle_prioritize_full_cloud_macro", True)
+    )
+    args.sparsepcgc_actual_oracle_apply_full_override = bool(
+        getattr(args, "sparsepcgc_actual_oracle_apply_full_override", True)
+    )
+    args.sparsepcgc_actual_oracle_local_max_drop_ratio = min(
+        max(float(getattr(args, "sparsepcgc_actual_oracle_local_max_drop_ratio", 0.05)), 0.0),
+        0.10,
+    )
+    args.sparsepcgc_actual_oracle_operation_cycle = str(
+        getattr(args, "sparsepcgc_actual_oracle_operation_cycle", "add,move")
+    )
+    args.sparsepcgc_actual_oracle_aux_probe_interval = max(
+        int(getattr(args, "sparsepcgc_actual_oracle_aux_probe_interval", 6)),
+        0,
+    )
+    args.repair_balance_operation_head_grads = bool(
+        getattr(args, "repair_balance_operation_head_grads", True)
+    )
+    args.repair_operation_head_grad_target = max(
+        float(getattr(args, "repair_operation_head_grad_target", 1.0)),
+        0.0,
+    )
+    args.repair_operation_head_grad_min_scale = max(
+        float(getattr(args, "repair_operation_head_grad_min_scale", 1e-4)),
+        0.0,
+    )
+    args.repair_operation_head_grad_max_scale = max(
+        float(getattr(args, "repair_operation_head_grad_max_scale", 100000.0)),
+        args.repair_operation_head_grad_min_scale,
     )
     args.sparsepcgc_actual_oracle_full_cloud_subtree_target_ratio = min(
         max(float(getattr(args, "sparsepcgc_actual_oracle_full_cloud_subtree_target_ratio", 0.20)), 0.0),
@@ -3444,6 +3526,12 @@ def parse_pugan_args(parser, file_day, file_time):
             args.sparsepcgc_actual_oracle_actual_eval_max = 1
         if not _cli_option_was_provided("--sparsepcgc_actual_oracle_interval"):
             args.sparsepcgc_actual_oracle_interval = 1
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_amount_weight"):
+            args.sparsepcgc_actual_oracle_amount_weight = 0.001
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_amount_logit_weight"):
+            args.sparsepcgc_actual_oracle_amount_logit_weight = 0.05
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_candidate_where_weight"):
+            args.sparsepcgc_actual_oracle_candidate_where_weight = 10.0
         if not _cli_option_was_provided("--sparsepcgc_actual_gt_disk_cache"):
             args.sparsepcgc_actual_gt_disk_cache = True
         if not _cli_option_was_provided("--sparsepcgc_edit_record_train_start_scale"):
@@ -3492,6 +3580,10 @@ def parse_pugan_args(parser, file_day, file_time):
             args.sparsepcgc_actual_oracle_full_cloud_macro_prune_candidate_max = 1
         if not _cli_option_was_provided("--sparsepcgc_actual_oracle_full_cloud_macro_prune_ratios"):
             args.sparsepcgc_actual_oracle_full_cloud_macro_prune_ratios = "0.20"
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_full_cloud_subtree_prune_ratios"):
+            args.sparsepcgc_actual_oracle_full_cloud_subtree_prune_ratios = "0.10,0.20,0.30"
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_full_cloud_subtree_target_ratio"):
+            args.sparsepcgc_actual_oracle_full_cloud_subtree_target_ratio = 0.20
         if not _cli_option_was_provided("--sparsepcgc_actual_oracle_full_cloud_prune_neighbor_thresholds"):
             args.sparsepcgc_actual_oracle_full_cloud_prune_neighbor_thresholds = "3"
         if not _cli_option_was_provided("--sparsepcgc_actual_oracle_full_cloud_macro_prune_max_ratio"):
@@ -3631,7 +3723,7 @@ def parse_pugan_args(parser, file_day, file_time):
             if not _cli_option_was_provided("--max_add_ratio"):
                 args.max_add_ratio = 0.006
             if not _cli_option_was_provided("--max_drop_ratio"):
-                args.max_drop_ratio = 0.030
+                args.max_drop_ratio = 0.050
             if not _cli_option_was_provided("--max_move_ratio"):
                 args.max_move_ratio = 0.005
             if not _cli_option_was_provided("--max_repair_ratio"):

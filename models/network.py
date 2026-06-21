@@ -2524,6 +2524,7 @@ class Network(nn.Module):
                     "actual_oracle_candidate_where_loss": _actuator_scalar("actual_oracle_candidate_where_loss"),
                     "actual_oracle_drop_amount_loss": _actuator_scalar("actual_oracle_drop_amount_loss"),
                     "actual_oracle_add_amount_loss": _actuator_scalar("actual_oracle_add_amount_loss"),
+                    "actual_oracle_move_amount_loss": _actuator_scalar("actual_oracle_move_amount_loss"),
                     "actual_oracle_drop_amount_logit_loss": _actuator_scalar("actual_oracle_drop_amount_logit_loss"),
                     "actual_oracle_add_amount_logit_loss": _actuator_scalar("actual_oracle_add_amount_logit_loss"),
                     "actual_oracle_amount_supervision_loss": _actuator_scalar("actual_oracle_amount_supervision_loss"),
@@ -2532,6 +2533,12 @@ class Network(nn.Module):
                     "actual_oracle_combo_extra_count": int(actuator_stats.get("actual_oracle_combo_extra_count", 0)),
                     "actual_oracle_drop_bad_count": int(actuator_stats.get("actual_oracle_drop_bad_count", 0)),
                     "actual_oracle_add_bad_count": int(actuator_stats.get("actual_oracle_add_bad_count", 0)),
+                    "actual_oracle_move_bad_count": int(actuator_stats.get("actual_oracle_move_bad_count", 0)),
+                    "actual_oracle_drop_reason": str(actuator_stats.get("actual_oracle_drop_reason", "")),
+                    "actual_oracle_operation": str(actuator_stats.get("actual_oracle_operation", "")),
+                    "actual_oracle_scheduled_operation": str(
+                        actuator_stats.get("actual_oracle_scheduled_operation", "")
+                    ),
                     "operation_amount_consistency_loss": float(actuator_stats.get("operation_amount_consistency_loss", pts_xyz.new_zeros(())).detach().cpu()),
                     "operation_entropy": float(actuator_stats.get("operation_entropy", pts_xyz.new_zeros(())).detach().cpu()),
                     "operation_prob_floor_applied": bool(actuator_stats.get("operation_prob_floor_applied", False)),

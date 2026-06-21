@@ -1049,6 +1049,9 @@ class OctreeStructureAnalysis(nn.Module):
         out["actual_oracle_drop_reason"] = str(
             source_tree.get("actual_oracle_drop_reason", "")
         )
+        out["actual_oracle_scheduled_operation"] = str(
+            source_tree.get("actual_oracle_scheduled_operation", "")
+        )
         out["actual_oracle_add_mask"] = _fit_map(
             source_tree.get("actual_oracle_add_mask", None),
             as_bool=True,
@@ -1062,6 +1065,10 @@ class OctreeStructureAnalysis(nn.Module):
             default=-1,
         )
         out["actual_oracle_best_add_child_slot"] = oracle_add_slot
+        out["actual_oracle_best_add_direction_index"] = _fit_long_map(
+            source_tree.get("actual_oracle_best_add_direction_index", None),
+            default=-1,
+        )
         out["actual_oracle_add_bad_mask"] = _fit_map(
             source_tree.get("actual_oracle_add_bad_mask", None),
             as_bool=True,
@@ -1072,6 +1079,10 @@ class OctreeStructureAnalysis(nn.Module):
         )
         out["actual_oracle_bad_add_child_slot"] = _fit_long_map(
             source_tree.get("actual_oracle_bad_add_child_slot", None),
+            default=-1,
+        )
+        out["actual_oracle_bad_add_direction_index"] = _fit_long_map(
+            source_tree.get("actual_oracle_bad_add_direction_index", None),
             default=-1,
         )
         if bool(out["actual_oracle_add_mask"].any().detach().cpu()):
@@ -1125,6 +1136,22 @@ class OctreeStructureAnalysis(nn.Module):
             if torch.is_tensor(move_score):
                 out["actual_oracle_move_score"] = move_score.detach().to(device=device)
             out["actual_oracle_move_used"] = bool(source_tree.get("actual_oracle_override_move_count", 0) or 0)
+        out["actual_oracle_move_bad_mask"] = _fit_map(
+            source_tree.get("actual_oracle_move_bad_mask", None),
+            as_bool=True,
+        )
+        out["actual_oracle_move_bad_score"] = _fit_map(
+            source_tree.get("actual_oracle_move_bad_score", None),
+            as_bool=False,
+        )
+        out["actual_oracle_move_direction_index"] = _fit_long_map(
+            source_tree.get("actual_oracle_move_direction_index", None),
+            default=-1,
+        )
+        out["actual_oracle_move_bad_direction_index"] = _fit_long_map(
+            source_tree.get("actual_oracle_move_bad_direction_index", None),
+            default=-1,
+        )
         out["actual_oracle_edit_record_bits"] = float(
             source_tree.get("actual_oracle_edit_record_bits", 0.0) or 0.0
         )
