@@ -59,9 +59,9 @@ def accumulate_checkpoint_metrics(metric_sums, compression_row, operation_row, s
         "total_loss": step_metric_values[0],
         "geom_loss": step_metric_values[1],
         "compression_loss_L_com": compression_row.get("compression_loss_L_com", step_metric_values[2]), # plot列がSurrogate表示でも実際のL_comをcheckpointへ使う
-        "single_loss": step_metric_values[6], # actual_compression列追加後のsingle-child損失位置を参照する
-        "node_loss": step_metric_values[7], # actual_compression列追加後のnode損失位置を参照する
-        "repair_loss": step_metric_values[11], # actual_compression列追加後のrepair損失位置を参照する
+        "single_loss": step_metric_values[8], # policy/oracle actual列追加後のsingle-child損失位置を参照する
+        "node_loss": step_metric_values[9], # policy/oracle actual列追加後のnode損失位置を参照する
+        "repair_loss": step_metric_values[13], # policy/oracle actual列追加後のrepair損失位置を参照する
         "actual_total_bit_percent_fresh": compression_row.get("actual_total_bit_percent_fresh"),
         "actual_total_bit_percent_cached": compression_row.get("actual_total_bit_percent_cached"),
         "surrogate_pred_bit_percent": compression_row.get("surrogate_pred_bit_percent"),
@@ -168,9 +168,9 @@ def finalize_checkpoint_metrics(args, stage, episode, plot, metric_sums, gate_re
         "total_loss": plot.epi_loss_return(),
         "geom_loss": plot.epi_avg[1] if len(plot.epi_avg) > 1 else None,
         "compression_loss_L_com": checkpoint_average(metric_sums, "compression_loss_L_com"), # Surrogate表示列ではなく実際のL_com平均をCheckpoint metricへ使う
-        "single_loss": plot.epi_avg[6] if len(plot.epi_avg) > 6 else None, # actual_compression列追加後のsingle-child平均を参照する
-        "node_loss": plot.epi_avg[7] if len(plot.epi_avg) > 7 else None, # actual_compression列追加後のnode平均を参照する
-        "repair_loss": plot.epi_avg[11] if len(plot.epi_avg) > 11 else None, # actual_compression列追加後のrepair平均を参照する
+        "single_loss": plot.epi_avg[8] if len(plot.epi_avg) > 8 else None, # policy/oracle actual列追加後のsingle-child平均を参照する
+        "node_loss": plot.epi_avg[9] if len(plot.epi_avg) > 9 else None, # policy/oracle actual列追加後のnode平均を参照する
+        "repair_loss": plot.epi_avg[13] if len(plot.epi_avg) > 13 else None, # policy/oracle actual列追加後のrepair平均を参照する
         "fresh_actual_delta": checkpoint_average(metric_sums, "actual_total_bit_percent_fresh"),
         "fresh_actual_count": int(metric_sums["counts"].get("actual_total_bit_percent_fresh", 0)),
         "cached_actual_delta": checkpoint_average(metric_sums, "actual_total_bit_percent_cached"),

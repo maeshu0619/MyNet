@@ -107,6 +107,7 @@ class Loss(
         return bool(
             getattr(args, "verbose_step_logs", False)
             and getattr(args, "_log_this_step", True)
+            and not getattr(args, "compact_step_text_log", False)
         )
 
     def _surrogate_weight(self, args): # Hard LossにSurrogate勾配を混ぜる重みを取得

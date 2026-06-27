@@ -38,18 +38,22 @@ class CauseDiagnosisAggregation(nn.Module):
         coords = coords.permute(0, 2, 1).contiguous()
         return coords[:, :, 0] * (grid * grid) + coords[:, :, 1] * grid + coords[:, :, 2]
 
-    def _aggregate_single(self, values, keys):
+    def _aggregate_with_inverse(self, values, inverse, counts):
         C, N = values.shape
-        unique, inverse = torch.unique(keys, sorted=False, return_inverse=True)
-        unit_count = unique.numel()
+        unit_count = int(counts.numel())
+        if unit_count <= 0:
+            return values.new_zeros((C, N)), values.new_zeros((1, N))
         sums = values.new_zeros((C, unit_count))
-        counts = values.new_zeros((1, unit_count))
         sums.scatter_add_(1, inverse.view(1, N).expand(C, N), values)
-        counts.scatter_add_(1, inverse.view(1, N), values.new_ones((1, N)))
-        means = sums / counts.clamp_min(1.0)
+        means = sums / counts.to(device=values.device, dtype=values.dtype).view(1, -1).clamp_min(1.0)
         gathered = means.index_select(1, inverse)
         priority = gathered[:, :].amax(dim=0, keepdim=True)
         return gathered, priority
+
+    def _aggregate_single(self, values, keys):
+        unique, inverse = torch.unique(keys, sorted=False, return_inverse=True)
+        counts = torch.bincount(inverse, minlength=int(unique.numel()))
+        return self._aggregate_with_inverse(values, inverse, counts)
 
     def forward(self, pts_xyz, cause_scores, cause_targets, unit_keys=None):
         unit_mode = "prebuilt"
@@ -78,8 +82,18 @@ class CauseDiagnosisAggregation(nn.Module):
         min_unit_sizes = []
         max_unit_sizes = []
         for b in range(pts_xyz.shape[0]):
-            score_b, priority_b = self._aggregate_single(cause_scores[b], keys[b])
-            target_b, _ = self._aggregate_single(cause_targets[b], keys[b])
+            unique_b, inverse_b = torch.unique(
+                keys[b],
+                sorted=False,
+                return_inverse=True,
+            )
+            count_b = torch.bincount(
+                inverse_b,
+                minlength=int(unique_b.numel()),
+            )
+
+            score_b, priority_b = self._aggregate_with_inverse(cause_scores[b], inverse_b, count_b)
+            target_b, _ = self._aggregate_with_inverse(cause_targets[b], inverse_b, count_b)
             agg_scores.append(score_b)
             agg_targets.append(target_b.detach())
             priorities.append(priority_b.detach())
@@ -91,16 +105,6 @@ class CauseDiagnosisAggregation(nn.Module):
             # - unit_count=1 なら全点が1unitに潰れている可能性がある
             # - max_unit_size が極端に大きいと局所診断が粗すぎる
             # ============================================================
-            unique_b, inverse_b = torch.unique(
-                keys[b],
-                sorted=False,
-                return_inverse=True,
-            )
-            count_b = torch.bincount(
-                inverse_b,
-                minlength=int(unique_b.numel()),
-            )
-
             unit_counts.append(int(unique_b.numel()))
 
             if count_b.numel() > 0:

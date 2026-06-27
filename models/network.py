@@ -324,6 +324,7 @@ class Network(nn.Module):
         B, _, N = coords_b3n.shape
         parent_codes = torch.zeros((B, N), device=coords_b3n.device, dtype=torch.long)
         child_slots = torch.zeros((B, N), device=coords_b3n.device, dtype=torch.long)
+        pattern_weights = (2 ** torch.arange(8, device=coords_b3n.device, dtype=torch.long)).view(1, 8)
         for b in range(B):
             coords = coords_b3n[b].transpose(0, 1).contiguous().to(dtype=torch.long)
             if coords.numel() == 0:
@@ -332,13 +333,13 @@ class Network(nn.Module):
             slots = self._child_slot_from_coords_lastdim(coords)
             child_slots[b] = slots
             unique_parents, inverse = torch.unique(parents, dim=0, sorted=True, return_inverse=True)
-            codes = torch.zeros((unique_parents.shape[0],), device=coords_b3n.device, dtype=torch.long)
-            for slot in range(8):
-                mask = slots == slot
-                if bool(mask.any().item()):
-                    parent_ids = torch.unique(inverse[mask], sorted=False)
-                    bit = codes.new_full((parent_ids.numel(),), 1 << slot)
-                    codes[parent_ids] = torch.bitwise_or(codes[parent_ids], bit)
+            occupancy = torch.zeros(
+                (unique_parents.shape[0], 8),
+                device=coords_b3n.device,
+                dtype=torch.bool,
+            )
+            occupancy[inverse, slots.clamp(0, 7)] = True
+            codes = (occupancy.to(dtype=torch.long) * pattern_weights).sum(dim=1)
             parent_codes[b] = codes.index_select(0, inverse)
         return parent_codes, child_slots
 
@@ -1154,6 +1155,111 @@ class Network(nn.Module):
         edit_loss = edit_loss * float(getattr(self.args, "loss_repair_scale", 1.0))
         return attr_loss, policy_loss, edit_loss
 
+    def _maybe_fast_full_cloud_oracle_forward(
+        self,
+        pts_xyz,
+        compute_internal_losses,
+        full_octree_context,
+        octree_input_mode,
+    ):
+        """
+        no-gradのFullCloud anchorで、actual oracle full overrideを採択済みなら、
+        巨大なNetwork/Actuator forwardを実測済みvoxel stateのセットだけに短絡する。
+        actual候補encodeとshadow subtreeの学習経路はそのまま残す。
+        """
+        if not bool(getattr(self.args, "fast_full_cloud_oracle_anchor", True)):
+            return None
+        if compute_internal_losses is not False:
+            return None
+        if str(octree_input_mode or "").strip().lower() != "full_cloud":
+            return None
+        if not isinstance(full_octree_context, dict):
+            return None
+        if not bool(full_octree_context.get("fast_full_cloud_oracle_anchor", False)):
+            return None
+        if str(full_octree_context.get("actual_oracle_override_scope", "")) != "full_cloud":
+            return None
+
+        override_coords = full_octree_context.get("actual_oracle_override_final_voxel_coords", None)
+        if not torch.is_tensor(override_coords):
+            return None
+        coords_b3n = self._normalize_node_voxel_coords(override_coords, device=pts_xyz.device)
+        if coords_b3n is None or coords_b3n.ndim != 3 or coords_b3n.shape[1] != 3 or coords_b3n.shape[-1] <= 0:
+            return None
+
+        before_coords = full_octree_context.get("full_global_voxel_coords", None)
+        if before_coords is None:
+            before_coords = full_octree_context.get("global_voxel_coords", None)
+        before_b3n = self._normalize_node_voxel_coords(before_coords, device=pts_xyz.device)
+        before_count = int(before_b3n.shape[-1]) if torch.is_tensor(before_b3n) else int(pts_xyz.shape[-1])
+        after_count = int(coords_b3n.shape[-1])
+
+        valid_mask = torch.ones(
+            (coords_b3n.shape[0], coords_b3n.shape[-1]),
+            device=pts_xyz.device,
+            dtype=torch.bool,
+        )
+        voxel_state = {
+            "initial_voxel_coords": before_b3n.detach() if torch.is_tensor(before_b3n) else coords_b3n.detach(),
+            "final_voxel_coords": coords_b3n.detach(),
+            "final_voxel_valid_mask": valid_mask.detach(),
+            "voxel_edit_mode": "actual_oracle_full_cloud_fast_anchor",
+            "voxel_edit_state_enabled": True,
+            "voxel_edit_initial_count": int(before_count),
+            "voxel_edit_final_count": int(after_count),
+            "input_voxel_count": int(before_count),
+            "before_occupied_voxel_count": int(before_count),
+            "final_voxel_count": int(after_count),
+            "after_occupied_voxel_count": int(after_count),
+            "voxel_edit_drop_count": int(full_octree_context.get("actual_oracle_override_drop_count", 0) or 0),
+            "voxel_edit_add_count": int(full_octree_context.get("actual_oracle_accepted_add_count", 0) or 0),
+            "voxel_edit_move_count": int(full_octree_context.get("actual_oracle_override_move_count", 0) or 0),
+            "estimated_edit_record_bits": float(full_octree_context.get("actual_oracle_edit_record_bits", 0.0) or 0.0),
+            "final_voxel_update_mode": "actual_oracle_full_cloud_override",
+            "final_voxel_recomputed_from_pts_out": False,
+            "actuator_voxel_mode": "actual_oracle_full_cloud_override",
+            "actuator_local_recomputed": False,
+            "actuator_octree_context_source": "full_octree_context",
+            "actuator_octree_context_is_full_cloud": True,
+            "actuator_octree_context_available": True,
+            "actuator_octree_context_has_global_voxel_coords": True,
+        }
+        if "global_qs" in full_octree_context:
+            voxel_state["voxel_step"] = full_octree_context["global_qs"]
+        if "global_offset" in full_octree_context:
+            voxel_state["voxel_offset"] = full_octree_context["global_offset"]
+
+        self.last_actuator_voxel_state = voxel_state
+        try:
+            setattr(self.args, "_last_actuator_voxel_state", self.last_actuator_voxel_state)
+        except Exception:
+            pass
+
+        zero = pts_xyz.new_zeros(())
+        final_w = pts_xyz.new_ones((pts_xyz.shape[0], 1, pts_xyz.shape[-1]))
+        out_label = {
+            "full_cloud_oracle_fast_path": True,
+            "canonical_voxel_coords_before": before_b3n.detach() if torch.is_tensor(before_b3n) else None,
+            "canonical_voxel_coords_after": coords_b3n.detach(),
+        }
+        self.last_structure_debug = {
+            "network_voxel_node_input_requested": bool(getattr(self.args, "network_voxel_node_input", False)),
+            "network_voxel_node_input_used": False,
+            "network_voxel_node_fallback": False,
+            "network_voxel_node_fallback_reason": "fast_full_cloud_oracle_anchor",
+            "network_voxel_node_count": int(after_count),
+            "network_voxel_node_source": "actual_oracle_full_cloud_override",
+            "full_cloud_oracle_fast_path": True,
+        }
+        self.last_runtime_timing = {
+            "encode": 0.0,
+            "structure": 0.0,
+            "actuator": 0.0,
+            "total_forward": 0.0,
+            "fast_full_cloud_oracle_anchor": 1.0,
+        }
+        return pts_xyz, zero, zero, zero, final_w, zero, zero, zero, out_label
+
     """Network"""
     def forward( # Network全体の順伝播を行う関数
         self,
@@ -1192,6 +1298,15 @@ class Network(nn.Module):
             setattr(self.args, "_last_actuator_voxel_state", None)
         except Exception:
             pass
+
+        fast_oracle_result = self._maybe_fast_full_cloud_oracle_forward(
+            pts_xyz,
+            compute_internal_losses,
+            full_octree_context,
+            octree_input_mode,
+        )
+        if fast_oracle_result is not None:
+            return fast_oracle_result
 
         prebuilt_subtree_mode = subtree_tree is not None
         full_unit_keys = None # Subtree Key保存用の変数初期化
@@ -2541,6 +2656,12 @@ class Network(nn.Module):
                     ),
                     "actual_oracle_apply_teacher_actions": bool(
                         _actuator_scalar("actual_oracle_apply_teacher_actions") > 0.5
+                    ),
+                    "actual_gate_prune_enabled": bool(
+                        _actuator_scalar("actual_gate_prune_enabled") > 0.5
+                    ),
+                    "actual_gate_prune_allowed": bool(
+                        _actuator_scalar("actual_gate_prune_allowed") > 0.5
                     ),
                     "codec_prune_prior_enabled": bool(
                         _actuator_scalar("codec_prune_prior_enabled") > 0.5

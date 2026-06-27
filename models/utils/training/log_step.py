@@ -1,5 +1,7 @@
 # models/utils/training/log_step.py
 
+import math
+
 import torch
 
 from models.utils.training.correlation import (
@@ -17,6 +19,47 @@ def _to_float(value, default=0.0):
         return float(value)
     except (TypeError, ValueError):
         return float(default)
+
+
+def _fmt(value, digits=4, default="n/a"):
+    try:
+        value = _to_float(value, float("nan"))
+    except Exception:
+        return default
+    if not math.isfinite(value):
+        return default
+    if abs(value) >= 100000.0 or (0.0 < abs(value) < 0.0001):
+        return f"{value:.3e}"
+    return f"{value:.{digits}f}"
+
+
+def _fmt_int(value, default="n/a"):
+    try:
+        value = _to_float(value, float("nan"))
+    except Exception:
+        return default
+    if not math.isfinite(value):
+        return default
+    return str(int(round(value)))
+
+
+def _first_value(mapping, keys, default=None):
+    if not isinstance(mapping, dict):
+        return default
+    for key in keys:
+        if key in mapping and mapping.get(key) is not None:
+            return mapping.get(key)
+    return default
+
+
+def _count_delta_text(before, after):
+    before_f = _to_float(before, float("nan"))
+    after_f = _to_float(after, float("nan"))
+    if not (math.isfinite(before_f) and math.isfinite(after_f)):
+        return "n/a"
+    delta = after_f - before_f
+    ratio = 0.0 if abs(before_f) < 1e-12 else 100.0 * delta / before_f
+    return f"{_fmt_int(before_f)}->{_fmt_int(after_f)}(d={_fmt(delta, 2)}, {ratio:.2f}%)"
 
 
 def _compression_debug_fresh_actual(args, comp_debug):
@@ -177,7 +220,7 @@ def log_compression_train_debug(writer, step, num_steps, args, comp_debug, loss,
         f"loss_single_source={comp_debug.get('loss_single_source', '')}, "
         f"prebuilt_node_count_used={float(comp_debug.get('prebuilt_node_count_used', 0.0)):.3f}, "
         f"prebuilt_single_child_count_used={float(comp_debug.get('prebuilt_single_child_count_used', 0.0)):.3f}, "
-        f"actual_compression_delta={float(comp_debug.get('actual_total_bit_percent', comp_debug.get('total_bit', 0.0))):.6f}, "
+        f"actual_train_objective_delta={float(comp_debug.get('actual_train_objective_percent', comp_debug.get('actual_total_bit_percent', comp_debug.get('total_bit', 0.0)))):.6f}, "
         f"uniform_noise[enabled={bool(comp_debug.get('uniform_noise_enabled', False))}, "
         f"applied={bool(comp_debug.get('uniform_noise_applied', False))}, "
         f"delta={float(comp_debug.get('uniform_noise_delta', 0.0)):.6g}, "
@@ -343,6 +386,232 @@ def log_sparsepcgc_train_debug(
         f"entropy_proxy={float(comp_debug.get('sparsepcgc_entropy_proxy_loss', 0.0)):.6f}, "
         f"density_proxy={float(comp_debug.get('sparsepcgc_density_proxy_loss', 0.0)):.6f}"
     )
+
+
+def log_compact_step_summary(
+    writer,
+    step,
+    num_steps,
+    args,
+    loss_obj,
+    comp_debug,
+    structure_debug,
+    edit_stats,
+    *,
+    L,
+    L_geom,
+    L_com,
+    L_com_objective,
+    L_attr,
+    L_policy,
+    L_actuator,
+    loss_bit,
+    loss_single,
+    loss_nodes,
+    stage_factors=None,
+    step_completed=None,
+):
+    if writer is None or not hasattr(writer, "write"):
+        return
+    comp_debug = comp_debug if isinstance(comp_debug, dict) else {}
+    structure_debug = structure_debug if isinstance(structure_debug, dict) else {}
+    edit_stats = edit_stats if isinstance(edit_stats, dict) else {}
+    terms = getattr(loss_obj, "last_compression_terms", {}) or {}
+    geom_debug = getattr(loss_obj, "last_geometry_debug", {}) or {}
+    stage_factors = stage_factors or {}
+
+    full_cloud = bool(
+        str(comp_debug.get("actual_scope", "")).strip().lower() == "full_cloud"
+        or bool(comp_debug.get("full_cloud_actual_primary_used", False))
+        or bool(comp_debug.get("full_cloud_teacher_used", False))
+        or bool(comp_debug.get("full_cloud_anchor_shadow_train_used", False))
+    )
+    eval_scope = str(
+        comp_debug.get(
+            "actual_oracle_eval_scope",
+            comp_debug.get("teacher_scope", comp_debug.get("actual_scope", "unknown")),
+        )
+    )
+    source = str(
+        comp_debug.get(
+            "policy_action_source",
+            comp_debug.get("actual_value_source", comp_debug.get("L_com_source", "")),
+        )
+    )
+    writer.write(
+        f"StepScope {step + 1}/{num_steps}: "
+        f"FullCloud={full_cloud}, scope={eval_scope}, source={source}"
+    )
+
+    weighted_geom = _to_float(L_geom, 0.0) * _to_float(stage_factors.get("geom", 1.0), 1.0) * _to_float(getattr(args, "w_geom", 1.0), 1.0)
+    weighted_com = _to_float(L_com_objective, 0.0) * _to_float(stage_factors.get("com", 1.0), 1.0) * _to_float(getattr(args, "w_com", 1.0), 1.0)
+    weighted_attr = _to_float(L_attr, 0.0) * _to_float(stage_factors.get("attr", 1.0), 1.0) * _to_float(getattr(args, "w_attr", 1.0), 1.0)
+    weighted_policy = _to_float(L_policy, 0.0) * _to_float(stage_factors.get("policy", 1.0), 1.0) * _to_float(getattr(args, "w_policy", 1.0), 1.0)
+    weighted_act = _to_float(L_actuator, 0.0) * _to_float(stage_factors.get("repair", 1.0), 1.0) * _to_float(getattr(args, "w_actuator", 1.0), 1.0)
+    raw_lcom = _first_value(
+        comp_debug,
+        (
+            "actual_total_bit_percent",
+            "actual_bit_percent",
+            "compression_forward_teacher_percent",
+            "total_bit",
+        ),
+        _to_float(L_com, 0.0),
+    )
+    raw_geom = _first_value(geom_debug, ("value", "hard", "weighted"), _to_float(L_geom, 0.0))
+    sparse_raw = _first_value(
+        comp_debug,
+        ("sparsepcgc_aux_loss", "sparsepcgc_aux_weighted", "compression_aux_loss"),
+        terms.get("sparsepcgc", 0.0),
+    )
+    writer.write(
+        f"StepLoss {step + 1}/{num_steps}: "
+        f"weighted[L={_fmt(L)}, geom={_fmt(weighted_geom)}, com={_fmt(weighted_com)}, "
+        f"attr={_fmt(weighted_attr)}, policy={_fmt(weighted_policy)}, act={_fmt(weighted_act)}] "
+        f"raw[geom={_fmt(raw_geom)}, L_com={_fmt(raw_lcom)}, bit={_fmt(loss_bit)}, "
+        f"single={_fmt(loss_single)}, node={_fmt(loss_nodes)}, sparse={_fmt(sparse_raw)}, "
+        f"attr={_fmt(L_attr)}, policy={_fmt(L_policy)}, act={_fmt(L_actuator)}]"
+    )
+
+    gt_bits = _first_value(comp_debug, ("gt_actual_bit", "gt_bit_abs", "actual_gt_bits"), float("nan"))
+    policy_mine_bits = _first_value(
+        comp_debug,
+        ("policy_final_full_cloud_total_bit_with_edit_record", "policy_final_full_cloud_gen_bit"),
+        float("nan"),
+    )
+    oracle_mine_bits = _first_value(
+        comp_debug,
+        ("gen_total_bit_with_edit_record", "actual_total_bits", "gen_actual_bit"),
+        float("nan"),
+    )
+    if (
+        (not math.isfinite(_to_float(policy_mine_bits, float("nan"))))
+        and not bool(comp_debug.get("oracle_full_cloud_override_used", False))
+    ):
+        policy_mine_bits = oracle_mine_bits
+    train_objective = _first_value(
+        comp_debug,
+        ("actual_train_objective_percent", "actual_total_bit_percent", "actual_bit_percent", "total_bit"),
+        float("nan"),
+    )
+    policy_actual = _first_value(
+        comp_debug,
+        ("policy_actual_percent", "policy_final_full_cloud_actual_bit_percent"),
+        float("nan"),
+    )
+    oracle_actual = _first_value(
+        comp_debug,
+        ("oracle_teacher_actual_percent", "oracle_full_cloud_actual_bit_percent"),
+        float("nan"),
+    )
+    raw_delta = _first_value(comp_debug, ("actual_raw_percent", "actual_oracle_raw_percent"), train_objective)
+    edit_bits = _first_value(comp_debug, ("actual_edit_record_bits", "actual_oracle_edit_record_bits"), 0.0)
+    writer.write(
+        f"StepBits {step + 1}/{num_steps}: "
+        f"GT={_fmt(gt_bits, 1)}, PolicyMINE={_fmt(policy_mine_bits, 1)}, "
+        f"OracleMINE={_fmt(oracle_mine_bits, 1)}, "
+        f"train_objective={_fmt(train_objective)}, policy_actual={_fmt(policy_actual)}, "
+        f"oracle_actual={_fmt(oracle_actual)}, raw={_fmt(raw_delta)}, edit_bits={_fmt(edit_bits, 1)}"
+    )
+
+    before_node = _first_value(comp_debug, ("gt_octree_node", "gt_node_abs", "prebuilt_node_count_before"), float("nan"))
+    after_node = _first_value(comp_debug, ("gen_octree_node", "gen_node_abs", "prebuilt_node_count_after"), float("nan"))
+    before_single = _first_value(comp_debug, ("gt_octree_single", "gt_single_abs", "prebuilt_single_child_count_before"), float("nan"))
+    after_single = _first_value(comp_debug, ("gen_octree_single", "gen_single_abs", "prebuilt_single_child_count_after"), float("nan"))
+    occ_entropy_delta = _first_value(
+        comp_debug,
+        ("actual_occupancy_entropy_delta", "exact_occ_entropy_delta", "occupancy_entropy_delta"),
+        float("nan"),
+    )
+    occ_nll_delta = _first_value(
+        comp_debug,
+        ("actual_occupancy_nll_delta", "exact_occ_nll_delta", "occupancy_nll_delta"),
+        float("nan"),
+    )
+    predictability = _first_value(
+        comp_debug,
+        ("actual_occupancy_predictability_after", "sparsepcgc_prob_true_mean_after"),
+        float("nan"),
+    )
+    lowprob = _first_value(
+        comp_debug,
+        ("actual_lowprob_occupancy_ratio_after", "sparsepcgc_prob_true_low_ratio_after", "lowprob_occupancy_ratio"),
+        float("nan"),
+    )
+    writer.write(
+        f"StepStruct {step + 1}/{num_steps}: "
+        f"node={_count_delta_text(before_node, after_node)}, "
+        f"single={_count_delta_text(before_single, after_single)}, "
+        f"occ_entropy_d={_fmt(occ_entropy_delta)}, occ_nll_d={_fmt(occ_nll_delta)}, "
+        f"occ_pred={_fmt(predictability)}, lowprob={_fmt(lowprob)}"
+    )
+
+    input_points = _first_value(
+        edit_stats,
+        ("input_points_avg", "input_points"),
+        _first_value(comp_debug, ("gt_points", "point_count_before"), float("nan")),
+    )
+    output_points = _first_value(
+        edit_stats,
+        ("output_points_avg", "output_points"),
+        _first_value(comp_debug, ("gen_points", "point_count_after"), float("nan")),
+    )
+    add_count = _first_value(
+        structure_debug,
+        ("add_target_voxel_count", "add_actual_point_count", "voxel_edit_add_count"),
+        _first_value(comp_debug, ("voxel_edit_add_count", "actual_oracle_accepted_add_count"), 0),
+    )
+    prune_count = _first_value(
+        structure_debug,
+        ("delete_target_voxel_count", "delete_removed_point_count", "voxel_edit_drop_count"),
+        _first_value(comp_debug, ("voxel_edit_drop_count", "actual_oracle_accepted_prune_count"), 0),
+    )
+    adjust_count = _first_value(
+        structure_debug,
+        ("move_source_voxel_count", "moved_different_voxel_count", "voxel_edit_move_count"),
+        _first_value(comp_debug, ("voxel_edit_move_count", "actual_oracle_accepted_adjust_count"), 0),
+    )
+    oracle_full_drop = _first_value(
+        comp_debug,
+        (
+            "actual_oracle_full_cloud_macro_best_drop_count",
+            "actual_oracle_override_drop_count",
+            "oracle_full_cloud_override_drop_count",
+        ),
+        0,
+    )
+    oracle_full_ratio = _first_value(
+        comp_debug,
+        ("actual_oracle_full_cloud_macro_best_ratio", "oracle_full_cloud_drop_ratio"),
+        0.0,
+    )
+    if not bool(comp_debug.get("oracle_full_cloud_override_used", False)):
+        oracle_full_drop = 0
+        oracle_full_ratio = 0.0
+    writer.write(
+        f"StepOps {step + 1}/{num_steps}: "
+        f"input={_fmt_int(input_points)}, output={_fmt_int(output_points)}, "
+        f"LocalAdd={_fmt_int(add_count)}, LocalPrune={_fmt_int(prune_count)}, "
+        f"LocalAdjust={_fmt_int(adjust_count)}, "
+        f"OracleFullPrune={_fmt_int(oracle_full_drop)}({100.0 * _to_float(oracle_full_ratio, 0.0):.2f}%)"
+    )
+
+
+def log_compact_step_grad(writer, step, num_steps, args):
+    if writer is None or not hasattr(writer, "write"):
+        return
+    grad_map = getattr(args, "_last_grad_flow", {}) or {}
+
+    def grad(name):
+        return _fmt(grad_map.get(f"{name}_grad_norm", float("nan")), digits=3)
+
+    writer.write(
+        f"StepVoxelGrad {step + 1}/{num_steps}: "
+        f"Prune(where={grad('delete_branch')}, amount={grad('delete_amount')}); "
+        f"Add(where={grad('add_branch')}, amount={grad('add_amount')}, target={grad('add_target_branch')}); "
+        f"Adjust(where={grad('move_branch')}, amount={grad('move_amount')})\n"
+    )
+
 
 def log_step_timing(
     writer,

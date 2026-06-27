@@ -87,6 +87,28 @@ def _parent_child_popcount(coords_n3: torch.Tensor, block: int = 2):
     return counts[inverse], unique_parent, inverse, counts
 
 
+def _parent_child_patterns(coords_n3: torch.Tensor):
+    coords_n3 = torch.unique(coords_n3.to(dtype=torch.long), dim=0, sorted=True)
+    parent = torch.div(coords_n3, 2, rounding_mode="floor")
+    unique_parent, inverse = torch.unique(parent, dim=0, sorted=True, return_inverse=True)
+    slots = (
+        (coords_n3[:, 0] & 1)
+        + 2 * (coords_n3[:, 1] & 1)
+        + 4 * (coords_n3[:, 2] & 1)
+    ).to(dtype=torch.long)
+    occupancy = torch.zeros((unique_parent.shape[0], 8), device=coords_n3.device, dtype=torch.bool)
+    occupancy[inverse, slots] = True
+    powers = (2 ** torch.arange(8, device=coords_n3.device, dtype=torch.long)).view(1, 8)
+    patterns = (occupancy.to(dtype=torch.long) * powers).sum(dim=1)
+    pop = occupancy.sum(dim=1).to(dtype=torch.long)
+    child_offsets = torch.tensor(
+        [(0, 0, 0), (1, 0, 0), (0, 1, 0), (1, 1, 0), (0, 0, 1), (1, 0, 1), (0, 1, 1), (1, 1, 1)],
+        device=coords_n3.device,
+        dtype=torch.long,
+    )
+    return unique_parent, inverse, slots, occupancy, patterns, pop, child_offsets
+
+
 def _occupied_key_membership(query_n3: torch.Tensor, occupied_n3: torch.Tensor) -> torch.Tensor:
     combined = torch.cat([query_n3, occupied_n3], dim=0)
     mins = combined.amin(dim=0)
@@ -178,6 +200,122 @@ def _parent_hole_fill_candidates(coords_n3: torch.Tensor):
     return rows
 
 
+def _pattern_canonicalization_candidates(coords_n3: torch.Tensor, max_edit_ratio: float = 0.01):
+    """Small Add/Prune/Adjust candidates that make rare 2x2x2 child patterns common.
+
+    This is only a probe.  It tests the user's entropy/context hypothesis without
+    assuming that global low-density pruning is the answer.
+    """
+    coords_n3 = torch.unique(coords_n3.to(dtype=torch.long), dim=0, sorted=True)
+    if int(coords_n3.shape[0]) <= 16:
+        return []
+    unique_parent, _inverse, _slots, occupancy, patterns, pop, child_offsets = _parent_child_patterns(coords_n3)
+    parent_count = int(unique_parent.shape[0])
+    if parent_count <= 1:
+        return []
+
+    pattern_freq = torch.bincount(patterns, minlength=256).to(device=coords_n3.device, dtype=torch.long)
+    rows = []
+    max_edits = max(1, int(math.ceil(int(coords_n3.shape[0]) * float(max_edit_ratio))))
+
+    def _coords_from_parent_patterns(parent_indices, target_masks, name):
+        keep_parts = [coords_n3]
+        remove_coords = []
+        add_coords = []
+        edit_count = 0
+        for parent_idx_raw, target_mask_raw in zip(parent_indices, target_masks):
+            if edit_count >= max_edits:
+                break
+            parent_idx = int(parent_idx_raw)
+            target_mask = int(target_mask_raw)
+            current = occupancy[parent_idx]
+            target_bits = torch.tensor(
+                [(target_mask >> slot) & 1 for slot in range(8)],
+                device=coords_n3.device,
+                dtype=torch.bool,
+            )
+            remove_slots = (current & ~target_bits).nonzero(as_tuple=False).reshape(-1)
+            add_slots = (~current & target_bits).nonzero(as_tuple=False).reshape(-1)
+            needed = int(remove_slots.numel() + add_slots.numel())
+            if needed <= 0 or edit_count + needed > max_edits:
+                continue
+            parent_coord = unique_parent[parent_idx].view(1, 3) * 2
+            if remove_slots.numel() > 0:
+                remove_coords.append(parent_coord + child_offsets.index_select(0, remove_slots))
+            if add_slots.numel() > 0:
+                add_coords.append(parent_coord + child_offsets.index_select(0, add_slots))
+            edit_count += needed
+        if edit_count <= 0:
+            return
+        candidate = coords_n3
+        if remove_coords:
+            remove = torch.unique(torch.cat(remove_coords, dim=0), dim=0, sorted=True)
+            occupied = _occupied_key_membership(candidate, remove)
+            # occupied marks candidate rows if they are in remove because query=candidate.
+            candidate = candidate[~occupied]
+        if add_coords:
+            add = torch.unique(torch.cat(add_coords, dim=0), dim=0, sorted=True)
+            candidate = torch.unique(torch.cat([candidate, add], dim=0), dim=0, sorted=True)
+        if 0 < int(candidate.shape[0]) != int(coords_n3.shape[0]) or add_coords or remove_coords:
+            rows.append((name, candidate))
+
+    for target_pop_delta, label in ((0, "adjust_same_pop"), (-1, "prune_to_common"), (1, "add_to_common")):
+        plans = []
+        for parent_idx in range(parent_count):
+            cur_pop = int(pop[parent_idx].detach().cpu())
+            target_pop = cur_pop + int(target_pop_delta)
+            if target_pop <= 0 or target_pop > 8:
+                continue
+            cur_mask = int(patterns[parent_idx].detach().cpu())
+            current_bits = occupancy[parent_idx]
+            best_mask = None
+            best_freq = -1
+            for mask in range(1, 256):
+                if bin(int(mask)).count("1") != target_pop:
+                    continue
+                mask_bits = torch.tensor(
+                    [(mask >> slot) & 1 for slot in range(8)],
+                    device=coords_n3.device,
+                    dtype=torch.bool,
+                )
+                if target_pop_delta == -1 and bool((mask_bits & ~current_bits).any().detach().cpu()):
+                    continue
+                if target_pop_delta == 1 and bool((current_bits & ~mask_bits).any().detach().cpu()):
+                    continue
+                diff = int((mask_bits != current_bits).sum().detach().cpu())
+                if target_pop_delta == 0 and diff != 2:
+                    continue
+                if abs(target_pop_delta) == 1 and diff != 1:
+                    continue
+                freq = int(pattern_freq[mask].detach().cpu())
+                if mask == cur_mask or freq <= 0:
+                    continue
+                if freq > best_freq:
+                    best_freq = freq
+                    best_mask = mask
+            if best_mask is not None:
+                rare = int(pattern_freq[cur_mask].detach().cpu())
+                gain = best_freq - rare
+                if gain > 0:
+                    plans.append((gain, parent_idx, best_mask))
+        plans.sort(reverse=True)
+        if not plans:
+            continue
+        for ratio in (0.001, 0.0025, 0.005, 0.01):
+            local_max = max(1, int(math.ceil(int(coords_n3.shape[0]) * ratio)))
+            old_max = max_edits
+            max_edits = local_max
+            try:
+                _coords_from_parent_patterns(
+                    [item[1] for item in plans],
+                    [item[2] for item in plans],
+                    f"pattern_{label}_{ratio:.4f}",
+                )
+            finally:
+                max_edits = old_max
+    return rows
+
+
 def transform_candidates(coords_n3: torch.Tensor, *, max_keep: int = 50000):
     coords_n3 = torch.unique(coords_n3.to(dtype=torch.long), dim=0, sorted=True)
     n = int(coords_n3.shape[0])
@@ -209,6 +347,9 @@ def transform_candidates(coords_n3: torch.Tensor, *, max_keep: int = 50000):
         _append(f"keep_parent_pop_ge_{min_child_pop}", keep_parent[inverse_parent])
 
     for name, cand in _hole_fill_candidates(coords_n3, max_add=max(1, int(max_keep) - n) if max_keep > n else 10000):
+        if 0 < int(cand.shape[0]) <= max_keep:
+            candidates.append((name, cand))
+    for name, cand in _pattern_canonicalization_candidates(coords_n3):
         if 0 < int(cand.shape[0]) <= max_keep:
             candidates.append((name, cand))
 
@@ -266,6 +407,7 @@ def macro_rate_candidates(
             )
     if include_add:
         candidates.extend(_parent_hole_fill_candidates(coords_n3))
+    candidates.extend(_pattern_canonicalization_candidates(coords_n3))
     return candidates
 
 
@@ -324,6 +466,7 @@ def main() -> int:
     parser.add_argument("--blocks-per-file", type=int, default=0)
     parser.add_argument("--min-block-voxels", type=int, default=256)
     parser.add_argument("--max-block-voxels", type=int, default=4096)
+    parser.add_argument("--skip-full", action="store_true")
     parser.add_argument("--macro-only", action="store_true")
     parser.add_argument("--include-add", action="store_true")
     parser.add_argument("--add-only", action="store_true")
@@ -359,7 +502,7 @@ def main() -> int:
             if subsampled:
                 step = max(1, int(math.ceil(int(coords.shape[0]) / float(cli.max_input_voxels))))
                 coords = coords[::step].contiguous()
-            coord_sets = [("subsampled" if subsampled else "full", coords)]
+            coord_sets = [] if bool(cli.skip_full) else [("subsampled" if subsampled else "full", coords)]
             if int(cli.block_size) > 0 and int(cli.blocks_per_file) > 0:
                 block = int(cli.block_size)
                 block_coords = torch.div(coords, block, rounding_mode="floor")

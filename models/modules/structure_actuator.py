@@ -2503,6 +2503,13 @@ class StructureRepairActuator(nn.Module):
         require_actual_gate_non_prune = bool(
             getattr(self.args, "sparsepcgc_actual_gate_non_prune", True)
         )
+        require_actual_gate_prune = bool(
+            getattr(self.args, "sparsepcgc_actual_gate_prune", True)
+        )
+        hard_prune_actual_allowed = (
+            (not require_actual_gate_prune)
+            or (actual_oracle_enabled and actual_oracle_has_drop)
+        )
         hard_add_actual_allowed = (
             (not require_actual_gate_non_prune)
             or (actual_oracle_enabled and actual_oracle_has_add)
@@ -2582,7 +2589,10 @@ class StructureRepairActuator(nn.Module):
             codec_prune_prior_block_size = configured_codec_prior_block_size
         else:
             dataset_key = str(getattr(self.args, "dataname", "")).strip().lower()
-            codec_prune_prior_block_size = 64 if dataset_key == "8i" else 32
+            if dataset_key == "8i":
+                codec_prune_prior_block_size = 64 if int(N) > 50000 else 8
+            else:
+                codec_prune_prior_block_size = 32 if int(N) > 20000 else 8
         codec_prune_prior_ratio = min(
             max(float(getattr(self.args, "sparsepcgc_codec_prune_prior_ratio", 0.05)), 0.0),
             0.30,
@@ -2614,6 +2624,7 @@ class StructureRepairActuator(nn.Module):
                 dtype=pts_xyz.dtype,
             )
         if codec_prune_prior_phase > 0.0:
+            hard_prune_actual_allowed = True
             warm_drop_gate = torch.maximum(
                 drop_operation_gate,
                 drop_operation_gate.new_tensor(codec_prune_prior_phase),
@@ -3008,7 +3019,20 @@ class StructureRepairActuator(nn.Module):
             * (soft_drop_where_grad_base - soft_drop_where_grad_base.detach())
         )
 
-        if actual_oracle_enabled and actual_oracle_apply_teacher_actions and actual_oracle_has_drop:
+        hard_delete_selection_mask = delete_candidate_mask.unsqueeze(1)
+        if (
+            require_actual_gate_prune
+            and actual_oracle_enabled
+            and not (codec_prune_prior_phase > 0.0)
+        ):
+            hard_delete_selection_mask = (
+                hard_delete_selection_mask
+                & leaf_delete_op_mask.to(device=pts_xyz.device, dtype=torch.bool)
+            )
+
+        if not hard_prune_actual_allowed:
+            hard_drop_mask = torch.zeros_like(drop_prob, dtype=torch.bool)
+        elif actual_oracle_enabled and actual_oracle_apply_teacher_actions and actual_oracle_has_drop:
             # The full-cloud teacher may intersect one selected subtree almost
             # completely. Cap the local hard application so a useful global
             # teacher cannot erase 90-100% of the shadow geometry.
@@ -3046,7 +3070,7 @@ class StructureRepairActuator(nn.Module):
                 drop_prob,
                 block_size=codec_prune_prior_block_size,
                 target_drop_ratio=learned_drop_ratio_value,
-                selection_mask=delete_candidate_mask.unsqueeze(1),
+                selection_mask=hard_delete_selection_mask,
                 max_hard_count=int(getattr(self.args, "repair_max_hard_drop_voxels", 0)),
             )
         else:
@@ -3055,7 +3079,7 @@ class StructureRepairActuator(nn.Module):
                 drop_prob,
                 target_drop_ratio=learned_drop_ratio_value,
                 max_drop_ratio=learned_drop_ratio_value,
-                selection_mask=delete_candidate_mask.unsqueeze(1),
+                selection_mask=hard_delete_selection_mask,
                 hard_threshold=float(getattr(self.args, "repair_drop_hard_threshold", 0.5)),
                 voxel_cache=voxel_cache,
                 force_min_count=bool(getattr(self.args, "repair_force_min_drop_voxels", False)),
@@ -5932,6 +5956,12 @@ class StructureRepairActuator(nn.Module):
             "actual_oracle_apply_teacher_actions": pts_xyz.new_tensor(
                 float(actual_oracle_apply_teacher_actions)
             ).detach(),
+            "actual_gate_prune_enabled": pts_xyz.new_tensor(
+                float(require_actual_gate_prune)
+            ).detach(),
+            "actual_gate_prune_allowed": pts_xyz.new_tensor(
+                float(hard_prune_actual_allowed)
+            ).detach(),
             "codec_prune_prior_enabled": pts_xyz.new_tensor(
                 float(codec_prune_prior_enabled)
             ).detach(),
@@ -6397,6 +6427,8 @@ class StructureRepairActuator(nn.Module):
             "actual_oracle_apply_teacher_actions": pts_xyz.new_tensor(
                 float(actual_oracle_apply_teacher_actions)
             ),
+            "actual_gate_prune_enabled": pts_xyz.new_tensor(float(require_actual_gate_prune)),
+            "actual_gate_prune_allowed": pts_xyz.new_tensor(float(hard_prune_actual_allowed)),
             "codec_prune_prior_enabled": pts_xyz.new_tensor(float(codec_prune_prior_enabled)),
             "codec_prune_prior_phase": pts_xyz.new_tensor(codec_prune_prior_phase),
             "codec_prune_prior_ratio": pts_xyz.new_tensor(codec_prune_prior_active_ratio),

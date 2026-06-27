@@ -1167,6 +1167,8 @@ class CompressionLossMixin:
         return debug
 
     def _log_compression_grad_probe(self, args, label, L_com, gen_xyz):
+        if bool(getattr(args, "compact_step_text_log", False)):
+            return
         if not bool(getattr(args, "compression_grad_probe", True)):
             return
         every = max(int(getattr(args, "compression_grad_probe_every", 1)), 1)
@@ -1369,6 +1371,31 @@ class CompressionLossMixin:
         raw_loss_bit_percent = 100.0 * self._relative_ratio(gen_bit, gt_bit)
         loss_bit_ratio = self._relative_ratio(gen_total_bit, gt_bit)
         loss_bit_percent = 100.0 * loss_bit_ratio
+        policy_actual_noop_guard_used = False
+        policy_actual_noop_guard_margin = max(
+            float(getattr(args, "sparsepcgc_policy_actual_noop_guard_margin", 0.0)),
+            0.0,
+        )
+        policy_actual_noop_guard_raw_percent = float(loss_bit_percent)
+        policy_actual_noop_guard_raw_bit = float(gen_bit)
+        policy_actual_noop_guard_raw_total_bit = float(gen_total_bit)
+        policy_actual_noop_guard_raw_edit_record_bits = float(edit_record_bits)
+        if (
+            self._is_sparsepcgc_context(args)
+            and bool(getattr(args, "sparsepcgc_policy_actual_noop_guard", True))
+            and float(loss_bit_percent) > float(policy_actual_noop_guard_margin)
+        ):
+            # If the measured policy edit is worse than no-op, the codec action
+            # selected by training for this step is no-op.  The raw bad edit is
+            # still logged below so this cannot masquerade as an improvement.
+            policy_actual_noop_guard_used = True
+            stats_gen = dict(cached_gt)
+            gen_bit = float(gt_bit)
+            edit_record_bits = 0.0
+            gen_total_bit = float(gt_bit)
+            raw_loss_bit_percent = 0.0
+            loss_bit_ratio = 0.0
+            loss_bit_percent = 0.0
 
         L_com_hard = gen_xyz.new_tensor(loss_bit_percent)
         L_com = L_com_hard
@@ -1556,7 +1583,13 @@ class CompressionLossMixin:
             "actual_gen_oracle_cache_hit": bool(actual_gen_cache_hit),
                 "actual_total_bits": gen_total_bit,
                 "actual_raw_bits": gen_bit,
-                "actual_edit_record_bits": edit_record_bits,
+            "actual_edit_record_bits": edit_record_bits,
+            "policy_actual_noop_guard_used": bool(policy_actual_noop_guard_used),
+            "policy_actual_noop_guard_margin": float(policy_actual_noop_guard_margin),
+            "policy_actual_noop_guard_raw_percent": float(policy_actual_noop_guard_raw_percent),
+            "policy_actual_noop_guard_raw_bit": float(policy_actual_noop_guard_raw_bit),
+            "policy_actual_noop_guard_raw_total_bit": float(policy_actual_noop_guard_raw_total_bit),
+            "policy_actual_noop_guard_raw_edit_record_bits": float(policy_actual_noop_guard_raw_edit_record_bits),
                 "actual_edit_record_percent": self._relative_percent(
                     gen_bit + edit_record_bits,
                     gen_bit,

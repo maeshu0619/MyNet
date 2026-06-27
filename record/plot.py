@@ -2,8 +2,10 @@
 loss: 全損失
 geom: 幾何損失
 compression: Surrogateが予測したtotal-bit差百分率
-	actual_compression: 実codecで測ったtotal-bit差百分率
-	actual_compression_ratio: 実codecで測った100*Mine/GT百分率
+actual_compression: L_comに使った実codec objective差百分率
+policy_actual_compression: Network自身の最終出力actual差百分率
+oracle_teacher_compression: Oracle teacher候補のactual差百分率
+actual_compression_ratio: L_comに使った実codec objectiveの100*Mine/GT百分率
 attr: 原因分解損失
 policy: 修復ポリシー損失
 single: single-child 指標の変化率
@@ -50,7 +52,7 @@ class PlotMaker():
         else:
             log_root = os.path.abspath(os.path.expanduser(str(log_root)))
         self.save_dir = os.path.join(log_root, self.args.date, f"MyNetwork_train/{args.compress}")
-        self.num_loss = 16 # 実圧縮percent列とratio列を追加したmetric総数
+        self.num_loss = 18 # train objective / policy / oracle actual系列を分離したmetric総数
         self.x_len = 10
         self.y_len = 4
         self.step_loss_his = [[] for _ in range(self.num_loss)]
@@ -59,7 +61,12 @@ class PlotMaker():
         self.step_x_his = []
         self.epo_x_his = []
         self.epi_x_his = []
-        self.edit_keys = ["added_ratio_percent", "deleted_ratio_percent", "adjusted_ratio_percent"]
+        self.edit_keys = [
+            "added_ratio_percent",
+            "deleted_ratio_percent",
+            "adjusted_ratio_percent",
+            "oracle_full_cloud_prune_ratio_percent",
+        ]
         self.step_edit_his = [[] for _ in self.edit_keys]
         self.epo_edit_his = [[] for _ in self.edit_keys]
         self.epi_edit_his = [[] for _ in self.edit_keys]
@@ -174,7 +181,7 @@ class PlotMaker():
         self.filename_step = f"{args.time}_step"
         self.filename_epo = f"{args.time}_epo"
         self.filename_epi = f"{args.time}_epi"
-        self.title_group = [[0, 1, 11], [2, 3, 6, 7], [12, 13, 14], [4, 8], [5, 9, 10]] # 実圧縮とSurrogate圧縮を同じ圧縮グループに並べる
+        self.title_group = [[0, 1, 13], [2, 3, 4, 5, 8, 9], [14, 15, 16], [6, 10], [7, 11, 12]] # actual objective / policy / oracleを同じ圧縮グループに並べる
         self.group_title = [
             "other", 
             "compression", 
@@ -186,7 +193,9 @@ class PlotMaker():
             "", 
             "_geom", 
             "_com", 
-            "_actual_com", # 実codecで測った圧縮差百分率の個別plot名
+            "_actual_train_objective", # L_comに使った実codec objectiveの個別plot名
+            "_policy_actual",
+            "_oracle_teacher_actual",
             "_attr",
             "_policy",
             "_single", 
@@ -204,7 +213,9 @@ class PlotMaker():
             "Loss", 
             "Loss of Geometry", 
             "Surrogate Predicted Delta (100*(Mine-GT)/GT)",
-            "Actual Codec Delta (100*(Mine-GT)/GT)", # 実圧縮の同一式percentを描画する
+            "Training Actual Objective Delta",
+            "Policy Actual Delta",
+            "Oracle Teacher Actual Delta",
             "Loss of Octree Cost Attribution",
             "Loss of Structure Repair Policy",
             "Loss of Single Child Nodes", 
@@ -216,13 +227,15 @@ class PlotMaker():
             "Surrogate Teacher Fit Loss (SmoothL1)",
             "Surrogate Bit Prediction Error (%)",
             "Surrogate Mean Prediction Error (bit/node/single/bpn, %)",
-            "Actual Codec Ratio (100*Mine/GT)",
+            "Training Actual Objective Ratio (100*Mine/GT)",
         ]
         self.metric_keys = [
             "loss",
             "geom",
             "compression",
-            "actual_compression", # 実codecで測った(Mine-GT)*100/GTをCSVへ保存する
+            "actual_compression", # L_comに使った実codec objectiveをCSVへ保存する
+            "policy_actual_compression",
+            "oracle_teacher_compression",
             "attr",
             "policy",
             "single",
@@ -856,14 +869,20 @@ class PlotMaker():
         key_to_index = {key: index for index, key in enumerate(self.metric_keys)}
         surrogate_idx = key_to_index.get("compression")
         actual_idx = key_to_index.get("actual_compression")
+        policy_idx = key_to_index.get("policy_actual_compression")
+        oracle_idx = key_to_index.get("oracle_teacher_compression")
         if surrogate_idx is None or actual_idx is None:
             return
         plotted = False
         handles = []
         series = [
             ("Surrogate", loss_history[surrogate_idx], "tab:blue"),
-            ("Actual", loss_history[actual_idx], "tab:orange"),
+            ("TrainObjective", loss_history[actual_idx], "tab:orange"),
         ]
+        if policy_idx is not None:
+            series.append(("PolicyActual", loss_history[policy_idx], "tab:green"))
+        if oracle_idx is not None:
+            series.append(("OracleTeacher", loss_history[oracle_idx], "tab:red"))
         for label, values, color in series:
             plot_values = self._plot_values(values)
             plot_x, plot_values = self._downsample_series(list(x_history), plot_values)
@@ -876,7 +895,7 @@ class PlotMaker():
         ax.axhline(0.0, color="black", linewidth=0.7, alpha=0.4)
         ax.set_xlabel(xl)
         ax.set_ylabel("Delta [%]")
-        ax.set_title("Surrogate vs Actual Compression Delta")
+        ax.set_title("Surrogate / Train Objective / Policy / Oracle Delta")
         if handles:
             ax.legend(handles=handles, loc="best")
         ax.grid(True, alpha=0.35)
@@ -911,7 +930,7 @@ class PlotMaker():
         ax.axhline(100.0, color="black", linewidth=0.7, alpha=0.4)
         ax.set_xlabel(xl)
         ax.set_ylabel("Ratio [%]")
-        ax.set_title("Actual Codec Ratio (100*Mine/GT)")
+        ax.set_title("Training Actual Objective Ratio (100*Mine/GT)")
         if plotted:
             ax.legend(loc="best")
         ax.grid(True, alpha=0.35)
@@ -1007,13 +1026,15 @@ class PlotMaker():
         save_path = os.path.join(self.save_dir, f"{filename_front}_point_edits.png")
         edit_titles = {
             "added_ratio_percent": "Add",
-            "deleted_ratio_percent": "Prun",
+            "deleted_ratio_percent": "Prune",
             "adjusted_ratio_percent": "Adjust",
+            "oracle_full_cloud_prune_ratio_percent": "OracleFullPrune",
         }
         edit_colors = {
             "added_ratio_percent": "#2ca02c",
             "deleted_ratio_percent": "#d62728",
             "adjusted_ratio_percent": "#1f77b4",
+            "oracle_full_cloud_prune_ratio_percent": "#9467bd",
         }
         fig, axes = plot_mod.subplots(
             len(self.edit_keys),

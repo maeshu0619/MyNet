@@ -17,6 +17,7 @@ def build_compression_metric_row(
 ):
     actual_delta = case_float(comp_debug.get("actual_total_bit_percent", float("nan")), float("nan"))
     gt_actual_bits = case_float(comp_debug.get("gt_actual_bit", comp_debug.get("gt_bit_abs", float("nan"))), float("nan"))
+    gen_actual_bits_raw = case_float(comp_debug.get("gen_actual_bit", comp_debug.get("gen_bit_abs", float("nan"))), float("nan"))
     gen_actual_bits = case_float(
         comp_debug.get(
             "gen_total_bit_with_edit_record",
@@ -24,11 +25,41 @@ def build_compression_metric_row(
         ),
         float("nan"),
     )
+    actual_raw_formula_percent = float("nan")
+    actual_billed_formula_percent = float("nan")
+    if math.isfinite(gt_actual_bits) and gt_actual_bits > 0.0:
+        if math.isfinite(gen_actual_bits_raw):
+            actual_raw_formula_percent = 100.0 * (gen_actual_bits_raw - gt_actual_bits) / gt_actual_bits
+        if math.isfinite(gen_actual_bits):
+            actual_billed_formula_percent = 100.0 * (gen_actual_bits - gt_actual_bits) / gt_actual_bits
     actual_ratio = float("nan")
     if math.isfinite(gt_actual_bits) and gt_actual_bits > 0.0 and math.isfinite(gen_actual_bits):
         actual_ratio = 100.0 * gen_actual_bits / gt_actual_bits
     elif math.isfinite(actual_delta):
         actual_ratio = 100.0 + actual_delta
+    oracle_override_used = (
+        bool(comp_debug.get("oracle_full_cloud_override_used", False))
+        or str(comp_debug.get("policy_action_source", "")) == "actual_oracle_full_cloud_override"
+    )
+    policy_actual_percent = case_float(comp_debug.get("policy_final_full_cloud_actual_bit_percent", float("nan")), float("nan"))
+    if not math.isfinite(policy_actual_percent) and not oracle_override_used:
+        policy_actual_percent = case_float(
+            comp_debug.get(
+                "policy_full_cloud_actual_bit_percent",
+                comp_debug.get("full_cloud_actual_bit_percent", actual_delta),
+            ),
+            float("nan"),
+        )
+    oracle_teacher_actual_percent = case_float(
+        comp_debug.get("oracle_full_cloud_actual_bit_percent", float("nan")),
+        float("nan"),
+    )
+    actual_formula_mismatch = None
+    if math.isfinite(actual_delta) and math.isfinite(actual_billed_formula_percent):
+        actual_formula_mismatch = abs(actual_delta - actual_billed_formula_percent) > 1e-5
+    actual_value_matches_policy_output = None
+    if math.isfinite(actual_delta) and math.isfinite(policy_actual_percent):
+        actual_value_matches_policy_output = abs(actual_delta - policy_actual_percent) <= 1e-5
     fresh_actual = is_fresh_actual(args, comp_debug)
     cached_actual = math.isfinite(actual_delta) and not fresh_actual
     return {
@@ -43,14 +74,40 @@ def build_compression_metric_row(
         "fresh_actual": bool(fresh_actual),
         "cached_actual": bool(cached_actual),
         "actual_total_bit_percent": actual_delta if math.isfinite(actual_delta) else None,
+        "actual_train_objective_percent": actual_delta if math.isfinite(actual_delta) else None,
+        "policy_actual_percent": policy_actual_percent if math.isfinite(policy_actual_percent) else None,
+        "oracle_teacher_actual_percent": (
+            oracle_teacher_actual_percent if math.isfinite(oracle_teacher_actual_percent) else None
+        ),
         "actual_total_bit_ratio_percent": actual_ratio if math.isfinite(actual_ratio) else None,
+        "actual_raw_formula_percent": (
+            actual_raw_formula_percent if math.isfinite(actual_raw_formula_percent) else None
+        ),
+        "actual_billed_formula_percent": (
+            actual_billed_formula_percent if math.isfinite(actual_billed_formula_percent) else None
+        ),
+        "actual_formula_mismatch": actual_formula_mismatch,
+        "actual_value_is_oracle_override": bool(oracle_override_used),
+        "actual_value_matches_policy_output": actual_value_matches_policy_output,
         "actual_total_bit_percent_fresh": actual_delta if fresh_actual else None,
         "actual_total_bit_percent_cached": actual_delta if cached_actual else None,
         "full_cloud_actual_bit_percent": case_float(comp_debug.get("full_cloud_actual_bit_percent", float("nan")), float("nan")),
         "policy_full_cloud_actual_bit_percent": case_float(comp_debug.get("policy_full_cloud_actual_bit_percent", float("nan")), float("nan")),
+        "policy_final_full_cloud_raw_bit_percent": case_float(comp_debug.get("policy_final_full_cloud_raw_bit_percent", float("nan")), float("nan")),
+        "policy_final_full_cloud_actual_bit_percent": case_float(comp_debug.get("policy_final_full_cloud_actual_bit_percent", float("nan")), float("nan")),
+        "policy_final_full_cloud_gt_bit": case_float(comp_debug.get("policy_final_full_cloud_gt_bit", float("nan")), float("nan")),
+        "policy_final_full_cloud_gen_bit": case_float(comp_debug.get("policy_final_full_cloud_gen_bit", float("nan")), float("nan")),
+        "policy_final_full_cloud_total_bit_with_edit_record": case_float(
+            comp_debug.get("policy_final_full_cloud_total_bit_with_edit_record", float("nan")),
+            float("nan"),
+        ),
         "oracle_full_cloud_raw_bit_percent": case_float(comp_debug.get("oracle_full_cloud_raw_bit_percent", float("nan")), float("nan")),
         "oracle_full_cloud_actual_bit_percent": case_float(comp_debug.get("oracle_full_cloud_actual_bit_percent", float("nan")), float("nan")),
-        "oracle_full_cloud_override_used": bool(comp_debug.get("oracle_full_cloud_override_used", False)),
+        "oracle_full_cloud_override_used": bool(oracle_override_used),
+        "policy_action_source": str(comp_debug.get("policy_action_source", "")),
+        "policy_actual_noop_guard_used": bool(comp_debug.get("policy_actual_noop_guard_used", False)),
+        "policy_actual_noop_guard_raw_percent": case_float(comp_debug.get("policy_actual_noop_guard_raw_percent", float("nan")), float("nan")),
+        "policy_actual_noop_guard_margin": case_float(comp_debug.get("policy_actual_noop_guard_margin", 0.0), 0.0),
         "subtree_actual_bit_percent": case_float(comp_debug.get("subtree_actual_bit_percent", float("nan")), float("nan")),
         "local_proxy_percent": case_float(comp_debug.get("local_proxy_percent", float("nan")), float("nan")),
         "actual_scope": str(comp_debug.get("actual_scope", "")),
@@ -624,6 +681,26 @@ def build_operation_metric_row(
     actual_oracle_time = case_float(structure_debug.get("actual_oracle_time", 0.0), 0.0)
     actual_oracle_delta_actual = case_float(structure_debug.get("actual_oracle_delta_actual_percent", float("nan")), float("nan"))
     actual_oracle_proxy = case_float(structure_debug.get("actual_oracle_proxy_percent", float("nan")), float("nan"))
+    oracle_full_cloud_override_used = (
+        bool(comp_debug.get("oracle_full_cloud_override_used", False))
+        or str(comp_debug.get("policy_action_source", "")) == "actual_oracle_full_cloud_override"
+    )
+    oracle_full_cloud_prune_count = 0
+    oracle_full_cloud_prune_ratio_percent = 0.0
+    if oracle_full_cloud_override_used:
+        oracle_full_cloud_prune_count = case_int(
+            structure_debug.get(
+                "actual_oracle_full_cloud_macro_best_drop_count",
+                comp_debug.get("actual_oracle_full_cloud_macro_best_drop_count", 0),
+            )
+        )
+        oracle_full_cloud_prune_ratio_percent = 100.0 * case_float(
+            structure_debug.get(
+                "actual_oracle_full_cloud_macro_best_ratio",
+                comp_debug.get("actual_oracle_full_cloud_macro_best_ratio", 0.0),
+            ),
+            0.0,
+        )
     fast_diagnostic_used_fallback = (
         actual_oracle_accepted_candidate_count > 0
         and actual_oracle_accepted_prune_count > 0
@@ -763,6 +840,8 @@ def build_operation_metric_row(
         "actual_oracle_apply_teacher_actions": bool(
             structure_debug.get("actual_oracle_apply_teacher_actions", False)
         ),
+        "actual_gate_prune_enabled": bool(structure_debug.get("actual_gate_prune_enabled", False)),
+        "actual_gate_prune_allowed": bool(structure_debug.get("actual_gate_prune_allowed", False)),
         "codec_prune_prior_enabled": bool(structure_debug.get("codec_prune_prior_enabled", False)),
         "codec_prune_prior_phase": case_float(structure_debug.get("codec_prune_prior_phase", 0.0), 0.0),
         "codec_prune_prior_ratio": case_float(structure_debug.get("codec_prune_prior_ratio", 0.0), 0.0),
@@ -878,6 +957,10 @@ def build_operation_metric_row(
         "output_points": case_float(edit_stats.get("output_points_avg", edit_stats.get("output_points", float("nan"))), float("nan")),
         "added_ratio_percent": case_float(edit_stats.get("added_ratio_percent", float("nan")), float("nan")),
         "deleted_ratio_percent": case_float(edit_stats.get("deleted_ratio_percent", float("nan")), float("nan")),
+        "local_policy_deleted_ratio_percent": case_float(edit_stats.get("deleted_ratio_percent", float("nan")), float("nan")),
+        "oracle_full_cloud_prune_ratio_percent": oracle_full_cloud_prune_ratio_percent,
+        "oracle_full_cloud_prune_count": oracle_full_cloud_prune_count,
+        "oracle_full_cloud_override_used": bool(oracle_full_cloud_override_used),
         "adjusted_ratio_percent": case_float(edit_stats.get("adjusted_ratio_percent", float("nan")), float("nan")),
         "adjusted_ratio_percent_point_debug": case_float(edit_stats.get("adjusted_ratio_percent_point_debug", edit_stats.get("adjusted_ratio_percent", float("nan"))), float("nan")),
         "voxel_edit_input_count": case_int(edit_stats.get("voxel_edit_input_count", 0)),

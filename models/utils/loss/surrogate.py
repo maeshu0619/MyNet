@@ -981,6 +981,15 @@ class SurrogateCompressionLossMixin:
         gen_total_bit_with_edit_record = float("nan")
         actual_edit_record_bits = 0.0
         actual_raw_percent_value = 0.0
+        policy_actual_noop_guard_used = False
+        policy_actual_noop_guard_margin = max(
+            float(getattr(args, "sparsepcgc_policy_actual_noop_guard_margin", 0.0)),
+            0.0,
+        )
+        policy_actual_noop_guard_raw_percent = float("nan")
+        policy_actual_noop_guard_raw_bit = float("nan")
+        policy_actual_noop_guard_raw_total_bit = float("nan")
+        policy_actual_noop_guard_raw_edit_record_bits = float("nan")
         cached_gt = None
         local_proxy_rate_target_value = float("nan")
         local_proxy_aux_target_value = float("nan")
@@ -1009,7 +1018,23 @@ class SurrogateCompressionLossMixin:
                 self._store_cached_actual_gt(cache_key, cached_gt)
             # actual codec教師は評価指標なので、train用ノイズなしの編集点群で測る。
             actual_xyz = gen_xyz if actual_gen_xyz is None else actual_gen_xyz
-            stats_gen = self._encode_actual_batch(args, actual_xyz, final_w=final_w)
+            cached_oracle_stats = (
+                full_octree_context.get("actual_oracle_cached_edited_actual_stats", None)
+                if isinstance(full_octree_context, dict)
+                and str(requested_octree_mode).strip().lower() == "full_cloud"
+                and str(full_octree_context.get("actual_oracle_override_scope", "")) == "full_cloud"
+                else None
+            )
+            expected_actual_points = int(actual_xyz.shape[-1]) if torch.is_tensor(actual_xyz) else -1
+            actual_gen_cache_hit = bool(
+                isinstance(cached_oracle_stats, dict)
+                and int(cached_oracle_stats.get("point_count", -2)) == expected_actual_points
+                and float(cached_oracle_stats.get("bit", 0.0)) > 0.0
+            )
+            if actual_gen_cache_hit:
+                stats_gen = dict(cached_oracle_stats)
+            else:
+                stats_gen = self._encode_actual_batch(args, actual_xyz, final_w=final_w)
             if timing_enabled:
                 timing["actual_encode"] = time.time() - actual_t0
                 timing_cursor = time.time()
@@ -1034,6 +1059,29 @@ class SurrogateCompressionLossMixin:
             stats_for_target["bit"] = float(gen_total_bit_with_edit_record)
             actual_raw_percent_value = self._relative_percent(raw_gen_bit, float(cached_gt["bit"]))
             actual_bit_percent = self._relative_percent(gen_total_bit_with_edit_record, float(cached_gt["bit"]))
+            policy_actual_noop_guard_used = False
+            policy_actual_noop_guard_margin = max(
+                float(getattr(args, "sparsepcgc_policy_actual_noop_guard_margin", 0.0)),
+                0.0,
+            )
+            policy_actual_noop_guard_raw_percent = float(actual_bit_percent)
+            policy_actual_noop_guard_raw_bit = float(raw_gen_bit)
+            policy_actual_noop_guard_raw_total_bit = float(gen_total_bit_with_edit_record)
+            policy_actual_noop_guard_raw_edit_record_bits = float(actual_edit_record_bits)
+            if (
+                str(teacher_codec).strip().lower() == "sparsepcgc"
+                and bool(getattr(args, "sparsepcgc_policy_actual_noop_guard", True))
+                and float(actual_bit_percent) > float(policy_actual_noop_guard_margin)
+            ):
+                policy_actual_noop_guard_used = True
+                stats_gen = dict(cached_gt)
+                raw_gen_bit = float(cached_gt["bit"])
+                actual_edit_record_bits = 0.0
+                gen_total_bit_with_edit_record = float(cached_gt["bit"])
+                stats_for_target = dict(cached_gt)
+                stats_for_target["bit"] = float(cached_gt["bit"])
+                actual_raw_percent_value = 0.0
+                actual_bit_percent = 0.0
             actual_bpp_percent = self._relative_percent(float(stats_gen["bpp"]), float(cached_gt["bpp"]))
             actual_single_percent = self._relative_percent(
                 float(stats_gen["single"]),
@@ -1057,6 +1105,8 @@ class SurrogateCompressionLossMixin:
             target_was_clamped = bool(target_debug["target_clamped"])
             target_scale = str(target_debug["target_mode"])
             target_teacher_source = "fresh_actual"
+            if actual_gen_cache_hit:
+                target_teacher_source = "oracle_cached_actual"
             warmup_steps = max(
                 int(getattr(args, "compression_surrogate_warmup_steps", getattr(args, "compression_surrogate_train_steps", 2))),
                 0,
@@ -1087,6 +1137,12 @@ class SurrogateCompressionLossMixin:
                     "actual_bit_percent": float(actual_bit_percent),
                     "actual_raw_percent": float(actual_raw_percent_value),
                     "actual_edit_record_bits": float(actual_edit_record_bits),
+                    "policy_actual_noop_guard_used": bool(policy_actual_noop_guard_used),
+                    "policy_actual_noop_guard_margin": float(policy_actual_noop_guard_margin),
+                    "policy_actual_noop_guard_raw_percent": float(policy_actual_noop_guard_raw_percent),
+                    "policy_actual_noop_guard_raw_bit": float(policy_actual_noop_guard_raw_bit),
+                    "policy_actual_noop_guard_raw_total_bit": float(policy_actual_noop_guard_raw_total_bit),
+                    "policy_actual_noop_guard_raw_edit_record_bits": float(policy_actual_noop_guard_raw_edit_record_bits),
                     "actual_bpp_percent": float(actual_bpp_percent),
                     "actual_single_percent": float(actual_single_percent),
                     "actual_node_percent": float(actual_node_percent),
@@ -1212,6 +1268,25 @@ class SurrogateCompressionLossMixin:
             )
             actual_edit_record_bits = float(target_entry.get("actual_edit_record_bits", 0.0) or 0.0)
             actual_raw_percent_value = float(target_entry.get("actual_raw_percent", actual_bit_percent))
+            policy_actual_noop_guard_used = bool(target_entry.get("policy_actual_noop_guard_used", False))
+            policy_actual_noop_guard_margin = float(
+                target_entry.get("policy_actual_noop_guard_margin", policy_actual_noop_guard_margin)
+            )
+            policy_actual_noop_guard_raw_percent = float(
+                target_entry.get("policy_actual_noop_guard_raw_percent", policy_actual_noop_guard_raw_percent)
+            )
+            policy_actual_noop_guard_raw_bit = float(
+                target_entry.get("policy_actual_noop_guard_raw_bit", policy_actual_noop_guard_raw_bit)
+            )
+            policy_actual_noop_guard_raw_total_bit = float(
+                target_entry.get("policy_actual_noop_guard_raw_total_bit", policy_actual_noop_guard_raw_total_bit)
+            )
+            policy_actual_noop_guard_raw_edit_record_bits = float(
+                target_entry.get(
+                    "policy_actual_noop_guard_raw_edit_record_bits",
+                    policy_actual_noop_guard_raw_edit_record_bits,
+                )
+            )
             stale_hit = "stale" in str(target_cache_hit).lower()
             actual_value_source = "stale_target" if stale_hit else "target_cache"
             if bool(getattr(args, "_surrogate_pretrain_active", False)) and not bool(
@@ -1834,6 +1909,12 @@ class SurrogateCompressionLossMixin:
                 "actual_total_bit_percent": self._scalar(actual_bit_percent_t),
                 "actual_target": self._scalar(actual_bit_percent_t),
                 "actual_raw_percent": float(actual_raw_percent_value),
+                "policy_actual_noop_guard_used": bool(policy_actual_noop_guard_used),
+                "policy_actual_noop_guard_margin": float(policy_actual_noop_guard_margin),
+                "policy_actual_noop_guard_raw_percent": float(policy_actual_noop_guard_raw_percent),
+                "policy_actual_noop_guard_raw_bit": float(policy_actual_noop_guard_raw_bit),
+                "policy_actual_noop_guard_raw_total_bit": float(policy_actual_noop_guard_raw_total_bit),
+                "policy_actual_noop_guard_raw_edit_record_bits": float(policy_actual_noop_guard_raw_edit_record_bits),
                 "actual_target_percent_with_edit_record": float(target_raw_percent_value),
             "actual_clamped_percent": float(target_clamped_percent_value),
             "actual_forward_value": self._scalar(forward_teacher_percent_t),

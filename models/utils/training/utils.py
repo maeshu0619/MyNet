@@ -216,10 +216,29 @@ def actual_compression_plot_metric(loss_obj, device):
     comp_debug = getattr(loss_obj, "last_compression_debug", {}) or {} # 直近Stepの圧縮debug辞書を取り出す
     if "surrogate_teacher_is_actual" in comp_debug and not bool(comp_debug.get("surrogate_teacher_is_actual", False)): # local_proxyなど実codecでない教師は除外する
         return None # 実圧縮ではない値をactual_compressionグラフへ混ぜない
-    actual_value = comp_debug.get("actual_total_bit_percent", None) # 実codecで測った(Mine-GT)*100/GTを取り出す
+    actual_value = comp_debug.get(
+        "actual_train_objective_percent",
+        comp_debug.get("actual_total_bit_percent", None),
+    ) # L_comに使った実codec objectiveを取り出す
     if actual_value is None:
         return None # 実圧縮値が無いStepはplot集計から除外する
     return metric_tensor(actual_value, device) # plot/CSVに渡せるscalar tensorへ正規化する
+
+
+def policy_actual_compression_plot_metric(loss_obj, device):
+    comp_debug = getattr(loss_obj, "last_compression_debug", {}) or {}
+    actual_value = comp_debug.get("policy_actual_percent", comp_debug.get("policy_final_full_cloud_actual_bit_percent", None))
+    if actual_value is None:
+        return None
+    return metric_tensor(actual_value, device)
+
+
+def oracle_teacher_compression_plot_metric(loss_obj, device):
+    comp_debug = getattr(loss_obj, "last_compression_debug", {}) or {}
+    actual_value = comp_debug.get("oracle_teacher_actual_percent", comp_debug.get("oracle_full_cloud_actual_bit_percent", None))
+    if actual_value is None:
+        return None
+    return metric_tensor(actual_value, device)
 
 
 def actual_compression_ratio_plot_metric(loss_obj, device):
@@ -785,6 +804,8 @@ def snapshot_module_parameters(module):
 
 
 def capture_param_update_snapshots(args, model, step_idx, total_count):
+    if bool(getattr(args, "compact_step_text_log", False)):
+        return None
     if not bool(getattr(args, "debug_grad_flow", False)):
         return None
     if not should_log_step(step_idx, total_count, getattr(args, "debug_grad_flow_rate", 1)):
@@ -805,6 +826,8 @@ def capture_param_update_snapshots(args, model, step_idx, total_count):
 
 def log_param_updates(args, writer, model, snapshots, step_idx, total_count):
     if not snapshots:
+        return
+    if bool(getattr(args, "compact_step_text_log", False)):
         return
     if not bool(getattr(args, "debug_grad_flow", False)):
         args._last_grad_flow = {}
@@ -848,9 +871,13 @@ def log_param_updates(args, writer, model, snapshots, step_idx, total_count):
 
 
 def log_grad_flow(args, writer, model, step_idx, total_count, global_step=None):
-    if not bool(getattr(args, "debug_grad_flow", False)):
+    compact_step_log = bool(getattr(args, "compact_step_text_log", False))
+    if not bool(getattr(args, "debug_grad_flow", False)) and not compact_step_log:
         return
-    should_write = should_log_step(step_idx, total_count, getattr(args, "debug_grad_flow_rate", 1))
+    should_write = (
+        should_log_step(step_idx, total_count, getattr(args, "debug_grad_flow_rate", 1))
+        and not compact_step_log
+    )
     base_model = model.module if hasattr(model, "module") else model
     grad_map = {}
     parts = []

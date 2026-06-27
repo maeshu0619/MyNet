@@ -894,28 +894,32 @@ def _sparsepcgc_codec_proxy_profile(unique_coords, args):
             + child_bucket
         ).to(dtype=torch.long)
 
-        context_stats = {}
-        occupancy_cpu = occupancy.detach().cpu()
-        for parent_idx, ctx_value in enumerate(context_id.detach().cpu().tolist()):
-            item = context_stats.get(int(ctx_value))
-            if item is None:
-                item = {"total": 0, "occ": [0] * 8}
-                context_stats[int(ctx_value)] = item
-            item["total"] += 1
-            row = occupancy_cpu[parent_idx]
-            for slot in range(8):
-                if bool(row[slot]):
-                    item["occ"][slot] += 1
-
-        parent_slot_prob = torch.empty((parent_count, 8), device=device, dtype=torch.float32)
-        for parent_idx, ctx_value in enumerate(context_id.detach().cpu().tolist()):
-            item = context_stats[int(ctx_value)]
-            denom = float(item["total"]) + 2.0 * smoothing
-            probs = [
-                min(max((float(item["occ"][slot]) + smoothing) / denom, eps), 1.0 - eps)
-                for slot in range(8)
-            ]
-            parent_slot_prob[parent_idx] = torch.tensor(probs, device=device, dtype=torch.float32)
+        unique_context, context_inverse = torch.unique(
+            context_id,
+            sorted=True,
+            return_inverse=True,
+        )
+        context_count = torch.bincount(
+            context_inverse,
+            minlength=int(unique_context.numel()),
+        ).to(device=device, dtype=torch.float32)
+        context_occ = torch.zeros(
+            (int(unique_context.numel()), 8),
+            device=device,
+            dtype=torch.float32,
+        )
+        context_occ.scatter_add_(
+            0,
+            context_inverse.view(-1, 1).expand(-1, 8),
+            occupancy.to(dtype=torch.float32),
+        )
+        parent_slot_prob = (
+            context_occ.index_select(0, context_inverse) + float(smoothing)
+        ) / (
+            context_count.index_select(0, context_inverse).view(-1, 1)
+            + 2.0 * float(smoothing)
+        )
+        parent_slot_prob = parent_slot_prob.clamp(min=eps, max=1.0 - eps)
 
         occupied_rate = -torch.log2(parent_slot_prob.clamp_min(eps))
         empty_rate = -torch.log2((1.0 - parent_slot_prob).clamp_min(eps))
@@ -1800,8 +1804,37 @@ def _sparsepcgc_actual_oracle_full_cloud_macro_prune_candidates(
         max(float(getattr(args, "sparsepcgc_actual_oracle_full_cloud_subtree_target_ratio", 0.20)), 0.0),
         max_ratio,
     )
-    for block_size in sorted(set(block_sizes)):
-        full_coords_cpu = full_coords.detach().to(device="cpu", dtype=torch.long).numpy()
+    min_target_fraction = min(
+        max(
+            float(
+                getattr(
+                    args,
+                    "sparsepcgc_actual_oracle_full_cloud_subtree_min_target_fraction",
+                    0.50,
+                )
+            ),
+            0.0,
+        ),
+        1.0,
+    )
+    min_target_ratio = float(target_ratio) * float(min_target_fraction)
+    auto_refine_blocks = bool(
+        getattr(args, "sparsepcgc_actual_oracle_full_cloud_subtree_auto_refine_blocks", True)
+    )
+    min_refine_block_size = max(
+        int(getattr(args, "sparsepcgc_actual_oracle_full_cloud_subtree_min_refine_block_size", 16)),
+        2,
+    )
+    full_coords_cpu = full_coords.detach().to(device="cpu", dtype=torch.long).numpy()
+    structured_has_target_like = False
+    structured_seen_blocks = set()
+
+    def _append_structured_candidates_for_block(block_size):
+        nonlocal structured_has_target_like
+        block_size = max(int(block_size), 2)
+        if block_size in structured_seen_blocks:
+            return
+        structured_seen_blocks.add(block_size)
         block_coords_cpu = np.floor_divide(full_coords_cpu, int(block_size))
         unique_blocks_cpu, block_inverse_cpu, block_counts_cpu = np.unique(
             block_coords_cpu,
@@ -1810,7 +1843,7 @@ def _sparsepcgc_actual_oracle_full_cloud_macro_prune_candidates(
             return_counts=True,
         )
         if int(unique_blocks_cpu.shape[0]) <= 1:
-            continue
+            return
         block_order_cpu = np.argsort(block_counts_cpu, kind="stable")
         cumulative_counts_cpu = np.cumsum(block_counts_cpu[block_order_cpu], dtype=np.int64)
         ordered_subtree_ratios = sorted(
@@ -1838,6 +1871,13 @@ def _sparsepcgc_actual_oracle_full_cloud_macro_prune_candidates(
             drop_mask = torch.from_numpy(drop_mask_cpu).to(device=full_coords.device)
             candidate_coords = full_coords[~drop_mask].contiguous()
             actual_ratio = float(drop_count) / max(float(full_count), 1.0)
+            target_like = actual_ratio >= min_target_ratio
+            structured_has_target_like = bool(structured_has_target_like or target_like)
+            score = float(10000.0 - 1000.0 * abs(actual_ratio - target_ratio))
+            if not target_like:
+                # A too-coarse block can drop only a tiny fraction of the cloud.
+                # Do not let that under-target candidate consume the only actual eval.
+                score -= float(20000.0 + 1000.0 * max(min_target_ratio - actual_ratio, 0.0))
             candidates.append(
                 {
                     "op": "full_cloud_subtree_prune",
@@ -1851,19 +1891,43 @@ def _sparsepcgc_actual_oracle_full_cloud_macro_prune_candidates(
                     ).to(device=full_coords.device, dtype=torch.long),
                     "block_size": int(block_size),
                     "drop_ratio": float(actual_ratio),
-                    "score": float(10000.0 - 1000.0 * abs(actual_ratio - target_ratio)),
+                    "target_like": bool(target_like),
+                    "score": float(score),
                 }
             )
-            if len(candidates) >= int(max_candidates):
+            if len(candidates) >= int(max_candidates) and structured_has_target_like:
                 break
-        if len(candidates) >= int(max_candidates):
+
+    base_block_sizes = sorted(set(block_sizes))
+    for block_size in base_block_sizes:
+        _append_structured_candidates_for_block(block_size)
+        if len(candidates) >= int(max_candidates) and structured_has_target_like:
             break
+
+    if (
+        auto_refine_blocks
+        and not structured_has_target_like
+        and target_ratio > 0.0
+    ):
+        refined_block_sizes = []
+        seen_refined = set(base_block_sizes)
+        for block_size in base_block_sizes:
+            refine_block = max(int(block_size) // 2, 0)
+            while refine_block >= min_refine_block_size:
+                if refine_block not in seen_refined:
+                    refined_block_sizes.append(refine_block)
+                    seen_refined.add(refine_block)
+                refine_block //= 2
+        for block_size in refined_block_sizes:
+            _append_structured_candidates_for_block(block_size)
+            if len(candidates) >= int(max_candidates) and structured_has_target_like:
+                break
 
     # Structured subtree candidates are intentionally ranked above scattered
     # voxel heuristics and already fill the proxy top-K budget. Avoid the much
     # more expensive full-cloud neighbor/parent scans when they cannot possibly
     # reach actual evaluation.
-    if len(candidates) >= int(max_candidates):
+    if len(candidates) >= int(max_candidates) and structured_has_target_like:
         candidates = sorted(candidates, key=lambda item: float(item.get("score", 0.0)), reverse=True)
         return candidates[: int(max_candidates)]
 
@@ -2917,38 +2981,6 @@ def _attach_sparsepcgc_actual_oracle_drop(
     add_candidate_pool = []
     add_candidates = []
 
-    if actual_validate_this_step:
-        proxy_profile = _sparsepcgc_codec_proxy_profile(unique_coords, args)
-        base_proxy_bits = float(proxy_profile.get("base_proxy_bits", 0.0) or 0.0)
-        debug["high_rate_mppov_count"] = int(proxy_profile.get("high_rate_mppov_count", 0) or 0)
-        debug["low_prob_occupied_count"] = int(proxy_profile.get("low_prob_occupied_count", 0) or 0)
-        debug["single_child_chain_count"] = int(proxy_profile.get("single_child_chain_count", 0) or 0)
-        debug["context_pattern_candidate_count"] = int(proxy_profile.get("context_pattern_candidate_count", 0) or 0)
-
-        candidate_pool, unique_coords_from_pool, inverse_from_pool = _sparsepcgc_actual_oracle_candidate_indices(
-            coords_n3,
-            args,
-            global_step,
-            drop_pool_budget,
-            proxy_profile=proxy_profile,
-        )
-        if unique_coords_from_pool is not None and inverse_from_pool is not None:
-            unique_coords = unique_coords_from_pool
-            inverse = inverse_from_pool
-        candidate_indices = candidate_pool[:drop_budget]
-        add_candidate_pool = _sparsepcgc_actual_oracle_add_candidates(
-            unique_coords,
-            args,
-            global_step,
-            add_pool_budget,
-            proxy_profile=proxy_profile,
-        )
-        add_candidates = add_candidate_pool[:add_budget]
-    debug["enabled"] = True
-    debug["candidate_count"] = int(len(candidate_indices) + len(add_candidates))
-    debug["candidate_pool_count"] = int(len(candidate_pool) + len(add_candidate_pool))
-    debug["generated_candidate_count"] = int(debug["candidate_pool_count"])
-
     full_eval_coords = None
     oracle_eval_scope = "subtree_local"
     if bool(getattr(args, "sparsepcgc_actual_oracle_eval_full_cloud_splice", True)) and isinstance(full_octree_context, dict):
@@ -2972,6 +3004,68 @@ def _attach_sparsepcgc_actual_oracle_drop(
     )
     debug["full_cloud_teacher_required"] = bool(full_cloud_teacher_required)
     debug["full_cloud_teacher_eval_available"] = not bool(missing_full_cloud_teacher_eval)
+
+    early_actual_eval_max = max(
+        int(getattr(args, "sparsepcgc_actual_oracle_actual_eval_max", max_candidates)),
+        0,
+    )
+    if early_actual_eval_max <= 0:
+        early_actual_eval_max = max_candidates
+    early_aux_probe_interval = max(
+        int(getattr(args, "sparsepcgc_actual_oracle_aux_probe_interval", 6)),
+        0,
+    )
+    early_aux_probe_due = (
+        early_aux_probe_interval > 0
+        and (int(global_step) + 1) % int(early_aux_probe_interval) == 0
+    )
+    early_full_cloud_macro_max = max(
+        int(getattr(args, "sparsepcgc_actual_oracle_full_cloud_macro_prune_candidate_max", 1)),
+        0,
+    )
+    skip_unused_local_candidate_generation = bool(
+        bool(getattr(args, "sparsepcgc_actual_oracle_skip_unused_local_candidates", True))
+        and actual_validate_this_step
+        and (not early_aux_probe_due)
+        and torch.is_tensor(full_eval_coords)
+        and bool(getattr(args, "sparsepcgc_actual_oracle_prioritize_full_cloud_macro", True))
+        and early_full_cloud_macro_max > 0
+        and int(early_actual_eval_max) <= int(early_full_cloud_macro_max)
+    )
+    debug["skip_unused_local_candidate_generation"] = bool(skip_unused_local_candidate_generation)
+
+    if actual_validate_this_step:
+        proxy_profile = _sparsepcgc_codec_proxy_profile(unique_coords, args)
+        base_proxy_bits = float(proxy_profile.get("base_proxy_bits", 0.0) or 0.0)
+        debug["high_rate_mppov_count"] = int(proxy_profile.get("high_rate_mppov_count", 0) or 0)
+        debug["low_prob_occupied_count"] = int(proxy_profile.get("low_prob_occupied_count", 0) or 0)
+        debug["single_child_chain_count"] = int(proxy_profile.get("single_child_chain_count", 0) or 0)
+        debug["context_pattern_candidate_count"] = int(proxy_profile.get("context_pattern_candidate_count", 0) or 0)
+
+        if not skip_unused_local_candidate_generation:
+            candidate_pool, unique_coords_from_pool, inverse_from_pool = _sparsepcgc_actual_oracle_candidate_indices(
+                coords_n3,
+                args,
+                global_step,
+                drop_pool_budget,
+                proxy_profile=proxy_profile,
+            )
+            if unique_coords_from_pool is not None and inverse_from_pool is not None:
+                unique_coords = unique_coords_from_pool
+                inverse = inverse_from_pool
+            candidate_indices = candidate_pool[:drop_budget]
+            add_candidate_pool = _sparsepcgc_actual_oracle_add_candidates(
+                unique_coords,
+                args,
+                global_step,
+                add_pool_budget,
+                proxy_profile=proxy_profile,
+            )
+            add_candidates = add_candidate_pool[:add_budget]
+    debug["enabled"] = True
+    debug["candidate_count"] = int(len(candidate_indices) + len(add_candidates))
+    debug["candidate_pool_count"] = int(len(candidate_pool) + len(add_candidate_pool))
+    debug["generated_candidate_count"] = int(debug["candidate_pool_count"])
 
     def _oracle_actual_eval_coords(local_candidate_coords):
         if torch.is_tensor(full_eval_coords):
@@ -3187,7 +3281,10 @@ def _attach_sparsepcgc_actual_oracle_drop(
     elif not actual_validate_this_step:
         if not _apply_fast_diagnostic_teacher():
             debug["reason"] = "interval_skip_no_fast_diagnostic_candidate"
-    elif (not candidate_pool and not add_candidate_pool) or unique_coords is None or inverse is None:
+    elif (
+        (not skip_unused_local_candidate_generation)
+        and (not candidate_pool and not add_candidate_pool)
+    ) or unique_coords is None or inverse is None:
         debug["reason"] = "no_valid_actual_oracle_candidates"
     else:
         oracle_time_start = time.time()
@@ -3631,8 +3728,6 @@ def _attach_sparsepcgc_actual_oracle_drop(
                         debug.get("full_cloud_macro_local_map_time", 0.0)
                         + (time.time() - local_map_start)
                     )
-                    if not local_unique_indices:
-                        continue
                     restore_start = time.time()
                     candidate_xyz = _restore_codec_xyz_from_global_voxels(
                         args,
@@ -3679,7 +3774,10 @@ def _attach_sparsepcgc_actual_oracle_drop(
                             drop_count=full_drop_count,
                         )
                     keep_local = torch.ones((unique_coords.shape[0],), device=unique_coords.device, dtype=torch.bool)
-                    keep_local[torch.as_tensor(local_unique_indices, device=unique_coords.device, dtype=torch.long)] = False
+                    if local_unique_indices:
+                        keep_local[
+                            torch.as_tensor(local_unique_indices, device=unique_coords.device, dtype=torch.long)
+                        ] = False
                     local_candidate_coords = torch.unique(unique_coords[keep_local], dim=0, sorted=True)
                     local_proxy_start = time.time()
                     proxy_bits, proxy_percent = _sparsepcgc_proxy_delta_percent(
@@ -4502,6 +4600,7 @@ def _attach_sparsepcgc_actual_oracle_drop(
                 override_drop_count = 0
                 override_subtree_prune_count = 0
                 override_scope = ""
+                selected_full_cloud_override = False
                 current_combo_percent = 0.0
                 selected_raw_percent = 0.0
                 selected_actual_percent = 0.0
@@ -4719,7 +4818,7 @@ def _attach_sparsepcgc_actual_oracle_drop(
                         if selected_drop + selected_add > 0:
                             continue
                         unique_indices = [int(v) for v in item.get("unique_indices", [])]
-                        if not unique_indices:
+                        if not unique_indices and op_name != "full_cloud_subtree_prune":
                             continue
                         if op_name in {"parent_collapse", "full_cloud_subtree_prune"}:
                             accepted_parent_collapse_count = 1
@@ -4731,6 +4830,7 @@ def _attach_sparsepcgc_actual_oracle_drop(
                             override_drop_count = int(item.get("full_cloud_drop_count", 0) or 0)
                             override_subtree_prune_count = int(item.get("drop_block_count", 0) or 0)
                             override_scope = str(item.get("override_scope", "full_cloud"))
+                            selected_full_cloud_override = True
                             actual_stats_item = item.get("actual_stats", None)
                             if isinstance(actual_stats_item, dict):
                                 debug["cached_edited_actual_stats"] = dict(actual_stats_item)
@@ -4742,7 +4842,8 @@ def _attach_sparsepcgc_actual_oracle_drop(
                         selected_edited_actual_bits = _item_edited_actual_bits(item)
                         selected_edit_record_bits = float(item.get("edit_record_bits", 0.0))
                         remaining = max(max_selected - selected_drop - selected_add, 0)
-                        _mark_drop_many(unique_indices[:remaining], strength)
+                        if unique_indices and remaining > 0:
+                            _mark_drop_many(unique_indices[:remaining], strength)
                         continue
 
                     if op_name == "add_group":
@@ -4912,7 +5013,12 @@ def _attach_sparsepcgc_actual_oracle_drop(
                 debug["tested_count"] = int(tested)
                 debug["combo_extra_count"] = int(combo_extra_count)
                 debug["best_percent"] = float(min(best_percent, current_combo_percent))
-                debug["used"] = bool(selected_drop > 0 or selected_add > 0 or selected_move > 0)
+                debug["used"] = bool(
+                    selected_drop > 0
+                    or selected_add > 0
+                    or selected_move > 0
+                    or selected_full_cloud_override
+                )
                 debug["selected_drop_count"] = int(selected_drop)
                 debug["selected_add_count"] = int(selected_add)
                 debug["selected_move_count"] = int(selected_move)
@@ -4940,6 +5046,8 @@ def _attach_sparsepcgc_actual_oracle_drop(
                     debug["reason"] = "no_actual_improving_combo_candidate"
                 elif selected_move > 0:
                     debug["reason"] = "actual_improving_subtree_move_found"
+                elif selected_full_cloud_override:
+                    debug["reason"] = "actual_improving_full_cloud_override_found"
                 elif selected_drop > 0 and selected_add > 0:
                     debug["reason"] = "actual_improving_drop_add_found"
                 elif selected_add > 0:
@@ -5103,7 +5211,12 @@ def _attach_sparsepcgc_actual_oracle_drop(
     patched_context = dict(full_octree_context or {})
     patched_context.update(patched_values)
 
-    if bool(getattr(args, "sparsepcgc_actual_oracle_log", True)) and writer is not None and hasattr(writer, "write"):
+    if (
+        bool(getattr(args, "sparsepcgc_actual_oracle_log", True))
+        and not bool(getattr(args, "compact_step_text_log", False))
+        and writer is not None
+        and hasattr(writer, "write")
+    ):
         if bool(getattr(args, "_log_this_step", False)) or bool(debug["used"]) or bool(debug["enabled"]):
             writer.write(
                 "SparsePCGCActualOracle: "
@@ -5287,6 +5400,8 @@ def _safe_scalar_for_grad_log(value):
             return None
 
 def _phase7_debug_enabled(args, global_step):
+    if bool(getattr(args, "compact_step_text_log", False)):
+        return False
     if not bool(getattr(args, "phase7_debug", True)):
         return False
     interval = max(int(getattr(args, "phase7_debug_every", 10)), 1)
@@ -5636,6 +5751,8 @@ def _phase7_update_from_voxel_state(comp_debug, model):
     )
 
 def _phase7_writer_line(args, writer, text):
+    if bool(getattr(args, "compact_step_text_log", False)):
+        return
     if writer is not None and hasattr(writer, "write"):
         writer.write(text)
     if bool(getattr(args, "phase7_debug_print", True)):
@@ -6889,7 +7006,7 @@ def _collect_train_voxel_collision_stats(args, writer, global_step, stage_tensor
     for stage in sorted(stages):
         tensor = stage_tensors.get(stage)
         if tensor is None:
-            if hasattr(writer, "write"):
+            if hasattr(writer, "write") and not bool(getattr(args, "compact_step_text_log", False)):
                 writer.write(f"VoxelCollisionUnavailable[{stage}]: stage tensor is not available in train.py")
             continue
         with torch.no_grad():
@@ -6901,7 +7018,7 @@ def _collect_train_voxel_collision_stats(args, writer, global_step, stage_tensor
                 first_batch_only=first_only,
             )
         flat.update(flatten_voxel_collision_stats(f"voxel_collision_{stage}", stats))
-        if hasattr(writer, "write"):
+        if hasattr(writer, "write") and not bool(getattr(args, "compact_step_text_log", False)):
             writer.write(format_voxel_collision_summary(stage, stats))
             note = str(stats.get("sampling_note", ""))
             if note:
@@ -7374,7 +7491,7 @@ def run_episode_full_cloud_validation(
                             }
                         )
 
-                    if _phase7_debug_enabled(args, global_train_step):
+                    if _phase7_debug_enabled(args, global_step):
                         _phase7_writer_line(
                             args,
                             writer,
@@ -7648,6 +7765,7 @@ def train(model, args, loss, writer, plot, notifier=None):
 
                 """ログ判定"""
                 log_this_step = should_log_step(step + 1, num_steps, args.print_rate) # このStepで通常ログを出すか判定
+                compact_step_text_log = bool(getattr(args, "compact_step_text_log", True))
                 profile_this_step = should_log_step(global_train_step + 1, max(int(getattr(args, "_total_train_steps_estimate", num_steps)), 1), int(getattr(args, "profile_interval", 100))) # Profileログを出すStepあ否かの判定
                 timing_enabled = bool(
                     (getattr(args, "debug_timing", False) and log_this_step)
@@ -8012,7 +8130,11 @@ def train(model, args, loss, writer, plot, notifier=None):
                         group_meta = {}
 
                     """ログ"""
-                    if log_this_step and bool(getattr(args, "train_patch_subset_log", True)):
+                    if (
+                        log_this_step
+                        and bool(getattr(args, "train_patch_subset_log", True))
+                        and not compact_step_text_log
+                    ):
                         if is_anchor_step:
                             point_counts = list(subtree_point_counts)
                             stat_groups = eligible_groups or [(0, torch.arange(input_xyz.shape[-1], device=input_xyz.device))]
@@ -8104,7 +8226,11 @@ def train(model, args, loss, writer, plot, notifier=None):
                     """モデルの実行"""
                     prev_log_flag = getattr(args, "_log_this_step", False)
                     try:
-                        args._log_this_step = bool(getattr(args, "verbose_step_logs", False) and detail_log_this_step) # このSubtree処理内で詳細ログを出すか否か決定
+                        args._log_this_step = bool(
+                            (not compact_step_text_log)
+                            and getattr(args, "verbose_step_logs", False)
+                            and detail_log_this_step
+                        ) # このSubtree処理内で詳細ログを出すか否か決定
                         if is_anchor_step:
                             """全点群の場合"""
                             full_cloud_anchor_block_start = time.time()
@@ -8113,7 +8239,8 @@ def train(model, args, loss, writer, plot, notifier=None):
                             args._current_exact_teacher_mode = "full_cloud" # exact occupancy teacherは全点群基準で走らせる
                             args._current_exact_teacher_uses_full_context = False # 全点群はSubtree文脈を使わない
                             args._current_exact_teacher_fallback_reason = "" # full-cloudではfallback理由なし
-                            writer.write("Running full cloud Anchor step.") # Anchor Stepであることをログに出す
+                            if not compact_step_text_log:
+                                writer.write("Running full cloud Anchor step.") # Anchor Stepであることをログに出す
 
                             # FullCloud anchorは原則no-gradだが、明示的に許可され、
                             # かつnode/voxel数が上限以内のときだけ学習graphを作る。
@@ -8127,21 +8254,22 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 full_cloud_canonical_context,
                             )
 
-                            writer.write(
-                                "FullCloudAnchorMode: "
-                                f"no_grad={bool(full_cloud_anchor_no_grad)}, "
-                                f"reason={full_cloud_anchor_no_grad_reason}, "
-                                f"node_count={int(full_cloud_anchor_node_count)}, "
-                                f"node_count_source={full_cloud_anchor_node_count_source}, "
-                                f"grad_node_limit={int(getattr(args, 'full_cloud_anchor_grad_node_limit', 50000))}, "
-                                f"allow_grad={bool(getattr(args, 'full_cloud_anchor_allow_grad', False))}"
-                            )
+                            if not compact_step_text_log:
+                                writer.write(
+                                    "FullCloudAnchorMode: "
+                                    f"no_grad={bool(full_cloud_anchor_no_grad)}, "
+                                    f"reason={full_cloud_anchor_no_grad_reason}, "
+                                    f"node_count={int(full_cloud_anchor_node_count)}, "
+                                    f"node_count_source={full_cloud_anchor_node_count_source}, "
+                                    f"grad_node_limit={int(getattr(args, 'full_cloud_anchor_grad_node_limit', 50000))}, "
+                                    f"allow_grad={bool(getattr(args, 'full_cloud_anchor_allow_grad', False))}"
+                                )
                             full_cloud_anchor_shadow_train_active = bool(
                                 full_cloud_anchor_shadow_train_requested
                                 and full_cloud_anchor_no_grad
                                 and selected_groups
                             )
-                            if full_cloud_anchor_shadow_train_requested:
+                            if full_cloud_anchor_shadow_train_requested and not compact_step_text_log:
                                 writer.write(
                                     "FullCloudAnchorShadowTrain: "
                                     f"requested={bool(full_cloud_anchor_shadow_train_requested)}, "
@@ -8161,6 +8289,13 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 full_octree_context["octree_context_scope"] = "full_cloud"
                                 full_octree_context["octree_input_mode"] = "full_cloud"
                                 full_octree_context["canonical_source"] = "full_cloud_canonical"
+                                full_octree_context["fast_full_cloud_oracle_anchor"] = bool(
+                                    full_cloud_anchor_shadow_train_active
+                                    and bool(getattr(args, "sparsepcgc_actual_oracle_apply_full_override", False))
+                                    and isinstance(step_actual_oracle_metric_debug, dict)
+                                    and bool(step_actual_oracle_metric_debug.get("used", False))
+                                    and str(step_actual_oracle_metric_debug.get("override_scope", "")) == "full_cloud"
+                                )
                                 gen_pts, L_attr, L_policy, L_actuator, final_w, Lp_out, La_fit, La_rep, out_label = model.forward(
                                     input_xyz,
                                     input_attr_full,
@@ -8188,7 +8323,10 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 encoder_debug_chunks.append(dict(getattr(base_model, "last_encoder_debug", {}) or {})) # Encoder Debug情報をコピーして保存
                             gen_xyz = gen_pts[:, :3, :]
                             _log_sparsepcgc_restore_debug(args, writer, out_label)
-                            train_edit_stats = summarize_point_edits( input_xyz=input_xyz[:, :3, :], gen_pts=gen_pts, final_w=final_w, args=args) # 入力点群と出力点群を比較し、各操作の編集統計を計算
+                            if full_cloud_anchor_shadow_train_active:
+                                train_edit_stats = None
+                            else:
+                                train_edit_stats = summarize_point_edits( input_xyz=input_xyz[:, :3, :], gen_pts=gen_pts, final_w=final_w, args=args) # 入力点群と出力点群を比較し、各操作の編集統計を計算
                             final_w_for_loss = None
                             if _discrete_loss_mode_value(args) != "hard":
                                 final_w_for_loss = final_w
@@ -8197,13 +8335,21 @@ def train(model, args, loss, writer, plot, notifier=None):
 
                             with loss_grad_ctx, autocast_ctx:
                                 """形状損失の計算"""
-                                L_geom = loss.get_geometry_loss(
-                                    args,
-                                    gen_pts=gen_xyz,
-                                    gt_pts=input_xyz[:, :3, :],
-                                    final_w=final_w_for_loss,
-                                    out_label=out_label,
+                                full_cloud_oracle_fast_path = bool(
+                                    full_cloud_anchor_shadow_train_active
+                                    and isinstance(out_label, dict)
+                                    and bool(out_label.get("full_cloud_oracle_fast_path", False))
                                 )
+                                if full_cloud_oracle_fast_path:
+                                    L_geom = input_xyz.new_zeros(())
+                                else:
+                                    L_geom = loss.get_geometry_loss(
+                                        args,
+                                        gen_pts=gen_xyz,
+                                        gt_pts=input_xyz[:, :3, :],
+                                        final_w=final_w_for_loss,
+                                        out_label=out_label,
+                                    )
 
                                 """圧縮損失の計算"""
                                 if stage_factors["com"] != 0.0:
@@ -8256,39 +8402,111 @@ def train(model, args, loss, writer, plot, notifier=None):
                                         and bool(step_actual_oracle_metric_debug.get("used", False))
                                         and str(step_actual_oracle_metric_debug.get("override_scope", "")) == "full_cloud"
                                     ):
-                                        billed_percent = finite_float_or_none(
+                                        oracle_billed_percent = finite_float_or_none(
                                             step_actual_oracle_metric_debug.get("delta_actual_percent", None)
                                         )
                                         edit_record_bits = max(
                                             float(step_actual_oracle_metric_debug.get("selected_edit_record_bits", 0.0) or 0.0),
                                             0.0,
                                         )
-                                        if billed_percent is not None:
+                                        if oracle_billed_percent is not None:
+                                            billed_debug = dict(getattr(loss, "last_compression_debug", {}) or {})
+                                            gt_actual_bit_for_override = finite_float_or_none(
+                                                billed_debug.get(
+                                                    "gt_actual_bit",
+                                                    billed_debug.get("gt_bit_abs", None),
+                                                )
+                                            )
+                                            final_encoded_bit = finite_float_or_none(
+                                                billed_debug.get(
+                                                    "gen_actual_bit",
+                                                    billed_debug.get("gen_bit_abs", None),
+                                                )
+                                            )
+                                            oracle_edited_bit = finite_float_or_none(
+                                                step_actual_oracle_metric_debug.get("edited_actual_bits", None)
+                                            )
+                                            policy_final_raw_percent = None
+                                            policy_final_billed_percent = None
+                                            policy_final_total_bit_with_edit_record = None
+                                            if (
+                                                gt_actual_bit_for_override is not None
+                                                and gt_actual_bit_for_override > 0.0
+                                                and final_encoded_bit is not None
+                                            ):
+                                                policy_final_total_bit_with_edit_record = (
+                                                    float(final_encoded_bit) + float(edit_record_bits)
+                                                )
+                                                policy_final_raw_percent = 100.0 * (
+                                                    float(final_encoded_bit) - float(gt_actual_bit_for_override)
+                                                ) / float(gt_actual_bit_for_override)
+                                                policy_final_billed_percent = 100.0 * (
+                                                    float(final_encoded_bit)
+                                                    + float(edit_record_bits)
+                                                    - float(gt_actual_bit_for_override)
+                                                ) / float(gt_actual_bit_for_override)
+                                            if (
+                                                gt_actual_bit_for_override is not None
+                                                and gt_actual_bit_for_override > 0.0
+                                                and oracle_edited_bit is not None
+                                                and oracle_edited_bit > 0.0
+                                            ):
+                                                raw_percent = 100.0 * (
+                                                    float(oracle_edited_bit) - float(gt_actual_bit_for_override)
+                                                ) / float(gt_actual_bit_for_override)
+                                                billed_percent = float(oracle_billed_percent)
+                                                edited_actual_bit_for_log = float(oracle_edited_bit)
+                                                override_bit_source = "oracle_cached_candidate_encode"
+                                            else:
+                                                raw_percent = finite_float_or_none(
+                                                    step_actual_oracle_metric_debug.get("selected_raw_percent", None)
+                                                )
+                                                billed_percent = float(oracle_billed_percent)
+                                                if oracle_edited_bit is not None and oracle_edited_bit > 0.0:
+                                                    edited_actual_bit_for_log = float(oracle_edited_bit)
+                                                    override_bit_source = "oracle_cached_candidate_encode"
+                                                else:
+                                                    edited_actual_bit_for_log = float(final_encoded_bit or 0.0)
+                                                    override_bit_source = "fresh_final_full_cloud_encode_fallback"
                                             billed_tensor = L_com.new_tensor(float(billed_percent))
                                             L_com = billed_tensor + (L_com - L_com.detach())
                                             loss_bit = billed_tensor + (loss_bit - loss_bit.detach())
-                                            billed_debug = dict(getattr(loss, "last_compression_debug", {}) or {})
                                             billed_debug.update(
                                                 {
                                                     "total_bit": float(billed_percent),
                                                     "actual_total_bit_percent": float(billed_percent),
+                                                    "actual_train_objective_percent": float(billed_percent),
                                                     "actual_bit_percent": float(billed_percent),
                                                     "actual_delta_percent": float(billed_percent),
+                                                    "actual_raw_percent": float(raw_percent)
+                                                    if raw_percent is not None
+                                                    else float(billed_percent),
                                                     "actual_edit_record_bits": float(edit_record_bits),
-                                                    "actual_total_bits": float(
-                                                        step_actual_oracle_metric_debug.get("edited_actual_bits", 0.0) or 0.0
-                                                    )
+                                                    "actual_total_bits": float(edited_actual_bit_for_log) + float(edit_record_bits),
+                                                    "gen_actual_bit": float(edited_actual_bit_for_log),
+                                                    "gen_total_bit_with_edit_record": float(edited_actual_bit_for_log)
                                                     + float(edit_record_bits),
-                                                    "gen_total_bit_with_edit_record": float(
-                                                        step_actual_oracle_metric_debug.get("edited_actual_bits", 0.0) or 0.0
-                                                    )
-                                                    + float(edit_record_bits),
-                                                    "policy_full_cloud_actual_bit_percent": None,
+                                                    "actual_target": float(billed_percent),
+                                                    "actual_forward_value": float(billed_percent),
+                                                    "compression_forward_teacher_percent": float(billed_percent),
+                                                    "forward_display_value": float(billed_percent),
+                                                    "policy_actual_percent": policy_final_billed_percent,
+                                                    "oracle_teacher_actual_percent": float(oracle_billed_percent),
+                                                    "policy_full_cloud_actual_bit_percent": policy_final_billed_percent,
+                                                    "policy_action_source": "actual_oracle_full_cloud_override",
                                                     "oracle_full_cloud_raw_bit_percent": finite_float_or_none(
                                                         step_actual_oracle_metric_debug.get("selected_raw_percent", None)
                                                     ),
-                                                    "oracle_full_cloud_actual_bit_percent": float(billed_percent),
+                                                    "oracle_full_cloud_actual_bit_percent": float(oracle_billed_percent),
                                                     "oracle_full_cloud_override_used": True,
+                                                    "oracle_full_cloud_override_bit_source": str(override_bit_source),
+                                                    "policy_final_full_cloud_raw_bit_percent": policy_final_raw_percent,
+                                                    "policy_final_full_cloud_actual_bit_percent": policy_final_billed_percent,
+                                                    "policy_final_full_cloud_gt_bit": gt_actual_bit_for_override,
+                                                    "policy_final_full_cloud_gen_bit": final_encoded_bit,
+                                                    "policy_final_full_cloud_total_bit_with_edit_record": (
+                                                        policy_final_total_bit_with_edit_record
+                                                    ),
                                                 }
                                             )
                                             loss.last_compression_debug = billed_debug
@@ -8337,19 +8555,20 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 final_w = None
                                 out_label = None
                                 loss.last_compression_terms = {}
-                                writer.write(
-                                    "FullCloudAnchorShadowTrain: "
-                                    "full-cloud actual/correction state updated; "
-                                    "resetting differentiable losses and running selected subtree with grad."
-                                )
+                                if not compact_step_text_log:
+                                    writer.write(
+                                        "FullCloudAnchorShadowTrain: "
+                                        "full-cloud actual/correction state updated; "
+                                        "resetting differentiable losses and running selected subtree with grad."
+                                    )
                             step_timing_breakdown["full_cloud_anchor_block_time"] = float(
                                 time.time() - full_cloud_anchor_block_start
                             )
                         if (not is_anchor_step) or full_cloud_anchor_shadow_train_active:
                             """Subtreeの場合"""
-                            if full_cloud_anchor_shadow_train_active:
+                            if full_cloud_anchor_shadow_train_active and not compact_step_text_log:
                                 writer.write("Running shadow subtree step for FullCloud anchor gradient.") # FullCloud anchor用の軽量grad経路
-                            else:
+                            elif not compact_step_text_log:
                                 writer.write("Running subtree step with selected Subtree.") # Subtree Stepであることをログに出す
                             num_selected = float(max(len(selected_groups), 1)) # 選択されたSubtree数をFloatで取得
                             subtree_edit_sums = new_point_edit_sums() # 複数Subtreeの点編集統計を累積するための変数を初期化
@@ -8394,7 +8613,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 if input_attr_full is not None:
                                     subtree_attr = input_attr_full.index_select(2, point_idx).contiguous() # 属性を取り出す
                                 subtree_cache_key = ( f"{cache_key}|subtree_depth={int(subtree_ref['depth'][0].item())}|subtree_key={subtree_key}")
-                                if log_this_step:
+                                if log_this_step and not compact_step_text_log:
                                     selected_path = subtree_group_meta.get("subtree_path", None)
                                     root_path = full_octree_context.get("root_to_subtree_path", None) if isinstance(full_octree_context, dict) else None
                                     parent_occ = full_octree_context.get("parent_occupancy_code", None) if isinstance(full_octree_context, dict) else None
@@ -9435,7 +9654,15 @@ def train(model, args, loss, writer, plot, notifier=None):
                     comp_debug["full_cloud_anchor_unique_coord_before"] = full_cloud_anchor_debug_snapshot.get("unique_coord_before", None)
                     comp_debug["full_cloud_anchor_unique_coord_after"] = full_cloud_anchor_debug_snapshot.get("unique_coord_after", None)
                     for oracle_metric_key in (
+                        "actual_train_objective_percent",
+                        "policy_actual_percent",
+                        "oracle_teacher_actual_percent",
                         "policy_full_cloud_actual_bit_percent",
+                        "policy_final_full_cloud_raw_bit_percent",
+                        "policy_final_full_cloud_actual_bit_percent",
+                        "policy_final_full_cloud_gt_bit",
+                        "policy_final_full_cloud_gen_bit",
+                        "policy_final_full_cloud_total_bit_with_edit_record",
                         "oracle_full_cloud_raw_bit_percent",
                         "oracle_full_cloud_actual_bit_percent",
                         "oracle_full_cloud_override_used",
@@ -9484,7 +9711,21 @@ def train(model, args, loss, writer, plot, notifier=None):
                             comp_debug["full_cloud_actual_bit_percent"] = float(full_actual_primary_value)
                             comp_debug["full_cloud_actual_percent"] = float(full_actual_primary_value)
                             comp_debug["actual_total_bit_percent"] = float(full_actual_primary_value)
+                            comp_debug["actual_train_objective_percent"] = float(full_actual_primary_value)
                             comp_debug["actual_bit_percent"] = float(full_actual_primary_value)
+                            comp_debug["actual_target"] = float(full_actual_primary_value)
+                            comp_debug["actual_forward_value"] = float(full_actual_primary_value)
+                            comp_debug["compression_forward_teacher_percent"] = float(full_actual_primary_value)
+                            comp_debug["forward_display_value"] = float(full_actual_primary_value)
+                            if bool(comp_debug.get("oracle_full_cloud_override_used", False)):
+                                comp_debug["policy_action_source"] = "actual_oracle_full_cloud_override"
+                                comp_debug["policy_actual_noop_guard_used"] = False
+                                comp_debug["oracle_teacher_actual_percent"] = comp_debug.get(
+                                    "oracle_full_cloud_actual_bit_percent",
+                                    float(full_actual_primary_value),
+                                )
+                            else:
+                                comp_debug["policy_actual_percent"] = float(full_actual_primary_value)
                             if subtree_actual_before is not None:
                                 comp_debug["full_vs_subtree_actual_gap"] = float(full_actual_primary_value) - float(subtree_actual_before)
                                 comp_debug["sign_match_subtree_full"] = bool(
@@ -9736,7 +9977,13 @@ def train(model, args, loss, writer, plot, notifier=None):
                     comp_debug.update(corr_debug) # 診断情報の追加
                     loss.last_compression_debug = comp_debug # 相関診断を追加したcomp_debugを保存しなおす
                     corr_value = finite_float_or_none(corr_debug.get("corr_surrogate_actual")) # Surrogateと実圧縮の相関地を取り出す
-                    if ( log_this_step and bool(getattr(args, "surrogate_realign_on_low_corr", False)) and corr_value is not None and corr_value < float(getattr(args, "surrogate_realign_min_corr", 0.3))):
+                    if (
+                        log_this_step
+                        and not compact_step_text_log
+                        and bool(getattr(args, "surrogate_realign_on_low_corr", False))
+                        and corr_value is not None
+                        and corr_value < float(getattr(args, "surrogate_realign_min_corr", 0.3))
+                    ):
                         writer.write( "SurrogateRealignNotice: " f"corr_surrogate_actual={corr_value:.6f} below " f"{float(getattr(args, 'surrogate_realign_min_corr', 0.3)):.6f}; " f"realign_steps={int(getattr(args, 'surrogate_realign_steps', 0))} " "(current implementation logs the trigger; extra realign steps are not run unless added later).")
                     skip_optimizer_reason = None
 
@@ -9975,6 +10222,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                             compression_metric_row[key] = comp_debug[key]
                 if (
                     bool(getattr(args, "full_cloud_actual_correction_debug", True))
+                    and not compact_step_text_log
                     and bool(getattr(args, "_log_this_step", True))
                     and isinstance(comp_debug, dict)
                     and (
@@ -10105,19 +10353,43 @@ def train(model, args, loss, writer, plot, notifier=None):
 
                 """ログ"""
                 if log_this_step:
-                    log_step_loss( writer, step, num_steps, L, L_geom, L_com, L_com_objective, L_attr, L_policy, L_actuator, Lp_out, La_fit, La_rep, L_discrete_policy, loss_bit, loss_single, loss_nodes)
-                    if cp_debug and bool(getattr(args, "cp_log_grad_terms", True)):
-                        log_compression_primary_terms(writer, step, num_steps, cp_debug)
-                    log_compression_stats( writer, step, num_steps, comp_debug)
-                    before_node, after_node, before_single, after_single = log_compression_train_debug( writer, step, num_steps, args, comp_debug, loss, L_com)
-                    log_codec_actual_correlation( writer, step, num_steps, args, comp_debug, codec_actual_metric_pairs, before_node, after_node, before_single, after_single)
-                    log_sparsepcgc_train_debug( writer, step, num_steps, args, comp_debug, sparsepcgc_proxy_actual_pairs)
-                    soft_proxy_debug_text = _format_soft_proxy_debug(args)
-                    if soft_proxy_debug_text:
-                        writer.write(f"SoftProxyGradDebug: {soft_proxy_debug_text}")
-                    if structure_debug:
-                        log_structure_debug( writer, structure_debug, step, num_steps)
-                        write_structure_decision_debug( writer, f"StructureDecision step={step + 1}/{num_steps}", structure_debug)
+                    if compact_step_text_log:
+                        log_compact_step_summary(
+                            writer,
+                            step,
+                            num_steps,
+                            args,
+                            loss,
+                            comp_debug,
+                            structure_debug,
+                            train_edit_stats,
+                            L=L,
+                            L_geom=L_geom,
+                            L_com=L_com,
+                            L_com_objective=L_com_objective,
+                            L_attr=L_attr,
+                            L_policy=L_policy,
+                            L_actuator=L_actuator,
+                            loss_bit=loss_bit,
+                            loss_single=loss_single,
+                            loss_nodes=loss_nodes,
+                            stage_factors=stage_factors,
+                            step_completed=None,
+                        )
+                    else:
+                        log_step_loss( writer, step, num_steps, L, L_geom, L_com, L_com_objective, L_attr, L_policy, L_actuator, Lp_out, La_fit, La_rep, L_discrete_policy, loss_bit, loss_single, loss_nodes)
+                        if cp_debug and bool(getattr(args, "cp_log_grad_terms", True)):
+                            log_compression_primary_terms(writer, step, num_steps, cp_debug)
+                        log_compression_stats( writer, step, num_steps, comp_debug)
+                        before_node, after_node, before_single, after_single = log_compression_train_debug( writer, step, num_steps, args, comp_debug, loss, L_com)
+                        log_codec_actual_correlation( writer, step, num_steps, args, comp_debug, codec_actual_metric_pairs, before_node, after_node, before_single, after_single)
+                        log_sparsepcgc_train_debug( writer, step, num_steps, args, comp_debug, sparsepcgc_proxy_actual_pairs)
+                        soft_proxy_debug_text = _format_soft_proxy_debug(args)
+                        if soft_proxy_debug_text:
+                            writer.write(f"SoftProxyGradDebug: {soft_proxy_debug_text}")
+                        if structure_debug:
+                            log_structure_debug( writer, structure_debug, step, num_steps)
+                            write_structure_decision_debug( writer, f"StructureDecision step={step + 1}/{num_steps}", structure_debug)
                 if timing_enabled:
                     sync_for_timing(use_cuda)
                     timing_loss_end = time.time()
@@ -10154,7 +10426,8 @@ def train(model, args, loss, writer, plot, notifier=None):
                     and not bool(full_cloud_anchor_shadow_train_active)
                 ):
                     step_grad_rows = []
-                    writer.write("StepGradProbe: skipped because full_cloud_anchor_no_grad=True")
+                    if not compact_step_text_log:
+                        writer.write("StepGradProbe: skipped because full_cloud_anchor_no_grad=True")
                 else:
                     step_grad_rows = build_step_grad_rows(
                         args,
@@ -10175,11 +10448,12 @@ def train(model, args, loss, writer, plot, notifier=None):
                             step_grad_row,
                         )
                         append_count += 1
-                    writer.write(
-                        "StepGradProbe: "
-                        f"rows={append_count}, "
-                        f"path={metric_csv_paths.get('step_grad')}"
-                    )
+                    if not compact_step_text_log:
+                        writer.write(
+                            "StepGradProbe: "
+                            f"rows={append_count}, "
+                            f"path={metric_csv_paths.get('step_grad')}"
+                        )
 
                 """勾配を流す"""
                 step_completed = False # Optimizer更新が成功したかのフラグ
@@ -10271,7 +10545,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                             f"gap={float(comp_debug.get('phase7_full_vs_subtree_gap', 0.0) or 0.0):.6g}"
                         )
 
-                    if bool(getattr(args, "debug_grad_flow", False)):
+                    if bool(getattr(args, "debug_grad_flow", False)) or compact_step_text_log:
                         log_grad_flow(args, writer, model, step + 1, num_steps, global_step=global_train_step) # 各層・各モジュールに勾配が届いているか否かの判定ログ
                     nonfinite_grad_summary = _summarize_nonfinite_grads(
                         model,
@@ -10477,6 +10751,8 @@ def train(model, args, loss, writer, plot, notifier=None):
                 if skip_optimizer_reason is not None or not total_loss_finite:
                     args._last_grad_flow = {} # backwardしていないskip stepでは前stepの勾配値をCSVへ持ち越さない
                 operation_metric_row = attach_grad_flow_to_operation_row(operation_metric_row, args) # backward後に得られた各操作headの勾配normをOperation CSV行へ反映する
+                if log_this_step and compact_step_text_log:
+                    log_compact_step_grad(writer, step, num_steps, args)
                 if _phase7_should_save_eval_summary(args, global_train_step):
                     phase7_eval_summary_row = _phase7_build_eval_summary_row(
                         args,
@@ -10505,9 +10781,11 @@ def train(model, args, loss, writer, plot, notifier=None):
                     epoch_metric_sums = new_metric_sums(L.device, plot.num_loss) # Epoch内で初めのStepなら損失累積器を作る
                 surrogate_compression_metric = surrogate_compression_plot_metric(loss, L_com, L.device) # Surrogate予測の(Mine-GT)*100/GTを通常plotへ渡す
                 actual_compression_metric = actual_compression_plot_metric(loss, L.device) # 実codecで測った(Mine-GT)*100/GTを通常plotへ渡す
+                policy_actual_metric = policy_actual_compression_plot_metric(loss, L.device) # Network自身の最終出力actualを通常plotへ渡す
+                oracle_teacher_metric = oracle_teacher_compression_plot_metric(loss, L.device) # Oracle teacher actualを通常plotへ渡す
                 actual_compression_ratio_metric = actual_compression_ratio_plot_metric(loss, L.device) # 実codecで測った100*Mine/GTを通常plotへ渡す
                 surrogate_metrics = surrogate_plot_metrics(loss) # Surrogate教師学習の誤差系列を通常plotへ渡す
-                metric_values = [ L, L_geom, surrogate_compression_metric, actual_compression_metric, L_attr, L_policy, loss_single, loss_nodes, Lp_out, La_fit, La_rep, L_actuator, *surrogate_metrics, actual_compression_ratio_metric] # plot列順にStep損失をまとめる
+                metric_values = [ L, L_geom, surrogate_compression_metric, actual_compression_metric, policy_actual_metric, oracle_teacher_metric, L_attr, L_policy, loss_single, loss_nodes, Lp_out, La_fit, La_rep, L_actuator, *surrogate_metrics, actual_compression_ratio_metric] # plot列順にStep損失をまとめる
                 add_metric_sums( epoch_metric_sums, metric_values, L.device) # 現在Stepの損失値をEpoch累積器へ加算
                 if episode_metric_sums is None:
                     episode_metric_sums = new_metric_sums(L.device, plot.num_loss) # Episode内で初めのEpochなら損失累積器を作る
@@ -10516,11 +10794,16 @@ def train(model, args, loss, writer, plot, notifier=None):
                 accumulate_checkpoint_metrics( episode_checkpoint_sums, compression_metric_row, operation_metric_row, step_metric_values) # ChackPoint判定用メトリクス
                 if train_edit_stats is None:
                     train_edit_stats = summarize_point_edits( input_xyz=input_xyz[:, :3, :], gen_pts=gen_pts, final_w=final_w, args=args) # 点操作情報を計算
-                plot.record_point_edits("step", global_train_step + 1, train_edit_stats) # 点操作統計をCSVに記録
+                plot_edit_stats = dict(train_edit_stats or {})
+                plot_edit_stats["oracle_full_cloud_prune_ratio_percent"] = operation_metric_row.get(
+                    "oracle_full_cloud_prune_ratio_percent",
+                    0.0,
+                )
+                plot.record_point_edits("step", global_train_step + 1, plot_edit_stats) # 点操作統計をCSVに記録
                 plot.record_occupancy_metrics("step", global_train_step + 1, compression_metric_row) # 占有pattern/probability proxyと実hard octree統計をCSVに記録
                 plot.record_voxel_collision_metrics("step", global_train_step + 1, compression_metric_row) # SparsePCGC量子化後の点潰れ率をCSV/plotへ記録
                 plot_step_info = plot.record_metrics("step", global_train_step + 1, step_metric_values) # Step単位の損失値をCSVに保存
-                if plot_step_info.get("skipped", False):
+                if plot_step_info.get("skipped", False) and not compact_step_text_log:
                     threshold_text = f"{plot_step_info.get('threshold', float('nan')):.6g}"
                     baseline = plot_step_info.get("baseline", None)
                     baseline_text = ""
@@ -10531,11 +10814,13 @@ def train(model, args, loss, writer, plot, notifier=None):
                     sync_for_timing(use_cuda)
                     en_step = time.time()
 
-                    log_step_timing( writer=writer, args=args, step=step, num_steps=num_steps, epoch=epoch, global_train_step=global_train_step, use_cuda=use_cuda, st_step=st_step, timing_data_start=timing_data_start, timing_data_end=timing_data_end, timing_model_start=timing_model_start, timing_model_end=timing_model_end, timing_noise_start=timing_noise_start, timing_noise_end=timing_noise_end, timing_loss_start=timing_loss_start, timing_loss_end=timing_loss_end, timing_step_end=timing_step_end, en_step=en_step, loss=loss, model=model, KNN_BACKEND=KNN_BACKEND)
+                    if not compact_step_text_log:
+                        log_step_timing( writer=writer, args=args, step=step, num_steps=num_steps, epoch=epoch, global_train_step=global_train_step, use_cuda=use_cuda, st_step=st_step, timing_data_start=timing_data_start, timing_data_end=timing_data_end, timing_model_start=timing_model_start, timing_model_end=timing_model_end, timing_noise_start=timing_noise_start, timing_noise_end=timing_noise_end, timing_loss_start=timing_loss_start, timing_loss_end=timing_loss_end, timing_step_end=timing_step_end, en_step=en_step, loss=loss, model=model, KNN_BACKEND=KNN_BACKEND)
                 else:
                     en_step = time.time()
                 if log_this_step:
-                    log_point_edit_stats( writer, train_edit_stats, step, num_steps)
+                    if not compact_step_text_log:
+                        log_point_edit_stats( writer, train_edit_stats, step, num_steps)
                     print( f"Epi{episode + 1}/Epo{epoch + 1}/Step{step + 1}:" f"{en_step-st_step:.4f}s   |   " f"{datetime.datetime.now().strftime('%Y/%m/%d %H:%M:%S')}")
                 amp_info["consecutive_amp_skips"] = int(consecutive_amp_skips)
                 point_count_min = min(subtree_point_counts) if subtree_point_counts else None

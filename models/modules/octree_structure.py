@@ -1730,13 +1730,6 @@ class OctreeStructureAnalysis(nn.Module):
                         qs_override,
                         snap_delta_norm,
                     )
-                    leaf_pattern_diag = self._leaf_pattern_diagnosis_from_coords(
-                        work_xyz,
-                        tree_coords,
-                        source=str(source_tree.get("octree_context_scope", "prebuilt_global_voxel_coords"))
-                        if isinstance(source_tree, dict)
-                        else "prebuilt_global_voxel_coords",
-                    )
                     # Section1:
                     # local xyz再量子化ではなく、prebuilt global_voxel_coordsから
                     # parent node / child slot / 8-child occupancy patternを診断する。
