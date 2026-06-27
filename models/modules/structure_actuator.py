@@ -5690,8 +5690,18 @@ class StructureRepairActuator(nn.Module):
                 sparsepcgc_context and voxel_edit_state_enabled,
             )
         )
+        compression_backend = str(
+            getattr(self.args, "compression_loss_backend", "")
+        ).strip().lower()
+        keep_point_aligned_public_output = bool(
+            str(getattr(self.args, "trainORtest", "train")).strip().lower() == "train"
+            and (
+                compression_backend.endswith("_surrogate")
+                or compression_backend.endswith("_actual")
+            )
+        )
         point_soft_delta_debug = delta
-        if voxel_restored_output_enabled and voxel_edit_state_enabled:
+        if voxel_restored_output_enabled and voxel_edit_state_enabled and not keep_point_aligned_public_output:
             pts_out = self._voxel_centers_from_global_coords(
                 voxel_edit_final_coords,
                 voxel_step,
@@ -6694,6 +6704,16 @@ class StructureRepairActuator(nn.Module):
             "restored_xyz_debug": restored_xyz_debug,
             "restore_info": restore_info,
             "repair_output_voxel_restored_points": bool(voxel_restored_output_enabled),
+            "public_output_uses_voxel_restored_points": bool(
+                voxel_restored_output_enabled
+                and voxel_edit_state_enabled
+                and not keep_point_aligned_public_output
+            ),
+            "public_output_keeps_point_aligned_grad_path": bool(
+                voxel_restored_output_enabled
+                and voxel_edit_state_enabled
+                and keep_point_aligned_public_output
+            ),
             "final_voxel_update_mode": "occupied_voxel_edit_state_phase3",
             "final_voxel_recomputed_from_pts_out": False,
             "point_child_slots": point_child_slots,

@@ -565,6 +565,63 @@ def _select_actual_gen_xyz_from_voxel_state(
     }
 
 
+def _has_valid_compression_points(xyz):
+    return bool(
+        torch.is_tensor(xyz)
+        and xyz.ndim == 3
+        and xyz.shape[1] >= 3
+        and xyz.shape[-1] > 0
+    )
+
+
+def _select_compression_proxy_inputs(
+    args,
+    *,
+    grad_xyz,
+    actual_xyz,
+    final_w_for_loss,
+    voxel_state_used,
+    scope,
+):
+    actual_total_bit_mode = bool(uses_actual_total_bit_objective(args))
+    separate_grad_input = bool(actual_total_bit_mode and voxel_state_used)
+
+    if separate_grad_input or not voxel_state_used:
+        proxy_xyz = grad_xyz
+        proxy_source = f"{scope}_grad_xyz"
+    else:
+        proxy_xyz = actual_xyz
+        proxy_source = "voxel_restored_actual"
+
+    proxy_final_w = final_w_for_loss
+    if str(scope).strip().lower() == "subtree" and voxel_state_used and not separate_grad_input:
+        proxy_final_w = None
+
+    if not _has_valid_compression_points(proxy_xyz):
+        fallback_actual_valid = _has_valid_compression_points(actual_xyz)
+        proxy_xyz = actual_xyz if fallback_actual_valid else grad_xyz
+        proxy_source = "actual_fallback" if fallback_actual_valid else "grad_fallback"
+
+    debug = {
+        "compression_grad_input_source": str(proxy_source),
+        "compression_grad_input_uses_voxel_state": bool(
+            "voxel" in str(proxy_source) or "actual_fallback" == str(proxy_source)
+        ),
+        "compression_grad_input_separated_from_actual": bool(separate_grad_input),
+        "compression_grad_input_kept_final_w": bool(proxy_final_w is not None),
+        "compression_grad_input_tensor_requires_grad": bool(
+            torch.is_tensor(proxy_xyz) and proxy_xyz.requires_grad
+        ),
+        "compression_grad_input_final_w_requires_grad": bool(
+            torch.is_tensor(proxy_final_w) and proxy_final_w.requires_grad
+        ),
+        "compression_grad_input_expected_requires_grad": bool(
+            actual_total_bit_mode and _has_valid_compression_points(grad_xyz)
+        ),
+    }
+    return proxy_xyz, proxy_final_w, debug
+
+
 def _restore_codec_xyz_from_global_voxels(args, coords_b3n, context, like_xyz):
     if not torch.is_tensor(coords_b3n) or coords_b3n.ndim != 3 or coords_b3n.shape[1] != 3:
         return None
@@ -7538,7 +7595,14 @@ def run_episode_full_cloud_validation(
                             and not voxel_restored_actual_debug.get("fallback", False)
                         )
 
-                        validation_compression_source_xyz = gen_xyz_for_actual if validation_voxel_state_used else gen_xyz
+                        validation_compression_source_xyz, validation_final_w_for_loss, validation_proxy_input_debug = _select_compression_proxy_inputs(
+                            args,
+                            grad_xyz=gen_xyz,
+                            actual_xyz=gen_xyz_for_actual,
+                            final_w_for_loss=final_w_for_loss,
+                            voxel_state_used=validation_voxel_state_used,
+                            scope="full_cloud_validation",
+                        )
 
                         compression_gen_xyz, _ = prepare_compression_points(
                             validation_compression_source_xyz,
@@ -7554,6 +7618,8 @@ def run_episode_full_cloud_validation(
                         # Phase7-3: actual codecへ渡す点群だけの切替debug。
                         # geometry lossのgen_xyzは変更しない。
                         if isinstance(voxel_restored_actual_debug, dict):
+                            voxel_restored_actual_debug = dict(voxel_restored_actual_debug)
+                            voxel_restored_actual_debug.update(validation_proxy_input_debug)
                             try:
                                 setattr(args, "_last_voxel_restored_actual_debug", dict(voxel_restored_actual_debug))
                             except Exception:
@@ -7565,7 +7631,7 @@ def run_episode_full_cloud_validation(
                             args,
                             gen_xyz=compression_gen_xyz,
                             gt_xyz=input_xyz[:, :3, :],
-                            final_w=final_w_for_loss,
+                            final_w=validation_final_w_for_loss,
                             cache_key=cache_key,
                             refresh_actual_gen="always",
                             actual_gen_xyz=gen_xyz_for_actual,
@@ -8477,9 +8543,14 @@ def train(model, args, loss, writer, plot, notifier=None):
                                         and not voxel_restored_actual_debug.get("fallback", False)
                                     )
 
-                                    # voxel state 復元に成功した場合は、proxy側もactual側も同じ点群を使う。
-                                    # 復元に失敗した場合だけ従来のgen_xyzへfallbackする。
-                                    full_cloud_compression_source_xyz = gen_xyz_for_actual if full_cloud_voxel_state_used else gen_xyz
+                                    full_cloud_compression_source_xyz, full_cloud_final_w_for_compression, full_cloud_proxy_input_debug = _select_compression_proxy_inputs(
+                                        args,
+                                        grad_xyz=gen_xyz,
+                                        actual_xyz=gen_xyz_for_actual,
+                                        final_w_for_loss=final_w_for_loss,
+                                        voxel_state_used=full_cloud_voxel_state_used,
+                                        scope="full_cloud",
+                                    )
 
                                     compression_gen_xyz, noise_debug = prepare_compression_points(
                                         full_cloud_compression_source_xyz,
@@ -8487,6 +8558,16 @@ def train(model, args, loss, writer, plot, notifier=None):
                                         model,
                                         collect_stats=bool(log_this_step or profile_this_step),
                                     ) # 圧縮損失用の入力点群を作る
+
+                                    if isinstance(voxel_restored_actual_debug, dict):
+                                        voxel_restored_actual_debug = dict(voxel_restored_actual_debug)
+                                    else:
+                                        voxel_restored_actual_debug = {}
+                                    voxel_restored_actual_debug.update(full_cloud_proxy_input_debug)
+                                    try:
+                                        setattr(args, "_last_voxel_restored_actual_debug", dict(voxel_restored_actual_debug))
+                                    except Exception:
+                                        pass
 
                                     args._current_exact_teacher_mode = "full_cloud"
                                     args._current_exact_teacher_uses_full_context = False
@@ -8496,7 +8577,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                                         args,
                                         gen_xyz=compression_gen_xyz,
                                         gt_xyz=input_xyz[:, :3, :],
-                                        final_w=final_w_for_loss,
+                                        final_w=full_cloud_final_w_for_compression,
                                         cache_key=cache_key,
                                         refresh_actual_gen=refresh_actual_gen,
                                         actual_gen_xyz=gen_xyz_for_actual,
@@ -8504,6 +8585,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                                         full_octree_context=full_octree_context,
                                         octree_input_mode="full_cloud",
                                     )
+                                    full_cloud_comp_debug = dict(getattr(loss, "last_compression_debug", {}) or {})
+                                    full_cloud_comp_debug.update(voxel_restored_actual_debug)
+                                    loss.last_compression_debug = full_cloud_comp_debug
                                     if (
                                         bool(getattr(args, "sparsepcgc_actual_oracle_apply_full_override", False))
                                         and
@@ -8869,8 +8953,17 @@ def train(model, args, loss, writer, plot, notifier=None):
                                             # fallback時だけ従来の final_w_sub_loss を使う。
                                             final_w_sub_compression = None if subtree_voxel_state_used else final_w_sub_loss
 
+                                        subtree_proxy_input_xyz, subtree_final_w_for_compression, subtree_proxy_input_debug = _select_compression_proxy_inputs(
+                                            args,
+                                            grad_xyz=gen_subtree_xyz,
+                                            actual_xyz=subtree_compression_source_xyz,
+                                            final_w_for_loss=final_w_sub_loss,
+                                            voxel_state_used=subtree_voxel_state_used,
+                                            scope="subtree",
+                                        )
+
                                         compression_subtree_xyz, noise_debug_sub = prepare_compression_points(
-                                            subtree_compression_source_xyz,
+                                            subtree_proxy_input_xyz,
                                             args,
                                             model,
                                             collect_stats=bool(log_this_step or profile_this_step),
@@ -8890,11 +8983,16 @@ def train(model, args, loss, writer, plot, notifier=None):
                                                 "voxel_restored_actual_used": bool(subtree_voxel_state_used),
                                                 "voxel_restored_actual_fallback": bool(voxel_restored_actual_debug.get("fallback", False)),
                                                 "voxel_restored_actual_fallback_reason": str(voxel_restored_actual_debug.get("reason", "")),
-                                                "subtree_proxy_uses_voxel_state": bool(subtree_voxel_state_used),
+                                                "subtree_proxy_uses_voxel_state": bool(
+                                                    subtree_proxy_input_debug.get("compression_grad_input_uses_voxel_state", False)
+                                                ),
                                                 "subtree_actual_uses_voxel_state": bool(subtree_voxel_state_used),
-                                                "subtree_final_w_disabled_for_voxel_state": bool(subtree_voxel_state_used),
+                                                "subtree_final_w_disabled_for_voxel_state": bool(
+                                                    subtree_final_w_for_compression is None
+                                                ),
                                             }
                                         )
+                                        voxel_restored_actual_debug.update(subtree_proxy_input_debug)
 
                                         try:
                                             setattr(args, "_last_voxel_restored_actual_debug", dict(voxel_restored_actual_debug))
@@ -8907,7 +9005,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                                             args,
                                             gen_xyz=compression_subtree_xyz,
                                             gt_xyz=subtree_xyz[:, :3, :],
-                                            final_w=final_w_sub_compression,
+                                            final_w=subtree_final_w_for_compression,
                                             cache_key=subtree_cache_key,
                                             refresh_actual_gen=refresh_actual_gen,
                                             actual_gen_xyz=subtree_voxel_state_xyz,

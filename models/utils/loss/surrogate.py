@@ -348,7 +348,10 @@ class SurrogateCompressionLossMixin:
                 pad = weights_all.new_ones(*weights_all.shape[:-1], N - weights_all.shape[-1])
                 weights_all = torch.cat([weights_all, pad], dim=-1)
             weights_all = torch.nan_to_num(weights_all, nan=0.0, posinf=1.0, neginf=0.0)
-            weights_all = weights_all.clamp(0.0, 1.0)
+            # final_w is hard-forward / soft-backward.
+            # A plain clamp on 0/1 values would zero the prune gradient here.
+            weights_all_clamped = weights_all.clamp(0.0, 1.0)
+            weights_all = weights_all_clamped.detach() + weights_all - weights_all.detach()
 
         features = []
         ref_min = gt_xyz.detach().amin(dim=2)
@@ -1446,6 +1449,27 @@ class SurrogateCompressionLossMixin:
         surrogate_loss_against_train_target = F.smooth_l1_loss(pred_percent.reshape(1), train_target_t.detach().reshape(1), reduction="mean")
         surrogate_loss_against_raw_actual = F.smooth_l1_loss(pred_percent.reshape(1), raw_actual_t.detach().reshape(1), reduction="mean")
         teacher_is_actual_for_control = bool(actual_value_source in {"fresh_teacher", "target_cache", "stale_target"})
+        proxy_main_with_actual_teacher = bool(
+            getattr(args, "compression_surrogate_proxy_main_with_actual_teacher", False)
+        )
+        proxy_grad_with_actual_teacher = bool(
+            getattr(args, "compression_surrogate_proxy_grad_with_actual_teacher", False)
+        )
+        sparse_aux_with_actual_teacher = bool(
+            getattr(args, "sparsepcgc_aux_with_actual_teacher", False)
+        )
+        proxy_main_allowed = bool(
+            (not teacher_is_actual_for_control) or proxy_main_with_actual_teacher
+        )
+        proxy_grad_allowed = bool(
+            (not teacher_is_actual_for_control) or proxy_grad_with_actual_teacher
+        )
+        sparse_aux_actual_teacher_allowed = bool(
+            (not teacher_is_actual_for_control) or sparse_aux_with_actual_teacher
+        )
+        proxy_main_block_reason = "" if proxy_main_allowed else "blocked_by_actual_teacher"
+        proxy_grad_block_reason = "" if proxy_grad_allowed else "blocked_by_actual_teacher"
+        sparse_aux_block_reason = "" if sparse_aux_actual_teacher_allowed else "blocked_by_actual_teacher"
         auto_freeze_debug = self._update_surrogate_auto_freeze_state(
             args,
             abs_error=self._scalar(surrogate_abs_bit_error),
@@ -1583,16 +1607,17 @@ class SurrogateCompressionLossMixin:
                     else forward_teacher_percent_t
                 )
 
-        main_loss = main_loss + soft_rate_proxy_ste + soft_prune_rate_ste
+        if proxy_main_allowed:
+            main_loss = main_loss + soft_rate_proxy_ste + soft_prune_rate_ste
         if not detach_surrogate_from_network:
             surrogate_loss_for_grad_weighted = surrogate_loss_for_grad_weighted + (
                 soft_rate_proxy_grad_weight * soft_rate_proxy_for_grad
-                if inputs_finite and soft_rate_proxy_grad_weight > 0.0
+                if proxy_grad_allowed and inputs_finite and soft_rate_proxy_grad_weight > 0.0
                 else gen_xyz.new_zeros(())
             )
             surrogate_loss_for_grad_weighted = surrogate_loss_for_grad_weighted + (
                 prune_rate_proxy_grad_weight * prune_com_proxy
-                if inputs_finite and prune_com_proxy.requires_grad and prune_rate_proxy_grad_weight > 0.0
+                if proxy_grad_allowed and inputs_finite and prune_com_proxy.requires_grad and prune_rate_proxy_grad_weight > 0.0
                 else gen_xyz.new_zeros(())
             )
         else:
@@ -1645,10 +1670,20 @@ class SurrogateCompressionLossMixin:
         sparsepcgc_aux_gate_mode = str(getattr(args, "sparsepcgc_aux_gate_mode", "hard")).strip().lower()
         sparsepcgc_aux_min_corr = float(getattr(args, "sparsepcgc_aux_min_corr", 0.30))
         sparsepcgc_aux_min_sign = float(getattr(args, "sparsepcgc_aux_min_sign_match", 0.50))
-        sparsepcgc_aux_used_for_backprop = bool(sparsepcgc_aux_backprop_requested)
-        sparsepcgc_aux_gating_reason = "disabled_by_arg"
+        sparsepcgc_aux_used_for_backprop = bool(
+            sparsepcgc_aux_backprop_requested and sparse_aux_actual_teacher_allowed
+        )
+        sparsepcgc_aux_gating_reason = (
+            "disabled_by_arg"
+            if not sparsepcgc_aux_backprop_requested
+            else (
+                "blocked_by_actual_teacher"
+                if not sparse_aux_actual_teacher_allowed
+                else "enabled"
+            )
+        )
         sparsepcgc_aux_gate_multiplier = 1.0 if sparsepcgc_aux_used_for_backprop else 0.0
-        if sparsepcgc_aux_backprop_requested and sparsepcgc_aux_gating:
+        if sparsepcgc_aux_used_for_backprop and sparsepcgc_aux_gating:
             if sparsepcgc_aux_gate_mode == "soft":
                 min_mult = min(max(float(getattr(args, "sparsepcgc_aux_soft_min_weight", 0.05)), 0.0), 1.0)
                 if sparse_corr is None or sparse_sign_match is None:
@@ -1685,7 +1720,7 @@ class SurrogateCompressionLossMixin:
                     sparsepcgc_aux_gating_reason = "sign_match_below_threshold"
                 else:
                     sparsepcgc_aux_gating_reason = "passed"
-        elif sparsepcgc_aux_backprop_requested:
+        elif sparsepcgc_aux_backprop_requested and sparse_aux_actual_teacher_allowed:
             sparsepcgc_aux_gating_reason = "gating_disabled"
         sparsepcgc_aux_weight_effective = sparsepcgc_aux_weight * sparsepcgc_aux_gate_multiplier if sparsepcgc_aux_used_for_backprop else 0.0
         sparse_aux_objective = sparsepcgc_aux_weight_effective * sparse_aux_raw if sparsepcgc_aux_used_for_backprop else sparse_aux_loss.new_zeros(())
@@ -1851,6 +1886,10 @@ class SurrogateCompressionLossMixin:
             "compression_aux_in_objective": bool(getattr(args, "compression_surrogate_aux_in_objective", False)),
             "compression_main_grad_scale": float(main_grad_scale),
             "compression_main_grad_scale_reason": str(main_grad_scale_reason),
+            "proxy_main_used_for_backprop": bool(proxy_main_allowed),
+            "proxy_grad_used_for_backprop": bool(proxy_grad_allowed),
+            "proxy_main_block_reason": str(proxy_main_block_reason),
+            "proxy_grad_block_reason": str(proxy_grad_block_reason),
             "compression_proxy_input_mode": compression_proxy_input_mode,
             "compression_proxy_uses_subtree_tree": bool(uses_subtree_tree),
             "compression_proxy_uses_full_context": bool(isinstance(full_octree_context, dict)),
@@ -1866,6 +1905,8 @@ class SurrogateCompressionLossMixin:
             "sparsepcgc_aux_weight_effective": float(sparsepcgc_aux_weight_effective),
             "sparsepcgc_aux_backprop": bool(sparsepcgc_aux_backprop_requested),
             "sparsepcgc_aux_used_for_backprop": bool(sparsepcgc_aux_used_for_backprop),
+            "sparsepcgc_aux_actual_teacher_allowed": bool(sparse_aux_actual_teacher_allowed),
+            "sparsepcgc_aux_block_reason": str(sparse_aux_block_reason),
             "sparsepcgc_aux_gating_enabled": bool(sparsepcgc_aux_gating),
             "sparsepcgc_aux_gate_mode": str(sparsepcgc_aux_gate_mode),
             "sparsepcgc_aux_gate_multiplier": float(sparsepcgc_aux_gate_multiplier),

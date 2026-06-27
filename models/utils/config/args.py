@@ -1908,6 +1908,18 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--compression_soft_rate_proxy_grad_weight', default=0.05, type=float, help='actual値forwardにsoft rate proxy勾配だけを足すSTE重み')
     parser.add_argument('--compression_soft_prune_rate_proxy_grad_weight', default=1.0, type=float, help='actual値forwardにsoft prune proxy勾配だけを足すSTE重み')
     parser.add_argument(
+        '--compression_surrogate_proxy_main_with_actual_teacher',
+        default=False,
+        type=str2bool,
+        help='actual teacherが取れているstepでもsoft rate/prune proxyをcompression mainへ足すか。Falseならactual主目的を優先する',
+    )
+    parser.add_argument(
+        '--compression_surrogate_proxy_grad_with_actual_teacher',
+        default=False,
+        type=str2bool,
+        help='actual teacherが取れているstepでもsoft rate/prune proxy勾配をSurrogate主目的へ足すか。Falseならactual mimic勾配を優先する',
+    )
+    parser.add_argument(
         '--compression_soft_prune_where_proxy_grad_weight',
         default=0.0002,
         type=float,
@@ -1950,6 +1962,12 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--compression_surrogate_loss_scale', default=100.0, type=float, help='旧互換用。実圧縮教師百分率モードでは未使用')
     parser.add_argument('--sparsepcgc_aux_loss', default=True, type=str2bool, help='SparsePCGC向けactive coordinate/孤立proxy補助lossを使うか')
     parser.add_argument('--sparsepcgc_aux_backprop', default=False, type=str2bool, help='SparsePCGC soft proxy補助項を主圧縮lossへ勾配として流すか。Falseなら補助値は別ログに残し、実bit Surrogate本体を最適化する')
+    parser.add_argument(
+        '--sparsepcgc_aux_with_actual_teacher',
+        default=False,
+        type=str2bool,
+        help='actual teacherが取れているstepでもSparsePCGC soft proxy補助項をbackpropへ使うか。Falseならactual圧縮値と競合させない',
+    )
     parser.add_argument('--sparsepcgc_active_coord_weight', default=0.60, type=float, help='SparsePCGC補助loss内のactive coordinate削減項重み')
     parser.add_argument('--sparsepcgc_isolated_proxy_weight', default=0.25, type=float, help='SparsePCGC補助loss内の孤立voxel proxy項重み')
     parser.add_argument('--sparsepcgc_entropy_proxy_weight', default=0.15, type=float, help='SparsePCGC補助loss内のoccupancy entropy proxy項重み')
@@ -3465,12 +3483,21 @@ def parse_pugan_args(parser, file_day, file_time):
     args.compression_surrogate_aux_in_objective = bool(
         getattr(args, "compression_surrogate_aux_in_objective", False)
     )
+    args.compression_surrogate_proxy_main_with_actual_teacher = bool(
+        getattr(args, "compression_surrogate_proxy_main_with_actual_teacher", False)
+    )
+    args.compression_surrogate_proxy_grad_with_actual_teacher = bool(
+        getattr(args, "compression_surrogate_proxy_grad_with_actual_teacher", False)
+    )
     args.compression_surrogate_log_soft_aux = bool(
         getattr(args, "compression_surrogate_log_soft_aux", True)
     )
     args.com_sparsepcgc = max(float(getattr(args, "com_sparsepcgc", 0.0)), 0.0)
     args.sparsepcgc_aux_loss = bool(getattr(args, "sparsepcgc_aux_loss", True))
     args.sparsepcgc_aux_backprop = bool(getattr(args, "sparsepcgc_aux_backprop", False))
+    args.sparsepcgc_aux_with_actual_teacher = bool(
+        getattr(args, "sparsepcgc_aux_with_actual_teacher", False)
+    )
     args.sparsepcgc_active_coord_weight = max(float(getattr(args, "sparsepcgc_active_coord_weight", 0.60)), 0.0)
     args.sparsepcgc_isolated_proxy_weight = max(float(getattr(args, "sparsepcgc_isolated_proxy_weight", 0.25)), 0.0)
     args.sparsepcgc_entropy_proxy_weight = max(float(getattr(args, "sparsepcgc_entropy_proxy_weight", 0.15)), 0.0)
@@ -3811,6 +3838,12 @@ def parse_pugan_args(parser, file_day, file_time):
                 float(getattr(args, "compression_soft_prune_rate_proxy_grad_weight", 1.0)),
                 0.10,
             )
+        if not _cli_option_was_provided("--compression_surrogate_proxy_main_with_actual_teacher"):
+            args.compression_surrogate_proxy_main_with_actual_teacher = False
+        if not _cli_option_was_provided("--compression_surrogate_proxy_grad_with_actual_teacher"):
+            args.compression_surrogate_proxy_grad_with_actual_teacher = False
+        if not _cli_option_was_provided("--sparsepcgc_aux_with_actual_teacher"):
+            args.sparsepcgc_aux_with_actual_teacher = False
         if not _cli_option_was_provided("--sparsepcgc_active_coord_weight"):
             args.sparsepcgc_active_coord_weight = max(float(getattr(args, "sparsepcgc_active_coord_weight", 0.60)), 1.00)
         if not _cli_option_was_provided("--sparsepcgc_isolated_proxy_weight"):
