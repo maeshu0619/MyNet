@@ -86,12 +86,6 @@ def log_loss_weight_setup(writer, args):
         )
         writer.write("Compression Surrogate Backward: enabled")
         writer.write(
-            "Compression Surrogate Proxy/Aux Gating: "
-            f"proxy_main_with_actual_teacher={bool(getattr(args, 'compression_surrogate_proxy_main_with_actual_teacher', False))}, "
-            f"proxy_grad_with_actual_teacher={bool(getattr(args, 'compression_surrogate_proxy_grad_with_actual_teacher', False))}, "
-            f"sparse_aux_with_actual_teacher={bool(getattr(args, 'sparsepcgc_aux_with_actual_teacher', False))}"
-        )
-        writer.write(
             f"Surrogate compression objective on {compression_backend}: "
             "actual_total_bit_percent = 100*(Mine_bits-GT_bits)/GT_bits with surrogate backward; "
             "soft auxiliary proxies are diagnostics unless explicitly enabled."

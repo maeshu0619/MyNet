@@ -217,8 +217,11 @@ def actual_compression_plot_metric(loss_obj, device):
     if "surrogate_teacher_is_actual" in comp_debug and not bool(comp_debug.get("surrogate_teacher_is_actual", False)): # local_proxyなど実codecでない教師は除外する
         return None # 実圧縮ではない値をactual_compressionグラフへ混ぜない
     actual_value = comp_debug.get(
-        "actual_train_objective_percent",
-        comp_debug.get("actual_total_bit_percent", None),
+        "compression_loss_L_com",
+        comp_debug.get(
+            "actual_train_objective_percent",
+            comp_debug.get("actual_total_bit_percent", None),
+        ),
     ) # L_comに使った実codec objectiveを取り出す
     if actual_value is None:
         return None # 実圧縮値が無いStepはplot集計から除外する

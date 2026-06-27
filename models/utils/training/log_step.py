@@ -77,6 +77,60 @@ def _compression_debug_fresh_actual(args, comp_debug):
     return False
 
 
+def _resolve_actual_compression_loss(comp_debug):
+    return _first_value(
+        comp_debug,
+        (
+            "actual_total_bit_percent",
+            "actual_train_objective_percent",
+            "actual_bit_percent",
+        ),
+        float("nan"),
+    )
+
+
+def _resolve_actual_bits_before_after(comp_debug):
+    gt_bits = _first_value(
+        comp_debug,
+        ("gt_actual_bit", "before_bits", "actual_gt_bits"),
+        float("nan"),
+    )
+    gen_bits = _first_value(
+        comp_debug,
+        (
+            "gen_total_bit_with_edit_record",
+            "actual_total_bits",
+            "gen_actual_bit",
+            "after_bits",
+        ),
+        float("nan"),
+    )
+    return _to_float(gt_bits, float("nan")), _to_float(gen_bits, float("nan"))
+
+
+def log_actual_compression_loss(writer, comp_debug):
+    if writer is None or not hasattr(writer, "write"):
+        return
+    comp_debug = comp_debug if isinstance(comp_debug, dict) else {}
+    actual_compression_loss = _resolve_actual_compression_loss(comp_debug)
+    source = str(comp_debug.get("actual_value_source", "unknown"))
+    freshness = "fresh" if bool(comp_debug.get("actual_value_is_fresh", False)) else "stale"
+    extra = ""
+    if not math.isfinite(_to_float(actual_compression_loss, float("nan"))):
+        if bool(comp_debug.get("actual_codec_fallback_to_proxy", False)):
+            extra = " (proxy_fallback)"
+        elif bool(comp_debug.get("actual_codec_skipped_by_interval", False)):
+            extra = " (skipped_by_interval)"
+        elif source == "local_proxy":
+            extra = " (local_proxy)"
+        elif source in {"target_cache", "stale_target"}:
+            extra = " (cached_target)"
+    writer.write(
+        f"Actual Compression Loss: {_fmt(actual_compression_loss, 6)} "
+        f"[source={source}, {freshness}]{extra}"
+    )
+
+
 def log_step_loss(
     writer,
     step,
@@ -116,12 +170,24 @@ def log_step_loss(
 
 
 def log_compression_stats(writer, step, num_steps, comp_debug):
+    gt_actual_bit, gen_actual_bit = _resolve_actual_bits_before_after(comp_debug)
+    actual_total_bit_percent = _first_value(
+        comp_debug,
+        ("actual_total_bit_percent", "actual_train_objective_percent", "actual_bit_percent"),
+        float("nan"),
+    )
+    actual_raw_percent = _first_value(
+        comp_debug,
+        ("actual_raw_percent", "actual_total_bit_percent"),
+        float("nan"),
+    )
+    log_actual_compression_loss(writer, comp_debug)
     writer.write(
         f"CompressionStats step={step + 1}/{num_steps}: "
-        f"actual_bit:{float(comp_debug.get('gt_actual_bit', float('nan'))):.6f}"
-        f"->{float(comp_debug.get('gen_actual_bit', float('nan'))):.6f}, "
-        f"actual_bit_percent={float(comp_debug.get('actual_total_bit_percent', comp_debug.get('total_bit', 0.0))):.6f}, "
-        f"actual_raw_percent={float(comp_debug.get('actual_raw_percent', comp_debug.get('actual_total_bit_percent', 0.0))):.6f}, "
+        f"actual_bit:{_fmt(gt_actual_bit, 6)}"
+        f"->{_fmt(gen_actual_bit, 6)}, "
+        f"actual_bit_percent={_fmt(actual_total_bit_percent, 6)}, "
+        f"actual_raw_percent={_fmt(actual_raw_percent, 6)}, "
         f"edit_record_bits={float(comp_debug.get('actual_edit_record_bits', 0.0)):.3f}, "
         f"codec_points={int(comp_debug.get('gt_points', 0))}->{int(comp_debug.get('gen_points', 0))}, "
         f"unique_coords={int(comp_debug.get('gt_unique_coord_count', 0))}->{int(comp_debug.get('gen_unique_coord_count', 0))}, "
@@ -145,12 +211,6 @@ def log_compression_stats(writer, step, num_steps, comp_debug):
         f"sparsepcgc_aux_weight_effective={float(comp_debug.get('sparsepcgc_aux_weight_effective', 0.0)):.6f}, "
         f"sparsepcgc_aux_gate={comp_debug.get('sparsepcgc_aux_gating_reason', '')}, "
         f"grad_source={comp_debug.get('grad_source', '')}, "
-        f"grad_input={comp_debug.get('compression_grad_input_source', '')}, "
-        f"grad_input_voxel={bool(comp_debug.get('compression_grad_input_uses_voxel_state', False))}, "
-        f"grad_input_split={bool(comp_debug.get('compression_grad_input_separated_from_actual', False))}, "
-        f"grad_input_final_w={bool(comp_debug.get('compression_grad_input_kept_final_w', False))}, "
-        f"grad_input_xyz_req={bool(comp_debug.get('compression_grad_input_tensor_requires_grad', False))}, "
-        f"grad_input_w_req={bool(comp_debug.get('compression_grad_input_final_w_requires_grad', False))}, "
         f"surrogate_grad={float(comp_debug.get('surrogate_loss_for_grad', 0.0)):.6f}, "
         f"proxy_grad={float(comp_debug.get('proxy_aux_for_grad', 0.0)):.6f}, "
         f"lcom_without_sparse={float(comp_debug.get('lcom_without_sparsepcgc_aux', 0.0)):.6f}, "
@@ -253,10 +313,7 @@ def log_compression_train_debug(writer, step, num_steps, args, comp_debug, loss,
         f"teacher_ste[forward={float(comp_debug.get('actual_forward_value', 0.0)):.6f}, "
         f"surrogate_grad={float(comp_debug.get('surrogate_loss_for_grad', 0.0)):.6f}, "
         f"proxy_grad={float(comp_debug.get('proxy_aux_for_grad', 0.0)):.6f}, "
-        f"source={comp_debug.get('grad_source', '')}, "
-        f"proxy_main={bool(comp_debug.get('proxy_main_used_for_backprop', False))}, "
-        f"proxy_grad_used={bool(comp_debug.get('proxy_grad_used_for_backprop', False))}, "
-        f"sparse_aux_used={bool(comp_debug.get('sparsepcgc_aux_used_for_backprop', False))}], "
+        f"source={comp_debug.get('grad_source', '')}], "
         f"corr[surrogate={_to_float(comp_debug.get('corr_surrogate_actual', float('nan')), float('nan')):.6f}, "
         f"lcom={_to_float(comp_debug.get('corr_lcom_actual', float('nan')), float('nan')):.6f}, "
         f"cp_main={_to_float(comp_debug.get('corr_cp_main_actual', float('nan')), float('nan')):.6f}, "
@@ -462,6 +519,8 @@ def log_compact_step_summary(
     raw_lcom = _first_value(
         comp_debug,
         (
+            "compression_loss_L_com",
+            "compression_objective",
             "actual_total_bit_percent",
             "actual_bit_percent",
             "compression_forward_teacher_percent",
@@ -506,17 +565,21 @@ def log_compact_step_summary(
             f"dominant={comp_debug.get('cp_support_dominant', 'n/a')}"
         )
 
-    gt_bits = _first_value(comp_debug, ("gt_actual_bit", "gt_bit_abs", "actual_gt_bits"), float("nan"))
+    log_actual_compression_loss(writer, comp_debug)
+
+    gt_bits, oracle_gen_bits = _resolve_actual_bits_before_after(comp_debug)
     policy_mine_bits = _first_value(
         comp_debug,
-        ("policy_final_full_cloud_total_bit_with_edit_record", "policy_final_full_cloud_gen_bit"),
+        (
+            "policy_final_full_cloud_total_bit_with_edit_record",
+            "policy_final_full_cloud_gen_bit",
+            "gen_total_bit_with_edit_record",
+            "actual_total_bits",
+            "gen_actual_bit",
+        ),
         float("nan"),
     )
-    oracle_mine_bits = _first_value(
-        comp_debug,
-        ("gen_total_bit_with_edit_record", "actual_total_bits", "gen_actual_bit"),
-        float("nan"),
-    )
+    oracle_mine_bits = oracle_gen_bits
     if (
         (not math.isfinite(_to_float(policy_mine_bits, float("nan"))))
         and not bool(comp_debug.get("oracle_full_cloud_override_used", False))
@@ -524,7 +587,7 @@ def log_compact_step_summary(
         policy_mine_bits = oracle_mine_bits
     train_objective = _first_value(
         comp_debug,
-        ("actual_train_objective_percent", "actual_total_bit_percent", "actual_bit_percent", "total_bit"),
+        ("compression_loss_L_com", "actual_train_objective_percent", "actual_total_bit_percent", "actual_bit_percent", "total_bit"),
         float("nan"),
     )
     policy_actual = _first_value(

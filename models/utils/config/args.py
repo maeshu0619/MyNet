@@ -3570,6 +3570,10 @@ def parse_pugan_args(parser, file_day, file_time):
         if args.compression_loss_backend.endswith("_surrogate") and not _cli_option_was_provided("--surrogate_pretrain_actual_refresh_interval"):
             # 事前学習中はSparsePCGC teacherを毎Step更新し、ゼロ/ stale教師だけの学習を避ける。
             args.surrogate_pretrain_actual_refresh_interval = 1
+        if args.compression_loss_backend.endswith("_surrogate") and not _cli_option_was_provided("--actual_eval_interval"):
+            # train側のrefresh_actual_genがFalseだとsurrogate teacher更新自体が止まるため、
+            # SparsePCGC surrogateではactual teacherを毎Step更新する。
+            args.actual_eval_interval = 1
         if not _cli_option_was_provided("--compression_surrogate_forward_mode"):
             args.compression_surrogate_forward_mode = "teacher_ste"
         if args.compression_loss_backend.endswith("_surrogate") and not _cli_option_was_provided("--detach_surrogate_from_network"):
@@ -3838,12 +3842,6 @@ def parse_pugan_args(parser, file_day, file_time):
                 float(getattr(args, "compression_soft_prune_rate_proxy_grad_weight", 1.0)),
                 0.10,
             )
-        if not _cli_option_was_provided("--compression_surrogate_proxy_main_with_actual_teacher"):
-            args.compression_surrogate_proxy_main_with_actual_teacher = False
-        if not _cli_option_was_provided("--compression_surrogate_proxy_grad_with_actual_teacher"):
-            args.compression_surrogate_proxy_grad_with_actual_teacher = False
-        if not _cli_option_was_provided("--sparsepcgc_aux_with_actual_teacher"):
-            args.sparsepcgc_aux_with_actual_teacher = False
         if not _cli_option_was_provided("--sparsepcgc_active_coord_weight"):
             args.sparsepcgc_active_coord_weight = max(float(getattr(args, "sparsepcgc_active_coord_weight", 0.60)), 1.00)
         if not _cli_option_was_provided("--sparsepcgc_isolated_proxy_weight"):

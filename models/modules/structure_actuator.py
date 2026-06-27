@@ -2634,6 +2634,22 @@ class StructureRepairActuator(nn.Module):
                 + drop_operation_gate
                 - drop_operation_gate.detach()
             )
+        prune_gate_monotonic_floor = getattr(self.args, "_sparsepcgc_last_drop_gate_floor", None)
+        if self.training and prune_enabled and prune_gate_monotonic_floor is not None:
+            try:
+                prune_gate_monotonic_floor = float(prune_gate_monotonic_floor)
+            except Exception:
+                prune_gate_monotonic_floor = None
+        else:
+            prune_gate_monotonic_floor = None
+        if self.training and prune_enabled and prune_gate_monotonic_floor is not None:
+            drop_gate_floor_tensor = drop_operation_gate.new_tensor(float(prune_gate_monotonic_floor))
+            drop_operation_gate_monotonic = torch.maximum(drop_operation_gate, drop_gate_floor_tensor)
+            drop_operation_gate = (
+                drop_operation_gate_monotonic.detach()
+                + drop_operation_gate
+                - drop_operation_gate.detach()
+            )
 
         delete_prior = (
             0.95 * p_outlier
@@ -2681,6 +2697,18 @@ class StructureRepairActuator(nn.Module):
             max(float(getattr(self.args, "repair_drop_ratio_floor", 0.0)), 0.0),
             float(max_drop_ratio),
         )
+        prune_ratio_monotonic_floor = getattr(self.args, "_sparsepcgc_last_prune_ratio_floor", None)
+        if self.training and prune_enabled and prune_ratio_monotonic_floor is not None:
+            try:
+                prune_ratio_monotonic_floor = float(prune_ratio_monotonic_floor)
+            except Exception:
+                prune_ratio_monotonic_floor = None
+        else:
+            prune_ratio_monotonic_floor = None
+        monotonic_prune_floor_value = None if prune_ratio_monotonic_floor is None else max(
+            float(prune_ratio_monotonic_floor),
+            float(drop_ratio_floor),
+        )
         if self.training and prune_enabled and drop_ratio_floor > 0.0:
             learned_drop_ratio_floored = torch.maximum(
                 learned_drop_ratio,
@@ -2691,7 +2719,23 @@ class StructureRepairActuator(nn.Module):
                 + learned_drop_ratio
                 - learned_drop_ratio.detach()
             )
+        if self.training and prune_enabled and monotonic_prune_floor_value is not None:
+            monotonic_floor_tensor = learned_drop_ratio.new_tensor(float(monotonic_prune_floor_value))
+            learned_drop_ratio_monotonic = torch.maximum(learned_drop_ratio, monotonic_floor_tensor)
+            learned_drop_ratio = (
+                learned_drop_ratio_monotonic.detach()
+                + learned_drop_ratio
+                - learned_drop_ratio.detach()
+            )
         learned_drop_ratio = learned_drop_ratio * drop_operation_gate
+        if self.training and prune_enabled and monotonic_prune_floor_value is not None:
+            post_gate_floor_tensor = learned_drop_ratio.new_tensor(float(monotonic_prune_floor_value))
+            learned_drop_ratio_post_gate = torch.maximum(learned_drop_ratio, post_gate_floor_tensor)
+            learned_drop_ratio = (
+                learned_drop_ratio_post_gate.detach()
+                + learned_drop_ratio
+                - learned_drop_ratio.detach()
+            )
         codec_prune_prior_active_ratio = min(
             codec_prune_prior_ratio * codec_prune_prior_phase,
             float(max_drop_ratio),
@@ -2733,6 +2777,23 @@ class StructureRepairActuator(nn.Module):
         hard_drop_voxel_sum = pts_xyz.new_zeros(())
         # hard削除数は整数なので、学習比率の値だけを使ってVoxel選択数へ変換する。
         learned_drop_ratio_value = float(learned_drop_ratio.detach().mean().cpu()) if prune_enabled else 0.0
+        if self.training and prune_enabled:
+            try:
+                setattr(
+                    self.args,
+                    "_sparsepcgc_last_prune_ratio_floor",
+                    float(max(learned_drop_ratio_value, float(monotonic_prune_floor_value or 0.0))),
+                )
+            except Exception:
+                pass
+            try:
+                setattr(
+                    self.args,
+                    "_sparsepcgc_last_drop_gate_floor",
+                    float(drop_operation_gate.detach().mean().cpu()),
+                )
+            except Exception:
+                pass
         delete_prior = torch.sigmoid(delete_prior.clamp(-8.0, 8.0))
         delete_prior = delete_prior * drop_operation_gate
         drop_score_noise = max(
@@ -5678,8 +5739,8 @@ class StructureRepairActuator(nn.Module):
                     f"final_voxel_update_mode=state_update_from_initial_voxels, "
                     f"final_voxel_recomputed_from_pts_out=False, "
                     f"initial_voxel_point_count={int(voxel_coords.shape[2])}, "
-                    f"final_voxel_point_count={int(voxel_edit_final_coords.shape[2])}, "
-                    f"final_voxel_added_slots={int(voxel_edit_final_coords.shape[2] - voxel_coords.shape[2])}"
+                    f"final_voxel_point_count={int(final_voxel_coords.shape[2])}, "
+                    f"final_voxel_added_slots={int(final_voxel_coords.shape[2] - voxel_coords.shape[2])}"
                 )
         # SparsePCGC/Voxel modeでは、Actuatorの公開出力もoccupied voxel状態から復元する。
         # 点ごとのsoft座標差分はproxy勾配用に内部で使うだけで、出力点群にはしない。
@@ -5690,18 +5751,8 @@ class StructureRepairActuator(nn.Module):
                 sparsepcgc_context and voxel_edit_state_enabled,
             )
         )
-        compression_backend = str(
-            getattr(self.args, "compression_loss_backend", "")
-        ).strip().lower()
-        keep_point_aligned_public_output = bool(
-            str(getattr(self.args, "trainORtest", "train")).strip().lower() == "train"
-            and (
-                compression_backend.endswith("_surrogate")
-                or compression_backend.endswith("_actual")
-            )
-        )
         point_soft_delta_debug = delta
-        if voxel_restored_output_enabled and voxel_edit_state_enabled and not keep_point_aligned_public_output:
+        if voxel_restored_output_enabled and voxel_edit_state_enabled:
             pts_out = self._voxel_centers_from_global_coords(
                 voxel_edit_final_coords,
                 voxel_step,
@@ -5982,6 +6033,9 @@ class StructureRepairActuator(nn.Module):
             ).detach(),
             "codec_prune_prior_block_count_mean": pts_xyz.new_tensor(
                 float(sum(codec_prune_prior_block_counts)) / max(float(len(codec_prune_prior_block_counts)), 1.0)
+            ).detach(),
+            "prune_ratio_monotonic_floor": pts_xyz.new_tensor(
+                float(monotonic_prune_floor_value if monotonic_prune_floor_value is not None else float("nan"))
             ).detach(),
             "raw_learned_drop_ratio": raw_learned_drop_ratio.mean().detach(),
             "raw_learned_add_ratio": raw_learned_add_ratio.mean().detach(),
@@ -6446,6 +6500,9 @@ class StructureRepairActuator(nn.Module):
             "codec_prune_prior_block_count_mean": pts_xyz.new_tensor(
                 float(sum(codec_prune_prior_block_counts)) / max(float(len(codec_prune_prior_block_counts)), 1.0)
             ),
+            "prune_ratio_monotonic_floor": pts_xyz.new_tensor(
+                float(monotonic_prune_floor_value if monotonic_prune_floor_value is not None else float("nan"))
+            ),
             "raw_learned_drop_ratio": raw_learned_drop_ratio.mean(),
             "raw_learned_add_ratio": raw_learned_add_ratio.mean(),
             "raw_learned_move_ratio": raw_learned_move_ratio.mean(),
@@ -6704,16 +6761,6 @@ class StructureRepairActuator(nn.Module):
             "restored_xyz_debug": restored_xyz_debug,
             "restore_info": restore_info,
             "repair_output_voxel_restored_points": bool(voxel_restored_output_enabled),
-            "public_output_uses_voxel_restored_points": bool(
-                voxel_restored_output_enabled
-                and voxel_edit_state_enabled
-                and not keep_point_aligned_public_output
-            ),
-            "public_output_keeps_point_aligned_grad_path": bool(
-                voxel_restored_output_enabled
-                and voxel_edit_state_enabled
-                and keep_point_aligned_public_output
-            ),
             "final_voxel_update_mode": "occupied_voxel_edit_state_phase3",
             "final_voxel_recomputed_from_pts_out": False,
             "point_child_slots": point_child_slots,

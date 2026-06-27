@@ -348,10 +348,7 @@ class SurrogateCompressionLossMixin:
                 pad = weights_all.new_ones(*weights_all.shape[:-1], N - weights_all.shape[-1])
                 weights_all = torch.cat([weights_all, pad], dim=-1)
             weights_all = torch.nan_to_num(weights_all, nan=0.0, posinf=1.0, neginf=0.0)
-            # final_w is hard-forward / soft-backward.
-            # A plain clamp on 0/1 values would zero the prune gradient here.
-            weights_all_clamped = weights_all.clamp(0.0, 1.0)
-            weights_all = weights_all_clamped.detach() + weights_all - weights_all.detach()
+            weights_all = weights_all.clamp(0.0, 1.0)
 
         features = []
         ref_min = gt_xyz.detach().amin(dim=2)
@@ -989,6 +986,7 @@ class SurrogateCompressionLossMixin:
             float(getattr(args, "sparsepcgc_policy_actual_noop_guard_margin", 0.0)),
             0.0,
         )
+        policy_actual_noop_guard_percent = float("nan")
         policy_actual_noop_guard_raw_percent = float("nan")
         policy_actual_noop_guard_raw_bit = float("nan")
         policy_actual_noop_guard_raw_total_bit = float("nan")
@@ -1067,6 +1065,7 @@ class SurrogateCompressionLossMixin:
                 float(getattr(args, "sparsepcgc_policy_actual_noop_guard_margin", 0.0)),
                 0.0,
             )
+            policy_actual_noop_guard_percent = float(actual_bit_percent)
             policy_actual_noop_guard_raw_percent = float(actual_bit_percent)
             policy_actual_noop_guard_raw_bit = float(raw_gen_bit)
             policy_actual_noop_guard_raw_total_bit = float(gen_total_bit_with_edit_record)
@@ -1077,14 +1076,7 @@ class SurrogateCompressionLossMixin:
                 and float(actual_bit_percent) > float(policy_actual_noop_guard_margin)
             ):
                 policy_actual_noop_guard_used = True
-                stats_gen = dict(cached_gt)
-                raw_gen_bit = float(cached_gt["bit"])
-                actual_edit_record_bits = 0.0
-                gen_total_bit_with_edit_record = float(cached_gt["bit"])
-                stats_for_target = dict(cached_gt)
-                stats_for_target["bit"] = float(cached_gt["bit"])
-                actual_raw_percent_value = 0.0
-                actual_bit_percent = 0.0
+                policy_actual_noop_guard_percent = 0.0
             actual_bpp_percent = self._relative_percent(float(stats_gen["bpp"]), float(cached_gt["bpp"]))
             actual_single_percent = self._relative_percent(
                 float(stats_gen["single"]),
@@ -1142,7 +1134,8 @@ class SurrogateCompressionLossMixin:
                     "actual_edit_record_bits": float(actual_edit_record_bits),
                     "policy_actual_noop_guard_used": bool(policy_actual_noop_guard_used),
                     "policy_actual_noop_guard_margin": float(policy_actual_noop_guard_margin),
-                    "policy_actual_noop_guard_raw_percent": float(policy_actual_noop_guard_raw_percent),
+                    "policy_actual_noop_guard_percent": float(policy_actual_noop_guard_percent),
+                    # "policy_actual_noop_guard_raw_percent": float(policy_actual_noop_guard_raw_percent),
                     "policy_actual_noop_guard_raw_bit": float(policy_actual_noop_guard_raw_bit),
                     "policy_actual_noop_guard_raw_total_bit": float(policy_actual_noop_guard_raw_total_bit),
                     "policy_actual_noop_guard_raw_edit_record_bits": float(policy_actual_noop_guard_raw_edit_record_bits),
@@ -1185,18 +1178,26 @@ class SurrogateCompressionLossMixin:
             )
         elif local_proxy_teacher and inputs_finite:
             teacher_codec = self._surrogate_backend_label(args).replace("_surrogate", "")
-            cached_gt = {
-                "bit": 0.0,
-                "bpp": 0.0,
-                "bpn": 0.0,
-                "single": 0.0,
-                "node": 0.0,
-                "octree_single": 0.0,
-                "octree_node": 0.0,
-                "octree_depth": 0,
-                "point_count": int(gt_xyz.shape[-1]),
-                "codec": teacher_codec,
-            }
+            cached_gt = self._get_cached_actual_gt(cache_key)
+            if cached_gt is None:
+                try:
+                    cached_gt = self._encode_actual_batch(args, gt_xyz)
+                    self._store_cached_actual_gt(cache_key, cached_gt)
+                except Exception:
+                    cached_gt = None
+            if cached_gt is None:
+                cached_gt = {
+                    "bit": 0.0,
+                    "bpp": 0.0,
+                    "bpn": 0.0,
+                    "single": 0.0,
+                    "node": 0.0,
+                    "octree_single": 0.0,
+                    "octree_node": 0.0,
+                    "octree_depth": 0,
+                    "point_count": int(gt_xyz.shape[-1]),
+                    "codec": teacher_codec,
+                }
             local_aux_target = (
                 aux_node_weight * soft_node_percent.to(device=gen_xyz.device, dtype=torch.float32)
                 + aux_single_weight * soft_single_percent.to(device=gen_xyz.device, dtype=torch.float32)
@@ -1275,6 +1276,9 @@ class SurrogateCompressionLossMixin:
             policy_actual_noop_guard_margin = float(
                 target_entry.get("policy_actual_noop_guard_margin", policy_actual_noop_guard_margin)
             )
+            # policy_actual_noop_guard_percent = float(
+            #     target_entry.get("policy_actual_noop_guard_percent", policy_actual_noop_guard_percent)
+            # )
             policy_actual_noop_guard_raw_percent = float(
                 target_entry.get("policy_actual_noop_guard_raw_percent", policy_actual_noop_guard_raw_percent)
             )
@@ -1424,7 +1428,7 @@ class SurrogateCompressionLossMixin:
         forward_teacher_raw_percent_value = float(actual_bit_percent)
         # Surrogateへ渡す教師値は、target生成時のclamp/transformと揃えて学習を安定化する。
         # raw actual percent は別途ログに残し、loss側だけを安全な値へ寄せる。
-        forward_teacher_percent_value = float(target_train_percent_value)
+        forward_teacher_percent_value = float(actual_bit_percent)
         forward_teacher_source = str(actual_value_source)
         if actual_value_source == "local_proxy":
             forward_teacher_percent_value = float(target_train_percent_value)
@@ -1449,27 +1453,10 @@ class SurrogateCompressionLossMixin:
         surrogate_loss_against_train_target = F.smooth_l1_loss(pred_percent.reshape(1), train_target_t.detach().reshape(1), reduction="mean")
         surrogate_loss_against_raw_actual = F.smooth_l1_loss(pred_percent.reshape(1), raw_actual_t.detach().reshape(1), reduction="mean")
         teacher_is_actual_for_control = bool(actual_value_source in {"fresh_teacher", "target_cache", "stale_target"})
-        proxy_main_with_actual_teacher = bool(
-            getattr(args, "compression_surrogate_proxy_main_with_actual_teacher", False)
-        )
-        proxy_grad_with_actual_teacher = bool(
-            getattr(args, "compression_surrogate_proxy_grad_with_actual_teacher", False)
-        )
-        sparse_aux_with_actual_teacher = bool(
-            getattr(args, "sparsepcgc_aux_with_actual_teacher", False)
-        )
-        proxy_main_allowed = bool(
-            (not teacher_is_actual_for_control) or proxy_main_with_actual_teacher
-        )
-        proxy_grad_allowed = bool(
-            (not teacher_is_actual_for_control) or proxy_grad_with_actual_teacher
-        )
         sparse_aux_actual_teacher_allowed = bool(
-            (not teacher_is_actual_for_control) or sparse_aux_with_actual_teacher
+            (not teacher_is_actual_for_control)
+            or bool(getattr(args, "sparsepcgc_aux_with_actual_teacher", False))
         )
-        proxy_main_block_reason = "" if proxy_main_allowed else "blocked_by_actual_teacher"
-        proxy_grad_block_reason = "" if proxy_grad_allowed else "blocked_by_actual_teacher"
-        sparse_aux_block_reason = "" if sparse_aux_actual_teacher_allowed else "blocked_by_actual_teacher"
         auto_freeze_debug = self._update_surrogate_auto_freeze_state(
             args,
             abs_error=self._scalar(surrogate_abs_bit_error),
@@ -1528,11 +1515,14 @@ class SurrogateCompressionLossMixin:
             effective_point_count = point_w.clamp(0.0, 1.0).sum(dim=1).mean()
         ref_point_count = gen_xyz.new_tensor(float(max(int(gt_xyz.shape[-1]), 1)), dtype=torch.float32)
         soft_point_percent = 100.0 * (effective_point_count - ref_point_count) / ref_point_count.abs().clamp_min(1.0)
+        sparsepcgc_soft_rate_weight = float(getattr(args, "compression_soft_rate_sparsepcgc_weight", 0.05))
+        if teacher_is_actual_for_control and not sparse_aux_actual_teacher_allowed:
+            sparsepcgc_soft_rate_weight = 0.0
         soft_rate_proxy_for_grad = (
             float(getattr(args, "compression_soft_rate_point_weight", 0.25)) * soft_point_percent
             + float(getattr(args, "compression_soft_rate_node_weight", 0.10)) * loss_nodes
             + float(getattr(args, "compression_soft_rate_single_weight", 0.05)) * loss_single
-            + float(getattr(args, "compression_soft_rate_sparsepcgc_weight", 0.05)) * sparse_terms["loss"].to(device=gen_xyz.device, dtype=torch.float32)
+            + sparsepcgc_soft_rate_weight * sparse_terms["loss"].to(device=gen_xyz.device, dtype=torch.float32)
             + actuator_rate_proxy
         )
         soft_rate_proxy_for_grad = torch.nan_to_num(
@@ -1607,17 +1597,16 @@ class SurrogateCompressionLossMixin:
                     else forward_teacher_percent_t
                 )
 
-        if proxy_main_allowed:
-            main_loss = main_loss + soft_rate_proxy_ste + soft_prune_rate_ste
+        main_loss = main_loss + soft_rate_proxy_ste + soft_prune_rate_ste
         if not detach_surrogate_from_network:
             surrogate_loss_for_grad_weighted = surrogate_loss_for_grad_weighted + (
                 soft_rate_proxy_grad_weight * soft_rate_proxy_for_grad
-                if proxy_grad_allowed and inputs_finite and soft_rate_proxy_grad_weight > 0.0
+                if inputs_finite and soft_rate_proxy_grad_weight > 0.0
                 else gen_xyz.new_zeros(())
             )
             surrogate_loss_for_grad_weighted = surrogate_loss_for_grad_weighted + (
                 prune_rate_proxy_grad_weight * prune_com_proxy
-                if proxy_grad_allowed and inputs_finite and prune_com_proxy.requires_grad and prune_rate_proxy_grad_weight > 0.0
+                if inputs_finite and prune_com_proxy.requires_grad and prune_rate_proxy_grad_weight > 0.0
                 else gen_xyz.new_zeros(())
             )
         else:
@@ -1676,11 +1665,7 @@ class SurrogateCompressionLossMixin:
         sparsepcgc_aux_gating_reason = (
             "disabled_by_arg"
             if not sparsepcgc_aux_backprop_requested
-            else (
-                "blocked_by_actual_teacher"
-                if not sparse_aux_actual_teacher_allowed
-                else "enabled"
-            )
+            else ("blocked_by_actual_teacher" if not sparse_aux_actual_teacher_allowed else "enabled")
         )
         sparsepcgc_aux_gate_multiplier = 1.0 if sparsepcgc_aux_used_for_backprop else 0.0
         if sparsepcgc_aux_used_for_backprop and sparsepcgc_aux_gating:
@@ -1886,10 +1871,6 @@ class SurrogateCompressionLossMixin:
             "compression_aux_in_objective": bool(getattr(args, "compression_surrogate_aux_in_objective", False)),
             "compression_main_grad_scale": float(main_grad_scale),
             "compression_main_grad_scale_reason": str(main_grad_scale_reason),
-            "proxy_main_used_for_backprop": bool(proxy_main_allowed),
-            "proxy_grad_used_for_backprop": bool(proxy_grad_allowed),
-            "proxy_main_block_reason": str(proxy_main_block_reason),
-            "proxy_grad_block_reason": str(proxy_grad_block_reason),
             "compression_proxy_input_mode": compression_proxy_input_mode,
             "compression_proxy_uses_subtree_tree": bool(uses_subtree_tree),
             "compression_proxy_uses_full_context": bool(isinstance(full_octree_context, dict)),
@@ -1906,7 +1887,6 @@ class SurrogateCompressionLossMixin:
             "sparsepcgc_aux_backprop": bool(sparsepcgc_aux_backprop_requested),
             "sparsepcgc_aux_used_for_backprop": bool(sparsepcgc_aux_used_for_backprop),
             "sparsepcgc_aux_actual_teacher_allowed": bool(sparse_aux_actual_teacher_allowed),
-            "sparsepcgc_aux_block_reason": str(sparse_aux_block_reason),
             "sparsepcgc_aux_gating_enabled": bool(sparsepcgc_aux_gating),
             "sparsepcgc_aux_gate_mode": str(sparsepcgc_aux_gate_mode),
             "sparsepcgc_aux_gate_multiplier": float(sparsepcgc_aux_gate_multiplier),
@@ -1959,6 +1939,7 @@ class SurrogateCompressionLossMixin:
                 "actual_raw_percent": float(actual_raw_percent_value),
                 "policy_actual_noop_guard_used": bool(policy_actual_noop_guard_used),
                 "policy_actual_noop_guard_margin": float(policy_actual_noop_guard_margin),
+                # "policy_actual_noop_guard_percent": float(policy_actual_noop_guard_percent),
                 "policy_actual_noop_guard_raw_percent": float(policy_actual_noop_guard_raw_percent),
                 "policy_actual_noop_guard_raw_bit": float(policy_actual_noop_guard_raw_bit),
                 "policy_actual_noop_guard_raw_total_bit": float(policy_actual_noop_guard_raw_total_bit),

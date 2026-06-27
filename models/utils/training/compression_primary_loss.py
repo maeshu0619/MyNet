@@ -204,7 +204,7 @@ def build_compression_primary_loss(
         # actual_total_bit_objective_mix=1.0でもactualが0のstepだけproxy側へ少し戻すため、
         # forward値はactualのまま、backwardだけSparsePCGC補助へ戻す。
         sparsepcgc_main_grad_weight = max(
-            float(getattr(args, "cp_sparsepcgc_aux_main_grad_weight", getattr(args, "com_sparsepcgc", 0.0))),
+            float(getattr(args, "cp_sparsepcgc_aux_main_grad_weight", 0.0)),
             0.0,
         )
         if sparsepcgc_main_grad_weight > 0.0 and term_requires_grad(L_sparsepcgc):
