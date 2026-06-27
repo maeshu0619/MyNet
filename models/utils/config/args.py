@@ -3620,11 +3620,10 @@ def parse_pugan_args(parser, file_day, file_time):
         if not _cli_option_was_provided("--sparsepcgc_actual_oracle_eval_full_cloud_splice"):
             args.sparsepcgc_actual_oracle_eval_full_cloud_splice = True
         if not _cli_option_was_provided("--sparsepcgc_actual_oracle_apply_full_override"):
-            # Only an actual-improving full-cloud candidate can be applied.
-            # This keeps the logged policy codec input aligned with the measured bit delta.
-            args.sparsepcgc_actual_oracle_apply_full_override = (
-                str(getattr(args, "dataname", "")).strip().lower() == "8i"
-            )
+            # Keep the actual-oracle as a teacher/diagnostic unless explicitly requested.
+            # Applying its full-cloud candidate makes the logged policy codec input an
+            # oracle action, not the network's own action.
+            args.sparsepcgc_actual_oracle_apply_full_override = False
         if not _cli_option_was_provided("--sparsepcgc_actual_oracle_single_eval_fraction"):
             args.sparsepcgc_actual_oracle_single_eval_fraction = 0.25
         if not _cli_option_was_provided("--sparsepcgc_codec_proxy_weight"):

@@ -4,6 +4,17 @@ from .actual_codec_status import is_fresh_actual
 from .scalar_utils import case_float, case_int, summarize_octree_level_debug
 from .sparsepcgc_controls import add_warmup_factor, sparsepcgc_add_experiment_active
 
+
+def _ratio_percent_or_nan(numerator, denominator):
+    numerator = case_float(numerator, float("nan"))
+    denominator = case_float(denominator, float("nan"))
+    if not math.isfinite(numerator) or not math.isfinite(denominator):
+        return float("nan")
+    if denominator <= 0.0:
+        return 0.0 if abs(numerator) <= 1e-12 else float("nan")
+    return 100.0 * numerator / denominator
+
+
 def build_compression_metric_row(
     args,
     *,
@@ -115,6 +126,11 @@ def build_compression_metric_row(
         "full_cloud_actual_primary_used": bool(comp_debug.get("full_cloud_actual_primary_used", False)),
         "full_cloud_actual_primary_forward_value": case_float(comp_debug.get("full_cloud_actual_primary_forward_value", float("nan")), float("nan")),
         "full_cloud_actual_primary_subtree_forward_before": case_float(comp_debug.get("full_cloud_actual_primary_subtree_forward_before", float("nan")), float("nan")),
+        "full_cloud_actual_primary_reason": str(comp_debug.get("full_cloud_actual_primary_reason", "")),
+        "full_cloud_actual_primary_raw_policy_value": case_float(comp_debug.get("full_cloud_actual_primary_raw_policy_value", float("nan")), float("nan")),
+        "full_cloud_actual_primary_noop_guard_used": bool(comp_debug.get("full_cloud_actual_primary_noop_guard_used", False)),
+        "full_cloud_actual_primary_oracle_source": bool(comp_debug.get("full_cloud_actual_primary_oracle_source", False)),
+        "full_cloud_actual_primary_suppressed_zero": bool(comp_debug.get("full_cloud_actual_primary_suppressed_zero", False)),
         "full_cloud_actual_primary_grad_source": str(comp_debug.get("full_cloud_actual_primary_grad_source", "")),
         "full_cloud_actual_primary_grad_fn": str(comp_debug.get("full_cloud_actual_primary_grad_fn", "")),
         "full_vs_subtree_actual_gap": case_float(comp_debug.get("full_vs_subtree_actual_gap", float("nan")), float("nan")),
@@ -701,6 +717,68 @@ def build_operation_metric_row(
             ),
             0.0,
         )
+    voxel_edit_input_count = case_int(edit_stats.get("voxel_edit_input_count", 0), 0)
+    if voxel_edit_input_count <= 0:
+        voxel_edit_input_count = case_int(
+            structure_debug.get(
+                "input_voxel_count",
+                structure_debug.get(
+                    "before_occupied_voxel_count",
+                    structure_debug.get("voxel_edit_initial_count", active_before if active_before > 0 else unique_before),
+                ),
+            ),
+            0,
+        )
+    voxel_edit_add_count = case_int(
+        edit_stats.get("voxel_edit_add_count", structure_debug.get("add_target_voxel_count", 0)),
+        0,
+    )
+    voxel_edit_drop_count = case_int(
+        edit_stats.get("voxel_edit_drop_count", structure_debug.get("delete_target_voxel_count", 0)),
+        0,
+    )
+    voxel_edit_move_count = case_int(
+        edit_stats.get("voxel_edit_move_count", structure_debug.get("move_source_voxel_count", 0)),
+        0,
+    )
+    voxel_edit_final_count = case_int(
+        edit_stats.get("voxel_edit_final_count", structure_debug.get("after_occupied_voxel_count", 0)),
+        0,
+    )
+    if voxel_edit_final_count <= 0 and voxel_edit_input_count > 0:
+        voxel_edit_final_count = max(voxel_edit_input_count + voxel_edit_add_count - voxel_edit_drop_count, 0)
+    full_cloud_voxel_count = case_int(edit_stats.get("full_cloud_voxel_count", 0), 0)
+    if full_cloud_voxel_count <= 0:
+        full_cloud_voxel_count = case_int(
+            getattr(args, "_full_cloud_canonical_coords_count", 0),
+            0,
+        )
+    if full_cloud_voxel_count <= 0:
+        full_cloud_voxel_count = case_int(
+            comp_debug.get(
+                "full_cloud_anchor_unique_coord_before",
+                comp_debug.get("gt_unique_coord_count", voxel_edit_input_count),
+            ),
+            0,
+        )
+    voxel_add_ratio_percent = case_float(edit_stats.get("voxel_add_ratio_percent", float("nan")), float("nan"))
+    if not math.isfinite(voxel_add_ratio_percent):
+        voxel_add_ratio_percent = _ratio_percent_or_nan(voxel_edit_add_count, voxel_edit_input_count)
+    voxel_drop_ratio_percent = case_float(edit_stats.get("voxel_drop_ratio_percent", float("nan")), float("nan"))
+    if not math.isfinite(voxel_drop_ratio_percent):
+        voxel_drop_ratio_percent = _ratio_percent_or_nan(voxel_edit_drop_count, voxel_edit_input_count)
+    voxel_move_ratio_percent = case_float(edit_stats.get("voxel_move_ratio_percent", float("nan")), float("nan"))
+    if not math.isfinite(voxel_move_ratio_percent):
+        voxel_move_ratio_percent = _ratio_percent_or_nan(voxel_edit_move_count, voxel_edit_input_count)
+    full_cloud_voxel_drop_ratio_percent = case_float(
+        edit_stats.get("full_cloud_voxel_drop_ratio_percent", float("nan")),
+        float("nan"),
+    )
+    if not math.isfinite(full_cloud_voxel_drop_ratio_percent):
+        full_cloud_voxel_drop_ratio_percent = _ratio_percent_or_nan(
+            voxel_edit_drop_count,
+            full_cloud_voxel_count if full_cloud_voxel_count > 0 else voxel_edit_input_count,
+        )
     fast_diagnostic_used_fallback = (
         actual_oracle_accepted_candidate_count > 0
         and actual_oracle_accepted_prune_count > 0
@@ -961,16 +1039,18 @@ def build_operation_metric_row(
         "oracle_full_cloud_prune_ratio_percent": oracle_full_cloud_prune_ratio_percent,
         "oracle_full_cloud_prune_count": oracle_full_cloud_prune_count,
         "oracle_full_cloud_override_used": bool(oracle_full_cloud_override_used),
+        "full_cloud_voxel_drop_ratio_percent": full_cloud_voxel_drop_ratio_percent,
+        "full_cloud_voxel_count": case_int(full_cloud_voxel_count, 0),
         "adjusted_ratio_percent": case_float(edit_stats.get("adjusted_ratio_percent", float("nan")), float("nan")),
         "adjusted_ratio_percent_point_debug": case_float(edit_stats.get("adjusted_ratio_percent_point_debug", edit_stats.get("adjusted_ratio_percent", float("nan"))), float("nan")),
-        "voxel_edit_input_count": case_int(edit_stats.get("voxel_edit_input_count", 0)),
-        "voxel_edit_add_count": case_int(edit_stats.get("voxel_edit_add_count", structure_debug.get("add_target_voxel_count", 0))),
-        "voxel_edit_drop_count": case_int(edit_stats.get("voxel_edit_drop_count", structure_debug.get("delete_target_voxel_count", 0))),
-        "voxel_edit_move_count": case_int(edit_stats.get("voxel_edit_move_count", structure_debug.get("move_source_voxel_count", 0))),
-        "voxel_edit_final_count": case_int(edit_stats.get("voxel_edit_final_count", structure_debug.get("after_occupied_voxel_count", 0))),
-        "voxel_add_ratio_percent": case_float(edit_stats.get("voxel_add_ratio_percent", float("nan")), float("nan")),
-        "voxel_drop_ratio_percent": case_float(edit_stats.get("voxel_drop_ratio_percent", float("nan")), float("nan")),
-        "voxel_move_ratio_percent": case_float(edit_stats.get("voxel_move_ratio_percent", float("nan")), float("nan")),
+        "voxel_edit_input_count": case_int(voxel_edit_input_count, 0),
+        "voxel_edit_add_count": case_int(voxel_edit_add_count, 0),
+        "voxel_edit_drop_count": case_int(voxel_edit_drop_count, 0),
+        "voxel_edit_move_count": case_int(voxel_edit_move_count, 0),
+        "voxel_edit_final_count": case_int(voxel_edit_final_count, 0),
+        "voxel_add_ratio_percent": voxel_add_ratio_percent,
+        "voxel_drop_ratio_percent": voxel_drop_ratio_percent,
+        "voxel_move_ratio_percent": voxel_move_ratio_percent,
         "codec_points_after": case_int(comp_debug.get("gen_points", 0)),
         "codec_points_before": case_int(comp_debug.get("gt_points", 0)),
         "codec_unique_after": unique_after,

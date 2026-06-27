@@ -310,6 +310,12 @@ def new_point_edit_sums():
         "net_change": 0,
         "adjust_mean_sum": 0.0,
         "adjust_max": 0.0,
+        "voxel_edit_input_count": 0,
+        "voxel_edit_add_count": 0,
+        "voxel_edit_drop_count": 0,
+        "voxel_edit_move_count": 0,
+        "voxel_edit_final_count": 0,
+        "full_cloud_voxel_count": 0,
         "count": 0,
     }
 
@@ -327,8 +333,17 @@ def add_point_edit_sums(edit_sums, edit_stats):
         "deleted_points",
         "adjusted_points",
         "net_change",
+        "voxel_edit_input_count",
+        "voxel_edit_add_count",
+        "voxel_edit_drop_count",
+        "voxel_edit_move_count",
+        "voxel_edit_final_count",
     ):
         edit_sums[key] += int(edit_stats.get(key, 0))
+    edit_sums["full_cloud_voxel_count"] = max(
+        int(edit_sums.get("full_cloud_voxel_count", 0)),
+        int(edit_stats.get("full_cloud_voxel_count", 0) or 0),
+    )
     edit_sums["adjust_mean_sum"] += float(edit_stats.get("adjust_mean", 0.0))
     edit_sums["adjust_max"] = max(float(edit_sums["adjust_max"]), float(edit_stats.get("adjust_max", 0.0)))
     edit_sums["count"] += 1
@@ -359,6 +374,26 @@ def finalize_point_edit_sums(edit_sums):
     finalized["adjusted_ratio_percent"] = point_ratio_percent(
         finalized.get("adjusted_points", 0),
         finalized.get("input_points", 0),
+    )
+    voxel_input_count = int(finalized.get("voxel_edit_input_count", 0) or 0)
+    voxel_drop_count = int(finalized.get("voxel_edit_drop_count", 0) or 0)
+    full_cloud_voxel_count = int(finalized.get("full_cloud_voxel_count", 0) or 0)
+    full_cloud_denominator = full_cloud_voxel_count if full_cloud_voxel_count > 0 else voxel_input_count
+    finalized["voxel_add_ratio_percent"] = point_ratio_percent(
+        finalized.get("voxel_edit_add_count", 0),
+        voxel_input_count,
+    )
+    finalized["voxel_drop_ratio_percent"] = point_ratio_percent(
+        voxel_drop_count,
+        voxel_input_count,
+    )
+    finalized["voxel_move_ratio_percent"] = point_ratio_percent(
+        finalized.get("voxel_edit_move_count", 0),
+        voxel_input_count,
+    )
+    finalized["full_cloud_voxel_drop_ratio_percent"] = point_ratio_percent(
+        voxel_drop_count,
+        full_cloud_denominator,
     )
     return finalized
 
@@ -460,6 +495,20 @@ def summarize_point_edits(input_xyz, gen_pts, final_w=None, args=None, edit_ref_
     voxel_move_count = 0
     voxel_final_count = 0
     voxel_mode = False
+    full_cloud_voxel_count = 0
+    if args is not None:
+        for attr_name in (
+            "_full_cloud_canonical_coords_count",
+            "_full_cloud_input_voxel_count",
+            "_full_cloud_voxel_count",
+        ):
+            try:
+                attr_value = getattr(args, attr_name, None)
+                if attr_value is not None:
+                    full_cloud_voxel_count = int(float(attr_value))
+                    break
+            except Exception:
+                full_cloud_voxel_count = 0
     if isinstance(voxel_state, dict):
         def _state_int(*keys):
             for key in keys:
@@ -477,6 +526,13 @@ def summarize_point_edits(input_xyz, gen_pts, final_w=None, args=None, edit_ref_
         voxel_drop_count = _state_int("voxel_edit_drop_count", "delete_target_voxel_count")
         voxel_move_count = _state_int("voxel_edit_move_count", "move_source_voxel_count")
         voxel_final_count = _state_int("final_voxel_count", "after_occupied_voxel_count", "voxel_edit_final_count")
+        if full_cloud_voxel_count <= 0:
+            full_cloud_voxel_count = _state_int(
+                "full_cloud_voxel_count",
+                "full_input_voxel_count",
+                "input_voxel_count",
+                "before_occupied_voxel_count",
+            )
 
     point_added_debug = int(added_points)
     point_deleted_debug = int(deleted_points)
@@ -520,6 +576,11 @@ def summarize_point_edits(input_xyz, gen_pts, final_w=None, args=None, edit_ref_
         "voxel_add_ratio_percent": point_ratio_percent(voxel_add_count, voxel_input_count),
         "voxel_drop_ratio_percent": point_ratio_percent(voxel_drop_count, voxel_input_count),
         "voxel_move_ratio_percent": point_ratio_percent(voxel_move_count, voxel_input_count),
+        "full_cloud_voxel_count": int(full_cloud_voxel_count),
+        "full_cloud_voxel_drop_ratio_percent": point_ratio_percent(
+            voxel_drop_count,
+            full_cloud_voxel_count if full_cloud_voxel_count > 0 else voxel_input_count,
+        ),
         "voxel_operation_mode": bool(voxel_mode),
         "adjust_threshold": float(threshold),
         "adjust_mean": float(mean_adjust),

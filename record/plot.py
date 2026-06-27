@@ -64,6 +64,7 @@ class PlotMaker():
         self.edit_keys = [
             "added_ratio_percent",
             "deleted_ratio_percent",
+            "full_cloud_voxel_drop_ratio_percent",
             "adjusted_ratio_percent",
             "oracle_full_cloud_prune_ratio_percent",
         ]
@@ -1027,12 +1028,14 @@ class PlotMaker():
         edit_titles = {
             "added_ratio_percent": "Add",
             "deleted_ratio_percent": "Prune",
+            "full_cloud_voxel_drop_ratio_percent": "FullCloudVoxelPrune",
             "adjusted_ratio_percent": "Adjust",
             "oracle_full_cloud_prune_ratio_percent": "OracleFullPrune",
         }
         edit_colors = {
             "added_ratio_percent": "#2ca02c",
             "deleted_ratio_percent": "#d62728",
+            "full_cloud_voxel_drop_ratio_percent": "#ff7f0e",
             "adjusted_ratio_percent": "#1f77b4",
             "oracle_full_cloud_prune_ratio_percent": "#9467bd",
         }

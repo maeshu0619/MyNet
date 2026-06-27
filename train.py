@@ -8935,31 +8935,101 @@ def train(model, args, loss, writer, plot, notifier=None):
                                         full_cloud_primary_value is not None
                                         and torch.is_tensor(L_com)
                                     ):
-                                        full_cloud_primary_tensor = L_com.new_tensor(float(full_cloud_primary_value))
-                                        L_com = full_cloud_primary_tensor + (L_com - L_com.detach())
-                                        if torch.is_tensor(loss_bit):
-                                            loss_bit = full_cloud_primary_tensor + (loss_bit - loss_bit.detach())
-                                        full_cloud_primary_override_debug = {
-                                            "full_cloud_actual_primary_used": True,
-                                            "full_cloud_actual_primary_forward_value": float(full_cloud_primary_value),
-                                            "full_cloud_actual_primary_subtree_forward_before": (
-                                                float(subtree_primary_value) if subtree_primary_value is not None else None
-                                            ),
-                                            "full_cloud_actual_primary_grad_source": "shadow_subtree_ste",
-                                            "full_cloud_actual_primary_requires_grad": bool(L_com.requires_grad),
-                                            "full_cloud_actual_primary_grad_fn": (
-                                                type(L_com.grad_fn).__name__ if getattr(L_com, "grad_fn", None) is not None else ""
-                                            ),
-                                        }
-                                        try:
-                                            args._sparsepcgc_full_cloud_actual_primary_active = True
-                                        except Exception:
-                                            pass
+                                        full_cloud_primary_raw_policy_value = finite_float_or_none(
+                                            full_cloud_anchor_debug_snapshot.get(
+                                                "policy_actual_noop_guard_raw_percent",
+                                                full_cloud_anchor_debug_snapshot.get("actual_raw_percent", None),
+                                            )
+                                        )
+                                        full_cloud_primary_oracle_source = (
+                                            bool(full_cloud_anchor_debug_snapshot.get("oracle_full_cloud_override_used", False))
+                                            or str(full_cloud_anchor_debug_snapshot.get("policy_action_source", "")) == "actual_oracle_full_cloud_override"
+                                        )
+                                        full_cloud_primary_noop_guard = bool(
+                                            full_cloud_anchor_debug_snapshot.get("policy_actual_noop_guard_used", False)
+                                        )
+                                        full_cloud_primary_is_zero = abs(float(full_cloud_primary_value)) <= 1e-9
+                                        subtree_primary_has_signal = (
+                                            subtree_primary_value is not None
+                                            and abs(float(subtree_primary_value)) > 1e-9
+                                        )
+                                        raw_policy_has_signal = (
+                                            full_cloud_primary_raw_policy_value is not None
+                                            and abs(float(full_cloud_primary_raw_policy_value)) > 1e-9
+                                        )
+                                        suppress_zero_full_cloud_primary = (
+                                            full_cloud_primary_is_zero
+                                            and not full_cloud_primary_oracle_source
+                                            and (
+                                                subtree_primary_has_signal
+                                                or (full_cloud_primary_noop_guard and raw_policy_has_signal)
+                                            )
+                                        )
+                                        if suppress_zero_full_cloud_primary:
+                                            full_cloud_primary_override_debug = {
+                                                "full_cloud_actual_primary_used": False,
+                                                "full_cloud_actual_primary_reason": "zero_full_cloud_primary_preserved_subtree_actual",
+                                                "full_cloud_actual_primary_forward_value": float(full_cloud_primary_value),
+                                                "full_cloud_actual_primary_subtree_forward_before": (
+                                                    float(subtree_primary_value) if subtree_primary_value is not None else None
+                                                ),
+                                                "full_cloud_actual_primary_raw_policy_value": (
+                                                    float(full_cloud_primary_raw_policy_value)
+                                                    if full_cloud_primary_raw_policy_value is not None
+                                                    else None
+                                                ),
+                                                "full_cloud_actual_primary_noop_guard_used": bool(full_cloud_primary_noop_guard),
+                                                "full_cloud_actual_primary_oracle_source": bool(full_cloud_primary_oracle_source),
+                                                "full_cloud_actual_primary_suppressed_zero": True,
+                                                "full_cloud_actual_primary_grad_source": "shadow_subtree_ste",
+                                                "full_cloud_actual_primary_requires_grad": bool(L_com.requires_grad),
+                                                "full_cloud_actual_primary_grad_fn": (
+                                                    type(L_com.grad_fn).__name__ if getattr(L_com, "grad_fn", None) is not None else ""
+                                                ),
+                                            }
+                                            try:
+                                                args._sparsepcgc_full_cloud_actual_primary_active = False
+                                            except Exception:
+                                                pass
+                                        else:
+                                            full_cloud_primary_tensor = L_com.new_tensor(float(full_cloud_primary_value))
+                                            L_com = full_cloud_primary_tensor + (L_com - L_com.detach())
+                                            if torch.is_tensor(loss_bit):
+                                                loss_bit = full_cloud_primary_tensor + (loss_bit - loss_bit.detach())
+                                            full_cloud_primary_override_debug = {
+                                                "full_cloud_actual_primary_used": True,
+                                                "full_cloud_actual_primary_reason": "active",
+                                                "full_cloud_actual_primary_forward_value": float(full_cloud_primary_value),
+                                                "full_cloud_actual_primary_subtree_forward_before": (
+                                                    float(subtree_primary_value) if subtree_primary_value is not None else None
+                                                ),
+                                                "full_cloud_actual_primary_raw_policy_value": (
+                                                    float(full_cloud_primary_raw_policy_value)
+                                                    if full_cloud_primary_raw_policy_value is not None
+                                                    else None
+                                                ),
+                                                "full_cloud_actual_primary_noop_guard_used": bool(full_cloud_primary_noop_guard),
+                                                "full_cloud_actual_primary_oracle_source": bool(full_cloud_primary_oracle_source),
+                                                "full_cloud_actual_primary_suppressed_zero": False,
+                                                "full_cloud_actual_primary_grad_source": "shadow_subtree_ste",
+                                                "full_cloud_actual_primary_requires_grad": bool(L_com.requires_grad),
+                                                "full_cloud_actual_primary_grad_fn": (
+                                                    type(L_com.grad_fn).__name__ if getattr(L_com, "grad_fn", None) is not None else ""
+                                                ),
+                                            }
+                                            try:
+                                                args._sparsepcgc_full_cloud_actual_primary_active = True
+                                            except Exception:
+                                                pass
                                     else:
                                         full_cloud_primary_override_debug = {
                                             "full_cloud_actual_primary_used": False,
                                             "full_cloud_actual_primary_reason": "missing_full_cloud_value_or_lcom_tensor",
                                         }
+                                        try:
+                                            args._sparsepcgc_full_cloud_actual_primary_active = False
+                                        except Exception:
+                                            pass
 
                     finally:
                         args._log_this_step = prev_log_flag
