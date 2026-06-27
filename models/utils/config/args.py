@@ -1116,6 +1116,18 @@ def parse_pugan_args(parser, file_day, file_time):
         help='1 stepでactual SparsePCGCへ回す候補数の上限。proxy上位Kだけをactual検証する',
     )
     parser.add_argument(
+        '--sparsepcgc_actual_oracle_fallback_after_full_macro_fail',
+        default=True,
+        type=str2bool,
+        help='full-cloud macro pruneがactual改善を見つけないstepだけlocal/pattern候補へ追加actual検証枠を使う',
+    )
+    parser.add_argument(
+        '--sparsepcgc_actual_oracle_full_macro_fail_extra_eval_max',
+        default=2,
+        type=int,
+        help='full-cloud macro prune失敗時にだけ追加するactual検証候補数。成功stepでは使わない',
+    )
+    parser.add_argument(
         '--sparsepcgc_actual_oracle_eval_full_cloud_splice',
         default=True,
         type=str2bool,
@@ -1696,6 +1708,12 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--cp_lambda_actuator', default=0.05, type=float, help='compression_primaryのactuator safety penalty重み')
     parser.add_argument('--cp_lambda_sparsepcgc', default=0.0, type=float, help='compression_primaryのSparsePCGC soft aux safety penalty重み')
     parser.add_argument('--cp_lambda_op', default=0.0, type=float, help='compression_primaryのoperation safety penalty重み(現状は実験用、default無効)')
+    parser.add_argument('--compression_primary_aux_target_ratio', default=0.25, type=float, help='compression_primary内部のsupport blockを|main|に対してどこまで許すかの比率上限')
+    parser.add_argument('--compression_primary_aux_balance_min_scale', default=0.0, type=float, help='compression_primary内部support blockの最小scale')
+    parser.add_argument('--compression_primary_aux_balance_max_scale', default=1.0, type=float, help='compression_primary内部support blockの最大scale')
+    parser.add_argument('--compression_primary_tail_target_ratio', default=0.15, type=float, help='compression_primary終盤で加えるattr/policy/actuator/correction support blockを|main|に対してどこまで許すかの比率上限')
+    parser.add_argument('--compression_primary_tail_balance_min_scale', default=0.0, type=float, help='compression_primary終盤support blockの最小scale')
+    parser.add_argument('--compression_primary_tail_balance_max_scale', default=1.0, type=float, help='compression_primary終盤support blockの最大scale')
     parser.add_argument(
         '--compression_primary_proxy_grad_weight',
         default=0.10,
@@ -2448,6 +2466,23 @@ def parse_pugan_args(parser, file_day, file_time):
         "cp_tau_sparsepcgc",
     ):
         setattr(args, _name, float(getattr(args, _name, 0.0)))
+    for _name in (
+        "compression_primary_aux_target_ratio",
+        "compression_primary_aux_balance_min_scale",
+        "compression_primary_aux_balance_max_scale",
+        "compression_primary_tail_target_ratio",
+        "compression_primary_tail_balance_min_scale",
+        "compression_primary_tail_balance_max_scale",
+    ):
+        setattr(args, _name, max(float(getattr(args, _name, 0.0)), 0.0))
+    args.compression_primary_aux_balance_max_scale = max(
+        float(getattr(args, "compression_primary_aux_balance_max_scale", 1.0)),
+        float(getattr(args, "compression_primary_aux_balance_min_scale", 0.0)),
+    )
+    args.compression_primary_tail_balance_max_scale = max(
+        float(getattr(args, "compression_primary_tail_balance_max_scale", 1.0)),
+        float(getattr(args, "compression_primary_tail_balance_min_scale", 0.0)),
+    )
     args.cp_use_stage_factors = bool(getattr(args, "cp_use_stage_factors", False))
     args.cp_force_joint_actuator = bool(getattr(args, "cp_force_joint_actuator", True))
     args.cp_log_grad_terms = bool(getattr(args, "cp_log_grad_terms", True))
@@ -3485,7 +3520,11 @@ def parse_pugan_args(parser, file_day, file_time):
         if not _cli_option_was_provided("--checkpoint_actual_source"):
             args.checkpoint_actual_source = "full_cloud"
         if not _cli_option_was_provided("--train_full_cloud_actual_interval"):
-            args.train_full_cloud_actual_interval = 1
+            # Full-cloud SparsePCGC teacher is already supplied by the splice-based
+            # actual oracle.  The no-grad full-cloud anchor only produced zero
+            # correction in the current logs while forcing an 800k-voxel forward
+            # every step, so keep it off unless explicitly requested.
+            args.train_full_cloud_actual_interval = 0
         if not _cli_option_was_provided("--sparsepcgc_full_cloud_actual_primary"):
             args.sparsepcgc_full_cloud_actual_primary = True
         if not _cli_option_was_provided("--sparsepcgc_require_full_cloud_actual_teacher"):
@@ -3510,6 +3549,9 @@ def parse_pugan_args(parser, file_day, file_time):
             # SparsePCGC actual bitと相関している主surrogate勾配をNetworkへ返す。
             # forward値はteacher_steのactual bitを保ち、backwardだけsurrogate予測を使う。
             args.detach_surrogate_from_network = False
+        if args.compression_loss_backend.endswith("_surrogate") and not _cli_option_was_provided("--surrogate_target_clip_percent"):
+            # raw percentの外れ値(特にGT bitが0近傍のstep)でlossが爆発しないよう、既定で上限を入れる。
+            args.surrogate_target_clip_percent = 100.0
         if not _cli_option_was_provided("--compression_surrogate_refresh_interval"):
             # SparsePCGCの圧縮損失は必ず実Codec値で測る。速度はactual以外の更新回数を削って稼ぐ。
             args.compression_surrogate_refresh_interval = 1 if args.compression_loss_backend.endswith("_surrogate") else max(int(getattr(args, "compression_surrogate_refresh_interval", 0)), 50)
@@ -3605,6 +3647,10 @@ def parse_pugan_args(parser, file_day, file_time):
             args.sparsepcgc_actual_oracle_max_candidates = 12
         if not _cli_option_was_provided("--sparsepcgc_actual_oracle_actual_eval_max"):
             args.sparsepcgc_actual_oracle_actual_eval_max = 1
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_fallback_after_full_macro_fail"):
+            args.sparsepcgc_actual_oracle_fallback_after_full_macro_fail = True
+        if not _cli_option_was_provided("--sparsepcgc_actual_oracle_full_macro_fail_extra_eval_max"):
+            args.sparsepcgc_actual_oracle_full_macro_fail_extra_eval_max = 2
         if not _cli_option_was_provided("--sparsepcgc_actual_oracle_interval"):
             args.sparsepcgc_actual_oracle_interval = 1
         if not _cli_option_was_provided("--sparsepcgc_actual_oracle_amount_weight"):
@@ -4300,6 +4346,13 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     args.sparsepcgc_actual_oracle_actual_eval_max = max(
         int(getattr(args, "sparsepcgc_actual_oracle_actual_eval_max", 8)),
+        0,
+    )
+    args.sparsepcgc_actual_oracle_fallback_after_full_macro_fail = bool(
+        getattr(args, "sparsepcgc_actual_oracle_fallback_after_full_macro_fail", True)
+    )
+    args.sparsepcgc_actual_oracle_full_macro_fail_extra_eval_max = max(
+        int(getattr(args, "sparsepcgc_actual_oracle_full_macro_fail_extra_eval_max", 2)),
         0,
     )
     args.sparsepcgc_actual_oracle_eval_full_cloud_splice = bool(

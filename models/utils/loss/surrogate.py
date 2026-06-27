@@ -1418,14 +1418,21 @@ class SurrogateCompressionLossMixin:
 
         surrogate_bit_percent = pred.reshape(-1).mean() if pred.numel() > 0 else x_soft.new_zeros(())
         surrogate_raw_percent = pred_raw.reshape(-1).mean() if pred_raw.numel() > 0 else x_soft.new_zeros(())
-        forward_teacher_percent_value = float(actual_bit_percent)
+        forward_teacher_raw_percent_value = float(actual_bit_percent)
+        # Surrogateへ渡す教師値は、target生成時のclamp/transformと揃えて学習を安定化する。
+        # raw actual percent は別途ログに残し、loss側だけを安全な値へ寄せる。
+        forward_teacher_percent_value = float(target_train_percent_value)
         forward_teacher_source = str(actual_value_source)
         if actual_value_source == "local_proxy":
-            forward_teacher_percent_value = float(target_percent_value)
+            forward_teacher_percent_value = float(target_train_percent_value)
             forward_teacher_source = "local_proxy_target"
         if not math.isfinite(forward_teacher_percent_value):
             forward_teacher_percent_value = 0.0
             forward_teacher_source = f"{forward_teacher_source}_nonfinite_zero"
+        forward_teacher_clamped = bool(
+            math.isfinite(forward_teacher_raw_percent_value)
+            and abs(float(forward_teacher_percent_value) - forward_teacher_raw_percent_value) > 1e-6
+        )
 
         actual_bit_percent_t = gen_xyz.new_tensor(float(actual_bit_percent), dtype=torch.float32)
         forward_teacher_percent_t = gen_xyz.new_tensor(float(forward_teacher_percent_value), dtype=torch.float32)
@@ -1918,6 +1925,8 @@ class SurrogateCompressionLossMixin:
                 "actual_target_percent_with_edit_record": float(target_raw_percent_value),
             "actual_clamped_percent": float(target_clamped_percent_value),
             "actual_forward_value": self._scalar(forward_teacher_percent_t),
+            "actual_forward_raw_value": float(forward_teacher_raw_percent_value),
+            "actual_forward_clamped": bool(forward_teacher_clamped),
             "actual_forward_source": str(forward_teacher_source),
             "compression_forward_teacher_percent": float(forward_teacher_percent_value),
             "compression_forward_teacher_source": str(forward_teacher_source),

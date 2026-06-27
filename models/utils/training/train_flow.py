@@ -126,8 +126,17 @@ def weighted_compression_terms(args, terms, L_com, La_fit, include_weight=True):
 def actual_backend_compression_terms(args, terms, L_com, La_fit):
     # actual/surrogate backendではproxy用のcom_bit=1000を使わず、bit差分をpercent単位のまま主目的にする。
     zero = L_com.new_zeros(())
-    # Surrogateのbit予測percentを取得し、なければ現在のL_comをそのまま使う。
+    # actual総bit差があればそれを優先し、なければSurrogateのbit予測percentを使う。
+    actual_bit_term = terms.get("actual_total_bit_percent", None)
     bit_term = terms.get("bit", L_com)
+    # actual bitがちょうど0のstepでは、proxy bitを主目的へ戻して無信号化を避ける。
+    proxy_bit_term = terms.get("proxy_bit", None)
+    if torch.is_tensor(actual_bit_term):
+        try:
+            if float(actual_bit_term.detach().abs().item()) <= 1e-9 and torch.is_tensor(proxy_bit_term):
+                bit_term = proxy_bit_term
+        except Exception:
+            pass
     # SparsePCGCのsoft補助項を取得し、未計算なら0として扱う。
     sparsepcgc_term = terms.get("sparsepcgc", zero)
     # node補助は明示weightがある場合だけ足し、既定ではbit差分を膨らませない。
@@ -146,11 +155,50 @@ def actual_backend_compression_terms(args, terms, L_com, La_fit):
     )
 
 
+def _actual_total_bit_objective_mix_state(args, terms, L_com):
+    # actual bit がちょうど0のstepでは、actual単独だとmainが無信号になる。
+    # その場合だけproxy側を半分まで許して、mainが0のまま止まらないようにする。
+    mix = min(max(float(getattr(args, "actual_total_bit_objective_mix", 0.5)), 0.0), 1.0)
+    zero_fallback_used = False
+    if uses_actual_total_bit_objective(args):
+        actual_value = None
+        if isinstance(terms, dict):
+            actual_term = terms.get("actual_total_bit_percent", None)
+            if torch.is_tensor(actual_term):
+                try:
+                    actual_value = float(actual_term.detach().abs().item())
+                except Exception:
+                    actual_value = None
+            if actual_value is None:
+                actual_term = terms.get("actual_total_bit_percent_fresh", None)
+                if torch.is_tensor(actual_term):
+                    try:
+                        actual_value = float(actual_term.detach().abs().item())
+                    except Exception:
+                        actual_value = None
+        if actual_value is None and isinstance(terms, dict):
+            bit_term = terms.get("bit", None)
+            if torch.is_tensor(bit_term):
+                try:
+                    actual_value = float(bit_term.detach().abs().item())
+                except Exception:
+                    actual_value = None
+        if actual_value is None and torch.is_tensor(L_com):
+            try:
+                actual_value = float(L_com.detach().abs().item())
+            except Exception:
+                actual_value = None
+        if actual_value is not None and actual_value <= 1e-9:
+            mix = min(mix, 0.5)
+            zero_fallback_used = True
+    return mix, zero_fallback_used
+
+
 def compose_train_compression_main(args, terms, L_com, La_fit):
     # compression_primary用に、w_comを掛ける前の圧縮主目的を作る。
     term_main = actual_backend_compression_terms(args, terms, L_com, La_fit) if uses_actual_total_bit_objective(args) else weighted_compression_terms(args, terms, L_com, La_fit, include_weight=False)
-    # half/half比率を既定にしつつ、必要なら外部設定で調整できるようにする。
-    mix = min(max(float(getattr(args, "actual_total_bit_objective_mix", 0.5)), 0.0), 1.0)
+    # half/half比率を既定にしつつ、actual=0のときだけproxy側を少し戻す。
+    mix, _ = _actual_total_bit_objective_mix_state(args, terms, L_com)
     # actual/surrogate系だけL_com直結と内訳目的を混ぜる。
     if uses_actual_total_bit_objective(args):
         return mix * L_com + (1.0 - mix) * term_main
@@ -167,8 +215,8 @@ def compose_train_compression_objective(args, terms, L_com, La_fit):
         if uses_actual_total_bit_objective(args)
         else weighted_compression_terms(args, terms, L_com, La_fit, include_weight=True)
     )
-    # half/half比率を既定にしつつ、必要なら外部設定で調整できるようにする。
-    mix = min(max(float(getattr(args, "actual_total_bit_objective_mix", 0.5)), 0.0), 1.0)
+    # half/half比率を既定にしつつ、actual=0のときだけproxy側を少し戻す。
+    mix, _ = _actual_total_bit_objective_mix_state(args, terms, L_com)
     # actual/surrogate系だけL_com直結と内訳目的を混ぜる。
     if uses_actual_total_bit_objective(args):
         return mix * direct_objective + (1.0 - mix) * term_objective

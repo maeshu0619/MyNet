@@ -1,7 +1,9 @@
+import math
+
 import torch
 
 from .scalar_utils import case_float
-from .train_flow import compose_train_compression_main
+from .train_flow import compose_train_compression_main, _actual_total_bit_objective_mix_state
 from .utils import uses_actual_total_bit_objective
 
 def as_scalar_loss_tensor(value):
@@ -21,6 +23,121 @@ def zero_like_loss(reference):
 def relu_penalty(term, tau):
     tau_t = term.new_tensor(float(tau))
     return torch.relu(term - tau_t)
+
+
+def _compression_primary_support_balance(
+    args,
+    primary_value,
+    support_value,
+    *,
+    enabled=True,
+    target_ratio_name="compression_primary_aux_target_ratio",
+    min_scale_name="compression_primary_aux_balance_min_scale",
+    max_scale_name="compression_primary_aux_balance_max_scale",
+    disabled_reason="actual_total_bit_balance_disabled",
+):
+    """
+    compression_primary で、圧縮主目的に対して support block が強くなりすぎたときだけ
+    support block を弱めるためのバランス情報を返す。
+
+    返り値:
+      {
+        "scale": support block に掛ける係数,
+        "reason": ログ用の簡潔な説明,
+        "target_ratio": support / |primary| の目標上限,
+        "primary_mag": |primary|,
+        "support_mag": |support|,
+        "scaled_support_mag": scale * |support|,
+        "dominant": "compression" / "support" / "neutral",
+      }
+    """
+    if not enabled:
+        return {
+            "scale": 1.0,
+            "reason": str(disabled_reason),
+            "target_ratio": None,
+            "primary_mag": None,
+            "support_mag": None,
+            "scaled_support_mag": None,
+            "dominant": "neutral",
+        }
+
+    target_ratio = max(float(getattr(args, target_ratio_name, 0.25)), 0.0)
+    min_scale = min(max(float(getattr(args, min_scale_name, 0.0)), 0.0), 1.0)
+    max_scale = min(max(float(getattr(args, max_scale_name, 1.0)), min_scale), 1.0)
+    if primary_value is None or support_value is None:
+        return {
+            "scale": 1.0,
+            "reason": "balance_value_missing",
+            "target_ratio": float(target_ratio),
+            "primary_mag": None,
+            "support_mag": None,
+            "scaled_support_mag": None,
+            "dominant": "neutral",
+        }
+    if not torch.is_tensor(primary_value) or not torch.is_tensor(support_value):
+        return {
+            "scale": 1.0,
+            "reason": "balance_tensor_missing",
+            "target_ratio": float(target_ratio),
+            "primary_mag": None,
+            "support_mag": None,
+            "scaled_support_mag": None,
+            "dominant": "neutral",
+        }
+
+    primary_mag = float(torch.nan_to_num(primary_value.detach().abs(), nan=0.0, posinf=0.0, neginf=0.0).cpu())
+    support_mag = float(torch.nan_to_num(support_value.detach().abs(), nan=0.0, posinf=0.0, neginf=0.0).cpu())
+    if not math.isfinite(primary_mag) or not math.isfinite(support_mag):
+        return {
+            "scale": 1.0,
+            "reason": "balance_non_finite",
+            "target_ratio": float(target_ratio),
+            "primary_mag": None,
+            "support_mag": None,
+            "scaled_support_mag": None,
+            "dominant": "neutral",
+        }
+    if support_mag <= 1e-12:
+        dominant = "compression" if primary_mag > 1e-12 else "neutral"
+        return {
+            "scale": float(max_scale),
+            "reason": "support_block_zero",
+            "target_ratio": float(target_ratio),
+            "primary_mag": float(primary_mag),
+            "support_mag": float(support_mag),
+            "scaled_support_mag": 0.0,
+            "dominant": dominant,
+        }
+
+    budget_mag = target_ratio * primary_mag
+    raw_scale = 0.0 if budget_mag <= 1e-12 else (budget_mag / support_mag)
+    scale = min(max(raw_scale, min_scale), max_scale)
+    scaled_support_mag = scale * support_mag
+
+    if raw_scale < min_scale:
+        reason = "support_over_budget"
+    elif raw_scale > max_scale:
+        reason = "support_under_budget"
+    else:
+        reason = "balanced_to_target"
+
+    if primary_mag <= 1e-12 and scaled_support_mag <= 1e-12:
+        dominant = "neutral"
+    elif primary_mag + 1e-12 >= scaled_support_mag:
+        dominant = "compression"
+    else:
+        dominant = "support"
+
+    return {
+        "scale": float(scale),
+        "reason": str(reason),
+        "target_ratio": float(target_ratio),
+        "primary_mag": float(primary_mag),
+        "support_mag": float(support_mag),
+        "scaled_support_mag": float(scaled_support_mag),
+        "dominant": dominant,
+    }
 
 
 def term_requires_grad(value):
@@ -77,11 +194,14 @@ def build_compression_primary_loss(
         main_source, L_com_main = select_compression_primary_main(terms, L_com)
     if uses_actual_total_bit_objective(args):
         # actual/surrogate系ではL_com直結と圧縮内訳を半々で混ぜた主目的にする。
+        _, main_zero_fallback_used = _actual_total_bit_objective_mix_state(args, terms, L_com)
         L_com_main = compose_train_compression_main(args, terms, L_com_main, zero_like_loss(L_com_main))
         # Debugで混合主目的を使ったことを追えるようにsource名へ印を付ける。
         main_source = f"{main_source}+mixed_terms"
+        if main_zero_fallback_used:
+            main_source = f"{main_source}+zero_actual_fallback"
         # SparsePCGC補助項はsurrogate側でgate済みのTensorだけがterms["sparsepcgc"]へ入る。
-        # actual_total_bit_objective_mix=1.0ではcompose側で内訳項が捨てられるため、
+        # actual_total_bit_objective_mix=1.0でもactualが0のstepだけproxy側へ少し戻すため、
         # forward値はactualのまま、backwardだけSparsePCGC補助へ戻す。
         sparsepcgc_main_grad_weight = max(
             float(getattr(args, "cp_sparsepcgc_aux_main_grad_weight", getattr(args, "com_sparsepcgc", 0.0))),
@@ -173,26 +293,50 @@ def build_compression_primary_loss(
     sf_geom = float(stage_factors.get("geom", 1.0)) if use_stage else 1.0
     sf_repair = float(stage_factors.get("repair", 1.0)) if use_stage else 1.0
 
-    L = (
-        sf_com * L_com_primary
-        + sf_geom * float(getattr(args, "cp_lambda_geom", 1.0)) * P_geom
-        + sf_com * single_weight_effective * P_single
-        + sf_com * node_weight_effective * P_nodes
-        + sf_com * float(getattr(args, "cp_lambda_sparsepcgc", 1.0)) * P_sparsepcgc
-        + sf_repair * float(getattr(args, "cp_lambda_actuator", 0.1)) * P_actuator
-        + sf_repair * float(getattr(args, "cp_lambda_op", 0.0)) * P_op
-        + sf_com * single_delta_penalty_weight * single_delta_penalty
-        + sf_com * full_context_cp_weight * (
-            L_full_context_subtree_delta
-            if L_full_context_subtree_delta is not None
-            else zero
-        )
-        + sf_com * full_cloud_correction_cp_weight * (
-            L_full_cloud_actual_correction
-            if L_full_cloud_actual_correction is not None
-            else zero
-        )
+    main_block = sf_com * L_com_primary
+    geom_block = sf_geom * float(getattr(args, "cp_lambda_geom", 1.0)) * P_geom
+    single_block = sf_com * single_weight_effective * P_single
+    node_block = sf_com * node_weight_effective * P_nodes
+    sparsepcgc_block = sf_com * float(getattr(args, "cp_lambda_sparsepcgc", 1.0)) * P_sparsepcgc
+    actuator_block = sf_repair * float(getattr(args, "cp_lambda_actuator", 0.1)) * P_actuator
+    op_block = sf_repair * float(getattr(args, "cp_lambda_op", 0.0)) * P_op
+    single_delta_block = sf_com * single_delta_penalty_weight * single_delta_penalty
+    full_context_block = sf_com * full_context_cp_weight * (
+        L_full_context_subtree_delta
+        if L_full_context_subtree_delta is not None
+        else zero
     )
+    full_cloud_correction_block = sf_com * full_cloud_correction_cp_weight * (
+        L_full_cloud_actual_correction
+        if L_full_cloud_actual_correction is not None
+        else zero
+    )
+    aux_block = (
+        geom_block
+        + single_block
+        + node_block
+        + sparsepcgc_block
+        + actuator_block
+        + op_block
+        + single_delta_block
+        + full_context_block
+        + full_cloud_correction_block
+    )
+    aux_balance = _compression_primary_support_balance(
+        args,
+        main_block,
+        aux_block,
+        enabled=uses_actual_total_bit_objective(args),
+        target_ratio_name="compression_primary_aux_target_ratio",
+        min_scale_name="compression_primary_aux_balance_min_scale",
+        max_scale_name="compression_primary_aux_balance_max_scale",
+        disabled_reason="actual_total_bit_balance_disabled",
+    )
+    aux_balance_scale = float(aux_balance["scale"])
+    aux_balance_reason = str(aux_balance["reason"])
+    aux_block_scaled = aux_balance_scale * aux_block
+    L = main_block + aux_block_scaled
+    main_grad_scale = 1.0 / max(float(aux_balance_scale), 1e-12)
 
     debug = {
         "loss_mode": "compression_primary",
@@ -206,6 +350,32 @@ def build_compression_primary_loss(
         "cp_P_sparsepcgc": case_float(P_sparsepcgc, float("nan")),
         "cp_P_actuator": case_float(P_actuator, float("nan")),
         "cp_P_op": case_float(P_op, float("nan")),
+        "cp_main_block": case_float(main_block, float("nan")),
+        "cp_aux_block_raw": case_float(aux_block, float("nan")),
+        "cp_aux_block_scaled": case_float(aux_block_scaled, float("nan")),
+        "cp_aux_target_ratio": (
+            float(aux_balance["target_ratio"])
+            if aux_balance.get("target_ratio", None) is not None
+            else float("nan")
+        ),
+        "cp_aux_balance_primary_abs": (
+            float(aux_balance["primary_mag"])
+            if aux_balance.get("primary_mag", None) is not None
+            else float("nan")
+        ),
+        "cp_aux_balance_support_abs": (
+            float(aux_balance["support_mag"])
+            if aux_balance.get("support_mag", None) is not None
+            else float("nan")
+        ),
+        "cp_aux_balance_scaled_support_abs": (
+            float(aux_balance["scaled_support_mag"])
+            if aux_balance.get("scaled_support_mag", None) is not None
+            else float("nan")
+        ),
+        "cp_aux_balance_scale": float(aux_balance_scale),
+        "cp_aux_balance_reason": str(aux_balance_reason),
+        "cp_aux_balance_dominant": str(aux_balance.get("dominant", "neutral")),
         "cp_full_context_subtree_delta": case_float(
             L_full_context_subtree_delta if L_full_context_subtree_delta is not None else zero,
             0.0,
@@ -235,6 +405,12 @@ def build_compression_primary_loss(
         "single_delta_penalty_weight": float(single_delta_penalty_weight),
         "single_delta_penalty_used_for_backprop": bool(single_delta_penalty_used),
         "cp_sparsepcgc_main_grad_weight": float(sparsepcgc_main_grad_weight),
+        "compression_main_grad_scale": float(main_grad_scale),
+        "compression_main_grad_scale_reason": str(aux_balance_reason),
+        "compression_aux_in_objective": True,
+        "compression_main_loss": case_float(L_com_main, float("nan")),
+        "compression_aux_loss": case_float(aux_block_scaled, float("nan")),
+        "compression_objective": case_float(L, float("nan")),
         "cp_total": case_float(L, float("nan")),
         "cp_main_requires_grad": term_requires_grad(L_com_main),
         "cp_geom_requires_grad": term_requires_grad(L_geom),
@@ -278,6 +454,14 @@ def log_compression_primary_terms(writer, step, num_steps, cp_debug):
         f"P_sparsepcgc={float(cp_debug.get('cp_P_sparsepcgc', 0.0)):.6f}, "
         f"P_actuator={float(cp_debug.get('cp_P_actuator', 0.0)):.6f}, "
         f"P_op={float(cp_debug.get('cp_P_op', 0.0)):.6f}, "
+        f"main_block={float(cp_debug.get('cp_main_block', 0.0)):.6f}, "
+        f"aux_raw={float(cp_debug.get('cp_aux_block_raw', 0.0)):.6f}, "
+        f"aux_scaled={float(cp_debug.get('cp_aux_block_scaled', 0.0)):.6f}, "
+        f"target_ratio={float(cp_debug.get('cp_aux_target_ratio', 0.0)):.6f}, "
+        f"aux_balance_scale={float(cp_debug.get('cp_aux_balance_scale', 1.0)):.6f}, "
+        f"main_grad_scale={float(cp_debug.get('compression_main_grad_scale', 1.0)):.6f}, "
+        f"balance_reason={cp_debug.get('compression_main_grad_scale_reason', 'n/a')}, "
+        f"dominant={cp_debug.get('cp_aux_balance_dominant', 'neutral')}, "
         f"full_context_subtree_delta={float(cp_debug.get('cp_full_context_subtree_delta', 0.0)):.6f}, "
         f"node_w={float(cp_debug.get('node_loss_weight_effective', 0.0)):.6f}/"
         f"{float(cp_debug.get('node_loss_weight_raw', 0.0)):.6f}, "

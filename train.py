@@ -66,6 +66,7 @@ from models.utils.training.scalar_utils import *
 from models.utils.training.correlation_debug import *
 from models.utils.training.sparsepcgc_controls import *
 from models.utils.training.compression_primary_loss import *
+from models.utils.training.compression_primary_loss import _compression_primary_support_balance
 from models.utils.training.full_context_subtree_loss import build_full_context_subtree_delta_loss
 from models.utils.training.case_debug import *
 from models.utils.training.metric_csv import *
@@ -101,6 +102,12 @@ STEP_GRAD_COLUMNS = [
     "grad_signed_mean",
     "param_name_sample",
 ]
+
+def _limit_training_seq_dirs(seq_dirs, args):
+    # 8iは4シーケンスのうち先頭3つだけを学習に使う。
+    if str(getattr(args, "dataname", "")).strip().lower() == "8i":
+        return list(seq_dirs[:3])
+    return list(seq_dirs)
 
 def _log_sparsepcgc_restore_debug(args, writer, out_label, prefix="VoxelRestoreDebug"):
     # Phase2: canonical voxel coordsから復元した点群候補のdebugだけを出す。
@@ -3023,6 +3030,15 @@ def _attach_sparsepcgc_actual_oracle_drop(
         int(getattr(args, "sparsepcgc_actual_oracle_full_cloud_macro_prune_candidate_max", 1)),
         0,
     )
+    early_full_macro_fail_extra_eval_max = max(
+        int(getattr(args, "sparsepcgc_actual_oracle_full_macro_fail_extra_eval_max", 2)),
+        0,
+    )
+    early_full_macro_fallback_enabled = bool(
+        getattr(args, "sparsepcgc_actual_oracle_fallback_after_full_macro_fail", True)
+        and early_full_cloud_macro_max > 0
+        and early_full_macro_fail_extra_eval_max > 0
+    )
     skip_unused_local_candidate_generation = bool(
         bool(getattr(args, "sparsepcgc_actual_oracle_skip_unused_local_candidates", True))
         and actual_validate_this_step
@@ -3033,6 +3049,48 @@ def _attach_sparsepcgc_actual_oracle_drop(
         and int(early_actual_eval_max) <= int(early_full_cloud_macro_max)
     )
     debug["skip_unused_local_candidate_generation"] = bool(skip_unused_local_candidate_generation)
+    debug["full_cloud_macro_fallback_candidate_generation_enabled"] = bool(early_full_macro_fallback_enabled)
+    debug["full_cloud_macro_fail_extra_eval_max"] = int(early_full_macro_fail_extra_eval_max)
+
+    local_candidate_generation_done = False
+
+    def _ensure_local_candidate_generation():
+        nonlocal candidate_pool, candidate_indices, add_candidate_pool, add_candidates
+        nonlocal unique_coords, inverse, local_candidate_generation_done
+        if local_candidate_generation_done:
+            return
+        local_candidate_generation_done = True
+        local_candidate_start = time.time()
+        candidate_pool, unique_coords_from_pool, inverse_from_pool = _sparsepcgc_actual_oracle_candidate_indices(
+            coords_n3,
+            args,
+            global_step,
+            drop_pool_budget,
+            proxy_profile=proxy_profile,
+        )
+        if unique_coords_from_pool is not None and inverse_from_pool is not None:
+            unique_coords = unique_coords_from_pool
+            inverse = inverse_from_pool
+        candidate_indices = candidate_pool[:drop_budget]
+        add_candidate_pool = _sparsepcgc_actual_oracle_add_candidates(
+            unique_coords,
+            args,
+            global_step,
+            add_pool_budget,
+            proxy_profile=proxy_profile,
+        )
+        add_candidates = add_candidate_pool[:add_budget]
+        debug["local_candidate_generation_time"] = float(
+            debug.get("local_candidate_generation_time", 0.0)
+            + (time.time() - local_candidate_start)
+        )
+        debug["local_candidate_generation_lazy"] = bool(skip_unused_local_candidate_generation)
+        debug["candidate_count"] = int(len(candidate_indices) + len(add_candidates))
+        debug["candidate_pool_count"] = int(len(candidate_pool) + len(add_candidate_pool))
+        if skip_unused_local_candidate_generation:
+            debug["generated_candidate_count"] = int(debug.get("generated_candidate_count", 0)) + int(
+                debug["candidate_pool_count"]
+            )
 
     if actual_validate_this_step:
         proxy_profile = _sparsepcgc_codec_proxy_profile(unique_coords, args)
@@ -3043,25 +3101,7 @@ def _attach_sparsepcgc_actual_oracle_drop(
         debug["context_pattern_candidate_count"] = int(proxy_profile.get("context_pattern_candidate_count", 0) or 0)
 
         if not skip_unused_local_candidate_generation:
-            candidate_pool, unique_coords_from_pool, inverse_from_pool = _sparsepcgc_actual_oracle_candidate_indices(
-                coords_n3,
-                args,
-                global_step,
-                drop_pool_budget,
-                proxy_profile=proxy_profile,
-            )
-            if unique_coords_from_pool is not None and inverse_from_pool is not None:
-                unique_coords = unique_coords_from_pool
-                inverse = inverse_from_pool
-            candidate_indices = candidate_pool[:drop_budget]
-            add_candidate_pool = _sparsepcgc_actual_oracle_add_candidates(
-                unique_coords,
-                args,
-                global_step,
-                add_pool_budget,
-                proxy_profile=proxy_profile,
-            )
-            add_candidates = add_candidate_pool[:add_budget]
+            _ensure_local_candidate_generation()
     debug["enabled"] = True
     debug["candidate_count"] = int(len(candidate_indices) + len(add_candidates))
     debug["candidate_pool_count"] = int(len(candidate_pool) + len(add_candidate_pool))
@@ -3324,29 +3364,46 @@ def _attach_sparsepcgc_actual_oracle_drop(
             actual_eval_max = max(int(actual_eval_max), 2)
         else:
             scheduled_operation = "prune"
-        debug["actual_eval_max"] = int(actual_eval_max)
         debug["aux_probe_due"] = bool(aux_probe_due)
         debug["aux_probe_interval"] = int(aux_probe_interval)
         debug["scheduled_operation"] = str(scheduled_operation)
-        single_eval_fraction = min(
-            max(float(getattr(args, "sparsepcgc_actual_oracle_single_eval_fraction", 0.50)), 0.0),
-            1.0,
-        )
         prioritize_full_cloud_macro = bool(
             getattr(args, "sparsepcgc_actual_oracle_prioritize_full_cloud_macro", True)
             and torch.is_tensor(full_eval_coords)
             and int(getattr(args, "sparsepcgc_actual_oracle_full_cloud_macro_prune_candidate_max", 0)) > 0
         )
+        actual_eval_max_configured = int(actual_eval_max)
+        full_macro_fail_extra_eval_max = max(
+            int(getattr(args, "sparsepcgc_actual_oracle_full_macro_fail_extra_eval_max", 2)),
+            0,
+        )
+        full_macro_fail_fallback_enabled = bool(
+            getattr(args, "sparsepcgc_actual_oracle_fallback_after_full_macro_fail", True)
+            and prioritize_full_cloud_macro
+            and scheduled_operation == "prune"
+            and full_macro_fail_extra_eval_max > 0
+        )
+        actual_eval_limit = int(actual_eval_max_configured)
+        if full_macro_fail_fallback_enabled:
+            actual_eval_limit += int(full_macro_fail_extra_eval_max)
+        debug["actual_eval_max_configured"] = int(actual_eval_max_configured)
+        debug["actual_eval_max"] = int(actual_eval_limit)
+        debug["full_cloud_macro_fail_fallback_enabled"] = bool(full_macro_fail_fallback_enabled)
+        debug["full_cloud_macro_fail_extra_eval_max"] = int(full_macro_fail_extra_eval_max)
+        single_eval_fraction = min(
+            max(float(getattr(args, "sparsepcgc_actual_oracle_single_eval_fraction", 0.50)), 0.0),
+            1.0,
+        )
         if prioritize_full_cloud_macro or scheduled_operation in {"add", "move"}:
             single_eval_max = 0
         else:
-            single_eval_max = max(1, int(math.ceil(float(actual_eval_max) * single_eval_fraction)))
-            single_eval_max = min(int(single_eval_max), int(actual_eval_max))
+            single_eval_max = max(1, int(math.ceil(float(actual_eval_limit) * single_eval_fraction)))
+            single_eval_max = min(int(single_eval_max), int(actual_eval_limit))
         debug["single_eval_max"] = int(single_eval_max)
         debug["prioritize_full_cloud_macro"] = bool(prioritize_full_cloud_macro)
 
         def _actual_budget_exhausted(tested_count):
-            return int(tested_count) >= int(actual_eval_max)
+            return int(tested_count) >= int(actual_eval_limit)
 
         try:
             full_cloud_cache_key = str(
@@ -3647,18 +3704,27 @@ def _attach_sparsepcgc_actual_oracle_drop(
             if not subtree_move_allowed_this_step:
                 subtree_move_max = 0
 
-            complex_eval_budget = max(int(actual_eval_max) - int(single_eval_max), 0)
-            full_cloud_macro_eval_limit = min(full_cloud_macro_max, complex_eval_budget)
+            complex_eval_budget = max(int(actual_eval_limit) - int(single_eval_max), 0)
+            configured_complex_eval_budget = max(
+                int(actual_eval_max_configured) - int(single_eval_max),
+                0,
+            )
+            full_cloud_macro_budget = (
+                configured_complex_eval_budget
+                if full_macro_fail_fallback_enabled
+                else complex_eval_budget
+            )
+            full_cloud_macro_eval_limit = min(full_cloud_macro_max, full_cloud_macro_budget)
             remaining_complex_budget = max(complex_eval_budget - full_cloud_macro_eval_limit, 0)
+            pattern_plan_eval_limit = min(pattern_plan_max, 1 if remaining_complex_budget > 0 else 0)
+            remaining_complex_budget = max(remaining_complex_budget - pattern_plan_eval_limit, 0)
             macro_prune_eval_limit = min(macro_prune_max, remaining_complex_budget)
             remaining_complex_budget = max(remaining_complex_budget - macro_prune_eval_limit, 0)
+            parent_prune_eval_limit = min(parent_prune_max, 1 if remaining_complex_budget > 0 else 0)
+            remaining_complex_budget = max(remaining_complex_budget - parent_prune_eval_limit, 0)
             joint_eval_limit = min(max_joint_candidates, 1 if complex_eval_budget > 0 else 0)
             joint_eval_limit = min(joint_eval_limit, remaining_complex_budget)
             remaining_complex_budget = max(remaining_complex_budget - joint_eval_limit, 0)
-            parent_prune_eval_limit = min(parent_prune_max, 1 if remaining_complex_budget > 0 else 0)
-            remaining_complex_budget = max(remaining_complex_budget - parent_prune_eval_limit, 0)
-            pattern_plan_eval_limit = min(pattern_plan_max, 1 if remaining_complex_budget > 0 else 0)
-            remaining_complex_budget = max(remaining_complex_budget - pattern_plan_eval_limit, 0)
             subtree_move_eval_limit = min(subtree_move_max, 1 if remaining_complex_budget > 0 else 0)
             remaining_complex_budget = max(remaining_complex_budget - subtree_move_eval_limit, 0)
             group_eval_limit = min(group_candidate_max, remaining_complex_budget)
@@ -3830,6 +3896,24 @@ def _attach_sparsepcgc_actual_oracle_drop(
                         )
                     else:
                         bad_candidate_count += 1
+            if full_macro_fail_fallback_enabled:
+                full_macro_fallback_triggered = bool(full_cloud_macro_improving_count <= 0)
+                debug["full_cloud_macro_fallback_triggered"] = bool(full_macro_fallback_triggered)
+                if not full_macro_fallback_triggered:
+                    pattern_plan_eval_limit = 0
+                    macro_prune_eval_limit = 0
+                    parent_prune_eval_limit = 0
+                    joint_eval_limit = 0
+                    subtree_move_eval_limit = 0
+                    group_eval_limit = 0
+            else:
+                debug["full_cloud_macro_fallback_triggered"] = False
+            debug["macro_prune_eval_max"] = int(macro_prune_eval_limit)
+            debug["joint_eval_max"] = int(joint_eval_limit)
+            debug["group_eval_max"] = int(group_eval_limit)
+            debug["parent_prune_eval_max"] = int(parent_prune_eval_limit)
+            debug["pattern_plan_eval_max"] = int(pattern_plan_eval_limit)
+            debug["subtree_move_eval_max"] = int(subtree_move_eval_limit)
             if macro_prune_eval_limit > 0:
                 macro_candidates = _sparsepcgc_actual_oracle_macro_prune_candidates(
                     unique_coords,
@@ -3904,6 +3988,8 @@ def _attach_sparsepcgc_actual_oracle_drop(
                             mask = inverse == int(unique_idx)
                             if bool(mask.any().detach().cpu()):
                                 bad_drop_point_mask[0] |= mask
+            if joint_eval_limit > 0:
+                _ensure_local_candidate_generation()
             if joint_eval_limit > 0 and candidate_indices and add_candidates:
                 pair_candidates = []
                 for drop_candidate in candidate_indices:
@@ -4012,235 +4098,238 @@ def _attach_sparsepcgc_actual_oracle_drop(
                     else:
                         bad_candidate_count += 1
 
-            group_voxels = max(
-                int(getattr(args, "sparsepcgc_actual_oracle_group_voxels", 4)),
-                2,
-            )
-            raw_group_size_list = getattr(args, "sparsepcgc_actual_oracle_group_size_list", [group_voxels])
-            if isinstance(raw_group_size_list, str):
-                group_size_values = []
-                for item in raw_group_size_list.replace(";", ",").split(","):
-                    item = item.strip()
-                    if not item:
-                        continue
-                    try:
-                        group_size_values.append(int(float(item)))
-                    except ValueError:
-                        continue
-            elif isinstance(raw_group_size_list, (list, tuple)):
-                group_size_values = []
-                for item in raw_group_size_list:
-                    try:
-                        group_size_values.append(int(float(item)))
-                    except (TypeError, ValueError):
-                        continue
-            else:
-                group_size_values = []
-            max_group_voxels = min(
-                group_voxels,
-                max(int(getattr(args, "sparsepcgc_actual_oracle_max_selected_voxels", 4)), 1),
-            )
-            if not group_size_values:
-                group_size_values = [max_group_voxels]
-            group_size_values = sorted(
-                {
-                    min(max(int(size), 2), max_group_voxels)
-                    for size in group_size_values
-                    if int(size) >= 2
-                }
-            )
-            if not group_size_values and max_group_voxels >= 2:
-                group_size_values = [max_group_voxels]
-            min_improve = max(float(getattr(args, "sparsepcgc_actual_oracle_min_improve_percent", 0.0)), 0.0)
-            group_candidates_used = 0
+            if group_eval_limit > 0:
+                _ensure_local_candidate_generation()
+            if group_eval_limit > 0:
+                group_voxels = max(
+                    int(getattr(args, "sparsepcgc_actual_oracle_group_voxels", 4)),
+                    2,
+                )
+                raw_group_size_list = getattr(args, "sparsepcgc_actual_oracle_group_size_list", [group_voxels])
+                if isinstance(raw_group_size_list, str):
+                    group_size_values = []
+                    for item in raw_group_size_list.replace(";", ",").split(","):
+                        item = item.strip()
+                        if not item:
+                            continue
+                        try:
+                            group_size_values.append(int(float(item)))
+                        except ValueError:
+                            continue
+                elif isinstance(raw_group_size_list, (list, tuple)):
+                    group_size_values = []
+                    for item in raw_group_size_list:
+                        try:
+                            group_size_values.append(int(float(item)))
+                        except (TypeError, ValueError):
+                            continue
+                else:
+                    group_size_values = []
+                max_group_voxels = min(
+                    group_voxels,
+                    max(int(getattr(args, "sparsepcgc_actual_oracle_max_selected_voxels", 4)), 1),
+                )
+                if not group_size_values:
+                    group_size_values = [max_group_voxels]
+                group_size_values = sorted(
+                    {
+                        min(max(int(size), 2), max_group_voxels)
+                        for size in group_size_values
+                        if int(size) >= 2
+                    }
+                )
+                if not group_size_values and max_group_voxels >= 2:
+                    group_size_values = [max_group_voxels]
+                min_improve = max(float(getattr(args, "sparsepcgc_actual_oracle_min_improve_percent", 0.0)), 0.0)
+                group_candidates_used = 0
 
-            group_drop_indices_all = []
-            if len(candidate_pool) >= 2:
-                for drop_candidate in candidate_pool:
-                    idx = int(drop_candidate.get("unique_idx", -1) if isinstance(drop_candidate, dict) else drop_candidate)
-                    if idx >= 0 and idx not in group_drop_indices_all:
-                        group_drop_indices_all.append(idx)
-                    if len(group_drop_indices_all) >= max_group_voxels:
+                group_drop_indices_all = []
+                if len(candidate_pool) >= 2:
+                    for drop_candidate in candidate_pool:
+                        idx = int(drop_candidate.get("unique_idx", -1) if isinstance(drop_candidate, dict) else drop_candidate)
+                        if idx >= 0 and idx not in group_drop_indices_all:
+                            group_drop_indices_all.append(idx)
+                        if len(group_drop_indices_all) >= max_group_voxels:
+                            break
+
+                group_add_items_all = []
+                if len(add_candidate_pool) >= 2:
+                    seen_targets = set()
+                    for add_candidate in add_candidate_pool:
+                        target_coord = add_candidate.get("target_coord", None)
+                        if not torch.is_tensor(target_coord):
+                            continue
+                        target_key = tuple(int(v) for v in target_coord.view(-1).detach().cpu().tolist())
+                        if target_key in seen_targets:
+                            continue
+                        seen_targets.add(target_key)
+                        group_add_items_all.append(add_candidate)
+                        if len(group_add_items_all) >= max_group_voxels:
+                            break
+
+                used_drop_group_sizes = set()
+                used_add_group_sizes = set()
+                for requested_group_size in group_size_values:
+                    if group_candidates_used >= group_eval_limit:
                         break
 
-            group_add_items_all = []
-            if len(add_candidate_pool) >= 2:
-                seen_targets = set()
-                for add_candidate in add_candidate_pool:
-                    target_coord = add_candidate.get("target_coord", None)
-                    if not torch.is_tensor(target_coord):
-                        continue
-                    target_key = tuple(int(v) for v in target_coord.view(-1).detach().cpu().tolist())
-                    if target_key in seen_targets:
-                        continue
-                    seen_targets.add(target_key)
-                    group_add_items_all.append(add_candidate)
-                    if len(group_add_items_all) >= max_group_voxels:
-                        break
-
-            used_drop_group_sizes = set()
-            used_add_group_sizes = set()
-            for requested_group_size in group_size_values:
-                if group_candidates_used >= group_eval_limit:
-                    break
-
-                drop_group_size = min(int(requested_group_size), len(group_drop_indices_all), max_group_voxels)
-                if (
-                    group_candidate_max > 0
-                    and scheduled_operation == "prune"
-                    and drop_group_size >= 2
-                    and drop_group_size not in used_drop_group_sizes
-                    and group_candidates_used < group_eval_limit
-                ):
-                    used_drop_group_sizes.add(drop_group_size)
-                    debug["generated_candidate_count"] = int(debug.get("generated_candidate_count", 0)) + 1
-                    if _actual_budget_exhausted(tested):
-                        break
-                    group_drop_indices = group_drop_indices_all[:drop_group_size]
-                    keep_unique = torch.ones((unique_coords.shape[0],), device=coords.device, dtype=torch.bool)
-                    keep_unique[torch.as_tensor(group_drop_indices, device=coords.device, dtype=torch.long)] = False
-                    if int(keep_unique.sum().item()) > 0:
-                        candidate_coords = unique_coords[keep_unique]
-                        candidate_xyz = _oracle_actual_eval_xyz(candidate_coords)
-                        if candidate_xyz is not None and candidate_xyz.shape[-1] > 0:
-                            stats = loss._encode_actual_batch(args, candidate_xyz)
-                            tested += 1
-                            group_tested += 1
-                            group_candidates_used += 1
-                            cand_bit = float(stats.get("bit", 0.0))
-                            edit_record_bits = _sparsepcgc_edit_record_total_bits(
-                                args,
-                                edit_record_unique_count,
-                                drop_count=len(group_drop_indices),
-                            )
-                            proxy_bits, proxy_percent = _sparsepcgc_proxy_delta_percent(
-                                unique_coords[keep_unique],
-                                args,
-                                base_proxy_bits,
-                            )
-                            geometry_percent = _sparsepcgc_geometry_penalty_percent(
-                                args,
-                                edit_record_unique_count,
-                                drop_count=len(group_drop_indices),
-                            )
-                            raw_percent, actual_percent, cand_percent = _candidate_objective(
-                                cand_bit,
-                                edit_record_bits,
-                                geometry_percent,
-                            )
-                            _update_best(raw_percent, actual_percent, cand_percent, edit_record_bits, cand_bit, proxy_percent)
-                            if cand_percent < -min_improve:
-                                group_improving_count += 1
-                                improving_candidate_count += 1
-                                improving.append(
-                                    {
-                                        "op": "drop_group",
-                                        "unique_indices": list(group_drop_indices),
-                                        "percent": float(cand_percent),
-                                        "raw_percent": float(raw_percent),
-                                        "actual_percent": float(actual_percent),
-                                        "proxy_percent": float(proxy_percent),
-                                        "proxy_bits": float(proxy_bits),
-                                        "geometry_percent": float(geometry_percent),
-                                        "edit_record_bits": float(edit_record_bits),
-                                    }
+                    drop_group_size = min(int(requested_group_size), len(group_drop_indices_all), max_group_voxels)
+                    if (
+                        group_candidate_max > 0
+                        and scheduled_operation == "prune"
+                        and drop_group_size >= 2
+                        and drop_group_size not in used_drop_group_sizes
+                        and group_candidates_used < group_eval_limit
+                    ):
+                        used_drop_group_sizes.add(drop_group_size)
+                        debug["generated_candidate_count"] = int(debug.get("generated_candidate_count", 0)) + 1
+                        if _actual_budget_exhausted(tested):
+                            break
+                        group_drop_indices = group_drop_indices_all[:drop_group_size]
+                        keep_unique = torch.ones((unique_coords.shape[0],), device=coords.device, dtype=torch.bool)
+                        keep_unique[torch.as_tensor(group_drop_indices, device=coords.device, dtype=torch.long)] = False
+                        if int(keep_unique.sum().item()) > 0:
+                            candidate_coords = unique_coords[keep_unique]
+                            candidate_xyz = _oracle_actual_eval_xyz(candidate_coords)
+                            if candidate_xyz is not None and candidate_xyz.shape[-1] > 0:
+                                stats = loss._encode_actual_batch(args, candidate_xyz)
+                                tested += 1
+                                group_tested += 1
+                                group_candidates_used += 1
+                                cand_bit = float(stats.get("bit", 0.0))
+                                edit_record_bits = _sparsepcgc_edit_record_total_bits(
+                                    args,
+                                    edit_record_unique_count,
+                                    drop_count=len(group_drop_indices),
                                 )
-                            else:
-                                bad_candidate_count += 1
-                                for unique_idx in group_drop_indices:
-                                    mask = inverse == int(unique_idx)
-                                    if bool(mask.any().detach().cpu()):
-                                        bad_drop_point_mask[0] |= mask
-
-                add_group_size = min(int(requested_group_size), len(group_add_items_all), max_group_voxels)
-                if (
-                    group_candidate_max > 0
-                    and scheduled_operation == "add"
-                    and add_group_size >= 2
-                    and add_group_size not in used_add_group_sizes
-                    and group_candidates_used < group_eval_limit
-                ):
-                    used_add_group_sizes.add(add_group_size)
-                    debug["generated_candidate_count"] = int(debug.get("generated_candidate_count", 0)) + 1
-                    if _actual_budget_exhausted(tested):
-                        break
-                    group_add_items = group_add_items_all[:add_group_size]
-                    target_coords = [
-                        item["target_coord"].to(device=unique_coords.device, dtype=torch.long).view(1, 3)
-                        for item in group_add_items
-                    ]
-                    candidate_coords = torch.cat([unique_coords] + target_coords, dim=0)
-                    candidate_coords = torch.unique(candidate_coords, dim=0, sorted=True)
-                    if int(candidate_coords.shape[0]) > int(unique_coords.shape[0]):
-                        candidate_xyz = _oracle_actual_eval_xyz(candidate_coords)
-                        if candidate_xyz is not None and candidate_xyz.shape[-1] > 0:
-                            stats = loss._encode_actual_batch(args, candidate_xyz)
-                            tested += 1
-                            group_tested += 1
-                            group_candidates_used += 1
-                            cand_bit = float(stats.get("bit", 0.0))
-                            edit_record_bits = _sparsepcgc_edit_record_total_bits(
-                                args,
-                                edit_record_unique_count,
-                                add_count=len(group_add_items),
-                            )
-                            proxy_bits, proxy_percent = _sparsepcgc_proxy_delta_percent(
-                                candidate_coords,
-                                args,
-                                base_proxy_bits,
-                            )
-                            geometry_percent = _sparsepcgc_geometry_penalty_percent(
-                                args,
-                                edit_record_unique_count,
-                                add_count=len(group_add_items),
-                            )
-                            raw_percent, actual_percent, cand_percent = _candidate_objective(
-                                cand_bit,
-                                edit_record_bits,
-                                geometry_percent,
-                            )
-                            _update_best(raw_percent, actual_percent, cand_percent, edit_record_bits, cand_bit, proxy_percent)
-                            if cand_percent < -min_improve:
-                                group_improving_count += 1
-                                improving_candidate_count += 1
-                                improving.append(
-                                    {
-                                        "op": "add_group",
-                                        "source_unique_indices": [
-                                            int(item["source_unique_idx"]) for item in group_add_items
-                                        ],
-                                        "target_child_slots": [
-                                            int(item["target_child_slot"]) for item in group_add_items
-                                        ],
-                                        "target_coords": torch.cat(target_coords, dim=0).detach().clone(),
-                                        "percent": float(cand_percent),
-                                        "raw_percent": float(raw_percent),
-                                        "actual_percent": float(actual_percent),
-                                        "proxy_percent": float(proxy_percent),
-                                        "proxy_bits": float(proxy_bits),
-                                        "geometry_percent": float(geometry_percent),
-                                        "edit_record_bits": float(edit_record_bits),
-                                    }
+                                proxy_bits, proxy_percent = _sparsepcgc_proxy_delta_percent(
+                                    unique_coords[keep_unique],
+                                    args,
+                                    base_proxy_bits,
                                 )
-                            else:
-                                bad_candidate_count += 1
-                                for item in group_add_items:
-                                    source_unique_idx = int(item["source_unique_idx"])
-                                    mask = inverse == source_unique_idx
-                                    if bool(mask.any().detach().cpu()):
-                                        bad_add_point_mask[0] |= mask
-                                        strength = _oracle_strength(cand_percent, bad=True)
-                                        bad_add_score[0, mask] = torch.maximum(
-                                            bad_add_score[0, mask],
-                                            bad_add_score.new_full((int(mask.sum().item()),), float(strength)),
-                                        )
-                                        target_coord = item["target_coord"].to(
-                                            device=unique_coords.device,
-                                            dtype=torch.long,
-                                        ).reshape(3)
-                                        bad_add_direction_index[0, mask] = _neighbor_direction_index(
-                                            target_coord - unique_coords[source_unique_idx]
-                                        )
+                                geometry_percent = _sparsepcgc_geometry_penalty_percent(
+                                    args,
+                                    edit_record_unique_count,
+                                    drop_count=len(group_drop_indices),
+                                )
+                                raw_percent, actual_percent, cand_percent = _candidate_objective(
+                                    cand_bit,
+                                    edit_record_bits,
+                                    geometry_percent,
+                                )
+                                _update_best(raw_percent, actual_percent, cand_percent, edit_record_bits, cand_bit, proxy_percent)
+                                if cand_percent < -min_improve:
+                                    group_improving_count += 1
+                                    improving_candidate_count += 1
+                                    improving.append(
+                                        {
+                                            "op": "drop_group",
+                                            "unique_indices": list(group_drop_indices),
+                                            "percent": float(cand_percent),
+                                            "raw_percent": float(raw_percent),
+                                            "actual_percent": float(actual_percent),
+                                            "proxy_percent": float(proxy_percent),
+                                            "proxy_bits": float(proxy_bits),
+                                            "geometry_percent": float(geometry_percent),
+                                            "edit_record_bits": float(edit_record_bits),
+                                        }
+                                    )
+                                else:
+                                    bad_candidate_count += 1
+                                    for unique_idx in group_drop_indices:
+                                        mask = inverse == int(unique_idx)
+                                        if bool(mask.any().detach().cpu()):
+                                            bad_drop_point_mask[0] |= mask
+
+                    add_group_size = min(int(requested_group_size), len(group_add_items_all), max_group_voxels)
+                    if (
+                        group_candidate_max > 0
+                        and scheduled_operation == "add"
+                        and add_group_size >= 2
+                        and add_group_size not in used_add_group_sizes
+                        and group_candidates_used < group_eval_limit
+                    ):
+                        used_add_group_sizes.add(add_group_size)
+                        debug["generated_candidate_count"] = int(debug.get("generated_candidate_count", 0)) + 1
+                        if _actual_budget_exhausted(tested):
+                            break
+                        group_add_items = group_add_items_all[:add_group_size]
+                        target_coords = [
+                            item["target_coord"].to(device=unique_coords.device, dtype=torch.long).view(1, 3)
+                            for item in group_add_items
+                        ]
+                        candidate_coords = torch.cat([unique_coords] + target_coords, dim=0)
+                        candidate_coords = torch.unique(candidate_coords, dim=0, sorted=True)
+                        if int(candidate_coords.shape[0]) > int(unique_coords.shape[0]):
+                            candidate_xyz = _oracle_actual_eval_xyz(candidate_coords)
+                            if candidate_xyz is not None and candidate_xyz.shape[-1] > 0:
+                                stats = loss._encode_actual_batch(args, candidate_xyz)
+                                tested += 1
+                                group_tested += 1
+                                group_candidates_used += 1
+                                cand_bit = float(stats.get("bit", 0.0))
+                                edit_record_bits = _sparsepcgc_edit_record_total_bits(
+                                    args,
+                                    edit_record_unique_count,
+                                    add_count=len(group_add_items),
+                                )
+                                proxy_bits, proxy_percent = _sparsepcgc_proxy_delta_percent(
+                                    candidate_coords,
+                                    args,
+                                    base_proxy_bits,
+                                )
+                                geometry_percent = _sparsepcgc_geometry_penalty_percent(
+                                    args,
+                                    edit_record_unique_count,
+                                    add_count=len(group_add_items),
+                                )
+                                raw_percent, actual_percent, cand_percent = _candidate_objective(
+                                    cand_bit,
+                                    edit_record_bits,
+                                    geometry_percent,
+                                )
+                                _update_best(raw_percent, actual_percent, cand_percent, edit_record_bits, cand_bit, proxy_percent)
+                                if cand_percent < -min_improve:
+                                    group_improving_count += 1
+                                    improving_candidate_count += 1
+                                    improving.append(
+                                        {
+                                            "op": "add_group",
+                                            "source_unique_indices": [
+                                                int(item["source_unique_idx"]) for item in group_add_items
+                                            ],
+                                            "target_child_slots": [
+                                                int(item["target_child_slot"]) for item in group_add_items
+                                            ],
+                                            "target_coords": torch.cat(target_coords, dim=0).detach().clone(),
+                                            "percent": float(cand_percent),
+                                            "raw_percent": float(raw_percent),
+                                            "actual_percent": float(actual_percent),
+                                            "proxy_percent": float(proxy_percent),
+                                            "proxy_bits": float(proxy_bits),
+                                            "geometry_percent": float(geometry_percent),
+                                            "edit_record_bits": float(edit_record_bits),
+                                        }
+                                    )
+                                else:
+                                    bad_candidate_count += 1
+                                    for item in group_add_items:
+                                        source_unique_idx = int(item["source_unique_idx"])
+                                        mask = inverse == source_unique_idx
+                                        if bool(mask.any().detach().cpu()):
+                                            bad_add_point_mask[0] |= mask
+                                            strength = _oracle_strength(cand_percent, bad=True)
+                                            bad_add_score[0, mask] = torch.maximum(
+                                                bad_add_score[0, mask],
+                                                bad_add_score.new_full((int(mask.sum().item()),), float(strength)),
+                                            )
+                                            target_coord = item["target_coord"].to(
+                                                device=unique_coords.device,
+                                                dtype=torch.long,
+                                            ).reshape(3)
+                                            bad_add_direction_index[0, mask] = _neighbor_direction_index(
+                                                target_coord - unique_coords[source_unique_idx]
+                                            )
 
             if parent_prune_eval_limit > 0 and unique_count > 1:
                 parent_coords = torch.div(unique_coords, 2, rounding_mode="floor")
@@ -5117,6 +5206,7 @@ def _attach_sparsepcgc_actual_oracle_drop(
         "actual_oracle_single_child_chain_count": int(debug.get("single_child_chain_count", 0)),
         "actual_oracle_context_pattern_candidate_count": int(debug.get("context_pattern_candidate_count", 0)),
         "actual_oracle_eval_count": int(debug.get("tested_count", 0)),
+        "actual_oracle_eval_max_configured": int(debug.get("actual_eval_max_configured", debug.get("actual_eval_max", 0))),
         "actual_oracle_eval_max": int(debug.get("actual_eval_max", 0)),
         "actual_oracle_eval_scope": str(debug.get("actual_eval_scope", "")),
         "actual_oracle_eval_full_coord_count": int(debug.get("actual_eval_full_coord_count", 0)),
@@ -5185,6 +5275,11 @@ def _attach_sparsepcgc_actual_oracle_drop(
         "actual_oracle_joint_improving_count": int(debug.get("joint_improving_count", 0) or 0),
         "actual_oracle_group_tested_count": int(debug.get("group_tested_count", 0) or 0),
         "actual_oracle_group_improving_count": int(debug.get("group_improving_count", 0) or 0),
+        "actual_oracle_full_cloud_macro_fallback_triggered": bool(debug.get("full_cloud_macro_fallback_triggered", False)),
+        "actual_oracle_full_cloud_macro_fail_extra_eval_max": int(debug.get("full_cloud_macro_fail_extra_eval_max", 0) or 0),
+        "actual_oracle_full_cloud_macro_fallback_candidate_generation_enabled": bool(
+            debug.get("full_cloud_macro_fallback_candidate_generation_enabled", False)
+        ),
         "actual_oracle_full_cloud_macro_tested_count": int(debug.get("full_cloud_macro_tested_count", 0) or 0),
         "actual_oracle_full_cloud_macro_improving_count": int(debug.get("full_cloud_macro_improving_count", 0) or 0),
         "actual_oracle_full_cloud_macro_best_percent": float(debug.get("full_cloud_macro_best_percent", 0.0) or 0.0),
@@ -5329,6 +5424,7 @@ def _copy_sparsepcgc_actual_oracle_debug_for_metrics(target, debug):
             "actual_oracle_single_child_chain_count": int(debug.get("single_child_chain_count", 0) or 0),
             "actual_oracle_context_pattern_candidate_count": int(debug.get("context_pattern_candidate_count", 0) or 0),
             "actual_oracle_eval_count": int(debug.get("tested_count", 0) or 0),
+            "actual_oracle_eval_max_configured": int(debug.get("actual_eval_max_configured", debug.get("actual_eval_max", 0)) or 0),
             "actual_oracle_eval_max": int(debug.get("actual_eval_max", 0) or 0),
             "actual_oracle_eval_scope": str(debug.get("actual_eval_scope", "")),
             "actual_oracle_eval_full_coord_count": int(debug.get("actual_eval_full_coord_count", 0) or 0),
@@ -5354,6 +5450,11 @@ def _copy_sparsepcgc_actual_oracle_debug_for_metrics(target, debug):
             "actual_oracle_joint_improving_count": int(debug.get("joint_improving_count", 0) or 0),
             "actual_oracle_group_tested_count": int(debug.get("group_tested_count", 0) or 0),
             "actual_oracle_group_improving_count": int(debug.get("group_improving_count", 0) or 0),
+            "actual_oracle_full_cloud_macro_fallback_triggered": bool(debug.get("full_cloud_macro_fallback_triggered", False)),
+            "actual_oracle_full_cloud_macro_fail_extra_eval_max": int(debug.get("full_cloud_macro_fail_extra_eval_max", 0) or 0),
+            "actual_oracle_full_cloud_macro_fallback_candidate_generation_enabled": bool(
+                debug.get("full_cloud_macro_fallback_candidate_generation_enabled", False)
+            ),
             "actual_oracle_full_cloud_macro_tested_count": int(debug.get("full_cloud_macro_tested_count", 0) or 0),
             "actual_oracle_full_cloud_macro_improving_count": int(debug.get("full_cloud_macro_improving_count", 0) or 0),
             "actual_oracle_full_cloud_macro_best_percent": float(debug.get("full_cloud_macro_best_percent", 0.0) or 0.0),
@@ -7627,9 +7728,17 @@ def train(model, args, loss, writer, plot, notifier=None):
     """基本情報"""
     set_seed(args.seed, deterministic=getattr(args, "deterministic", False)) # ランスシードを固定し、学習結果の再現性を確保する
     best_loss = float('inf') # 後続の計算・ログのため
-    seq_dirs = collect_seq_dirs2(args.input_dir, dataset_name=args.dataname) # 入力ディレクトリから学習対象のシーケンスディレクトリ一覧を集める
+    raw_seq_dirs = collect_seq_dirs2(args.input_dir, dataset_name=args.dataname) # 入力ディレクトリから学習対象のシーケンスディレクトリ一覧を集める
+    seq_dirs = _limit_training_seq_dirs(raw_seq_dirs, args) # 8iだけ先頭3シーケンスに制限し、4つ目は使わない
     num_seq = len(seq_dirs)
     writer.write(f"Total seq directories: {num_seq}")
+    if len(seq_dirs) != len(raw_seq_dirs):
+        kept_names = ", ".join(os.path.basename(seq_dir) for seq_dir in seq_dirs)
+        writer.write(
+            "8i training sequence limit applied: "
+            f"using {len(seq_dirs)} of {len(raw_seq_dirs)} sequence directories"
+        )
+        writer.write(f"8i kept sequence dirs: {kept_names}")
     seq_datasets = [(seq_dir, PlyDirDataset(args, seq_dir)) for seq_dir in seq_dirs] # 各シーケンス内のPLY点群ファイルを読み込むデータセットを作る
     total_train_files = sum(len(dataset) for _, dataset in seq_datasets) # 全シーケンスに含まれる点群ファイル数を合計し、総Step数の見積もりなどに使用
     args._total_train_steps_estimate = max(int(getattr(args, "episodes", 1)), 1) * max(int(total_train_files), 1) # Episode数と点群ファイル数からそう学修Step数を概算
@@ -9095,6 +9204,23 @@ def train(model, args, loss, writer, plot, notifier=None):
                 # Phase7-2のfull-context subtree deltaをここへ追加するため、
                 # termsを使う前に必ず初期化する。
                 terms = dict(getattr(loss, "last_compression_terms", {}) or {})
+                compression_debug_terms = dict(getattr(loss, "last_compression_debug", {}) or {})
+                actual_total_bit_percent_term = compression_debug_terms.get(
+                    "actual_total_bit_percent_fresh",
+                    compression_debug_terms.get("actual_total_bit_percent", None),
+                )
+                if actual_total_bit_percent_term is not None:
+                    if torch.is_tensor(L_com):
+                        terms = dict(terms)
+                        terms["actual_total_bit_percent"] = L_com.new_tensor(float(actual_total_bit_percent_term))
+                        terms["actual_total_bit_percent_fresh"] = L_com.new_tensor(float(actual_total_bit_percent_term))
+                    else:
+                        terms = dict(terms)
+                        terms["actual_total_bit_percent"] = float(actual_total_bit_percent_term)
+                        terms["actual_total_bit_percent_fresh"] = float(actual_total_bit_percent_term)
+                if torch.is_tensor(loss_bit):
+                    terms = dict(terms)
+                    terms["proxy_bit"] = loss_bit
                 if torch.is_tensor(L_full_context_subtree_delta):
                     terms = dict(terms)
                     terms["full_context_subtree_delta"] = L_full_context_subtree_delta
@@ -9192,6 +9318,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                         global_train_step=global_train_step,
                         stage_factors=stage_factors,
                     )
+                    compression_support_anchor = L_com_objective
                     # L_com_objective に後から足す gradient-only proxy を、
                     # 実際に backward される L にも反映するための蓄積変数である。
                     # forward値は0なので、損失値自体は変えない。
@@ -9603,12 +9730,79 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 cp_debug["prune_where_direct_anchor_used"] = False
                                 cp_debug["prune_where_direct_anchor_source"] = "no_requires_grad_proxy"
                                 
-                    L = (
-                        L
-                        + stage_factors["attr"] * args.w_attr * L_attr
-                        + stage_factors["policy"] * args.w_policy * L_policy
-                        + stage_factors["repair"] * args.w_actuator * L_actuator
+                    tail_attr_block = stage_factors["attr"] * args.w_attr * L_attr
+                    tail_policy_block = stage_factors["policy"] * args.w_policy * L_policy
+                    tail_actuator_block = stage_factors["repair"] * args.w_actuator * L_actuator
+                    tail_support_raw = tail_attr_block + tail_policy_block + tail_actuator_block
+                    tail_balance = _compression_primary_support_balance(
+                        args,
+                        compression_support_anchor if torch.is_tensor(compression_support_anchor) else L,
+                        tail_support_raw,
+                        enabled=uses_actual_total_bit_objective(args),
+                        target_ratio_name="compression_primary_tail_target_ratio",
+                        min_scale_name="compression_primary_tail_balance_min_scale",
+                        max_scale_name="compression_primary_tail_balance_max_scale",
+                        disabled_reason="tail_balance_disabled",
                     )
+                    tail_support_scale = float(tail_balance["scale"])
+                    tail_support_scaled = tail_support_scale * tail_support_raw
+                    L = L + tail_support_scaled
+
+                    if isinstance(cp_debug, dict):
+                        cp_debug["cp_support_tail_attr_raw"] = case_float(tail_attr_block, float("nan"))
+                        cp_debug["cp_support_tail_policy_raw"] = case_float(tail_policy_block, float("nan"))
+                        cp_debug["cp_support_tail_actuator_raw"] = case_float(tail_actuator_block, float("nan"))
+                        cp_debug["cp_support_tail_attr_scaled"] = case_float(
+                            tail_support_scale * tail_attr_block,
+                            float("nan"),
+                        )
+                        cp_debug["cp_support_tail_policy_scaled"] = case_float(
+                            tail_support_scale * tail_policy_block,
+                            float("nan"),
+                        )
+                        cp_debug["cp_support_tail_actuator_scaled"] = case_float(
+                            tail_support_scale * tail_actuator_block,
+                            float("nan"),
+                        )
+                        cp_debug["cp_support_tail_raw"] = case_float(tail_support_raw, float("nan"))
+                        cp_debug["cp_support_tail_scaled"] = case_float(tail_support_scaled, float("nan"))
+                        cp_debug["cp_support_tail_scale"] = float(tail_support_scale)
+                        cp_debug["cp_support_tail_reason"] = str(tail_balance.get("reason", ""))
+                        cp_debug["cp_support_tail_target_ratio"] = (
+                            float(tail_balance["target_ratio"])
+                            if tail_balance.get("target_ratio", None) is not None
+                            else float("nan")
+                        )
+                        cp_debug["cp_support_tail_primary_abs"] = (
+                            float(tail_balance["primary_mag"])
+                            if tail_balance.get("primary_mag", None) is not None
+                            else float("nan")
+                        )
+                        cp_debug["cp_support_tail_support_abs"] = (
+                            float(tail_balance["support_mag"])
+                            if tail_balance.get("support_mag", None) is not None
+                            else float("nan")
+                        )
+                        cp_debug["cp_support_tail_scaled_support_abs"] = (
+                            float(tail_balance["scaled_support_mag"])
+                            if tail_balance.get("scaled_support_mag", None) is not None
+                            else float("nan")
+                        )
+                        cp_debug["cp_support_tail_dominant"] = str(
+                            tail_balance.get("dominant", "neutral")
+                        )
+                        aux_scaled = float(cp_debug.get("cp_aux_block_scaled", 0.0))
+                        support_total_scaled = aux_scaled + case_float(tail_support_scaled, 0.0)
+                        main_block_value = float(cp_debug.get("cp_main_block", 0.0))
+                        cp_debug["cp_support_total_scaled"] = float(support_total_scaled)
+                        cp_debug["cp_support_total_ratio_to_main"] = (
+                            abs(support_total_scaled) / max(abs(main_block_value), 1e-12)
+                        )
+                        cp_debug["cp_support_dominant"] = (
+                            "compression"
+                            if abs(main_block_value) + 1e-12 >= abs(support_total_scaled)
+                            else "support"
+                        )
                     L_discrete_policy = L.new_zeros(())
                 elif _discrete_loss_mode_value(args) == "hard":
                     policy_loss_fn = getattr(model, "discrete_policy_loss", None) # モデルが保持しているHard離散方策用の損失関数を取得する
@@ -9651,18 +9845,71 @@ def train(model, args, loss, writer, plot, notifier=None):
                     )
                     add_correction_directly = correction_weight > 0.0
 
-                    if add_correction_directly:
-                        L = L + correction_weight * full_cloud_correction_loss
+                    correction_block = correction_weight * full_cloud_correction_loss
+                    correction_scale = 1.0
+                    correction_balance = None
+
+                    if add_correction_directly and bool(compression_primary_mode):
+                        correction_balance = _compression_primary_support_balance(
+                            args,
+                            compression_support_anchor if torch.is_tensor(compression_support_anchor) else L,
+                            correction_block,
+                            enabled=uses_actual_total_bit_objective(args),
+                            target_ratio_name="compression_primary_tail_target_ratio",
+                            min_scale_name="compression_primary_tail_balance_min_scale",
+                            max_scale_name="compression_primary_tail_balance_max_scale",
+                            disabled_reason="tail_balance_disabled",
+                        )
+                        correction_scale = float(correction_balance["scale"])
+                        L = L + correction_scale * correction_block
+                    elif add_correction_directly:
+                        L = L + correction_block
 
                     if isinstance(full_cloud_correction_debug, dict):
                         full_cloud_correction_debug["full_cloud_corr_loss_added_to_total"] = bool(add_correction_directly)
                         full_cloud_correction_debug["full_cloud_corr_loss_weight_used"] = float(correction_weight)
+                        full_cloud_correction_debug["full_cloud_corr_loss_scale_to_total"] = float(correction_scale)
                         full_cloud_correction_debug["full_cloud_corr_loss_added_via_compression_primary"] = bool(
                             compression_primary_mode and add_correction_directly
                         )
                         full_cloud_correction_debug["full_cloud_corr_loss_requires_grad"] = bool(
                             torch.is_tensor(full_cloud_correction_loss)
                             and full_cloud_correction_loss.requires_grad
+                        )
+                    if isinstance(cp_debug, dict):
+                        cp_debug["cp_support_correction_raw"] = case_float(correction_block, float("nan"))
+                        cp_debug["cp_support_correction_scaled"] = case_float(
+                            correction_scale * correction_block,
+                            float("nan"),
+                        )
+                        cp_debug["cp_support_correction_scale"] = float(correction_scale)
+                        cp_debug["cp_support_correction_reason"] = str(
+                            (correction_balance or {}).get("reason", "")
+                        )
+                        cp_debug["cp_support_correction_target_ratio"] = (
+                            float(correction_balance["target_ratio"])
+                            if correction_balance is not None
+                            and correction_balance.get("target_ratio", None) is not None
+                            else float("nan")
+                        )
+                        cp_debug["cp_support_correction_dominant"] = str(
+                            (correction_balance or {}).get("dominant", "neutral")
+                        )
+                        aux_scaled = float(cp_debug.get("cp_aux_block_scaled", 0.0))
+                        tail_scaled = float(cp_debug.get("cp_support_tail_scaled", 0.0))
+                        correction_scaled = case_float(correction_scale * correction_block, 0.0)
+                        cp_debug["cp_support_total_scaled"] = float(
+                            aux_scaled + tail_scaled + correction_scaled
+                        )
+                        main_block_value = float(cp_debug.get("cp_main_block", 0.0))
+                        cp_debug["cp_support_total_ratio_to_main"] = (
+                            abs(aux_scaled + tail_scaled + correction_scaled)
+                            / max(abs(main_block_value), 1e-12)
+                        )
+                        cp_debug["cp_support_dominant"] = (
+                            "compression"
+                            if abs(main_block_value) + 1e-12 >= abs(aux_scaled + tail_scaled + correction_scaled)
+                            else "support"
                         )
                 else:
                     if isinstance(full_cloud_correction_debug, dict):

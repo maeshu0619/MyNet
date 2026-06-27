@@ -134,6 +134,9 @@ def log_compression_stats(writer, step, num_steps, comp_debug):
         f"surrogate_abs_bit_error={float(comp_debug.get('surrogate_abs_bit_error', 0.0)):.6f}, "
         f"surrogate_signed_bit_error={float(comp_debug.get('surrogate_signed_bit_error', 0.0)):.6f}, "
         f"surrogate_train_loss={float(comp_debug.get('surrogate_train_loss', 0.0)):.6f}, "
+        f"actual_forward={float(comp_debug.get('actual_forward_value', 0.0)):.6f}, "
+        f"actual_forward_raw={float(comp_debug.get('actual_forward_raw_value', comp_debug.get('actual_bit_percent', 0.0))):.6f}, "
+        f"actual_forward_clamped={bool(comp_debug.get('actual_forward_clamped', False))}, "
         f"lcom_main={float(comp_debug.get('compression_main_loss', 0.0)):.6f}, "
         f"lcom_aux={float(comp_debug.get('compression_aux_loss', 0.0)):.6f}, "
         f"lcom_sparsepcgc_aux={float(comp_debug.get('sparsepcgc_aux_loss', 0.0)):.6f}, "
@@ -142,7 +145,6 @@ def log_compression_stats(writer, step, num_steps, comp_debug):
         f"sparsepcgc_aux_weight_effective={float(comp_debug.get('sparsepcgc_aux_weight_effective', 0.0)):.6f}, "
         f"sparsepcgc_aux_gate={comp_debug.get('sparsepcgc_aux_gating_reason', '')}, "
         f"grad_source={comp_debug.get('grad_source', '')}, "
-        f"actual_forward={float(comp_debug.get('actual_forward_value', 0.0)):.6f}, "
         f"surrogate_grad={float(comp_debug.get('surrogate_loss_for_grad', 0.0)):.6f}, "
         f"proxy_grad={float(comp_debug.get('proxy_aux_for_grad', 0.0)):.6f}, "
         f"lcom_without_sparse={float(comp_debug.get('lcom_without_sparsepcgc_aux', 0.0)):.6f}, "
@@ -472,6 +474,28 @@ def log_compact_step_summary(
         f"single={_fmt(loss_single)}, node={_fmt(loss_nodes)}, sparse={_fmt(sparse_raw)}, "
         f"attr={_fmt(L_attr)}, policy={_fmt(L_policy)}, act={_fmt(L_actuator)}]"
     )
+    if str(comp_debug.get("loss_mode", "")).strip().lower() == "compression_primary":
+        writer.write(
+            f"StepBalance {step + 1}/{num_steps}: "
+            f"main={_fmt(comp_debug.get('cp_main_block', float('nan')))}"
+            f"(src={comp_debug.get('cp_main_source', 'n/a')}), "
+            f"cp_aux={_fmt(comp_debug.get('cp_aux_block_scaled', float('nan')))}"
+            f"(raw={_fmt(comp_debug.get('cp_aux_block_raw', float('nan')))}, "
+            f"scale={_fmt(comp_debug.get('cp_aux_balance_scale', float('nan')))}, "
+            f"target={_fmt(comp_debug.get('cp_aux_target_ratio', float('nan')))}, "
+            f"dom={comp_debug.get('cp_aux_balance_dominant', 'n/a')}), "
+            f"tail={_fmt(comp_debug.get('cp_support_tail_scaled', float('nan')))}"
+            f"(raw={_fmt(comp_debug.get('cp_support_tail_raw', float('nan')))}, "
+            f"scale={_fmt(comp_debug.get('cp_support_tail_scale', float('nan')))}, "
+            f"target={_fmt(comp_debug.get('cp_support_tail_target_ratio', float('nan')))}, "
+            f"dom={comp_debug.get('cp_support_tail_dominant', 'n/a')}), "
+            f"corr={_fmt(comp_debug.get('cp_support_correction_scaled', float('nan')))}"
+            f"(raw={_fmt(comp_debug.get('cp_support_correction_raw', float('nan')))}, "
+            f"scale={_fmt(comp_debug.get('cp_support_correction_scale', float('nan')))}), "
+            f"support_total={_fmt(comp_debug.get('cp_support_total_scaled', float('nan')))}, "
+            f"support/main={_fmt(comp_debug.get('cp_support_total_ratio_to_main', float('nan')))}, "
+            f"dominant={comp_debug.get('cp_support_dominant', 'n/a')}"
+        )
 
     gt_bits = _first_value(comp_debug, ("gt_actual_bit", "gt_bit_abs", "actual_gt_bits"), float("nan"))
     policy_mine_bits = _first_value(
