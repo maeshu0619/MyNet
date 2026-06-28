@@ -6680,14 +6680,56 @@ def _format_soft_proxy_debug(args):
 
 
 def _balance_actual_operation_head_gradients(args, model, structure_debug=None):
-    """Normalize only operation heads backed by a fresh actual-oracle label."""
+    """
+    Operation head の optimizer.step 直前の実勾配を調整する。
+
+    目的:
+      - actual oracle教師がある場合は従来通り、そのoperationのheadを揃える。
+      - minimal_loss_objective=True の場合は、
+        Prune Where(drop_head) と Prune Amount(drop_amount_head) を
+        teacher有無に関係なく目標normへ揃える。
+
+    注意:
+      - loss値やforward値は変えない。
+      - backward後、optimizer.step前の param.grad だけを変更する。
+      - loss_grad_probe の個別loss勾配ログとは別物である。
+    """
     debug = {}
+
     if not bool(getattr(args, "repair_balance_operation_head_grads", True)):
         return debug
-    target = max(float(getattr(args, "repair_operation_head_grad_target", 1.0)), 0.0)
-    if target <= 0.0:
-        return debug
+
     structure_debug = structure_debug if isinstance(structure_debug, dict) else {}
+
+    # ============================================================
+    # 通常のoperation head balance目標値
+    # ============================================================
+    # 既存のactual oracle用target。
+    # 明示指定されていない場合は1.0相当として扱う。
+    # ============================================================
+    default_target = max(
+        float(getattr(args, "repair_operation_head_grad_target", 1.0)),
+        0.0,
+    )
+
+    # ============================================================
+    # Prune Where / Amount 専用の目標norm
+    # ============================================================
+    # 今回は args.py を追加編集せず、
+    # 既存の grad_scale_operation_amount=200.0 を
+    # Prune Where / Amount の最終grad targetとしても使う。
+    #
+    # これにより:
+    #   drop_head        -> grad norm 約200
+    #   drop_amount_head -> grad norm 約200
+    # ============================================================
+    prune_target = max(
+        float(getattr(args, "grad_scale_operation_amount", default_target)),
+        0.0,
+    )
+
+    if default_target <= 0.0 and prune_target <= 0.0:
+        return debug
 
     def _positive(*keys):
         for key in keys:
@@ -6715,6 +6757,19 @@ def _balance_actual_operation_head_gradients(args, model, structure_debug=None):
             "actual_oracle_selected_move_count",
         ),
     }
+
+    # ============================================================
+    # minimal_loss_objective中はPruneを常にbalance対象にする
+    # ============================================================
+    # 理由:
+    #   現在の主損失は圧縮損失 + 幾何損失だけである。
+    #   actual oracle教師の有無に依存させると、
+    #   Prune Where / Amount の勾配norm調整が発火しないstepが出る。
+    # ============================================================
+    force_prune_balance = bool(getattr(args, "minimal_loss_objective", False))
+    if force_prune_balance:
+        teacher_active["prune"] = True
+
     base_model = model.module if hasattr(model, "module") else model
     actuator = getattr(base_model, "actuator", None)
     if actuator is None:
@@ -6729,16 +6784,35 @@ def _balance_actual_operation_head_gradients(args, model, structure_debug=None):
         "move_where": ("move", [getattr(actuator, "move_voxel_head", None)]),
         "move_amount": ("move", [getattr(actuator, "move_amount_head", None)]),
     }
-    min_scale = max(float(getattr(args, "repair_operation_head_grad_min_scale", 1e-4)), 0.0)
+
+    min_scale = max(
+        float(getattr(args, "repair_operation_head_grad_min_scale", 1e-4)),
+        0.0,
+    )
     max_scale = max(
-        float(getattr(args, "repair_operation_head_grad_max_scale", 100.0)),
+        float(getattr(args, "repair_operation_head_grad_max_scale", 100000.0)),
         min_scale,
     )
+
     for label, (operation, modules) in groups.items():
         if not teacher_active.get(operation, False):
             continue
+
+        # ========================================================
+        # Prune Where / Amountだけは200程度へ揃える
+        # ========================================================
+        if label in {"prune_where", "prune_amount"}:
+            target = prune_target
+        else:
+            target = default_target
+
+        if target <= 0.0:
+            debug[f"{label}_grad_balance_status"] = "target_disabled"
+            continue
+
         params = []
         seen = set()
+
         for module in modules:
             if module is None:
                 continue
@@ -6747,26 +6821,42 @@ def _balance_actual_operation_head_gradients(args, model, structure_debug=None):
                     continue
                 seen.add(id(param))
                 params.append(param)
+
         if not params:
             debug[f"{label}_grad_balance_status"] = "no_grad"
             continue
+
         norm_sq = 0.0
         for param in params:
-            grad = torch.nan_to_num(param.grad.detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
+            grad = torch.nan_to_num(
+                param.grad.detach().float(),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
             norm_sq += float(torch.sum(grad * grad).cpu())
+
         norm_before = math.sqrt(max(norm_sq, 0.0))
+
         if not math.isfinite(norm_before) or norm_before <= 1e-12:
             debug[f"{label}_grad_balance_status"] = "zero_or_nonfinite"
+            debug[f"{label}_grad_norm_before_balance"] = float(norm_before)
             continue
-        scale = min(max(target / norm_before, min_scale), max_scale)
+
+        scale = float(target) / float(norm_before)
+        scale = min(max(scale, min_scale), max_scale)
+
         for param in params:
-            param.grad.mul_(float(scale))
+            if param.grad is not None:
+                param.grad.mul_(float(scale))
+
         debug[f"{label}_grad_norm_before_balance"] = float(norm_before)
+        debug[f"{label}_grad_balance_target"] = float(target)
         debug[f"{label}_grad_balance_scale"] = float(scale)
         debug[f"{label}_grad_norm_after_balance"] = float(norm_before * scale)
         debug[f"{label}_grad_balance_status"] = "scaled"
-    return debug
 
+    return debug
 
 def _discrete_loss_mode_value(args):
     # parse_pugan_args が正規化する正式名を使う。旧 typo 名が残る実験設定だけ後方互換で読む。
@@ -9402,12 +9492,30 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 posinf=0.0,
                                 neginf=0.0,
                             )
-
-                            # 勾配復帰の強さ。
-                            # forward値は変えず、backwardだけproxy側へ流す。
+                            # ============================================================
+                            # 圧縮proxy勾配のPrune Where倍率
+                            # ============================================================
+                            # 目的:
+                            #   compression_primary_proxy_grad_weight は圧縮proxy全体の基本倍率である。
+                            #   ただし現在の圧縮proxy勾配はほぼ Prune Where(drop_head) に集中している。
+                            #
+                            #   そのため、grad_scale_prune_where_compression をここで掛ける。
+                            #
+                            # 現在の目標:
+                            #   prune_where_drop_head ≒ 1202
+                            #   grad_scale_prune_where_compression = 0.17
+                            #   1202 * 0.17 ≒ 204
+                            # ============================================================
                             proxy_grad_weight = float(
                                 getattr(args, "compression_primary_proxy_grad_weight", 0.10)
                             )
+
+                            prune_where_compression_scale = max(
+                                float(getattr(args, "grad_scale_prune_where_compression", 1.0)),
+                                0.0,
+                            )
+
+                            proxy_grad_weight = proxy_grad_weight * prune_where_compression_scale
 
                             if torch.is_tensor(L_com_objective):
                                 compression_proxy_grad_delta = proxy_grad_weight * (
@@ -9898,7 +10006,10 @@ def train(model, args, loss, writer, plot, notifier=None):
                         drop_amount_bias = getattr(drop_amount_head, "bias", None)
 
                         if torch.is_tensor(drop_amount_bias) and drop_amount_bias.requires_grad:
-                            amount_bias_anchor_weight = 1.0
+                            amount_bias_anchor_weight = max(
+                                float(getattr(args, "grad_scale_operation_amount", 1.0)),
+                                0.0,
+                            )
 
                             amount_bias_anchor = -torch.nan_to_num(
                                 drop_amount_bias.float().mean(),
