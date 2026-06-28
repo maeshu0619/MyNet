@@ -844,7 +844,37 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument('--sparsepcgc_codec_prune_prior_ratio', default=0.05, type=float)
     parser.add_argument('--sparsepcgc_codec_prune_prior_logit_weight', default=6.0, type=float)
-    parser.add_argument('--sparsepcgc_codec_prune_prior_warmup_steps', default=200, type=int)
+    parser.add_argument('--sparsepcgc_codec_prune_prior_warmup_steps', default=10, type=int)
+    parser.add_argument(
+        '--sparsepcgc_prune_after_prior_mode',
+        default='oracle',
+        type=str,
+        help='warmup後のPrune hard実行モード。oracleは既存挙動、networkはNetwork出力を優先',
+    )
+    parser.add_argument(
+        '--sparsepcgc_network_prune_ratio_floor',
+        default=0.05,
+        type=float,
+        help='network modeでwarmup後も維持するPrune実行量の最低割合',
+    )
+    parser.add_argument(
+        '--sparsepcgc_network_prune_min_hard_count',
+        default=1,
+        type=int,
+        help='network modeでwarmup後も保証するhard Prune最小個数(train時のみ)',
+    )
+    parser.add_argument(
+        '--sparsepcgc_network_prune_floor_steps',
+        default=1000,
+        type=int,
+        help='network prune floorを一定割合で維持するstep数(公称warmup終了後から数える)',
+    )
+    parser.add_argument(
+        '--sparsepcgc_network_prune_floor_decay_steps',
+        default=1000,
+        type=int,
+        help='network prune floorを0へ線形減衰させるstep数(公称warmup終了後から数える)',
+    )
     parser.add_argument(
         '--sparsepcgc_actual_gate_non_prune',
         default=True,
@@ -3506,7 +3536,28 @@ def parse_pugan_args(parser, file_day, file_time):
         0.0,
     )
     args.sparsepcgc_codec_prune_prior_warmup_steps = max(
-        int(getattr(args, "sparsepcgc_codec_prune_prior_warmup_steps", 200)),
+        int(getattr(args, "sparsepcgc_codec_prune_prior_warmup_steps", 10)),
+        0,
+    )
+    args.sparsepcgc_prune_after_prior_mode = str(
+        getattr(args, "sparsepcgc_prune_after_prior_mode", "oracle")
+    ).strip().lower()
+    if args.sparsepcgc_prune_after_prior_mode not in {"oracle", "network"}:
+        args.sparsepcgc_prune_after_prior_mode = "oracle"
+    args.sparsepcgc_network_prune_ratio_floor = min(
+        max(float(getattr(args, "sparsepcgc_network_prune_ratio_floor", 0.05)), 0.0),
+        0.95,
+    )
+    args.sparsepcgc_network_prune_min_hard_count = max(
+        int(getattr(args, "sparsepcgc_network_prune_min_hard_count", 1)),
+        0,
+    )
+    args.sparsepcgc_network_prune_floor_steps = max(
+        int(getattr(args, "sparsepcgc_network_prune_floor_steps", 1000)),
+        0,
+    )
+    args.sparsepcgc_network_prune_floor_decay_steps = max(
+        int(getattr(args, "sparsepcgc_network_prune_floor_decay_steps", 1000)),
         0,
     )
     args.sparsepcgc_actual_gate_non_prune = bool(

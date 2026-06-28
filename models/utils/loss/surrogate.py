@@ -1130,12 +1130,13 @@ class SurrogateCompressionLossMixin:
                     "backend_label": self._surrogate_backend_label(args, teacher_codec),
                     "teacher_codec": teacher_codec,
                     "actual_bit_percent": float(actual_bit_percent),
+                    "actual_bit_percent_raw": float(actual_bit_percent),
                     "actual_raw_percent": float(actual_raw_percent_value),
                     "actual_edit_record_bits": float(actual_edit_record_bits),
                     "policy_actual_noop_guard_used": bool(policy_actual_noop_guard_used),
                     "policy_actual_noop_guard_margin": float(policy_actual_noop_guard_margin),
                     "policy_actual_noop_guard_percent": float(policy_actual_noop_guard_percent),
-                    # "policy_actual_noop_guard_raw_percent": float(policy_actual_noop_guard_raw_percent),
+                    "policy_actual_noop_guard_raw_percent": float(policy_actual_noop_guard_raw_percent),
                     "policy_actual_noop_guard_raw_bit": float(policy_actual_noop_guard_raw_bit),
                     "policy_actual_noop_guard_raw_total_bit": float(policy_actual_noop_guard_raw_total_bit),
                     "policy_actual_noop_guard_raw_edit_record_bits": float(policy_actual_noop_guard_raw_edit_record_bits),
@@ -1935,12 +1936,22 @@ class SurrogateCompressionLossMixin:
                 stats_gen.get("unique_coord_count", stats_gen.get("point_count", gen_points))
             ) if stats_gen is not None else int(target_entry.get("gen_unique_coord_count", gen_points)) if target_entry is not None else gen_points,
                 "actual_total_bit_percent": self._scalar(actual_bit_percent_t),
+                "actual_bit_percent_raw": float(actual_bit_percent),
+                "actual_bit_percent_used_for_loss": float(forward_teacher_percent_value),
+                "actual_bit_percent_used_for_loss_source": str(forward_teacher_source),
                 "actual_target": self._scalar(actual_bit_percent_t),
                 "actual_raw_percent": float(actual_raw_percent_value),
                 "policy_actual_noop_guard_used": bool(policy_actual_noop_guard_used),
                 "policy_actual_noop_guard_margin": float(policy_actual_noop_guard_margin),
-                # "policy_actual_noop_guard_percent": float(policy_actual_noop_guard_percent),
+                "policy_actual_noop_guard_percent": float(policy_actual_noop_guard_percent),
                 "policy_actual_noop_guard_raw_percent": float(policy_actual_noop_guard_raw_percent),
+                "policy_actual_noop_guard_reason": (
+                    "raw_actual_above_margin" if bool(policy_actual_noop_guard_used) else ""
+                ),
+                "policy_actual_noop_guard_replaced_in_loss": bool(
+                    policy_actual_noop_guard_used
+                    and abs(float(forward_teacher_percent_value) - float(actual_bit_percent)) > 1e-6
+                ),
                 "policy_actual_noop_guard_raw_bit": float(policy_actual_noop_guard_raw_bit),
                 "policy_actual_noop_guard_raw_total_bit": float(policy_actual_noop_guard_raw_total_bit),
                 "policy_actual_noop_guard_raw_edit_record_bits": float(policy_actual_noop_guard_raw_edit_record_bits),
@@ -1950,6 +1961,12 @@ class SurrogateCompressionLossMixin:
             "actual_forward_raw_value": float(forward_teacher_raw_percent_value),
             "actual_forward_clamped": bool(forward_teacher_clamped),
             "actual_forward_source": str(forward_teacher_source),
+            "compression_loss_raw": float(actual_bit_percent),
+            "compression_loss_used": float(forward_teacher_percent_value),
+            "compression_loss_noop_replaced": bool(
+                policy_actual_noop_guard_used
+                and abs(float(forward_teacher_percent_value) - float(actual_bit_percent)) > 1e-6
+            ),
             "compression_forward_teacher_percent": float(forward_teacher_percent_value),
             "compression_forward_teacher_source": str(forward_teacher_source),
             "local_proxy_target_percent": float(target_percent_value) if actual_value_source == "local_proxy" else None,

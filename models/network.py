@@ -2908,6 +2908,46 @@ class Network(nn.Module):
                     "operation_entropy_weight_effective",
                 ):
                     self.last_structure_debug[key] = _actuator_scalar(key, 0.0)
+                for key in (
+                    "phase0_network_prune_mode",
+                    "actual_oracle_force_no_edit_used",
+                    "actual_oracle_has_drop",
+                    "hard_prune_actual_allowed",
+                    "phase0_network_mode_but_hard_drop_zero",
+                    "phase0_noop_only_collapse_detected",
+                    "drop_score_gate_applied_to_hard_selection",
+                    "min_hard_drop_count_floor_applied",
+                ):
+                    self.last_structure_debug[key] = bool(_actuator_scalar(key, 0.0) > 0.5)
+                for key in (
+                    "prune_after_prior_mode",
+                    "hard_drop_block_reason",
+                    "collapse_reason",
+                    "hard_drop_count_trace",
+                    "delete_candidate_empty_reason",
+                ):
+                    self.last_structure_debug[key] = str(actuator_stats.get(key, ""))
+                for key in (
+                    "learned_drop_ratio_before_floor",
+                    "learned_drop_ratio_after_floor",
+                    "learned_drop_ratio_before_gate",
+                    "learned_drop_ratio_after_gate",
+                    "effective_drop_ratio_for_hard_count",
+                    "network_prune_ratio_floor",
+                    "network_prune_min_hard_count",
+                    "network_prune_floor_steps",
+                    "network_prune_floor_decay_steps",
+                    "voxel_count",
+                    "delete_candidate_count",
+                    "delete_candidate_point_count",
+                    "hard_delete_selection_count",
+                    "pre_round_target_count",
+                    "post_round_target_count",
+                    "hard_mask_count",
+                    "final_hard_drop_count",
+                    "selected_drop_count_hard",
+                ):
+                    self.last_structure_debug[key] = _actuator_scalar(key, 0.0)
         else:
             self.last_structure_debug = {
                 "network_voxel_node_input_requested": bool(node_voxel_debug.get("network_voxel_node_input_requested", False)),

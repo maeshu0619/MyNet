@@ -223,6 +223,16 @@ def log_codec_setup(writer, args):
             f"surrogate_levels={getattr(args, 'compression_surrogate_levels', '4,6,8')}"
         )
         writer.write(
+            "SparsePCGC Prune Prior/Floor: "
+            f"prune_after_prior_mode={getattr(args, 'sparsepcgc_prune_after_prior_mode', 'oracle')}, "
+            f"codec_prior_enabled={bool(getattr(args, 'sparsepcgc_codec_prune_prior', False))}, "
+            f"codec_prior_warmup_steps={int(getattr(args, 'sparsepcgc_codec_prune_prior_warmup_steps', 0))}, "
+            f"network_prune_ratio_floor={float(getattr(args, 'sparsepcgc_network_prune_ratio_floor', 0.0)):.6g}, "
+            f"network_prune_min_hard_count={int(getattr(args, 'sparsepcgc_network_prune_min_hard_count', 0))}, "
+            f"network_prune_floor_steps={int(getattr(args, 'sparsepcgc_network_prune_floor_steps', 0))}, "
+            f"network_prune_floor_decay_steps={int(getattr(args, 'sparsepcgc_network_prune_floor_decay_steps', 0))}"
+        )
+        writer.write(
             "SparsePCGC Exact Occupancy Teacher: "
             f"enabled={bool(getattr(args, 'enable_sparsepcgc_exact_occupancy_teacher', False))}, "
             f"interval={int(getattr(args, 'sparsepcgc_exact_occupancy_interval', 1))}, "

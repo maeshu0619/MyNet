@@ -5612,6 +5612,41 @@ def _phase7_update_from_structure(comp_debug, structure_debug, *, is_anchor_step
         "leaf_move_target_match_ratio",
         "leaf_add_target_bias_mean",
         "leaf_move_target_bias_mean",
+
+        "actual_oracle_force_no_edit_used",
+        "actual_oracle_noop_label_count",
+        "actual_oracle_noop_label_weight",
+        "actual_oracle_has_drop",
+        "prune_after_prior_mode",
+        "phase0_network_prune_mode",
+        "actual_gate_prune_enabled",
+        "actual_gate_prune_allowed",
+        "hard_prune_actual_allowed",
+        "hard_drop_block_reason",
+        "hard_drop_count_trace",
+        "codec_prune_prior_phase",
+        "raw_learned_drop_ratio",
+        "learned_drop_ratio_before_floor",
+        "learned_drop_ratio_after_floor",
+        "learned_drop_ratio_before_gate",
+        "learned_drop_ratio_after_gate",
+        "effective_drop_ratio_for_hard_count",
+        "drop_operation_gate",
+        "voxel_count",
+        "delete_candidate_count",
+        "delete_candidate_point_count",
+        "delete_candidate_empty_reason",
+        "hard_delete_selection_count",
+        "pre_round_target_count",
+        "post_round_target_count",
+        "min_hard_drop_count_floor_applied",
+        "hard_mask_count",
+        "final_hard_drop_count",
+        "selected_drop_count_hard",
+        "drop_ratio_hard",
+        "phase0_network_mode_but_hard_drop_zero",
+        "phase0_noop_only_collapse_detected",
+        "collapse_reason",
     ):
         if key in structure_debug:
             comp_debug[key] = structure_debug.get(key)
@@ -10407,8 +10442,13 @@ def train(model, args, loss, writer, plot, notifier=None):
                             comp_debug["actual_total_bit_percent"] = float(full_actual_primary_value)
                             comp_debug["actual_train_objective_percent"] = float(full_actual_primary_value)
                             comp_debug["actual_bit_percent"] = float(full_actual_primary_value)
+                            comp_debug["actual_bit_percent_raw"] = float(full_actual_primary_value)
+                            comp_debug["actual_bit_percent_used_for_loss"] = float(full_actual_primary_value)
                             comp_debug["actual_target"] = float(full_actual_primary_value)
                             comp_debug["actual_forward_value"] = float(full_actual_primary_value)
+                            comp_debug["actual_forward_raw_value"] = float(full_actual_primary_value)
+                            comp_debug["compression_loss_raw"] = float(full_actual_primary_value)
+                            comp_debug["compression_loss_used"] = float(full_actual_primary_value)
                             comp_debug["compression_forward_teacher_percent"] = float(full_actual_primary_value)
                             comp_debug["forward_display_value"] = float(full_actual_primary_value)
                             if bool(comp_debug.get("oracle_full_cloud_override_used", False)):

@@ -866,6 +866,43 @@ class StructureRepairActuator(nn.Module):
         mode = str(getattr(self.args, "repair_selection_mode", "target")).strip().lower().replace("-", "_")
         return mode in {"threshold_cap", "cap", "optional", "threshold"}
 
+    def _prune_after_prior_mode(self):
+        mode = str(getattr(self.args, "sparsepcgc_prune_after_prior_mode", "oracle")).strip().lower()
+        if mode not in {"oracle", "network"}:
+            return "oracle"
+        return mode
+
+    def _network_prune_floor_ratio(self, max_drop_ratio):
+        if not self.training:
+            return 0.0
+        if self._prune_after_prior_mode() != "network":
+            return 0.0
+        floor_ratio = min(
+            max(float(getattr(self.args, "sparsepcgc_network_prune_ratio_floor", 0.0)), 0.0),
+            float(max_drop_ratio),
+        )
+        if floor_ratio <= 0.0:
+            return 0.0
+        warmup_steps = max(int(getattr(self.args, "sparsepcgc_codec_prune_prior_warmup_steps", 0)), 0)
+        floor_steps = max(int(getattr(self.args, "sparsepcgc_network_prune_floor_steps", 0)), 0)
+        decay_steps = max(int(getattr(self.args, "sparsepcgc_network_prune_floor_decay_steps", 0)), 0)
+        current_step = max(int(getattr(self.args, "_global_train_step", 0)), 0)
+        post_warmup_step = max(current_step - warmup_steps, 0)
+        if post_warmup_step < floor_steps:
+            return floor_ratio
+        if decay_steps <= 0:
+            return 0.0
+        decay_progress = max(post_warmup_step - floor_steps, 0)
+        decay_phase = max(1.0 - float(decay_progress) / float(decay_steps), 0.0)
+        return floor_ratio * decay_phase
+
+    def _network_phase0_prune_mode(self, codec_prune_prior_phase):
+        return bool(
+            self.training
+            and self._prune_after_prior_mode() == "network"
+            and float(codec_prune_prior_phase) <= 0.0
+        )
+
     def _max_offset(self, pts_xyz, coord_scale):
         raw_max = float(getattr(self.args, "max_repair_offset", getattr(self.args, "max_disp_offset", 0.002)))
         qstep_max = float(getattr(self.args, "max_repair_qstep", 0.25)) * self._effective_qs()
@@ -1526,14 +1563,28 @@ class StructureRepairActuator(nn.Module):
         voxel_cache=None,
         force_min_count=False,
         max_hard_count=0,
+        min_hard_count=0,
         allow_single_candidate=False,
     ):
         B, _, N = drop_scores.shape
         hard_drop = torch.zeros_like(drop_scores, dtype=torch.bool)
+        hard_drop_trace = {
+            "voxel_count": 0.0,
+            "pre_round_target_count": 0.0,
+            "post_round_target_count": 0.0,
+            "min_count_floor_applied": False,
+            "hard_mask_count": 0.0,
+            "candidate_count": 0.0,
+            "final_hard_drop_count": 0.0,
+        }
         threshold_cap_mode = self._threshold_cap_mode()
-        if N <= 0 or float(max_drop_ratio) <= 0.0:
-            return hard_drop
-        if not threshold_cap_mode and float(target_drop_ratio) <= 0.0:
+        network_floor_mode = bool(self.training and self._prune_after_prior_mode() == "network")
+        min_hard_count = max(int(min_hard_count), 0)
+        if N <= 0 or float(max_drop_ratio) <= 0.0 or (not threshold_cap_mode and float(target_drop_ratio) <= 0.0):
+            try:
+                setattr(self, "_last_hard_drop_count_trace", hard_drop_trace)
+            except Exception:
+                pass
             return hard_drop
         if selection_mask is None:
             valid_all = torch.ones((B, N), device=drop_scores.device, dtype=torch.bool)
@@ -1569,10 +1620,15 @@ class StructureRepairActuator(nn.Module):
                 voxel_count = int(torch.unique(valid_inverse, sorted=False).numel())
             if voxel_count <= 1 and not bool(allow_single_candidate):
                 continue
+            hard_drop_trace["voxel_count"] += float(voxel_count)
+            pre_round_target_count = float(target_drop_ratio) * float(voxel_count)
+            floor_applied = False
+            reserve = 0 if bool(allow_single_candidate) else 1
+            available_count = max(voxel_count - reserve, 0)
             if threshold_cap_mode:
                 cap_count = int(math.ceil(float(max_drop_ratio) * float(voxel_count)))
-                reserve = 0 if bool(allow_single_candidate) else 1
-                drop_count = min(max(cap_count, 0), voxel_count - reserve)
+                drop_count = min(max(cap_count, 0), available_count)
+                post_round_target_count = int(cap_count)
             else:
                 cap_count = int(round(float(max_drop_ratio) * float(voxel_count)))
                 target_count = int(round(float(target_drop_ratio) * float(voxel_count)))
@@ -1580,8 +1636,27 @@ class StructureRepairActuator(nn.Module):
                     target_count = max(target_count, 1)
                 if (force_min_count or bool(allow_single_candidate)) and max_drop_ratio > 0.0:
                     cap_count = max(cap_count, 1)
-                reserve = 0 if bool(allow_single_candidate) else 1
-                drop_count = min(target_count, cap_count, voxel_count - reserve)
+                if network_floor_mode:
+                    if target_drop_ratio > 0.0 and target_count <= 0 and voxel_count > 0:
+                        target_count = 1
+                        floor_applied = True
+                    if max_drop_ratio > 0.0 and cap_count <= 0 and voxel_count > 0:
+                        cap_count = 1
+                        floor_applied = True
+                drop_count = min(target_count, cap_count, available_count)
+                if network_floor_mode and target_drop_ratio > 0.0 and drop_count <= 0 and available_count > 0:
+                    drop_count = 1
+                    floor_applied = True
+                post_round_target_count = int(target_count)
+            if network_floor_mode and min_hard_count > 0 and available_count > 0 and (target_drop_ratio > 0.0 or max_drop_ratio > 0.0):
+                floored_drop_count = min(max(int(drop_count), min_hard_count), available_count)
+                if floored_drop_count != int(drop_count):
+                    floor_applied = True
+                drop_count = floored_drop_count
+            if floor_applied:
+                hard_drop_trace["min_count_floor_applied"] = True
+            hard_drop_trace["pre_round_target_count"] += float(pre_round_target_count)
+            hard_drop_trace["post_round_target_count"] += float(post_round_target_count)
             if int(max_hard_count) > 0:
                 drop_count = min(drop_count, int(max_hard_count))
             if drop_count <= 0:
@@ -1594,7 +1669,7 @@ class StructureRepairActuator(nn.Module):
                     largest=True,
                     sorted=False,
                 ).indices
-                if threshold_cap_mode:
+                if threshold_cap_mode and not network_floor_mode:
                     selected_scores = voxel_scores.index_select(0, selected_voxel_idx)
                     selected_voxel_idx = selected_voxel_idx[selected_scores >= float(hard_threshold)]
                     if selected_voxel_idx.numel() <= 0:
@@ -1605,12 +1680,19 @@ class StructureRepairActuator(nn.Module):
                     valid_inverse,
                     drop_count,
                 )
-                if threshold_cap_mode:
+                if threshold_cap_mode and not network_floor_mode:
                     selected_voxel_idx = selected_voxel_idx[selected_scores >= float(hard_threshold)]
                     if selected_voxel_idx.numel() <= 0:
                         continue
             selected_points = self._isin_voxel_ids(inverse_all, selected_voxel_idx)
             hard_drop[b, 0] = selected_points
+            hard_drop_trace["hard_mask_count"] += float(selected_points.sum().item())
+            hard_drop_trace["candidate_count"] += float(voxel_count)
+        hard_drop_trace["final_hard_drop_count"] = float(hard_drop.detach().sum().item())
+        try:
+            setattr(self, "_last_hard_drop_count_trace", hard_drop_trace)
+        except Exception:
+            pass
         return hard_drop
 
     @staticmethod
@@ -1659,8 +1741,21 @@ class StructureRepairActuator(nn.Module):
             device=voxel_coords.device,
             dtype=torch.bool,
         )
+        hard_drop_trace = {
+            "voxel_count": 0.0,
+            "pre_round_target_count": 0.0,
+            "post_round_target_count": 0.0,
+            "min_count_floor_applied": False,
+            "hard_mask_count": 0.0,
+            "candidate_count": 0.0,
+            "final_hard_drop_count": 0.0,
+        }
         ratio = min(max(float(target_drop_ratio), 0.0), 1.0)
         if ratio <= 0.0 or point_count <= 0:
+            try:
+                setattr(self, "_last_hard_drop_count_trace", hard_drop_trace)
+            except Exception:
+                pass
             return hard_drop
         if selection_mask is None:
             selection = torch.ones(
@@ -1699,7 +1794,15 @@ class StructureRepairActuator(nn.Module):
             selected_blocks = torch.zeros((block_count,), device=coords.device, dtype=torch.bool)
             selected_blocks[order[:take]] = True
             selected_local = selected_blocks.index_select(0, inverse)
-            hard_drop[batch_idx, 0, valid_idx[selected_local]] = True
+            selected_points = valid_idx[selected_local]
+            hard_drop[batch_idx, 0, selected_points] = True
+            hard_drop_trace["hard_mask_count"] += float(selected_points.numel())
+            hard_drop_trace["candidate_count"] += float(block_count)
+        hard_drop_trace["final_hard_drop_count"] = float(hard_drop.detach().sum().item())
+        try:
+            setattr(self, "_last_hard_drop_count_trace", hard_drop_trace)
+        except Exception:
+            pass
         return hard_drop
 
     @staticmethod
@@ -2500,6 +2603,8 @@ class StructureRepairActuator(nn.Module):
         actual_oracle_has_bad_drop = bool(actual_oracle_drop_bad_mask.detach().any().item()) if actual_oracle_enabled else False
         actual_oracle_has_bad_add = bool(actual_oracle_add_bad_mask.detach().any().item()) if actual_oracle_enabled else False
         actual_oracle_has_bad_move = bool(actual_oracle_move_bad_mask.detach().any().item()) if actual_oracle_enabled else False
+        prune_after_prior_mode = self._prune_after_prior_mode()
+        prune_after_prior_network_mode = prune_after_prior_mode == "network"
         require_actual_gate_non_prune = bool(
             getattr(self.args, "sparsepcgc_actual_gate_non_prune", True)
         )
@@ -2508,6 +2613,7 @@ class StructureRepairActuator(nn.Module):
         )
         hard_prune_actual_allowed = (
             (not require_actual_gate_prune)
+            or prune_after_prior_network_mode
             or (actual_oracle_enabled and actual_oracle_has_drop)
         )
         hard_add_actual_allowed = (
@@ -2563,10 +2669,11 @@ class StructureRepairActuator(nn.Module):
             move_enabled=disp_enabled,
         )
         if actual_oracle_enabled and actual_oracle_apply_teacher_actions:
-            if actual_oracle_has_drop and prune_enabled:
-                drop_operation_gate = torch.ones_like(drop_operation_gate)
-            else:
-                drop_operation_gate = torch.zeros_like(drop_operation_gate)
+            if prune_after_prior_mode != "network":
+                if actual_oracle_has_drop and prune_enabled:
+                    drop_operation_gate = torch.ones_like(drop_operation_gate)
+                else:
+                    drop_operation_gate = torch.zeros_like(drop_operation_gate)
             if actual_oracle_has_add and add_enabled:
                 add_operation_gate = torch.ones_like(add_operation_gate)
             else:
@@ -2582,6 +2689,8 @@ class StructureRepairActuator(nn.Module):
         codec_prune_prior_enabled = bool(
             prune_enabled and getattr(self.args, "sparsepcgc_codec_prune_prior", False)
         )
+        prune_after_prior_mode = self._prune_after_prior_mode()
+        prune_after_prior_network_mode = prune_after_prior_mode == "network"
         configured_codec_prior_block_size = int(
             getattr(self.args, "sparsepcgc_codec_prune_prior_block_size", 0)
         )
@@ -2608,6 +2717,7 @@ class StructureRepairActuator(nn.Module):
                 1.0 - float(current_train_step) / float(codec_prune_prior_warmup_steps),
                 0.0,
             )
+        phase0_network_prune_mode = self._network_phase0_prune_mode(codec_prune_prior_phase)
         codec_prune_prior_score = torch.zeros(
             (B, 1, N),
             device=pts_xyz.device,
@@ -2675,6 +2785,7 @@ class StructureRepairActuator(nn.Module):
         delete_prior = delete_prior + float(
             getattr(self.args, "repair_drop_pattern_prior_weight", 1.5)
         ) * drop_pattern_prior
+        hard_drop_block_reason = "network_mode" if prune_after_prior_network_mode else "oracle_mode"
         # targetなしAmount学習では、Pruneの実行量をtarget_drop_ratioへ寄せない。
         # max_drop_ratioだけを0〜30%の探索上限として使う。
         target_drop_ratio = 0.0
@@ -2693,6 +2804,7 @@ class StructureRepairActuator(nn.Module):
             "repair_drop_amount_random_mix_end",
         )
         raw_learned_drop_ratio = learned_drop_ratio
+        learned_drop_ratio_before_floor = learned_drop_ratio
         drop_ratio_floor = min(
             max(float(getattr(self.args, "repair_drop_ratio_floor", 0.0)), 0.0),
             float(max_drop_ratio),
@@ -2727,29 +2839,44 @@ class StructureRepairActuator(nn.Module):
                 + learned_drop_ratio
                 - learned_drop_ratio.detach()
             )
-        learned_drop_ratio = learned_drop_ratio * drop_operation_gate
-        if self.training and prune_enabled and monotonic_prune_floor_value is not None:
-            post_gate_floor_tensor = learned_drop_ratio.new_tensor(float(monotonic_prune_floor_value))
-            learned_drop_ratio_post_gate = torch.maximum(learned_drop_ratio, post_gate_floor_tensor)
-            learned_drop_ratio = (
-                learned_drop_ratio_post_gate.detach()
-                + learned_drop_ratio
-                - learned_drop_ratio.detach()
+        learned_drop_ratio_after_floor = learned_drop_ratio
+        network_prune_floor_ratio = self._network_prune_floor_ratio(max_drop_ratio)
+        if self.training and prune_enabled and network_prune_floor_ratio > 0.0:
+            network_floor_tensor = learned_drop_ratio.new_tensor(float(network_prune_floor_ratio))
+            learned_drop_ratio_network_floor = torch.maximum(learned_drop_ratio_after_floor, network_floor_tensor)
+            learned_drop_ratio_after_floor = (
+                learned_drop_ratio_network_floor.detach()
+                + learned_drop_ratio_after_floor
+                - learned_drop_ratio_after_floor.detach()
             )
+        learned_drop_ratio_before_gate = learned_drop_ratio_after_floor
+        learned_drop_ratio_after_gate = learned_drop_ratio_before_gate * drop_operation_gate
         codec_prune_prior_active_ratio = min(
             codec_prune_prior_ratio * codec_prune_prior_phase,
             float(max_drop_ratio),
         )
+        effective_drop_ratio_for_hard_count = (
+            learned_drop_ratio_before_gate if phase0_network_prune_mode else learned_drop_ratio_after_gate
+        )
         if codec_prune_prior_active_ratio > 0.0:
-            prior_drop_ratio = learned_drop_ratio.new_tensor(codec_prune_prior_active_ratio)
-            prior_drop_ratio_forward = torch.maximum(learned_drop_ratio, prior_drop_ratio)
-            learned_drop_ratio = (
-                prior_drop_ratio_forward.detach()
-                + learned_drop_ratio
-                - learned_drop_ratio.detach()
+            codec_prior_tensor = learned_drop_ratio.new_tensor(codec_prune_prior_active_ratio)
+            effective_drop_ratio_forward = torch.maximum(effective_drop_ratio_for_hard_count, codec_prior_tensor)
+            effective_drop_ratio_for_hard_count = (
+                effective_drop_ratio_forward.detach()
+                + effective_drop_ratio_for_hard_count
+                - effective_drop_ratio_for_hard_count.detach()
             )
+        if network_prune_floor_ratio > 0.0:
+            network_floor_tensor = learned_drop_ratio.new_tensor(float(network_prune_floor_ratio))
+            effective_drop_ratio_forward = torch.maximum(effective_drop_ratio_for_hard_count, network_floor_tensor)
+            effective_drop_ratio_for_hard_count = (
+                effective_drop_ratio_forward.detach()
+                + effective_drop_ratio_for_hard_count
+                - effective_drop_ratio_for_hard_count.detach()
+            )
+        learned_drop_ratio = learned_drop_ratio_before_gate
         learned_drop_ratio_for_ops = self._scale_amount_downstream_grad(
-            learned_drop_ratio,
+            effective_drop_ratio_for_hard_count,
             op_name="drop",
         )
         # Prune量head用のSoft/Hard比較値を初期化する。
@@ -2776,7 +2903,9 @@ class StructureRepairActuator(nn.Module):
         soft_drop_voxel_sum = pts_xyz.new_zeros(())
         hard_drop_voxel_sum = pts_xyz.new_zeros(())
         # hard削除数は整数なので、学習比率の値だけを使ってVoxel選択数へ変換する。
-        learned_drop_ratio_value = float(learned_drop_ratio.detach().mean().cpu()) if prune_enabled else 0.0
+        learned_drop_ratio_value = (
+            float(effective_drop_ratio_for_hard_count.detach().mean().cpu()) if prune_enabled else 0.0
+        )
         if self.training and prune_enabled:
             try:
                 setattr(
@@ -2794,8 +2923,14 @@ class StructureRepairActuator(nn.Module):
                 )
             except Exception:
                 pass
+        network_prune_min_hard_count = (
+            int(getattr(self.args, "sparsepcgc_network_prune_min_hard_count", 0))
+            if phase0_network_prune_mode
+            else 0
+        )
         delete_prior = torch.sigmoid(delete_prior.clamp(-8.0, 8.0))
-        delete_prior = delete_prior * drop_operation_gate
+        if not phase0_network_prune_mode:
+            delete_prior = delete_prior * drop_operation_gate
         drop_score_noise = max(
             self._annealed_value("repair_drop_score_noise_start", "repair_drop_score_noise_end"),
             0.0,
@@ -2872,7 +3007,8 @@ class StructureRepairActuator(nn.Module):
                 + raw_proxy_grad_eps
                 * (raw_drop_logit_for_grad - raw_drop_logit_for_grad.detach())
             )
-        drop_prob_proxy = drop_prob_proxy * drop_operation_gate
+        if not phase0_network_prune_mode:
+            drop_prob_proxy = drop_prob_proxy * drop_operation_gate
         drop_prob = (repair_gate * delete_prior * learned_drop).clamp(0.0, 1.0)
         if prune_enabled and max_drop_ratio > 0.0:
             # ============================================================
@@ -2926,7 +3062,7 @@ class StructureRepairActuator(nn.Module):
                 + (1.0 - codec_prune_prior_phase) * drop_prob_direct
             )
             drop_prob_direct = codec_prior_direct.detach() + drop_prob_direct - drop_prob_direct.detach()
-        if actual_oracle_enabled and actual_oracle_apply_teacher_actions:
+        if actual_oracle_enabled and actual_oracle_apply_teacher_actions and not phase0_network_prune_mode:
             oracle_drop_forward = leaf_delete_op_mask.to(device=drop_prob.device, dtype=drop_prob.dtype)
             oracle_grad_eps = min(
                 max(float(getattr(self.args, "sparsepcgc_actual_oracle_where_grad_eps", 0.05)), 0.0),
@@ -2946,16 +3082,32 @@ class StructureRepairActuator(nn.Module):
             )
         drop_prob_raw_for_amount = drop_prob
         delete_candidate_mask = selection_bool.clone()
+        delete_candidate_initial_count = int(delete_candidate_mask.detach().sum().item())
         delete_max_points = int(getattr(self.args, "repair_delete_max_points_per_voxel", 8))
+        delete_candidate_after_point_cap_count = delete_candidate_initial_count
         if delete_max_points > 0:
             delete_candidate_mask = delete_candidate_mask & (
                 voxel_point_counts.squeeze(1) <= float(delete_max_points)
             )
+            delete_candidate_after_point_cap_count = int(delete_candidate_mask.detach().sum().item())
 
         # leaf pattern診断がDeleteを推奨したnode/voxelだけをDelete source候補にする。
         # これにより、圧縮率改善と無関係なDeleteを候補集合から除外する。
-        if hard_leaf_operation_mask_enabled:
+        delete_candidate_after_leaf_mask_count = delete_candidate_after_point_cap_count
+        if hard_leaf_operation_mask_enabled and not phase0_network_prune_mode:
             delete_candidate_mask = delete_candidate_mask & leaf_delete_op_mask.squeeze(1)
+            delete_candidate_after_leaf_mask_count = int(delete_candidate_mask.detach().sum().item())
+        delete_candidate_point_count_value = int(delete_candidate_mask.detach().sum().item())
+        delete_candidate_empty_reason = ""
+        if delete_candidate_point_count_value <= 0:
+            if delete_candidate_initial_count <= 0:
+                delete_candidate_empty_reason = "selection_mask_empty"
+            elif delete_max_points > 0 and delete_candidate_after_point_cap_count <= 0:
+                delete_candidate_empty_reason = "delete_max_points_cap"
+            elif hard_leaf_operation_mask_enabled and not phase0_network_prune_mode and delete_candidate_after_leaf_mask_count <= 0:
+                delete_candidate_empty_reason = "leaf_or_oracle_delete_mask"
+            else:
+                delete_candidate_empty_reason = "candidate_generation_empty"
         delete_candidate_weight = delete_candidate_mask.unsqueeze(1).to(dtype=drop_prob.dtype)
 
         # voxel_point_counts は同一Voxel内の全点に同じ点数が入っている。
@@ -3085,18 +3237,25 @@ class StructureRepairActuator(nn.Module):
             require_actual_gate_prune
             and actual_oracle_enabled
             and not (codec_prune_prior_phase > 0.0)
+            and not prune_after_prior_network_mode
         ):
             hard_delete_selection_mask = (
                 hard_delete_selection_mask
                 & leaf_delete_op_mask.to(device=pts_xyz.device, dtype=torch.bool)
             )
 
+        hard_delete_selection_count_value = int(hard_delete_selection_mask.detach().sum().item())
+        if not bool(hard_delete_selection_mask.any().item()):
+            hard_drop_block_reason = "hard_delete_selection_mask_empty"
+
         if not hard_prune_actual_allowed:
+            hard_drop_block_reason = "hard_prune_gate_blocked"
             hard_drop_mask = torch.zeros_like(drop_prob, dtype=torch.bool)
-        elif actual_oracle_enabled and actual_oracle_apply_teacher_actions and actual_oracle_has_drop:
+        elif actual_oracle_enabled and actual_oracle_apply_teacher_actions and actual_oracle_has_drop and not phase0_network_prune_mode:
             # The full-cloud teacher may intersect one selected subtree almost
             # completely. Cap the local hard application so a useful global
             # teacher cannot erase 90-100% of the shadow geometry.
+            hard_drop_block_reason = "oracle_teacher_drop"
             oracle_local_cap = min(
                 float(max_drop_ratio),
                 max(
@@ -3123,9 +3282,11 @@ class StructureRepairActuator(nn.Module):
                 voxel_cache=voxel_cache,
                 force_min_count=False,
                 max_hard_count=int(getattr(self.args, "repair_max_hard_drop_voxels", 0)),
+                min_hard_count=0,
                 allow_single_candidate=False,
             )
         elif codec_prune_prior_phase > 0.0:
+            hard_drop_block_reason = "codec_prior_phase_hard_drop"
             hard_drop_mask = self._hard_codec_block_drop_mask(
                 voxel_coords,
                 drop_prob,
@@ -3135,6 +3296,7 @@ class StructureRepairActuator(nn.Module):
                 max_hard_count=int(getattr(self.args, "repair_max_hard_drop_voxels", 0)),
             )
         else:
+            hard_drop_block_reason = "network_learned_hard_drop"
             hard_drop_mask = self._hard_voxel_drop_mask(
                 voxel_coords,
                 drop_prob,
@@ -3145,8 +3307,10 @@ class StructureRepairActuator(nn.Module):
                 voxel_cache=voxel_cache,
                 force_min_count=bool(getattr(self.args, "repair_force_min_drop_voxels", False)),
                 max_hard_count=int(getattr(self.args, "repair_max_hard_drop_voxels", 0)),
+                min_hard_count=network_prune_min_hard_count,
                 allow_single_candidate=False,
             )
+        hard_drop_trace_debug = dict(getattr(self, "_last_hard_drop_count_trace", {}) or {})
         hard_drop = hard_drop_mask.to(dtype=pts_xyz.dtype)
         # Phase3: Pruneは点削除ではなく、対象点が属するoccupied voxelの削除候補として記録する。
         voxel_edit_drop_mask = hard_drop_mask.detach().squeeze(1).to(dtype=torch.bool)
@@ -3203,7 +3367,7 @@ class StructureRepairActuator(nn.Module):
         # drop_amount_head 専用の量一致損失。
         # Hard削除量は教師値としてdetachし、learned_drop_ratio側だけに勾配を流す。
         drop_amount_supervision_loss = (
-            drop_ratio_hard_batch.detach() - learned_drop_ratio
+            drop_ratio_hard_batch.detach() - effective_drop_ratio_for_hard_count
         ).pow(2).mean()
         if (actual_oracle_has_drop or actual_oracle_has_bad_drop) and max_drop_ratio > 0.0:
             drop_oracle_target_ratio = (
@@ -3236,7 +3400,7 @@ class StructureRepairActuator(nn.Module):
 
         # Soft削除量と learned_drop_ratio の整合性も補助的に見る。
         drop_amount_soft_consistency_loss = (
-            drop_ratio_soft_batch.detach() - learned_drop_ratio
+            drop_ratio_soft_batch.detach() - learned_drop_ratio_before_gate
         ).pow(2).mean()
 
         if timing_enabled:
@@ -4697,7 +4861,71 @@ class StructureRepairActuator(nn.Module):
                 int(moved_different_voxel_count_value),
                 int(actual_oracle_override_move_count_value),
             )
+        delete_candidate_voxel_count_value = self._unique_voxel_count_from_cache(voxel_cache, delete_candidate_mask)
+        hard_delete_selection_voxel_count_value = self._unique_voxel_count_from_cache(
+            voxel_cache,
+            hard_delete_selection_mask.squeeze(1),
+        )
+        actual_oracle_force_no_edit_used = bool(
+            getattr(self.args, "sparsepcgc_actual_oracle_force_no_edit", False)
+            and float(leaf_operation_masks.get("actual_oracle_noop_label_weight", 0.0) or 0.0) > 0.0
+            and int(leaf_operation_masks.get("actual_oracle_noop_label_count", 0) or 0) > 0
+            and not actual_oracle_has_drop
+        )
         hard_drop_count_value = int(hard_drop.detach().sum().item())
+        if hard_drop_count_value <= 0 and hard_drop_block_reason == "network_learned_hard_drop":
+            hard_drop_block_reason = "network_learned_hard_drop_zero"
+        last_hard_drop_trace = hard_drop_trace_debug if isinstance(hard_drop_trace_debug, dict) else {}
+        pre_round_target_count_value = float(last_hard_drop_trace.get("pre_round_target_count", 0.0))
+        post_round_target_count_value = float(last_hard_drop_trace.get("post_round_target_count", 0.0))
+        hard_mask_count_value = float(last_hard_drop_trace.get("hard_mask_count", 0.0))
+        min_hard_drop_count_floor_applied = bool(last_hard_drop_trace.get("min_count_floor_applied", False))
+        phase0_network_mode_but_hard_drop_zero = bool(
+            phase0_network_prune_mode
+            and delete_candidate_voxel_count_value > 0
+            and hard_drop_count_value <= 0
+        )
+        phase0_collapse_reason = ""
+        if phase0_network_mode_but_hard_drop_zero:
+            if delete_candidate_voxel_count_value <= 0:
+                phase0_collapse_reason = f"candidate_empty:{delete_candidate_empty_reason or 'unknown'}"
+            elif not hard_prune_actual_allowed:
+                phase0_collapse_reason = "hard_prune_gate_blocked"
+            elif learned_drop_ratio_value <= 0.0:
+                phase0_collapse_reason = "effective_ratio_zero"
+            elif post_round_target_count_value <= 0.0:
+                phase0_collapse_reason = "target_count_zero"
+            elif hard_mask_count_value <= 0.0:
+                phase0_collapse_reason = "hard_threshold_or_score_zero"
+            elif actual_oracle_force_no_edit_used:
+                phase0_collapse_reason = "force_no_edit"
+            else:
+                phase0_collapse_reason = "unknown"
+        phase0_noop_only_collapse_detected = bool(
+            phase0_network_mode_but_hard_drop_zero or (phase0_network_prune_mode and learned_drop_ratio_value <= 0.0)
+        )
+        hard_drop_count_trace = (
+            "codec_prune_prior_phase="
+            f"{float(codec_prune_prior_phase):.6g}, "
+            f"raw_learned_drop_ratio={float(raw_learned_drop_ratio.detach().mean().item()):.6g}, "
+            f"learned_drop_ratio_before_floor={float(learned_drop_ratio_before_floor.detach().mean().item()):.6g}, "
+            f"learned_drop_ratio_after_floor={float(learned_drop_ratio_after_floor.detach().mean().item()):.6g}, "
+            f"learned_drop_ratio_before_gate={float(learned_drop_ratio_before_gate.detach().mean().item()):.6g}, "
+            f"drop_operation_gate={float(drop_operation_gate.detach().mean().item()):.6g}, "
+            f"learned_drop_ratio_after_gate={float(learned_drop_ratio_after_gate.detach().mean().item()):.6g}, "
+            f"effective_drop_ratio_for_hard_count={float(effective_drop_ratio_for_hard_count.detach().mean().item()):.6g}, "
+            f"voxel_count={float(last_hard_drop_trace.get('voxel_count', 0.0)):.6g}, "
+            f"pre_round_target_count={pre_round_target_count_value:.6g}, "
+            f"post_round_target_count={post_round_target_count_value:.6g}, "
+            f"min_count_floor_applied={min_hard_drop_count_floor_applied}, "
+            f"delete_candidate_count={float(delete_candidate_voxel_count_value):.6g}, "
+            f"hard_delete_selection_count={float(hard_delete_selection_voxel_count_value):.6g}, "
+            f"delete_candidate_empty_reason={delete_candidate_empty_reason}, "
+            f"hard_mask_count={hard_mask_count_value:.6g}, "
+            f"final_hard_drop_count={float(last_hard_drop_trace.get('final_hard_drop_count', float(hard_drop_count_value))):.6g}, "
+            f"selected_drop_count_hard={float(hard_drop_count_value):.6g}, "
+            f"drop_ratio_hard={float(drop_ratio_hard.detach().mean().item()):.6g}"
+        )
         hard_move_count_value = int(hard_move.detach().sum().item())
         raw_hard_move_count_value = int(raw_hard_move_bool.detach().sum().item())
         adjusted_point_rate_value = float(hard_move_count_value) / max(float(B * N), 1.0)
@@ -6017,12 +6245,28 @@ class StructureRepairActuator(nn.Module):
             "actual_oracle_apply_teacher_actions": pts_xyz.new_tensor(
                 float(actual_oracle_apply_teacher_actions)
             ).detach(),
+            "actual_oracle_force_no_edit_used": pts_xyz.new_tensor(float(actual_oracle_force_no_edit_used)).detach(),
+            "actual_oracle_has_drop": pts_xyz.new_tensor(float(actual_oracle_has_drop)).detach(),
+            "prune_after_prior_mode": prune_after_prior_mode,
+            "phase0_network_prune_mode": pts_xyz.new_tensor(float(phase0_network_prune_mode)).detach(),
             "actual_gate_prune_enabled": pts_xyz.new_tensor(
                 float(require_actual_gate_prune)
             ).detach(),
             "actual_gate_prune_allowed": pts_xyz.new_tensor(
                 float(hard_prune_actual_allowed)
             ).detach(),
+            "hard_prune_actual_allowed": pts_xyz.new_tensor(
+                float(hard_prune_actual_allowed)
+            ).detach(),
+            "hard_drop_block_reason": hard_drop_block_reason,
+            "phase0_network_mode_but_hard_drop_zero": pts_xyz.new_tensor(
+                float(phase0_network_mode_but_hard_drop_zero)
+            ).detach(),
+            "phase0_noop_only_collapse_detected": pts_xyz.new_tensor(
+                float(phase0_noop_only_collapse_detected)
+            ).detach(),
+            "collapse_reason": phase0_collapse_reason,
+            "hard_drop_count_trace": hard_drop_count_trace,
             "codec_prune_prior_enabled": pts_xyz.new_tensor(
                 float(codec_prune_prior_enabled)
             ).detach(),
@@ -6037,9 +6281,39 @@ class StructureRepairActuator(nn.Module):
             "prune_ratio_monotonic_floor": pts_xyz.new_tensor(
                 float(monotonic_prune_floor_value if monotonic_prune_floor_value is not None else float("nan"))
             ).detach(),
+            "network_prune_ratio_floor": pts_xyz.new_tensor(float(network_prune_floor_ratio)).detach(),
+            "network_prune_min_hard_count": pts_xyz.new_tensor(float(network_prune_min_hard_count)).detach(),
+            "network_prune_floor_steps": pts_xyz.new_tensor(
+                float(getattr(self.args, "sparsepcgc_network_prune_floor_steps", 0))
+            ).detach(),
+            "network_prune_floor_decay_steps": pts_xyz.new_tensor(
+                float(getattr(self.args, "sparsepcgc_network_prune_floor_decay_steps", 0))
+            ).detach(),
+            "drop_score_gate_applied_to_hard_selection": pts_xyz.new_tensor(float(not phase0_network_prune_mode)).detach(),
             "raw_learned_drop_ratio": raw_learned_drop_ratio.mean().detach(),
             "raw_learned_add_ratio": raw_learned_add_ratio.mean().detach(),
             "raw_learned_move_ratio": raw_learned_move_ratio.mean().detach(),
+            "learned_drop_ratio_before_floor": learned_drop_ratio_before_floor.mean().detach(),
+            "learned_drop_ratio_after_floor": learned_drop_ratio_after_floor.mean().detach(),
+            "learned_drop_ratio_before_gate": learned_drop_ratio_before_gate.mean().detach(),
+            "learned_drop_ratio_after_gate": learned_drop_ratio_after_gate.mean().detach(),
+            "effective_drop_ratio_for_hard_count": effective_drop_ratio_for_hard_count.mean().detach(),
+            "voxel_count": pts_xyz.new_tensor(
+                float(last_hard_drop_trace.get("voxel_count", 0.0))
+            ).detach(),
+            "delete_candidate_initial_count": pts_xyz.new_tensor(float(delete_candidate_initial_count)).detach(),
+            "delete_candidate_after_point_cap_count": pts_xyz.new_tensor(float(delete_candidate_after_point_cap_count)).detach(),
+            "delete_candidate_after_leaf_mask_count": pts_xyz.new_tensor(float(delete_candidate_after_leaf_mask_count)).detach(),
+            "delete_candidate_count": pts_xyz.new_tensor(float(delete_candidate_voxel_count_value)).detach(),
+            "delete_candidate_point_count": pts_xyz.new_tensor(float(delete_candidate_point_count_value)).detach(),
+            "delete_candidate_empty_reason": delete_candidate_empty_reason,
+            "hard_delete_selection_count": pts_xyz.new_tensor(float(hard_delete_selection_voxel_count_value)).detach(),
+            "hard_delete_selection_point_count": pts_xyz.new_tensor(float(hard_delete_selection_count_value)).detach(),
+            "pre_round_target_count": pts_xyz.new_tensor(float(pre_round_target_count_value)).detach(),
+            "post_round_target_count": pts_xyz.new_tensor(float(post_round_target_count_value)).detach(),
+            "min_hard_drop_count_floor_applied": pts_xyz.new_tensor(float(min_hard_drop_count_floor_applied)).detach(),
+            "hard_mask_count": pts_xyz.new_tensor(float(hard_mask_count_value)).detach(),
+            "final_hard_drop_count": pts_xyz.new_tensor(float(hard_drop_count_value)).detach(),
             "learned_drop_ratio": learned_drop_ratio.mean().detach(),
             "learned_drop_prob": learned_drop_prob.detach(),
             "drop_prob_mean": drop_prob.mean().detach(),
@@ -6491,8 +6765,18 @@ class StructureRepairActuator(nn.Module):
             "actual_oracle_apply_teacher_actions": pts_xyz.new_tensor(
                 float(actual_oracle_apply_teacher_actions)
             ),
+            "actual_oracle_force_no_edit_used": pts_xyz.new_tensor(float(actual_oracle_force_no_edit_used)),
+            "actual_oracle_has_drop": pts_xyz.new_tensor(float(actual_oracle_has_drop)),
+            "prune_after_prior_mode": prune_after_prior_mode,
+            "phase0_network_prune_mode": pts_xyz.new_tensor(float(phase0_network_prune_mode)),
             "actual_gate_prune_enabled": pts_xyz.new_tensor(float(require_actual_gate_prune)),
             "actual_gate_prune_allowed": pts_xyz.new_tensor(float(hard_prune_actual_allowed)),
+            "hard_prune_actual_allowed": pts_xyz.new_tensor(float(hard_prune_actual_allowed)),
+            "hard_drop_block_reason": hard_drop_block_reason,
+            "phase0_network_mode_but_hard_drop_zero": pts_xyz.new_tensor(float(phase0_network_mode_but_hard_drop_zero)),
+            "phase0_noop_only_collapse_detected": pts_xyz.new_tensor(float(phase0_noop_only_collapse_detected)),
+            "collapse_reason": phase0_collapse_reason,
+            "hard_drop_count_trace": hard_drop_count_trace,
             "codec_prune_prior_enabled": pts_xyz.new_tensor(float(codec_prune_prior_enabled)),
             "codec_prune_prior_phase": pts_xyz.new_tensor(codec_prune_prior_phase),
             "codec_prune_prior_ratio": pts_xyz.new_tensor(codec_prune_prior_active_ratio),
@@ -6503,9 +6787,37 @@ class StructureRepairActuator(nn.Module):
             "prune_ratio_monotonic_floor": pts_xyz.new_tensor(
                 float(monotonic_prune_floor_value if monotonic_prune_floor_value is not None else float("nan"))
             ),
+            "network_prune_ratio_floor": pts_xyz.new_tensor(float(network_prune_floor_ratio)),
+            "network_prune_min_hard_count": pts_xyz.new_tensor(float(network_prune_min_hard_count)),
+            "network_prune_floor_steps": pts_xyz.new_tensor(
+                float(getattr(self.args, "sparsepcgc_network_prune_floor_steps", 0))
+            ),
+            "network_prune_floor_decay_steps": pts_xyz.new_tensor(
+                float(getattr(self.args, "sparsepcgc_network_prune_floor_decay_steps", 0))
+            ),
+            "drop_score_gate_applied_to_hard_selection": pts_xyz.new_tensor(float(not phase0_network_prune_mode)),
             "raw_learned_drop_ratio": raw_learned_drop_ratio.mean(),
             "raw_learned_add_ratio": raw_learned_add_ratio.mean(),
             "raw_learned_move_ratio": raw_learned_move_ratio.mean(),
+            "learned_drop_ratio_before_floor": learned_drop_ratio_before_floor.mean(),
+            "learned_drop_ratio_after_floor": learned_drop_ratio_after_floor.mean(),
+            "learned_drop_ratio_before_gate": learned_drop_ratio_before_gate.mean(),
+            "learned_drop_ratio_after_gate": learned_drop_ratio_after_gate.mean(),
+            "effective_drop_ratio_for_hard_count": effective_drop_ratio_for_hard_count.mean(),
+            "voxel_count": pts_xyz.new_tensor(float(last_hard_drop_trace.get("voxel_count", 0.0))),
+            "delete_candidate_initial_count": pts_xyz.new_tensor(float(delete_candidate_initial_count)),
+            "delete_candidate_after_point_cap_count": pts_xyz.new_tensor(float(delete_candidate_after_point_cap_count)),
+            "delete_candidate_after_leaf_mask_count": pts_xyz.new_tensor(float(delete_candidate_after_leaf_mask_count)),
+            "delete_candidate_count": pts_xyz.new_tensor(float(delete_candidate_voxel_count_value)),
+            "delete_candidate_point_count": pts_xyz.new_tensor(float(delete_candidate_point_count_value)),
+            "delete_candidate_empty_reason": delete_candidate_empty_reason,
+            "hard_delete_selection_count": pts_xyz.new_tensor(float(hard_delete_selection_voxel_count_value)),
+            "hard_delete_selection_point_count": pts_xyz.new_tensor(float(hard_delete_selection_count_value)),
+            "pre_round_target_count": pts_xyz.new_tensor(float(pre_round_target_count_value)),
+            "post_round_target_count": pts_xyz.new_tensor(float(post_round_target_count_value)),
+            "min_hard_drop_count_floor_applied": pts_xyz.new_tensor(float(min_hard_drop_count_floor_applied)),
+            "hard_mask_count": pts_xyz.new_tensor(float(hard_mask_count_value)),
+            "final_hard_drop_count": pts_xyz.new_tensor(float(hard_drop_count_value)),
             "learned_drop_ratio": learned_drop_ratio.mean(),
             "learned_drop_prob": learned_drop_prob,
             "drop_prob_mean": drop_prob.mean(),

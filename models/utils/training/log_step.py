@@ -113,6 +113,16 @@ def log_actual_compression_loss(writer, comp_debug):
         return
     comp_debug = comp_debug if isinstance(comp_debug, dict) else {}
     actual_compression_loss = _resolve_actual_compression_loss(comp_debug)
+    actual_compression_loss_raw = _first_value(
+        comp_debug,
+        ("compression_loss_raw", "actual_bit_percent_raw", "actual_raw_percent", "actual_bit_percent"),
+        float("nan"),
+    )
+    actual_compression_loss_used = _first_value(
+        comp_debug,
+        ("compression_loss_used", "actual_bit_percent_used_for_loss", "actual_forward_value", "actual_bit_percent"),
+        float("nan"),
+    )
     source = str(comp_debug.get("actual_value_source", "unknown"))
     freshness = "fresh" if bool(comp_debug.get("actual_value_is_fresh", False)) else "stale"
     extra = ""
@@ -127,6 +137,7 @@ def log_actual_compression_loss(writer, comp_debug):
             extra = " (cached_target)"
     writer.write(
         f"Actual Compression Loss: {_fmt(actual_compression_loss, 6)} "
+        f"(raw={_fmt(actual_compression_loss_raw, 6)}, used={_fmt(actual_compression_loss_used, 6)}) "
         f"[source={source}, {freshness}]{extra}"
     )
 
@@ -181,6 +192,21 @@ def log_compression_stats(writer, step, num_steps, comp_debug):
         ("actual_raw_percent", "actual_total_bit_percent"),
         float("nan"),
     )
+    actual_used_percent = _first_value(
+        comp_debug,
+        ("actual_bit_percent_used_for_loss", "actual_forward_value", "actual_total_bit_percent"),
+        float("nan"),
+    )
+    compression_loss_raw = _first_value(
+        comp_debug,
+        ("compression_loss_raw", "actual_bit_percent_raw", "actual_raw_percent", "actual_total_bit_percent"),
+        float("nan"),
+    )
+    compression_loss_used = _first_value(
+        comp_debug,
+        ("compression_loss_used", "actual_bit_percent_used_for_loss", "actual_forward_value", "actual_total_bit_percent"),
+        float("nan"),
+    )
     log_actual_compression_loss(writer, comp_debug)
     writer.write(
         f"CompressionStats step={step + 1}/{num_steps}: "
@@ -188,6 +214,12 @@ def log_compression_stats(writer, step, num_steps, comp_debug):
         f"->{_fmt(gen_actual_bit, 6)}, "
         f"actual_bit_percent={_fmt(actual_total_bit_percent, 6)}, "
         f"actual_raw_percent={_fmt(actual_raw_percent, 6)}, "
+        f"actual_used_for_loss={_fmt(actual_used_percent, 6)}, "
+        f"compression_loss_raw={_fmt(compression_loss_raw, 6)}, "
+        f"compression_loss_used={_fmt(compression_loss_used, 6)}, "
+        f"policy_actual_noop_guard_used={bool(comp_debug.get('policy_actual_noop_guard_used', False))}, "
+        f"policy_actual_noop_guard_replaced_in_loss={bool(comp_debug.get('policy_actual_noop_guard_replaced_in_loss', False))}, "
+        f"actual_oracle_force_no_edit_used={bool(comp_debug.get('actual_oracle_force_no_edit_used', False))}, "
         f"edit_record_bits={float(comp_debug.get('actual_edit_record_bits', 0.0)):.3f}, "
         f"codec_points={int(comp_debug.get('gt_points', 0))}->{int(comp_debug.get('gen_points', 0))}, "
         f"unique_coords={int(comp_debug.get('gt_unique_coord_count', 0))}->{int(comp_debug.get('gen_unique_coord_count', 0))}, "
@@ -684,11 +716,30 @@ def log_compact_step_summary(
     if not bool(comp_debug.get("oracle_full_cloud_override_used", False)):
         oracle_full_drop = 0
         oracle_full_ratio = 0.0
+    def _prefer_text(key):
+        comp_value = str(comp_debug.get(key, "") or "").strip()
+        if comp_value:
+            return comp_value
+        return str(structure_debug.get(key, "") or "").strip()
+
+    hard_drop_reason = _prefer_text("hard_drop_block_reason")
+    prune_after_prior_mode = _prefer_text("prune_after_prior_mode")
+    hard_drop_count_trace = _prefer_text("hard_drop_count_trace")
+    collapse_reason = _prefer_text("collapse_reason")
+    collapse_detected = bool(
+        comp_debug.get("phase0_noop_only_collapse_detected", False)
+        or structure_debug.get("phase0_noop_only_collapse_detected", False)
+    )
     writer.write(
         f"StepOps {step + 1}/{num_steps}: "
         f"input={_fmt_int(input_points)}, output={_fmt_int(output_points)}, "
         f"LocalAdd={_fmt_int(add_count)}, LocalPrune={_fmt_int(prune_count)}, "
         f"LocalAdjust={_fmt_int(adjust_count)}, "
+        f"PruneMode={prune_after_prior_mode}, "
+        f"HardPruneReason={hard_drop_reason}, "
+        f"CollapseDetected={collapse_detected}, "
+        f"CollapseReason={collapse_reason}, "
+        f"HardDropTrace={hard_drop_count_trace}, "
         f"OracleFullPrune={_fmt_int(oracle_full_drop)}({100.0 * _to_float(oracle_full_ratio, 0.0):.2f}%)"
     )
 
