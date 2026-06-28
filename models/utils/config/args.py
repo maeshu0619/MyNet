@@ -1784,6 +1784,26 @@ def parse_pugan_args(parser, file_day, file_time):
         help='幾何損失でD2を主目的に含めるか。既定では無効',
     )
 
+    # 勾配数値
+    parser.add_argument(
+        '--grad_scale_prune_where_compression',
+        default=1.0,
+        type=float,
+        help='圧縮損失側のPrune Where関連勾配をまとめて増減する倍率。詳細係数の比率は保ったまま全体だけ変える',
+    )
+    parser.add_argument(
+        '--grad_scale_prune_where_actuator',
+        default=1.0,
+        type=float,
+        help='Actuator側のPrune Where関連勾配をまとめて増減する倍率。詳細係数の比率は保ったまま全体だけ変える',
+    )
+    parser.add_argument(
+        '--grad_scale_operation_amount',
+        default=1.0,
+        type=float,
+        help='Operation Amount関連の勾配をまとめて増減する倍率。詳細係数の比率は保ったまま全体だけ変える',
+    )
+
     """Compression"""
     parser.add_argument('--compress', default='SparsePCGC', type=str, help='使用する圧縮手法')
     parser.add_argument('--octree_voxel', type=float, default=1e-3, help='Octreeボクセルサイズ')
@@ -2407,6 +2427,18 @@ def parse_pugan_args(parser, file_day, file_time):
         max(float(getattr(args, "repair_operation_amount_target_prob_max", 0.98)), 0.50),
         1.0 - 1e-4,
     )
+    args.grad_scale_prune_where_compression = max(
+        float(getattr(args, "grad_scale_prune_where_compression", 1.0)),
+        0.0,
+    )
+    args.grad_scale_prune_where_actuator = max(
+        float(getattr(args, "grad_scale_prune_where_actuator", 1.0)),
+        0.0,
+    )
+    args.grad_scale_operation_amount = max(
+        float(getattr(args, "grad_scale_operation_amount", 1.0)),
+        0.0,
+    )
     args.w_com = max(float(getattr(args, "w_com", 10.0)), 0.0)
     args.repair_drop_where_actuator_weight = max(float(getattr(args, "repair_drop_where_actuator_weight", 0.1)), 0.0)
     args.repair_add_where_actuator_weight = max(float(getattr(args, "repair_add_where_actuator_weight", 0.3)), 0.0)
@@ -2448,6 +2480,156 @@ def parse_pugan_args(parser, file_day, file_time):
             args.repair_where_downstream_grad_min_scale,
         ),
         args.repair_where_downstream_grad_max_scale,
+    )
+
+    def _scale_if_not_cli(option_name: str, attr_name: str, multiplier: float):
+        if not _cli_option_was_provided(option_name):
+            setattr(args, attr_name, float(getattr(args, attr_name)) * float(multiplier))
+
+    # 勾配数値: prune_where compression side
+    _scale_if_not_cli(
+        "--compression_soft_prune_node_grad_weight",
+        "compression_soft_prune_node_grad_weight",
+        args.grad_scale_prune_where_compression,
+    )
+    _scale_if_not_cli(
+        "--compression_soft_prune_single_grad_weight",
+        "compression_soft_prune_single_grad_weight",
+        args.grad_scale_prune_where_compression,
+    )
+    _scale_if_not_cli(
+        "--compression_soft_prune_bit_grad_weight",
+        "compression_soft_prune_bit_grad_weight",
+        args.grad_scale_prune_where_compression,
+    )
+    _scale_if_not_cli(
+        "--compression_soft_rate_prune_weight",
+        "compression_soft_rate_prune_weight",
+        args.grad_scale_prune_where_compression,
+    )
+    _scale_if_not_cli(
+        "--compression_soft_rate_proxy_grad_weight",
+        "compression_soft_rate_proxy_grad_weight",
+        args.grad_scale_prune_where_compression,
+    )
+    _scale_if_not_cli(
+        "--compression_soft_prune_rate_proxy_grad_weight",
+        "compression_soft_prune_rate_proxy_grad_weight",
+        args.grad_scale_prune_where_compression,
+    )
+    _scale_if_not_cli(
+        "--compression_soft_prune_where_proxy_grad_weight",
+        "compression_soft_prune_where_proxy_grad_weight",
+        args.grad_scale_prune_where_compression,
+    )
+    _scale_if_not_cli(
+        "--compression_soft_prune_logit_direct_grad_weight",
+        "compression_soft_prune_logit_direct_grad_weight",
+        args.grad_scale_prune_where_compression,
+    )
+    _scale_if_not_cli(
+        "--compression_soft_prune_direct_grad_weight",
+        "compression_soft_prune_direct_grad_weight",
+        args.grad_scale_prune_where_compression,
+    )
+
+    # 勾配数値: prune_where actuator side
+    _scale_if_not_cli(
+        "--repair_prune_where_ste_grad_scale",
+        "repair_prune_where_ste_grad_scale",
+        args.grad_scale_prune_where_actuator,
+    )
+    _scale_if_not_cli(
+        "--repair_prune_where_direct_grad_scale",
+        "repair_prune_where_direct_grad_scale",
+        args.grad_scale_prune_where_actuator,
+    )
+    _scale_if_not_cli(
+        "--repair_drop_where_proxy_raw_grad_eps",
+        "repair_drop_where_proxy_raw_grad_eps",
+        args.grad_scale_prune_where_actuator,
+    )
+    _scale_if_not_cli(
+        "--repair_drop_where_actuator_weight",
+        "repair_drop_where_actuator_weight",
+        args.grad_scale_prune_where_actuator,
+    )
+    _scale_if_not_cli(
+        "--repair_add_where_actuator_weight",
+        "repair_add_where_actuator_weight",
+        args.grad_scale_prune_where_actuator,
+    )
+    _scale_if_not_cli(
+        "--repair_move_where_actuator_weight",
+        "repair_move_where_actuator_weight",
+        args.grad_scale_prune_where_actuator,
+    )
+
+    # 勾配数値: operation amount
+    _scale_if_not_cli(
+        "--repair_amount_downstream_grad_scale",
+        "repair_amount_downstream_grad_scale",
+        args.grad_scale_operation_amount,
+    )
+    _scale_if_not_cli(
+        "--repair_drop_amount_downstream_grad_scale",
+        "repair_drop_amount_downstream_grad_scale",
+        args.grad_scale_operation_amount,
+    )
+    _scale_if_not_cli(
+        "--repair_add_amount_downstream_grad_scale",
+        "repair_add_amount_downstream_grad_scale",
+        args.grad_scale_operation_amount,
+    )
+    _scale_if_not_cli(
+        "--repair_move_amount_downstream_grad_scale",
+        "repair_move_amount_downstream_grad_scale",
+        args.grad_scale_operation_amount,
+    )
+    _scale_if_not_cli(
+        "--repair_operation_amount_logit_weight",
+        "repair_operation_amount_logit_weight",
+        args.grad_scale_operation_amount,
+    )
+    _scale_if_not_cli(
+        "--repair_operation_amount_consistency_weight",
+        "repair_operation_amount_consistency_weight",
+        args.grad_scale_operation_amount,
+    )
+    _scale_if_not_cli(
+        "--repair_operation_amount_direct_weight",
+        "repair_operation_amount_direct_weight",
+        args.grad_scale_operation_amount,
+    )
+    _scale_if_not_cli(
+        "--repair_drop_amount_supervision_weight",
+        "repair_drop_amount_supervision_weight",
+        args.grad_scale_operation_amount,
+    )
+    _scale_if_not_cli(
+        "--repair_drop_amount_soft_consistency_weight",
+        "repair_drop_amount_soft_consistency_weight",
+        args.grad_scale_operation_amount,
+    )
+    _scale_if_not_cli(
+        "--repair_move_amount_supervision_weight",
+        "repair_move_amount_supervision_weight",
+        args.grad_scale_operation_amount,
+    )
+    _scale_if_not_cli(
+        "--repair_move_amount_soft_consistency_weight",
+        "repair_move_amount_soft_consistency_weight",
+        args.grad_scale_operation_amount,
+    )
+    _scale_if_not_cli(
+        "--repair_add_amount_supervision_weight",
+        "repair_add_amount_supervision_weight",
+        args.grad_scale_operation_amount,
+    )
+    _scale_if_not_cli(
+        "--repair_add_amount_soft_consistency_weight",
+        "repair_add_amount_soft_consistency_weight",
+        args.grad_scale_operation_amount,
     )
 
     args._add_cli_provided = _cli_option_was_provided("--add")

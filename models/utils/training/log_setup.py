@@ -39,6 +39,12 @@ def log_basic_setup(writer, args, file_day, file_time):
         f"geometry_use_d2={bool(getattr(args, 'geometry_use_d2', False))}"
     )
     writer.write(
+        "Gradient Scale Groups: "
+        f"prune_where_compression={float(getattr(args, 'grad_scale_prune_where_compression', 1.0)):.6g}, "
+        f"prune_where_actuator={float(getattr(args, 'grad_scale_prune_where_actuator', 1.0)):.6g}, "
+        f"operation_amount={float(getattr(args, 'grad_scale_operation_amount', 1.0)):.6g}"
+    )
+    writer.write(
         "Gradient Diagnostics: "
         f"compression_grad_probe={bool(getattr(args, 'compression_grad_probe', False))}"
         f"(every={int(getattr(args, 'compression_grad_probe_every', 1))}), "

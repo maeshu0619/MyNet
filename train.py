@@ -7397,7 +7397,18 @@ def _build_exact_occupancy_ste_term(args, terms, model, out_label, before_xyz, a
         model=model,
         out_label=out_label,
     )
-
+    # ============================================================
+    # Prune勾配リバランス中は exact occupancy のsoft勾配を止める
+    # ============================================================
+    # 目的:
+    #   hardなActual occupancy値はforwardに残す。
+    #   ただしbackwardだけはsoft_proxyへ流さない。
+    #   これにより、Prune Whereへ残っている巨大勾配を切り分ける。
+    # ============================================================
+    if bool(getattr(args, "_prune_grad_rebalance_active", False)):
+        if isinstance(soft_debug, dict):
+            soft_debug["exact_occ_soft_proxy_suppressed_by_prune_rebalance"] = True
+        soft_proxy = None
     debug = {}
     debug.update(hard_debug)
     debug.update(soft_debug)
@@ -9634,17 +9645,16 @@ def train(model, args, loss, writer, plot, notifier=None):
                             cp_debug["prune_where_grad_proxy_source"] = "no_prune_soft_terms_available"
 
                     L_downstream = L_com_objective
-                    # build_compression_primary_loss が返した L は、
-                    # 後から追加した gradient-only proxy をまだ含んでいない。
-
                     # ============================================================
-                    # Actual Occupancy hard統計 + soft proxy勾配のSTE項
+                    # Prune勾配リバランス状態を exact occupancy STE 側へ渡す
                     # ============================================================
-                    # forward値は hard_octree_occupancy_stats と同じActual値にする。
-                    # backwardは既存のsoft圧縮proxy/Actuator soft termsへ流す。
-                    # これにより、Predicted Occupancyの数値はActual定義に揃えつつ、
-                    # 学習時にはNetwork側へ勾配を返す。
+                    # 目的:
+                    #   Prune Where anchorを止めても、
+                    #   exact occupancy STE のsoft proxyからWhereへ大きな勾配が残る。
+                    #   そのため、診断中はexact occupancyのsoft勾配も止める。
                     # ============================================================
+                    setattr(args, "_prune_grad_rebalance_active", bool(prune_grad_rebalance))
+                    setattr(args, "_prune_where_anchor_scale", float(prune_where_anchor_scale))
                     exact_occ_ste_term, exact_occ_debug = _build_exact_occupancy_ste_term(
                         args,
                         terms=terms,
@@ -9865,7 +9875,57 @@ def train(model, args, loss, writer, plot, notifier=None):
                             if isinstance(cp_debug, dict):
                                 cp_debug["prune_amount_anchor_used"] = False
                                 cp_debug["prune_amount_anchor_source"] = "no_requires_grad_amount_proxy"
+                        # ============================================================
+                        # 保険: Prune Amount bias への直接gradient-only anchor
+                        # ============================================================
+                        # 目的:
+                        #   learned_drop_ratio / raw_learned_drop_ratio が
+                        #   drop_amount_head に接続されていない場合でも、
+                        #   drop_amount_head.bias へ直接勾配を入れる。
+                        #
+                        # 方針:
+                        #   loss = -bias.mean()
+                        #   optimizerはlossを下げるため、biasは増える方向に更新される。
+                        #   つまりPrune Amountが増える方向へ動く。
+                        #
+                        # 注意:
+                        #   これは診断用である。
+                        #   Amount headが動くことを確認した後は、重みを下げるか、
+                        #   proxy接続の修正に置き換える。
+                        # ============================================================
+                        actuator_for_amount_bias = getattr(base_model_for_amount_proxy, "actuator", None)
+                        drop_amount_head = getattr(actuator_for_amount_bias, "drop_amount_head", None)
+                        drop_amount_bias = getattr(drop_amount_head, "bias", None)
 
+                        if torch.is_tensor(drop_amount_bias) and drop_amount_bias.requires_grad:
+                            amount_bias_anchor_weight = 1.0
+
+                            amount_bias_anchor = -torch.nan_to_num(
+                                drop_amount_bias.float().mean(),
+                                nan=0.0,
+                                posinf=0.0,
+                                neginf=0.0,
+                            )
+
+                            prune_amount_bias_delta = amount_bias_anchor_weight * (
+                                amount_bias_anchor - amount_bias_anchor.detach()
+                            )
+
+                            L_com_objective = L_com_objective + prune_amount_bias_delta
+                            L_com = L_com_objective
+                            L_downstream = L_com_objective
+
+                            # 実際にbackwardされるLにも足す。
+                            # forward値は0なので、損失値は変わらない。
+                            L = L + prune_amount_bias_delta
+
+                            if isinstance(cp_debug, dict):
+                                cp_debug["prune_amount_bias_anchor_used"] = True
+                                cp_debug["prune_amount_bias_anchor_weight"] = float(amount_bias_anchor_weight)
+                                cp_debug["prune_amount_bias_anchor_value"] = float(drop_amount_bias.detach().float().mean().cpu())
+                        else:
+                            if isinstance(cp_debug, dict):
+                                cp_debug["prune_amount_bias_anchor_used"] = False
                     tail_attr_block = stage_factors["attr"] * args.w_attr * L_attr
                     tail_policy_block = stage_factors["policy"] * args.w_policy * L_policy
                     tail_actuator_block = stage_factors["repair"] * args.w_actuator * L_actuator
