@@ -6858,6 +6858,75 @@ def _balance_actual_operation_head_gradients(args, model, structure_debug=None):
 
     return debug
 
+def _register_prune_where_head_grad_scale_hook(args, model, writer=None):
+    """
+    Prune Where(drop_head)へ入る勾配全体を倍率調整する。
+
+    目的:
+      - loss_grad_probe上でも、通常backward上でも、
+        prune_where_drop_head の勾配を直接 1/6 程度へ下げる。
+      - forward値、loss値、hard選択結果は変えない。
+      - drop_amount_head には触らないため、Amount=200は維持される。
+
+    注意:
+      - optimizer.step直前のgrad balanceとは別である。
+      - このhookはautogradからdrop_head parameterへ流れる勾配そのものに効く。
+    """
+    scale = max(
+        float(getattr(args, "grad_scale_prune_where_head", 1.0)),
+        0.0,
+    )
+
+    # 1.0なら何もしない。
+    if abs(scale - 1.0) < 1e-12:
+        if writer is not None and hasattr(writer, "write"):
+            writer.write(
+                "PruneWhereGradHook: disabled because grad_scale_prune_where_head=1.0"
+            )
+        return
+
+    base_model = model.module if hasattr(model, "module") else model
+    actuator = getattr(base_model, "actuator", None)
+    if actuator is None:
+        if writer is not None and hasattr(writer, "write"):
+            writer.write("PruneWhereGradHook: skipped because actuator is missing")
+        return
+
+    drop_head = getattr(actuator, "drop_head", None)
+    if drop_head is None:
+        if writer is not None and hasattr(writer, "write"):
+            writer.write("PruneWhereGradHook: skipped because actuator.drop_head is missing")
+        return
+
+    # 二重登録を防ぐ。
+    if bool(getattr(base_model, "_prune_where_head_grad_scale_hook_registered", False)):
+        if writer is not None and hasattr(writer, "write"):
+            writer.write("PruneWhereGradHook: already registered")
+        return
+
+    handles = []
+
+    for name, param in drop_head.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        # gradそのものをscale倍する。
+        # forward値やloss値は変わらない。
+        handle = param.register_hook(
+            lambda grad, s=scale: grad * s if grad is not None else grad
+        )
+        handles.append(handle)
+
+    setattr(base_model, "_prune_where_head_grad_scale_hook_registered", True)
+    setattr(base_model, "_prune_where_head_grad_scale_hook_handles", handles)
+
+    if writer is not None and hasattr(writer, "write"):
+        writer.write(
+            f"PruneWhereGradHook: registered, "
+            f"scale={float(scale):.6g}, "
+            f"param_count={len(handles)}"
+        )
+        
 def _discrete_loss_mode_value(args):
     # parse_pugan_args が正規化する正式名を使う。旧 typo 名が残る実験設定だけ後方互換で読む。
     return str(
@@ -11690,6 +11759,8 @@ if __name__ == '__main__':
         setup_cuda_t0 = time.time()
         model = model.cuda()
         writer.write(f"SetupTiming: model_to_cuda={time.time() - setup_cuda_t0:.3f}s")
+
+    _register_prune_where_head_grad_scale_hook(args, model, writer=writer)
 
     setup_loss_t0 = time.time()
     loss = Loss(args, file_day + "-" + file_time, writer)

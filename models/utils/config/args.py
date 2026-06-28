@@ -1803,6 +1803,12 @@ def parse_pugan_args(parser, file_day, file_time):
         type=float,
         help='Operation Amount関連の勾配をまとめて増減する倍率。詳細係数の比率は保ったまま全体だけ変える',
     )
+    parser.add_argument(
+        '--grad_scale_prune_where_head',
+        default=1.0 / 6.0,
+        type=float,
+        help='Prune Whereのdrop_headへ入る勾配全体を縮小する倍率。0.1667なら約1/6倍にする',
+    )
 
     """Compression"""
     parser.add_argument('--compress', default='SparsePCGC', type=str, help='使用する圧縮手法')
@@ -2437,6 +2443,10 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     args.grad_scale_operation_amount = max(
         float(getattr(args, "grad_scale_operation_amount", 200.0)),
+        0.0,
+    )
+    args.grad_scale_prune_where_head = max(
+        float(getattr(args, "grad_scale_prune_where_head", 1.0 / 6.0)),
         0.0,
     )
     args.w_com = max(float(getattr(args, "w_com", 10.0)), 0.0)
