@@ -9584,6 +9584,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                         prune_where_proxy_grad_weight = float(
                             getattr(args, "compression_soft_prune_where_proxy_grad_weight", 0.10)
                         )
+
+                        if prune_grad_rebalance:
+                            prune_where_proxy_grad_weight *= float(prune_where_anchor_scale)
                         prune_where_proxy_grad_max = max(
                             float(getattr(args, "compression_soft_prune_where_proxy_grad_max", 1.0)),
                             0.0,
@@ -9655,19 +9658,12 @@ def train(model, args, loss, writer, plot, notifier=None):
                     if torch.is_tensor(compression_extra_grad_delta) and compression_extra_grad_delta.requires_grad:
                         L = L + compression_extra_grad_delta
 
-                    # ============================================================
-                    # Prune Where direct gradient anchor
-                    # ============================================================
-                    # L_com_objective.requires_grad=True でも、勾配がMoveにしか流れていない場合がある。
-                    # そのため、requires_gradの有無ではなく、Prune Where専用proxyを常に探して、
-                    # forward値0のgradient-only項としてL_com_objectiveへ追加する。
-                    #
-                    # target_drop_ratioへ寄せるMSEは使わない。
-                    # 目的は drop_head の勾配0を防ぐことだけである。
-                    # ============================================================
                     prune_where_direct_weight = float(
                         getattr(args, "compression_soft_prune_logit_direct_grad_weight", 0.01)
                     )
+
+                    if prune_grad_rebalance:
+                        prune_where_direct_weight *= float(prune_where_anchor_scale)
 
                     if prune_where_direct_weight > 0.0:
                         base_model_for_prune_proxy = _unwrap_train_model(model)
@@ -9733,6 +9729,129 @@ def train(model, args, loss, writer, plot, notifier=None):
                             if isinstance(cp_debug, dict):
                                 cp_debug["prune_where_direct_anchor_used"] = False
                                 cp_debug["prune_where_direct_anchor_source"] = "no_requires_grad_proxy"
+                    
+                    # ============================================================
+                    # Prune Amount 専用の gradient-only anchor
+                    # ============================================================
+                    # 目的:
+                    #   圧縮損失だけの訓練で、Whereだけでなく
+                    #   prune_amount_head に明確な勾配を返す。
+                    #
+                    # 方針:
+                    #   forward値は0にする。
+                    #   backwardだけ learned_drop_ratio / raw_learned_drop_ratio へ返す。
+                    #   これにより、損失値そのものは変えずにAmount headを起こす。
+                    # ============================================================
+                    if prune_grad_rebalance:
+                        base_model_for_amount_proxy = _unwrap_train_model(model)
+
+                        actuator_soft_terms = dict(
+                            getattr(base_model_for_amount_proxy, "last_actuator_soft_terms", {}) or {}
+                        )
+
+                        args_soft_terms = getattr(args, "_last_actuator_soft_terms", None)
+                        if isinstance(args_soft_terms, dict):
+                            actuator_soft_terms.update(args_soft_terms)
+
+                        if isinstance(out_label, dict):
+                            for key in (
+                                "learned_drop_ratio",
+                                "raw_learned_drop_ratio",
+                                "voxel_soft_drop_amount",
+                                "soft_drop_mass",
+                            ):
+                                value = out_label.get(key, None)
+                                if torch.is_tensor(value):
+                                    actuator_soft_terms[key] = value
+
+                        amount_proxy = None
+                        amount_proxy_source = "none"
+
+                        for key in (
+                            "learned_drop_ratio",
+                            "raw_learned_drop_ratio",
+                            "voxel_soft_drop_amount",
+                            "soft_drop_mass",
+                        ):
+                            value = actuator_soft_terms.get(key, None)
+                            if torch.is_tensor(value) and value.requires_grad:
+                                amount_proxy = value
+                                amount_proxy_source = key
+                                break
+
+                        if amount_proxy is not None:
+                            amount_value = torch.nan_to_num(
+                                amount_proxy.float().mean(),
+                                nan=0.0,
+                                posinf=0.0,
+                                neginf=0.0,
+                            )
+
+                            max_drop_ratio = max(
+                                float(getattr(args, "max_drop_ratio", 0.30)),
+                                1e-6,
+                            )
+
+                            # Amountの目標は、まず5%程度に固定する。
+                            # これは最終性能用ではなく、Amount headが勾配を受け取れるかを確認する診断用である。
+                            target_drop_ratio = min(
+                                max(
+                                    float(getattr(args, "repair_drop_ratio_floor", 0.03)),
+                                    float(getattr(args, "repair_init_drop_ratio", 0.05)),
+                                    0.05,
+                                ),
+                                max_drop_ratio,
+                            )
+
+                            if amount_proxy_source == "raw_learned_drop_ratio":
+                                logit_scale = max(
+                                    float(getattr(args, "repair_operation_amount_logit_scale", 6.0)),
+                                    1e-6,
+                                )
+                                amount_ratio = torch.sigmoid(amount_value / logit_scale) * float(max_drop_ratio)
+                            elif amount_proxy_source == "soft_drop_mass":
+                                # soft_drop_mass は個数スケールの可能性があるため、
+                                # ここでは診断用としてそのまま使わず、learned_drop_ratioが無い場合の最後の保険に留める。
+                                amount_ratio = amount_value.clamp(0.0, float(max_drop_ratio))
+                            else:
+                                amount_ratio = amount_value.clamp(0.0, float(max_drop_ratio))
+
+                            target_tensor = amount_ratio.new_tensor(float(target_drop_ratio))
+
+                            amount_anchor_loss = torch.nn.functional.smooth_l1_loss(
+                                amount_ratio,
+                                target_tensor,
+                                reduction="mean",
+                            )
+
+                            # かなり強めにする。
+                            # 前回ログではAmount勾配が1e-7程度だったため、
+                            # まずは診断用に10.0で強制的に起こす。
+                            amount_anchor_weight = 10.0
+
+                            prune_amount_grad_delta = amount_anchor_weight * (
+                                amount_anchor_loss - amount_anchor_loss.detach()
+                            )
+
+                            L_com_objective = L_com_objective + prune_amount_grad_delta
+                            L_com = L_com_objective
+                            L_downstream = L_com_objective
+
+                            # 実際にbackwardされるLにも足す。
+                            # forward値は0なので、損失値は変わらない。
+                            L = L + prune_amount_grad_delta
+
+                            if isinstance(cp_debug, dict):
+                                cp_debug["prune_amount_anchor_used"] = True
+                                cp_debug["prune_amount_anchor_source"] = amount_proxy_source
+                                cp_debug["prune_amount_anchor_weight"] = float(amount_anchor_weight)
+                                cp_debug["prune_amount_anchor_target_ratio"] = float(target_drop_ratio)
+                                cp_debug["prune_amount_anchor_value"] = float(amount_ratio.detach().cpu())
+                                cp_debug["prune_amount_anchor_loss"] = float(amount_anchor_loss.detach().cpu())
+                        else:
+                            if isinstance(cp_debug, dict):
+                                cp_debug["prune_amount_anchor_used"] = False
+                                cp_debug["prune_amount_anchor_source"] = "no_requires_grad_amount_proxy"
                                 
                     tail_attr_block = stage_factors["attr"] * args.w_attr * L_attr
                     tail_policy_block = stage_factors["policy"] * args.w_policy * L_policy

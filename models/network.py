@@ -2351,6 +2351,18 @@ class Network(nn.Module):
             "voxel_soft_move_amount",
             "voxel_soft_edit_score",
             "voxel_soft_edit_count_proxy",
+
+            # ============================================================
+            # 追加: train.py側でAmount/Gateへgradient-only勾配を返すために保存する
+            # ============================================================
+            "raw_learned_drop_ratio",
+            "raw_learned_add_ratio",
+            "raw_learned_move_ratio",
+            "drop_operation_gate",
+            "add_operation_gate",
+            "move_operation_gate",
+            "operation_gate_logit",
+            "operation_gate_prob",
         )
         self.last_actuator_soft_terms = {
             key: value
