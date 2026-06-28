@@ -248,6 +248,8 @@ def actual_compression_ratio_plot_metric(loss_obj, device):
     comp_debug = getattr(loss_obj, "last_compression_debug", {}) or {}
     if "surrogate_teacher_is_actual" in comp_debug and not bool(comp_debug.get("surrogate_teacher_is_actual", False)):
         return None
+    args = getattr(loss_obj, "args", None)
+    compression_loss_delta = bool(getattr(args, "compression_loss_delta", True))
 
     gt_bits = comp_debug.get("gt_actual_bit", comp_debug.get("gt_bit_abs", None))
     gen_bits = comp_debug.get(
@@ -273,7 +275,9 @@ def actual_compression_ratio_plot_metric(loss_obj, device):
         return None
     if not math.isfinite(actual_value):
         return None
-    return metric_tensor(100.0 + actual_value, device)
+    if compression_loss_delta:
+        return metric_tensor(100.0 + actual_value, device)
+    return metric_tensor(100.0 - actual_value, device)
 
 
 def surrogate_compression_plot_metric(loss_obj, fallback_value, device):

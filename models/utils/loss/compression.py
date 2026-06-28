@@ -1371,6 +1371,8 @@ class CompressionLossMixin:
         raw_loss_bit_percent = 100.0 * self._relative_ratio(gen_bit, gt_bit)
         loss_bit_ratio = self._relative_ratio(gen_total_bit, gt_bit)
         loss_bit_percent = 100.0 * loss_bit_ratio
+        if not bool(getattr(args, "compression_loss_delta", True)):
+            loss_bit_percent = 100.0 - loss_bit_percent
         policy_actual_noop_guard_used = False
         policy_actual_noop_guard_margin = max(
             float(getattr(args, "sparsepcgc_policy_actual_noop_guard_margin", 0.0)),
@@ -1383,7 +1385,7 @@ class CompressionLossMixin:
         if (
             self._is_sparsepcgc_context(args)
             and bool(getattr(args, "sparsepcgc_policy_actual_noop_guard", True))
-            and float(loss_bit_percent) > float(policy_actual_noop_guard_margin)
+            and float(raw_loss_bit_percent) > float(policy_actual_noop_guard_margin)
         ):
             # If the measured policy edit is worse than no-op, the codec action
             # selected by training for this step is no-op.  The raw bad edit is
@@ -1395,7 +1397,7 @@ class CompressionLossMixin:
             gen_total_bit = float(gt_bit)
             raw_loss_bit_percent = 0.0
             loss_bit_ratio = 0.0
-            loss_bit_percent = 0.0
+            loss_bit_percent = 0.0 if bool(getattr(args, "compression_loss_delta", True)) else 100.0
 
         L_com_hard = gen_xyz.new_tensor(loss_bit_percent)
         L_com = L_com_hard

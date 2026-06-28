@@ -30,6 +30,10 @@ def log_basic_setup(writer, args, file_day, file_time):
         "delta_percent=(after_bits-before_bits)/before_bits*100; negative means improved compression."
     )
     writer.write(
+        f"Compression Loss Mode: compression_loss_delta={bool(getattr(args, 'compression_loss_delta', True))} "
+        "(True keeps the standard delta, False uses 100-delta for the objective)."
+    )
+    writer.write(
         "Gradient Diagnostics: "
         f"compression_grad_probe={bool(getattr(args, 'compression_grad_probe', False))}"
         f"(every={int(getattr(args, 'compression_grad_probe_every', 1))}), "

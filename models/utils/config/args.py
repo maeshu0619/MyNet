@@ -1759,6 +1759,12 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--discrete_policy_weight', default=1, type=float, help='ポリシー勾配の重み')
     parser.add_argument('--discrete_policy_reward_clip', default=100.0, type=float, help='報酬のクリップ値（0で無効）')
     parser.add_argument('--discrete_policy_baseline_momentum', default=0.95, type=float, help='ベースラインのEMA係数')
+    parser.add_argument(
+        '--compression_loss_delta',
+        default=True,
+        type=str2bool,
+        help='Trueなら圧縮損失を従来どおりのdelta percentで使う。Falseなら1-delta percentへ切り替える',
+    )
 
     """Compression"""
     parser.add_argument('--compress', default='SparsePCGC', type=str, help='使用する圧縮手法')
@@ -2452,6 +2458,7 @@ def parse_pugan_args(parser, file_day, file_time):
         args.w_policy = float(args.w_add)
     if _cli_option_was_provided("--w_dis") and not _cli_option_was_provided("--w_actuator"):
         args.w_actuator = float(args.w_dis)
+    args.compression_loss_delta = bool(getattr(args, "compression_loss_delta", True))
     args.w_attr = float(args.w_attr)
     args.w_policy = float(args.w_policy)
     args.w_actuator = float(args.w_actuator)
