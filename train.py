@@ -9437,6 +9437,19 @@ def train(model, args, loss, writer, plot, notifier=None):
                     # ・SparsePCGCで有効な「bit/node/singleを減らす方向」のproxyを使う
                     # ============================================================
 
+                    # ============================================================
+                    # Prune勾配リバランス
+                    # ============================================================
+                    # 目的:
+                    #   Whereへ偏った後付け勾配を止め、Amount anchorの効果を見る。
+                    #
+                    # 注意:
+                    #   ここでは診断を優先し、Where anchor scaleは0にする。
+                    #   後で安定したら 0.01 や 0.05 に戻してよい。
+                    # ============================================================
+                    prune_grad_rebalance = True
+                    prune_where_anchor_scale = 0.0
+
                     actuator_soft_terms = {}
 
                     base_model_for_prune_proxy = _unwrap_train_model(model)
@@ -9852,7 +9865,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                             if isinstance(cp_debug, dict):
                                 cp_debug["prune_amount_anchor_used"] = False
                                 cp_debug["prune_amount_anchor_source"] = "no_requires_grad_amount_proxy"
-                                
+
                     tail_attr_block = stage_factors["attr"] * args.w_attr * L_attr
                     tail_policy_block = stage_factors["policy"] * args.w_policy * L_policy
                     tail_actuator_block = stage_factors["repair"] * args.w_actuator * L_actuator
