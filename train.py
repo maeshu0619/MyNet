@@ -9234,7 +9234,8 @@ def train(model, args, loss, writer, plot, notifier=None):
                             L_full_context_subtree_delta.requires_grad
                         )
                     
-                L_com_objective = compose_train_compression_objective(args, terms, L_com, La_fit) # actual/surrogateではL_com直結と内訳合成を半々で混ぜる
+                minimal_loss_objective = bool(getattr(args, "minimal_loss_objective", True))
+                L_com_objective = compose_train_compression_objective(args, terms, L_com, La_fit) # minimal_loss_objective時はL_comをそのまま通す
                 # ============================================================
                 # 非有限損失の保険
                 # ============================================================
@@ -9305,14 +9306,21 @@ def train(model, args, loss, writer, plot, notifier=None):
                 ) # 形状損失と圧縮損失の合成
 
                 """属性/方策/操作損失を合成"""
-                legacy_L_total = ( legacy_L_downstream + stage_factors["attr"] * args.w_attr * L_attr + stage_factors["policy"] * args.w_policy * L_policy + stage_factors["repair"] * args.w_actuator * L_actuator)
+                legacy_L_total = legacy_L_downstream
+                if not minimal_loss_objective:
+                    legacy_L_total = (
+                        legacy_L_downstream
+                        + stage_factors["attr"] * args.w_attr * L_attr
+                        + stage_factors["policy"] * args.w_policy * L_policy
+                        + stage_factors["repair"] * args.w_actuator * L_actuator
+                    )
 
                 """損失の合成"""
                 L = legacy_L_total
                 L_downstream = legacy_L_downstream
                 L_discrete_policy = L.new_zeros(())
                 cp_debug = {} # compression primaryモード用のdebug情報を空辞書で初期化
-                if compression_primary_mode: # 圧縮優先の場合、圧縮損失を重視した損失を再計算
+                if compression_primary_mode and not minimal_loss_objective: # 圧縮優先の場合、圧縮損失を重視した損失を再計算
                     L, L_com_objective, cp_debug = build_compression_primary_loss(
                         args,
                         terms=terms,
@@ -9923,6 +9931,31 @@ def train(model, args, loss, writer, plot, notifier=None):
                             and full_cloud_correction_loss.requires_grad
                         )
 
+                # ============================================================
+                # Ablation: 圧縮損失のみで backward する
+                # ============================================================
+                # 目的:
+                #   幾何損失 L_geom、属性損失 L_attr、方策損失 L_policy、
+                #   操作損失 L_actuator、FullCloud補正損失などを
+                #   optimizer更新に一切使わない。
+                #
+                # 注意:
+                #   L_com_objective は train.py 側で構成された
+                #   「学習用の圧縮目的」である。
+                #   まずはこちらを使う方が、現在の圧縮学習経路を保ったまま
+                #   他損失だけを除外できる。
+                # ============================================================
+                compression_only_ablation = True
+
+                if compression_only_ablation:
+                    L = L_com_objective
+                    L_downstream = L
+                    L_discrete_policy = L.new_zeros(())
+
+                    if isinstance(cp_debug, dict):
+                        cp_debug["compression_only_ablation"] = True
+                        cp_debug["compression_only_ablation_loss"] = "L_com_objective"
+                        
                 """情報精査"""
                 comp_debug = dict(getattr(loss, "last_compression_debug", {}) or {}) # 直前の圧縮Debug情報を取り出す
                 # Phase7-3: Network経路debugをcompression debugへ集約する。

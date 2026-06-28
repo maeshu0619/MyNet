@@ -1765,6 +1765,24 @@ def parse_pugan_args(parser, file_day, file_time):
         type=str2bool,
         help='Trueなら圧縮損失を従来どおりのdelta percentで使う。Falseなら1-delta percentへ切り替える',
     )
+    parser.add_argument(
+        '--minimal_loss_objective',
+        default=True,
+        type=str2bool,
+        help='Trueなら学習の主損失を圧縮損失と幾何損失のみに絞る',
+    )
+    parser.add_argument(
+        '--geometry_fit_weight',
+        default=0.05,
+        type=float,
+        help='幾何損失へ足す局所fit補助項の重み',
+    )
+    parser.add_argument(
+        '--geometry_use_d2',
+        default=False,
+        type=str2bool,
+        help='幾何損失でD2を主目的に含めるか。既定では無効',
+    )
 
     """Compression"""
     parser.add_argument('--compress', default='SparsePCGC', type=str, help='使用する圧縮手法')
@@ -2459,6 +2477,9 @@ def parse_pugan_args(parser, file_day, file_time):
     if _cli_option_was_provided("--w_dis") and not _cli_option_was_provided("--w_actuator"):
         args.w_actuator = float(args.w_dis)
     args.compression_loss_delta = bool(getattr(args, "compression_loss_delta", True))
+    args.minimal_loss_objective = bool(getattr(args, "minimal_loss_objective", True))
+    args.geometry_fit_weight = max(float(getattr(args, "geometry_fit_weight", 0.05)), 0.0)
+    args.geometry_use_d2 = bool(getattr(args, "geometry_use_d2", False))
     args.w_attr = float(args.w_attr)
     args.w_policy = float(args.w_policy)
     args.w_actuator = float(args.w_actuator)

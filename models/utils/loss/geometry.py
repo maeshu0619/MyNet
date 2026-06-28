@@ -5,6 +5,7 @@ import torch
 from .utils_loss import (
     chamfer_l2_loss,
     chamfer_l2_loss_and_weight_surrogate,
+    chamfer_dist,
     compute_d2_psnr,
     remove_outlier_points_by_label,
 )
@@ -39,6 +40,13 @@ class GeometryLossMixin:
     @staticmethod
     def _debug_requires_grad(value):
         return bool(torch.is_tensor(value) and value.requires_grad)
+
+    @staticmethod
+    def _fit_proxy_loss(gen_pts_f, gt_pts_f):
+        gen = gen_pts_f.transpose(1, 2).contiguous()
+        gt = gt_pts_f.transpose(1, 2).contiguous()
+        _, dist2, _, _ = chamfer_dist(gen, gt)
+        return dist2.mean()
 
     def _soft_actuator_geometry_proxy(self, args, reference):
         if getattr(args, "trainORtest", "train") != "train":
@@ -156,20 +164,26 @@ class GeometryLossMixin:
                     )
                     surrogate_cd = weighted_cd
                     mode_name = "weighted_soft" if use_weighted_forward else "hard"
+                L_fit = self._fit_proxy_loss(gen_pts_f, gt_inlinear_f)
             L_geom = L_cd
+            fit_weight = max(float(getattr(args, "geometry_fit_weight", 0.05)), 0.0)
+            if fit_weight > 0.0:
+                L_geom = L_geom + fit_weight * L_fit
             self._set_geometry_debug(
                 mode=mode_name,
                 value=float(L_geom.detach()),
                 hard=float(hard_cd),
                 surrogate=float(surrogate_cd),
                 weighted=float(weighted_cd),
+                fit=float(L_fit.detach()),
+                fit_weight=float(fit_weight),
                 gen_points=int(gen_pts.shape[-1]),
                 gt_points=int(gt_inlinear.shape[-1]),
             )
             if self._should_verbose_step(args):
                 self.writer.write(
                     f"L_geom  :{self._scalar(L_geom):.4f}"
-                    f" (hard:{float(hard_cd):.4f}, weighted:{float(weighted_cd):.4f})"
+                    f" (hard:{float(hard_cd):.4f}, weighted:{float(weighted_cd):.4f}, fit:{float(L_fit):.4f}, w_fit:{fit_weight:.4f})"
                 )
         elif args.loss_type == "cd+d2":
             with self._geometry_autocast_ctx(gen_pts):
@@ -191,21 +205,30 @@ class GeometryLossMixin:
                     L_cd_hard = chamfer_l2_loss(gen_pts_f, gt_pts_f)
                     L_cd = L_cd_hard
 
-                L_d2_hard = compute_d2_psnr(gen_pts_f, gt_pts_f, use_torch_ops=use_torch_d2)
-                if use_weighted_forward:
-                    L_d2_soft = compute_d2_psnr(gen_pts_f, gt_pts_f, final_w=final_w_f, use_torch_ops=use_torch_d2)
-                    L_d2_psnr = self.lambda_p * L_d2_hard + L_d2_soft
-                else:
-                    L_d2_psnr = L_d2_hard
+                L_fit = self._fit_proxy_loss(gen_pts_f, gt_pts_f)
 
-            L_d2_term = -float(getattr(args, "geom_d2_weight", 0.2)) * L_d2_psnr
-            L_geom += L_cd + L_d2_term
+                if bool(getattr(args, "geometry_use_d2", False)):
+                    L_d2_hard = compute_d2_psnr(gen_pts_f, gt_pts_f, use_torch_ops=use_torch_d2)
+                    if use_weighted_forward:
+                        L_d2_soft = compute_d2_psnr(gen_pts_f, gt_pts_f, final_w=final_w_f, use_torch_ops=use_torch_d2)
+                        L_d2_psnr = self.lambda_p * L_d2_hard + L_d2_soft
+                    else:
+                        L_d2_psnr = L_d2_hard
+                    L_d2_term = -float(getattr(args, "geom_d2_weight", 0.0)) * L_d2_psnr
+                else:
+                    L_d2_psnr = gen_pts_f.new_zeros(())
+                    L_d2_term = gen_pts_f.new_zeros(())
+
+            fit_weight = max(float(getattr(args, "geometry_fit_weight", 0.05)), 0.0)
+            L_geom = L_cd + fit_weight * L_fit + L_d2_term
             self._set_geometry_debug(
                 mode="cd+d2",
                 value=float(L_geom.detach()),
                 hard=float(L_cd_hard.detach() if 'L_cd_hard' in locals() else L_cd.detach()),
                 surrogate=float(L_cd_surrogate.detach() if 'L_cd_surrogate' in locals() else L_cd.detach()),
                 weighted=float(L_cd.detach()),
+                fit=float(L_fit.detach()),
+                fit_weight=float(fit_weight),
                 d2_psnr=float(L_d2_psnr.detach()),
                 d2_term=float(L_d2_term.detach()),
                 gen_points=int(gen_pts.shape[-1]),
@@ -215,6 +238,7 @@ class GeometryLossMixin:
                 self.writer.write(
                     f"L_geom  :{self._scalar(L_geom):.4f}->"
                     f"L_cd:{self._scalar(L_cd):.4f}, "
+                    f"Fit:{self._scalar(L_fit):.4f}, "
                     f"D2PSNR:{self._scalar(L_d2_psnr):.4f}, "
                     f"L_d2_term:{self._scalar(L_d2_term):.4f}"
                 )

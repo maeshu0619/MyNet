@@ -1,0 +1,171 @@
+myNet/
+├── .git
+│   ├── COMMIT_EDITMSG
+│   ├── FETCH_HEAD
+│   ├── HEAD
+│   ├── branches
+│   ├── config
+│   ├── description
+│   ├── hooks
+│   │   ├── applypatch-msg.sample
+│   │   ├── commit-msg.sample
+│   │   ├── fsmonitor-watchman.sample
+│   │   ├── post-update.sample
+│   │   ├── pre-applypatch.sample
+│   │   ├── pre-commit.sample
+│   │   ├── pre-merge-commit.sample
+│   │   ├── pre-push.sample
+│   │   ├── pre-rebase.sample
+│   │   ├── pre-receive.sample
+│   │   └── ...（2項目省略）
+│   ├── index
+│   ├── info
+│   │   └── exclude
+│   ├── logs
+│   │   ├── HEAD
+│   │   └── refs
+│   │       ├── heads
+│   │       │   ├── backup-before-push
+│   │       │   └── main
+│   │       └── remotes
+│   │           ├── backup
+│   │           │   └── main
+│   │           └── origin
+│   │               └── main
+│   └── ...（2項目省略）
+├── .gitignore
+├── cfgs
+│   └── utils.py
+├── directory_structure.txt
+├── models
+│   ├── Chamfer3D
+│   │   ├── chamfer3D.cu
+│   │   ├── chamfer_cuda.cpp
+│   │   ├── dist_chamfer_3D.py
+│   │   └── setup.py
+│   ├── analyzer
+│   │   ├── analyzer.py
+│   │   └── analyzer_pre.py
+│   ├── decoder
+│   │   └── merge.py
+│   ├── encoder
+│   │   ├── fp_h.py
+│   │   ├── fp_module.py
+│   │   └── point_trans.py
+│   ├── modules
+│   │   ├── add.py
+│   │   ├── cause_aggregation.py
+│   │   ├── cost_attribution.py
+│   │   ├── displace.py
+│   │   ├── multi.py
+│   │   ├── octree_structure.py
+│   │   ├── prune.py
+│   │   ├── resblock.py
+│   │   ├── structure_actuator.py
+│   │   └── structure_policy.py
+│   ├── pointops
+│   │   ├── functions
+│   │   │   ├── __init__.py
+│   │   │   └── pointops.py
+│   │   ├── src
+│   │   │   ├── .ninja_deps
+│   │   │   ├── .ninja_log
+│   │   │   ├── ballquery
+│   │   │   │   ├── ballquery_cuda.cpp
+│   │   │   │   ├── ballquery_cuda_kernel.cu
+│   │   │   │   └── ballquery_cuda_kernel.h
+│   │   │   ├── ballquery_cuda.o
+│   │   │   ├── ballquery_cuda_kernel.cuda.o
+│   │   │   ├── build.ninja
+│   │   │   ├── featuredistribute
+│   │   │   │   ├── featuredistribute_cuda.cpp
+│   │   │   │   ├── featuredistribute_cuda_kernel.cu
+│   │   │   │   └── featuredistribute_cuda_kernel.h
+│   │   │   ├── featuredistribute_cuda.o
+│   │   │   ├── featuredistribute_cuda_kernel.cuda.o
+│   │   │   ├── grouping
+│   │   │   │   ├── grouping_cuda.cpp
+│   │   │   │   ├── grouping_cuda_kernel.cu
+│   │   │   │   └── grouping_cuda_kernel.h
+│   │   │   ├── __init__.py
+│   │   │   ├── cuda_utils.h
+│   │   │   ├── pointops_api.cpp
+│   │   │   └── ...（22項目省略）
+│   │   ├── __init__.py
+│   │   └── setup.py
+│   ├── utils
+│   │   ├── augment
+│   │   │   ├── __init__.py
+│   │   │   └── expand.py
+│   │   ├── compression
+│   │   │   ├── __init__.py
+│   │   │   ├── draco.py
+│   │   │   ├── edit_record.py
+│   │   │   ├── gpcc_tmc3.py
+│   │   │   ├── octree_stats.py
+│   │   │   ├── proxy_oa.py
+│   │   │   └── proxy_octree.py
+│   │   ├── config
+│   │   │   ├── __init__.py
+│   │   │   └── args.py
+│   │   ├── data
+│   │   │   ├── __init__.py
+│   │   │   └── dataset.py
+│   │   ├── eval
+│   │   │   ├── __init__.py
+│   │   │   └── utils_eval.py
+│   │   ├── io
+│   │   │   ├── __init__.py
+│   │   │   └── utils_ply.py
+│   │   ├── kernels
+│   │   │   ├── __init__.py
+│   │   │   └── utils_kernel.py
+│   │   ├── loss
+│   │   │   ├── __init__.py
+│   │   │   ├── actual_encoder.py
+│   │   │   ├── compression.py
+│   │   │   ├── geometry.py
+│   │   │   ├── loss.py
+│   │   │   ├── loss_oa.py
+│   │   │   ├── loss_pre.py
+│   │   │   ├── proxy.py
+│   │   │   ├── sparsepcgc_teacher_worker.py
+│   │   │   ├── surrogate.py
+│   │   │   └── utils_loss.py
+│   │   ├── misc
+│   │   │   ├── __init__.py
+│   │   │   ├── einops_compat.py
+│   │   │   └── organize.py
+│   │   ├── modelnet
+│   │   │   ├── __init__.py
+│   │   │   └── utils_modelnet40.py
+│   │   ├── __init__.py
+│   │   ├── logging_formatter.py
+│   │   └── ...（7項目省略）
+│   └── network.py
+├── record
+│   ├── __init__.py
+│   ├── plot.py
+│   └── write.py
+├── repkpu_model
+│   └── ckpt-best.pth
+├── test.py
+├── tools
+│   └── sparsepcgc_octree_probe.py
+├── train.py
+└── utils
+    ├── compress
+    │   ├── ChamferDistance.py
+    │   ├── D1PSNR.py
+    │   ├── D2PSNR.py
+    │   ├── EarthMoverDistance.py
+    │   ├── HausdorffDistance.py
+    │   ├── NormalConsistency.py
+    │   ├── PointToPlane.py
+    │   ├── PointToPoint.py
+    │   ├── __init__.py
+    │   ├── codec_eval.py
+    │   ├── evaluation.py
+    │   ├── nearest.py
+    │   └── ply_io.py
+    └── __init__.py

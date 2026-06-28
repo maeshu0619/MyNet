@@ -195,6 +195,8 @@ def _actual_total_bit_objective_mix_state(args, terms, L_com):
 
 
 def compose_train_compression_main(args, terms, L_com, La_fit):
+    if bool(getattr(args, "minimal_loss_objective", True)):
+        return L_com
     # compression_primary用に、w_comを掛ける前の圧縮主目的を作る。
     term_main = actual_backend_compression_terms(args, terms, L_com, La_fit) if uses_actual_total_bit_objective(args) else weighted_compression_terms(args, terms, L_com, La_fit, include_weight=False)
     # half/half比率を既定にしつつ、actual=0のときだけproxy側を少し戻す。
@@ -207,6 +209,8 @@ def compose_train_compression_main(args, terms, L_com, La_fit):
 
 
 def compose_train_compression_objective(args, terms, L_com, La_fit):
+    if bool(getattr(args, "minimal_loss_objective", True)):
+        return L_com
     # 実Codec/Surrogate系ではL_com直結と内訳合成を半々にし、片方だけに寄りすぎないようにする。
     direct_objective = float(getattr(args, "w_com", 1.0)) * L_com
     # actual/surrogateではproxy用の巨大係数を避け、proxyでは従来の重み付き内訳を使う。
