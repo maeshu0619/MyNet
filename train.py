@@ -3311,7 +3311,7 @@ def _attach_sparsepcgc_actual_oracle_drop(
         debug["fast_diagnostic_proxy_bits"] = float(proxy_bits)
         debug["fast_diagnostic_proxy_percent"] = float(proxy_percent)
         return True
-    st2 = time.time()
+    
     if missing_full_cloud_teacher_eval:
         debug["reason"] = "full_cloud_splice_missing_for_required_teacher"
         debug["tested_count"] = 0
@@ -3630,8 +3630,6 @@ def _attach_sparsepcgc_actual_oracle_drop(
                             target_coord.reshape(3) - source_coord
                         )
 
-            print(time.time()-st2)
-
             joint_tested = 0
             joint_improving_count = 0
             group_tested = 0
@@ -3749,84 +3747,230 @@ def _attach_sparsepcgc_actual_oracle_drop(
             debug["parent_prune_eval_max"] = int(parent_prune_eval_limit)
             debug["pattern_plan_eval_max"] = int(pattern_plan_eval_limit)
             debug["subtree_move_eval_max"] = int(subtree_move_eval_limit)
-            if full_cloud_macro_eval_limit > 0 and torch.is_tensor(full_eval_coords):
-                full_macro_generate_start = time.time()
-                full_macro_candidates = _sparsepcgc_actual_oracle_full_cloud_macro_prune_candidates(
+            st2 = time.time()
+            def _sparsepcgc_rows_membership_mask_fast(query_n3, table_n3):
+                """
+                query_n3 の各行が table_n3 に含まれるかを返す。
+                旧実装の {tuple(...)} + .cpu().tolist() を置き換える。
+                GPU TensorならGPU上で searchsorted するため、CPU往復をほぼ消せる。
+                """
+                if (
+                    not torch.is_tensor(query_n3)
+                    or not torch.is_tensor(table_n3)
+                    or query_n3.numel() <= 0
+                    or table_n3.numel() <= 0
+                ):
+                    device = query_n3.device if torch.is_tensor(query_n3) else torch.device("cpu")
+                    return torch.zeros((0,), device=device, dtype=torch.bool)
+
+                query = query_n3.to(dtype=torch.long).reshape(-1, 3).contiguous()
+                table = table_n3.to(device=query.device, dtype=torch.long).reshape(-1, 3).contiguous()
+                if query.numel() <= 0 or table.numel() <= 0:
+                    return torch.zeros((query.shape[0],), device=query.device, dtype=torch.bool)
+
+                both = torch.cat([query, table], dim=0)
+                mins = both.amin(dim=0)
+                span = (both.amax(dim=0) - mins + 1).clamp_min(1)
+
+                def _key(values):
+                    shifted = values - mins
+                    return shifted[:, 0] * span[1] * span[2] + shifted[:, 1] * span[2] + shifted[:, 2]
+
+                table_keys = torch.unique(_key(table), sorted=True)
+                query_keys = _key(query)
+                pos = torch.searchsorted(table_keys, query_keys)
+                in_bounds = pos < table_keys.numel()
+                safe_pos = pos.clamp(max=max(int(table_keys.numel()) - 1, 0))
+                return in_bounds & (table_keys[safe_pos] == query_keys)
+
+            def _sparsepcgc_full_macro_candidate_cache_key():
+                context_key = ""
+                if isinstance(full_octree_context, dict):
+                    context_key = str(full_octree_context.get("actual_oracle_full_cloud_cache_key", "") or "")
+                if not context_key:
+                    context_key = str(cache_key or "")
+
+                ratios = str(getattr(args, "sparsepcgc_actual_oracle_full_cloud_macro_prune_ratios", ""))
+                subtree_ratios = str(getattr(args, "sparsepcgc_actual_oracle_full_cloud_subtree_prune_ratios", ""))
+                block_sizes = str(getattr(args, "sparsepcgc_actual_oracle_full_cloud_subtree_block_sizes", ""))
+                target_ratio = str(getattr(args, "sparsepcgc_actual_oracle_full_cloud_subtree_target_ratio", ""))
+                return (
+                    f"{context_key}|full_macro_candidates"
+                    f"|n={int(full_eval_coords.shape[0])}"
+                    f"|max={int(full_cloud_macro_max)}"
+                    f"|ratios={ratios}"
+                    f"|subtree_ratios={subtree_ratios}"
+                    f"|blocks={block_sizes}"
+                    f"|target={target_ratio}"
+                )
+
+            def _get_or_build_full_macro_candidates_fast():
+                use_cache = bool(getattr(args, "sparsepcgc_full_macro_candidate_cache", True))
+                cache_max = max(int(getattr(args, "sparsepcgc_full_macro_candidate_cache_max_entries", 4)), 1)
+                key = _sparsepcgc_full_macro_candidate_cache_key()
+
+                if use_cache:
+                    cache = getattr(args, "_sparsepcgc_full_macro_candidate_cache", None)
+                    if not isinstance(cache, OrderedDict):
+                        cache = OrderedDict()
+                        setattr(args, "_sparsepcgc_full_macro_candidate_cache", cache)
+                    cached = cache.get(key, None)
+                    if cached is not None:
+                        cache.move_to_end(key)
+                        debug["full_cloud_macro_generate_cache_hit"] = True
+                        return cached
+
+                built = _sparsepcgc_actual_oracle_full_cloud_macro_prune_candidates(
                     full_eval_coords,
                     args,
                     full_cloud_macro_max,
                     teacher_coords=unique_coords,
                 )
-                debug["full_cloud_macro_generate_time"] = float(time.time() - full_macro_generate_start)
-                debug["generated_candidate_count"] = int(debug.get("generated_candidate_count", 0)) + int(len(full_macro_candidates))
-                min_improve = max(float(getattr(args, "sparsepcgc_actual_oracle_min_improve_percent", 0.0)), 0.0)
-                for full_macro_item in full_macro_candidates:
-                    if _actual_budget_exhausted(tested) or full_cloud_macro_tested >= full_cloud_macro_eval_limit:
-                        break
-                    candidate_coords = full_macro_item.get("candidate_coords", None)
+
+                if use_cache:
+                    cache[key] = built
+                    cache.move_to_end(key)
+                    while len(cache) > cache_max:
+                        try:
+                            cache.popitem(last=False)
+                        except Exception:
+                            break
+                    debug["full_cloud_macro_generate_cache_hit"] = False
+                return built
+
+            def _get_full_macro_local_indices_tensor(full_macro_item):
+                op_name = str(full_macro_item.get("op", ""))
+                if op_name == "full_cloud_subtree_prune":
+                    drop_block_coords = full_macro_item.get("drop_block_coords", None)
+                    block_size = max(int(full_macro_item.get("block_size", 32)), 2)
+                    if not torch.is_tensor(drop_block_coords):
+                        return unique_coords.new_zeros((0,), dtype=torch.long)
+                    local_blocks = torch.div(unique_coords, block_size, rounding_mode="floor")
+                    local_mask = _sparsepcgc_rows_membership_mask_fast(local_blocks, drop_block_coords)
+                else:
                     drop_coords = full_macro_item.get("drop_coords", None)
-                    if not torch.is_tensor(candidate_coords) or not torch.is_tensor(drop_coords):
-                        continue
-                    local_map_start = time.time()
-                    if str(full_macro_item.get("op", "")) == "full_cloud_subtree_prune":
-                        drop_block_coords = full_macro_item.get("drop_block_coords", None)
-                        block_size = max(int(full_macro_item.get("block_size", 32)), 2)
-                        if not torch.is_tensor(drop_block_coords):
-                            continue
-                        drop_block_key_set = {
-                            tuple(int(v) for v in row)
-                            for row in drop_block_coords.detach().cpu().tolist()
-                        }
-                        local_blocks = torch.div(unique_coords, block_size, rounding_mode="floor")
-                        local_unique_indices = [
-                            int(idx)
-                            for idx, row in enumerate(local_blocks.detach().cpu().tolist())
-                            if tuple(int(v) for v in row) in drop_block_key_set
-                        ]
-                        drop_key_set = None
-                    else:
-                        drop_key_set = {tuple(int(v) for v in row) for row in drop_coords.detach().cpu().tolist()}
-                        local_unique_indices = [
-                            int(idx)
-                            for idx, row in enumerate(unique_coords.detach().cpu().tolist())
-                            if tuple(int(v) for v in row) in drop_key_set
-                        ]
-                    debug["full_cloud_macro_local_map_time"] = float(
-                        debug.get("full_cloud_macro_local_map_time", 0.0)
-                        + (time.time() - local_map_start)
-                    )
+                    if not torch.is_tensor(drop_coords):
+                        return unique_coords.new_zeros((0,), dtype=torch.long)
+                    local_mask = _sparsepcgc_rows_membership_mask_fast(unique_coords, drop_coords)
+                return local_mask.nonzero(as_tuple=False).reshape(-1).to(device=unique_coords.device, dtype=torch.long)
+
+            def _get_cached_or_encode_full_macro_actual(full_macro_item, candidate_coords):
+                use_cache = bool(getattr(args, "sparsepcgc_full_macro_actual_cache", True))
+                stats = None
+                cache_hit = False
+
+                context_key = ""
+                if isinstance(full_octree_context, dict):
+                    context_key = str(full_octree_context.get("actual_oracle_full_cloud_cache_key", "") or "")
+                if not context_key:
+                    context_key = str(cache_key or "")
+
+                op_name = str(full_macro_item.get("op", "macro_prune"))
+                variant = str(full_macro_item.get("variant", ""))
+                block_size = int(full_macro_item.get("block_size", 0) or 0)
+                drop_count = int(full_macro_item.get("drop_count", 0) or 0)
+                drop_block_count = int(full_macro_item.get("drop_block_count", 0) or 0)
+                drop_ratio = float(full_macro_item.get("drop_ratio", 0.0) or 0.0)
+                encode_key = (
+                    f"{context_key}|full_macro_actual"
+                    f"|op={op_name}|variant={variant}"
+                    f"|n={int(candidate_coords.shape[0])}"
+                    f"|drop={drop_count}|drop_blocks={drop_block_count}"
+                    f"|block={block_size}|ratio={drop_ratio:.8f}"
+                )
+
+                if use_cache and hasattr(loss, "_get_cached_actual_gt"):
+                    try:
+                        stats = loss._get_cached_actual_gt(encode_key)
+                        cache_hit = stats is not None
+                    except Exception:
+                        stats = None
+                        cache_hit = False
+
+                if stats is None:
                     restore_start = time.time()
-                    candidate_xyz = _restore_codec_xyz_from_global_voxels(
-                        args,
-                        candidate_coords.transpose(0, 1).contiguous().unsqueeze(0),
-                        full_octree_context if isinstance(full_octree_context, dict) else subtree_tree,
-                        subtree_xyz,
+                    with torch.no_grad():
+                        candidate_xyz = _restore_codec_xyz_from_global_voxels(
+                            args,
+                            candidate_coords.transpose(0, 1).contiguous().unsqueeze(0),
+                            full_octree_context if isinstance(full_octree_context, dict) else subtree_tree,
+                            subtree_xyz,
+                        )
+                    debug["full_cloud_macro_restore_time"] = float(
+                        debug.get("full_cloud_macro_restore_time", 0.0) + (time.time() - restore_start)
                     )
                     if candidate_xyz is None or candidate_xyz.shape[-1] <= 0:
-                        continue
-                    debug["full_cloud_macro_restore_time"] = float(
-                        debug.get("full_cloud_macro_restore_time", 0.0)
-                        + (time.time() - restore_start)
-                    )
+                        return None, False
+
                     candidate_encode_wall_start = time.time()
                     stats = loss._encode_actual_batch(args, candidate_xyz)
                     debug["candidate_actual_wall_time"] = float(
-                        debug.get("candidate_actual_wall_time", 0.0)
-                        + (time.time() - candidate_encode_wall_start)
+                        debug.get("candidate_actual_wall_time", 0.0) + (time.time() - candidate_encode_wall_start)
                     )
                     debug["candidate_actual_encode_time"] = float(
                         debug.get("candidate_actual_encode_time", 0.0)
                         + float(stats.get("encode_time", 0.0) or 0.0)
                     )
+
+                    if use_cache and hasattr(loss, "_store_cached_actual_gt"):
+                        try:
+                            loss._store_cached_actual_gt(encode_key, stats)
+                        except Exception:
+                            pass
+
+                debug["full_cloud_macro_actual_cache_hit_count"] = int(
+                    debug.get("full_cloud_macro_actual_cache_hit_count", 0)
+                ) + int(cache_hit)
+                return stats, cache_hit
+
+            if full_cloud_macro_eval_limit > 0 and torch.is_tensor(full_eval_coords):
+                full_macro_generate_start = time.time()
+                full_macro_candidates = _get_or_build_full_macro_candidates_fast()
+                debug["full_cloud_macro_generate_time"] = float(time.time() - full_macro_generate_start)
+                debug["generated_candidate_count"] = int(debug.get("generated_candidate_count", 0)) + int(len(full_macro_candidates))
+                min_improve = max(float(getattr(args, "sparsepcgc_actual_oracle_min_improve_percent", 0.0)), 0.0)
+
+                compute_local_proxy = bool(
+                    getattr(args, "sparsepcgc_full_macro_compute_exact_local_proxy", False)
+                )
+                max_local_indices_for_record = max(
+                    int(getattr(args, "sparsepcgc_actual_oracle_max_selected_voxels", 4)),
+                    1,
+                )
+
+                for full_macro_item in full_macro_candidates:
+                    if _actual_budget_exhausted(tested) or full_cloud_macro_tested >= full_cloud_macro_eval_limit:
+                        break
+
+                    candidate_coords = full_macro_item.get("candidate_coords", None)
+                    if not torch.is_tensor(candidate_coords):
+                        continue
+                    candidate_coords = candidate_coords.to(device=full_eval_coords.device, dtype=torch.long).contiguous()
+
+                    local_map_start = time.time()
+                    with torch.no_grad():
+                        local_unique_indices_tensor = _get_full_macro_local_indices_tensor(full_macro_item)
+                    debug["full_cloud_macro_local_map_time"] = float(
+                        debug.get("full_cloud_macro_local_map_time", 0.0) + (time.time() - local_map_start)
+                    )
+
+                    stats, actual_cache_hit = _get_cached_or_encode_full_macro_actual(full_macro_item, candidate_coords)
+                    if not isinstance(stats, dict):
+                        continue
+
                     tested += 1
                     full_cloud_macro_tested += 1
                     cand_bit = float(stats.get("bit", 0.0))
+                    if not math.isfinite(cand_bit) or cand_bit <= 0.0:
+                        continue
+
                     full_drop_count = int(
                         full_macro_item.get(
                             "drop_count",
-                            len(drop_key_set) if drop_key_set is not None else 0,
+                            int(local_unique_indices_tensor.numel()),
                         )
                     )
+
                     if str(full_macro_item.get("op", "")) == "full_cloud_subtree_prune":
                         edit_record_bits = _sparsepcgc_edit_record_structured_prune_bits(
                             args,
@@ -3840,22 +3984,31 @@ def _attach_sparsepcgc_actual_oracle_drop(
                             edit_record_unique_count,
                             drop_count=full_drop_count,
                         )
-                    keep_local = torch.ones((unique_coords.shape[0],), device=unique_coords.device, dtype=torch.bool)
-                    if local_unique_indices:
-                        keep_local[
-                            torch.as_tensor(local_unique_indices, device=unique_coords.device, dtype=torch.long)
-                        ] = False
-                    local_candidate_coords = torch.unique(unique_coords[keep_local], dim=0, sorted=True)
-                    local_proxy_start = time.time()
-                    proxy_bits, proxy_percent = _sparsepcgc_proxy_delta_percent(
-                        local_candidate_coords,
-                        args,
-                        base_proxy_bits,
-                    )
-                    debug["full_cloud_macro_local_proxy_time"] = float(
-                        debug.get("full_cloud_macro_local_proxy_time", 0.0)
-                        + (time.time() - local_proxy_start)
-                    )
+
+                    if compute_local_proxy:
+                        local_proxy_start = time.time()
+                        keep_local = torch.ones(
+                            (unique_coords.shape[0],),
+                            device=unique_coords.device,
+                            dtype=torch.bool,
+                        )
+                        if local_unique_indices_tensor.numel() > 0:
+                            keep_local[local_unique_indices_tensor] = False
+                        local_candidate_coords = unique_coords[keep_local]
+                        proxy_bits, proxy_percent = _sparsepcgc_proxy_delta_percent(
+                            local_candidate_coords,
+                            args,
+                            base_proxy_bits,
+                        )
+                        debug["full_cloud_macro_local_proxy_time"] = float(
+                            debug.get("full_cloud_macro_local_proxy_time", 0.0)
+                            + (time.time() - local_proxy_start)
+                        )
+                    else:
+                        proxy_bits = float(full_macro_item.get("proxy_bits", 0.0) or 0.0)
+                        proxy_percent = float(full_macro_item.get("proxy_percent", 0.0) or 0.0)
+                        debug["full_cloud_macro_local_proxy_skipped"] = True
+
                     geometry_percent = _sparsepcgc_geometry_penalty_percent(
                         args,
                         edit_record_unique_count,
@@ -3866,14 +4019,32 @@ def _attach_sparsepcgc_actual_oracle_drop(
                         edit_record_bits,
                         geometry_percent,
                     )
+
                     if float(cand_percent) < float(full_cloud_macro_best_percent):
                         full_cloud_macro_best_percent = float(cand_percent)
                         full_cloud_macro_best_ratio = float(full_macro_item.get("drop_ratio", 0.0))
                         full_cloud_macro_best_drop_count = int(full_drop_count)
-                    _update_best(raw_percent, actual_percent, cand_percent, edit_record_bits, cand_bit, proxy_percent)
+
+                    _update_best(
+                        raw_percent,
+                        actual_percent,
+                        cand_percent,
+                        edit_record_bits,
+                        cand_bit,
+                        proxy_percent,
+                    )
+
                     if cand_percent < -min_improve:
                         full_cloud_macro_improving_count += 1
                         improving_candidate_count += 1
+
+                        local_unique_indices = [
+                            int(v)
+                            for v in local_unique_indices_tensor[:max_local_indices_for_record]
+                            .detach()
+                            .cpu()
+                            .tolist()
+                        ]
                         improving.append(
                             {
                                 "op": str(full_macro_item.get("op", "macro_prune")),
@@ -3890,13 +4061,17 @@ def _attach_sparsepcgc_actual_oracle_drop(
                                 "drop_block_count": int(full_macro_item.get("drop_block_count", 0)),
                                 "block_size": int(full_macro_item.get("block_size", 0)),
                                 "drop_ratio": float(full_macro_item.get("drop_ratio", 0.0)),
-                                "override_final_voxel_coords": candidate_coords.detach().clone(),
+                                "override_final_voxel_coords": candidate_coords.detach(),
                                 "override_scope": "full_cloud",
                                 "actual_stats": dict(stats),
+                                "actual_cache_hit": bool(actual_cache_hit),
                             }
                         )
                     else:
                         bad_candidate_count += 1
+                        
+            print(time.time()-st2)
+
             if full_macro_fail_fallback_enabled:
                 full_macro_fallback_triggered = bool(full_cloud_macro_improving_count <= 0)
                 debug["full_cloud_macro_fallback_triggered"] = bool(full_macro_fallback_triggered)
@@ -3915,6 +4090,8 @@ def _attach_sparsepcgc_actual_oracle_drop(
             debug["parent_prune_eval_max"] = int(parent_prune_eval_limit)
             debug["pattern_plan_eval_max"] = int(pattern_plan_eval_limit)
             debug["subtree_move_eval_max"] = int(subtree_move_eval_limit)
+            
+            
             if macro_prune_eval_limit > 0:
                 macro_candidates = _sparsepcgc_actual_oracle_macro_prune_candidates(
                     unique_coords,
