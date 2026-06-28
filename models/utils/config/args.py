@@ -1711,12 +1711,12 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--compression_primary_aux_target_ratio', default=0.25, type=float, help='compression_primary内部のsupport blockを|main|に対してどこまで許すかの比率上限')
     parser.add_argument('--compression_primary_aux_balance_min_scale', default=0.0, type=float, help='compression_primary内部support blockの最小scale')
     parser.add_argument('--compression_primary_aux_balance_max_scale', default=1.0, type=float, help='compression_primary内部support blockの最大scale')
-    parser.add_argument('--compression_primary_tail_target_ratio', default=0.15, type=float, help='compression_primary終盤で加えるattr/policy/actuator/correction support blockを|main|に対してどこまで許すかの比率上限')
+    parser.add_argument('--compression_primary_tail_target_ratio', default=0.40, type=float, help='compression_primary終盤で加えるattr/policy/actuator/correction support blockを|main|に対してどこまで許すかの比率上限')
     parser.add_argument('--compression_primary_tail_balance_min_scale', default=0.0, type=float, help='compression_primary終盤support blockの最小scale')
     parser.add_argument('--compression_primary_tail_balance_max_scale', default=1.0, type=float, help='compression_primary終盤support blockの最大scale')
     parser.add_argument(
         '--compression_primary_proxy_grad_weight',
-        default=0.10,
+        default=0.02,
         type=float,
         help='compression_primaryでhard圧縮目的のforward値を保ったまま、backwardだけ微分可能proxyへ流す重み',
     )
@@ -1731,9 +1731,9 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--w_geom',     default=10**4, type=float, help='幾何損失ブロック全体の重み')
     parser.add_argument('--geom_d2_weight', default=0.2, type=float, help='loss_type=cd+d2 のときの D2PSNR 報酬項の重み')
     parser.add_argument('--w_com',      default=3, type=float, help='圧縮損失ブロック全体の重み（actual/surrogate backendでは total-bit 差[%%] に直接掛かる）')
-    parser.add_argument('--w_attr',     default=1, type=float, help='原因分解損失ブロック全体の重み')
-    parser.add_argument('--w_policy',   default=0.03, type=float, help='構造修復ポリシー損失ブロック全体の重み')
-    parser.add_argument('--w_actuator', default=0.02, type=float, help='構造修復アクチュエータ正則化損失ブロック全体の重み')
+    parser.add_argument('--w_attr',     default=20.0, type=float, help='原因分解損失ブロック全体の重み')
+    parser.add_argument('--w_policy',   default=0.3, type=float, help='構造修復ポリシー損失ブロック全体の重み')
+    parser.add_argument('--w_actuator', default=1.0, type=float, help='構造修復アクチュエータ正則化損失ブロック全体の重み')
     parser.add_argument('--w_prun',     default=None, type=float, help='旧名: --w_attr の後方互換alias')
     parser.add_argument('--w_add',      default=None, type=float, help='旧名: --w_policy の後方互換alias')
     parser.add_argument('--w_dis',      default=None, type=float, help='旧名: --w_actuator の後方互換alias')
@@ -1787,7 +1787,7 @@ def parse_pugan_args(parser, file_day, file_time):
     # 勾配数値
     parser.add_argument(
         '--grad_scale_prune_where_compression',
-        default=1.0,
+        default=0.17,
         type=float,
         help='圧縮損失側のPrune Where関連勾配をまとめて増減する倍率。詳細係数の比率は保ったまま全体だけ変える',
     )
@@ -1799,7 +1799,7 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--grad_scale_operation_amount',
-        default=1.0,
+        default=200.0,
         type=float,
         help='Operation Amount関連の勾配をまとめて増減する倍率。詳細係数の比率は保ったまま全体だけ変える',
     )
@@ -2428,7 +2428,7 @@ def parse_pugan_args(parser, file_day, file_time):
         1.0 - 1e-4,
     )
     args.grad_scale_prune_where_compression = max(
-        float(getattr(args, "grad_scale_prune_where_compression", 1.0)),
+        float(getattr(args, "grad_scale_prune_where_compression", 0.17)),
         0.0,
     )
     args.grad_scale_prune_where_actuator = max(
@@ -2436,7 +2436,7 @@ def parse_pugan_args(parser, file_day, file_time):
         0.0,
     )
     args.grad_scale_operation_amount = max(
-        float(getattr(args, "grad_scale_operation_amount", 1.0)),
+        float(getattr(args, "grad_scale_operation_amount", 200.0)),
         0.0,
     )
     args.w_com = max(float(getattr(args, "w_com", 10.0)), 0.0)
