@@ -875,6 +875,36 @@ def parse_pugan_args(parser, file_day, file_time):
         type=int,
         help='network prune floorを0へ線形減衰させるstep数(公称warmup終了後から数える)',
     )
+    # ============================================================
+    # Direct Network Prune 診断モード
+    # ============================================================
+    # Phase / oracle / no-op guard / full-cloud primary による
+    # 0化を切り離し、NetworkのPrune行動とraw圧縮損失だけで学習する。
+    # ============================================================
+    parser.add_argument(
+        '--direct_network_prune',
+        default=False,
+        type=str2bool,
+        help='TrueならPhase/oracle/no-op guardを通さず、NetworkのPruneとraw圧縮損失で直接学習する',
+    )
+    parser.add_argument(
+        '--direct_prune_ratio_floor',
+        default=0.05,
+        type=float,
+        help='direct_network_prune時に保証するPrune割合の下限',
+    )
+    parser.add_argument(
+        '--direct_prune_min_hard_count',
+        default=1,
+        type=int,
+        help='direct_network_prune時に候補がある限り保証する最小hard Prune数',
+    )
+    parser.add_argument(
+        '--direct_prune_use_raw_compression_loss',
+        default=True,
+        type=str2bool,
+        help='direct_network_prune時にno-op置換後ではなくraw actual compression lossを使う',
+    )
     parser.add_argument(
         '--sparsepcgc_actual_gate_non_prune',
         default=True,
@@ -3542,7 +3572,7 @@ def parse_pugan_args(parser, file_day, file_time):
     args.sparsepcgc_prune_after_prior_mode = str(
         getattr(args, "sparsepcgc_prune_after_prior_mode", "oracle")
     ).strip().lower()
-    if args.sparsepcgc_prune_after_prior_mode not in {"oracle", "network"}:
+    if args.sparsepcgc_prune_after_prior_mode not in {"oracle", "network", "direct_network"}:
         args.sparsepcgc_prune_after_prior_mode = "oracle"
     args.sparsepcgc_network_prune_ratio_floor = min(
         max(float(getattr(args, "sparsepcgc_network_prune_ratio_floor", 0.05)), 0.0),
@@ -3560,6 +3590,41 @@ def parse_pugan_args(parser, file_day, file_time):
         int(getattr(args, "sparsepcgc_network_prune_floor_decay_steps", 1000)),
         0,
     )
+    # ============================================================
+    # Direct Network Prune 正規化
+    # ============================================================
+    args.direct_network_prune = bool(getattr(args, "direct_network_prune", False))
+    if str(getattr(args, "sparsepcgc_prune_after_prior_mode", "")).strip().lower() == "direct_network":
+        args.direct_network_prune = True
+
+    args.direct_prune_ratio_floor = min(
+        max(float(getattr(args, "direct_prune_ratio_floor", 0.05)), 0.0),
+        0.95,
+    )
+    args.direct_prune_min_hard_count = max(
+        int(getattr(args, "direct_prune_min_hard_count", 1)),
+        0,
+    )
+    args.direct_prune_use_raw_compression_loss = bool(
+        getattr(args, "direct_prune_use_raw_compression_loss", True)
+    )
+
+    if args.direct_network_prune:
+        # 既存挙動を直接削除せず、directモード時だけ安全装置を切る。
+        args.sparsepcgc_prune_after_prior_mode = "direct_network"
+
+        # no-op化の主因になり得るものを診断時だけ止める。
+        args.sparsepcgc_policy_actual_noop_guard = False
+        args.sparsepcgc_full_cloud_actual_primary = False
+        args.full_cloud_actual_correction = False
+        args.full_cloud_actual_correction_loss_enable = False
+
+        # oracleはログ・教師として残してよいが、hard行動の強制適用は禁止する。
+        args.sparsepcgc_actual_oracle_apply_teacher_actions = False
+        args.sparsepcgc_actual_oracle_apply_full_override = False
+
+        # direct modeではNetwork Pruneを止めるactual gateを使わない。
+        args.sparsepcgc_actual_gate_prune = False
     args.sparsepcgc_actual_gate_non_prune = bool(
         getattr(args, "sparsepcgc_actual_gate_non_prune", True)
     )

@@ -2825,7 +2825,6 @@ def _sparsepcgc_splice_subtree_coords_into_full_cloud(full_coords_b3n, subtree_c
         return None
     return spliced
 
-
 def _attach_sparsepcgc_actual_oracle_drop(
     *,
     args,
@@ -3053,7 +3052,7 @@ def _attach_sparsepcgc_actual_oracle_drop(
     debug["full_cloud_macro_fail_extra_eval_max"] = int(early_full_macro_fail_extra_eval_max)
 
     local_candidate_generation_done = False
-
+    
     def _ensure_local_candidate_generation():
         nonlocal candidate_pool, candidate_indices, add_candidate_pool, add_candidates
         nonlocal unique_coords, inverse, local_candidate_generation_done
@@ -3312,7 +3311,7 @@ def _attach_sparsepcgc_actual_oracle_drop(
         debug["fast_diagnostic_proxy_bits"] = float(proxy_bits)
         debug["fast_diagnostic_proxy_percent"] = float(proxy_percent)
         return True
-
+    st2 = time.time()
     if missing_full_cloud_teacher_eval:
         debug["reason"] = "full_cloud_splice_missing_for_required_teacher"
         debug["tested_count"] = 0
@@ -3630,6 +3629,8 @@ def _attach_sparsepcgc_actual_oracle_drop(
                         bad_add_direction_index[0, mask] = _neighbor_direction_index(
                             target_coord.reshape(3) - source_coord
                         )
+
+            print(time.time()-st2)
 
             joint_tested = 0
             joint_improving_count = 0
@@ -8369,6 +8370,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                             )
                             patched_full_context["actual_oracle_full_cloud_cache_key"] = str(cache_key)
                             oracle_subtree_xyz = input_xyz.index_select(2, selected_point_idx).contiguous()
+                            st = time.time()
                             patched_subtree_tree, patched_full_context, oracle_debug = _attach_sparsepcgc_actual_oracle_drop(
                                 args=args,
                                 writer=writer,
@@ -8379,11 +8381,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 cache_key=oracle_cache_key,
                                 global_step=global_train_step,
                             )
-
-                            # A full-cloud structured candidate is the final output teacher, while
-                            # the selected subtree only receives the intersecting local drop mask.
-                            # Applying full-cloud coordinates inside the shadow subtree would mix
-                            # coordinate scopes and duplicate the entire cloud in that forward.
+                            # print(time.time()-st)
                             if str(oracle_debug.get("override_scope", "")) == "full_cloud":
                                 apply_full_override = bool(
                                     getattr(args, "sparsepcgc_actual_oracle_apply_full_override", False)
@@ -9236,7 +9234,10 @@ def train(model, args, loss, writer, plot, notifier=None):
                                     setattr(args, "_full_cloud_actual_correction_state", full_cloud_correction_state)
                                 except Exception:
                                     pass
-                                if bool(getattr(args, "sparsepcgc_full_cloud_actual_primary", True)):
+                                if (
+                                    bool(getattr(args, "sparsepcgc_full_cloud_actual_primary", True))
+                                    and not bool(getattr(args, "direct_network_prune", False))
+                                ):
                                     full_cloud_primary_value = finite_float_or_none(
                                         full_cloud_anchor_debug_snapshot.get(
                                             "actual_total_bit_percent",
@@ -10333,7 +10334,15 @@ def train(model, args, loss, writer, plot, notifier=None):
 
                 """情報精査"""
                 comp_debug = dict(getattr(loss, "last_compression_debug", {}) or {}) # 直前の圧縮Debug情報を取り出す
-                # Phase7-3: Network経路debugをcompression debugへ集約する。
+                # ============================================================
+                # Direct Network Prune debug
+                # ============================================================
+                if bool(getattr(args, "direct_network_prune", False)):
+                    comp_debug["direct_network_prune"] = True
+                    comp_debug["direct_prune_use_raw_compression_loss"] = bool(
+                        getattr(args, "direct_prune_use_raw_compression_loss", True)
+                    )
+                    comp_debug["direct_prune_expected_no_full_cloud_primary"] = True
                 base_model_for_phase7 = model.module if hasattr(model, "module") else model
                 phase7_structure_debug = getattr(base_model_for_phase7, "last_structure_debug", {}) or {}
                 _phase7_update_from_structure(

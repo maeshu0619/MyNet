@@ -1073,6 +1073,7 @@ class SurrogateCompressionLossMixin:
             if (
                 str(teacher_codec).strip().lower() == "sparsepcgc"
                 and bool(getattr(args, "sparsepcgc_policy_actual_noop_guard", True))
+                and not bool(getattr(args, "direct_network_prune", False))
                 and float(actual_bit_percent) > float(policy_actual_noop_guard_margin)
             ):
                 policy_actual_noop_guard_used = True
@@ -1431,9 +1432,16 @@ class SurrogateCompressionLossMixin:
         # raw actual percent は別途ログに残し、loss側だけを安全な値へ寄せる。
         forward_teacher_percent_value = float(actual_bit_percent)
         forward_teacher_source = str(actual_value_source)
-        if actual_value_source == "local_proxy":
-            forward_teacher_percent_value = float(target_train_percent_value)
-            forward_teacher_source = "local_proxy_target"
+        # ============================================================
+        # Direct Network Prune:
+        # no-op置換後・local proxy置換後ではなく、raw actual percentを
+        # compression lossのforward教師値として使う。
+        # ============================================================
+        if bool(getattr(args, "direct_network_prune", False)) and bool(
+            getattr(args, "direct_prune_use_raw_compression_loss", True)
+        ):
+            forward_teacher_percent_value = float(actual_bit_percent)
+            forward_teacher_source = "direct_network_raw_actual"
         if not math.isfinite(forward_teacher_percent_value):
             forward_teacher_percent_value = 0.0
             forward_teacher_source = f"{forward_teacher_source}_nonfinite_zero"

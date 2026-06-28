@@ -868,35 +868,71 @@ class StructureRepairActuator(nn.Module):
 
     def _prune_after_prior_mode(self):
         mode = str(getattr(self.args, "sparsepcgc_prune_after_prior_mode", "oracle")).strip().lower()
-        if mode not in {"oracle", "network"}:
+        if bool(getattr(self.args, "direct_network_prune", False)):
+            return "direct_network"
+        if mode not in {"oracle", "network", "direct_network"}:
             return "oracle"
         return mode
+
+    def _direct_network_prune_mode(self):
+        return bool(
+            self.training
+            and (
+                bool(getattr(self.args, "direct_network_prune", False))
+                or self._prune_after_prior_mode() == "direct_network"
+            )
+        )
 
     def _network_prune_floor_ratio(self, max_drop_ratio):
         if not self.training:
             return 0.0
-        if self._prune_after_prior_mode() != "network":
+
+        mode = self._prune_after_prior_mode()
+        if mode not in {"network", "direct_network"}:
             return 0.0
-        floor_ratio = min(
-            max(float(getattr(self.args, "sparsepcgc_network_prune_ratio_floor", 0.0)), 0.0),
-            float(max_drop_ratio),
-        )
+
+        if mode == "direct_network":
+            floor_ratio = float(
+                getattr(
+                    self.args,
+                    "direct_prune_ratio_floor",
+                    getattr(self.args, "sparsepcgc_network_prune_ratio_floor", 0.05),
+                )
+            )
+        else:
+            floor_ratio = float(getattr(self.args, "sparsepcgc_network_prune_ratio_floor", 0.0))
+
+        floor_ratio = min(max(floor_ratio, 0.0), float(max_drop_ratio))
         if floor_ratio <= 0.0:
             return 0.0
-        warmup_steps = max(int(getattr(self.args, "sparsepcgc_codec_prune_prior_warmup_steps", 0)), 0)
-        floor_steps = max(int(getattr(self.args, "sparsepcgc_network_prune_floor_steps", 0)), 0)
-        decay_steps = max(int(getattr(self.args, "sparsepcgc_network_prune_floor_decay_steps", 0)), 0)
+
         current_step = max(int(getattr(self.args, "_global_train_step", 0)), 0)
-        post_warmup_step = max(current_step - warmup_steps, 0)
+
+        # direct_networkではPhaseに依存させない。
+        # warmup終了後ではなく、訓練開始直後からNetwork Pruneの実行機会を残す。
+        if mode == "direct_network":
+            floor_steps = max(int(getattr(self.args, "sparsepcgc_network_prune_floor_steps", 1000)), 0)
+            decay_steps = max(int(getattr(self.args, "sparsepcgc_network_prune_floor_decay_steps", 1000)), 0)
+            post_warmup_step = current_step
+        else:
+            warmup_steps = max(int(getattr(self.args, "sparsepcgc_codec_prune_prior_warmup_steps", 0)), 0)
+            floor_steps = max(int(getattr(self.args, "sparsepcgc_network_prune_floor_steps", 0)), 0)
+            decay_steps = max(int(getattr(self.args, "sparsepcgc_network_prune_floor_decay_steps", 0)), 0)
+            post_warmup_step = max(current_step - warmup_steps, 0)
+
         if post_warmup_step < floor_steps:
             return floor_ratio
+
         if decay_steps <= 0:
             return 0.0
+
         decay_progress = max(post_warmup_step - floor_steps, 0)
         decay_phase = max(1.0 - float(decay_progress) / float(decay_steps), 0.0)
         return floor_ratio * decay_phase
 
     def _network_phase0_prune_mode(self, codec_prune_prior_phase):
+        if self._direct_network_prune_mode():
+            return True
         return bool(
             self.training
             and self._prune_after_prior_mode() == "network"
@@ -2858,7 +2894,7 @@ class StructureRepairActuator(nn.Module):
         effective_drop_ratio_for_hard_count = (
             learned_drop_ratio_before_gate if phase0_network_prune_mode else learned_drop_ratio_after_gate
         )
-        if codec_prune_prior_active_ratio > 0.0:
+        if codec_prune_prior_active_ratio > 0.0 and not self._direct_network_prune_mode():
             codec_prior_tensor = learned_drop_ratio.new_tensor(codec_prune_prior_active_ratio)
             effective_drop_ratio_forward = torch.maximum(effective_drop_ratio_for_hard_count, codec_prior_tensor)
             effective_drop_ratio_for_hard_count = (
@@ -3231,7 +3267,16 @@ class StructureRepairActuator(nn.Module):
             + prune_where_ste_grad_scale
             * (soft_drop_where_grad_base - soft_drop_where_grad_base.detach())
         )
-
+        # ============================================================
+        # Direct Network Prune:
+        # Phase0以降だけでなく、訓練中はNetworkのPruneを直接通す。
+        # actual oracle / hard gate による全停止をここで切り離す。
+        # ============================================================
+        direct_network_prune_mode = self._direct_network_prune_mode()
+        if direct_network_prune_mode:
+            hard_prune_actual_allowed = True
+            actual_oracle_apply_teacher_actions = False
+            require_actual_gate_prune = False
         hard_delete_selection_mask = delete_candidate_mask.unsqueeze(1)
         if (
             require_actual_gate_prune
@@ -3285,7 +3330,7 @@ class StructureRepairActuator(nn.Module):
                 min_hard_count=0,
                 allow_single_candidate=False,
             )
-        elif codec_prune_prior_phase > 0.0:
+        elif codec_prune_prior_phase > 0.0 and not direct_network_prune_mode:
             hard_drop_block_reason = "codec_prior_phase_hard_drop"
             hard_drop_mask = self._hard_codec_block_drop_mask(
                 voxel_coords,
@@ -3305,10 +3350,20 @@ class StructureRepairActuator(nn.Module):
                 selection_mask=hard_delete_selection_mask,
                 hard_threshold=float(getattr(self.args, "repair_drop_hard_threshold", 0.5)),
                 voxel_cache=voxel_cache,
-                force_min_count=bool(getattr(self.args, "repair_force_min_drop_voxels", False)),
+                force_min_count=bool(
+                    getattr(self.args, "repair_force_min_drop_voxels", False)
+                    or direct_network_prune_mode
+                ),
                 max_hard_count=int(getattr(self.args, "repair_max_hard_drop_voxels", 0)),
-                min_hard_count=network_prune_min_hard_count,
-                allow_single_candidate=False,
+                min_hard_count=(
+                    max(
+                        int(network_prune_min_hard_count),
+                        int(getattr(self.args, "direct_prune_min_hard_count", 1)),
+                    )
+                    if direct_network_prune_mode
+                    else network_prune_min_hard_count
+                ),
+                allow_single_candidate=bool(direct_network_prune_mode),
             )
         hard_drop_trace_debug = dict(getattr(self, "_last_hard_drop_count_trace", {}) or {})
         hard_drop = hard_drop_mask.to(dtype=pts_xyz.dtype)
