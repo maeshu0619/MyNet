@@ -303,13 +303,13 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--repair_prune_where_direct_grad_scale',
-        default=0.0003,
+        default=0.00003,
         type=float,
         help='Prune Whereで候補maskによりdrop_head勾配が0化されるのを防ぐため、drop_prob_proxyへ直接戻す微小勾配倍率。forwardのhard削除候補は変えない',
     )
     parser.add_argument(
         '--repair_drop_where_proxy_raw_grad_eps',
-        default=0.0005,
+        default=0.00005,
         type=float,
         help='Prune Whereのdrop_prob_proxyにforward値0差分でraw drop logitへの直通勾配を足す倍率。sigmoid/tanh飽和時のdrop_head勾配0を防ぐ',
     )
@@ -1533,10 +1533,10 @@ def parse_pugan_args(parser, file_day, file_time):
 
     # 圧縮損失における点操作のAmount
     parser.add_argument('--repair_amount_downstream_grad_scale', default=10.0, type=float, help='Amount ratioから実際の点操作へ向かう下流勾配だけを強める倍率。forward値は変えず、backwardだけ強める')
-    parser.add_argument('--repair_drop_amount_downstream_grad_scale', default=300.0, type=float, help='Prune Amount ratioから実際の削除操作へ向かう下流勾配だけを強める倍率')
+    parser.add_argument('--repair_drop_amount_downstream_grad_scale', default=3000.0, type=float, help='Prune Amount ratioから実際の削除操作へ向かう下流勾配だけを強める倍率')
     parser.add_argument('--repair_add_amount_downstream_grad_scale', default=150.0, type=float, help='Add Amount ratioから実際の追加操作へ向かう下流勾配だけを強める倍率')
     parser.add_argument('--repair_move_amount_downstream_grad_scale', default=25.0, type=float, help='Move Amount ratioから実際の移動操作へ向かう下流勾配だけを強める倍率')
-    parser.add_argument('--repair_amount_downstream_grad_max_scale', default=1000.0, type=float, help='Amount downstream STE倍率の上限。極端な勾配増幅を抑える')
+    parser.add_argument('--repair_amount_downstream_grad_max_scale', default=10000.0, type=float, help='Amount downstream STE倍率の上限。極端な勾配増幅を抑える')
     parser.add_argument('--repair_soft_normalizer_floor', default=1e-4, type=float, help='Soft操作量正規化の分母下限。AMP fp16で0除算/inf勾配を防ぐ')
     # 圧縮損失における点操作のWhere
     parser.add_argument('--repair_where_downstream_grad_scale', default=1.0, type=float, help='Where scoreから実際の点操作へ向かう下流勾配だけを調整する倍率。forward値は変えず、backwardだけ変える')
@@ -1581,7 +1581,7 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--compression_soft_prune_logit_direct_grad_weight',
-        default=0.0005,
+        default=0.00002,
         type=float,
         help='train.pyでdrop_logitからPrune Whereへ直接返す保険用の微小勾配重み。forward値は変えない',
     )
@@ -1919,9 +1919,9 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--compression_soft_node_actuator_grad_weight', default=10.0, type=float, help='soft actuator rate proxyをnode項へSTEで戻す重み')
     parser.add_argument('--compression_soft_single_actuator_grad_weight', default=5.0, type=float, help='soft actuator rate proxyをsingle項へSTEで戻す重み')
     parser.add_argument('--compression_soft_bit_actuator_grad_weight', default=10.0, type=float, help='soft actuator rate proxyをbit proxy項へSTEで戻す重み')
-    parser.add_argument('--compression_soft_prune_node_grad_weight', default=2.5, type=float, help='soft prune node proxyをnode項へSTEで戻す重み')
-    parser.add_argument('--compression_soft_prune_single_grad_weight', default=2.0, type=float, help='soft prune single proxyをsingle項へSTEで戻す重み')
-    parser.add_argument('--compression_soft_prune_bit_grad_weight', default=3.0, type=float, help='soft prune bit proxyをbit proxy項へSTEで戻す重み')
+    parser.add_argument('--compression_soft_prune_node_grad_weight', default=0.025, type=float, help='soft prune node proxyをnode項へSTEで戻す重み')
+    parser.add_argument('--compression_soft_prune_single_grad_weight', default=0.2, type=float, help='soft prune single proxyをsingle項へSTEで戻す重み')
+    parser.add_argument('--compression_soft_prune_bit_grad_weight', default=0.03, type=float, help='soft prune bit proxyをbit proxy項へSTEで戻す重み')
     parser.add_argument('--compression_soft_rate_point_weight', default=0.25, type=float, help='soft rate proxy内のpoint数差分重み')
     parser.add_argument('--compression_soft_rate_node_weight', default=0.10, type=float, help='soft rate proxy内のnode項重み')
     parser.add_argument('--compression_soft_rate_single_weight', default=0.05, type=float, help='soft rate proxy内のsingle項重み')
@@ -1945,7 +1945,7 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--compression_soft_prune_where_proxy_grad_weight',
-        default=0.0002,
+        default=0.00002,
         type=float,
         help='L_comへPrune Where専用soft proxyをgradient-onlyで足す倍率。forward値は変えず、drop_headへの勾配だけを復帰する',
     )
@@ -3867,7 +3867,7 @@ def parse_pugan_args(parser, file_day, file_time):
             )
         if not _cli_option_was_provided("--compression_soft_prune_rate_proxy_grad_weight"):
             args.compression_soft_prune_rate_proxy_grad_weight = min(
-                float(getattr(args, "compression_soft_prune_rate_proxy_grad_weight", 1.0)),
+                float(getattr(args, "compression_soft_prune_rate_proxy_grad_weight", 0.1)),
                 0.10,
             )
         if not _cli_option_was_provided("--sparsepcgc_active_coord_weight"):
