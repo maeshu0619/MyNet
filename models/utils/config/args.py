@@ -853,9 +853,9 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--sparsepcgc_network_prune_ratio_floor',
-        default=0.01,
+        default=0.001,
         type=float,
-        help='network modeでwarmup後も維持するPrune実行量の最低割合',
+        help='Network Pruneの最低割合。Amountを固定しないため、通常は0.1%程度の0個回避用にする',
     )
     parser.add_argument(
         '--sparsepcgc_network_prune_min_hard_count',
@@ -865,22 +865,16 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--sparsepcgc_network_prune_floor_steps',
-        default=100,
+        default=20,
         type=int,
-        help='network prune floorを一定割合で維持するstep数(公称warmup終了後から数える)',
+        help='Network prune floorを一定割合で維持するstep数。Amount固定を避けるため短くする',
     )
     parser.add_argument(
         '--sparsepcgc_network_prune_floor_decay_steps',
-        default=400,
+        default=100,
         type=int,
-        help='network prune floorを0へ線形減衰させるstep数(公称warmup終了後から数える)',
+        help='Network prune floorを0へ線形減衰させるstep数。Amount固定を避けるため短くする',
     )
-    # ============================================================
-    # SparsePCGC Hybrid Prune Prior
-    # ============================================================
-    # direct_network_pruneのようにcodec priorを完全に消すのではなく、
-    # warmup後も弱いscore bias / amount biasとして残す。
-    # ============================================================
     parser.add_argument(
         '--sparsepcgc_hybrid_prune_prior',
         default=True,
@@ -901,18 +895,10 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--sparsepcgc_hybrid_prior_amount_blend',
-        default=True,
+        default=False,
         type=str2bool,
-        help='Trueならwarmup後もPrune量計算にcodec prior ratioを弱く混ぜる',
+        help='Trueならwarmup後もPrune量計算にcodec prior ratioを弱く混ぜる。AmountをNetworkに任せる通常訓練ではFalse',
     )
-    # ============================================================
-    # SparsePCGC Hybrid 強化設定
-    # ============================================================
-    # 目的:
-    #   200Step以降に codec prior から Network へ一気に切り替わる問題を避ける。
-    #   priorを「実行」「Where蒸留」「Amount蒸留」の3経路で残し、
-    #   徐々にNetworkへ移行する。
-    # ============================================================
 
     parser.add_argument(
         '--sparsepcgc_prune_monotonic_floor',
@@ -928,10 +914,10 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--sparsepcgc_hybrid_amount_mode',
-        default='blend',
-        choices=['max', 'blend'],
+        default='network',
+        choices=['max', 'blend', 'network'],
         type=str,
-        help='codec prior ratioとNetwork Amountの混ぜ方。maxは旧挙動、blendは滑らかに混ぜる',
+        help='codec prior ratioとNetwork Amountの混ぜ方。networkならwarmup後のPrune量はNetwork出力を使う',
     )
     parser.add_argument(
         '--sparsepcgc_hybrid_amount_min_network_keep',
@@ -971,13 +957,128 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--sparsepcgc_codec_prior_amount_distill_weight',
-        default=0.02,
+        default=0.0,
         type=float,
-        help='codec prior ratioをNetwork Prune Amountへ模倣させるAmount蒸留loss重み',
+        help='codec prior ratioをNetwork Prune Amountへ模倣させるAmount蒸留loss重み。Amount自由学習では0推奨',
     )
     # ============================================================
-    # Prune Amount anchor 診断用
+    # Multi-Subtree training
     # ============================================================
+    # 目的:
+    #   1Stepで1つのSubtreeだけではなく、診断score上位K個のSubtreeを学習する。
+    #   まずはK=3で固定し、将来的にNetworkがKを決める設計へ拡張する。
+    # ============================================================
+    parser.add_argument(
+        '--sparsepcgc_multi_subtree_train',
+        default=True,
+        type=str2bool,
+        help='Trueなら診断score上位の複数Subtreeを1Stepで学習する',
+    )
+    parser.add_argument(
+        '--sparsepcgc_multi_subtree_topk',
+        default=3,
+        type=int,
+        help='1Stepで学習する上位Subtree数。まずは3推奨',
+    )
+    parser.add_argument(
+        '--sparsepcgc_multi_subtree_max_total_points',
+        default=8192,
+        type=int,
+        help='選択Subtree合計点数の上限。0なら無制限。計算時間増加を抑えるために使う',
+    )
+    parser.add_argument(
+        '--sparsepcgc_multi_subtree_disable_random_pick',
+        default=True,
+        type=str2bool,
+        help='Trueならmulti-subtree時にrandom pickせず、score上位から選ぶ',
+    )
+
+    # ============================================================
+    # Outcome Weighted Imitation
+    # ============================================================
+    # 目的:
+    #   actual圧縮損失が下がった行動を強く模倣し、
+    #   悪化した行動を避ける。
+    #   Amountが0へ逃げる問題に対して、成功Amount memoryで下支えする。
+    # ============================================================
+    parser.add_argument(
+        '--sparsepcgc_outcome_imitation',
+        default=True,
+        type=str2bool,
+        help='Trueならactual結果に基づくWhere/Amount imitationを追加する',
+    )
+    parser.add_argument(
+        '--sparsepcgc_outcome_good_margin',
+        default=0.25,
+        type=float,
+        help='actual percentがこの値より小さい負値なら良い行動として扱う',
+    )
+    parser.add_argument(
+        '--sparsepcgc_outcome_bad_margin',
+        default=0.25,
+        type=float,
+        help='actual percentがこの値より大きい正値なら悪い行動として扱う',
+    )
+    parser.add_argument(
+        '--sparsepcgc_outcome_weight_scale',
+        default=5.0,
+        type=float,
+        help='actual percentの改善/悪化をimitation重みに変換するスケール',
+    )
+    parser.add_argument(
+        '--sparsepcgc_outcome_max_weight',
+        default=2.0,
+        type=float,
+        help='outcome imitation重みの上限',
+    )
+    parser.add_argument(
+        '--sparsepcgc_outcome_where_weight',
+        default=0.05,
+        type=float,
+        help='良い行動のWhere imitation重み',
+    )
+    parser.add_argument(
+        '--sparsepcgc_outcome_bad_where_weight',
+        default=0.02,
+        type=float,
+        help='悪い行動のWhere anti-imitation重み',
+    )
+    parser.add_argument(
+        '--sparsepcgc_outcome_amount_weight',
+        default=0.05,
+        type=float,
+        help='良い行動のAmount imitation重み',
+    )
+    parser.add_argument(
+        '--sparsepcgc_outcome_bad_amount_weight',
+        default=0.005,
+        type=float,
+        help='悪い行動のAmount抑制重み。強すぎるとPruneが減り続けるため小さくする',
+    )
+    parser.add_argument(
+        '--sparsepcgc_success_amount_memory',
+        default=True,
+        type=str2bool,
+        help='Trueなら圧縮損失が下がったSubtreeの成功Prune量をEMAで記憶する',
+    )
+    parser.add_argument(
+        '--sparsepcgc_success_amount_ema',
+        default=0.20,
+        type=float,
+        help='成功Amount memoryのEMA更新率',
+    )
+    parser.add_argument(
+        '--sparsepcgc_success_amount_min_keep',
+        default=0.60,
+        type=float,
+        help='成功Amount memoryの何割を下回ったらAmount低下を抑制するか',
+    )
+    parser.add_argument(
+        '--sparsepcgc_success_amount_anticollapse_weight',
+        default=0.03,
+        type=float,
+        help='成功Amountより下がりすぎた場合に戻す補助loss重み',
+    )
     parser.add_argument(
         '--prune_amount_soft_anchor_enable',
         default=False,
@@ -2493,6 +2594,10 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--pin_memory', default=True, type=str2bool, help='CPU→GPU転送高速化のためメモリ固定するか')
     parser.add_argument('--persistent_workers', default=True, type=str2bool, help='ワーカーを維持するか')
     parser.add_argument('--dataset_cache', default=False, type=str2bool, help='データセットをメモリにキャッシュするか')
+    parser.add_argument('--episode_input_common_cache', default=False, type=str2bool, help='同じ入力データをEpisodeごとに繰り返すとき、入力依存の共通前処理をCPUキャッシュして再利用するか')
+    parser.add_argument('--episode_input_common_cache_enable_dataset_cache', default=True, type=str2bool, help='episode_input_common_cache=True時にPLY dataset_cacheも自動で有効化するか')
+    parser.add_argument('--episode_input_common_cache_max_entries', default=0, type=int, help='Episode共通前処理キャッシュの最大件数(0なら学習ファイル数まで自動設定)')
+    parser.add_argument('--episode_input_common_cache_max_memory_mb', default=2048, type=int, help='Episode共通前処理キャッシュのCPUメモリ上限(MB, 0で無制限)')
     parser.add_argument('--ply_loader', default='numpy', type=str, help='PLY読み込み方法(numpy/open3d/auto)')
     parser.add_argument('--mp_start_method', default='auto', type=str, help='マルチプロセス起動方法')
     parser.add_argument('--weight_decay', default=0, type=float, help='重み減衰')
@@ -3734,10 +3839,10 @@ def parse_pugan_args(parser, file_day, file_time):
     )
 
     args.sparsepcgc_hybrid_amount_mode = str(
-        getattr(args, "sparsepcgc_hybrid_amount_mode", "blend")
+        getattr(args, "sparsepcgc_hybrid_amount_mode", "network")
     ).strip().lower()
-    if args.sparsepcgc_hybrid_amount_mode not in {"max", "blend"}:
-        args.sparsepcgc_hybrid_amount_mode = "blend"
+    if args.sparsepcgc_hybrid_amount_mode not in {"max", "blend", "network"}:
+        args.sparsepcgc_hybrid_amount_mode = "network"
 
     args.sparsepcgc_hybrid_amount_min_network_keep = min(
         max(float(getattr(args, "sparsepcgc_hybrid_amount_min_network_keep", 0.15)), 0.0),
@@ -3766,6 +3871,77 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     args.sparsepcgc_codec_prior_amount_distill_weight = max(
         float(getattr(args, "sparsepcgc_codec_prior_amount_distill_weight", 0.02)),
+        0.0,
+    )
+    # ============================================================
+    # Multi-Subtree training 正規化
+    # ============================================================
+    args.sparsepcgc_multi_subtree_train = bool(
+        getattr(args, "sparsepcgc_multi_subtree_train", True)
+    )
+    args.sparsepcgc_multi_subtree_topk = max(
+        int(getattr(args, "sparsepcgc_multi_subtree_topk", 3)),
+        1,
+    )
+    args.sparsepcgc_multi_subtree_max_total_points = max(
+        int(getattr(args, "sparsepcgc_multi_subtree_max_total_points", 8192)),
+        0,
+    )
+    args.sparsepcgc_multi_subtree_disable_random_pick = bool(
+        getattr(args, "sparsepcgc_multi_subtree_disable_random_pick", True)
+    )
+
+    # ============================================================
+    # Outcome Weighted Imitation 正規化
+    # ============================================================
+    args.sparsepcgc_outcome_imitation = bool(
+        getattr(args, "sparsepcgc_outcome_imitation", True)
+    )
+    args.sparsepcgc_outcome_good_margin = max(
+        float(getattr(args, "sparsepcgc_outcome_good_margin", 0.25)),
+        0.0,
+    )
+    args.sparsepcgc_outcome_bad_margin = max(
+        float(getattr(args, "sparsepcgc_outcome_bad_margin", 0.25)),
+        0.0,
+    )
+    args.sparsepcgc_outcome_weight_scale = max(
+        float(getattr(args, "sparsepcgc_outcome_weight_scale", 5.0)),
+        1e-6,
+    )
+    args.sparsepcgc_outcome_max_weight = max(
+        float(getattr(args, "sparsepcgc_outcome_max_weight", 2.0)),
+        0.0,
+    )
+    args.sparsepcgc_outcome_where_weight = max(
+        float(getattr(args, "sparsepcgc_outcome_where_weight", 0.05)),
+        0.0,
+    )
+    args.sparsepcgc_outcome_bad_where_weight = max(
+        float(getattr(args, "sparsepcgc_outcome_bad_where_weight", 0.02)),
+        0.0,
+    )
+    args.sparsepcgc_outcome_amount_weight = max(
+        float(getattr(args, "sparsepcgc_outcome_amount_weight", 0.05)),
+        0.0,
+    )
+    args.sparsepcgc_outcome_bad_amount_weight = max(
+        float(getattr(args, "sparsepcgc_outcome_bad_amount_weight", 0.005)),
+        0.0,
+    )
+    args.sparsepcgc_success_amount_memory = bool(
+        getattr(args, "sparsepcgc_success_amount_memory", True)
+    )
+    args.sparsepcgc_success_amount_ema = min(
+        max(float(getattr(args, "sparsepcgc_success_amount_ema", 0.20)), 1e-4),
+        1.0,
+    )
+    args.sparsepcgc_success_amount_min_keep = min(
+        max(float(getattr(args, "sparsepcgc_success_amount_min_keep", 0.60)), 0.0),
+        1.0,
+    )
+    args.sparsepcgc_success_amount_anticollapse_weight = max(
+        float(getattr(args, "sparsepcgc_success_amount_anticollapse_weight", 0.03)),
         0.0,
     )
     args.prune_amount_soft_anchor_enable = bool(

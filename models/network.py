@@ -2352,9 +2352,11 @@ class Network(nn.Module):
             "voxel_soft_edit_score",
             "voxel_soft_edit_count_proxy",
 
-            # ============================================================
-            # 追加: train.py側でAmount/Gateへgradient-only勾配を返すために保存する
-            # ============================================================
+            "network_drop_logit_for_outcome",
+            "hard_drop_mask_for_outcome",
+            "hard_delete_selection_mask_for_outcome",
+            "drop_ratio_hard_for_outcome",
+            "raw_learned_drop_ratio_for_outcome",
             "raw_learned_drop_ratio",
             "raw_learned_add_ratio",
             "raw_learned_move_ratio",

@@ -109,6 +109,471 @@ def _limit_training_seq_dirs(seq_dirs, args):
         return list(seq_dirs[:3])
     return list(seq_dirs)
 
+def _sparsepcgc_outcome_actual_percent(debug):
+    """
+    Outcome Weighted Imitation用にactual圧縮損失を取り出す。
+    負なら改善、正なら悪化である。
+    """
+    if not isinstance(debug, dict):
+        return None
+
+    for key in (
+        "compression_loss_raw",
+        "actual_forward_raw_value",
+        "actual_bit_percent_raw",
+        "actual_bit_percent",
+        "compression_loss_used",
+        "actual_bit_percent_used_for_loss",
+    ):
+        value = debug.get(key, None)
+        try:
+            value = float(value)
+        except Exception:
+            continue
+        if math.isfinite(value):
+            return float(value)
+
+    return None
+
+
+def _sparsepcgc_scalar_tensor(value, reference):
+    """
+    Tensor/floatをreferenceと同じdevice/dtypeのscalar Tensorへ揃える。
+    """
+    if torch.is_tensor(value):
+        value = value.to(device=reference.device, dtype=reference.dtype)
+        return value.mean()
+    try:
+        return reference.new_tensor(float(value))
+    except Exception:
+        return reference.new_zeros(())
+
+
+def _episode_input_common_cache_enabled(args):
+    return bool(getattr(args, "episode_input_common_cache", False))
+
+
+def _clone_input_common_cache_value_to_cpu(value):
+    if torch.is_tensor(value):
+        return value.detach().to(device="cpu").clone()
+    if isinstance(value, dict):
+        return {key: _clone_input_common_cache_value_to_cpu(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_clone_input_common_cache_value_to_cpu(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_clone_input_common_cache_value_to_cpu(item) for item in value)
+    return value
+
+
+def _clone_input_common_cache_value_to_device(value, device=None):
+    if torch.is_tensor(value):
+        out = value.detach().clone()
+        if device is not None:
+            out = out.to(device=device)
+        return out
+    if isinstance(value, dict):
+        return {key: _clone_input_common_cache_value_to_device(item, device=device) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_clone_input_common_cache_value_to_device(item, device=device) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_clone_input_common_cache_value_to_device(item, device=device) for item in value)
+    return value
+
+
+def _estimate_input_common_cache_bytes(value):
+    if torch.is_tensor(value):
+        return int(value.numel()) * int(value.element_size())
+    if isinstance(value, dict):
+        return sum(_estimate_input_common_cache_bytes(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return sum(_estimate_input_common_cache_bytes(item) for item in value)
+    return 0
+
+
+def _episode_input_common_cache_store(args, cache_key, value):
+    if (not _episode_input_common_cache_enabled(args)) or (not cache_key):
+        return
+
+    max_entries = int(getattr(args, "episode_input_common_cache_max_entries", 0))
+    if max_entries <= 0:
+        max_entries = int(getattr(args, "_episode_input_common_cache_auto_max_entries", 0))
+    max_memory_mb = int(getattr(args, "episode_input_common_cache_max_memory_mb", 0))
+    max_bytes = max(max_memory_mb, 0) * 1024 * 1024
+
+    if max_entries <= 0 and max_bytes <= 0:
+        return
+
+    cache = getattr(args, "_episode_input_common_cache", None)
+    if not isinstance(cache, OrderedDict):
+        cache = OrderedDict()
+        setattr(args, "_episode_input_common_cache", cache)
+
+    bytes_used = int(getattr(args, "_episode_input_common_cache_bytes", 0) or 0)
+    cpu_value = _clone_input_common_cache_value_to_cpu(value)
+    entry_bytes = _estimate_input_common_cache_bytes(cpu_value)
+
+    old_entry = cache.pop(cache_key, None)
+    if isinstance(old_entry, dict):
+        bytes_used -= int(old_entry.get("bytes", 0) or 0)
+
+    cache[cache_key] = {
+        "value": cpu_value,
+        "bytes": int(entry_bytes),
+    }
+    cache.move_to_end(cache_key)
+    bytes_used += int(entry_bytes)
+
+    while cache and (
+        (max_entries > 0 and len(cache) > max_entries)
+        or (max_bytes > 0 and bytes_used > max_bytes)
+    ):
+        _, removed = cache.popitem(last=False)
+        if isinstance(removed, dict):
+            bytes_used -= int(removed.get("bytes", 0) or 0)
+
+    setattr(args, "_episode_input_common_cache_bytes", max(int(bytes_used), 0))
+
+
+def _episode_input_common_cache_fetch(args, cache_key, *, device=None, section="common"):
+    if (not _episode_input_common_cache_enabled(args)) or (not cache_key):
+        return None
+
+    stats = getattr(args, "_episode_input_common_cache_stats", None)
+    if not isinstance(stats, dict):
+        stats = {}
+        setattr(args, "_episode_input_common_cache_stats", stats)
+    section_stats = stats.setdefault(section, {"hit": 0, "miss": 0})
+
+    cache = getattr(args, "_episode_input_common_cache", None)
+    if not isinstance(cache, OrderedDict):
+        section_stats["miss"] += 1
+        return None
+
+    entry = cache.get(cache_key, None)
+    if not isinstance(entry, dict) or "value" not in entry:
+        section_stats["miss"] += 1
+        return None
+
+    cache.move_to_end(cache_key)
+    section_stats["hit"] += 1
+    return _clone_input_common_cache_value_to_device(entry["value"], device=device)
+
+
+def _episode_input_common_cache_summary(args):
+    cache = getattr(args, "_episode_input_common_cache", None)
+    stats = getattr(args, "_episode_input_common_cache_stats", None)
+    bytes_used = int(getattr(args, "_episode_input_common_cache_bytes", 0) or 0)
+
+    total_hits = 0
+    total_misses = 0
+    section_parts = []
+    if isinstance(stats, dict):
+        for section_name in sorted(stats.keys()):
+            item = stats.get(section_name, {}) or {}
+            hit = int(item.get("hit", 0) or 0)
+            miss = int(item.get("miss", 0) or 0)
+            total_hits += hit
+            total_misses += miss
+            section_parts.append(f"{section_name}[hit={hit},miss={miss}]")
+
+    return {
+        "entries": len(cache) if isinstance(cache, OrderedDict) else 0,
+        "bytes": int(bytes_used),
+        "hits": int(total_hits),
+        "misses": int(total_misses),
+        "sections": section_parts,
+    }
+
+
+def _episode_input_common_cache_key(cache_key, section, **parts):
+    items = [f"{cache_key}|episode_input_common={section}"]
+    for name, value in parts.items():
+        items.append(f"{name}={value}")
+    return "|".join(items)
+
+
+def _selected_metadata_input_common_cache_key(cache_key, selected_groups, subtree_depth, args):
+    selected_keys = sorted(int(subtree_key) for subtree_key, _ in (selected_groups or []))
+    selected_text = ",".join(str(key) for key in selected_keys) if selected_keys else "none"
+    selected_hash = hashlib.sha1(selected_text.encode("utf-8")).hexdigest()[:16]
+    repair_unit_level = int(getattr(args, "repair_unit_level", int(subtree_depth)))
+    return _episode_input_common_cache_key(
+        cache_key,
+        "selected_metadata",
+        depth=int(subtree_depth),
+        repair_unit_level=int(repair_unit_level),
+        selected_count=len(selected_keys),
+        selected_hash=selected_hash,
+    )
+
+
+def _sparsepcgc_success_amount_memory_key(cache_key, subtree_key):
+    return f"{str(cache_key)}|subtree={int(subtree_key)}"
+
+
+def _sparsepcgc_update_success_amount_memory(args, memory_key, actual_percent, hard_ratio):
+    """
+    actualで改善したSubtreeのPrune量をEMAで記憶する。
+    Amountが0へ逃げることを防ぐための教師として使う。
+    """
+    if not bool(getattr(args, "sparsepcgc_success_amount_memory", True)):
+        return None
+
+    if memory_key is None:
+        return None
+
+    try:
+        actual_percent = float(actual_percent)
+        hard_ratio = float(hard_ratio)
+    except Exception:
+        return None
+
+    if not (math.isfinite(actual_percent) and math.isfinite(hard_ratio)):
+        return None
+
+    memory = getattr(args, "_sparsepcgc_success_amount_memory", None)
+    if not isinstance(memory, dict):
+        memory = {}
+        setattr(args, "_sparsepcgc_success_amount_memory", memory)
+
+    item = memory.get(memory_key, None)
+
+    good_margin = max(float(getattr(args, "sparsepcgc_outcome_good_margin", 0.25)), 0.0)
+    if actual_percent < -good_margin and hard_ratio > 0.0:
+        ema = min(max(float(getattr(args, "sparsepcgc_success_amount_ema", 0.20)), 1e-4), 1.0)
+        if isinstance(item, dict):
+            old_ratio = float(item.get("ratio", hard_ratio))
+            old_best = float(item.get("best_percent", actual_percent))
+            count = int(item.get("count", 0)) + 1
+            new_ratio = (1.0 - ema) * old_ratio + ema * hard_ratio
+            best_percent = min(old_best, actual_percent)
+        else:
+            count = 1
+            new_ratio = hard_ratio
+            best_percent = actual_percent
+
+        memory[memory_key] = {
+            "ratio": float(new_ratio),
+            "count": int(count),
+            "best_percent": float(best_percent),
+        }
+        return float(new_ratio)
+
+    if isinstance(item, dict):
+        try:
+            return float(item.get("ratio", 0.0))
+        except Exception:
+            return None
+
+    return None
+
+
+def _build_sparsepcgc_outcome_weighted_imitation_loss(
+    args,
+    *,
+    actual_percent,
+    actuator_terms,
+    reference,
+    memory_key=None,
+):
+    """
+    actual結果に基づき、WhereとAmountを追加学習する。
+
+    actual_percent < 0:
+      実際に圧縮損失が下がった行動なので、hard_drop_maskを模倣する。
+
+    actual_percent > 0:
+      実際に悪化した行動なので、そのhard_drop_maskを避ける。
+
+    注意:
+      bad amount抑制を強くしすぎるとPrune量が0へ逃げる。
+      そのためbad amount weightは小さくし、成功Amount memoryで下支えする。
+    """
+    zero = reference.new_zeros(())
+    debug = {
+        "outcome_imitation_used": False,
+        "outcome_actual_percent": float("nan"),
+        "outcome_good_weight": 0.0,
+        "outcome_bad_weight": 0.0,
+        "outcome_where_loss": 0.0,
+        "outcome_amount_loss": 0.0,
+        "outcome_amount_anticollapse_loss": 0.0,
+        "outcome_success_amount_teacher": float("nan"),
+    }
+
+    if not bool(getattr(args, "sparsepcgc_outcome_imitation", True)):
+        return zero, debug
+
+    if not isinstance(actuator_terms, dict):
+        return zero, debug
+
+    try:
+        actual_percent = float(actual_percent)
+    except Exception:
+        return zero, debug
+
+    if not math.isfinite(actual_percent):
+        return zero, debug
+
+    debug["outcome_actual_percent"] = float(actual_percent)
+
+    logit = actuator_terms.get("network_drop_logit_for_outcome", None)
+    if logit is None:
+        logit = actuator_terms.get("learned_drop_logit", None)
+
+    hard_mask = actuator_terms.get("hard_drop_mask_for_outcome", None)
+    candidate_mask = actuator_terms.get("hard_delete_selection_mask_for_outcome", None)
+
+    if not torch.is_tensor(logit) or not torch.is_tensor(hard_mask):
+        return zero, debug
+
+    logit = logit.to(device=reference.device, dtype=reference.dtype)
+    hard_target = hard_mask.to(device=reference.device, dtype=reference.dtype).detach()
+
+    if hard_target.shape != logit.shape:
+        try:
+            hard_target = hard_target.reshape_as(logit)
+        except Exception:
+            return zero, debug
+
+    if torch.is_tensor(candidate_mask):
+        candidate = candidate_mask.to(device=reference.device, dtype=torch.bool)
+        if candidate.shape != logit.shape:
+            try:
+                candidate = candidate.reshape_as(logit)
+            except Exception:
+                candidate = torch.ones_like(logit, dtype=torch.bool)
+    else:
+        candidate = torch.ones_like(logit, dtype=torch.bool)
+
+    hard_bool = hard_target > 0.5
+    good_margin = max(float(getattr(args, "sparsepcgc_outcome_good_margin", 0.25)), 0.0)
+    bad_margin = max(float(getattr(args, "sparsepcgc_outcome_bad_margin", 0.25)), 0.0)
+    scale = max(float(getattr(args, "sparsepcgc_outcome_weight_scale", 5.0)), 1e-6)
+    max_weight = max(float(getattr(args, "sparsepcgc_outcome_max_weight", 2.0)), 0.0)
+
+    good_weight = 0.0
+    bad_weight = 0.0
+    if actual_percent < -good_margin:
+        good_weight = min((-actual_percent - good_margin) / scale, max_weight)
+    elif actual_percent > bad_margin:
+        bad_weight = min((actual_percent - bad_margin) / scale, max_weight)
+
+    debug["outcome_good_weight"] = float(good_weight)
+    debug["outcome_bad_weight"] = float(bad_weight)
+
+    total_loss = zero
+    where_loss = zero
+    amount_loss = zero
+    anticollapse_loss = zero
+
+    # ------------------------------------------------------------
+    # Where imitation / anti-imitation
+    # ------------------------------------------------------------
+    if good_weight > 0.0:
+        # 良い行動では、選ばれたmaskを正例にする。
+        # 非選択候補も弱い負例にするが、重みは小さくする。
+        weight = candidate.to(dtype=reference.dtype) * 0.05 + hard_bool.to(dtype=reference.dtype) * 0.95
+        if bool(weight.detach().sum().item() > 0):
+            raw = torch.nn.functional.binary_cross_entropy_with_logits(
+                logit.float(),
+                hard_target.float(),
+                reduction="none",
+            ).to(dtype=reference.dtype)
+            where_loss = (raw * weight).sum() / weight.sum().clamp_min(1.0)
+            total_loss = total_loss + (
+                float(getattr(args, "sparsepcgc_outcome_where_weight", 0.05))
+                * float(good_weight)
+                * where_loss
+            )
+
+    elif bad_weight > 0.0 and bool(hard_bool.detach().any().item()):
+        # 悪い行動では、実際に削った場所だけを負例にする。
+        # 全候補を負例にするとPrune全体が潰れるので禁止。
+        weight = hard_bool.to(dtype=reference.dtype)
+        raw = torch.nn.functional.binary_cross_entropy_with_logits(
+            logit.float(),
+            torch.zeros_like(logit, dtype=torch.float32),
+            reduction="none",
+        ).to(dtype=reference.dtype)
+        where_loss = (raw * weight).sum() / weight.sum().clamp_min(1.0)
+        total_loss = total_loss + (
+            float(getattr(args, "sparsepcgc_outcome_bad_where_weight", 0.02))
+            * float(bad_weight)
+            * where_loss
+        )
+
+    # ------------------------------------------------------------
+    # Amount imitation / anti-collapse
+    # ------------------------------------------------------------
+    raw_ratio = actuator_terms.get("raw_learned_drop_ratio_for_outcome", None)
+    if raw_ratio is None:
+        raw_ratio = actuator_terms.get("raw_learned_drop_ratio", None)
+
+    hard_ratio = actuator_terms.get("drop_ratio_hard_for_outcome", None)
+    if hard_ratio is None:
+        hard_ratio = actuator_terms.get("drop_ratio_hard", None)
+
+    if torch.is_tensor(raw_ratio):
+        raw_ratio_t = _sparsepcgc_scalar_tensor(raw_ratio, reference)
+        hard_ratio_t = _sparsepcgc_scalar_tensor(hard_ratio, reference).detach().clamp(0.0, 0.95)
+
+        success_teacher = _sparsepcgc_update_success_amount_memory(
+            args,
+            memory_key,
+            actual_percent,
+            float(hard_ratio_t.detach().cpu()),
+        )
+
+        if success_teacher is not None and math.isfinite(float(success_teacher)):
+            debug["outcome_success_amount_teacher"] = float(success_teacher)
+
+        if good_weight > 0.0:
+            # 改善したStepの実Prune量を教師にする。
+            amount_loss = (raw_ratio_t - hard_ratio_t).pow(2)
+            total_loss = total_loss + (
+                float(getattr(args, "sparsepcgc_outcome_amount_weight", 0.05))
+                * float(good_weight)
+                * amount_loss
+            )
+
+        elif bad_weight > 0.0:
+            # 悪化したStepでは軽くAmountを下げる。
+            # ただし強すぎると0へ逃げるため、weightは非常に小さくする。
+            bad_target = (hard_ratio_t.detach() * 0.5).clamp(0.0, 0.95)
+            amount_loss = (raw_ratio_t - bad_target).pow(2)
+            total_loss = total_loss + (
+                float(getattr(args, "sparsepcgc_outcome_bad_amount_weight", 0.005))
+                * float(bad_weight)
+                * amount_loss
+            )
+
+        if success_teacher is not None and math.isfinite(float(success_teacher)):
+            # 成功Amountより下がりすぎる場合だけ戻す。
+            # これにより、200Step以降にPrune量がどんどん0へ逃げる問題を抑える。
+            min_keep = min(
+                max(float(getattr(args, "sparsepcgc_success_amount_min_keep", 0.60)), 0.0),
+                1.0,
+            )
+            target_min = reference.new_tensor(float(success_teacher) * float(min_keep))
+            anticollapse_loss = torch.relu(target_min - raw_ratio_t).pow(2)
+            total_loss = total_loss + (
+                float(getattr(args, "sparsepcgc_success_amount_anticollapse_weight", 0.03))
+                * anticollapse_loss
+            )
+
+    debug["outcome_where_loss"] = float(where_loss.detach().float().cpu()) if torch.is_tensor(where_loss) else 0.0
+    debug["outcome_amount_loss"] = float(amount_loss.detach().float().cpu()) if torch.is_tensor(amount_loss) else 0.0
+    debug["outcome_amount_anticollapse_loss"] = (
+        float(anticollapse_loss.detach().float().cpu()) if torch.is_tensor(anticollapse_loss) else 0.0
+    )
+    debug["outcome_imitation_used"] = bool(
+        torch.is_tensor(total_loss)
+        and float(total_loss.detach().float().cpu()) != 0.0
+    )
+
+    return torch.nan_to_num(total_loss, nan=0.0, posinf=0.0, neginf=0.0), debug
+
 def _log_sparsepcgc_restore_debug(args, writer, out_label, prefix="VoxelRestoreDebug"):
     # Phase2: canonical voxel coordsから復元した点群候補のdebugだけを出す。
     # 学習に使うgen_xyzはここでは変更しない。
@@ -1248,6 +1713,86 @@ def _select_sparsepcgc_potential_subtree_key(
         return None, {"enabled": True, "reason": "no_scored_groups", "pool": len(pool_keys)}
 
     scored.sort(key=lambda item: item[0], reverse=True)
+    # ============================================================
+    # Multi-Subtree top-k selection
+    # ============================================================
+    # 既に計算したpotential scoreを使い、追加のactual評価なしで上位K個を選ぶ。
+    # これによりSubtree選択自体の時間はほぼ増やさない。
+    # ただし、選んだSubtreeを実際にForward/Lossする時間はKに応じて増える。
+    # ============================================================
+    if bool(getattr(args, "sparsepcgc_multi_subtree_train", False)):
+        multi_k = max(int(getattr(args, "sparsepcgc_multi_subtree_topk", 3)), 1)
+        max_total_points = max(
+            int(getattr(args, "sparsepcgc_multi_subtree_max_total_points", 8192)),
+            0,
+        )
+
+        selected_items = []
+        selected_total_points = 0
+
+        for score_value, key_value, detail_value in scored:
+            point_idx = group_by_key.get(int(key_value), None)
+            point_count = int(point_idx.numel()) if torch.is_tensor(point_idx) else 0
+
+            if point_count <= 0:
+                continue
+
+            # 計算時間増加を抑えるため、選択Subtreeの総点数を制限する。
+            # ただし1個も選ばれていない場合は、最大候補を必ず入れる。
+            if (
+                max_total_points > 0
+                and selected_items
+                and selected_total_points + point_count > max_total_points
+            ):
+                continue
+
+            selected_items.append((float(score_value), int(key_value), detail_value, int(point_count)))
+            selected_total_points += int(point_count)
+
+            if len(selected_items) >= multi_k:
+                break
+
+        if not selected_items:
+            score_value, key_value, detail_value = scored[0]
+            point_idx = group_by_key.get(int(key_value), None)
+            point_count = int(point_idx.numel()) if torch.is_tensor(point_idx) else 0
+            selected_items = [(float(score_value), int(key_value), detail_value, int(point_count))]
+            selected_total_points = int(point_count)
+
+        selected_keys = [int(item[1]) for item in selected_items]
+        selected = candidate_subtree_keys.new_tensor(
+            selected_keys,
+            dtype=candidate_subtree_keys.dtype,
+        )
+
+        first_detail = selected_items[0][2] if isinstance(selected_items[0][2], dict) else {}
+        meta = {
+            "enabled": True,
+            "reason": "selected_topk",
+            "multi_subtree": True,
+            "requested_topk": int(multi_k),
+            "selected_count": int(len(selected_items)),
+            "selected_keys": ",".join(str(k) for k in selected_keys),
+            "selected_total_points": int(selected_total_points),
+            "pool": len(pool_keys),
+            "scored": len(scored),
+            "rank": 0,
+            "score": float(selected_items[0][0]),
+            "best_score": float(scored[0][0]),
+            "key": int(selected_items[0][1]),
+            "random": False,
+            "drop_score": float(first_detail.get("drop_score", 0.0)) if isinstance(first_detail, dict) else 0.0,
+            "add_score": float(first_detail.get("add_score", 0.0)) if isinstance(first_detail, dict) else 0.0,
+            "macro_density_score": float(first_detail.get("macro_density_score", 0.0)) if isinstance(first_detail, dict) else 0.0,
+            "proxy_rate_score": float(first_detail.get("proxy_rate_score", 0.0)) if isinstance(first_detail, dict) else 0.0,
+            "proxy_bits": float(first_detail.get("proxy_bits", 0.0)) if isinstance(first_detail, dict) else 0.0,
+            "fast_diag_local_count": int(first_detail.get("fast_diag_local_count", 0) or 0) if isinstance(first_detail, dict) else 0,
+            "fast_diag_local_ratio": float(first_detail.get("fast_diag_local_ratio", 0.0) or 0.0) if isinstance(first_detail, dict) else 0.0,
+            "fast_diag_score": float(first_detail.get("fast_diag_score", 0.0) or 0.0) if isinstance(first_detail, dict) else 0.0,
+            "fast_diag_global_drop_count": int(fast_diag_global.get("global_drop_count", 0) or 0),
+            "fast_diag_global_drop_ratio": float(fast_diag_global.get("global_drop_ratio", 0.0) or 0.0),
+        }
+        return selected, meta
     random_mix = min(max(float(getattr(args, "sparsepcgc_subtree_potential_random_mix", 0.05)), 0.0), 1.0)
     seed_text = f"{cache_key or ''}|potential_pick|step={int(global_step)}|seed={int(getattr(args, 'seed', 0))}"
     seed_value = int(hashlib.sha1(seed_text.encode("utf-8")).hexdigest()[:16], 16)
@@ -2836,6 +3381,7 @@ def _attach_sparsepcgc_actual_oracle_drop(
     cache_key,
     global_step,
 ):
+    st2 = time.time()
     debug = {
         "enabled": False,
         "used": False,
@@ -3747,7 +4293,6 @@ def _attach_sparsepcgc_actual_oracle_drop(
             debug["parent_prune_eval_max"] = int(parent_prune_eval_limit)
             debug["pattern_plan_eval_max"] = int(pattern_plan_eval_limit)
             debug["subtree_move_eval_max"] = int(subtree_move_eval_limit)
-            st2 = time.time()
             def _sparsepcgc_rows_membership_mask_fast(query_n3, table_n3):
                 """
                 query_n3 の各行が table_n3 に含まれるかを返す。
@@ -7869,7 +8414,8 @@ def run_episode_full_cloud_validation(
                     break
                 file_path = dataset.files[idx]
                 pts = dataset[idx]
-                cache_key = f"{make_step_cache_key(file_path, args)}|episode_full_cloud_validation"
+                input_common_cache_key = make_step_cache_key(file_path, args)
+                cache_key = f"{input_common_cache_key}|episode_full_cloud_validation"
                 args._global_train_step = int(global_step)
                 args._current_sample_name = os.path.basename(str(file_path))
                 args._current_teacher_scope = "full_cloud"
@@ -7887,11 +8433,23 @@ def run_episode_full_cloud_validation(
                     input_attr = input_pcd[:, 3:, :].contiguous() if input_pcd.shape[1] > 3 else None
                     autocast_ctx = torch.cuda.amp.autocast(dtype=amp_dtype, enabled=use_amp) if use_cuda else nullcontext()
                     with torch.no_grad(), autocast_ctx:
-                        full_octree_context = _build_full_cloud_octree_context_for_train(
-                            input_xyz,
+                        full_octree_context = _episode_input_common_cache_fetch(
                             args,
-                            coord_scale=None,
+                            _episode_input_common_cache_key(input_common_cache_key, "full_cloud_canonical"),
+                            device=input_xyz.device,
+                            section="full_cloud_canonical",
                         )
+                        if full_octree_context is None:
+                            full_octree_context = _build_full_cloud_octree_context_for_train(
+                                input_xyz,
+                                args,
+                                coord_scale=None,
+                            )
+                            _episode_input_common_cache_store(
+                                args,
+                                _episode_input_common_cache_key(input_common_cache_key, "full_cloud_canonical"),
+                                full_octree_context,
+                            )
                         full_cloud_canonical_context = full_octree_context
                         gen_pts, _, _, _, final_w, _, _, _, out_label = model.forward(
                             input_xyz,
@@ -8113,6 +8671,12 @@ def train(model, args, loss, writer, plot, notifier=None):
     best_loss = float('inf') # 後続の計算・ログのため
     raw_seq_dirs = collect_seq_dirs2(args.input_dir, dataset_name=args.dataname) # 入力ディレクトリから学習対象のシーケンスディレクトリ一覧を集める
     seq_dirs = _limit_training_seq_dirs(raw_seq_dirs, args) # 8iだけ先頭3シーケンスに制限し、4つ目は使わない
+    if (
+        _episode_input_common_cache_enabled(args)
+        and bool(getattr(args, "episode_input_common_cache_enable_dataset_cache", True))
+        and not bool(getattr(args, "dataset_cache", False))
+    ):
+        args.dataset_cache = True
     num_seq = len(seq_dirs)
     writer.write(f"Total seq directories: {num_seq}")
     if len(seq_dirs) != len(raw_seq_dirs):
@@ -8125,6 +8689,21 @@ def train(model, args, loss, writer, plot, notifier=None):
     seq_datasets = [(seq_dir, PlyDirDataset(args, seq_dir)) for seq_dir in seq_dirs] # 各シーケンス内のPLY点群ファイルを読み込むデータセットを作る
     total_train_files = sum(len(dataset) for _, dataset in seq_datasets) # 全シーケンスに含まれる点群ファイル数を合計し、総Step数の見積もりなどに使用
     args._total_train_steps_estimate = max(int(getattr(args, "episodes", 1)), 1) * max(int(total_train_files), 1) # Episode数と点群ファイル数からそう学修Step数を概算
+    if _episode_input_common_cache_enabled(args):
+        setattr(args, "_episode_input_common_cache", OrderedDict())
+        setattr(args, "_episode_input_common_cache_bytes", 0)
+        setattr(args, "_episode_input_common_cache_stats", {})
+        auto_max_entries = max(int(total_train_files), 1)
+        setattr(args, "_episode_input_common_cache_auto_max_entries", auto_max_entries)
+        configured_max_entries = int(getattr(args, "episode_input_common_cache_max_entries", 0))
+        effective_max_entries = configured_max_entries if configured_max_entries > 0 else auto_max_entries
+        effective_max_memory_mb = int(getattr(args, "episode_input_common_cache_max_memory_mb", 0))
+        writer.write(
+            "EpisodeInputCommonCache: "
+            f"enabled=True, dataset_cache={bool(getattr(args, 'dataset_cache', False))}, "
+            f"max_entries={effective_max_entries}, "
+            f"max_memory_mb={effective_max_memory_mb}"
+        )
     # Phase7-4:
     # ablation modeは学習前に一度だけ適用する。
     # phase7_ablation_mode='none' の場合は何も上書きしない。
@@ -8311,11 +8890,23 @@ def train(model, args, loss, writer, plot, notifier=None):
                 # Subtree / full anchor / actual / proxy / debug は必ずこれを基準にする。
                 # ============================================================
                 full_cloud_canonical_start = time.time()
-                full_cloud_canonical_context = _build_full_cloud_octree_context_for_train(
-                    input_xyz[:, :3, :],
+                full_cloud_canonical_context = _episode_input_common_cache_fetch(
                     args,
-                    coord_scale=None,
+                    _episode_input_common_cache_key(cache_key, "full_cloud_canonical"),
+                    device=input_xyz.device,
+                    section="full_cloud_canonical",
                 )
+                if full_cloud_canonical_context is None:
+                    full_cloud_canonical_context = _build_full_cloud_octree_context_for_train(
+                        input_xyz[:, :3, :],
+                        args,
+                        coord_scale=None,
+                    )
+                    _episode_input_common_cache_store(
+                        args,
+                        _episode_input_common_cache_key(cache_key, "full_cloud_canonical"),
+                        full_cloud_canonical_context,
+                    )
                 step_timing_breakdown["full_cloud_canonical_build_time"] = float(time.time() - full_cloud_canonical_start)
 
                 try:
@@ -8399,13 +8990,31 @@ def train(model, args, loss, writer, plot, notifier=None):
 
                     min_subtree_points = max(int(getattr(args, "train_subtree_min_points", 1)), 1)
                     subtree_group_build_start = time.time()
-                    subtree_group_state = build_octree_subtree_groups_with_retry(
-                        input_xyz,
-                        args,
-                        requested_subtree_depth,
-                        min_subtree_points,
-                        allow_largest_fallback=True,
+                    subtree_group_cache_key = _episode_input_common_cache_key(
+                        cache_key,
+                        "subtree_groups",
+                        requested_depth=int(requested_subtree_depth),
+                        min_points=int(min_subtree_points),
                     )
+                    subtree_group_state = _episode_input_common_cache_fetch(
+                        args,
+                        subtree_group_cache_key,
+                        device=input_xyz.device,
+                        section="subtree_groups",
+                    )
+                    if subtree_group_state is None:
+                        subtree_group_state = build_octree_subtree_groups_with_retry(
+                            input_xyz,
+                            args,
+                            requested_subtree_depth,
+                            min_subtree_points,
+                            allow_largest_fallback=True,
+                        )
+                        _episode_input_common_cache_store(
+                            args,
+                            subtree_group_cache_key,
+                            subtree_group_state,
+                        )
                     step_timing_breakdown["subtree_group_build_time"] = float(time.time() - subtree_group_build_start)
                     # subtree_depth_meta = sample_train_subtree_depth( input_xyz, args, global_step=global_train_step, cache_key=cache_key) # Octree深度の決定
                     # subtree_depth_meta, requested_subtree_depth = maybe_raise_subtree_depth_for_large_input( subtree_depth_meta, raw_pts_num, args) # 大点群時は点を捨てずにSubtree深度だけ1段階浅くする
@@ -8482,8 +9091,25 @@ def train(model, args, loss, writer, plot, notifier=None):
                         if torch.is_tensor(potential_selected_keys) and int(potential_selected_keys.numel()) > 0:
                             selected_subtree_keys = potential_selected_keys
                         else:
-                            selected_subtree_keys = select_octree_subtree_keys(candidate_subtree_keys, global_train_step, args)
-                            selected_subtree_keys = select_single_subtree_key( candidate_subtree_keys, selected_subtree_keys, global_train_step, args, cache_key) # 1StepでForwardするSubtreeをランダムに1個へ絞る
+                            selected_subtree_keys = select_octree_subtree_keys(
+                                candidate_subtree_keys,
+                                global_train_step,
+                                args,
+                            )
+
+                            if bool(getattr(args, "sparsepcgc_multi_subtree_train", False)):
+                                # potential選択が使えない場合でも、single化せず上位K個だけ使う。
+                                # ここではselect_octree_subtree_keysの順序を尊重する。
+                                multi_k = max(int(getattr(args, "sparsepcgc_multi_subtree_topk", 3)), 1)
+                                selected_subtree_keys = selected_subtree_keys[:multi_k]
+                            else:
+                                selected_subtree_keys = select_single_subtree_key(
+                                    candidate_subtree_keys,
+                                    selected_subtree_keys,
+                                    global_train_step,
+                                    args,
+                                    cache_key,
+                                ) # 1StepでForwardするSubtreeをランダムに1個へ絞る
                     selected_subtree_count = int(selected_subtree_keys.numel()) # 実際に選択されたSubtree数を数える
                     subset_step = selected_subtree_for_grad and selected_subtree_count < eligible_subtree_count # 候補の一部だけを使ったStepか否かの判定
                     encoder_debug_chunks = [] if detail_log_this_step else None # 詳細ログ対象Stepなら、各Subtree Forward時のEncoder Debugを保存するリスト
@@ -8513,12 +9139,38 @@ def train(model, args, loss, writer, plot, notifier=None):
                     # ============================================================
                     if selected_subtree_for_grad:
                         t1 = time.time()
-                        subtree_trees, full_octree_contexts, group_meta = build_selected_group_octree_metadata(
-                            input_xyz,
-                            subtree_ref,
+                        selected_metadata_cache_key = _selected_metadata_input_common_cache_key(
+                            cache_key,
                             selected_groups,
-                            args=args,
+                            subtree_group_state.get("depth", requested_subtree_depth),
+                            args,
                         )
+                        selected_metadata_cache = _episode_input_common_cache_fetch(
+                            args,
+                            selected_metadata_cache_key,
+                            device=input_xyz.device,
+                            section="selected_metadata",
+                        )
+                        if isinstance(selected_metadata_cache, dict):
+                            subtree_trees = dict(selected_metadata_cache.get("subtree_trees", {}) or {})
+                            full_octree_contexts = dict(selected_metadata_cache.get("full_octree_contexts", {}) or {})
+                            group_meta = dict(selected_metadata_cache.get("group_meta", {}) or {})
+                        else:
+                            subtree_trees, full_octree_contexts, group_meta = build_selected_group_octree_metadata(
+                                input_xyz,
+                                subtree_ref,
+                                selected_groups,
+                                args=args,
+                            )
+                            _episode_input_common_cache_store(
+                                args,
+                                selected_metadata_cache_key,
+                                {
+                                    "subtree_trees": subtree_trees,
+                                    "full_octree_contexts": full_octree_contexts,
+                                    "group_meta": group_meta,
+                                },
+                            )
                         # ============================================================
                         # build_selected_group_octree_metadata() が内部で局所再量子化していても、
                         # ここで必ず full cloud canonical voxel coords に差し替える。
@@ -9059,6 +9711,11 @@ def train(model, args, loss, writer, plot, notifier=None):
                             )
                         if (not is_anchor_step) or full_cloud_anchor_shadow_train_active:
                             """Subtreeの場合"""
+                            subtree_edit_sums = new_point_edit_sums()
+                            subtree_noise_debug_values = []
+                            subtree_compression_term_sums = {}
+                            subtree_full_context_delta_debug_values = []
+                            subtree_outcome_imitation_debug_values = []
                             if full_cloud_anchor_shadow_train_active and not compact_step_text_log:
                                 writer.write("Running shadow subtree step for FullCloud anchor gradient.") # FullCloud anchor用の軽量grad経路
                             elif not compact_step_text_log:
@@ -9067,7 +9724,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                             subtree_edit_sums = new_point_edit_sums() # 複数Subtreeの点編集統計を累積するための変数を初期化
                             subtree_noise_debug_values = [] # 各Subtreeで圧縮用ノイズを加えたかなどを統合
                             subtree_compression_term_sums = {} # Subtreeごとの圧縮損失内訳を累積する辞書
-                            subtree_full_context_delta_debug_values = [] # 各Subtreeのfull-context delta debugを統合するためのリスト
+                            subtree_outcome_imitation_debug_values = [] # 各SubtreeのOutcome imitation debugを統合する
 
                             for subtree_key, point_idx in selected_groups: # 選択されたSubtreeを1つずつ取り出し、それぞれ日いて点群を切り出し、Forward、形状損失、圧縮損失を計算
                                 args._current_teacher_scope = "subtree_local" # Subtree stepではteacherが局所点群基準であることをLoss側へ渡す
@@ -9300,10 +9957,46 @@ def train(model, args, loss, writer, plot, notifier=None):
                                             octree_input_mode=octree_input_mode,
                                         )
 
-                                        # loss 側の debug にも、Subtree actual 入力の情報を混ぜる。
-                                        # これを入れないと、後段の Phase7 summary で used=True が見えにくい。
                                         subtree_comp_debug = dict(getattr(loss, "last_compression_debug", {}) or {})
                                         subtree_comp_debug.update(voxel_restored_actual_debug)
+
+                                        # ============================================================
+                                        # Outcome Weighted Imitation
+                                        # ============================================================
+                                        # 圧縮損失が下がった実行済みhard actionをNetworkへ覚えさせる。
+                                        # 圧縮損失が悪化した場合は、その削除maskだけを避けるように学習する。
+                                        # ここで使うactual_percentはloss計算後にしか分からないため、
+                                        # Actuator内ではなくtrain.py側で追加lossを作る。
+                                        # ============================================================
+                                        outcome_actual_percent = _sparsepcgc_outcome_actual_percent(subtree_comp_debug)
+
+                                        base_model_for_outcome = _unwrap_train_model(model)
+                                        outcome_terms = dict(
+                                            getattr(base_model_for_outcome, "last_actuator_soft_terms", {}) or {}
+                                        )
+
+                                        outcome_memory_key = _sparsepcgc_success_amount_memory_key(
+                                            cache_key,
+                                            subtree_key_int,
+                                        )
+
+                                        L_outcome_imitation_sub, outcome_imitation_debug_sub = (
+                                            _build_sparsepcgc_outcome_weighted_imitation_loss(
+                                                args,
+                                                actual_percent=outcome_actual_percent,
+                                                actuator_terms=outcome_terms,
+                                                reference=subtree_xyz,
+                                                memory_key=outcome_memory_key,
+                                            )
+                                        )
+
+                                        # Actuatorの行動選択に対する補助lossとして加える。
+                                        L_actuator_sub = L_actuator_sub + L_outcome_imitation_sub
+
+                                        if isinstance(outcome_imitation_debug_sub, dict):
+                                            subtree_outcome_imitation_debug_values.append(outcome_imitation_debug_sub)
+                                            subtree_comp_debug.update(outcome_imitation_debug_sub)
+
                                         loss.last_compression_debug = subtree_comp_debug
 
                                         L_full_context_subtree_delta_sub, full_context_subtree_delta_debug_sub = build_full_context_subtree_delta_loss(
@@ -9353,7 +10046,39 @@ def train(model, args, loss, writer, plot, notifier=None):
                             if subtree_compression_term_sums:
                                 loss.last_compression_terms = subtree_compression_term_sums
                             last_subtree_actual_debug_for_correction = dict(getattr(loss, "last_compression_debug", {}) or {})
-                            if subtree_full_context_delta_debug_values:
+                            # ============================================================
+                            # Outcome imitation debug merge
+                            # ============================================================
+                            if subtree_outcome_imitation_debug_values:
+                                merged_outcome_debug = {}
+                                numeric_keys = set()
+                                for item in subtree_outcome_imitation_debug_values:
+                                    if isinstance(item, dict):
+                                        for key, value in item.items():
+                                            if isinstance(value, (int, float)):
+                                                numeric_keys.add(key)
+
+                                for key in sorted(numeric_keys):
+                                    vals = []
+                                    for item in subtree_outcome_imitation_debug_values:
+                                        try:
+                                            val = float(item.get(key, float("nan")))
+                                        except Exception:
+                                            continue
+                                        if math.isfinite(val):
+                                            vals.append(val)
+                                    if vals:
+                                        merged_outcome_debug[key] = float(sum(vals) / max(len(vals), 1))
+
+                                merged_outcome_debug["outcome_imitation_subtree_count"] = int(
+                                    len(subtree_outcome_imitation_debug_values)
+                                )
+
+                                try:
+                                    last_subtree_actual_debug_for_correction.update(merged_outcome_debug)
+                                    loss.last_compression_debug.update(merged_outcome_debug)
+                                except Exception:
+                                    pass
                                 merged_full_context_debug = {}
                                 all_keys = set()
                                 for item in subtree_full_context_delta_debug_values:
@@ -9387,8 +10112,8 @@ def train(model, args, loss, writer, plot, notifier=None):
                                         merged_full_context_debug[key] = "|".join(sorted(set(text_values)))
 
                                 full_context_subtree_delta_debug = merged_full_context_debug
-                            if isinstance(full_context_subtree_delta_debug, dict):
-                                last_full_context_debug_for_correction = dict(full_context_subtree_delta_debug)
+                                if isinstance(full_context_subtree_delta_debug, dict):
+                                    last_full_context_debug_for_correction = dict(full_context_subtree_delta_debug)
                             if full_cloud_anchor_shadow_train_active and full_cloud_anchor_debug_snapshot:
                                 base_model_for_shadow_correction = model.module if hasattr(model, "module") else model
                                 (
@@ -9415,6 +10140,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                                     bool(getattr(args, "sparsepcgc_full_cloud_actual_primary", True))
                                     and not bool(getattr(args, "direct_network_prune", False))
                                 ):
+                                    merged_full_context_debug = {}
                                     full_cloud_primary_value = finite_float_or_none(
                                         full_cloud_anchor_debug_snapshot.get(
                                             "actual_total_bit_percent",
@@ -11818,6 +12544,17 @@ def train(model, args, loss, writer, plot, notifier=None):
         plot.plot_occupancy_curve("epi")
         plot.plot_voxel_collision_curve("epi")
         writer.write(f"Saved episode plots/csv: {plot.save_dir}")
+        if _episode_input_common_cache_enabled(args):
+            cache_summary = _episode_input_common_cache_summary(args)
+            writer.write(
+                "EpisodeInputCommonCacheSummary: "
+                f"episode={episode + 1}, "
+                f"entries={int(cache_summary['entries'])}, "
+                f"memory={format_bytes(int(cache_summary['bytes']))}, "
+                f"hits={int(cache_summary['hits'])}, "
+                f"misses={int(cache_summary['misses'])}, "
+                f"sections={'; '.join(cache_summary['sections']) if cache_summary['sections'] else 'none'}"
+            )
         writer.flush()
         checkpoint_metrics = finalize_checkpoint_metrics( args, current_stage, episode, plot, episode_checkpoint_sums, checkpoint_gate_refs)
         full_cloud_val = run_episode_full_cloud_validation(

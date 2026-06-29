@@ -2993,19 +2993,41 @@ class StructureRepairActuator(nn.Module):
         learned_drop_ratio_before_gate = learned_drop_ratio_after_floor
         learned_drop_ratio_after_gate = learned_drop_ratio_before_gate * drop_operation_gate
         # ============================================================
-        # Hybrid Amount:
-        # warmup中はcodec_prune_prior_phase、
-        # warmup後はcodec_prune_prior_hybrid_alphaで弱くprior ratioを残す。
+        # Network自由Amountモード
         # ============================================================
-        codec_prune_prior_count_alpha = (
-            codec_prune_prior_hybrid_alpha
-            if bool(getattr(self.args, "sparsepcgc_hybrid_prior_amount_blend", True))
-            else codec_prune_prior_phase
-        )
+        # warmup中:
+        #   codec priorのPrune量を使って探索・教師行動を作る。
+        #
+        # warmup終了後:
+        #   codec_prior_ratio × alpha で 1.75% 等に固定しない。
+        #   hard countに使うPrune量はNetworkのAmount出力を基本にする。
+        #
+        # ただしWhere / hard action hybrid / prior distillationは残す。
+        # ============================================================
+        amount_mode = str(
+            getattr(self.args, "sparsepcgc_hybrid_amount_mode", "network")
+        ).strip().lower()
+        if amount_mode not in {"network", "blend", "max"}:
+            amount_mode = "network"
+
+        if amount_mode == "network":
+            # warmup中だけprior量を使う。
+            # Phase0以降はprior量をhard countへ混ぜない。
+            codec_prune_prior_count_alpha = float(codec_prune_prior_phase)
+        else:
+            codec_prune_prior_count_alpha = (
+                codec_prune_prior_hybrid_alpha
+                if bool(getattr(self.args, "sparsepcgc_hybrid_prior_amount_blend", True))
+                else codec_prune_prior_phase
+            )
+
         codec_prune_prior_active_ratio = min(
             codec_prune_prior_ratio * float(codec_prune_prior_count_alpha),
             float(max_drop_ratio),
         )
+
+        # Phase0以降は learned_drop_ratio_before_gate を使い、
+        # operation gateでAmountがさらに潰れる経路を避ける。
         effective_drop_ratio_for_hard_count = (
             learned_drop_ratio_before_gate if phase0_network_prune_mode else learned_drop_ratio_after_gate
         )
@@ -3019,10 +3041,12 @@ class StructureRepairActuator(nn.Module):
             and prune_enabled
             and codec_prune_prior_active_ratio > 0.0
             and codec_prune_prior_hybrid_alpha > 0.0
+            and amount_mode != "network"
+            and float(getattr(self.args, "sparsepcgc_codec_prior_amount_distill_weight", 0.0)) > 0.0
             and not self._direct_network_prune_mode()
         ):
-            # Network自身のraw Amountがcodec prior ratioへ近づくように弱く蒸留する。
-            # ここではforwardを直接変えず、drop_amount_headへ教師信号を返す目的で使う。
+            # Amountをprior比率へ固定したいablation用。
+            # 通常のNetwork自由Amountでは使わない。
             codec_prior_amount_target = raw_learned_drop_ratio.detach().new_tensor(
                 float(codec_prune_prior_ratio)
             )
@@ -3030,16 +3054,14 @@ class StructureRepairActuator(nn.Module):
                 raw_learned_drop_ratio - codec_prior_amount_target
             ).pow(2).mean() * float(codec_prune_prior_hybrid_alpha)
 
-        if codec_prune_prior_active_ratio > 0.0 and not self._direct_network_prune_mode():
+        if (
+            codec_prune_prior_active_ratio > 0.0
+            and amount_mode != "network"
+            and not self._direct_network_prune_mode()
+        ):
             codec_prior_tensor = learned_drop_ratio.new_tensor(float(codec_prune_prior_active_ratio))
 
-            if str(getattr(self.args, "sparsepcgc_hybrid_amount_mode", "blend")).strip().lower() == "blend":
-                # ============================================================
-                # Amount blend
-                # ============================================================
-                # 旧: max(Network, prior) なので5%に張り付きやすい。
-                # 新: alpha * prior + (1-alpha) * Network で滑らかに移行する。
-                # ============================================================
+            if amount_mode == "blend":
                 min_network_keep = min(
                     max(float(getattr(self.args, "sparsepcgc_hybrid_amount_min_network_keep", 0.15)), 0.0),
                     1.0,
@@ -6873,6 +6895,11 @@ class StructureRepairActuator(nn.Module):
         return pts_out, final_w, loss, {
             # Adjust Soft状態
             "learned_drop_ratio_requires_grad": pts_xyz.new_tensor(float(learned_drop_ratio.requires_grad)),
+            "network_drop_logit_for_outcome": network_drop_logit_for_distill,
+            "hard_drop_mask_for_outcome": hard_drop_mask.detach(),
+            "hard_delete_selection_mask_for_outcome": hard_delete_selection_mask.detach(),
+            "drop_ratio_hard_for_outcome": drop_ratio_hard.detach(),
+            "raw_learned_drop_ratio_for_outcome": raw_learned_drop_ratio,
             "codec_prune_prior_hard_action_alpha": pts_xyz.new_tensor(
                 float(codec_prune_prior_hard_action_alpha)
             ).detach(),
