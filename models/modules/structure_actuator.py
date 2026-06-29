@@ -2793,6 +2793,47 @@ class StructureRepairActuator(nn.Module):
             max(float(codec_prune_prior_hybrid_alpha), 0.0),
             1.0,
         )
+        # ============================================================
+        # Hybrid Hard Action Alpha
+        # ============================================================
+        # codec_prune_prior_hybrid_alpha は主に score/logit bias 用である。
+        # しかし今回の問題は「hard actionがPhase0後にNetwork top-kへ急に切り替わる」
+        # ことなので、hard action自体にも別のtail alphaを持たせる。
+        # ============================================================
+        codec_prune_prior_hard_action_alpha = 0.0
+
+        if (
+            codec_prune_prior_enabled
+            and self.training
+            and not self._direct_network_prune_mode()
+            and bool(getattr(self.args, "sparsepcgc_hybrid_hard_action", True))
+        ):
+            if codec_prune_prior_phase > 0.0:
+                codec_prune_prior_hard_action_alpha = 1.0
+            else:
+                hard_tail_steps = max(
+                    int(getattr(self.args, "sparsepcgc_hybrid_hard_action_tail_steps", 2000)),
+                    0,
+                )
+                hard_tail_start_alpha = min(
+                    max(float(getattr(self.args, "sparsepcgc_hybrid_hard_action_tail_alpha", 0.85)), 0.0),
+                    1.0,
+                )
+
+                if hard_tail_steps > 0 and hard_tail_start_alpha > 0.0:
+                    hard_tail_step = max(current_train_step - codec_prune_prior_warmup_steps, 0)
+                    hard_tail_phase = max(
+                        1.0 - float(hard_tail_step) / float(hard_tail_steps),
+                        0.0,
+                    )
+                    codec_prune_prior_hard_action_alpha = float(
+                        hard_tail_start_alpha * hard_tail_phase
+                    )
+
+        codec_prune_prior_hard_action_alpha = min(
+            max(float(codec_prune_prior_hard_action_alpha), 0.0),
+            1.0,
+        )
         codec_prune_prior_score = torch.zeros(
             (B, 1, N),
             device=pts_xyz.device,
@@ -2819,7 +2860,20 @@ class StructureRepairActuator(nn.Module):
                 + drop_operation_gate
                 - drop_operation_gate.detach()
             )
-        prune_gate_monotonic_floor = getattr(self.args, "_sparsepcgc_last_drop_gate_floor", None)
+        # ============================================================
+        # Prune gate monotonic floor
+        # ============================================================
+        # 旧設計では前Stepのdrop_operation_gateをfloorとして残していた。
+        # しかしHybrid訓練では、過去Stepのgateが現在Stepの操作選択を固定し、
+        # NetworkがAmount/Whereを学習する余地を狭める。
+        # そのため既定では無効化する。
+        # ============================================================
+        prune_gate_monotonic_floor = (
+            getattr(self.args, "_sparsepcgc_last_drop_gate_floor", None)
+            if bool(getattr(self.args, "sparsepcgc_prune_gate_monotonic_floor", False))
+            else None
+        )        
+
         if self.training and prune_enabled and prune_gate_monotonic_floor is not None:
             try:
                 prune_gate_monotonic_floor = float(prune_gate_monotonic_floor)
@@ -2884,7 +2938,19 @@ class StructureRepairActuator(nn.Module):
             max(float(getattr(self.args, "repair_drop_ratio_floor", 0.0)), 0.0),
             float(max_drop_ratio),
         )
-        prune_ratio_monotonic_floor = getattr(self.args, "_sparsepcgc_last_prune_ratio_floor", None)
+        # ============================================================
+        # Prune ratio monotonic floor
+        # ============================================================
+        # 旧設計では前StepのPrune ratioをfloorとして使っていた。
+        # これにより一度5%付近になると、Networkが2%や1%を出しても
+        # hard実行量が5%付近に張り付きやすい。
+        # Hybrid訓練ではAmount学習を確認するため、既定では無効化する。
+        # ============================================================
+        prune_ratio_monotonic_floor = (
+            getattr(self.args, "_sparsepcgc_last_prune_ratio_floor", None)
+            if bool(getattr(self.args, "sparsepcgc_prune_monotonic_floor", False))
+            else None
+        )
         if self.training and prune_enabled and prune_ratio_monotonic_floor is not None:
             try:
                 prune_ratio_monotonic_floor = float(prune_ratio_monotonic_floor)
@@ -2943,17 +3009,74 @@ class StructureRepairActuator(nn.Module):
         effective_drop_ratio_for_hard_count = (
             learned_drop_ratio_before_gate if phase0_network_prune_mode else learned_drop_ratio_after_gate
         )
+
+        codec_prior_amount_blend_applied = False
+        codec_prior_amount_blend_alpha_value = 0.0
+        codec_prior_amount_distill_loss = pts_xyz.new_zeros(())
+
+        if (
+            self.training
+            and prune_enabled
+            and codec_prune_prior_active_ratio > 0.0
+            and codec_prune_prior_hybrid_alpha > 0.0
+            and not self._direct_network_prune_mode()
+        ):
+            # Network自身のraw Amountがcodec prior ratioへ近づくように弱く蒸留する。
+            # ここではforwardを直接変えず、drop_amount_headへ教師信号を返す目的で使う。
+            codec_prior_amount_target = raw_learned_drop_ratio.detach().new_tensor(
+                float(codec_prune_prior_ratio)
+            )
+            codec_prior_amount_distill_loss = (
+                raw_learned_drop_ratio - codec_prior_amount_target
+            ).pow(2).mean() * float(codec_prune_prior_hybrid_alpha)
+
         if codec_prune_prior_active_ratio > 0.0 and not self._direct_network_prune_mode():
-            codec_prior_tensor = learned_drop_ratio.new_tensor(codec_prune_prior_active_ratio)
-            effective_drop_ratio_forward = torch.maximum(effective_drop_ratio_for_hard_count, codec_prior_tensor)
+            codec_prior_tensor = learned_drop_ratio.new_tensor(float(codec_prune_prior_active_ratio))
+
+            if str(getattr(self.args, "sparsepcgc_hybrid_amount_mode", "blend")).strip().lower() == "blend":
+                # ============================================================
+                # Amount blend
+                # ============================================================
+                # 旧: max(Network, prior) なので5%に張り付きやすい。
+                # 新: alpha * prior + (1-alpha) * Network で滑らかに移行する。
+                # ============================================================
+                min_network_keep = min(
+                    max(float(getattr(self.args, "sparsepcgc_hybrid_amount_min_network_keep", 0.15)), 0.0),
+                    1.0,
+                )
+                amount_alpha = min(
+                    max(float(codec_prune_prior_count_alpha), 0.0),
+                    1.0 - float(min_network_keep),
+                )
+                codec_prior_amount_blend_alpha_value = float(amount_alpha)
+
+                alpha_tensor = learned_drop_ratio.new_tensor(float(amount_alpha))
+                effective_drop_ratio_forward = (
+                    alpha_tensor * codec_prior_tensor
+                    + (1.0 - alpha_tensor) * effective_drop_ratio_for_hard_count
+                )
+                codec_prior_amount_blend_applied = True
+            else:
+                # 旧互換: maxで下支えする。
+                effective_drop_ratio_forward = torch.maximum(
+                    effective_drop_ratio_for_hard_count,
+                    codec_prior_tensor,
+                )
+
             effective_drop_ratio_for_hard_count = (
                 effective_drop_ratio_forward.detach()
                 + effective_drop_ratio_for_hard_count
                 - effective_drop_ratio_for_hard_count.detach()
             )
+
+        # network floorは最後の保険だけにする。
+        # HybridではPrune量固定を避けたいので、必要ならCLIで小さくする。
         if network_prune_floor_ratio > 0.0:
             network_floor_tensor = learned_drop_ratio.new_tensor(float(network_prune_floor_ratio))
-            effective_drop_ratio_forward = torch.maximum(effective_drop_ratio_for_hard_count, network_floor_tensor)
+            effective_drop_ratio_forward = torch.maximum(
+                effective_drop_ratio_for_hard_count,
+                network_floor_tensor,
+            )
             effective_drop_ratio_for_hard_count = (
                 effective_drop_ratio_forward.detach()
                 + effective_drop_ratio_for_hard_count
@@ -2991,7 +3114,11 @@ class StructureRepairActuator(nn.Module):
         learned_drop_ratio_value = (
             float(effective_drop_ratio_for_hard_count.detach().mean().cpu()) if prune_enabled else 0.0
         )
-        if self.training and prune_enabled:
+        if (
+            self.training
+            and prune_enabled
+            and bool(getattr(self.args, "sparsepcgc_prune_monotonic_floor", False))
+        ):
             try:
                 setattr(
                     self.args,
@@ -3000,14 +3127,21 @@ class StructureRepairActuator(nn.Module):
                 )
             except Exception:
                 pass
-            try:
-                setattr(
-                    self.args,
-                    "_sparsepcgc_last_drop_gate_floor",
-                    float(drop_operation_gate.detach().mean().cpu()),
-                )
             except Exception:
                 pass
+            if (
+                self.training
+                and prune_enabled
+                and bool(getattr(self.args, "sparsepcgc_prune_gate_monotonic_floor", False))
+            ):
+                try:
+                    setattr(
+                        self.args,
+                        "_sparsepcgc_last_drop_gate_floor",
+                        float(drop_operation_gate.detach().mean().cpu()),
+                    )
+                except Exception:
+                    pass
         network_prune_min_hard_count = (
             int(getattr(self.args, "sparsepcgc_network_prune_min_hard_count", 0))
             if phase0_network_prune_mode
@@ -3048,7 +3182,15 @@ class StructureRepairActuator(nn.Module):
             learned_drop_logit,
             op_name="drop",
         )
-
+        # ============================================================
+        # Codec prior distillation用のNetwork素のlogit
+        # ============================================================
+        # learned_drop_logit に codec prior bias を足す前の値を保存する。
+        # この値を codec_prune_prior_score に近づけることで、
+        # priorが消えてもNetwork単独で近いWhere選択を再現できるようにする。
+        # ============================================================
+        network_drop_logit_for_distill = learned_drop_logit
+        codec_prior_where_distill_loss = pts_xyz.new_zeros(())
         codec_prune_prior_logit_weight = max(
             float(getattr(self.args, "sparsepcgc_codec_prune_prior_logit_weight", 6.0)),
             0.0,
@@ -3058,8 +3200,35 @@ class StructureRepairActuator(nn.Module):
                 2.0 * codec_prune_prior_score - 1.0
             ) * codec_prune_prior_logit_weight * float(codec_prune_prior_hybrid_alpha)
 
-            # priorは教師・biasとして使うためdetachする。
-            # どこを削るかの最終調整はNetworkのdrop_headが学習する。
+            # ========================================================
+            # Where distillation
+            # ========================================================
+            # forwardではpriorをlogit biasとして混ぜる。
+            # backwardでは、Network素のdrop logitがprior scoreを再現するようにBCEを入れる。
+            # ========================================================
+            if self.training and prune_enabled:
+                distill_target = codec_prune_prior_score.detach().clamp(0.02, 0.98)
+                distill_mask = selection_bool.unsqueeze(1).to(
+                    device=pts_xyz.device,
+                    dtype=pts_xyz.dtype,
+                )
+
+                where_bce = torch.nn.functional.binary_cross_entropy_with_logits(
+                    network_drop_logit_for_distill,
+                    distill_target,
+                    reduction="none",
+                )
+
+                codec_prior_where_distill_loss = (
+                    where_bce * distill_mask
+                ).sum() / distill_mask.sum().clamp_min(1.0)
+
+                codec_prior_where_distill_loss = (
+                    codec_prior_where_distill_loss
+                    * float(codec_prune_prior_hybrid_alpha)
+                )
+
+            # priorはforward biasとして使うが、prior側には勾配を返さない。
             learned_drop_logit = learned_drop_logit + codec_prior_logit.detach()
 
         if self.training and drop_score_noise > 0.0:
@@ -3395,6 +3564,55 @@ class StructureRepairActuator(nn.Module):
                 selection_mask=hard_delete_selection_mask,
                 max_hard_count=int(getattr(self.args, "repair_max_hard_drop_voxels", 0)),
             )
+        elif (
+            self.training
+            and prune_enabled
+            and not direct_network_prune_mode
+            and bool(getattr(self.args, "sparsepcgc_hybrid_hard_action", True))
+            and codec_prune_prior_hard_action_alpha > 0.0
+        ):
+            # ============================================================
+            # Hybrid hard action
+            # ============================================================
+            # Phase0以降も、いきなりNetwork top-kへ完全移行しない。
+            # 一定割合で、warmup中に良かったcodec block hard actionを継続する。
+            # ただし、Where蒸留lossによりNetworkもprior行動を学習する。
+            # ============================================================
+            hard_action_period = max(
+                int(getattr(self.args, "sparsepcgc_hybrid_hard_action_period", 20)),
+                1,
+            )
+            hard_action_slot = int(current_train_step % hard_action_period)
+            hard_action_threshold = int(
+                round(float(codec_prune_prior_hard_action_alpha) * float(hard_action_period))
+            )
+            use_codec_block_action = hard_action_slot < hard_action_threshold
+
+            if use_codec_block_action:
+                hard_drop_block_reason = "hybrid_codec_block_hard_drop"
+                hard_drop_mask = self._hard_codec_block_drop_mask(
+                    voxel_coords,
+                    drop_prob,
+                    block_size=codec_prune_prior_block_size,
+                    target_drop_ratio=learned_drop_ratio_value,
+                    selection_mask=hard_delete_selection_mask,
+                    max_hard_count=int(getattr(self.args, "repair_max_hard_drop_voxels", 0)),
+                )
+            else:
+                hard_drop_block_reason = "hybrid_network_voxel_hard_drop"
+                hard_drop_mask = self._hard_voxel_drop_mask(
+                    voxel_coords,
+                    drop_prob,
+                    target_drop_ratio=learned_drop_ratio_value,
+                    max_drop_ratio=learned_drop_ratio_value,
+                    selection_mask=hard_delete_selection_mask,
+                    hard_threshold=float(getattr(self.args, "repair_drop_hard_threshold", 0.5)),
+                    voxel_cache=voxel_cache,
+                    force_min_count=bool(getattr(self.args, "repair_force_min_drop_voxels", False)),
+                    max_hard_count=int(getattr(self.args, "repair_max_hard_drop_voxels", 0)),
+                    min_hard_count=network_prune_min_hard_count,
+                    allow_single_candidate=False,
+                )
         else:
             hard_drop_block_reason = "network_learned_hard_drop"
             hard_drop_mask = self._hard_voxel_drop_mask(
@@ -5735,7 +5953,8 @@ class StructureRepairActuator(nn.Module):
         actual_oracle_direction_supervision_loss = _finite_actuator_loss(
             actual_oracle_direction_supervision_loss
         )
-
+        codec_prior_where_distill_loss = _finite_actuator_loss(codec_prior_where_distill_loss)
+        codec_prior_amount_distill_loss = _finite_actuator_loss(codec_prior_amount_distill_loss)
         drop_amount_supervision_loss = _finite_actuator_loss(drop_amount_supervision_loss)
         drop_amount_soft_consistency_loss = _finite_actuator_loss(drop_amount_soft_consistency_loss)
         move_amount_supervision_loss = _finite_actuator_loss(move_amount_supervision_loss)
@@ -5780,6 +5999,8 @@ class StructureRepairActuator(nn.Module):
             + float(getattr(self.args, "repair_move_direction_ce_weight", 1e-3)) * move_direction_ce
             + float(getattr(self.args, "repair_add_direction_ce_weight", 1e-3)) * add_direction_ce
             + float(getattr(self.args, "repair_drop_where_actuator_weight", 0.1)) * drop_where_actuator_loss
+            + float(getattr(self.args, "sparsepcgc_codec_prior_distill_weight", 0.05)) * codec_prior_where_distill_loss
+            + float(getattr(self.args, "sparsepcgc_codec_prior_amount_distill_weight", 0.02)) * codec_prior_amount_distill_loss
             + float(getattr(self.args, "repair_add_where_actuator_weight", 0.1)) * add_where_actuator_loss
             + float(getattr(self.args, "repair_move_where_actuator_weight", 0.1)) * move_where_actuator_loss
             + float(getattr(self.args, "repair_operation_gate_oracle_weight", 0.1)) * operation_gate_oracle_loss
@@ -6388,6 +6609,17 @@ class StructureRepairActuator(nn.Module):
             "codec_prune_prior_count_alpha": pts_xyz.new_tensor(
                 float(codec_prune_prior_count_alpha)
             ).detach(),
+            "codec_prune_prior_hard_action_alpha": pts_xyz.new_tensor(
+                float(codec_prune_prior_hard_action_alpha)
+            ).detach(),
+            "codec_prior_amount_blend_applied": pts_xyz.new_tensor(
+                float(codec_prior_amount_blend_applied)
+            ).detach(),
+            "codec_prior_amount_blend_alpha": pts_xyz.new_tensor(
+                float(codec_prior_amount_blend_alpha_value)
+            ).detach(),
+            "codec_prior_where_distill_loss": codec_prior_where_distill_loss.detach(),
+            "codec_prior_amount_distill_loss": codec_prior_amount_distill_loss.detach(),
             "codec_prune_prior_block_size": pts_xyz.new_tensor(
                 float(codec_prune_prior_block_size)
             ).detach(),
@@ -6641,6 +6873,17 @@ class StructureRepairActuator(nn.Module):
         return pts_out, final_w, loss, {
             # Adjust Soft状態
             "learned_drop_ratio_requires_grad": pts_xyz.new_tensor(float(learned_drop_ratio.requires_grad)),
+            "codec_prune_prior_hard_action_alpha": pts_xyz.new_tensor(
+                float(codec_prune_prior_hard_action_alpha)
+            ).detach(),
+            "codec_prior_amount_blend_applied": pts_xyz.new_tensor(
+                float(codec_prior_amount_blend_applied)
+            ).detach(),
+            "codec_prior_amount_blend_alpha": pts_xyz.new_tensor(
+                float(codec_prior_amount_blend_alpha_value)
+            ).detach(),
+            "codec_prior_where_distill_loss": codec_prior_where_distill_loss.detach(),
+            "codec_prior_amount_distill_loss": codec_prior_amount_distill_loss.detach(),
             "learned_add_ratio_requires_grad": pts_xyz.new_tensor(float(learned_add_ratio.requires_grad)),
             "learned_move_ratio_requires_grad": pts_xyz.new_tensor(float(learned_move_ratio.requires_grad)),
             "operation_amount_logit_loss": operation_amount_logit_loss.detach(),

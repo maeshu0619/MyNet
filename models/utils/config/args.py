@@ -905,7 +905,76 @@ def parse_pugan_args(parser, file_day, file_time):
         type=str2bool,
         help='Trueならwarmup後もPrune量計算にcodec prior ratioを弱く混ぜる',
     )
+    # ============================================================
+    # SparsePCGC Hybrid 強化設定
+    # ============================================================
+    # 目的:
+    #   200Step以降に codec prior から Network へ一気に切り替わる問題を避ける。
+    #   priorを「実行」「Where蒸留」「Amount蒸留」の3経路で残し、
+    #   徐々にNetworkへ移行する。
+    # ============================================================
 
+    parser.add_argument(
+        '--sparsepcgc_prune_monotonic_floor',
+        default=False,
+        type=str2bool,
+        help='Trueなら前StepのPrune ratioをfloorとして使う。Hybrid訓練ではFalse推奨',
+    )
+    parser.add_argument(
+        '--sparsepcgc_prune_gate_monotonic_floor',
+        default=False,
+        type=str2bool,
+        help='Trueなら前StepのPrune operation gateをfloorとして使う。Hybrid訓練ではFalse推奨',
+    )
+    parser.add_argument(
+        '--sparsepcgc_hybrid_amount_mode',
+        default='blend',
+        choices=['max', 'blend'],
+        type=str,
+        help='codec prior ratioとNetwork Amountの混ぜ方。maxは旧挙動、blendは滑らかに混ぜる',
+    )
+    parser.add_argument(
+        '--sparsepcgc_hybrid_amount_min_network_keep',
+        default=0.15,
+        type=float,
+        help='Amount blend時に最低限残すNetwork比率。0.15ならpriorが強くてもNetworkを15%残す',
+    )
+    parser.add_argument(
+        '--sparsepcgc_hybrid_hard_action',
+        default=True,
+        type=str2bool,
+        help='Trueならwarmup後もcodec block hard actionとNetwork hard actionを混ぜる',
+    )
+    parser.add_argument(
+        '--sparsepcgc_hybrid_hard_action_tail_alpha',
+        default=0.85,
+        type=float,
+        help='warmup終了直後にcodec block hard actionを残す割合',
+    )
+    parser.add_argument(
+        '--sparsepcgc_hybrid_hard_action_tail_steps',
+        default=2000,
+        type=int,
+        help='warmup終了後にcodec block hard action割合を0へ減衰させるstep数',
+    )
+    parser.add_argument(
+        '--sparsepcgc_hybrid_hard_action_period',
+        default=20,
+        type=int,
+        help='hard action hybridの決定周期。20なら20step中alpha割合だけcodec block actionを使う',
+    )
+    parser.add_argument(
+        '--sparsepcgc_codec_prior_distill_weight',
+        default=0.05,
+        type=float,
+        help='codec prior scoreをNetwork drop logitへ模倣させるWhere蒸留loss重み',
+    )
+    parser.add_argument(
+        '--sparsepcgc_codec_prior_amount_distill_weight',
+        default=0.02,
+        type=float,
+        help='codec prior ratioをNetwork Prune Amountへ模倣させるAmount蒸留loss重み',
+    )
     # ============================================================
     # Prune Amount anchor 診断用
     # ============================================================
@@ -3653,7 +3722,52 @@ def parse_pugan_args(parser, file_day, file_time):
     args.sparsepcgc_hybrid_prior_amount_blend = bool(
         getattr(args, "sparsepcgc_hybrid_prior_amount_blend", True)
     )
+    # ============================================================
+    # SparsePCGC Hybrid 強化設定 正規化
+    # ============================================================
 
+    args.sparsepcgc_prune_monotonic_floor = bool(
+        getattr(args, "sparsepcgc_prune_monotonic_floor", False)
+    )
+    args.sparsepcgc_prune_gate_monotonic_floor = bool(
+        getattr(args, "sparsepcgc_prune_gate_monotonic_floor", False)
+    )
+
+    args.sparsepcgc_hybrid_amount_mode = str(
+        getattr(args, "sparsepcgc_hybrid_amount_mode", "blend")
+    ).strip().lower()
+    if args.sparsepcgc_hybrid_amount_mode not in {"max", "blend"}:
+        args.sparsepcgc_hybrid_amount_mode = "blend"
+
+    args.sparsepcgc_hybrid_amount_min_network_keep = min(
+        max(float(getattr(args, "sparsepcgc_hybrid_amount_min_network_keep", 0.15)), 0.0),
+        1.0,
+    )
+
+    args.sparsepcgc_hybrid_hard_action = bool(
+        getattr(args, "sparsepcgc_hybrid_hard_action", True)
+    )
+    args.sparsepcgc_hybrid_hard_action_tail_alpha = min(
+        max(float(getattr(args, "sparsepcgc_hybrid_hard_action_tail_alpha", 0.85)), 0.0),
+        1.0,
+    )
+    args.sparsepcgc_hybrid_hard_action_tail_steps = max(
+        int(getattr(args, "sparsepcgc_hybrid_hard_action_tail_steps", 2000)),
+        0,
+    )
+    args.sparsepcgc_hybrid_hard_action_period = max(
+        int(getattr(args, "sparsepcgc_hybrid_hard_action_period", 20)),
+        1,
+    )
+
+    args.sparsepcgc_codec_prior_distill_weight = max(
+        float(getattr(args, "sparsepcgc_codec_prior_distill_weight", 0.05)),
+        0.0,
+    )
+    args.sparsepcgc_codec_prior_amount_distill_weight = max(
+        float(getattr(args, "sparsepcgc_codec_prior_amount_distill_weight", 0.02)),
+        0.0,
+    )
     args.prune_amount_soft_anchor_enable = bool(
         getattr(args, "prune_amount_soft_anchor_enable", False)
     )
