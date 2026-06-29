@@ -2754,6 +2754,45 @@ class StructureRepairActuator(nn.Module):
                 0.0,
             )
         phase0_network_prune_mode = self._network_phase0_prune_mode(codec_prune_prior_phase)
+        # ============================================================
+        # Hybrid Prune Prior
+        # ============================================================
+        # codec_prune_prior_phaseはwarmup終了で0になる。
+        # しかし、完全にpriorを消すと未学習Networkが悪い5% Pruneを選び続ける。
+        # そのため、warmup後も弱いprior biasをtailとして残し、
+        # Network scoreへ段階的に移行する。
+        # ============================================================
+        codec_prune_prior_hybrid_alpha = 0.0
+
+        if (
+            codec_prune_prior_enabled
+            and self.training
+            and not self._direct_network_prune_mode()
+            and bool(getattr(self.args, "sparsepcgc_hybrid_prune_prior", True))
+        ):
+            if codec_prune_prior_phase > 0.0:
+                codec_prune_prior_hybrid_alpha = float(codec_prune_prior_phase)
+            else:
+                hybrid_tail_steps = max(
+                    int(getattr(self.args, "sparsepcgc_hybrid_prior_tail_steps", 1200)),
+                    0,
+                )
+                hybrid_tail_start_alpha = min(
+                    max(float(getattr(self.args, "sparsepcgc_hybrid_prior_tail_alpha", 0.35)), 0.0),
+                    1.0,
+                )
+                if hybrid_tail_steps > 0 and hybrid_tail_start_alpha > 0.0:
+                    tail_step = max(current_train_step - codec_prune_prior_warmup_steps, 0)
+                    tail_phase = max(
+                        1.0 - float(tail_step) / float(hybrid_tail_steps),
+                        0.0,
+                    )
+                    codec_prune_prior_hybrid_alpha = float(hybrid_tail_start_alpha * tail_phase)
+
+        codec_prune_prior_hybrid_alpha = min(
+            max(float(codec_prune_prior_hybrid_alpha), 0.0),
+            1.0,
+        )
         codec_prune_prior_score = torch.zeros(
             (B, 1, N),
             device=pts_xyz.device,
@@ -2887,8 +2926,18 @@ class StructureRepairActuator(nn.Module):
             )
         learned_drop_ratio_before_gate = learned_drop_ratio_after_floor
         learned_drop_ratio_after_gate = learned_drop_ratio_before_gate * drop_operation_gate
+        # ============================================================
+        # Hybrid Amount:
+        # warmup中はcodec_prune_prior_phase、
+        # warmup後はcodec_prune_prior_hybrid_alphaで弱くprior ratioを残す。
+        # ============================================================
+        codec_prune_prior_count_alpha = (
+            codec_prune_prior_hybrid_alpha
+            if bool(getattr(self.args, "sparsepcgc_hybrid_prior_amount_blend", True))
+            else codec_prune_prior_phase
+        )
         codec_prune_prior_active_ratio = min(
-            codec_prune_prior_ratio * codec_prune_prior_phase,
+            codec_prune_prior_ratio * float(codec_prune_prior_count_alpha),
             float(max_drop_ratio),
         )
         effective_drop_ratio_for_hard_count = (
@@ -3004,10 +3053,13 @@ class StructureRepairActuator(nn.Module):
             float(getattr(self.args, "sparsepcgc_codec_prune_prior_logit_weight", 6.0)),
             0.0,
         )
-        if codec_prune_prior_phase > 0.0 and codec_prune_prior_logit_weight > 0.0:
+        if codec_prune_prior_hybrid_alpha > 0.0 and codec_prune_prior_logit_weight > 0.0:
             codec_prior_logit = (
                 2.0 * codec_prune_prior_score - 1.0
-            ) * codec_prune_prior_logit_weight * codec_prune_prior_phase
+            ) * codec_prune_prior_logit_weight * float(codec_prune_prior_hybrid_alpha)
+
+            # priorは教師・biasとして使うためdetachする。
+            # どこを削るかの最終調整はNetworkのdrop_headが学習する。
             learned_drop_logit = learned_drop_logit + codec_prior_logit.detach()
 
         if self.training and drop_score_noise > 0.0:
@@ -3086,16 +3138,19 @@ class StructureRepairActuator(nn.Module):
             drop_prob_direct = torch.zeros_like(drop_prob_direct)
             drop_prob_proxy = torch.zeros_like(drop_prob_proxy)
         drop_prob = self._voxel_mean_logits(drop_prob, voxel_coords, voxel_cache=voxel_cache).clamp(0.0, 1.0)
-        if codec_prune_prior_phase > 0.0 and codec_prune_prior_logit_weight > 0.0:
+        if codec_prune_prior_hybrid_alpha > 0.0 and codec_prune_prior_logit_weight > 0.0:
             codec_prior_prob = torch.sigmoid(codec_prior_logit)
+            hybrid_alpha_tensor = drop_prob.new_tensor(float(codec_prune_prior_hybrid_alpha))
+
             codec_prior_forward = (
-                codec_prune_prior_phase * codec_prior_prob
-                + (1.0 - codec_prune_prior_phase) * drop_prob
+                hybrid_alpha_tensor * codec_prior_prob
+                + (1.0 - hybrid_alpha_tensor) * drop_prob
             )
             drop_prob = codec_prior_forward.detach() + drop_prob - drop_prob.detach()
+
             codec_prior_direct = (
-                codec_prune_prior_phase * codec_prior_prob
-                + (1.0 - codec_prune_prior_phase) * drop_prob_direct
+                hybrid_alpha_tensor * codec_prior_prob
+                + (1.0 - hybrid_alpha_tensor) * drop_prob_direct
             )
             drop_prob_direct = codec_prior_direct.detach() + drop_prob_direct - drop_prob_direct.detach()
         if actual_oracle_enabled and actual_oracle_apply_teacher_actions and not phase0_network_prune_mode:
@@ -6327,6 +6382,12 @@ class StructureRepairActuator(nn.Module):
             ).detach(),
             "codec_prune_prior_phase": pts_xyz.new_tensor(codec_prune_prior_phase).detach(),
             "codec_prune_prior_ratio": pts_xyz.new_tensor(codec_prune_prior_active_ratio).detach(),
+            "codec_prune_prior_hybrid_alpha": pts_xyz.new_tensor(
+                float(codec_prune_prior_hybrid_alpha)
+            ).detach(),
+            "codec_prune_prior_count_alpha": pts_xyz.new_tensor(
+                float(codec_prune_prior_count_alpha)
+            ).detach(),
             "codec_prune_prior_block_size": pts_xyz.new_tensor(
                 float(codec_prune_prior_block_size)
             ).detach(),

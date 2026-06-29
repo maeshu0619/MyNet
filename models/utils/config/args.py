@@ -835,7 +835,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--repair_operation_head_grad_target', default=1.0, type=float)
     parser.add_argument('--repair_operation_head_grad_min_scale', default=1e-4, type=float)
     parser.add_argument('--repair_operation_head_grad_max_scale', default=100000.0, type=float)
-    parser.add_argument('--sparsepcgc_codec_prune_prior', default=False, type=str2bool)
+    parser.add_argument('--sparsepcgc_codec_prune_prior', default=True, type=str2bool)
     parser.add_argument(
         '--sparsepcgc_codec_prune_prior_block_size',
         default=0,
@@ -847,13 +847,13 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--sparsepcgc_codec_prune_prior_warmup_steps', default=10, type=int)
     parser.add_argument(
         '--sparsepcgc_prune_after_prior_mode',
-        default='direct_network',
+        default='network',
         type=str,
         help='warmup後のPrune hard実行モード。oracleは既存挙動、network/direct_networkはNetwork出力を優先',
     )
     parser.add_argument(
         '--sparsepcgc_network_prune_ratio_floor',
-        default=0.05,
+        default=0.01,
         type=float,
         help='network modeでwarmup後も維持するPrune実行量の最低割合',
     )
@@ -865,25 +865,71 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--sparsepcgc_network_prune_floor_steps',
-        default=1000,
+        default=100,
         type=int,
         help='network prune floorを一定割合で維持するstep数(公称warmup終了後から数える)',
     )
     parser.add_argument(
         '--sparsepcgc_network_prune_floor_decay_steps',
-        default=1000,
+        default=400,
         type=int,
         help='network prune floorを0へ線形減衰させるstep数(公称warmup終了後から数える)',
     )
     # ============================================================
-    # Direct Network Prune 診断モード
+    # SparsePCGC Hybrid Prune Prior
     # ============================================================
-    # Phase / oracle / no-op guard / full-cloud primary による
-    # 0化を切り離し、NetworkのPrune行動とraw圧縮損失だけで学習する。
+    # direct_network_pruneのようにcodec priorを完全に消すのではなく、
+    # warmup後も弱いscore bias / amount biasとして残す。
     # ============================================================
     parser.add_argument(
-        '--direct_network_prune',
+        '--sparsepcgc_hybrid_prune_prior',
         default=True,
+        type=str2bool,
+        help='Trueならwarmup後もcodec priorをNetwork scoreへ弱く混ぜる',
+    )
+    parser.add_argument(
+        '--sparsepcgc_hybrid_prior_tail_alpha',
+        default=0.35,
+        type=float,
+        help='warmup終了直後に残すcodec prior混合率。0.35なら35%だけpriorを残す',
+    )
+    parser.add_argument(
+        '--sparsepcgc_hybrid_prior_tail_steps',
+        default=1200,
+        type=int,
+        help='warmup終了後にcodec prior混合率を0へ減衰させるstep数',
+    )
+    parser.add_argument(
+        '--sparsepcgc_hybrid_prior_amount_blend',
+        default=True,
+        type=str2bool,
+        help='Trueならwarmup後もPrune量計算にcodec prior ratioを弱く混ぜる',
+    )
+
+    # ============================================================
+    # Prune Amount anchor 診断用
+    # ============================================================
+    parser.add_argument(
+        '--prune_amount_soft_anchor_enable',
+        default=False,
+        type=str2bool,
+        help='Trueならlearned_drop_ratio等をtarget_drop_ratioへ寄せる診断用soft anchorを使う',
+    )
+    parser.add_argument(
+        '--prune_amount_soft_anchor_weight',
+        default=0.0,
+        type=float,
+        help='Prune Amount soft anchorの重み。通常訓練では0',
+    )
+    parser.add_argument(
+        '--prune_amount_bias_anchor_enable',
+        default=False,
+        type=str2bool,
+        help='Trueならdrop_amount_head.biasへ直接gradient-only anchorを入れる診断用設定',
+    )
+    parser.add_argument(
+        '--direct_network_prune',
+        default=False,
         type=str2bool,
         help='TrueならPhase/oracle/no-op guardを通さず、NetworkのPruneとraw圧縮損失で直接学習する',
     )
@@ -3591,11 +3637,52 @@ def parse_pugan_args(parser, file_day, file_time):
         0,
     )
     # ============================================================
+    # SparsePCGC Hybrid Prune Prior 正規化
+    # ============================================================
+    args.sparsepcgc_hybrid_prune_prior = bool(
+        getattr(args, "sparsepcgc_hybrid_prune_prior", True)
+    )
+    args.sparsepcgc_hybrid_prior_tail_alpha = min(
+        max(float(getattr(args, "sparsepcgc_hybrid_prior_tail_alpha", 0.35)), 0.0),
+        1.0,
+    )
+    args.sparsepcgc_hybrid_prior_tail_steps = max(
+        int(getattr(args, "sparsepcgc_hybrid_prior_tail_steps", 1200)),
+        0,
+    )
+    args.sparsepcgc_hybrid_prior_amount_blend = bool(
+        getattr(args, "sparsepcgc_hybrid_prior_amount_blend", True)
+    )
+
+    args.prune_amount_soft_anchor_enable = bool(
+        getattr(args, "prune_amount_soft_anchor_enable", False)
+    )
+    args.prune_amount_soft_anchor_weight = max(
+        float(getattr(args, "prune_amount_soft_anchor_weight", 0.0)),
+        0.0,
+    )
+    args.prune_amount_bias_anchor_enable = bool(
+        getattr(args, "prune_amount_bias_anchor_enable", False)
+    )
+    # ============================================================
     # Direct Network Prune 正規化
     # ============================================================
-    args.direct_network_prune = bool(getattr(args, "direct_network_prune", False))
-    if str(getattr(args, "sparsepcgc_prune_after_prior_mode", "")).strip().lower() == "direct_network":
-        args.direct_network_prune = True
+    # direct_network_pruneは診断専用である。
+    # defaultやmode文字列だけで勝手に有効化しない。
+    # CLIで明示された場合だけ有効にする。
+    # ============================================================
+    direct_mode_requested = (
+        (
+            _cli_option_was_provided("--direct_network_prune")
+            and bool(getattr(args, "direct_network_prune", False))
+        )
+        or (
+            _cli_option_was_provided("--sparsepcgc_prune_after_prior_mode")
+            and str(getattr(args, "sparsepcgc_prune_after_prior_mode", "")).strip().lower() == "direct_network"
+        )
+    )
+
+    args.direct_network_prune = bool(direct_mode_requested)
 
     args.direct_prune_ratio_floor = min(
         max(float(getattr(args, "direct_prune_ratio_floor", 0.05)), 0.0),
@@ -3610,21 +3697,19 @@ def parse_pugan_args(parser, file_day, file_time):
     )
 
     if args.direct_network_prune:
-        # 既存挙動を直接削除せず、directモード時だけ安全装置を切る。
         args.sparsepcgc_prune_after_prior_mode = "direct_network"
-
-        # no-op化の主因になり得るものを診断時だけ止める。
         args.sparsepcgc_policy_actual_noop_guard = False
         args.sparsepcgc_full_cloud_actual_primary = False
         args.full_cloud_actual_correction = False
         args.full_cloud_actual_correction_loss_enable = False
-
-        # oracleはログ・教師として残してよいが、hard行動の強制適用は禁止する。
         args.sparsepcgc_actual_oracle_apply_teacher_actions = False
         args.sparsepcgc_actual_oracle_apply_full_override = False
-
-        # direct modeではNetwork Pruneを止めるactual gateを使わない。
         args.sparsepcgc_actual_gate_prune = False
+    else:
+        # 通常訓練ではdirect modeを必ず無効化する。
+        args.direct_network_prune = False
+        if str(getattr(args, "sparsepcgc_prune_after_prior_mode", "")).strip().lower() == "direct_network":
+            args.sparsepcgc_prune_after_prior_mode = "network"
     args.sparsepcgc_actual_gate_non_prune = bool(
         getattr(args, "sparsepcgc_actual_gate_non_prune", True)
     )
@@ -4939,22 +5024,18 @@ def parse_pugan_args(parser, file_day, file_time):
     # ============================================================
     # Direct Network Prune 最終上書き
     # ============================================================
-    # 注意:
-    #   ここは必ず parse_pugan_args の最後、return args の直前に置く。
-    #   途中で sparsepcgc_full_cloud_actual_primary などが再設定されるため、
-    #   direct_network_prune 用の安全装置解除は最後に再適用する必要がある。
+    # direct_network_pruneは診断専用であり、通常訓練では絶対に勝手に有効化しない。
+    # ここでcodec priorをFalseにするのは、明示的にdirectを指定したときだけである。
     # ============================================================
+    direct_mode_requested = bool(getattr(args, "direct_network_prune", False))
 
-    if str(getattr(args, "sparsepcgc_prune_after_prior_mode", "")).strip().lower() == "direct_network":
-        args.direct_network_prune = True
-
-    if bool(getattr(args, "direct_network_prune", False)):
+    if direct_mode_requested:
         args.sparsepcgc_prune_after_prior_mode = "direct_network"
 
-        # Phase / prior を hard Prune 実行条件から切り離す。
+        # direct診断時だけPhase/priorを切る。
         args.sparsepcgc_codec_prune_prior = False
 
-        # actual oracle / gate でNetwork Pruneを止めない。
+        # actual oracle / gateでNetwork Pruneを止めない。
         args.sparsepcgc_actual_gate_prune = False
         args.sparsepcgc_actual_oracle_apply_teacher_actions = False
         args.sparsepcgc_actual_oracle_apply_full_override = False
@@ -4968,4 +5049,8 @@ def parse_pugan_args(parser, file_day, file_time):
         args.train_full_cloud_actual_interval = 0
         args.full_cloud_actual_correction = False
         args.full_cloud_actual_correction_loss_enable = False
+    else:
+        args.direct_network_prune = False
+        if str(getattr(args, "sparsepcgc_prune_after_prior_mode", "")).strip().lower() == "direct_network":
+            args.sparsepcgc_prune_after_prior_mode = "network"
     return args

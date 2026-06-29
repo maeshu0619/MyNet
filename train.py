@@ -10237,10 +10237,18 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 reduction="mean",
                             )
 
-                            # かなり強めにする。
-                            # 前回ログではAmount勾配が1e-7程度だったため、
-                            # まずは診断用に10.0で強制的に起こす。
-                            amount_anchor_weight = 10.0
+                            # ============================================================
+                            # Prune Amount soft anchor
+                            # ============================================================
+                            # これは診断用である。
+                            # 通常訓練ではAmountを人工的にtargetへ寄せず、
+                            # actual / surrogate / hybrid priorから学習させる。
+                            # ============================================================
+                            amount_anchor_weight = (
+                                max(float(getattr(args, "prune_amount_soft_anchor_weight", 0.0)), 0.0)
+                                if bool(getattr(args, "prune_amount_soft_anchor_enable", False))
+                                else 0.0
+                            )
 
                             prune_amount_grad_delta = amount_anchor_weight * (
                                 amount_anchor_loss - amount_anchor_loss.detach()
@@ -10287,7 +10295,11 @@ def train(model, args, loss, writer, plot, notifier=None):
                         drop_amount_head = getattr(actuator_for_amount_bias, "drop_amount_head", None)
                         drop_amount_bias = getattr(drop_amount_head, "bias", None)
 
-                        if torch.is_tensor(drop_amount_bias) and drop_amount_bias.requires_grad:
+                        if (
+                            bool(getattr(args, "prune_amount_bias_anchor_enable", False))
+                            and torch.is_tensor(drop_amount_bias)
+                            and drop_amount_bias.requires_grad
+                        ):
                             amount_bias_anchor_weight = max(
                                 float(getattr(args, "grad_scale_operation_amount", 1.0)),
                                 0.0,
