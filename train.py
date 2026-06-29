@@ -11958,7 +11958,24 @@ if __name__ == '__main__':
     writer.write(f"SetupTiming: plot_init={time.time() - setup_plot_t0:.3f}s")
 
     log_training_setup( writer, args, file_day, file_time)
-
+    # ============================================================
+    # Direct Network Prune 起動確認
+    # ============================================================
+    if bool(getattr(args, "direct_network_prune", False)):
+        writer.write(
+            "DirectNetworkPrune: ACTIVE, "
+            f"prune_after_prior_mode={getattr(args, 'sparsepcgc_prune_after_prior_mode', '')}, "
+            f"codec_prior={getattr(args, 'sparsepcgc_codec_prune_prior', None)}, "
+            f"actual_gate_prune={getattr(args, 'sparsepcgc_actual_gate_prune', None)}, "
+            f"noop_guard={getattr(args, 'sparsepcgc_policy_actual_noop_guard', None)}, "
+            f"full_cloud_primary={getattr(args, 'sparsepcgc_full_cloud_actual_primary', None)}, "
+            f"full_cloud_correction={getattr(args, 'full_cloud_actual_correction_loss_enable', None)}"
+        )
+    else:
+        writer.write(
+            "DirectNetworkPrune: INACTIVE. "
+            "この状態ではPhase0後にoracle/gateでPruneが止まる可能性がある。"
+        )
     notifier = TrainingMailNotifier.from_args(args, writer=writer)
 
     setup_model_t0 = time.time()

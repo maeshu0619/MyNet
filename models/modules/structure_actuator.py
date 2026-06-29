@@ -2640,7 +2640,7 @@ class StructureRepairActuator(nn.Module):
         actual_oracle_has_bad_add = bool(actual_oracle_add_bad_mask.detach().any().item()) if actual_oracle_enabled else False
         actual_oracle_has_bad_move = bool(actual_oracle_move_bad_mask.detach().any().item()) if actual_oracle_enabled else False
         prune_after_prior_mode = self._prune_after_prior_mode()
-        prune_after_prior_network_mode = prune_after_prior_mode == "network"
+        prune_after_prior_network_mode = prune_after_prior_mode in {"network", "direct_network"}
         require_actual_gate_non_prune = bool(
             getattr(self.args, "sparsepcgc_actual_gate_non_prune", True)
         )
@@ -2726,7 +2726,7 @@ class StructureRepairActuator(nn.Module):
             prune_enabled and getattr(self.args, "sparsepcgc_codec_prune_prior", False)
         )
         prune_after_prior_mode = self._prune_after_prior_mode()
-        prune_after_prior_network_mode = prune_after_prior_mode == "network"
+        prune_after_prior_network_mode = prune_after_prior_mode in {"network", "direct_network"}
         configured_codec_prior_block_size = int(
             getattr(self.args, "sparsepcgc_codec_prune_prior_block_size", 0)
         )

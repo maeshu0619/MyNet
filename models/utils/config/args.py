@@ -847,9 +847,9 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--sparsepcgc_codec_prune_prior_warmup_steps', default=10, type=int)
     parser.add_argument(
         '--sparsepcgc_prune_after_prior_mode',
-        default='oracle',
+        default='direct_network',
         type=str,
-        help='warmup後のPrune hard実行モード。oracleは既存挙動、networkはNetwork出力を優先',
+        help='warmup後のPrune hard実行モード。oracleは既存挙動、network/direct_networkはNetwork出力を優先',
     )
     parser.add_argument(
         '--sparsepcgc_network_prune_ratio_floor',
@@ -883,7 +883,7 @@ def parse_pugan_args(parser, file_day, file_time):
     # ============================================================
     parser.add_argument(
         '--direct_network_prune',
-        default=False,
+        default=True,
         type=str2bool,
         help='TrueならPhase/oracle/no-op guardを通さず、NetworkのPruneとraw圧縮損失で直接学習する',
     )
@@ -4936,5 +4936,36 @@ def parse_pugan_args(parser, file_day, file_time):
     args.save_ply_dir = _resolve_repo_or_cwd_path(args.save_ply_dir)
     args.codec_eval_dir = _resolve_repo_or_cwd_path(args.codec_eval_dir)
     args.output_log = _resolve_repo_or_cwd_path(args.output_log)
+    # ============================================================
+    # Direct Network Prune 最終上書き
+    # ============================================================
+    # 注意:
+    #   ここは必ず parse_pugan_args の最後、return args の直前に置く。
+    #   途中で sparsepcgc_full_cloud_actual_primary などが再設定されるため、
+    #   direct_network_prune 用の安全装置解除は最後に再適用する必要がある。
+    # ============================================================
 
+    if str(getattr(args, "sparsepcgc_prune_after_prior_mode", "")).strip().lower() == "direct_network":
+        args.direct_network_prune = True
+
+    if bool(getattr(args, "direct_network_prune", False)):
+        args.sparsepcgc_prune_after_prior_mode = "direct_network"
+
+        # Phase / prior を hard Prune 実行条件から切り離す。
+        args.sparsepcgc_codec_prune_prior = False
+
+        # actual oracle / gate でNetwork Pruneを止めない。
+        args.sparsepcgc_actual_gate_prune = False
+        args.sparsepcgc_actual_oracle_apply_teacher_actions = False
+        args.sparsepcgc_actual_oracle_apply_full_override = False
+
+        # no-opへ置換する経路を止める。
+        args.sparsepcgc_policy_actual_noop_guard = False
+
+        # full cloud primary / correction による L_com 上書きを止める。
+        args.sparsepcgc_full_cloud_actual_primary = False
+        args.sparsepcgc_require_full_cloud_actual_teacher = False
+        args.train_full_cloud_actual_interval = 0
+        args.full_cloud_actual_correction = False
+        args.full_cloud_actual_correction_loss_enable = False
     return args
