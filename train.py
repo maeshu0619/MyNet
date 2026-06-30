@@ -473,6 +473,57 @@ def _selected_metadata_input_common_cache_key(cache_key, selected_groups, subtre
     )
 
 
+def _selected_subtree_runtime_input_common_cache_key(cache_key, subtree_key, subtree_depth, point_count):
+    return _episode_input_common_cache_key(
+        cache_key,
+        "selected_subtree_runtime",
+        depth=int(subtree_depth),
+        subtree_key=int(subtree_key),
+        point_count=int(point_count),
+    )
+
+
+def _subtree_potential_input_common_cache_key(cache_key, subtree_depth):
+    return _episode_input_common_cache_key(
+        cache_key,
+        "subtree_potential_scores",
+        depth=int(subtree_depth),
+    )
+
+
+def _build_selected_subtree_runtime_cache_entry(
+    *,
+    input_xyz,
+    input_attr_full,
+    full_cloud_canonical_context,
+    subtree_tree,
+    full_octree_context,
+    point_idx,
+    group_meta,
+):
+    subtree_xyz = input_xyz.index_select(2, point_idx).contiguous()
+    subtree_attr = (
+        input_attr_full.index_select(2, point_idx).contiguous()
+        if torch.is_tensor(input_attr_full)
+        else None
+    )
+    patched_subtree_tree, patched_full_context = _inject_full_cloud_canonical_into_subtree_metadata(
+        subtree_tree=subtree_tree,
+        full_octree_context=full_octree_context,
+        full_cloud_canonical_context=full_cloud_canonical_context,
+        point_idx=point_idx,
+        device=input_xyz.device,
+    )
+    return {
+        "subtree_xyz": subtree_xyz,
+        "subtree_attr": subtree_attr,
+        "subtree_tree": patched_subtree_tree,
+        "full_octree_context": patched_full_context,
+        "group_meta": dict(group_meta or {}),
+        "point_count": int(point_idx.numel()),
+    }
+
+
 def _sparsepcgc_success_amount_memory_key(cache_key, subtree_key):
     return f"{str(cache_key)}|subtree={int(subtree_key)}"
 
@@ -1837,7 +1888,11 @@ def _select_sparsepcgc_potential_subtree_key(
         full_coords = full_cloud_canonical_context.get("global_voxel_coords", None)
     if not torch.is_tensor(full_coords) or full_coords.ndim != 3 or full_coords.shape[1] != 3:
         return None, {"enabled": True, "reason": "coords_missing"}
-    fast_diag_drop_set, fast_diag_global = _sparsepcgc_fast_diag_global_drop_set(full_coords, args)
+    fast_diag_drop_set = None
+    fast_diag_global = {
+        "global_drop_count": 0,
+        "global_drop_ratio": 0.0,
+    }
     fast_diag_weight = max(float(getattr(args, "sparsepcgc_subtree_potential_fast_diag_weight", 50.0)), 0.0)
     fast_diag_min_count = max(int(getattr(args, "sparsepcgc_subtree_potential_fast_diag_min_count", 1)), 0)
 
@@ -1856,31 +1911,83 @@ def _select_sparsepcgc_potential_subtree_key(
             key=lambda key: ((int(key) * 2654435761 + seed) & 0x7FFFFFFF),
         )[:max_scan]
 
+    score_map = {}
+    potential_cache_enabled = bool(
+        _episode_input_common_cache_enabled(args)
+        and getattr(args, "episode_input_subtree_potential_cache", True)
+        and cache_key
+    )
+    potential_cache_key = _subtree_potential_input_common_cache_key(
+        cache_key,
+        int(full_cloud_canonical_context.get("global_depth", 0) or 0),
+    )
+    if potential_cache_enabled:
+        cached_payload = _episode_input_common_cache_fetch(
+            args,
+            potential_cache_key,
+            device=None,
+            section="subtree_potential_scores",
+        )
+        if isinstance(cached_payload, dict):
+            cached_scores = cached_payload.get("score_map", None)
+            cached_fast_diag_global = cached_payload.get("fast_diag_global", None)
+            if isinstance(cached_scores, dict):
+                score_map = dict(cached_scores)
+            if isinstance(cached_fast_diag_global, dict):
+                fast_diag_global = dict(cached_fast_diag_global)
+
+    missing_keys = [int(key) for key in pool_keys if int(key) not in score_map]
+    if missing_keys:
+        fast_diag_drop_set, fast_diag_global = _sparsepcgc_fast_diag_global_drop_set(full_coords, args)
+        with torch.no_grad():
+            for key in missing_keys:
+                point_idx = group_by_key.get(int(key), None)
+                if not torch.is_tensor(point_idx) or point_idx.numel() <= 0:
+                    continue
+                idx = point_idx.to(device=full_coords.device, dtype=torch.long)
+                if int(idx.numel()) <= 1:
+                    continue
+                coords_n3 = full_coords[0].index_select(1, idx).transpose(0, 1).contiguous()
+                score, detail = _sparsepcgc_subtree_leaf_pattern_potential(coords_n3, args)
+                fast_local_count, fast_local_ratio = _sparsepcgc_fast_diag_local_count(coords_n3, fast_diag_drop_set)
+                if fast_local_count >= fast_diag_min_count and fast_diag_weight > 0.0:
+                    fast_score = fast_diag_weight * float(fast_local_count) / math.sqrt(max(float(coords_n3.shape[0]), 1.0))
+                    score += float(fast_score)
+                else:
+                    fast_score = 0.0
+                if isinstance(detail, dict):
+                    detail = dict(detail)
+                    detail["fast_diag_local_count"] = int(fast_local_count)
+                    detail["fast_diag_local_ratio"] = float(fast_local_ratio)
+                    detail["fast_diag_score"] = float(fast_score)
+                    detail["fast_diag_global_drop_count"] = int(fast_diag_global.get("global_drop_count", 0) or 0)
+                    detail["fast_diag_global_drop_ratio"] = float(fast_diag_global.get("global_drop_ratio", 0.0) or 0.0)
+                score_map[int(key)] = {
+                    "score": float(score),
+                    "detail": detail,
+                }
+        if potential_cache_enabled:
+            _episode_input_common_cache_store(
+                args,
+                potential_cache_key,
+                {
+                    "score_map": dict(score_map),
+                    "fast_diag_global": dict(fast_diag_global),
+                },
+            )
+
     scored = []
-    with torch.no_grad():
-        for key in pool_keys:
-            point_idx = group_by_key.get(int(key), None)
-            if not torch.is_tensor(point_idx) or point_idx.numel() <= 0:
-                continue
-            idx = point_idx.to(device=full_coords.device, dtype=torch.long)
-            if int(idx.numel()) <= 1:
-                continue
-            coords_n3 = full_coords[0].index_select(1, idx).transpose(0, 1).contiguous()
-            score, detail = _sparsepcgc_subtree_leaf_pattern_potential(coords_n3, args)
-            fast_local_count, fast_local_ratio = _sparsepcgc_fast_diag_local_count(coords_n3, fast_diag_drop_set)
-            if fast_local_count >= fast_diag_min_count and fast_diag_weight > 0.0:
-                fast_score = fast_diag_weight * float(fast_local_count) / math.sqrt(max(float(coords_n3.shape[0]), 1.0))
-                score += float(fast_score)
-            else:
-                fast_score = 0.0
-            if isinstance(detail, dict):
-                detail = dict(detail)
-                detail["fast_diag_local_count"] = int(fast_local_count)
-                detail["fast_diag_local_ratio"] = float(fast_local_ratio)
-                detail["fast_diag_score"] = float(fast_score)
-                detail["fast_diag_global_drop_count"] = int(fast_diag_global.get("global_drop_count", 0) or 0)
-                detail["fast_diag_global_drop_ratio"] = float(fast_diag_global.get("global_drop_ratio", 0.0) or 0.0)
-            scored.append((float(score), int(key), detail))
+    for key in pool_keys:
+        cached_item = score_map.get(int(key), None)
+        if not isinstance(cached_item, dict):
+            continue
+        scored.append(
+            (
+                float(cached_item.get("score", 0.0) or 0.0),
+                int(key),
+                cached_item.get("detail", None),
+            )
+        )
 
     if not scored:
         return None, {"enabled": True, "reason": "no_scored_groups", "pool": len(pool_keys)}
@@ -9324,62 +9431,132 @@ def train(model, args, loss, writer, plot, notifier=None):
                     else:
                         subtree_point_counts = [int(point_idx.numel()) for _, point_idx in selected_groups]
                         subtree_loss_scope = "subtree_output_vs_subtree_input"
-                        
+                    subtree_inputs_by_key = {}
+
                     # ============================================================
-                    # 選択済みSubtreeだけmetadataを構築する
-                    # これにより、同一階層の全Subtreeに対するtree/context構築を避ける
+                    # Episode共通Subtree runtime cache
+                    # candidateごとの入力点群 / 属性 / canonical metadata を個別Subtree単位で保存する。
+                    # これにより、選択組み合わせが変わっても Episode2以降で再利用できる。
                     # ============================================================
                     if selected_subtree_for_grad:
                         t1 = time.time()
-                        selected_metadata_cache_key = _selected_metadata_input_common_cache_key(
-                            cache_key,
-                            selected_groups,
-                            subtree_group_state.get("depth", requested_subtree_depth),
-                            args,
+                        subtree_trees = {}
+                        full_octree_contexts = {}
+                        group_meta = {}
+
+                        subtree_runtime_cache_enabled = bool(
+                            _episode_input_common_cache_enabled(args)
+                            and getattr(args, "episode_input_subtree_runtime_cache", True)
                         )
-                        selected_metadata_cache = _episode_input_common_cache_fetch(
-                            args,
-                            selected_metadata_cache_key,
-                            device=input_xyz.device,
-                            section="selected_metadata",
+                        subtree_runtime_depth = int(subtree_group_state.get("depth", requested_subtree_depth))
+                        prewarm_groups = list(selected_groups)
+                        if bool(getattr(args, "episode_input_subtree_runtime_prewarm_all", True)):
+                            prewarm_groups = list(candidate_groups)
+                        max_runtime_groups = max(
+                            int(getattr(args, "episode_input_subtree_runtime_max_groups", 0)),
+                            0,
                         )
-                        if isinstance(selected_metadata_cache, dict):
-                            subtree_trees = dict(selected_metadata_cache.get("subtree_trees", {}) or {})
-                            full_octree_contexts = dict(selected_metadata_cache.get("full_octree_contexts", {}) or {})
-                            group_meta = dict(selected_metadata_cache.get("group_meta", {}) or {})
-                        else:
-                            subtree_trees, full_octree_contexts, group_meta = build_selected_group_octree_metadata(
-                                input_xyz,
-                                subtree_ref,
-                                selected_groups,
-                                args=args,
+                        if max_runtime_groups > 0 and len(prewarm_groups) > max_runtime_groups:
+                            prewarm_groups = list(prewarm_groups[:max_runtime_groups])
+
+                        runtime_cache_entries = {}
+                        runtime_missing_groups = []
+                        for runtime_key, runtime_point_idx in prewarm_groups:
+                            runtime_key_int = int(runtime_key)
+                            runtime_cache_key = _selected_subtree_runtime_input_common_cache_key(
+                                cache_key,
+                                runtime_key_int,
+                                subtree_runtime_depth,
+                                int(runtime_point_idx.numel()),
                             )
-                            _episode_input_common_cache_store(
+                            runtime_entry = (
+                                _episode_input_common_cache_fetch(
+                                    args,
+                                    runtime_cache_key,
+                                    device=input_xyz.device,
+                                    section="selected_subtree_runtime",
+                                )
+                                if subtree_runtime_cache_enabled
+                                else None
+                            )
+                            if isinstance(runtime_entry, dict):
+                                runtime_cache_entries[runtime_key_int] = runtime_entry
+                            else:
+                                runtime_missing_groups.append((runtime_key, runtime_point_idx))
+
+                        if runtime_missing_groups:
+                            missing_metadata_cache_key = _selected_metadata_input_common_cache_key(
+                                cache_key,
+                                runtime_missing_groups,
+                                subtree_runtime_depth,
                                 args,
-                                selected_metadata_cache_key,
-                                {
-                                    "subtree_trees": subtree_trees,
-                                    "full_octree_contexts": full_octree_contexts,
-                                    "group_meta": group_meta,
-                                },
                             )
-                        # ============================================================
-                        # build_selected_group_octree_metadata() が内部で局所再量子化していても、
-                        # ここで必ず full cloud canonical voxel coords に差し替える。
-                        # ============================================================
-                        patched_subtree_trees = {}
-                        patched_full_octree_contexts = {}
+                            missing_metadata_cache = _episode_input_common_cache_fetch(
+                                args,
+                                missing_metadata_cache_key,
+                                device=input_xyz.device,
+                                section="selected_metadata",
+                            )
+                            if isinstance(missing_metadata_cache, dict):
+                                missing_subtree_trees = dict(missing_metadata_cache.get("subtree_trees", {}) or {})
+                                missing_full_octree_contexts = dict(missing_metadata_cache.get("full_octree_contexts", {}) or {})
+                                missing_group_meta = dict(missing_metadata_cache.get("group_meta", {}) or {})
+                            else:
+                                missing_subtree_trees, missing_full_octree_contexts, missing_group_meta = build_selected_group_octree_metadata(
+                                    input_xyz,
+                                    subtree_ref,
+                                    runtime_missing_groups,
+                                    args=args,
+                                )
+                                _episode_input_common_cache_store(
+                                    args,
+                                    missing_metadata_cache_key,
+                                    {
+                                        "subtree_trees": missing_subtree_trees,
+                                        "full_octree_contexts": missing_full_octree_contexts,
+                                        "group_meta": missing_group_meta,
+                                    },
+                                )
+
+                            for runtime_key, runtime_point_idx in runtime_missing_groups:
+                                runtime_key_int = int(runtime_key)
+                                runtime_entry = _build_selected_subtree_runtime_cache_entry(
+                                    input_xyz=input_xyz,
+                                    input_attr_full=input_attr_full,
+                                    full_cloud_canonical_context=full_cloud_canonical_context,
+                                    subtree_tree=missing_subtree_trees.get(runtime_key_int, {}),
+                                    full_octree_context=missing_full_octree_contexts.get(runtime_key_int, {}),
+                                    point_idx=runtime_point_idx,
+                                    group_meta=missing_group_meta.get(runtime_key_int, {}),
+                                )
+                                runtime_cache_entries[runtime_key_int] = runtime_entry
+                                if subtree_runtime_cache_enabled:
+                                    runtime_cache_key = _selected_subtree_runtime_input_common_cache_key(
+                                        cache_key,
+                                        runtime_key_int,
+                                        subtree_runtime_depth,
+                                        int(runtime_point_idx.numel()),
+                                    )
+                                    _episode_input_common_cache_store(
+                                        args,
+                                        runtime_cache_key,
+                                        runtime_entry,
+                                    )
 
                         for selected_key, selected_point_idx in selected_groups:
                             selected_key_int = int(selected_key)
+                            runtime_entry = runtime_cache_entries.get(selected_key_int, None)
+                            if not isinstance(runtime_entry, dict):
+                                raise RuntimeError(
+                                    "Selected subtree runtime cache entry is missing. "
+                                    f"subtree_key={selected_key_int}, depth={subtree_runtime_depth}"
+                                )
+                            subtree_inputs_by_key[selected_key_int] = runtime_entry
 
-                            patched_subtree_tree, patched_full_context = _inject_full_cloud_canonical_into_subtree_metadata(
-                                subtree_tree=subtree_trees.get(selected_key_int, {}),
-                                full_octree_context=full_octree_contexts.get(selected_key_int, {}),
-                                full_cloud_canonical_context=full_cloud_canonical_context,
-                                point_idx=selected_point_idx,
-                                device=input_xyz.device,
-                            )
+                            patched_subtree_tree = dict(runtime_entry.get("subtree_tree", {}) or {})
+                            patched_full_context = dict(runtime_entry.get("full_octree_context", {}) or {})
+                            selected_group_meta = dict(runtime_entry.get("group_meta", {}) or {})
+                            oracle_subtree_xyz = runtime_entry.get("subtree_xyz", None)
 
                             oracle_depth = 0
                             try:
@@ -9390,8 +9567,6 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 f"{cache_key}|subtree_depth={oracle_depth}|subtree_key={selected_key_int}"
                             )
                             patched_full_context["actual_oracle_full_cloud_cache_key"] = str(cache_key)
-                            oracle_subtree_xyz = input_xyz.index_select(2, selected_point_idx).contiguous()
-                            st = time.time()
                             patched_subtree_tree, patched_full_context, oracle_debug = _attach_sparsepcgc_actual_oracle_drop(
                                 args=args,
                                 writer=writer,
@@ -9402,7 +9577,6 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 cache_key=oracle_cache_key,
                                 global_step=global_train_step,
                             )
-                            # print(time.time()-st)
                             if str(oracle_debug.get("override_scope", "")) == "full_cloud":
                                 apply_full_override = bool(
                                     getattr(args, "sparsepcgc_actual_oracle_apply_full_override", False)
@@ -9425,46 +9599,39 @@ def train(model, args, loss, writer, plot, notifier=None):
                                     patched_full_context.pop(oracle_key, None)
                                 patched_full_context.pop("actual_oracle_cached_edited_actual_stats", None)
 
-                            patched_subtree_trees[selected_key_int] = patched_subtree_tree
-                            patched_full_octree_contexts[selected_key_int] = patched_full_context
+                            subtree_trees[selected_key_int] = patched_subtree_tree
+                            full_octree_contexts[selected_key_int] = patched_full_context
                             if isinstance(oracle_debug, dict) and oracle_debug:
                                 step_actual_oracle_metric_debug = dict(oracle_debug)
 
-                            if selected_key_int in group_meta:
-                                group_meta[selected_key_int] = dict(group_meta[selected_key_int])
-                            else:
-                                group_meta[selected_key_int] = {}
-
-                            group_meta[selected_key_int]["canonical_source"] = "full_cloud_canonical"
-                            group_meta[selected_key_int]["canonical_subtree_points"] = int(
+                            selected_group_meta["canonical_source"] = "full_cloud_canonical"
+                            selected_group_meta["canonical_subtree_points"] = int(
                                 patched_subtree_tree["global_voxel_coords"].shape[-1]
                             )
-                            group_meta[selected_key_int]["canonical_full_points"] = int(
+                            selected_group_meta["canonical_full_points"] = int(
                                 patched_full_context["full_global_voxel_coords"].shape[-1]
                             )
                             if isinstance(oracle_debug, dict):
-                                group_meta[selected_key_int]["actual_oracle_enabled"] = bool(
+                                selected_group_meta["actual_oracle_enabled"] = bool(
                                     oracle_debug.get("enabled", False)
                                 )
-                                group_meta[selected_key_int]["actual_oracle_used"] = bool(
+                                selected_group_meta["actual_oracle_used"] = bool(
                                     oracle_debug.get("used", False)
                                 )
-                                group_meta[selected_key_int]["actual_oracle_best_percent"] = float(
+                                selected_group_meta["actual_oracle_best_percent"] = float(
                                     oracle_debug.get("best_percent", 0.0)
                                 )
-                                group_meta[selected_key_int]["actual_oracle_reason"] = str(
+                                selected_group_meta["actual_oracle_reason"] = str(
                                     oracle_debug.get("reason", "")
                                 )
-
-                        subtree_trees = patched_subtree_trees
-                        full_octree_contexts = patched_full_octree_contexts
+                            group_meta[selected_key_int] = selected_group_meta
                         t2 = time.time()
                         step_timing_breakdown["selected_metadata_oracle_time"] = float(t2 - t1)
-                        # print(t2-t1)
                     else:
                         subtree_trees = {}
                         full_octree_contexts = {}
                         group_meta = {}
+                        subtree_inputs_by_key = {}
 
                     """ログ"""
                     if (
@@ -9947,12 +10114,15 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 # args._current_exact_teacher_mode = "global_subtree" if (use_subtree_tree and use_full_octree_context) else "local_subtree" # teacherの意味を分離する
                                 args._current_exact_teacher_uses_full_context = bool(use_subtree_tree and use_full_octree_context) # full文脈の使用可否
                                 args._current_exact_teacher_fallback_reason = "" if (use_subtree_tree and use_full_octree_context) else "missing_prebuilt_subtree_tree_or_full_octree_context" # fallback理由
-                                subtree_xyz = input_xyz.index_select(2, point_idx).contiguous() # 全体対入力点群から現在Subtreeに属する点だけを取り出す
+                                runtime_entry = subtree_inputs_by_key.get(subtree_key_int, {})
+                                subtree_xyz = runtime_entry.get("subtree_xyz", None)
+                                if not torch.is_tensor(subtree_xyz):
+                                    subtree_xyz = input_xyz.index_select(2, point_idx).contiguous() # 全体対入力点群から現在Subtreeに属する点だけを取り出す
                                 # VoxelCollisionログでは、Subtree学習中のGTも選択Subtreeに揃える。
                                 # これを入れないと input_gt だけ full cloud 全体になり、診断対象がずれる。
                                 voxel_collision_input_gt = subtree_xyz[:, :3, :]
-                                subtree_attr = None
-                                if input_attr_full is not None:
+                                subtree_attr = runtime_entry.get("subtree_attr", None)
+                                if subtree_attr is None and input_attr_full is not None:
                                     subtree_attr = input_attr_full.index_select(2, point_idx).contiguous() # 属性を取り出す
                                 subtree_cache_key = ( f"{cache_key}|subtree_depth={int(subtree_ref['depth'][0].item())}|subtree_key={subtree_key}")
                                 if log_this_step and not compact_step_text_log:

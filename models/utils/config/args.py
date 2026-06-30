@@ -2783,6 +2783,10 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--episode_input_common_cache_enable_dataset_cache', default=True, type=str2bool, help='episode_input_common_cache=True時にPLY dataset_cacheも自動で有効化するか')
     parser.add_argument('--episode_input_common_cache_max_entries', default=0, type=int, help='Episode共通前処理キャッシュの最大件数(0なら学習ファイル数まで自動設定)')
     parser.add_argument('--episode_input_common_cache_max_memory_mb', default=2048, type=int, help='Episode共通前処理キャッシュのCPUメモリ上限(MB, 0で無制限)')
+    parser.add_argument('--episode_input_subtree_runtime_cache', default=True, type=str2bool, help='Episode共通キャッシュ内に、Subtreeごとの入力点群/属性/canonical metadataを保存して再利用するか')
+    parser.add_argument('--episode_input_subtree_runtime_prewarm_all', default=False, type=str2bool, help='Episode共通キャッシュ有効時、各サンプルの候補Subtree runtime入力を初回Stepでまとめて作成し、Episode2以降で再利用するか')
+    parser.add_argument('--episode_input_subtree_runtime_max_groups', default=0, type=int, help='Subtree runtime prewarm対象の最大Subtree数。0なら候補全件')
+    parser.add_argument('--episode_input_subtree_potential_cache', default=True, type=str2bool, help='Subtree potential scoreの静的計算結果をEpisode内で再利用するか')
     parser.add_argument('--ply_loader', default='numpy', type=str, help='PLY読み込み方法(numpy/open3d/auto)')
     parser.add_argument('--mp_start_method', default='auto', type=str, help='マルチプロセス起動方法')
     parser.add_argument('--weight_decay', default=0, type=float, help='重み減衰')
@@ -5277,6 +5281,19 @@ def parse_pugan_args(parser, file_day, file_time):
     args.sparsepcgc_subtree_potential_fast_diag_min_count = max(
         int(getattr(args, "sparsepcgc_subtree_potential_fast_diag_min_count", 1)),
         0,
+    )
+    args.episode_input_subtree_runtime_cache = bool(
+        getattr(args, "episode_input_subtree_runtime_cache", True)
+    )
+    args.episode_input_subtree_runtime_prewarm_all = bool(
+        getattr(args, "episode_input_subtree_runtime_prewarm_all", True)
+    )
+    args.episode_input_subtree_runtime_max_groups = max(
+        int(getattr(args, "episode_input_subtree_runtime_max_groups", 0)),
+        0,
+    )
+    args.episode_input_subtree_potential_cache = bool(
+        getattr(args, "episode_input_subtree_potential_cache", True)
     )
     amount_cap = 0.30
 
