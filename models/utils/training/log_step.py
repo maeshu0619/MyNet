@@ -520,11 +520,13 @@ def log_compact_step_summary(
     geom_debug = getattr(loss_obj, "last_geometry_debug", {}) or {}
     stage_factors = stage_factors or {}
 
+    actual_scope_text = str(comp_debug.get("actual_scope", "")).strip().lower()
     full_cloud = bool(
-        str(comp_debug.get("actual_scope", "")).strip().lower() == "full_cloud"
+        actual_scope_text in {"full_cloud", "full_cloud_splice"}
         or bool(comp_debug.get("full_cloud_actual_primary_used", False))
         or bool(comp_debug.get("full_cloud_teacher_used", False))
         or bool(comp_debug.get("full_cloud_anchor_shadow_train_used", False))
+        or bool(comp_debug.get("full_cloud_splice_actual_used", False))
     )
     eval_scope = str(
         comp_debug.get(
@@ -746,10 +748,40 @@ def log_compact_step_summary(
     hard_target_ratio = _prefer_number("hard_drop_target_ratio_value")
     hard_target_network = _prefer_number("hard_drop_target_ratio_network_value")
     hard_target_prior = _prefer_number("hard_drop_target_ratio_codec_prior_value")
+    algorithmic_selector = _prefer_number("algorithmic_proposal_selector_active", 0.0)
+    algorithmic_where_source = _prefer_number("algorithmic_proposal_where_source_id", 0.0)
+    algorithmic_noop = _prefer_number("algorithmic_proposal_noop_selected", 0.0)
+    algorithmic_amount_class = _prefer_number("algorithmic_amount_selected_class", -1.0)
+    algorithmic_amount_bin = _prefer_number("algorithmic_amount_selected_bin_ratio")
+    algorithmic_amount_residual = _prefer_number("algorithmic_amount_residual")
+    algorithmic_amount_teacher = _prefer_number("algorithmic_amount_teacher_ratio")
     post_amount_used = _prefer_number("post_warmup_amount_hybrid_applied", 0.0)
+    post_amount_strategy = _prefer_number("post_warmup_amount_strategy_id", 0.0)
     post_amount_alpha = _prefer_number("post_warmup_amount_alpha")
     post_amount_proposal = _prefer_number("post_warmup_amount_proposal_ratio")
     post_amount_teacher = _prefer_number("post_warmup_amount_teacher_loss")
+    post_amount_teacher_weight = _prefer_number("post_warmup_amount_teacher_weight_effective")
+    amount_explore_step = _prefer_number("amount_explore_step", 0.0)
+    amount_explore_prob = _prefer_number("amount_explore_prob")
+    amount_explore_candidate = _prefer_number("amount_explore_candidate_ratio")
+    amount_explore_teacher_ratio = _prefer_number("amount_explore_teacher_ratio")
+    amount_explore_teacher_alpha = _prefer_number("amount_explore_teacher_alpha")
+    amount_explore_used_teacher = _prefer_number("amount_explore_used_teacher", 0.0)
+    proposal_selector_enabled = _prefer_number("proposal_selector_enabled", 0.0)
+    proposal_candidate_count = _prefer_number("proposal_candidate_count", 0.0)
+    proposal_actual_eval_count = _prefer_number("proposal_actual_eval_count", 0.0)
+    proposal_applied_count = _prefer_number("proposal_applied_subtree_count", 0.0)
+    proposal_noop_count = _prefer_number("proposal_noop_count", 0.0)
+    proposal_best_actual = _prefer_number("proposal_best_actual_percent")
+    proposal_chosen_actual = _prefer_number("proposal_chosen_actual_percent")
+    proposal_predicted_delta = _prefer_number("proposal_predicted_delta")
+    proposal_final_amount = _prefer_number("proposal_final_amount")
+    proposal_teacher_source = _prefer_text("proposal_teacher_source")
+    proposal_cls_loss = _prefer_number("proposal_cls_loss")
+    proposal_value_loss = _prefer_number("proposal_value_loss")
+    proposal_rank_loss = _prefer_number("proposal_rank_loss")
+    proposal_geom_loss = _prefer_number("proposal_geom_loss")
+    verified_noop_guard = _prefer_number("verified_noop_guard_used", 0.0)
     collapse_detected = bool(
         comp_debug.get("phase0_noop_only_collapse_detected", False)
         or structure_debug.get("phase0_noop_only_collapse_detected", False)
@@ -765,10 +797,40 @@ def log_compact_step_summary(
         f"AmountTarget={_fmt(hard_target_ratio, 5)}, "
         f"AmountNet={_fmt(hard_target_network, 5)}, "
         f"AmountPrior={_fmt(hard_target_prior, 5)}, "
+        f"AlgSelector={bool(round(_to_float(algorithmic_selector, 0.0)))}, "
+        f"AlgWhere={_fmt_int(algorithmic_where_source)}, "
+        f"AlgNoop={bool(round(_to_float(algorithmic_noop, 0.0)))}, "
+        f"AlgAmtClass={_fmt_int(algorithmic_amount_class)}, "
+        f"AlgAmtBin={_fmt(algorithmic_amount_bin, 5)}, "
+        f"AlgAmtRes={_fmt(algorithmic_amount_residual, 5)}, "
+        f"AlgAmtTeacher={_fmt(algorithmic_amount_teacher, 5)}, "
         f"PostAmountUsed={bool(round(_to_float(post_amount_used, 0.0)))}, "
+        f"PostStrategy={_fmt_int(post_amount_strategy)}, "
         f"PostAlpha={_fmt(post_amount_alpha, 5)}, "
         f"PostProposal={_fmt(post_amount_proposal, 5)}, "
         f"PostTeacher={_fmt(post_amount_teacher, 6)}, "
+        f"PostTeacherW={_fmt(post_amount_teacher_weight, 6)}, "
+        f"ExploreStep={bool(round(_to_float(amount_explore_step, 0.0)))}, "
+        f"ExploreProb={_fmt(amount_explore_prob, 4)}, "
+        f"ExploreCand={_fmt(amount_explore_candidate, 5)}, "
+        f"ExploreTeacher={_fmt(amount_explore_teacher_ratio, 5)}, "
+        f"ExploreTeacherAlpha={_fmt(amount_explore_teacher_alpha, 5)}, "
+        f"ExploreUseTeacher={bool(round(_to_float(amount_explore_used_teacher, 0.0)))}, "
+        f"ProposalSelector={bool(round(_to_float(proposal_selector_enabled, 0.0)))}, "
+        f"ProposalCandidates={_fmt_int(proposal_candidate_count)}, "
+        f"ProposalActualEval={_fmt_int(proposal_actual_eval_count)}, "
+        f"ProposalApplied={_fmt_int(proposal_applied_count)}, "
+        f"ProposalNoop={_fmt_int(proposal_noop_count)}, "
+        f"ProposalChosenAmount={_fmt(proposal_final_amount, 5)}, "
+        f"ProposalPredDelta={_fmt(proposal_predicted_delta, 5)}, "
+        f"ProposalActualDelta={_fmt(proposal_chosen_actual, 5)}, "
+        f"ProposalBestActual={_fmt(proposal_best_actual, 5)}, "
+        f"ProposalTeacher={proposal_teacher_source}, "
+        f"ProposalClsLoss={_fmt(proposal_cls_loss, 5)}, "
+        f"ProposalValueLoss={_fmt(proposal_value_loss, 5)}, "
+        f"ProposalRankLoss={_fmt(proposal_rank_loss, 5)}, "
+        f"ProposalGeomLoss={_fmt(proposal_geom_loss, 5)}, "
+        f"VerifiedNoopGuard={bool(round(_to_float(verified_noop_guard, 0.0)))}, "
         f"CollapseDetected={collapse_detected}, "
         f"CollapseReason={collapse_reason}, "
         f"HardDropTrace={hard_drop_count_trace}, "
@@ -784,6 +846,11 @@ def log_compact_step_summary(
         f"anchor_teacher_amount={_fmt(comp_debug.get('anchor_success_teacher_amount', float('nan')))}, "
         f"outcome_good={_fmt(comp_debug.get('outcome_good_weight', float('nan')))}, "
         f"outcome_bad={_fmt(comp_debug.get('outcome_bad_weight', float('nan')))}, "
+        f"amount_mem_label={int(_to_float(comp_debug.get('amount_outcome_memory_label_id', 0), 0))}, "
+        f"amount_mem_best={_fmt(comp_debug.get('amount_outcome_memory_best_ratio', float('nan')))}, "
+        f"amount_mem_score={_fmt(comp_debug.get('amount_outcome_memory_best_score', float('nan')))}, "
+        f"subtree_mem_score={_fmt(comp_debug.get('subtree_outcome_memory_score', float('nan')))}, "
+        f"subtree_mem_count={int(_to_float(comp_debug.get('subtree_outcome_memory_count', 0), 0))}, "
         f"surrogate_trust={_fmt(comp_debug.get('surrogate_trust_value', float('nan')))}, "
         f"stage_guard={bool(comp_debug.get('stage_switch_guard_used', False))}, "
         f"com_factor={_fmt(comp_debug.get('compression_loss_factor_effective', float('nan')))}, "

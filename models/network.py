@@ -15,6 +15,7 @@ from .utils.pointcloud.sparsepcgc_voxel import (
 from .modules.cause_aggregation import CauseDiagnosisAggregation
 from .modules.cost_attribution import CAUSE_NAMES, CostAttributionModule
 from .modules.octree_structure import OctreeStructureAnalysis
+from .modules.proposal_selector import AlgorithmicProposalSelector
 from .modules.structure_actuator import StructureRepairActuator
 from .modules.structure_policy import POLICY_NAMES, StructureRepairPolicy
 
@@ -68,6 +69,14 @@ class Network(nn.Module):
             hidden_dim=int(getattr(self.args, "repair_actuator_hidden_dim", 64)),
             args=self.args,
         )
+        proposal_amount_bins = getattr(self.args, "sparsepcgc_proposal_amount_bin_values", None)
+        if not isinstance(proposal_amount_bins, (list, tuple)) or not proposal_amount_bins:
+            proposal_amount_bins = (0.0, 0.015, 0.021, 0.026, 0.031, 0.038, 0.044, 0.05)
+        self.algorithmic_proposal_selector = AlgorithmicProposalSelector(
+            feature_dim=12,
+            hidden_dim=int(getattr(self.args, "sparsepcgc_proposal_selector_hidden_dim", 64)),
+            amount_bin_count=len(proposal_amount_bins),
+        )
 
         """旧モジュールセットアップ"""
         # self.prun_module = self.cost_attributor
@@ -106,6 +115,10 @@ class Network(nn.Module):
     """補助関数"""
     def discrete_policy_loss(self, reward): # 離散方策に対する方策勾配風の損失を返すための関数
         return reward.new_zeros(())
+
+    def score_algorithmic_proposal_subtrees(self, subtree_features):
+        """Score candidate subtrees for the algorithmic proposal selector path."""
+        return self.algorithmic_proposal_selector(subtree_features)
 
     def _normalize_coord_scale(self, pts_xyz, coord_scale): # 座標スケールと点群テンソルに合わせた形に整える補助関数
         if coord_scale is None:
@@ -2365,16 +2378,41 @@ class Network(nn.Module):
             "move_operation_gate",
             "operation_gate_logit",
             "operation_gate_prob",
+            "algorithmic_proposal_selector_enabled",
+            "algorithmic_proposal_selector_active",
+            "algorithmic_proposal_where_source_id",
+            "algorithmic_proposal_noop_selected",
+            "algorithmic_amount_selected_class",
+            "algorithmic_amount_selected_bin_ratio",
+            "algorithmic_amount_residual",
+            "algorithmic_amount_final_ratio",
+            "algorithmic_amount_noop_prob",
+            "algorithmic_amount_selected_prob",
+            "algorithmic_amount_teacher_class",
+            "algorithmic_amount_teacher_ratio",
+            "algorithmic_amount_selector_teacher_loss",
+            "algorithmic_amount_residual_teacher_loss",
             "hard_drop_target_ratio_source_id",
             "hard_drop_target_ratio_value",
             "hard_drop_target_ratio_network_value",
             "hard_drop_target_ratio_codec_prior_value",
             "post_warmup_amount_hybrid_applied",
             "post_warmup_amount_mode_id",
+            "post_warmup_amount_strategy_id",
             "post_warmup_amount_tail_phase",
             "post_warmup_amount_alpha",
             "post_warmup_amount_proposal_ratio",
             "post_warmup_amount_teacher_loss",
+            "post_warmup_amount_teacher_weight_effective",
+            "amount_explore_step",
+            "amount_explore_prob",
+            "amount_explore_candidate_ratio",
+            "amount_explore_candidate_index",
+            "amount_explore_teacher_ratio",
+            "amount_explore_teacher_count",
+            "amount_explore_teacher_score",
+            "amount_explore_teacher_alpha",
+            "amount_explore_used_teacher",
             "amount_mode_id",
             "amount_mode_network",
             "codec_prune_prior_base_ratio",
@@ -2946,6 +2984,12 @@ class Network(nn.Module):
                     "amount_mode_network",
                     "codec_block_budget_zero",
                     "codec_block_under_selected",
+                    "post_warmup_amount_hybrid_applied",
+                    "amount_explore_step",
+                    "amount_explore_used_teacher",
+                    "algorithmic_proposal_selector_enabled",
+                    "algorithmic_proposal_selector_active",
+                    "algorithmic_proposal_noop_selected",
                 ):
                     self.last_structure_debug[key] = bool(_actuator_scalar(key, 0.0) > 0.5)
                 for key in (
@@ -2966,10 +3010,35 @@ class Network(nn.Module):
                     "learned_drop_ratio_after_gate",
                     "learned_drop_ratio_value",
                     "effective_drop_ratio_for_hard_count",
+                    "algorithmic_proposal_where_source_id",
+                    "algorithmic_amount_selected_class",
+                    "algorithmic_amount_selected_bin_ratio",
+                    "algorithmic_amount_residual",
+                    "algorithmic_amount_final_ratio",
+                    "algorithmic_amount_noop_prob",
+                    "algorithmic_amount_selected_prob",
+                    "algorithmic_amount_teacher_class",
+                    "algorithmic_amount_teacher_ratio",
+                    "algorithmic_amount_selector_teacher_loss",
+                    "algorithmic_amount_residual_teacher_loss",
                     "hard_drop_target_ratio_source_id",
                     "hard_drop_target_ratio_value",
                     "hard_drop_target_ratio_network_value",
                     "hard_drop_target_ratio_codec_prior_value",
+                    "post_warmup_amount_strategy_id",
+                    "post_warmup_amount_mode_id",
+                    "post_warmup_amount_tail_phase",
+                    "post_warmup_amount_alpha",
+                    "post_warmup_amount_proposal_ratio",
+                    "post_warmup_amount_teacher_loss",
+                    "post_warmup_amount_teacher_weight_effective",
+                    "amount_explore_prob",
+                    "amount_explore_candidate_ratio",
+                    "amount_explore_candidate_index",
+                    "amount_explore_teacher_ratio",
+                    "amount_explore_teacher_count",
+                    "amount_explore_teacher_score",
+                    "amount_explore_teacher_alpha",
                     "amount_mode_id",
                     "network_prune_ratio_floor",
                     "network_prune_min_hard_count",

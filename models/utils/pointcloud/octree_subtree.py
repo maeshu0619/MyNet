@@ -227,6 +227,9 @@ def sample_train_subtree_depth(pts_xyz: torch.Tensor, args, global_step: int = 0
 def should_use_full_cloud_anchor(args, global_step: int = 0, cache_key: Optional[str] = None):
     """Return whether this step should train on the full cloud instead of one subtree."""
     step = int(global_step)
+    if bool(getattr(args, "train_full_cloud_anchor_every_step", False)):
+        return True, "train_full_cloud_anchor_every_step"
+
     actual_interval = max(int(getattr(args, "train_full_cloud_actual_interval", 0)), 0)
     if actual_interval > 0 and ((step + 1) % actual_interval) == 0:
         return True, "train_full_cloud_actual_interval"

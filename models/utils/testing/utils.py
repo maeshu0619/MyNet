@@ -834,6 +834,52 @@ def _run_full_cloud_inference(model, input_pcd, args, cache_key, use_cuda, use_a
     return result
 
 
+def _run_verified_proposal_inference(model, input_pcd, args, cache_key, use_cuda, use_amp, amp_dtype):
+    """
+    Proposal selector verified inference.
+
+    The forward path is intentionally the normal full-cloud proposal path.  When
+    actual-oracle / no-op guard debug is available, this wrapper rejects the
+    selected edit by returning the original cloud.  If no actual check was run,
+    it keeps the model output and marks verification as unavailable instead of
+    pretending the candidate was verified.
+    """
+    prev_mode = getattr(args, "sparsepcgc_proposal_inference_mode", "fast")
+    setattr(args, "sparsepcgc_proposal_inference_mode", "verified")
+    try:
+        result = _run_full_cloud_inference(model, input_pcd, args, cache_key, use_cuda, use_amp, amp_dtype)
+    finally:
+        setattr(args, "sparsepcgc_proposal_inference_mode", prev_mode)
+
+    structure_chunks = result.get("structure_debug_chunks", []) or []
+    structure_debug = structure_chunks[-1] if structure_chunks else {}
+
+    def _as_float(value, default=0.0):
+        try:
+            if torch.is_tensor(value):
+                return float(value.detach().reshape(-1)[0].cpu())
+            return float(value)
+        except Exception:
+            return float(default)
+
+    actual_eval_count = _as_float(structure_debug.get("actual_oracle_eval_count", 0.0), 0.0)
+    actual_delta = _as_float(structure_debug.get("actual_oracle_delta_actual_percent", 0.0), 0.0)
+    force_no_edit = bool(_as_float(structure_debug.get("actual_oracle_force_no_edit_used", 0.0), 0.0) > 0.5)
+    accept_threshold = float(getattr(args, "sparsepcgc_proposal_accept_threshold", 0.0))
+    verified_available = bool(actual_eval_count > 0.0 or force_no_edit)
+    reject_for_actual = bool(verified_available and (force_no_edit or actual_delta >= accept_threshold))
+
+    result["mode"] = "verified"
+    result["verified_noop_guard_used"] = bool(reject_for_actual)
+    result["verified_actual_available"] = bool(verified_available)
+    result["verified_actual_delta_percent"] = float(actual_delta)
+    if reject_for_actual:
+        result["gen_pts"] = input_pcd.contiguous()
+        result["final_w"] = input_pcd.new_ones((input_pcd.shape[0], 1, input_pcd.shape[-1]))
+        result["edit_ref_xyz"] = input_pcd[:, :3, :].contiguous()
+    return result
+
+
 def _run_subtree_merge_inference(model, input_pcd, args, cache_key, use_cuda, use_amp, amp_dtype, writer=None):
     input_xyz = input_pcd[:, :3, :]
     input_attr = _extract_input_attr(input_pcd)
@@ -1106,6 +1152,8 @@ def _legacy_inference_mode(args):
 def _run_named_inference_mode(mode_name, model, input_pcd, args, cache_key, use_cuda, use_amp, amp_dtype, writer=None):
     if mode_name == "legacy":
         mode_name = _legacy_inference_mode(args)
+    if mode_name == "verified":
+        return _run_verified_proposal_inference(model, input_pcd, args, cache_key, use_cuda, use_amp, amp_dtype)
     if mode_name == "full_cloud":
         return _run_full_cloud_inference(model, input_pcd, args, cache_key, use_cuda, use_amp, amp_dtype)
     if mode_name == "subtree_merge":

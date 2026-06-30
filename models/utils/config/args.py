@@ -82,6 +82,26 @@ def _cli_option_was_provided(option_name: str) -> bool:
     return any(arg == option_name or arg.startswith(prefix) for arg in sys.argv[1:])
 
 
+def _parse_csv_float_list(raw_value, default_values):
+    try:
+        if isinstance(raw_value, str):
+            tokens = [token.strip() for token in raw_value.split(",")]
+        elif isinstance(raw_value, (list, tuple)):
+            tokens = list(raw_value)
+        else:
+            tokens = []
+        values = []
+        for token in tokens:
+            if token in ("", None):
+                continue
+            values.append(float(token))
+        if values:
+            return values
+    except Exception:
+        pass
+    return [float(value) for value in default_values]
+
+
 def _default_checkpoint_path() -> str:
     preferred = _LOG_ROOT / pretrained_date / "MyNetwork_train" / "pretrained" / f"{pretrained_time}_{method_com}" / f"{model_name}.pth"
     if preferred.is_file():
@@ -370,6 +390,18 @@ def parse_pugan_args(parser, file_day, file_time):
         type=str,
         choices=['global_voxel_coords', 'full_global_voxel_coords', 'full_occupied_voxel_coords'],
         help='FullCloud anchorのnode数上限判定に使うfull_octree_context内の座標key',
+    )
+    parser.add_argument(
+        '--train_full_cloud_anchor_every_step',
+        default=False,
+        type=str2bool,
+        help='Trueならsubtree訓練中も毎Stepをfull-cloud anchorにする。全点群入力/全体文脈teacher確認用',
+    )
+    parser.add_argument(
+        '--train_full_cloud_anchor_every_step_shadow',
+        default=False,
+        type=str2bool,
+        help='毎Stepfull-cloud anchor時にもshadow subtree勾配経路を併走するか。Falseなら二重forwardを避けて高速化',
     )
     # Phase5 structure safety guard
     parser.add_argument(
@@ -844,7 +876,100 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument('--sparsepcgc_codec_prune_prior_ratio', default=0.05, type=float)
     parser.add_argument('--sparsepcgc_codec_prune_prior_logit_weight', default=6.0, type=float)
-    parser.add_argument('--sparsepcgc_codec_prune_prior_warmup_steps', default=200, type=int)
+    parser.add_argument('--sparsepcgc_codec_prune_prior_warmup_steps', default=0, type=int)
+    parser.add_argument(
+        '--sparsepcgc_algorithmic_proposal_selector',
+        default=True,
+        type=str2bool,
+        help='TrueならAlgorithmic Prune Proposal + Learned Subtree/Amount Selectorを使う',
+    )
+    parser.add_argument(
+        '--sparsepcgc_legacy_direct_actuator_train',
+        default=False,
+        type=str2bool,
+        help='Trueなら旧来のActuator直接Where/Amount訓練を使う。ablation用',
+    )
+    parser.add_argument(
+        '--sparsepcgc_algorithmic_amount_bins',
+        default='0.015,0.021,0.026,0.031,0.038,0.044,0.05',
+        type=str,
+        help='Algorithmic proposal selectorが選ぶAmount bin。no-opは暗黙のclass 0として別に持つ',
+    )
+    parser.add_argument(
+        '--sparsepcgc_algorithmic_amount_residual_scale',
+        default=0.0025,
+        type=float,
+        help='Amount binに足すNetwork residualの最大絶対値。0ならbinのみ',
+    )
+    parser.add_argument(
+        '--sparsepcgc_algorithmic_amount_selector_teacher_weight',
+        default=0.08,
+        type=float,
+        help='explore候補またはactual成功memoryをAmount selector class/residualへ蒸留する重み',
+    )
+    parser.add_argument(
+        '--sparsepcgc_algorithmic_amount_init_ratio',
+        default=0.03,
+        type=float,
+        help='Amount selectorの初期biasで優先するbin。warmup後の初期no-op固定を避ける',
+    )
+    parser.add_argument(
+        '--sparsepcgc_subtree_outcome_selector',
+        default=True,
+        type=str2bool,
+        help='TrueならSubtree potential scoreにactual outcome memoryを混ぜて選択する',
+    )
+    parser.add_argument(
+        '--sparsepcgc_subtree_outcome_selector_weight',
+        default=20.0,
+        type=float,
+        help='Subtree actual outcome memoryをSubtree選択scoreへ加える重み',
+    )
+    parser.add_argument(
+        '--sparsepcgc_subtree_outcome_memory_ema',
+        default=0.20,
+        type=float,
+        help='Subtree outcome memoryのEMA更新率',
+    )
+    parser.add_argument(
+        '--sparsepcgc_proposal_amount_bins',
+        default='0.0,0.015,0.021,0.026,0.031,0.038,0.044,0.05',
+        type=str,
+        help='Algorithmic proposal selector用Amount bin。0.0は明示no-op class',
+    )
+    parser.add_argument('--sparsepcgc_proposal_amount_residual_enable', default=True, type=str2bool)
+    parser.add_argument('--sparsepcgc_proposal_amount_residual_max', default=0.0025, type=float)
+    parser.add_argument('--sparsepcgc_proposal_topk_subtrees', default=5, type=int)
+    parser.add_argument('--sparsepcgc_proposal_max_apply_subtrees', default=3, type=int)
+    parser.add_argument('--sparsepcgc_proposal_eval_neighbor_amounts', default=True, type=str2bool)
+    parser.add_argument('--sparsepcgc_proposal_max_actual_candidates_per_step', default=12, type=int)
+    parser.add_argument('--sparsepcgc_proposal_use_surrogate_prefilter', default=True, type=str2bool)
+    parser.add_argument('--sparsepcgc_proposal_cls_loss_weight', default=1.0, type=float)
+    parser.add_argument('--sparsepcgc_proposal_value_loss_weight', default=0.5, type=float)
+    parser.add_argument('--sparsepcgc_proposal_rank_loss_weight', default=0.2, type=float)
+    parser.add_argument('--sparsepcgc_proposal_noop_margin', default=0.0, type=float)
+    parser.add_argument('--sparsepcgc_proposal_geom_penalty_weight', default=0.1, type=float)
+    parser.add_argument(
+        '--sparsepcgc_proposal_inference_mode',
+        default='fast',
+        choices=['fast', 'verified'],
+        type=str,
+        help='Algorithmic proposal推論。fastは予測のみ、verifiedは選択候補をactual確認して悪化ならno-op',
+    )
+    parser.add_argument('--sparsepcgc_proposal_accept_threshold', default=0.0, type=float)
+    parser.add_argument('--sparsepcgc_proposal_selector_hidden_dim', default=64, type=int)
+    parser.add_argument(
+        '--sparsepcgc_subtree_full_cloud_splice_loss',
+        default=True,
+        type=str2bool,
+        help='TrueならSubtree出力をfull-cloud OctreeへspliceしてからSparsePCGC圧縮損失を評価する',
+    )
+    parser.add_argument(
+        '--sparsepcgc_subtree_full_cloud_splice_geometry',
+        default=False,
+        type=str2bool,
+        help='Trueなら幾何損失もSubtree出力をfull-cloud点群へ戻した上で評価する。大点群ではChamferが重いため既定はFalse',
+    )
     parser.add_argument(
         '--sparsepcgc_warmup_force_codec_prior_amount',
         default=True,
@@ -994,13 +1119,13 @@ def parse_pugan_args(parser, file_day, file_time):
         '--sparsepcgc_post_warmup_amount_start_ratio',
         default=0.04,
         type=float,
-        help='warmup終了直後のAmount proposal。0.04なら4%から開始する',
+        help='warmup終了直後のAmount proposal。0.04なら4%%から開始する',
     )
     parser.add_argument(
         '--sparsepcgc_post_warmup_amount_end_ratio',
         default=0.006,
         type=float,
-        help='tail終了直前のAmount proposal。0.006なら0.6%まで緩やかに下げる',
+        help='tail終了直前のAmount proposal。0.006なら0.6%%まで緩やかに下げる',
     )
     parser.add_argument(
         '--sparsepcgc_post_warmup_amount_tail_steps',
@@ -1012,19 +1137,111 @@ def parse_pugan_args(parser, file_day, file_time):
         '--sparsepcgc_post_warmup_amount_max_alpha',
         default=0.65,
         type=float,
-        help='post-warmup Amount proposalを混ぜる最大割合。0.65なら最低35%はNetwork Amountを残す',
+        help='post-warmup Amount proposalを混ぜる最大割合。0.65なら最低35%%はNetwork Amountを残す',
     )
     parser.add_argument(
         '--sparsepcgc_post_warmup_amount_min_network_keep',
         default=0.30,
         type=float,
-        help='Amount hybrid時に最低限残すNetwork比率。0.30ならproposalが強くても30%はNetworkを残す',
+        help='Amount hybrid時に最低限残すNetwork比率。0.30ならproposalが強くても30%%はNetworkを残す',
     )
     parser.add_argument(
         '--sparsepcgc_post_warmup_amount_teacher_weight',
         default=0.08,
         type=float,
         help='post-warmup Amount targetをdrop_amount_headへ蒸留する補助loss重み',
+    )
+    parser.add_argument(
+        '--sparsepcgc_post_warmup_amount_strategy',
+        default='outcome_explore',
+        choices=['fixed_blend', 'outcome_explore', 'network'],
+        type=str,
+        help='warmup後のAmount制御。fixed_blendは旧固定tail、outcome_exploreはAmount候補探索+actual成功memory、networkは完全Network',
+    )
+    parser.add_argument(
+        '--sparsepcgc_amount_explore_ratios',
+        default='0.005,0.01,0.02,0.03,0.04,0.05',
+        type=str,
+        help='post-warmupで探索するPrune Amount候補。0.05は5%%',
+    )
+    parser.add_argument(
+        '--sparsepcgc_amount_explore_start_prob',
+        default=0.60,
+        type=float,
+        help='post-warmup直後にAmount探索Stepを入れる割合',
+    )
+    parser.add_argument(
+        '--sparsepcgc_amount_explore_end_prob',
+        default=0.20,
+        type=float,
+        help='長期訓練で残すAmount探索割合。0にしないことで探索を維持する',
+    )
+    parser.add_argument(
+        '--sparsepcgc_amount_explore_decay_steps',
+        default=5000,
+        type=int,
+        help='Amount探索割合をstart_probからend_probへ減衰させるstep数',
+    )
+    parser.add_argument(
+        '--sparsepcgc_amount_explore_period',
+        default=10,
+        type=int,
+        help='deterministic探索判定の周期。stepとsubtree keyから再現可能にする',
+    )
+    parser.add_argument(
+        '--sparsepcgc_amount_explore_prefer_high_until_success',
+        default=True,
+        type=str2bool,
+        help='成功memoryが少ない間は4〜5%%など高めAmountも一定頻度で試す',
+    )
+    parser.add_argument(
+        '--sparsepcgc_amount_outcome_memory',
+        default=True,
+        type=str2bool,
+        help='actual結果に基づきAmount候補ごとの成功/失敗EMAを保存する',
+    )
+    parser.add_argument(
+        '--sparsepcgc_amount_outcome_memory_ema',
+        default=0.20,
+        type=float,
+        help='Amount outcome memoryのEMA更新率',
+    )
+    parser.add_argument(
+        '--sparsepcgc_amount_outcome_good_margin',
+        default=0.25,
+        type=float,
+        help='actual percentがこの値より負ならAmount成功として扱う',
+    )
+    parser.add_argument(
+        '--sparsepcgc_amount_outcome_bad_margin',
+        default=0.25,
+        type=float,
+        help='actual percentがこの値より正ならAmount失敗として扱う',
+    )
+    parser.add_argument(
+        '--sparsepcgc_amount_memory_min_count_for_exploit',
+        default=1,
+        type=int,
+        help='success memoryをexploitに使うための最小成功回数',
+    )
+    parser.add_argument(
+        '--sparsepcgc_amount_success_teacher_weight',
+        default=0.08,
+        type=float,
+        help='actualで成功したAmount memoryへraw_learned_drop_ratioを寄せる補助loss重み',
+    )
+    parser.add_argument(
+        '--sparsepcgc_amount_success_teacher_max_alpha',
+        default=0.50,
+        type=float,
+        help='成功Amount memoryをhard targetへ混ぜる最大割合。固定化を避けるため1.0にしない',
+    )
+    parser.add_argument(
+        '--sparsepcgc_outcome_bad_amount_policy',
+        default='where_only',
+        choices=['where_only', 'success_guarded', 'legacy'],
+        type=str,
+        help='bad outcome時のAmount loss方針。where_onlyならAmountを下げずWhere負例だけ学習する',
     )
     parser.add_argument(
         '--sparsepcgc_codec_prior_distill_weight',
@@ -2706,7 +2923,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--save_test_ply', default=True, type=str2bool, help='test.pyで編集後PLYを保存するか')
     parser.add_argument('--test_drop_threshold', default=0.50, type=float, help='test.pyで点削除ゲートをhard化するしきい値。全点keep/全点dropになる場合はsum(final_w)ベースのexpected_keepへ自動フォールバック')
     parser.add_argument('--test_adjust_threshold', default=1e-6, type=float, help='test.pyで点が調整されたと数える最小移動距離')
-    parser.add_argument('--test_inference_mode', default='full_cloud', type=str, help='推論方法(auto/full_cloud/subtree_merge/patch/direct/legacy)')
+    parser.add_argument('--test_inference_mode', default='full_cloud', type=str, help='推論方法(auto/full_cloud/subtree_merge/patch/direct/legacy/verified)')
     parser.add_argument('--test_allow_subtree_merge', default=False, type=str2bool, help='Trueの時だけtest.pyでsubtree_merge推論を許可する')
     parser.add_argument('--test_auto_time_tolerance', default=0.10, type=float, help='auto選択で時間差がこの比率以内ならメモリ節約側を優先')
     parser.add_argument('--test_subtree_level', default=6, type=int, help='subtree_merge時に使うSubtree深さ(0ならtrain_subtree_level/repair_unit_level)')
@@ -3976,7 +4193,7 @@ def parse_pugan_args(parser, file_day, file_time):
         0.0,
     )
     args.sparsepcgc_codec_prune_prior_warmup_steps = max(
-        int(getattr(args, "sparsepcgc_codec_prune_prior_warmup_steps", 200)),
+        int(getattr(args, "sparsepcgc_codec_prune_prior_warmup_steps", 0)),
         0,
     )
     args.sparsepcgc_warmup_force_codec_prior_amount = bool(
@@ -4054,6 +4271,146 @@ def parse_pugan_args(parser, file_day, file_time):
         int(getattr(args, "sparsepcgc_hybrid_hard_action_period", 20)),
         1,
     )
+    args.sparsepcgc_legacy_direct_actuator_train = bool(
+        getattr(args, "sparsepcgc_legacy_direct_actuator_train", False)
+    )
+    args.sparsepcgc_algorithmic_proposal_selector = bool(
+        getattr(args, "sparsepcgc_algorithmic_proposal_selector", True)
+    )
+    if args.sparsepcgc_legacy_direct_actuator_train:
+        args.sparsepcgc_algorithmic_proposal_selector = False
+    default_algorithmic_amount_bins = (0.015, 0.021, 0.026, 0.031, 0.038, 0.044, 0.05)
+    parsed_algorithmic_bins = _parse_csv_float_list(
+        getattr(
+            args,
+            "sparsepcgc_algorithmic_amount_bins",
+            ",".join(str(v) for v in default_algorithmic_amount_bins),
+        ),
+        default_algorithmic_amount_bins,
+    )
+    normalized_algorithmic_bins = []
+    for ratio in parsed_algorithmic_bins:
+        try:
+            ratio_value = min(max(float(ratio), 0.0), 0.30)
+        except Exception:
+            continue
+        if ratio_value > 0.0:
+            normalized_algorithmic_bins.append(ratio_value)
+    if not normalized_algorithmic_bins:
+        normalized_algorithmic_bins = list(default_algorithmic_amount_bins)
+    normalized_algorithmic_bins = sorted(set(normalized_algorithmic_bins))
+    args.sparsepcgc_algorithmic_amount_bin_values = tuple(normalized_algorithmic_bins)
+    args.sparsepcgc_algorithmic_amount_bins = ",".join(
+        f"{value:.6f}".rstrip("0").rstrip(".") for value in normalized_algorithmic_bins
+    )
+    args.sparsepcgc_algorithmic_amount_residual_scale = min(
+        max(float(getattr(args, "sparsepcgc_algorithmic_amount_residual_scale", 0.005)), 0.0),
+        0.05,
+    )
+    args.sparsepcgc_algorithmic_amount_selector_teacher_weight = max(
+        float(getattr(args, "sparsepcgc_algorithmic_amount_selector_teacher_weight", 0.08)),
+        0.0,
+    )
+    args.sparsepcgc_algorithmic_amount_init_ratio = min(
+        max(float(getattr(args, "sparsepcgc_algorithmic_amount_init_ratio", 0.03)), 0.0),
+        0.30,
+    )
+    args.sparsepcgc_subtree_outcome_selector = bool(
+        getattr(args, "sparsepcgc_subtree_outcome_selector", True)
+    )
+    args.sparsepcgc_subtree_outcome_selector_weight = max(
+        float(getattr(args, "sparsepcgc_subtree_outcome_selector_weight", 20.0)),
+        0.0,
+    )
+    args.sparsepcgc_subtree_outcome_memory_ema = min(
+        max(float(getattr(args, "sparsepcgc_subtree_outcome_memory_ema", 0.20)), 1e-4),
+        1.0,
+    )
+    default_proposal_amount_bins = (0.0, 0.015, 0.021, 0.026, 0.031, 0.038, 0.044, 0.05)
+    parsed_proposal_bins = _parse_csv_float_list(
+        getattr(
+            args,
+            "sparsepcgc_proposal_amount_bins",
+            ",".join(str(v) for v in default_proposal_amount_bins),
+        ),
+        default_proposal_amount_bins,
+    )
+    normalized_proposal_bins = [0.0]
+    for ratio in parsed_proposal_bins:
+        try:
+            ratio_value = min(max(float(ratio), 0.0), 0.05)
+        except Exception:
+            continue
+        normalized_proposal_bins.append(ratio_value)
+    normalized_proposal_bins = sorted(set(normalized_proposal_bins))
+    args.sparsepcgc_proposal_amount_bin_values = tuple(normalized_proposal_bins)
+    args.sparsepcgc_proposal_amount_bins = ",".join(
+        f"{value:.6f}".rstrip("0").rstrip(".") if value != 0.0 else "0.0"
+        for value in normalized_proposal_bins
+    )
+    args.sparsepcgc_proposal_amount_residual_enable = bool(
+        getattr(args, "sparsepcgc_proposal_amount_residual_enable", True)
+    )
+    args.sparsepcgc_proposal_amount_residual_max = min(
+        max(float(getattr(args, "sparsepcgc_proposal_amount_residual_max", 0.0025)), 0.0),
+        0.01,
+    )
+    args.sparsepcgc_proposal_topk_subtrees = max(
+        int(getattr(args, "sparsepcgc_proposal_topk_subtrees", 5)),
+        1,
+    )
+    args.sparsepcgc_proposal_max_apply_subtrees = max(
+        int(getattr(args, "sparsepcgc_proposal_max_apply_subtrees", 3)),
+        1,
+    )
+    args.sparsepcgc_proposal_eval_neighbor_amounts = bool(
+        getattr(args, "sparsepcgc_proposal_eval_neighbor_amounts", True)
+    )
+    args.sparsepcgc_proposal_max_actual_candidates_per_step = max(
+        int(getattr(args, "sparsepcgc_proposal_max_actual_candidates_per_step", 12)),
+        1,
+    )
+    args.sparsepcgc_proposal_use_surrogate_prefilter = bool(
+        getattr(args, "sparsepcgc_proposal_use_surrogate_prefilter", True)
+    )
+    args.sparsepcgc_proposal_cls_loss_weight = max(
+        float(getattr(args, "sparsepcgc_proposal_cls_loss_weight", 1.0)),
+        0.0,
+    )
+    args.sparsepcgc_proposal_value_loss_weight = max(
+        float(getattr(args, "sparsepcgc_proposal_value_loss_weight", 0.5)),
+        0.0,
+    )
+    args.sparsepcgc_proposal_rank_loss_weight = max(
+        float(getattr(args, "sparsepcgc_proposal_rank_loss_weight", 0.2)),
+        0.0,
+    )
+    args.sparsepcgc_proposal_noop_margin = max(
+        float(getattr(args, "sparsepcgc_proposal_noop_margin", 0.0)),
+        0.0,
+    )
+    args.sparsepcgc_proposal_geom_penalty_weight = max(
+        float(getattr(args, "sparsepcgc_proposal_geom_penalty_weight", 0.1)),
+        0.0,
+    )
+    args.sparsepcgc_proposal_inference_mode = str(
+        getattr(args, "sparsepcgc_proposal_inference_mode", "fast")
+    ).strip().lower()
+    if args.sparsepcgc_proposal_inference_mode not in {"fast", "verified"}:
+        args.sparsepcgc_proposal_inference_mode = "fast"
+    args.sparsepcgc_proposal_accept_threshold = float(
+        getattr(args, "sparsepcgc_proposal_accept_threshold", 0.0)
+    )
+    args.sparsepcgc_proposal_selector_hidden_dim = max(
+        int(getattr(args, "sparsepcgc_proposal_selector_hidden_dim", 64)),
+        8,
+    )
+    args.sparsepcgc_subtree_full_cloud_splice_loss = bool(
+        getattr(args, "sparsepcgc_subtree_full_cloud_splice_loss", True)
+    )
+    args.sparsepcgc_subtree_full_cloud_splice_geometry = bool(
+        getattr(args, "sparsepcgc_subtree_full_cloud_splice_geometry", False)
+    )
     # ============================================================
     # Post-warmup Amount Hybrid 正規化
     # ============================================================
@@ -4091,6 +4448,87 @@ def parse_pugan_args(parser, file_day, file_time):
         float(getattr(args, "sparsepcgc_post_warmup_amount_teacher_weight", 0.08)),
         0.0,
     )
+    args.sparsepcgc_post_warmup_amount_strategy = str(
+        getattr(args, "sparsepcgc_post_warmup_amount_strategy", "outcome_explore")
+    ).strip().lower()
+    if args.sparsepcgc_post_warmup_amount_strategy not in {"fixed_blend", "outcome_explore", "network"}:
+        args.sparsepcgc_post_warmup_amount_strategy = "outcome_explore"
+    if (
+        not _cli_option_was_provided("--sparsepcgc_post_warmup_amount_strategy")
+        and _cli_option_was_provided("--sparsepcgc_post_warmup_amount_hybrid")
+        and not args.sparsepcgc_post_warmup_amount_hybrid
+    ):
+        args.sparsepcgc_post_warmup_amount_strategy = "network"
+    default_explore_ratios = (0.005, 0.01, 0.02, 0.03, 0.04, 0.05)
+    parsed_explore_ratios = _parse_csv_float_list(
+        getattr(args, "sparsepcgc_amount_explore_ratios", ",".join(str(v) for v in default_explore_ratios)),
+        default_explore_ratios,
+    )
+    normalized_explore_ratios = []
+    for ratio in parsed_explore_ratios:
+        try:
+            ratio_value = min(max(float(ratio), 0.0), 0.95)
+        except Exception:
+            continue
+        normalized_explore_ratios.append(ratio_value)
+    if not normalized_explore_ratios:
+        normalized_explore_ratios = list(default_explore_ratios)
+    normalized_explore_ratios = sorted(set(normalized_explore_ratios))
+    args.sparsepcgc_amount_explore_ratio_values = tuple(normalized_explore_ratios)
+    args.sparsepcgc_amount_explore_ratios = ",".join(f"{value:.6f}".rstrip("0").rstrip(".") for value in normalized_explore_ratios)
+    args.sparsepcgc_amount_explore_start_prob = min(
+        max(float(getattr(args, "sparsepcgc_amount_explore_start_prob", 0.60)), 0.0),
+        1.0,
+    )
+    args.sparsepcgc_amount_explore_end_prob = min(
+        max(float(getattr(args, "sparsepcgc_amount_explore_end_prob", 0.20)), 0.0),
+        1.0,
+    )
+    if args.sparsepcgc_amount_explore_end_prob > args.sparsepcgc_amount_explore_start_prob:
+        args.sparsepcgc_amount_explore_end_prob = args.sparsepcgc_amount_explore_start_prob
+    args.sparsepcgc_amount_explore_decay_steps = max(
+        int(getattr(args, "sparsepcgc_amount_explore_decay_steps", 5000)),
+        0,
+    )
+    args.sparsepcgc_amount_explore_period = max(
+        int(getattr(args, "sparsepcgc_amount_explore_period", 10)),
+        1,
+    )
+    args.sparsepcgc_amount_explore_prefer_high_until_success = bool(
+        getattr(args, "sparsepcgc_amount_explore_prefer_high_until_success", True)
+    )
+    args.sparsepcgc_amount_outcome_memory = bool(
+        getattr(args, "sparsepcgc_amount_outcome_memory", True)
+    )
+    args.sparsepcgc_amount_outcome_memory_ema = min(
+        max(float(getattr(args, "sparsepcgc_amount_outcome_memory_ema", 0.20)), 1e-4),
+        1.0,
+    )
+    args.sparsepcgc_amount_outcome_good_margin = max(
+        float(getattr(args, "sparsepcgc_amount_outcome_good_margin", 0.25)),
+        0.0,
+    )
+    args.sparsepcgc_amount_outcome_bad_margin = max(
+        float(getattr(args, "sparsepcgc_amount_outcome_bad_margin", 0.25)),
+        0.0,
+    )
+    args.sparsepcgc_amount_memory_min_count_for_exploit = max(
+        int(getattr(args, "sparsepcgc_amount_memory_min_count_for_exploit", 1)),
+        1,
+    )
+    args.sparsepcgc_amount_success_teacher_weight = max(
+        float(getattr(args, "sparsepcgc_amount_success_teacher_weight", 0.08)),
+        0.0,
+    )
+    args.sparsepcgc_amount_success_teacher_max_alpha = min(
+        max(float(getattr(args, "sparsepcgc_amount_success_teacher_max_alpha", 0.50)), 0.0),
+        1.0,
+    )
+    args.sparsepcgc_outcome_bad_amount_policy = str(
+        getattr(args, "sparsepcgc_outcome_bad_amount_policy", "where_only")
+    ).strip().lower()
+    if args.sparsepcgc_outcome_bad_amount_policy not in {"where_only", "success_guarded", "legacy"}:
+        args.sparsepcgc_outcome_bad_amount_policy = "where_only"
     args.sparsepcgc_codec_prior_distill_weight = max(
         float(getattr(args, "sparsepcgc_codec_prior_distill_weight", 0.05)),
         0.0,
@@ -5115,9 +5553,9 @@ def parse_pugan_args(parser, file_day, file_time):
     args.patch_batch_size = max(int(args.patch_batch_size), 1)
 
     args.test_inference_mode = str(getattr(args, "test_inference_mode", "auto")).strip().lower()
-    if args.test_inference_mode not in {"auto", "full_cloud", "subtree_merge", "patch", "direct", "legacy"}:
+    if args.test_inference_mode not in {"auto", "full_cloud", "subtree_merge", "patch", "direct", "legacy", "verified"}:
         raise ValueError(
-            "--test_inference_mode must be one of: auto, full_cloud, subtree_merge, patch, direct, legacy "
+            "--test_inference_mode must be one of: auto, full_cloud, subtree_merge, patch, direct, legacy, verified "
             f"(got {args.test_inference_mode})"
         )
     args.test_auto_time_tolerance = min(max(float(getattr(args, "test_auto_time_tolerance", 0.10)), 0.0), 1.0)
@@ -5146,6 +5584,12 @@ def parse_pugan_args(parser, file_day, file_time):
     args.train_patch_subset_anchor_interval = int(getattr(args, "train_patch_subset_anchor_interval", 0))
     if args.train_patch_subset_anchor_interval < 0:
         raise ValueError("--train_patch_subset_anchor_interval must be >= 0")
+    args.train_full_cloud_anchor_every_step = bool(
+        getattr(args, "train_full_cloud_anchor_every_step", False)
+    )
+    args.train_full_cloud_anchor_every_step_shadow = bool(
+        getattr(args, "train_full_cloud_anchor_every_step_shadow", False)
+    )
     args.train_full_cloud_actual_interval = int(getattr(args, "train_full_cloud_actual_interval", 0))
     if args.train_full_cloud_actual_interval < 0:
         raise ValueError("--train_full_cloud_actual_interval must be >= 0")

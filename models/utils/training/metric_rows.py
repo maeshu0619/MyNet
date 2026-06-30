@@ -100,6 +100,50 @@ def build_compression_metric_row(
         "actual_formula_mismatch": actual_formula_mismatch,
         "actual_value_is_oracle_override": bool(oracle_override_used),
         "actual_value_matches_policy_output": actual_value_matches_policy_output,
+        "proposal_selector_enabled": bool(comp_debug.get("proposal_selector_enabled", False)),
+        "proposal_candidate_count": case_int(comp_debug.get("proposal_candidate_count", 0), 0),
+        "proposal_actual_eval_count": case_int(comp_debug.get("proposal_actual_eval_count", 0), 0),
+        "proposal_surrogate_prefilter_count": case_int(
+            comp_debug.get("proposal_surrogate_prefilter_count", 0),
+            0,
+        ),
+        "proposal_applied_subtree_count": case_int(
+            comp_debug.get("proposal_applied_subtree_count", 0),
+            0,
+        ),
+        "proposal_selected_subtree_count": case_int(
+            comp_debug.get("proposal_selected_subtree_count", 0),
+            0,
+        ),
+        "proposal_noop_count": case_int(comp_debug.get("proposal_noop_count", 0), 0),
+        "proposal_best_actual_percent": case_float(
+            comp_debug.get("proposal_best_actual_percent", float("nan")),
+            float("nan"),
+        ),
+        "proposal_chosen_actual_percent": case_float(
+            comp_debug.get("proposal_chosen_actual_percent", float("nan")),
+            float("nan"),
+        ),
+        "proposal_predicted_delta": case_float(
+            comp_debug.get("proposal_predicted_delta", float("nan")),
+            float("nan"),
+        ),
+        "proposal_amount_bin": case_float(comp_debug.get("proposal_amount_bin", float("nan")), float("nan")),
+        "proposal_amount_residual": case_float(
+            comp_debug.get("proposal_amount_residual", float("nan")),
+            float("nan"),
+        ),
+        "proposal_final_amount": case_float(
+            comp_debug.get("proposal_final_amount", float("nan")),
+            float("nan"),
+        ),
+        "proposal_cls_loss": case_float(comp_debug.get("proposal_cls_loss", float("nan")), float("nan")),
+        "proposal_value_loss": case_float(comp_debug.get("proposal_value_loss", float("nan")), float("nan")),
+        "proposal_rank_loss": case_float(comp_debug.get("proposal_rank_loss", float("nan")), float("nan")),
+        "proposal_geom_loss": case_float(comp_debug.get("proposal_geom_loss", float("nan")), float("nan")),
+        "proposal_total_loss": case_float(comp_debug.get("proposal_total_loss", float("nan")), float("nan")),
+        "proposal_teacher_source": str(comp_debug.get("proposal_teacher_source", "")),
+        "verified_noop_guard_used": bool(comp_debug.get("verified_noop_guard_used", False)),
         "actual_total_bit_percent_fresh": actual_delta if fresh_actual else None,
         "actual_total_bit_percent_cached": actual_delta if cached_actual else None,
         "full_cloud_actual_bit_percent": case_float(comp_debug.get("full_cloud_actual_bit_percent", float("nan")), float("nan")),
@@ -125,6 +169,14 @@ def build_compression_metric_row(
         "subtree_actual_bit_percent": case_float(comp_debug.get("subtree_actual_bit_percent", float("nan")), float("nan")),
         "local_proxy_percent": case_float(comp_debug.get("local_proxy_percent", float("nan")), float("nan")),
         "actual_scope": str(comp_debug.get("actual_scope", "")),
+        "full_cloud_splice_geometry_used": bool(comp_debug.get("full_cloud_splice_geometry_used", False)),
+        "full_cloud_splice_actual_used": bool(comp_debug.get("full_cloud_splice_actual_used", False)),
+        "full_cloud_splice_actual_fallback": bool(comp_debug.get("full_cloud_splice_actual_fallback", False)),
+        "full_cloud_splice_actual_reason": str(comp_debug.get("full_cloud_splice_actual_reason", "")),
+        "full_cloud_splice_actual_points": case_int(comp_debug.get("full_cloud_splice_actual_points", 0), 0),
+        "full_cloud_splice_full_voxels": case_int(comp_debug.get("full_cloud_splice_full_voxels", 0), 0),
+        "full_cloud_splice_subtree_before_voxels": case_int(comp_debug.get("full_cloud_splice_subtree_before_voxels", 0), 0),
+        "full_cloud_splice_subtree_after_voxels": case_int(comp_debug.get("full_cloud_splice_subtree_after_voxels", 0), 0),
         "teacher_scope": str(comp_debug.get("teacher_scope", "")),
         "full_cloud_actual_primary_used": bool(comp_debug.get("full_cloud_actual_primary_used", False)),
         "full_cloud_actual_primary_forward_value": case_float(comp_debug.get("full_cloud_actual_primary_forward_value", float("nan")), float("nan")),
@@ -201,6 +253,22 @@ def build_compression_metric_row(
         "bad_amount_loss_disabled_no_success_memory": bool(
             comp_debug.get("bad_amount_loss_disabled_no_success_memory", False)
         ),
+        "outcome_bad_amount_policy_id": case_int(comp_debug.get("outcome_bad_amount_policy_id", 0), 0),
+        "amount_outcome_memory_saved": bool(comp_debug.get("amount_outcome_memory_saved", False)),
+        "amount_outcome_memory_label_id": case_int(comp_debug.get("amount_outcome_memory_label_id", 0), 0),
+        "amount_outcome_memory_used_ratio": case_float(comp_debug.get("amount_outcome_memory_used_ratio", float("nan")), float("nan")),
+        "amount_outcome_memory_bucket_ratio": case_float(comp_debug.get("amount_outcome_memory_bucket_ratio", float("nan")), float("nan")),
+        "amount_outcome_memory_best_ratio": case_float(comp_debug.get("amount_outcome_memory_best_ratio", float("nan")), float("nan")),
+        "amount_outcome_memory_best_score": case_float(comp_debug.get("amount_outcome_memory_best_score", float("nan")), float("nan")),
+        "amount_outcome_memory_best_count": case_int(comp_debug.get("amount_outcome_memory_best_count", 0), 0),
+        "amount_outcome_memory_good_count": case_int(comp_debug.get("amount_outcome_memory_good_count", 0), 0),
+        "amount_outcome_memory_bad_count": case_int(comp_debug.get("amount_outcome_memory_bad_count", 0), 0),
+        "amount_outcome_memory_entry_count": case_int(comp_debug.get("amount_outcome_memory_entry_count", 0), 0),
+        "subtree_outcome_memory_saved": bool(comp_debug.get("subtree_outcome_memory_saved", False)),
+        "subtree_outcome_memory_score": case_float(comp_debug.get("subtree_outcome_memory_score", float("nan")), float("nan")),
+        "subtree_outcome_memory_count": case_int(comp_debug.get("subtree_outcome_memory_count", 0), 0),
+        "subtree_outcome_memory_good_count": case_int(comp_debug.get("subtree_outcome_memory_good_count", 0), 0),
+        "subtree_outcome_memory_bad_count": case_int(comp_debug.get("subtree_outcome_memory_bad_count", 0), 0),
         "surrogate_trust_gate_used": bool(comp_debug.get("surrogate_trust_gate_used", False)),
         "surrogate_bit_error_for_trust": case_float(comp_debug.get("surrogate_bit_error_for_trust", float("nan")), float("nan")),
         "surrogate_trust_value": case_float(comp_debug.get("surrogate_trust_value", 1.0), 1.0),
@@ -997,6 +1065,116 @@ def build_operation_metric_row(
         "actual_oracle_has_drop": bool(structure_debug.get("actual_oracle_has_drop", False)),
         "prune_after_prior_mode": str(structure_debug.get("prune_after_prior_mode", "")),
         "phase0_network_prune_mode": bool(structure_debug.get("phase0_network_prune_mode", False)),
+        "algorithmic_proposal_selector_enabled": bool(
+            structure_debug.get("algorithmic_proposal_selector_enabled", False)
+        ),
+        "algorithmic_proposal_selector_active": bool(
+            structure_debug.get("algorithmic_proposal_selector_active", False)
+        ),
+        "algorithmic_proposal_where_source_id": case_int(
+            structure_debug.get("algorithmic_proposal_where_source_id", 0),
+            0,
+        ),
+        "algorithmic_proposal_noop_selected": bool(
+            structure_debug.get("algorithmic_proposal_noop_selected", False)
+        ),
+        "algorithmic_amount_selected_class": case_int(
+            structure_debug.get("algorithmic_amount_selected_class", -1),
+            -1,
+        ),
+        "algorithmic_amount_selected_bin_ratio": case_float(
+            structure_debug.get("algorithmic_amount_selected_bin_ratio", float("nan")),
+            float("nan"),
+        ),
+        "algorithmic_amount_residual": case_float(
+            structure_debug.get("algorithmic_amount_residual", float("nan")),
+            float("nan"),
+        ),
+        "algorithmic_amount_final_ratio": case_float(
+            structure_debug.get("algorithmic_amount_final_ratio", float("nan")),
+            float("nan"),
+        ),
+        "algorithmic_amount_noop_prob": case_float(
+            structure_debug.get("algorithmic_amount_noop_prob", float("nan")),
+            float("nan"),
+        ),
+        "algorithmic_amount_selected_prob": case_float(
+            structure_debug.get("algorithmic_amount_selected_prob", float("nan")),
+            float("nan"),
+        ),
+        "algorithmic_amount_teacher_class": case_int(
+            structure_debug.get("algorithmic_amount_teacher_class", -1),
+            -1,
+        ),
+        "algorithmic_amount_teacher_ratio": case_float(
+            structure_debug.get("algorithmic_amount_teacher_ratio", float("nan")),
+            float("nan"),
+        ),
+        "algorithmic_amount_selector_teacher_loss": case_float(
+            structure_debug.get("algorithmic_amount_selector_teacher_loss", float("nan")),
+            float("nan"),
+        ),
+        "algorithmic_amount_residual_teacher_loss": case_float(
+            structure_debug.get("algorithmic_amount_residual_teacher_loss", float("nan")),
+            float("nan"),
+        ),
+        "proposal_selector_enabled": bool(
+            comp_debug.get(
+                "proposal_selector_enabled",
+                structure_debug.get("proposal_selector_enabled", False),
+            )
+        ),
+        "proposal_candidate_count": case_int(comp_debug.get("proposal_candidate_count", 0), 0),
+        "proposal_actual_eval_count": case_int(comp_debug.get("proposal_actual_eval_count", 0), 0),
+        "proposal_surrogate_prefilter_count": case_int(
+            comp_debug.get("proposal_surrogate_prefilter_count", 0),
+            0,
+        ),
+        "proposal_applied_subtree_count": case_int(
+            comp_debug.get("proposal_applied_subtree_count", 0),
+            0,
+        ),
+        "proposal_selected_subtree_count": case_int(
+            comp_debug.get("proposal_selected_subtree_count", 0),
+            0,
+        ),
+        "proposal_noop_count": case_int(comp_debug.get("proposal_noop_count", 0), 0),
+        "proposal_best_actual_percent": case_float(
+            comp_debug.get("proposal_best_actual_percent", float("nan")),
+            float("nan"),
+        ),
+        "proposal_chosen_actual_percent": case_float(
+            comp_debug.get("proposal_chosen_actual_percent", float("nan")),
+            float("nan"),
+        ),
+        "proposal_predicted_delta": case_float(
+            comp_debug.get("proposal_predicted_delta", float("nan")),
+            float("nan"),
+        ),
+        "proposal_amount_bin": case_float(comp_debug.get("proposal_amount_bin", float("nan")), float("nan")),
+        "proposal_amount_residual": case_float(
+            comp_debug.get("proposal_amount_residual", float("nan")),
+            float("nan"),
+        ),
+        "proposal_final_amount": case_float(
+            comp_debug.get("proposal_final_amount", float("nan")),
+            float("nan"),
+        ),
+        "proposal_cls_loss": case_float(comp_debug.get("proposal_cls_loss", float("nan")), float("nan")),
+        "proposal_value_loss": case_float(comp_debug.get("proposal_value_loss", float("nan")), float("nan")),
+        "proposal_rank_loss": case_float(comp_debug.get("proposal_rank_loss", float("nan")), float("nan")),
+        "proposal_geom_loss": case_float(comp_debug.get("proposal_geom_loss", float("nan")), float("nan")),
+        "proposal_total_loss": case_float(comp_debug.get("proposal_total_loss", float("nan")), float("nan")),
+        "proposal_teacher_source": str(comp_debug.get("proposal_teacher_source", "")),
+        "verified_noop_guard_used": bool(comp_debug.get("verified_noop_guard_used", False)),
+        "full_cloud_splice_geometry_used": bool(comp_debug.get("full_cloud_splice_geometry_used", False)),
+        "full_cloud_splice_actual_used": bool(comp_debug.get("full_cloud_splice_actual_used", False)),
+        "full_cloud_splice_actual_fallback": bool(comp_debug.get("full_cloud_splice_actual_fallback", False)),
+        "full_cloud_splice_actual_reason": str(comp_debug.get("full_cloud_splice_actual_reason", "")),
+        "full_cloud_splice_actual_points": case_int(comp_debug.get("full_cloud_splice_actual_points", 0), 0),
+        "full_cloud_splice_full_voxels": case_int(comp_debug.get("full_cloud_splice_full_voxels", 0), 0),
+        "full_cloud_splice_subtree_before_voxels": case_int(comp_debug.get("full_cloud_splice_subtree_before_voxels", 0), 0),
+        "full_cloud_splice_subtree_after_voxels": case_int(comp_debug.get("full_cloud_splice_subtree_after_voxels", 0), 0),
         "actual_gate_prune_enabled": bool(structure_debug.get("actual_gate_prune_enabled", False)),
         "actual_gate_prune_allowed": bool(structure_debug.get("actual_gate_prune_allowed", False)),
         "hard_prune_actual_allowed": bool(structure_debug.get("hard_prune_actual_allowed", structure_debug.get("actual_gate_prune_allowed", False))),
@@ -1066,6 +1244,10 @@ def build_operation_metric_row(
             structure_debug.get("post_warmup_amount_mode_id", 0),
             0,
         ),
+        "post_warmup_amount_strategy_id": case_int(
+            structure_debug.get("post_warmup_amount_strategy_id", 0),
+            0,
+        ),
         "post_warmup_amount_tail_phase": case_float(
             structure_debug.get("post_warmup_amount_tail_phase", float("nan")),
             float("nan"),
@@ -1081,6 +1263,42 @@ def build_operation_metric_row(
         "post_warmup_amount_teacher_loss": case_float(
             structure_debug.get("post_warmup_amount_teacher_loss", float("nan")),
             float("nan"),
+        ),
+        "post_warmup_amount_teacher_weight_effective": case_float(
+            structure_debug.get("post_warmup_amount_teacher_weight_effective", float("nan")),
+            float("nan"),
+        ),
+        "amount_explore_step": bool(structure_debug.get("amount_explore_step", False)),
+        "amount_explore_prob": case_float(
+            structure_debug.get("amount_explore_prob", float("nan")),
+            float("nan"),
+        ),
+        "amount_explore_candidate_ratio": case_float(
+            structure_debug.get("amount_explore_candidate_ratio", float("nan")),
+            float("nan"),
+        ),
+        "amount_explore_candidate_index": case_int(
+            structure_debug.get("amount_explore_candidate_index", -1),
+            -1,
+        ),
+        "amount_explore_teacher_ratio": case_float(
+            structure_debug.get("amount_explore_teacher_ratio", float("nan")),
+            float("nan"),
+        ),
+        "amount_explore_teacher_count": case_int(
+            structure_debug.get("amount_explore_teacher_count", 0),
+            0,
+        ),
+        "amount_explore_teacher_score": case_float(
+            structure_debug.get("amount_explore_teacher_score", float("nan")),
+            float("nan"),
+        ),
+        "amount_explore_teacher_alpha": case_float(
+            structure_debug.get("amount_explore_teacher_alpha", float("nan")),
+            float("nan"),
+        ),
+        "amount_explore_used_teacher": bool(
+            structure_debug.get("amount_explore_used_teacher", False)
         ),
         "amount_mode_id": case_int(structure_debug.get("amount_mode_id", 0), 0),
         "amount_mode_network": bool(structure_debug.get("amount_mode_network", False)),

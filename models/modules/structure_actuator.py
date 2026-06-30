@@ -1,3 +1,4 @@
+import hashlib
 import math
 import time
 
@@ -78,6 +79,14 @@ class StructureRepairActuator(nn.Module):
         )
         # Pruneの実行量をActuator特徴から推定し、削除割合も学習対象にする。
         self.drop_amount_head = nn.Conv1d(in_channels, 1, 1)
+        algorithmic_amount_bins = self._algorithmic_amount_bin_values_from_args(args)
+        self.algorithmic_amount_bin_count = max(int(len(algorithmic_amount_bins)), 1)
+        self.algorithmic_amount_selector_head = nn.Sequential(
+            nn.Conv1d(in_channels, hidden_dim, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(hidden_dim, self.algorithmic_amount_bin_count + 1, 1),
+        )
+        self.algorithmic_amount_residual_head = nn.Conv1d(in_channels, 1, 1)
         # Addの実行量をActuator特徴から推定し、固定比率に張り付かないようにする。
         self.add_amount_head = nn.Conv1d(in_channels, 1, 1)
         # Adjustの実行量をActuator特徴から推定し、source選択数も学習対象にする。
@@ -90,6 +99,23 @@ class StructureRepairActuator(nn.Module):
         nn.init.zeros_(self.add_voxel_head[-1].bias)
         nn.init.zeros_(self.operation_gate_head[-1].weight)
         nn.init.zeros_(self.subtree_move_source_head[-1].weight)
+        nn.init.zeros_(self.algorithmic_amount_selector_head[-1].weight)
+        nn.init.zeros_(self.algorithmic_amount_selector_head[-1].bias)
+        init_selector_ratio = min(
+            max(float(getattr(self.args, "sparsepcgc_algorithmic_amount_init_ratio", 0.03)), 0.0),
+            0.30,
+        )
+        init_selector_class = 1
+        if algorithmic_amount_bins:
+            init_selector_class = 1 + min(
+                range(len(algorithmic_amount_bins)),
+                key=lambda idx: abs(float(algorithmic_amount_bins[idx]) - init_selector_ratio),
+            )
+        nn.init.constant_(self.algorithmic_amount_selector_head[-1].bias[0], -1.0)
+        if 0 <= init_selector_class < int(self.algorithmic_amount_selector_head[-1].bias.numel()):
+            nn.init.constant_(self.algorithmic_amount_selector_head[-1].bias[init_selector_class], 1.0)
+        nn.init.zeros_(self.algorithmic_amount_residual_head.weight)
+        nn.init.zeros_(self.algorithmic_amount_residual_head.bias)
         nn.init.normal_(self.drop_amount_head.weight, mean=0.0, std=1e-3)
         nn.init.normal_(self.add_amount_head.weight, mean=0.0, std=1e-3)
         nn.init.normal_(self.move_amount_head.weight, mean=0.0, std=1e-3)
@@ -883,6 +909,14 @@ class StructureRepairActuator(nn.Module):
             )
         )
 
+    def _algorithmic_proposal_selector_enabled(self):
+        return bool(
+            self.training
+            and bool(getattr(self.args, "sparsepcgc_algorithmic_proposal_selector", True))
+            and not bool(getattr(self.args, "sparsepcgc_legacy_direct_actuator_train", False))
+            and not self._direct_network_prune_mode()
+        )
+
     def _network_prune_floor_ratio(self, max_drop_ratio):
         if not self.training:
             return 0.0
@@ -938,6 +972,91 @@ class StructureRepairActuator(nn.Module):
             and self._prune_after_prior_mode() == "network"
             and float(codec_prune_prior_phase) <= 0.0
         )
+
+    def _post_warmup_amount_strategy(self):
+        strategy = str(
+            getattr(self.args, "sparsepcgc_post_warmup_amount_strategy", "outcome_explore")
+        ).strip().lower()
+        if strategy not in {"fixed_blend", "outcome_explore", "network"}:
+            return "outcome_explore"
+        return strategy
+
+    def _amount_explore_ratio_values(self):
+        raw_values = getattr(self.args, "sparsepcgc_amount_explore_ratio_values", None)
+        values = []
+        if isinstance(raw_values, (list, tuple)):
+            for value in raw_values:
+                try:
+                    ratio = float(value)
+                except Exception:
+                    continue
+                if math.isfinite(ratio):
+                    values.append(ratio)
+        if not values:
+            values = [0.005, 0.01, 0.02, 0.03, 0.04, 0.05]
+        values = sorted(set(min(max(float(value), 0.0), 0.95) for value in values))
+        return values
+
+    @staticmethod
+    def _algorithmic_amount_bin_values_from_args(args):
+        raw_values = getattr(args, "sparsepcgc_algorithmic_amount_bin_values", None)
+        values = []
+        if isinstance(raw_values, (list, tuple)):
+            for value in raw_values:
+                try:
+                    ratio = float(value)
+                except Exception:
+                    continue
+                if math.isfinite(ratio) and ratio > 0.0:
+                    values.append(min(max(float(ratio), 0.0), 0.30))
+        if not values:
+            raw_text = str(getattr(args, "sparsepcgc_algorithmic_amount_bins", "") or "")
+            for item in raw_text.replace(";", ",").split(","):
+                try:
+                    ratio = float(item.strip())
+                except Exception:
+                    continue
+                if math.isfinite(ratio) and ratio > 0.0:
+                    values.append(min(max(float(ratio), 0.0), 0.30))
+        if not values:
+            proposal_values = getattr(args, "sparsepcgc_proposal_amount_bin_values", None)
+            if isinstance(proposal_values, (list, tuple)):
+                for value in proposal_values:
+                    try:
+                        ratio = float(value)
+                    except Exception:
+                        continue
+                    if math.isfinite(ratio) and ratio > 0.0:
+                        values.append(min(max(float(ratio), 0.0), 0.05))
+        if not values:
+            values = [0.015, 0.021, 0.026, 0.031, 0.038, 0.044, 0.05]
+        return sorted(set(values))
+
+    def _algorithmic_amount_bin_values(self, max_drop_ratio, device, dtype):
+        values = self._algorithmic_amount_bin_values_from_args(self.args)
+        values = values[: int(getattr(self, "algorithmic_amount_bin_count", len(values)))]
+        if not values:
+            values = [0.03]
+        values = [min(max(float(value), 0.0), float(max_drop_ratio)) for value in values]
+        return torch.tensor(values, device=device, dtype=dtype)
+
+    @staticmethod
+    def _nearest_amount_bin_class(bin_values, ratio_value):
+        if not torch.is_tensor(bin_values) or int(bin_values.numel()) <= 0:
+            return 0
+        try:
+            ratio_value = float(ratio_value)
+        except Exception:
+            return 0
+        if not math.isfinite(ratio_value) or ratio_value <= 0.0:
+            return 0
+        idx = torch.argmin(torch.abs(bin_values.detach().float().cpu() - float(ratio_value))).item()
+        return int(idx) + 1
+
+    def _deterministic_step_hash(self, *parts):
+        text = "|".join(str(part) for part in parts)
+        digest = hashlib.sha1(text.encode("utf-8")).hexdigest()
+        return int(digest[:16], 16)
 
     def _max_offset(self, pts_xyz, coord_scale):
         raw_max = float(getattr(self.args, "max_repair_offset", getattr(self.args, "max_disp_offset", 0.002)))
@@ -3038,6 +3157,16 @@ class StructureRepairActuator(nn.Module):
         warmup_force_codec_prior_amount = bool(
             getattr(self.args, "sparsepcgc_warmup_force_codec_prior_amount", True)
         )
+        algorithmic_proposal_selector_enabled = bool(
+            self._algorithmic_proposal_selector_enabled()
+            and prune_enabled
+            and codec_prune_prior_enabled
+        )
+        algorithmic_proposal_selector_active = bool(
+            algorithmic_proposal_selector_enabled
+            and float(codec_prune_prior_phase) <= 0.0
+        )
+        algorithmic_proposal_where_source_id = 1 if algorithmic_proposal_selector_active else 0
 
         if amount_mode == "network":
             # warmup中だけprior量を使う。
@@ -3057,8 +3186,11 @@ class StructureRepairActuator(nn.Module):
 
         # Phase0以降は learned_drop_ratio_before_gate を使い、
         # operation gateでAmountがさらに潰れる経路を避ける。
+        # Algorithmic proposal selectorではoperation gateをno-op選択として扱う。
         network_effective_drop_ratio_for_hard_count = (
-            learned_drop_ratio_before_gate if phase0_network_prune_mode else learned_drop_ratio_after_gate
+            learned_drop_ratio_after_gate
+            if algorithmic_proposal_selector_active
+            else (learned_drop_ratio_before_gate if phase0_network_prune_mode else learned_drop_ratio_after_gate)
         )
         effective_drop_ratio_for_hard_count = network_effective_drop_ratio_for_hard_count
         hard_drop_target_ratio_source = "network_amount_phase0" if phase0_network_prune_mode else "network_amount"
@@ -3067,19 +3199,117 @@ class StructureRepairActuator(nn.Module):
         codec_prior_amount_blend_applied = False
         codec_prior_amount_blend_alpha_value = 0.0
         codec_prior_amount_distill_loss = pts_xyz.new_zeros(())
-        # ============================================================
-        # Post-warmup Amount Hybrid 初期値
-        # ============================================================
-        # warmup終了後にAmountがNetworkだけへ移行して0.2%付近に潰れる問題を防ぐ。
-        # ここではforwardのhard countだけをproposalで下支えし、
-        # backwardはNetwork Amountへ流す。
-        # ============================================================
         post_warmup_amount_hybrid_applied = False
         post_warmup_amount_mode_id = 0
+        post_warmup_amount_strategy_id = 0
         post_warmup_amount_tail_phase_value = 0.0
         post_warmup_amount_alpha_value = 0.0
         post_warmup_amount_proposal_ratio_value = 0.0
         post_warmup_amount_teacher_loss = pts_xyz.new_zeros(())
+        post_warmup_amount_teacher_weight_effective = float(
+            getattr(self.args, "sparsepcgc_post_warmup_amount_teacher_weight", 0.08)
+        )
+        amount_explore_step = False
+        amount_explore_prob_value = 0.0
+        amount_explore_candidate_ratio_value = 0.0
+        amount_explore_candidate_index_value = -1
+        amount_explore_teacher_ratio_value = float("nan")
+        amount_explore_teacher_count_value = 0.0
+        amount_explore_teacher_score_value = float("nan")
+        amount_explore_teacher_alpha_value = 0.0
+        amount_explore_used_teacher = False
+        algorithmic_amount_selector_logits = self.algorithmic_amount_selector_head(
+            actuator_features
+        ).mean(dim=2)
+        algorithmic_amount_selector_prob = torch.softmax(
+            algorithmic_amount_selector_logits.float(),
+            dim=1,
+        ).to(dtype=actuator_features.dtype)
+        algorithmic_amount_selected_class_t = torch.argmax(
+            algorithmic_amount_selector_prob.detach(),
+            dim=1,
+        )
+        algorithmic_amount_selected_class_value = int(
+            algorithmic_amount_selected_class_t.detach().reshape(-1)[0].item()
+        ) if int(algorithmic_amount_selected_class_t.numel()) > 0 else 0
+        algorithmic_amount_bin_values_t = self._algorithmic_amount_bin_values(
+            max_drop_ratio,
+            actuator_features.device,
+            actuator_features.dtype,
+        )
+        algorithmic_amount_bin_count_value = int(algorithmic_amount_bin_values_t.numel())
+        algorithmic_amount_selected_bin_ratio_value = 0.0
+        if algorithmic_amount_selected_class_value > 0 and algorithmic_amount_bin_count_value > 0:
+            selected_bin_idx = min(
+                max(int(algorithmic_amount_selected_class_value) - 1, 0),
+                algorithmic_amount_bin_count_value - 1,
+            )
+            algorithmic_amount_selected_bin_ratio_value = float(
+                algorithmic_amount_bin_values_t.detach().flatten()[selected_bin_idx].cpu()
+            )
+        algorithmic_amount_residual_scale = min(
+            max(float(getattr(self.args, "sparsepcgc_algorithmic_amount_residual_scale", 0.005)), 0.0),
+            float(max_drop_ratio),
+        )
+        algorithmic_amount_residual_raw = self.algorithmic_amount_residual_head(
+            actuator_features.mean(dim=2, keepdim=True)
+        )
+        algorithmic_amount_residual_t = (
+            torch.tanh(algorithmic_amount_residual_raw)
+            * float(algorithmic_amount_residual_scale)
+        )
+        algorithmic_amount_residual_value = float(
+            algorithmic_amount_residual_t.detach().mean().cpu()
+        ) if algorithmic_amount_residual_t.numel() > 0 else 0.0
+        selector_class_clamped = algorithmic_amount_selected_class_t.clamp(
+            0,
+            max(algorithmic_amount_bin_count_value, 0),
+        )
+        selector_bin_idx = (selector_class_clamped - 1).clamp(
+            0,
+            max(algorithmic_amount_bin_count_value - 1, 0),
+        )
+        if algorithmic_amount_bin_count_value > 0:
+            selector_base_ratio = algorithmic_amount_bin_values_t.index_select(
+                0,
+                selector_bin_idx.to(device=algorithmic_amount_bin_values_t.device, dtype=torch.long),
+            ).view(-1, 1, 1)
+        else:
+            selector_base_ratio = learned_drop_ratio.new_zeros(learned_drop_ratio.shape)
+        selector_non_noop = (selector_class_clamped > 0).to(
+            device=learned_drop_ratio.device,
+            dtype=learned_drop_ratio.dtype,
+        ).view(-1, 1, 1)
+        algorithmic_amount_selector_ratio_forward = (
+            selector_non_noop
+            * (selector_base_ratio + algorithmic_amount_residual_t).clamp(0.0, float(max_drop_ratio))
+        )
+        algorithmic_amount_selector_final_ratio_value = float(
+            algorithmic_amount_selector_ratio_forward.detach().mean().cpu()
+        ) if algorithmic_amount_selector_ratio_forward.numel() > 0 else 0.0
+        algorithmic_amount_selector_noop_prob_value = float(
+            algorithmic_amount_selector_prob[:, 0].detach().mean().cpu()
+        ) if algorithmic_amount_selector_prob.numel() > 0 else 0.0
+        algorithmic_amount_selector_selected_prob_value = float(
+            algorithmic_amount_selector_prob.gather(
+                1,
+                selector_class_clamped.view(-1, 1).to(
+                    device=algorithmic_amount_selector_prob.device,
+                    dtype=torch.long,
+                ),
+            ).detach().mean().cpu()
+        ) if algorithmic_amount_selector_prob.numel() > 0 else 0.0
+        algorithmic_amount_selector_teacher_class_id = -1
+        algorithmic_amount_selector_teacher_ratio_value = float("nan")
+        algorithmic_amount_selector_teacher_loss = pts_xyz.new_zeros(())
+        algorithmic_amount_residual_teacher_loss = pts_xyz.new_zeros(())
+        post_warmup_amount_strategy = self._post_warmup_amount_strategy()
+        if post_warmup_amount_strategy == "fixed_blend":
+            post_warmup_amount_strategy_id = 1
+        elif post_warmup_amount_strategy == "outcome_explore":
+            post_warmup_amount_strategy_id = 2
+        elif post_warmup_amount_strategy == "network":
+            post_warmup_amount_strategy_id = 3
         if (
             amount_mode == "network"
             and warmup_force_codec_prior_amount
@@ -3103,25 +3333,12 @@ class StructureRepairActuator(nn.Module):
             hard_drop_target_ratio_source_id = 1
         if (
             amount_mode == "network"
-            and bool(getattr(self.args, "sparsepcgc_post_warmup_amount_hybrid", True))
             and self.training
             and prune_enabled
             and codec_prune_prior_enabled
             and float(codec_prune_prior_phase) <= 0.0
             and not self._direct_network_prune_mode()
         ):
-            # ========================================================
-            # Post-warmup Amount Hybrid
-            # ========================================================
-            # 問題:
-            #   200Step以降にhard count用AmountがNetworkへ完全移行し、
-            #   raw/learned Amountが未成熟なため0.2%付近へ潰れる。
-            #
-            # 解決:
-            #   codec prior由来のAmount proposalをtailとして混ぜる。
-            #   ただしNetwork自由学習を壊さないため、forwardはhybrid値、
-            #   backwardはNetwork Amountへ流すSTEにする。
-            # ========================================================
             post_tail_steps = max(
                 int(getattr(self.args, "sparsepcgc_post_warmup_amount_tail_steps", 5000)),
                 0,
@@ -3165,11 +3382,12 @@ class StructureRepairActuator(nn.Module):
                 1.0 - float(min_network_keep),
             )
             post_amount_alpha = min(max(float(post_amount_alpha), 0.0), 1.0)
+            post_warmup_amount_tail_phase_value = float(post_tail_phase)
+            post_warmup_amount_proposal_ratio_value = float(proposal_ratio)
 
-            if proposal_ratio > 0.0 and post_amount_alpha > 0.0:
+            if post_warmup_amount_strategy == "fixed_blend" and proposal_ratio > 0.0 and post_amount_alpha > 0.0:
                 proposal_tensor = learned_drop_ratio.new_tensor(float(proposal_ratio))
                 alpha_tensor = learned_drop_ratio.new_tensor(float(post_amount_alpha))
-
                 post_amount_mode = str(
                     getattr(self.args, "sparsepcgc_post_warmup_amount_mode", "blend")
                 ).strip().lower()
@@ -3177,9 +3395,6 @@ class StructureRepairActuator(nn.Module):
                     post_amount_mode = "blend"
 
                 if post_amount_mode == "max":
-                    # maxモード:
-                    #   proposalそのものを固定下限にすると強すぎるため、
-                    #   alphaを掛けた弱い下限として使う。
                     post_warmup_amount_mode_id = 2
                     post_floor_tensor = proposal_tensor * alpha_tensor
                     effective_drop_ratio_forward = torch.maximum(
@@ -3189,9 +3404,6 @@ class StructureRepairActuator(nn.Module):
                     hard_drop_target_ratio_source = "post_warmup_amount_max"
                     hard_drop_target_ratio_source_id = 7
                 else:
-                    # blendモード:
-                    #   Network Amountを最低限残しながら、
-                    #   proposalをtailとして混ぜる。
                     post_warmup_amount_mode_id = 1
                     effective_drop_ratio_forward = (
                         alpha_tensor * proposal_tensor
@@ -3205,24 +3417,228 @@ class StructureRepairActuator(nn.Module):
                     + network_effective_drop_ratio_for_hard_count
                     - network_effective_drop_ratio_for_hard_count.detach()
                 )
-
-                # drop_amount_headへ弱く蒸留する。
-                # targetは実際にhard countへ使うforward値に合わせる。
-                # これにより、200Step以降もNetworkが0〜5%範囲のAmountを学ぶ材料を持つ。
                 post_warmup_amount_teacher_loss = (
                     raw_learned_drop_ratio - effective_drop_ratio_forward.detach()
                 ).pow(2).mean() * float(post_amount_alpha)
-
                 post_warmup_amount_hybrid_applied = True
-                post_warmup_amount_tail_phase_value = float(post_tail_phase)
                 post_warmup_amount_alpha_value = float(post_amount_alpha)
-                post_warmup_amount_proposal_ratio_value = float(proposal_ratio)
-
-                # 既存ログ互換:
-                # codec_prior_amount_blend_* を見ていた既存ログでも
-                # post-warmup hybridが効いたことが分かるようにする。
                 codec_prior_amount_blend_applied = True
                 codec_prior_amount_blend_alpha_value = float(post_amount_alpha)
+            elif post_warmup_amount_strategy == "outcome_explore":
+                explore_start_prob = min(
+                    max(float(getattr(self.args, "sparsepcgc_amount_explore_start_prob", 0.60)), 0.0),
+                    1.0,
+                )
+                explore_end_prob = min(
+                    max(float(getattr(self.args, "sparsepcgc_amount_explore_end_prob", 0.20)), 0.0),
+                    1.0,
+                )
+                if explore_end_prob > explore_start_prob:
+                    explore_end_prob = explore_start_prob
+                explore_decay_steps = max(
+                    int(getattr(self.args, "sparsepcgc_amount_explore_decay_steps", 5000)),
+                    0,
+                )
+                if explore_decay_steps > 0:
+                    explore_phase = max(
+                        1.0 - float(post_tail_step) / float(explore_decay_steps),
+                        0.0,
+                    )
+                else:
+                    explore_phase = 0.0
+                explore_prob = (
+                    explore_end_prob
+                    + (explore_start_prob - explore_end_prob) * float(explore_phase)
+                )
+                explore_prob = min(max(float(explore_prob), 0.0), 1.0)
+                amount_explore_prob_value = float(explore_prob)
+                post_warmup_amount_alpha_value = float(explore_prob)
+                post_warmup_amount_hybrid_applied = bool(explore_prob > 0.0)
+                post_warmup_amount_mode_id = 3
+
+                memory_key = str(
+                    getattr(
+                        self.args,
+                        "_current_sparsepcgc_amount_memory_key",
+                        getattr(self.args, "_current_sparsepcgc_forward_key", ""),
+                    )
+                    or ""
+                )
+                forward_key = str(
+                    getattr(self.args, "_current_sparsepcgc_forward_key", memory_key)
+                    or memory_key
+                    or getattr(self.args, "_current_subtree_id", "")
+                    or "global"
+                )
+                teacher_ratio = float(
+                    getattr(self.args, "_current_sparsepcgc_amount_outcome_teacher_ratio", float("nan"))
+                )
+                teacher_count = max(
+                    int(getattr(self.args, "_current_sparsepcgc_amount_outcome_teacher_count", 0)),
+                    0,
+                )
+                teacher_score = float(
+                    getattr(self.args, "_current_sparsepcgc_amount_outcome_teacher_score", float("nan"))
+                )
+                if math.isfinite(teacher_ratio):
+                    amount_explore_teacher_ratio_value = float(
+                        min(max(teacher_ratio, 0.0), float(max_drop_ratio))
+                    )
+                    amount_explore_teacher_count_value = float(teacher_count)
+                    amount_explore_teacher_score_value = float(teacher_score)
+
+                ratio_candidates = [
+                    min(max(float(value), 0.0), float(max_drop_ratio))
+                    for value in self._amount_explore_ratio_values()
+                ]
+                ratio_candidates = [value for value in ratio_candidates if value > 0.0]
+                preferred_candidates = list(ratio_candidates)
+                min_success_count = max(
+                    int(getattr(self.args, "sparsepcgc_amount_memory_min_count_for_exploit", 1)),
+                    1,
+                )
+                if (
+                    bool(getattr(self.args, "sparsepcgc_amount_explore_prefer_high_until_success", True))
+                    and teacher_count < min_success_count
+                    and len(preferred_candidates) >= 2
+                ):
+                    preferred_candidates = preferred_candidates[len(preferred_candidates) // 2 :]
+                period = max(int(getattr(self.args, "sparsepcgc_amount_explore_period", 10)), 1)
+                threshold = int(round(float(explore_prob) * float(period)))
+                threshold = min(max(threshold, 0), period)
+                hash_value = self._deterministic_step_hash(
+                    "amount_explore",
+                    int(current_train_step),
+                    forward_key,
+                    memory_key,
+                    int(getattr(self.args, "seed", 0)),
+                )
+                should_explore = bool(threshold > 0 and (hash_value % period) < threshold)
+                amount_explore_step = should_explore and bool(preferred_candidates)
+
+                if amount_explore_step:
+                    candidate_index = hash_value % max(len(preferred_candidates), 1)
+                    candidate_ratio = float(preferred_candidates[candidate_index])
+                    amount_explore_candidate_ratio_value = candidate_ratio
+                    amount_explore_candidate_index_value = int(candidate_index)
+                    candidate_tensor = learned_drop_ratio.new_tensor(candidate_ratio)
+                    effective_drop_ratio_for_hard_count = (
+                        candidate_tensor.detach()
+                        + network_effective_drop_ratio_for_hard_count
+                        - network_effective_drop_ratio_for_hard_count.detach()
+                    )
+                    hard_drop_target_ratio_source = "outcome_explore_candidate"
+                    hard_drop_target_ratio_source_id = 8
+                elif (
+                    math.isfinite(amount_explore_teacher_ratio_value)
+                    and amount_explore_teacher_ratio_value > 0.0
+                    and teacher_count >= min_success_count
+                ):
+                    teacher_alpha = min(
+                        max(float(getattr(self.args, "sparsepcgc_amount_success_teacher_max_alpha", 0.50)), 0.0),
+                        1.0,
+                    )
+                    teacher_alpha = min(
+                        teacher_alpha,
+                        0.15 * float(teacher_count),
+                    )
+                    teacher_alpha = min(max(float(teacher_alpha), 0.0), 1.0)
+                    amount_explore_teacher_alpha_value = float(teacher_alpha)
+                    amount_explore_used_teacher = bool(teacher_alpha > 0.0)
+                    if teacher_alpha > 0.0:
+                        teacher_tensor = learned_drop_ratio.new_tensor(float(amount_explore_teacher_ratio_value))
+                        alpha_tensor = learned_drop_ratio.new_tensor(float(teacher_alpha))
+                        effective_drop_ratio_forward = (
+                            alpha_tensor * teacher_tensor
+                            + (1.0 - alpha_tensor) * network_effective_drop_ratio_for_hard_count
+                        )
+                        effective_drop_ratio_for_hard_count = (
+                            effective_drop_ratio_forward.detach()
+                            + network_effective_drop_ratio_for_hard_count
+                            - network_effective_drop_ratio_for_hard_count.detach()
+                        )
+                        hard_drop_target_ratio_source = "outcome_success_memory_blend"
+                        hard_drop_target_ratio_source_id = 9
+                        post_warmup_amount_teacher_loss = (
+                            raw_learned_drop_ratio - teacher_tensor.detach()
+                        ).pow(2).mean()
+                        post_warmup_amount_teacher_weight_effective = float(
+                            getattr(self.args, "sparsepcgc_amount_success_teacher_weight", 0.08)
+                        )
+                elif math.isfinite(amount_explore_teacher_ratio_value) and amount_explore_teacher_ratio_value > 0.0:
+                    teacher_alpha = min(
+                        max(float(getattr(self.args, "sparsepcgc_amount_success_teacher_max_alpha", 0.50)), 0.0),
+                        1.0,
+                    ) * 0.5
+                    amount_explore_teacher_alpha_value = float(teacher_alpha)
+                    teacher_tensor = learned_drop_ratio.new_tensor(float(amount_explore_teacher_ratio_value))
+                    post_warmup_amount_teacher_loss = (
+                        raw_learned_drop_ratio - teacher_tensor.detach()
+                    ).pow(2).mean()
+                    post_warmup_amount_teacher_weight_effective = float(
+                        getattr(self.args, "sparsepcgc_amount_success_teacher_weight", 0.08)
+                    ) * float(max(teacher_alpha, 0.0))
+            if algorithmic_proposal_selector_active and post_warmup_amount_strategy == "outcome_explore":
+                target_ratio_for_selector = float("nan")
+                if amount_explore_step and amount_explore_candidate_ratio_value > 0.0:
+                    target_ratio_for_selector = float(amount_explore_candidate_ratio_value)
+                elif (
+                    math.isfinite(amount_explore_teacher_ratio_value)
+                    and amount_explore_teacher_ratio_value > 0.0
+                    and amount_explore_teacher_count_value >= float(
+                        max(int(getattr(self.args, "sparsepcgc_amount_memory_min_count_for_exploit", 1)), 1)
+                    )
+                ):
+                    target_ratio_for_selector = float(amount_explore_teacher_ratio_value)
+
+                if math.isfinite(target_ratio_for_selector):
+                    target_class = self._nearest_amount_bin_class(
+                        algorithmic_amount_bin_values_t,
+                        target_ratio_for_selector,
+                    )
+                    algorithmic_amount_selector_teacher_class_id = int(target_class)
+                    algorithmic_amount_selector_teacher_ratio_value = float(target_ratio_for_selector)
+                    target_class_tensor = torch.full(
+                        (int(algorithmic_amount_selector_logits.shape[0]),),
+                        int(target_class),
+                        device=algorithmic_amount_selector_logits.device,
+                        dtype=torch.long,
+                    )
+                    algorithmic_amount_selector_teacher_loss = torch.nn.functional.cross_entropy(
+                        algorithmic_amount_selector_logits.float(),
+                        target_class_tensor,
+                    ).to(dtype=pts_xyz.dtype)
+                    if int(target_class) > 0 and algorithmic_amount_bin_count_value > 0:
+                        target_bin_idx = min(max(int(target_class) - 1, 0), algorithmic_amount_bin_count_value - 1)
+                        target_bin_ratio = float(
+                            algorithmic_amount_bin_values_t.detach().flatten()[target_bin_idx].cpu()
+                        )
+                        target_residual = min(
+                            max(float(target_ratio_for_selector) - float(target_bin_ratio), -float(algorithmic_amount_residual_scale)),
+                            float(algorithmic_amount_residual_scale),
+                        )
+                        target_residual_t = algorithmic_amount_residual_t.new_full(
+                            algorithmic_amount_residual_t.shape,
+                            float(target_residual),
+                        )
+                        algorithmic_amount_residual_teacher_loss = (
+                            algorithmic_amount_residual_t - target_residual_t.detach()
+                        ).pow(2).mean()
+
+                if not amount_explore_step:
+                    effective_drop_ratio_forward = algorithmic_amount_selector_ratio_forward
+                    effective_drop_ratio_for_hard_count = (
+                        effective_drop_ratio_forward.detach()
+                        + algorithmic_amount_selector_ratio_forward
+                        - algorithmic_amount_selector_ratio_forward.detach()
+                    )
+                    if algorithmic_amount_selected_class_value <= 0:
+                        hard_drop_target_ratio_source = "algorithmic_selector_noop"
+                        hard_drop_target_ratio_source_id = 10
+                    else:
+                        hard_drop_target_ratio_source = "algorithmic_selector_bin_residual"
+                        hard_drop_target_ratio_source_id = 11
+                    amount_explore_used_teacher = False
         if (
             self.training
             and prune_enabled
@@ -3284,7 +3700,7 @@ class StructureRepairActuator(nn.Module):
 
         # network floorは最後の保険だけにする。
         # HybridではPrune量固定を避けたいので、必要ならCLIで小さくする。
-        if network_prune_floor_ratio > 0.0:
+        if network_prune_floor_ratio > 0.0 and not algorithmic_proposal_selector_active:
             network_floor_tensor = learned_drop_ratio.new_tensor(float(network_prune_floor_ratio))
             floor_applied_to_ratio = bool(
                 (
@@ -3799,6 +4215,18 @@ class StructureRepairActuator(nn.Module):
                 min_hard_count=int(
                     getattr(self.args, "sparsepcgc_codec_prior_warmup_min_hard_count", 0)
                 ),
+            )
+        elif algorithmic_proposal_selector_active:
+            hard_drop_block_reason = "algorithmic_proposal_codec_block_drop"
+            hard_drop_target_ratio_value = float(learned_drop_ratio_value)
+            hard_drop_mask = self._hard_codec_block_drop_mask(
+                voxel_coords,
+                codec_prune_prior_score,
+                block_size=codec_prune_prior_block_size,
+                target_drop_ratio=hard_drop_target_ratio_value,
+                selection_mask=hard_delete_selection_mask,
+                max_hard_count=int(getattr(self.args, "repair_max_hard_drop_voxels", 0)),
+                min_hard_count=0,
             )
         elif (
             self.training
@@ -5443,6 +5871,11 @@ class StructureRepairActuator(nn.Module):
         hard_drop_count_value = int(hard_drop.detach().sum().item())
         if hard_drop_count_value <= 0 and hard_drop_block_reason == "network_learned_hard_drop":
             hard_drop_block_reason = "network_learned_hard_drop_zero"
+        algorithmic_proposal_noop_selected = bool(
+            algorithmic_proposal_selector_active
+            and hard_drop_count_value <= 0
+            and hard_drop_target_ratio_value <= 0.0
+        )
         last_hard_drop_trace = hard_drop_trace_debug if isinstance(hard_drop_trace_debug, dict) else {}
         pre_round_target_count_value = float(last_hard_drop_trace.get("pre_round_target_count", 0.0))
         post_round_target_count_value = float(last_hard_drop_trace.get("post_round_target_count", 0.0))
@@ -6213,6 +6646,12 @@ class StructureRepairActuator(nn.Module):
         codec_prior_where_distill_loss = _finite_actuator_loss(codec_prior_where_distill_loss)
         codec_prior_amount_distill_loss = _finite_actuator_loss(codec_prior_amount_distill_loss)
         post_warmup_amount_teacher_loss = _finite_actuator_loss(post_warmup_amount_teacher_loss)
+        algorithmic_amount_selector_teacher_loss = _finite_actuator_loss(
+            algorithmic_amount_selector_teacher_loss
+        )
+        algorithmic_amount_residual_teacher_loss = _finite_actuator_loss(
+            algorithmic_amount_residual_teacher_loss
+        )
         drop_amount_supervision_loss = _finite_actuator_loss(drop_amount_supervision_loss)
         drop_amount_soft_consistency_loss = _finite_actuator_loss(drop_amount_soft_consistency_loss)
         move_amount_supervision_loss = _finite_actuator_loss(move_amount_supervision_loss)
@@ -6259,7 +6698,12 @@ class StructureRepairActuator(nn.Module):
             + float(getattr(self.args, "repair_drop_where_actuator_weight", 0.1)) * drop_where_actuator_loss
             + float(getattr(self.args, "sparsepcgc_codec_prior_distill_weight", 0.05)) * codec_prior_where_distill_loss
             + float(getattr(self.args, "sparsepcgc_codec_prior_amount_distill_weight", 0.0)) * codec_prior_amount_distill_loss
-            + float(getattr(self.args, "sparsepcgc_post_warmup_amount_teacher_weight", 0.08)) * post_warmup_amount_teacher_loss
+            + float(post_warmup_amount_teacher_weight_effective) * post_warmup_amount_teacher_loss
+            + float(getattr(self.args, "sparsepcgc_algorithmic_amount_selector_teacher_weight", 0.08))
+            * (
+                algorithmic_amount_selector_teacher_loss
+                + algorithmic_amount_residual_teacher_loss
+            )
             + float(getattr(self.args, "repair_add_where_actuator_weight", 0.1)) * add_where_actuator_loss
             + float(getattr(self.args, "repair_move_where_actuator_weight", 0.1)) * move_where_actuator_loss
             + float(getattr(self.args, "repair_operation_gate_oracle_weight", 0.1)) * operation_gate_oracle_loss
@@ -6839,6 +7283,44 @@ class StructureRepairActuator(nn.Module):
             "actual_oracle_has_drop": pts_xyz.new_tensor(float(actual_oracle_has_drop)).detach(),
             "prune_after_prior_mode": prune_after_prior_mode,
             "phase0_network_prune_mode": pts_xyz.new_tensor(float(phase0_network_prune_mode)).detach(),
+            "algorithmic_proposal_selector_enabled": pts_xyz.new_tensor(
+                float(algorithmic_proposal_selector_enabled)
+            ).detach(),
+            "algorithmic_proposal_selector_active": pts_xyz.new_tensor(
+                float(algorithmic_proposal_selector_active)
+            ).detach(),
+            "algorithmic_proposal_where_source_id": pts_xyz.new_tensor(
+                float(algorithmic_proposal_where_source_id)
+            ).detach(),
+            "algorithmic_proposal_noop_selected": pts_xyz.new_tensor(
+                float(algorithmic_proposal_noop_selected)
+            ).detach(),
+            "algorithmic_amount_selected_class": pts_xyz.new_tensor(
+                float(algorithmic_amount_selected_class_value)
+            ).detach(),
+            "algorithmic_amount_selected_bin_ratio": pts_xyz.new_tensor(
+                float(algorithmic_amount_selected_bin_ratio_value)
+            ).detach(),
+            "algorithmic_amount_residual": pts_xyz.new_tensor(
+                float(algorithmic_amount_residual_value)
+            ).detach(),
+            "algorithmic_amount_final_ratio": pts_xyz.new_tensor(
+                float(algorithmic_amount_selector_final_ratio_value)
+            ).detach(),
+            "algorithmic_amount_noop_prob": pts_xyz.new_tensor(
+                float(algorithmic_amount_selector_noop_prob_value)
+            ).detach(),
+            "algorithmic_amount_selected_prob": pts_xyz.new_tensor(
+                float(algorithmic_amount_selector_selected_prob_value)
+            ).detach(),
+            "algorithmic_amount_teacher_class": pts_xyz.new_tensor(
+                float(algorithmic_amount_selector_teacher_class_id)
+            ).detach(),
+            "algorithmic_amount_teacher_ratio": pts_xyz.new_tensor(
+                float(algorithmic_amount_selector_teacher_ratio_value)
+            ).detach(),
+            "algorithmic_amount_selector_teacher_loss": algorithmic_amount_selector_teacher_loss.detach(),
+            "algorithmic_amount_residual_teacher_loss": algorithmic_amount_residual_teacher_loss.detach(),
             "actual_gate_prune_enabled": pts_xyz.new_tensor(
                 float(require_actual_gate_prune)
             ).detach(),
@@ -6887,6 +7369,9 @@ class StructureRepairActuator(nn.Module):
             "post_warmup_amount_mode_id": pts_xyz.new_tensor(
                 float(post_warmup_amount_mode_id)
             ).detach(),
+            "post_warmup_amount_strategy_id": pts_xyz.new_tensor(
+                float(post_warmup_amount_strategy_id)
+            ).detach(),
             "post_warmup_amount_tail_phase": pts_xyz.new_tensor(
                 float(post_warmup_amount_tail_phase_value)
             ).detach(),
@@ -6897,6 +7382,32 @@ class StructureRepairActuator(nn.Module):
                 float(post_warmup_amount_proposal_ratio_value)
             ).detach(),
             "post_warmup_amount_teacher_loss": post_warmup_amount_teacher_loss.detach(),
+            "post_warmup_amount_teacher_weight_effective": pts_xyz.new_tensor(
+                float(post_warmup_amount_teacher_weight_effective)
+            ).detach(),
+            "amount_explore_step": pts_xyz.new_tensor(float(amount_explore_step)).detach(),
+            "amount_explore_prob": pts_xyz.new_tensor(float(amount_explore_prob_value)).detach(),
+            "amount_explore_candidate_ratio": pts_xyz.new_tensor(
+                float(amount_explore_candidate_ratio_value)
+            ).detach(),
+            "amount_explore_candidate_index": pts_xyz.new_tensor(
+                float(amount_explore_candidate_index_value)
+            ).detach(),
+            "amount_explore_teacher_ratio": pts_xyz.new_tensor(
+                float(amount_explore_teacher_ratio_value)
+            ).detach(),
+            "amount_explore_teacher_count": pts_xyz.new_tensor(
+                float(amount_explore_teacher_count_value)
+            ).detach(),
+            "amount_explore_teacher_score": pts_xyz.new_tensor(
+                float(amount_explore_teacher_score_value)
+            ).detach(),
+            "amount_explore_teacher_alpha": pts_xyz.new_tensor(
+                float(amount_explore_teacher_alpha_value)
+            ).detach(),
+            "amount_explore_used_teacher": pts_xyz.new_tensor(
+                float(amount_explore_used_teacher)
+            ).detach(),
             "hard_drop_target_ratio_source_id": pts_xyz.new_tensor(
                 float(hard_drop_target_ratio_source_id)
             ).detach(),
@@ -7449,6 +7960,44 @@ class StructureRepairActuator(nn.Module):
             "actual_oracle_has_drop": pts_xyz.new_tensor(float(actual_oracle_has_drop)),
             "prune_after_prior_mode": prune_after_prior_mode,
             "phase0_network_prune_mode": pts_xyz.new_tensor(float(phase0_network_prune_mode)),
+            "algorithmic_proposal_selector_enabled": pts_xyz.new_tensor(
+                float(algorithmic_proposal_selector_enabled)
+            ),
+            "algorithmic_proposal_selector_active": pts_xyz.new_tensor(
+                float(algorithmic_proposal_selector_active)
+            ),
+            "algorithmic_proposal_where_source_id": pts_xyz.new_tensor(
+                float(algorithmic_proposal_where_source_id)
+            ),
+            "algorithmic_proposal_noop_selected": pts_xyz.new_tensor(
+                float(algorithmic_proposal_noop_selected)
+            ),
+            "algorithmic_amount_selected_class": pts_xyz.new_tensor(
+                float(algorithmic_amount_selected_class_value)
+            ),
+            "algorithmic_amount_selected_bin_ratio": pts_xyz.new_tensor(
+                float(algorithmic_amount_selected_bin_ratio_value)
+            ),
+            "algorithmic_amount_residual": pts_xyz.new_tensor(
+                float(algorithmic_amount_residual_value)
+            ),
+            "algorithmic_amount_final_ratio": pts_xyz.new_tensor(
+                float(algorithmic_amount_selector_final_ratio_value)
+            ),
+            "algorithmic_amount_noop_prob": pts_xyz.new_tensor(
+                float(algorithmic_amount_selector_noop_prob_value)
+            ),
+            "algorithmic_amount_selected_prob": pts_xyz.new_tensor(
+                float(algorithmic_amount_selector_selected_prob_value)
+            ),
+            "algorithmic_amount_teacher_class": pts_xyz.new_tensor(
+                float(algorithmic_amount_selector_teacher_class_id)
+            ),
+            "algorithmic_amount_teacher_ratio": pts_xyz.new_tensor(
+                float(algorithmic_amount_selector_teacher_ratio_value)
+            ),
+            "algorithmic_amount_selector_teacher_loss": algorithmic_amount_selector_teacher_loss,
+            "algorithmic_amount_residual_teacher_loss": algorithmic_amount_residual_teacher_loss,
             "actual_gate_prune_enabled": pts_xyz.new_tensor(float(require_actual_gate_prune)),
             "actual_gate_prune_allowed": pts_xyz.new_tensor(float(hard_prune_actual_allowed)),
             "hard_prune_actual_allowed": pts_xyz.new_tensor(float(hard_prune_actual_allowed)),
@@ -7479,6 +8028,9 @@ class StructureRepairActuator(nn.Module):
             "post_warmup_amount_mode_id": pts_xyz.new_tensor(
                 float(post_warmup_amount_mode_id)
             ),
+            "post_warmup_amount_strategy_id": pts_xyz.new_tensor(
+                float(post_warmup_amount_strategy_id)
+            ),
             "post_warmup_amount_tail_phase": pts_xyz.new_tensor(
                 float(post_warmup_amount_tail_phase_value)
             ),
@@ -7489,6 +8041,32 @@ class StructureRepairActuator(nn.Module):
                 float(post_warmup_amount_proposal_ratio_value)
             ),
             "post_warmup_amount_teacher_loss": post_warmup_amount_teacher_loss.detach(),
+            "post_warmup_amount_teacher_weight_effective": pts_xyz.new_tensor(
+                float(post_warmup_amount_teacher_weight_effective)
+            ),
+            "amount_explore_step": pts_xyz.new_tensor(float(amount_explore_step)),
+            "amount_explore_prob": pts_xyz.new_tensor(float(amount_explore_prob_value)),
+            "amount_explore_candidate_ratio": pts_xyz.new_tensor(
+                float(amount_explore_candidate_ratio_value)
+            ),
+            "amount_explore_candidate_index": pts_xyz.new_tensor(
+                float(amount_explore_candidate_index_value)
+            ),
+            "amount_explore_teacher_ratio": pts_xyz.new_tensor(
+                float(amount_explore_teacher_ratio_value)
+            ),
+            "amount_explore_teacher_count": pts_xyz.new_tensor(
+                float(amount_explore_teacher_count_value)
+            ),
+            "amount_explore_teacher_score": pts_xyz.new_tensor(
+                float(amount_explore_teacher_score_value)
+            ),
+            "amount_explore_teacher_alpha": pts_xyz.new_tensor(
+                float(amount_explore_teacher_alpha_value)
+            ),
+            "amount_explore_used_teacher": pts_xyz.new_tensor(
+                float(amount_explore_used_teacher)
+            ),
             "codec_prune_prior_block_size": pts_xyz.new_tensor(float(codec_prune_prior_block_size)),
             "codec_prune_prior_block_count_mean": pts_xyz.new_tensor(
                 float(sum(codec_prune_prior_block_counts)) / max(float(len(codec_prune_prior_block_counts)), 1.0)

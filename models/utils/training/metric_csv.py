@@ -22,6 +22,7 @@ from .metric_columns import (
     CHECKPOINT_AVG_KEYS, 
     SURROGATE_PRETRAIN_COLUMNS,
     LOSS_GRAD_PROBE_COLUMNS,
+    PROPOSAL_CANDIDATE_COLUMNS,
     )
 
 def init_csv_file(path, columns, writer, label):
@@ -49,6 +50,7 @@ def init_metric_csvs(args, plot, writer):
         "checkpoint_episode": None,
         "surrogate_pretrain_step": None,
         "loss_grad_probe": None,
+        "proposal_candidate_step": None,
     }
     os.makedirs(plot.save_dir, exist_ok=True)
     if bool(getattr(args, "save_compression_metric_csv", True)):
@@ -77,4 +79,8 @@ def init_metric_csvs(args, plot, writer):
         path = os.path.join(plot.save_dir, f"{args.time}_step_grad.csv")
         init_csv_file(path, LOSS_GRAD_PROBE_COLUMNS, writer, "StepGradCSV")
         paths["loss_grad_probe"] = path
+    if bool(getattr(args, "sparsepcgc_algorithmic_proposal_selector", True)):
+        path = os.path.join(plot.save_dir, f"{args.time}_proposal_candidate_metrics_step.csv")
+        init_csv_file(path, PROPOSAL_CANDIDATE_COLUMNS, writer, "ProposalCandidateMetricCSV")
+        paths["proposal_candidate_step"] = path
     return paths

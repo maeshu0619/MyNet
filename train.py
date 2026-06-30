@@ -70,7 +70,11 @@ from models.utils.training.compression_primary_loss import _compression_primary_
 from models.utils.training.full_context_subtree_loss import build_full_context_subtree_delta_loss
 from models.utils.training.case_debug import *
 from models.utils.training.metric_csv import *
-from models.utils.training.metric_columns import LOSS_GRAD_PROBE_COLUMNS, PHASE7_EVAL_SUMMARY_COLUMNS
+from models.utils.training.metric_columns import (
+    LOSS_GRAD_PROBE_COLUMNS,
+    PHASE7_EVAL_SUMMARY_COLUMNS,
+    PROPOSAL_CANDIDATE_COLUMNS,
+)
 from models.utils.training.actual_codec_status import *
 from models.utils.training.metric_rows import *
 from models.utils.training.lr_control import apply_optimizer_lr_floor, step_scheduler_with_floor, optimizer_lrs_safe
@@ -528,6 +532,581 @@ def _sparsepcgc_success_amount_memory_key(cache_key, subtree_key):
     return f"{str(cache_key)}|subtree={int(subtree_key)}"
 
 
+def _sparsepcgc_amount_outcome_memory(args):
+    memory = getattr(args, "_sparsepcgc_amount_outcome_memory", None)
+    if not isinstance(memory, OrderedDict):
+        memory = OrderedDict()
+        setattr(args, "_sparsepcgc_amount_outcome_memory", memory)
+    return memory
+
+
+def _sparsepcgc_amount_explore_ratios(args):
+    raw_values = getattr(args, "sparsepcgc_amount_explore_ratio_values", None)
+    values = []
+    if isinstance(raw_values, (list, tuple)):
+        for value in raw_values:
+            try:
+                ratio = float(value)
+            except Exception:
+                continue
+            if math.isfinite(ratio):
+                values.append(max(ratio, 0.0))
+    if not values:
+        values = [0.005, 0.01, 0.02, 0.03, 0.04, 0.05]
+    return sorted(set(values))
+
+
+def _sparsepcgc_amount_outcome_memory_key(cache_key, subtree_key):
+    return _sparsepcgc_success_amount_memory_key(cache_key, subtree_key)
+
+
+def _sparsepcgc_quantize_amount_ratio(args, ratio):
+    try:
+        ratio_value = float(ratio)
+    except Exception:
+        return None
+    if not math.isfinite(ratio_value):
+        return None
+    candidates = _sparsepcgc_amount_explore_ratios(args)
+    if not candidates:
+        return max(ratio_value, 0.0)
+    return min(candidates, key=lambda candidate: abs(float(candidate) - ratio_value))
+
+
+def _sparsepcgc_amount_outcome_teacher(args, memory_key):
+    if not bool(getattr(args, "sparsepcgc_amount_outcome_memory", True)):
+        return None
+    if not memory_key:
+        return None
+    memory = _sparsepcgc_amount_outcome_memory(args)
+    entry = memory.get(memory_key, None)
+    if not isinstance(entry, dict):
+        return None
+    items = entry.get("items", {})
+    if not isinstance(items, dict) or not items:
+        return None
+
+    min_good_count = max(int(getattr(args, "sparsepcgc_amount_memory_min_count_for_exploit", 1)), 1)
+    best_entry = None
+    best_tuple = None
+    for ratio_key, bucket in items.items():
+        if not isinstance(bucket, dict):
+            continue
+        try:
+            ratio = float(bucket.get("ratio", ratio_key))
+            success_ema = float(bucket.get("success_ema", 0.0))
+            bad_ema = float(bucket.get("bad_ema", 0.0))
+            good_count = int(bucket.get("good_count", 0))
+            bad_count = int(bucket.get("bad_count", 0))
+            count = int(bucket.get("count", good_count + bad_count))
+            best_percent = float(bucket.get("best_percent", 0.0))
+        except Exception:
+            continue
+        if not math.isfinite(ratio) or ratio <= 0.0 or good_count < min_good_count:
+            continue
+        score = success_ema - bad_ema
+        ranking = (score, success_ema, good_count - bad_count, -best_percent, ratio)
+        if best_tuple is None or ranking > best_tuple:
+            best_tuple = ranking
+            best_entry = {
+                "ratio": float(ratio),
+                "score": float(score),
+                "good_count": int(good_count),
+                "bad_count": int(bad_count),
+                "count": int(count),
+                "best_percent": float(best_percent),
+                "bucket_count": int(len(items)),
+            }
+    return best_entry
+
+
+def _sparsepcgc_apply_amount_outcome_context(args, *, memory_key=None, forward_key=None):
+    teacher = _sparsepcgc_amount_outcome_teacher(args, memory_key)
+    setattr(args, "_current_sparsepcgc_amount_memory_key", str(memory_key or ""))
+    setattr(args, "_current_sparsepcgc_forward_key", str(forward_key or memory_key or ""))
+    setattr(
+        args,
+        "_current_sparsepcgc_amount_outcome_teacher_ratio",
+        float(teacher["ratio"]) if isinstance(teacher, dict) else float("nan"),
+    )
+    setattr(
+        args,
+        "_current_sparsepcgc_amount_outcome_teacher_score",
+        float(teacher["score"]) if isinstance(teacher, dict) else float("nan"),
+    )
+    setattr(
+        args,
+        "_current_sparsepcgc_amount_outcome_teacher_count",
+        int(teacher["good_count"]) if isinstance(teacher, dict) else 0,
+    )
+    setattr(
+        args,
+        "_current_sparsepcgc_amount_outcome_teacher_bad_count",
+        int(teacher["bad_count"]) if isinstance(teacher, dict) else 0,
+    )
+    return teacher
+
+
+def _sparsepcgc_update_amount_outcome_memory(args, memory_key, actual_percent, used_ratio):
+    debug = {
+        "amount_outcome_memory_saved": False,
+        "amount_outcome_memory_label_id": 0,
+        "amount_outcome_memory_used_ratio": float("nan"),
+        "amount_outcome_memory_bucket_ratio": float("nan"),
+        "amount_outcome_memory_best_ratio": float("nan"),
+        "amount_outcome_memory_best_score": float("nan"),
+        "amount_outcome_memory_best_count": 0,
+        "amount_outcome_memory_good_count": 0,
+        "amount_outcome_memory_bad_count": 0,
+        "amount_outcome_memory_entry_count": 0,
+    }
+    if not bool(getattr(args, "sparsepcgc_amount_outcome_memory", True)):
+        return debug
+    if not memory_key:
+        return debug
+
+    try:
+        actual_percent = float(actual_percent)
+        used_ratio = float(used_ratio)
+    except Exception:
+        teacher = _sparsepcgc_amount_outcome_teacher(args, memory_key)
+        if isinstance(teacher, dict):
+            debug.update(
+                {
+                    "amount_outcome_memory_best_ratio": float(teacher.get("ratio", float("nan"))),
+                    "amount_outcome_memory_best_score": float(teacher.get("score", float("nan"))),
+                    "amount_outcome_memory_best_count": int(teacher.get("good_count", 0)),
+                    "amount_outcome_memory_good_count": int(teacher.get("good_count", 0)),
+                    "amount_outcome_memory_bad_count": int(teacher.get("bad_count", 0)),
+                    "amount_outcome_memory_entry_count": int(teacher.get("bucket_count", 0)),
+                }
+            )
+        return debug
+
+    if not (math.isfinite(actual_percent) and math.isfinite(used_ratio) and used_ratio > 0.0):
+        teacher = _sparsepcgc_amount_outcome_teacher(args, memory_key)
+        if isinstance(teacher, dict):
+            debug.update(
+                {
+                    "amount_outcome_memory_best_ratio": float(teacher.get("ratio", float("nan"))),
+                    "amount_outcome_memory_best_score": float(teacher.get("score", float("nan"))),
+                    "amount_outcome_memory_best_count": int(teacher.get("good_count", 0)),
+                    "amount_outcome_memory_good_count": int(teacher.get("good_count", 0)),
+                    "amount_outcome_memory_bad_count": int(teacher.get("bad_count", 0)),
+                    "amount_outcome_memory_entry_count": int(teacher.get("bucket_count", 0)),
+                }
+            )
+        return debug
+
+    good_margin = max(float(getattr(args, "sparsepcgc_amount_outcome_good_margin", 0.25)), 0.0)
+    bad_margin = max(float(getattr(args, "sparsepcgc_amount_outcome_bad_margin", 0.25)), 0.0)
+    if actual_percent < -good_margin:
+        label_id = 1
+    elif actual_percent > bad_margin:
+        label_id = 3
+    else:
+        label_id = 2
+
+    bucket_ratio = _sparsepcgc_quantize_amount_ratio(args, used_ratio)
+    debug["amount_outcome_memory_label_id"] = int(label_id)
+    debug["amount_outcome_memory_used_ratio"] = float(used_ratio)
+    debug["amount_outcome_memory_bucket_ratio"] = (
+        float(bucket_ratio) if bucket_ratio is not None and math.isfinite(float(bucket_ratio)) else float("nan")
+    )
+
+    memory = _sparsepcgc_amount_outcome_memory(args)
+    entry = memory.get(memory_key, None)
+    if not isinstance(entry, dict):
+        entry = {"items": {}}
+    items = entry.setdefault("items", {})
+    bucket_key = None if bucket_ratio is None else f"{float(bucket_ratio):.6f}"
+    bucket = items.get(bucket_key, None) if bucket_key is not None else None
+    if not isinstance(bucket, dict):
+        bucket = {
+            "ratio": float(bucket_ratio if bucket_ratio is not None else used_ratio),
+            "success_ema": 0.0,
+            "bad_ema": 0.0,
+            "count": 0,
+            "good_count": 0,
+            "bad_count": 0,
+            "best_percent": float("inf"),
+            "last_percent": float("nan"),
+        }
+
+    ema = min(max(float(getattr(args, "sparsepcgc_amount_outcome_memory_ema", 0.20)), 1e-4), 1.0)
+    bucket["ratio"] = float(bucket_ratio if bucket_ratio is not None else used_ratio)
+    bucket["count"] = int(bucket.get("count", 0)) + 1
+    bucket["last_percent"] = float(actual_percent)
+    if label_id == 1:
+        bucket["good_count"] = int(bucket.get("good_count", 0)) + 1
+        bucket["success_ema"] = (1.0 - ema) * float(bucket.get("success_ema", 0.0)) + ema * 1.0
+        bucket["bad_ema"] = (1.0 - ema) * float(bucket.get("bad_ema", 0.0))
+        bucket["best_percent"] = min(float(bucket.get("best_percent", float("inf"))), float(actual_percent))
+        debug["amount_outcome_memory_saved"] = True
+    elif label_id == 3:
+        bucket["bad_count"] = int(bucket.get("bad_count", 0)) + 1
+        bucket["success_ema"] = (1.0 - ema) * float(bucket.get("success_ema", 0.0))
+        bucket["bad_ema"] = (1.0 - ema) * float(bucket.get("bad_ema", 0.0)) + ema * 1.0
+        bucket["best_percent"] = min(float(bucket.get("best_percent", float("inf"))), float(actual_percent))
+        debug["amount_outcome_memory_saved"] = True
+    items[bucket_key] = bucket
+    memory[memory_key] = entry
+    memory.move_to_end(memory_key)
+    max_entries = max(int(getattr(args, "episode_input_common_cache_max_entries", 0)), 256)
+    while len(memory) > max_entries:
+        memory.popitem(last=False)
+
+    teacher = _sparsepcgc_amount_outcome_teacher(args, memory_key)
+    if isinstance(teacher, dict):
+        debug.update(
+            {
+                "amount_outcome_memory_best_ratio": float(teacher.get("ratio", float("nan"))),
+                "amount_outcome_memory_best_score": float(teacher.get("score", float("nan"))),
+                "amount_outcome_memory_best_count": int(teacher.get("good_count", 0)),
+                "amount_outcome_memory_good_count": int(teacher.get("good_count", 0)),
+                "amount_outcome_memory_bad_count": int(teacher.get("bad_count", 0)),
+                "amount_outcome_memory_entry_count": int(teacher.get("bucket_count", len(items))),
+            }
+        )
+    else:
+        debug["amount_outcome_memory_entry_count"] = int(len(items))
+
+    return debug
+
+
+def _sparsepcgc_subtree_outcome_memory(args):
+    memory = getattr(args, "_sparsepcgc_subtree_outcome_memory", None)
+    if not isinstance(memory, OrderedDict):
+        memory = OrderedDict()
+        setattr(args, "_sparsepcgc_subtree_outcome_memory", memory)
+    return memory
+
+
+def _sparsepcgc_subtree_outcome_memory_key(cache_key, subtree_key):
+    return f"{str(cache_key)}|subtree={int(subtree_key)}"
+
+
+def _sparsepcgc_subtree_outcome_lookup(args, cache_key, subtree_key):
+    if not bool(getattr(args, "sparsepcgc_subtree_outcome_selector", True)):
+        return None
+    key = _sparsepcgc_subtree_outcome_memory_key(cache_key, subtree_key)
+    entry = _sparsepcgc_subtree_outcome_memory(args).get(key, None)
+    return entry if isinstance(entry, dict) else None
+
+
+def _sparsepcgc_update_subtree_outcome_memory(args, cache_key, subtree_key, actual_percent):
+    debug = {
+        "subtree_outcome_memory_saved": False,
+        "subtree_outcome_memory_score": float("nan"),
+        "subtree_outcome_memory_count": 0,
+        "subtree_outcome_memory_good_count": 0,
+        "subtree_outcome_memory_bad_count": 0,
+    }
+    if not bool(getattr(args, "sparsepcgc_subtree_outcome_selector", True)):
+        return debug
+    try:
+        actual_percent = float(actual_percent)
+        subtree_key = int(subtree_key)
+    except Exception:
+        return debug
+    if not math.isfinite(actual_percent):
+        return debug
+    memory = _sparsepcgc_subtree_outcome_memory(args)
+    key = _sparsepcgc_subtree_outcome_memory_key(cache_key, subtree_key)
+    entry = memory.get(key, None)
+    if not isinstance(entry, dict):
+        entry = {
+            "score_ema": 0.0,
+            "count": 0,
+            "good_count": 0,
+            "bad_count": 0,
+            "best_percent": float("inf"),
+            "last_percent": float("nan"),
+        }
+    good_margin = max(float(getattr(args, "sparsepcgc_amount_outcome_good_margin", 0.25)), 0.0)
+    bad_margin = max(float(getattr(args, "sparsepcgc_amount_outcome_bad_margin", 0.25)), 0.0)
+    reward = 0.0
+    if actual_percent < -good_margin:
+        reward = min((-actual_percent - good_margin) / 5.0, 2.0)
+        entry["good_count"] = int(entry.get("good_count", 0)) + 1
+    elif actual_percent > bad_margin:
+        reward = -min((actual_percent - bad_margin) / 5.0, 2.0)
+        entry["bad_count"] = int(entry.get("bad_count", 0)) + 1
+    ema = min(max(float(getattr(args, "sparsepcgc_subtree_outcome_memory_ema", 0.20)), 1e-4), 1.0)
+    entry["score_ema"] = (1.0 - ema) * float(entry.get("score_ema", 0.0)) + ema * float(reward)
+    entry["count"] = int(entry.get("count", 0)) + 1
+    entry["best_percent"] = min(float(entry.get("best_percent", float("inf"))), actual_percent)
+    entry["last_percent"] = float(actual_percent)
+    memory[key] = entry
+    memory.move_to_end(key)
+    max_entries = max(int(getattr(args, "episode_input_common_cache_max_entries", 0)), 256)
+    while len(memory) > max_entries:
+        memory.popitem(last=False)
+    debug.update(
+        {
+            "subtree_outcome_memory_saved": True,
+            "subtree_outcome_memory_score": float(entry.get("score_ema", 0.0)),
+            "subtree_outcome_memory_count": int(entry.get("count", 0)),
+            "subtree_outcome_memory_good_count": int(entry.get("good_count", 0)),
+            "subtree_outcome_memory_bad_count": int(entry.get("bad_count", 0)),
+        }
+    )
+    return debug
+
+
+def _sparsepcgc_proposal_amount_bins(args):
+    values = getattr(args, "sparsepcgc_proposal_amount_bin_values", None)
+    if not isinstance(values, (list, tuple)) or not values:
+        values = (0.0, 0.015, 0.021, 0.026, 0.031, 0.038, 0.044, 0.05)
+    out = [0.0]
+    for value in values:
+        try:
+            out.append(min(max(float(value), 0.0), 0.05))
+        except Exception:
+            continue
+    return tuple(sorted(set(out)))
+
+
+def _sparsepcgc_proposal_terms_for_subtree(args, subtree_key):
+    terms = getattr(args, "_current_sparsepcgc_proposal_terms_by_key", None)
+    if not isinstance(terms, dict):
+        return None
+    try:
+        return terms.get(int(subtree_key), None)
+    except Exception:
+        return None
+
+
+def _build_sparsepcgc_proposal_candidate_teacher_loss(
+    args,
+    proposal_terms,
+    *,
+    actual_percent,
+    actual_scope="subtree",
+    subtree_key,
+    cache_key,
+    global_step,
+    episode,
+    epoch,
+    step,
+    geom_loss=None,
+):
+    debug = {
+        "proposal_selector_enabled": False,
+        "proposal_candidate_count": 0,
+        "proposal_actual_eval_count": 0,
+        "proposal_surrogate_prefilter_count": 0,
+        "proposal_applied_subtree_count": 0,
+        "proposal_selected_subtree_count": 0,
+        "proposal_noop_count": 0,
+        "proposal_best_actual_percent": float("nan"),
+        "proposal_chosen_actual_percent": float("nan"),
+        "proposal_predicted_delta": float("nan"),
+        "proposal_amount_bin": float("nan"),
+        "proposal_amount_residual": float("nan"),
+        "proposal_final_amount": float("nan"),
+        "proposal_cls_loss": 0.0,
+        "proposal_value_loss": 0.0,
+        "proposal_rank_loss": 0.0,
+        "proposal_geom_loss": 0.0,
+        "proposal_total_loss": 0.0,
+        "proposal_teacher_source": "none",
+        "verified_noop_guard_used": False,
+    }
+    rows = []
+    if not isinstance(proposal_terms, dict):
+        return None, debug, rows
+    amount_logits = proposal_terms.get("amount_bin_logits", None)
+    pred_per_amount = proposal_terms.get("predicted_delta_per_amount", None)
+    select_logit = proposal_terms.get("subtree_select_logit", None)
+    subtree_pred_delta = proposal_terms.get("subtree_predicted_delta", None)
+    residual_raw = proposal_terms.get("amount_residual_raw", None)
+    if not (torch.is_tensor(amount_logits) and torch.is_tensor(pred_per_amount)):
+        return None, debug, rows
+
+    bins = _sparsepcgc_proposal_amount_bins(args)
+    class_count = min(int(amount_logits.numel()), len(bins))
+    if class_count <= 0:
+        return None, debug, rows
+    amount_logits = amount_logits.flatten()[:class_count]
+    pred_per_amount = pred_per_amount.flatten()[:class_count]
+    ref = amount_logits
+    bin_tensor = ref.new_tensor(list(bins[:class_count]))
+    selected_class = int(torch.argmax(amount_logits.detach()).item())
+    selected_class = min(max(selected_class, 0), class_count - 1)
+    residual_max = min(
+        max(float(getattr(args, "sparsepcgc_proposal_amount_residual_max", 0.0025)), 0.0),
+        0.01,
+    )
+    residual_enabled = bool(getattr(args, "sparsepcgc_proposal_amount_residual_enable", True))
+    if torch.is_tensor(residual_raw):
+        residual_tensor = torch.tanh(residual_raw.reshape(())) * float(residual_max)
+    else:
+        residual_tensor = ref.new_zeros(())
+    if not residual_enabled or selected_class == 0:
+        residual_tensor = residual_tensor * 0.0
+    selected_bin_tensor = bin_tensor[selected_class]
+    final_amount_tensor = torch.clamp(selected_bin_tensor + residual_tensor, 0.0, 0.05)
+    if selected_class == 0:
+        final_amount_tensor = final_amount_tensor * 0.0
+
+    actual_value = finite_float_or_none(actual_percent)
+    actual_available = actual_value is not None and math.isfinite(float(actual_value))
+    actual_scope_text = str(actual_scope or ("subtree" if actual_available else "none"))
+    noop_margin = max(float(getattr(args, "sparsepcgc_proposal_noop_margin", 0.0)), 0.0)
+    if actual_available:
+        if float(actual_value) < -float(noop_margin):
+            teacher_class = int(selected_class)
+            teacher_delta = float(actual_value)
+        else:
+            teacher_class = 0
+            teacher_delta = 0.0
+        teacher_source = "actual_subtree"
+    else:
+        teacher_class = int(torch.argmin(pred_per_amount.detach()).item())
+        teacher_delta = float(pred_per_amount.detach().flatten()[teacher_class].cpu())
+        teacher_source = "surrogate_fallback"
+    teacher_class = min(max(int(teacher_class), 0), class_count - 1)
+
+    candidate_classes = {0, selected_class}
+    if bool(getattr(args, "sparsepcgc_proposal_eval_neighbor_amounts", True)):
+        candidate_classes.add(max(selected_class - 1, 0))
+        candidate_classes.add(min(selected_class + 1, class_count - 1))
+    if bool(getattr(args, "sparsepcgc_proposal_use_surrogate_prefilter", True)):
+        candidate_classes.add(int(torch.argmin(pred_per_amount.detach()).item()))
+    candidate_classes = sorted(candidate_classes)
+
+    candidate_teacher_values = {}
+    for cls in candidate_classes:
+        if cls == 0:
+            candidate_teacher_values[int(cls)] = 0.0
+        elif actual_available and cls == selected_class:
+            candidate_teacher_values[int(cls)] = float(actual_value)
+        else:
+            candidate_teacher_values[int(cls)] = float(pred_per_amount.detach().flatten()[cls].cpu())
+    if candidate_teacher_values:
+        best_cls = min(candidate_teacher_values, key=lambda cls: candidate_teacher_values[cls])
+        best_value = float(candidate_teacher_values[best_cls])
+        if best_value < -float(noop_margin):
+            teacher_class = int(best_cls)
+            teacher_delta = best_value
+            if actual_available and best_cls == selected_class:
+                teacher_source = "actual_subtree"
+            elif actual_available:
+                teacher_source = "actual_subtree_mixed_surrogate"
+            else:
+                teacher_source = "surrogate_fallback"
+        else:
+            teacher_class = 0
+            teacher_delta = 0.0
+            teacher_source = "actual_subtree" if actual_available else "surrogate_fallback"
+
+    for cand_idx, cls in enumerate(candidate_classes):
+        is_noop = cls == 0
+        cand_bin = float(bin_tensor.detach().flatten()[cls].cpu())
+        cand_residual = 0.0 if is_noop else float(residual_tensor.detach().cpu())
+        cand_amount = 0.0 if is_noop else min(max(cand_bin + cand_residual, 0.0), 0.05)
+        cand_actual = 0.0 if is_noop else (float(actual_value) if cls == selected_class and actual_available else float("nan"))
+        cand_source = "noop" if is_noop else ("network_selected" if cls == selected_class else "neighbor_or_surrogate")
+        rows.append(
+            {
+                "global_step": int(global_step) + 1,
+                "episode": int(episode) + 1,
+                "epoch": int(epoch) + 1,
+                "step": int(step) + 1,
+                "sample_key": str(cache_key),
+                "subtree_key": int(subtree_key),
+                "candidate_id": int(cand_idx),
+                "amount_bin": cand_bin,
+                "amount_residual": cand_residual,
+                "final_amount": cand_amount,
+                "is_noop": bool(is_noop),
+                "proposal_valid": True,
+                "proposal_drop_count": 0,
+                "actual_percent": cand_actual,
+                "surrogate_percent": float(pred_per_amount.detach().flatten()[cls].cpu()),
+                "predicted_delta": float(pred_per_amount.detach().flatten()[cls].cpu()),
+                "teacher_is_best": bool(cls == teacher_class),
+                "teacher_label": int(teacher_class),
+                "candidate_source": cand_source,
+                "actual_scope": actual_scope_text if actual_available else "none",
+                "teacher_source": teacher_source,
+            }
+        )
+
+    target = torch.tensor([teacher_class], device=amount_logits.device, dtype=torch.long)
+    cls_loss = torch.nn.functional.cross_entropy(amount_logits.view(1, -1).float(), target)
+    teacher_delta_tensor = ref.new_tensor(float(teacher_delta))
+    pred_teacher = pred_per_amount[teacher_class]
+    value_loss = torch.nn.functional.smooth_l1_loss(pred_teacher, teacher_delta_tensor)
+    if torch.is_tensor(subtree_pred_delta):
+        value_loss = value_loss + torch.nn.functional.smooth_l1_loss(
+            subtree_pred_delta.reshape(()),
+            teacher_delta_tensor,
+        )
+    selected_pred = pred_per_amount[selected_class]
+    teacher_pred = pred_per_amount[teacher_class]
+    rank_margin = ref.new_tensor(0.1)
+    rank_loss = torch.relu(rank_margin + teacher_pred - selected_pred) if teacher_class != selected_class else ref.new_zeros(())
+    if teacher_class == 0 and selected_class != 0:
+        rank_loss = torch.relu(rank_margin + pred_per_amount[0] - selected_pred)
+    if torch.is_tensor(select_logit):
+        subtree_target = ref.new_tensor(0.0 if teacher_class == 0 else 1.0)
+        select_loss = torch.nn.functional.binary_cross_entropy_with_logits(
+            select_logit.reshape(()),
+            subtree_target,
+        )
+        cls_loss = cls_loss + select_loss
+    if torch.is_tensor(geom_loss):
+        geom_scalar = torch.nan_to_num(geom_loss.detach(), nan=0.0, posinf=0.0, neginf=0.0)
+        if torch.is_tensor(select_logit):
+            geom_loss_term = torch.sigmoid(select_logit.reshape(())) * torch.relu(geom_scalar)
+        else:
+            geom_loss_term = torch.relu(geom_scalar) * 0.0
+    else:
+        geom_loss_term = ref.new_zeros(())
+
+    total_loss = (
+        float(getattr(args, "sparsepcgc_proposal_cls_loss_weight", 1.0)) * cls_loss
+        + float(getattr(args, "sparsepcgc_proposal_value_loss_weight", 0.5)) * value_loss
+        + float(getattr(args, "sparsepcgc_proposal_rank_loss_weight", 0.2)) * rank_loss
+        + float(getattr(args, "sparsepcgc_proposal_geom_penalty_weight", 0.1)) * geom_loss_term
+    )
+    verified_guard = bool(
+        str(getattr(args, "sparsepcgc_proposal_inference_mode", "fast")).strip().lower() == "verified"
+        and actual_available
+        and selected_class != 0
+        and float(actual_value) >= -float(noop_margin)
+    )
+    debug.update(
+        {
+            "proposal_selector_enabled": True,
+            "proposal_candidate_count": int(len(rows)),
+            "proposal_actual_eval_count": 1 if actual_available else 0,
+            "proposal_surrogate_prefilter_count": int(max(len(rows) - (2 if actual_available else 1), 0)),
+            "proposal_applied_subtree_count": 0 if teacher_class == 0 else 1,
+            "proposal_selected_subtree_count": 1,
+            "proposal_noop_count": 1 if teacher_class == 0 else 0,
+            "proposal_best_actual_percent": min(0.0, float(actual_value)) if actual_available else float("nan"),
+            "proposal_chosen_actual_percent": float(actual_value) if actual_available else float("nan"),
+            "proposal_predicted_delta": float(
+                subtree_pred_delta.detach().cpu()
+            ) if torch.is_tensor(subtree_pred_delta) else float(pred_per_amount.detach()[selected_class].cpu()),
+            "proposal_amount_bin": float(selected_bin_tensor.detach().cpu()),
+            "proposal_amount_residual": float(residual_tensor.detach().cpu()),
+            "proposal_final_amount": float(final_amount_tensor.detach().cpu()),
+            "proposal_cls_loss": float(cls_loss.detach().cpu()),
+            "proposal_value_loss": float(value_loss.detach().cpu()),
+            "proposal_rank_loss": float(rank_loss.detach().cpu()),
+            "proposal_geom_loss": float(geom_loss_term.detach().cpu()),
+            "proposal_total_loss": float(total_loss.detach().cpu()),
+            "proposal_teacher_source": str(teacher_source),
+            "verified_noop_guard_used": bool(verified_guard),
+        }
+    )
+    return total_loss, debug, rows
+
+
 def _sparsepcgc_update_success_amount_memory(args, memory_key, actual_percent, hard_ratio):
     """
     actualで改善したSubtreeのPrune量をEMAで記憶する。
@@ -617,6 +1196,7 @@ def _build_sparsepcgc_outcome_weighted_imitation_loss(
         "outcome_amount_anticollapse_loss": 0.0,
         "outcome_success_amount_teacher": float("nan"),
         "bad_amount_loss_disabled_no_success_memory": False,
+        "outcome_bad_amount_policy_id": 0,
     }
 
     if not bool(getattr(args, "sparsepcgc_outcome_imitation", True)):
@@ -756,15 +1336,36 @@ def _build_sparsepcgc_outcome_weighted_imitation_loss(
             )
 
         elif bad_weight > 0.0:
-            # 悪化したStepでは軽くAmountを下げる。
-            # ただし強すぎると0へ逃げるため、weightは非常に小さくする。
-            if (
+            bad_policy = str(
+                getattr(args, "sparsepcgc_outcome_bad_amount_policy", "where_only")
+            ).strip().lower()
+            if bad_policy not in {"where_only", "success_guarded", "legacy"}:
+                bad_policy = "where_only"
+            debug["outcome_bad_amount_policy_id"] = {
+                "where_only": 1,
+                "success_guarded": 2,
+                "legacy": 3,
+            }.get(bad_policy, 0)
+            if bad_policy == "where_only":
+                pass
+            elif (
                 bool(getattr(args, "sparsepcgc_disable_bad_amount_when_no_success_memory", True))
                 and not (success_teacher is not None and math.isfinite(float(success_teacher)))
             ):
                 debug["bad_amount_loss_disabled_no_success_memory"] = True
             else:
-                bad_target = (hard_ratio_t.detach() * 0.5).clamp(0.0, 0.95)
+                if bad_policy == "success_guarded" and success_teacher is not None and math.isfinite(float(success_teacher)):
+                    min_keep = min(
+                        max(float(getattr(args, "sparsepcgc_success_amount_min_keep", 0.60)), 0.0),
+                        1.0,
+                    )
+                    success_floor = reference.new_tensor(float(success_teacher) * float(min_keep))
+                    bad_target = torch.maximum(
+                        (hard_ratio_t.detach() * 0.5).clamp(0.0, 0.95),
+                        success_floor.clamp(0.0, 0.95),
+                    )
+                else:
+                    bad_target = (hard_ratio_t.detach() * 0.5).clamp(0.0, 0.95)
                 amount_loss = (raw_ratio_t - bad_target).pow(2)
                 total_loss = total_loss + (
                     float(getattr(args, "sparsepcgc_outcome_bad_amount_weight", 0.005))
@@ -1872,7 +2473,13 @@ def _select_sparsepcgc_potential_subtree_key(
     args,
     global_step,
     cache_key,
+    model=None,
 ):
+    try:
+        setattr(args, "_current_sparsepcgc_proposal_terms_by_key", {})
+        setattr(args, "_current_sparsepcgc_proposal_selection_meta", {"enabled": False})
+    except Exception:
+        pass
     if not bool(getattr(args, "sparsepcgc_subtree_potential_priority", True)):
         return None, {"enabled": False, "reason": "disabled"}
     compress_key = str(getattr(args, "compress", "")).strip().lower().replace("_", "").replace("-", "")
@@ -1955,6 +2562,16 @@ def _select_sparsepcgc_potential_subtree_key(
                     score += float(fast_score)
                 else:
                     fast_score = 0.0
+                subtree_memory_bonus = 0.0
+                subtree_memory_count = 0
+                subtree_memory = _sparsepcgc_subtree_outcome_lookup(args, cache_key, key)
+                if isinstance(subtree_memory, dict):
+                    subtree_memory_count = int(subtree_memory.get("count", 0) or 0)
+                    subtree_memory_bonus = (
+                        float(getattr(args, "sparsepcgc_subtree_outcome_selector_weight", 20.0))
+                        * float(subtree_memory.get("score_ema", 0.0) or 0.0)
+                    )
+                    score += float(subtree_memory_bonus)
                 if isinstance(detail, dict):
                     detail = dict(detail)
                     detail["fast_diag_local_count"] = int(fast_local_count)
@@ -1962,6 +2579,8 @@ def _select_sparsepcgc_potential_subtree_key(
                     detail["fast_diag_score"] = float(fast_score)
                     detail["fast_diag_global_drop_count"] = int(fast_diag_global.get("global_drop_count", 0) or 0)
                     detail["fast_diag_global_drop_ratio"] = float(fast_diag_global.get("global_drop_ratio", 0.0) or 0.0)
+                    detail["subtree_outcome_memory_bonus"] = float(subtree_memory_bonus)
+                    detail["subtree_outcome_memory_count"] = int(subtree_memory_count)
                 score_map[int(key)] = {
                     "score": float(score),
                     "detail": detail,
@@ -1981,11 +2600,32 @@ def _select_sparsepcgc_potential_subtree_key(
         cached_item = score_map.get(int(key), None)
         if not isinstance(cached_item, dict):
             continue
+        score_value = float(cached_item.get("score", 0.0) or 0.0)
+        detail = cached_item.get("detail", None)
+        old_memory_bonus = (
+            float(detail.get("subtree_outcome_memory_bonus", 0.0) or 0.0)
+            if isinstance(detail, dict)
+            else 0.0
+        )
+        current_memory_bonus = 0.0
+        current_memory_count = 0
+        subtree_memory = _sparsepcgc_subtree_outcome_lookup(args, cache_key, key)
+        if isinstance(subtree_memory, dict):
+            current_memory_count = int(subtree_memory.get("count", 0) or 0)
+            current_memory_bonus = (
+                float(getattr(args, "sparsepcgc_subtree_outcome_selector_weight", 20.0))
+                * float(subtree_memory.get("score_ema", 0.0) or 0.0)
+            )
+        score_value = float(score_value) - float(old_memory_bonus) + float(current_memory_bonus)
+        if isinstance(detail, dict):
+            detail = dict(detail)
+            detail["subtree_outcome_memory_bonus"] = float(current_memory_bonus)
+            detail["subtree_outcome_memory_count"] = int(current_memory_count)
         scored.append(
             (
-                float(cached_item.get("score", 0.0) or 0.0),
+                float(score_value),
                 int(key),
-                cached_item.get("detail", None),
+                detail,
             )
         )
 
@@ -1993,6 +2633,143 @@ def _select_sparsepcgc_potential_subtree_key(
         return None, {"enabled": True, "reason": "no_scored_groups", "pool": len(pool_keys)}
 
     scored.sort(key=lambda item: item[0], reverse=True)
+
+    proposal_selector_enabled = bool(
+        getattr(args, "sparsepcgc_algorithmic_proposal_selector", True)
+        and not getattr(args, "sparsepcgc_legacy_direct_actuator_train", False)
+        and model is not None
+    )
+    if proposal_selector_enabled:
+        try:
+            base_model = _unwrap_train_model(model)
+            score_fn = getattr(base_model, "score_algorithmic_proposal_subtrees", None)
+        except Exception:
+            base_model = None
+            score_fn = None
+        if callable(score_fn):
+            proposal_topk = min(
+                max(int(getattr(args, "sparsepcgc_proposal_topk_subtrees", 5)), 1),
+                len(scored),
+            )
+            proposal_pool = scored[:proposal_topk]
+            feature_rows = []
+            pool_keys_for_terms = []
+            for rank_idx, (score_value, key_value, detail_value) in enumerate(proposal_pool):
+                point_idx = group_by_key.get(int(key_value), None)
+                point_count = int(point_idx.numel()) if torch.is_tensor(point_idx) else 0
+                detail_dict = detail_value if isinstance(detail_value, dict) else {}
+                memory_count = float(detail_dict.get("subtree_outcome_memory_count", 0) or 0)
+                feature_rows.append(
+                    [
+                        float(score_value) / 100.0,
+                        math.log1p(max(float(point_count), 0.0)) / 10.0,
+                        float(detail_dict.get("drop_score", 0.0) or 0.0) / 100.0,
+                        float(detail_dict.get("add_score", 0.0) or 0.0) / 100.0,
+                        float(detail_dict.get("macro_density_score", 0.0) or 0.0) / 100.0,
+                        float(detail_dict.get("proxy_rate_score", 0.0) or 0.0) / 100.0,
+                        float(detail_dict.get("fast_diag_local_ratio", 0.0) or 0.0),
+                        float(detail_dict.get("fast_diag_score", 0.0) or 0.0) / 100.0,
+                        float(detail_dict.get("subtree_outcome_memory_bonus", 0.0) or 0.0) / 100.0,
+                        math.log1p(max(memory_count, 0.0)) / 10.0,
+                        float(rank_idx) / max(float(proposal_topk - 1), 1.0),
+                        1.0,
+                    ]
+                )
+                pool_keys_for_terms.append(int(key_value))
+            try:
+                selector_device = next(base_model.parameters()).device
+            except Exception:
+                selector_device = full_coords.device
+            feature_tensor = torch.tensor(
+                feature_rows,
+                device=selector_device,
+                dtype=torch.float32,
+            )
+            selector_out = score_fn(feature_tensor)
+            predicted_delta = selector_out["subtree_predicted_delta"]
+            select_logit = selector_out["subtree_select_logit"]
+            threshold = float(getattr(args, "sparsepcgc_proposal_accept_threshold", 0.0))
+            max_apply = max(int(getattr(args, "sparsepcgc_proposal_max_apply_subtrees", 3)), 1)
+            if not bool(getattr(args, "sparsepcgc_multi_subtree_train", False)):
+                max_apply = 1
+            order = torch.argsort(predicted_delta.detach(), dim=0, descending=False)
+            accepted_indices = []
+            for order_item in order.detach().cpu().tolist():
+                idx = int(order_item)
+                pred_value = float(predicted_delta.detach().flatten()[idx].cpu())
+                if pred_value <= threshold:
+                    accepted_indices.append(idx)
+                if len(accepted_indices) >= max_apply:
+                    break
+            forced_probe = False
+            if not accepted_indices and int(order.numel()) > 0:
+                # Training still needs a concrete subtree to evaluate and teach no-op.
+                accepted_indices = [int(order.detach().cpu().flatten()[0].item())]
+                forced_probe = True
+
+            selected_keys = [int(pool_keys_for_terms[idx]) for idx in accepted_indices]
+            terms_by_key = {}
+            for idx, key_value in enumerate(pool_keys_for_terms):
+                terms_by_key[int(key_value)] = {
+                    "subtree_select_logit": select_logit[idx],
+                    "subtree_predicted_delta": predicted_delta[idx],
+                    "amount_bin_logits": selector_out["amount_bin_logits"][idx],
+                    "amount_residual_raw": selector_out["amount_residual_raw"][idx],
+                    "predicted_delta_per_amount": selector_out["predicted_delta_per_amount"][idx],
+                    "feature_tensor": feature_tensor[idx],
+                    "pool_rank": int(idx),
+                    "heuristic_score": float(proposal_pool[idx][0]),
+                }
+            setattr(args, "_current_sparsepcgc_proposal_terms_by_key", terms_by_key)
+            setattr(
+                args,
+                "_current_sparsepcgc_proposal_selection_meta",
+                {
+                    "enabled": True,
+                    "pool_count": int(len(proposal_pool)),
+                    "selected_count": int(len(selected_keys)),
+                    "selected_keys": ",".join(str(key) for key in selected_keys),
+                    "forced_probe": bool(forced_probe),
+                    "threshold": float(threshold),
+                    "best_predicted_delta": float(predicted_delta.detach().flatten()[int(order[0])].cpu())
+                    if int(order.numel()) > 0
+                    else float("nan"),
+                },
+            )
+            if selected_keys:
+                selected = candidate_subtree_keys.new_tensor(selected_keys, dtype=candidate_subtree_keys.dtype)
+                first_key = int(selected_keys[0])
+                first_idx = pool_keys_for_terms.index(first_key)
+                first_detail = proposal_pool[first_idx][2] if isinstance(proposal_pool[first_idx][2], dict) else {}
+                meta = {
+                    "enabled": True,
+                    "reason": "network_proposal_selector",
+                    "proposal_selector": True,
+                    "proposal_pool_count": int(len(proposal_pool)),
+                    "proposal_selected_count": int(len(selected_keys)),
+                    "proposal_selected_keys": ",".join(str(key) for key in selected_keys),
+                    "proposal_forced_probe": bool(forced_probe),
+                    "proposal_best_predicted_delta": float(
+                        predicted_delta.detach().flatten()[int(order[0])].cpu()
+                    ) if int(order.numel()) > 0 else float("nan"),
+                    "pool": len(pool_keys),
+                    "scored": len(scored),
+                    "rank": int(first_idx),
+                    "score": float(proposal_pool[first_idx][0]),
+                    "best_score": float(scored[0][0]),
+                    "key": int(first_key),
+                    "random": False,
+                    "drop_score": float(first_detail.get("drop_score", 0.0)) if isinstance(first_detail, dict) else 0.0,
+                    "add_score": float(first_detail.get("add_score", 0.0)) if isinstance(first_detail, dict) else 0.0,
+                    "subtree_outcome_memory_bonus": float(
+                        first_detail.get("subtree_outcome_memory_bonus", 0.0) or 0.0
+                    ) if isinstance(first_detail, dict) else 0.0,
+                    "subtree_outcome_memory_count": int(
+                        first_detail.get("subtree_outcome_memory_count", 0) or 0
+                    ) if isinstance(first_detail, dict) else 0,
+                }
+                return selected, meta
+
     # ============================================================
     # Multi-Subtree top-k selection
     # ============================================================
@@ -2071,6 +2848,8 @@ def _select_sparsepcgc_potential_subtree_key(
             "fast_diag_score": float(first_detail.get("fast_diag_score", 0.0) or 0.0) if isinstance(first_detail, dict) else 0.0,
             "fast_diag_global_drop_count": int(fast_diag_global.get("global_drop_count", 0) or 0),
             "fast_diag_global_drop_ratio": float(fast_diag_global.get("global_drop_ratio", 0.0) or 0.0),
+            "subtree_outcome_memory_bonus": float(first_detail.get("subtree_outcome_memory_bonus", 0.0) or 0.0) if isinstance(first_detail, dict) else 0.0,
+            "subtree_outcome_memory_count": int(first_detail.get("subtree_outcome_memory_count", 0) or 0) if isinstance(first_detail, dict) else 0,
         }
         return selected, meta
     random_mix = min(max(float(getattr(args, "sparsepcgc_subtree_potential_random_mix", 0.05)), 0.0), 1.0)
@@ -2117,6 +2896,12 @@ def _select_sparsepcgc_potential_subtree_key(
         ),
         "fast_diag_global_drop_count": int(fast_diag_global.get("global_drop_count", 0) or 0),
         "fast_diag_global_drop_ratio": float(fast_diag_global.get("global_drop_ratio", 0.0) or 0.0),
+        "subtree_outcome_memory_bonus": (
+            float(chosen_detail.get("subtree_outcome_memory_bonus", 0.0) or 0.0) if isinstance(chosen_detail, dict) else 0.0
+        ),
+        "subtree_outcome_memory_count": (
+            int(chosen_detail.get("subtree_outcome_memory_count", 0) or 0) if isinstance(chosen_detail, dict) else 0
+        ),
     }
     return selected, meta
 
@@ -3715,6 +4500,146 @@ def _sparsepcgc_splice_subtree_coords_into_full_cloud(full_coords_b3n, subtree_c
         return None
     return spliced
 
+
+def _sparsepcgc_splice_subtree_xyz_into_full_cloud(full_xyz_b3n, point_idx, candidate_xyz_b3m):
+    if not torch.is_tensor(full_xyz_b3n) or not torch.is_tensor(candidate_xyz_b3m):
+        return None
+    if full_xyz_b3n.ndim != 3 or candidate_xyz_b3m.ndim != 3:
+        return None
+    if full_xyz_b3n.shape[0] != candidate_xyz_b3m.shape[0] or full_xyz_b3n.shape[1] != 3 or candidate_xyz_b3m.shape[1] != 3:
+        return None
+    if not torch.is_tensor(point_idx):
+        return None
+    if full_xyz_b3n.shape[0] != 1:
+        return None
+    idx = point_idx.detach().to(device=full_xyz_b3n.device, dtype=torch.long).reshape(-1)
+    if idx.numel() <= 0:
+        return None
+    valid = (idx >= 0) & (idx < full_xyz_b3n.shape[-1])
+    idx = idx[valid]
+    if idx.numel() <= 0:
+        return None
+    keep_mask = torch.ones((full_xyz_b3n.shape[-1],), device=full_xyz_b3n.device, dtype=torch.bool)
+    keep_mask[idx] = False
+    keep_idx = keep_mask.nonzero(as_tuple=False).reshape(-1)
+    full_without_subtree = full_xyz_b3n.index_select(2, keep_idx)
+    candidate_xyz_b3m = candidate_xyz_b3m.to(device=full_xyz_b3n.device, dtype=full_xyz_b3n.dtype)
+    if candidate_xyz_b3m.shape[-1] <= 0:
+        return full_without_subtree.contiguous()
+    return torch.cat([full_without_subtree, candidate_xyz_b3m], dim=2).contiguous()
+
+
+def _sparsepcgc_full_cloud_splice_actual_from_voxel_state(
+    args,
+    writer,
+    model,
+    *,
+    subtree_tree,
+    full_octree_context,
+    like_xyz,
+    prefix="FullCloudSpliceActual",
+):
+    debug = {
+        "full_cloud_splice_loss_enabled": bool(getattr(args, "sparsepcgc_subtree_full_cloud_splice_loss", True)),
+        "full_cloud_splice_actual_used": False,
+        "full_cloud_splice_actual_fallback": False,
+        "full_cloud_splice_actual_reason": "",
+        "full_cloud_splice_actual_points": 0,
+        "full_cloud_splice_subtree_before_voxels": 0,
+        "full_cloud_splice_subtree_after_voxels": 0,
+        "full_cloud_splice_full_voxels": 0,
+    }
+    if not bool(debug["full_cloud_splice_loss_enabled"]):
+        debug["full_cloud_splice_actual_reason"] = "disabled"
+        return None, None, debug
+    if not isinstance(subtree_tree, dict) or not isinstance(full_octree_context, dict):
+        debug["full_cloud_splice_actual_fallback"] = True
+        debug["full_cloud_splice_actual_reason"] = "missing_context"
+        return None, None, debug
+    subtree_coords = subtree_tree.get("global_voxel_coords", None)
+    full_coords = full_octree_context.get("full_global_voxel_coords", None)
+    if not torch.is_tensor(subtree_coords) or not torch.is_tensor(full_coords):
+        debug["full_cloud_splice_actual_fallback"] = True
+        debug["full_cloud_splice_actual_reason"] = "missing_global_voxel_coords"
+        return None, None, debug
+    base_model = model.module if hasattr(model, "module") else model
+    voxel_state = getattr(base_model, "last_actuator_voxel_state", None)
+    if not isinstance(voxel_state, dict):
+        debug["full_cloud_splice_actual_fallback"] = True
+        debug["full_cloud_splice_actual_reason"] = "last_actuator_voxel_state_missing"
+        return None, None, debug
+    final_voxel_coords = voxel_state.get("final_voxel_coords", None)
+    if not torch.is_tensor(final_voxel_coords) or final_voxel_coords.ndim != 3 or final_voxel_coords.shape[1] != 3:
+        debug["full_cloud_splice_actual_fallback"] = True
+        debug["full_cloud_splice_actual_reason"] = "final_voxel_coords_missing_or_invalid"
+        return None, None, debug
+    final_voxel_valid_mask = voxel_state.get("final_voxel_valid_mask", None)
+    coords = final_voxel_coords.detach().to(device=like_xyz.device, dtype=torch.long)
+    if torch.is_tensor(final_voxel_valid_mask):
+        valid_mask = final_voxel_valid_mask.detach().to(device=coords.device, dtype=torch.bool)
+        if valid_mask.ndim == 3:
+            valid_mask = valid_mask.squeeze(1)
+        if valid_mask.ndim != 2 or valid_mask.shape[0] != coords.shape[0] or valid_mask.shape[1] != coords.shape[2]:
+            debug["full_cloud_splice_actual_fallback"] = True
+            debug["full_cloud_splice_actual_reason"] = "invalid_final_voxel_valid_mask"
+            return None, None, debug
+    else:
+        valid_mask = torch.ones((coords.shape[0], coords.shape[2]), device=coords.device, dtype=torch.bool)
+    if coords.shape[0] != 1:
+        debug["full_cloud_splice_actual_fallback"] = True
+        debug["full_cloud_splice_actual_reason"] = "batch_size_not_supported"
+        return None, None, debug
+    valid_b = valid_mask[0]
+    if int(valid_b.sum().detach().cpu()) <= 0:
+        debug["full_cloud_splice_actual_fallback"] = True
+        debug["full_cloud_splice_actual_reason"] = "empty_final_voxel_coords"
+        return None, None, debug
+    candidate_coords = coords[0, :, valid_b].transpose(0, 1).contiguous()
+    if subtree_coords.ndim == 3:
+        subtree_coords_n3 = subtree_coords[0].transpose(0, 1).contiguous() if subtree_coords.shape[1] == 3 else subtree_coords[0].contiguous()
+    else:
+        subtree_coords_n3 = subtree_coords.transpose(0, 1).contiguous() if subtree_coords.shape[0] == 3 else subtree_coords.contiguous()
+    spliced_coords_n3 = _sparsepcgc_splice_subtree_coords_into_full_cloud(
+        full_coords,
+        subtree_coords_n3,
+        candidate_coords,
+    )
+    if not torch.is_tensor(spliced_coords_n3) or int(spliced_coords_n3.shape[0]) <= 0:
+        debug["full_cloud_splice_actual_fallback"] = True
+        debug["full_cloud_splice_actual_reason"] = "splice_failed"
+        return None, None, debug
+    spliced_coords_b3n = spliced_coords_n3.transpose(0, 1).contiguous().unsqueeze(0)
+    spliced_xyz = _restore_codec_xyz_from_global_voxels(
+        args,
+        spliced_coords_b3n,
+        full_octree_context,
+        like_xyz,
+    )
+    if not torch.is_tensor(spliced_xyz) or spliced_xyz.ndim != 3 or spliced_xyz.shape[-1] <= 0:
+        debug["full_cloud_splice_actual_fallback"] = True
+        debug["full_cloud_splice_actual_reason"] = "restore_failed"
+        return None, spliced_coords_b3n, debug
+    debug.update(
+        {
+            "full_cloud_splice_actual_used": True,
+            "full_cloud_splice_actual_fallback": False,
+            "full_cloud_splice_actual_reason": "ok",
+            "full_cloud_splice_actual_points": int(spliced_xyz.shape[-1]),
+            "full_cloud_splice_subtree_before_voxels": int(subtree_coords_n3.shape[0]),
+            "full_cloud_splice_subtree_after_voxels": int(candidate_coords.shape[0]),
+            "full_cloud_splice_full_voxels": int(spliced_coords_n3.shape[0]),
+        }
+    )
+    if writer is not None and hasattr(writer, "write") and bool(getattr(args, "_log_this_step", True)):
+        writer.write(
+            f"{prefix}: used=True, "
+            f"full_voxels={int(spliced_coords_n3.shape[0])}, "
+            f"subtree_before={int(subtree_coords_n3.shape[0])}, "
+            f"subtree_after={int(candidate_coords.shape[0])}, "
+            f"points={int(spliced_xyz.shape[-1])}"
+        )
+    return spliced_xyz.contiguous(), spliced_coords_b3n, debug
+
 def _attach_sparsepcgc_actual_oracle_drop(
     *,
     args,
@@ -3726,7 +4651,6 @@ def _attach_sparsepcgc_actual_oracle_drop(
     cache_key,
     global_step,
 ):
-    st2 = time.time()
     debug = {
         "enabled": False,
         "used": False,
@@ -4962,7 +5886,6 @@ def _attach_sparsepcgc_actual_oracle_drop(
                     else:
                         bad_candidate_count += 1
                         
-            print(time.time()-st2)
 
             if full_macro_fail_fallback_enabled:
                 full_macro_fallback_triggered = bool(full_cloud_macro_improving_count <= 0)
@@ -8798,6 +9721,11 @@ def run_episode_full_cloud_validation(
                                 full_octree_context,
                             )
                         full_cloud_canonical_context = full_octree_context
+                        _sparsepcgc_apply_amount_outcome_context(
+                            args,
+                            memory_key=None,
+                            forward_key=cache_key,
+                        )
                         gen_pts, _, _, _, final_w, _, _, _, out_label = model.forward(
                             input_xyz,
                             input_attr,
@@ -9318,6 +10246,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                 subtree_trees = {} # 事前構築したSubtree内部OctreeをCPU側で保持する
                 full_octree_contexts = {} # full-cloud Octree内でのSubtree文脈をCPU側で保持する
                 group_meta = {} # 追加Octreeメタ情報を既存group_stateと分離して保持する
+                subtree_ref = None # full-cloud anchor onlyではSubtree参照を作らない
                 total_subtree_count = 0 # Subtree総数を0で初期化
                 eligible_subtree_count = 0 # 学習対象候補として残ったSubtreeの初期化
                 actual_eligible_subtree_count = 0 # 条件を満たしたSubtreeを初期化
@@ -9328,60 +10257,92 @@ def train(model, args, loss, writer, plot, notifier=None):
                 subtree_loss_scope = "full_cloud"
                 """Subtree分割学習"""
                 if subtree_mode:                    
+                    full_cloud_anchor_every_step = bool(
+                        getattr(args, "train_full_cloud_anchor_every_step", False)
+                    )
+                    full_cloud_anchor_every_step_shadow = bool(
+                        getattr(args, "train_full_cloud_anchor_every_step_shadow", False)
+                    )
+                    full_cloud_anchor_only_step = bool(
+                        full_cloud_anchor_every_step
+                        and not full_cloud_anchor_every_step_shadow
+                    )
                     """Subtree分割学習のセットアップ"""
                     optimizer.zero_grad(set_to_none=True) # 残った勾配の削除
                     subset_enabled = True # 部分集合学習を有効にする
                     input_attr_full = input_pcd[:, 3:, :].contiguous() if input_pcd.shape[1] > 3 else None # 属性のとりだし
-                    subtree_depth_meta = sample_train_subtree_depth(
-                        input_xyz,
-                        args,
-                        global_step=global_train_step,
-                        cache_key=cache_key,
-                    ) # Octree深度の決定
-
-                    subtree_depth_meta, requested_subtree_depth = maybe_raise_subtree_depth_for_large_input(
-                        subtree_depth_meta,
-                        raw_pts_num,
-                        args,
-                    ) # 大点群時のSubtree深度調整
-
-                    # Subtree分割の最小Depthを2に固定する
-                    train_subtree_depth_floor = int(getattr(args, "train_subtree_depth_floor", 4))
-                    requested_subtree_depth = max(int(requested_subtree_depth), train_subtree_depth_floor)
-
-                    # ログ上も、最終的に要求したDepthを分かるように残す
-                    subtree_depth_meta = dict(subtree_depth_meta)
-                    subtree_depth_meta["depth_floor"] = int(train_subtree_depth_floor)
-                    subtree_depth_meta["depth_after_floor"] = int(requested_subtree_depth)
-
-                    min_subtree_points = max(int(getattr(args, "train_subtree_min_points", 1)), 1)
-                    subtree_group_build_start = time.time()
-                    subtree_group_cache_key = _episode_input_common_cache_key(
-                        cache_key,
-                        "subtree_groups",
-                        requested_depth=int(requested_subtree_depth),
-                        min_points=int(min_subtree_points),
-                    )
-                    subtree_group_state = _episode_input_common_cache_fetch(
-                        args,
-                        subtree_group_cache_key,
-                        device=input_xyz.device,
-                        section="subtree_groups",
-                    )
-                    if subtree_group_state is None:
-                        subtree_group_state = build_octree_subtree_groups_with_retry(
+                    if full_cloud_anchor_only_step:
+                        subtree_depth_meta = {
+                            "depth": 0,
+                            "requested_depth": 0,
+                            "selection_reason": "full_cloud_anchor_every_step_skip_subtree_groups",
+                            "full_cloud_anchor_only_step": True,
+                        }
+                        requested_subtree_depth = 0
+                        min_subtree_points = max(int(getattr(args, "train_subtree_min_points", 1)), 1)
+                        subtree_group_state = {
+                            "subtree_ref": None,
+                            "unique_keys": input_xyz.new_empty((0,), dtype=torch.long),
+                            "index_lists": [],
+                            "all_groups": [],
+                            "eligible_groups": [],
+                            "groups": [],
+                            "depth": 0,
+                            "retry_count": 0,
+                            "selection_reason": "full_cloud_anchor_every_step_skip_subtree_groups",
+                        }
+                        step_timing_breakdown["subtree_group_build_time"] = 0.0
+                    else:
+                        subtree_depth_meta = sample_train_subtree_depth(
                             input_xyz,
                             args,
-                            requested_subtree_depth,
-                            min_subtree_points,
-                            allow_largest_fallback=True,
+                            global_step=global_train_step,
+                            cache_key=cache_key,
+                        ) # Octree深度の決定
+
+                        subtree_depth_meta, requested_subtree_depth = maybe_raise_subtree_depth_for_large_input(
+                            subtree_depth_meta,
+                            raw_pts_num,
+                            args,
+                        ) # 大点群時のSubtree深度調整
+
+                        # Subtree分割の最小Depthを2に固定する
+                        train_subtree_depth_floor = int(getattr(args, "train_subtree_depth_floor", 4))
+                        requested_subtree_depth = max(int(requested_subtree_depth), train_subtree_depth_floor)
+
+                        # ログ上も、最終的に要求したDepthを分かるように残す
+                        subtree_depth_meta = dict(subtree_depth_meta)
+                        subtree_depth_meta["depth_floor"] = int(train_subtree_depth_floor)
+                        subtree_depth_meta["depth_after_floor"] = int(requested_subtree_depth)
+
+                        min_subtree_points = max(int(getattr(args, "train_subtree_min_points", 1)), 1)
+                        subtree_group_build_start = time.time()
+                        subtree_group_cache_key = _episode_input_common_cache_key(
+                            cache_key,
+                            "subtree_groups",
+                            requested_depth=int(requested_subtree_depth),
+                            min_points=int(min_subtree_points),
                         )
-                        _episode_input_common_cache_store(
+                        subtree_group_state = _episode_input_common_cache_fetch(
                             args,
                             subtree_group_cache_key,
-                            subtree_group_state,
+                            device=input_xyz.device,
+                            section="subtree_groups",
                         )
-                    step_timing_breakdown["subtree_group_build_time"] = float(time.time() - subtree_group_build_start)
+                        if subtree_group_state is None:
+                            subtree_group_state = build_octree_subtree_groups_with_retry(
+                                input_xyz,
+                                args,
+                                requested_subtree_depth,
+                                min_subtree_points,
+                                allow_largest_fallback=True,
+                            )
+                            _episode_input_common_cache_store(
+                                args,
+                                subtree_group_cache_key,
+                                subtree_group_state,
+                            )
+                        step_timing_breakdown["subtree_group_build_time"] = float(time.time() - subtree_group_build_start)
                     # subtree_depth_meta = sample_train_subtree_depth( input_xyz, args, global_step=global_train_step, cache_key=cache_key) # Octree深度の決定
                     # subtree_depth_meta, requested_subtree_depth = maybe_raise_subtree_depth_for_large_input( subtree_depth_meta, raw_pts_num, args) # 大点群時は点を捨てずにSubtree深度だけ1段階浅くする
                     # requested_subtree_depth = int(requested_subtree_depth) # 調整後のSubtree深度を整数で取り出す
@@ -9389,7 +10350,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                     # subtree_group_state = build_octree_subtree_groups_with_retry( input_xyz, args, requested_subtree_depth, min_subtree_points, allow_largest_fallback=True) # 入力点群から指定深度のOctree Subtree群を作る
                     """Subtree情報"""
                     subtree_ref = subtree_group_state["subtree_ref"] # Subtree参照情報の抽出
-                    if subtree_ref is None:
+                    if subtree_ref is None and not full_cloud_anchor_only_step:
                         raise RuntimeError("Subtree mode did not find any valid octree subtree.")
                     # subtree_trees = dict(subtree_group_state.get("subtree_trees", {}) or {}) # 追加フィールドだけを参照し、既存形式は変えない
                     # full_octree_contexts = dict(subtree_group_state.get("full_octree_contexts", {}) or {}) # full-cloud上の親・兄弟・祖先文脈
@@ -9452,6 +10413,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                             args,
                             global_train_step,
                             cache_key,
+                            model=model,
                         )
                         step_timing_breakdown["subtree_potential_select_time"] = float(time.time() - subtree_potential_start)
                         if torch.is_tensor(potential_selected_keys) and int(potential_selected_keys.numel()) > 0:
@@ -9867,6 +10829,11 @@ def train(model, args, loss, writer, plot, notifier=None):
                                     and bool(step_actual_oracle_metric_debug.get("used", False))
                                     and str(step_actual_oracle_metric_debug.get("override_scope", "")) == "full_cloud"
                                 )
+                                _sparsepcgc_apply_amount_outcome_context(
+                                    args,
+                                    memory_key=None,
+                                    forward_key=cache_key,
+                                )
                                 gen_pts, L_attr, L_policy, L_actuator, final_w, Lp_out, La_fit, La_rep, out_label = model.forward(
                                     input_xyz,
                                     input_attr_full,
@@ -10192,6 +11159,15 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 if subtree_attr is None and input_attr_full is not None:
                                     subtree_attr = input_attr_full.index_select(2, point_idx).contiguous() # 属性を取り出す
                                 subtree_cache_key = ( f"{cache_key}|subtree_depth={int(subtree_ref['depth'][0].item())}|subtree_key={subtree_key}")
+                                amount_outcome_memory_key = _sparsepcgc_amount_outcome_memory_key(
+                                    cache_key,
+                                    subtree_key_int,
+                                )
+                                _sparsepcgc_apply_amount_outcome_context(
+                                    args,
+                                    memory_key=amount_outcome_memory_key,
+                                    forward_key=subtree_cache_key,
+                                )
                                 if log_this_step and not compact_step_text_log:
                                     selected_path = subtree_group_meta.get("subtree_path", None)
                                     root_path = full_octree_context.get("root_to_subtree_path", None) if isinstance(full_octree_context, dict) else None
@@ -10251,6 +11227,15 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 gen_subtree_xyz = gen_subtree_pts[:, :3, :]
                                 base_model_for_full_context = model.module if hasattr(model, "module") else model
                                 actuator_voxel_state_sub = getattr(base_model_for_full_context, "last_actuator_voxel_state", None)
+                                full_cloud_splice_geom_xyz = None
+                                full_cloud_splice_geom_used = False
+                                if bool(getattr(args, "sparsepcgc_subtree_full_cloud_splice_geometry", False)):
+                                    full_cloud_splice_geom_xyz = _sparsepcgc_splice_subtree_xyz_into_full_cloud(
+                                        input_xyz[:, :3, :],
+                                        point_idx,
+                                        gen_subtree_xyz,
+                                    )
+                                    full_cloud_splice_geom_used = torch.is_tensor(full_cloud_splice_geom_xyz)
                                 subtree_edit_stats = summarize_point_edits( input_xyz=subtree_xyz[:, :3, :], gen_pts=gen_subtree_pts, final_w=final_w_sub, args=args) # Subtree入力とSubtree出力を比較し、操作などを計算する
                                 add_point_edit_sums(subtree_edit_sums, subtree_edit_stats) # 現在Subtreeの編集統計を、Step全体の編集統計に累積する
                                 final_w_sub_loss = None
@@ -10261,7 +11246,16 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 autocast_ctx = torch.cuda.amp.autocast(dtype=amp_dtype, enabled=use_amp) if use_cuda else nullcontext() # Subtree損失計算用のAMP文脈を作る
                                 with autocast_ctx:
                                     """形状損失の計算"""
-                                    L_geom_sub = loss.get_geometry_loss( args, gen_pts=gen_subtree_xyz, gt_pts=subtree_xyz[:, :3, :], final_w=final_w_sub_loss, out_label=out_label_sub)
+                                    if full_cloud_splice_geom_used:
+                                        L_geom_sub = loss.get_geometry_loss(
+                                            args,
+                                            gen_pts=full_cloud_splice_geom_xyz,
+                                            gt_pts=input_xyz[:, :3, :],
+                                            final_w=None,
+                                            out_label=None,
+                                        )
+                                    else:
+                                        L_geom_sub = loss.get_geometry_loss( args, gen_pts=gen_subtree_xyz, gt_pts=subtree_xyz[:, :3, :], final_w=final_w_sub_loss, out_label=out_label_sub)
                                     if stage_factors["com"] != 0.0:
                                         """圧縮損失の計算"""
 
@@ -10285,7 +11279,44 @@ def train(model, args, loss, writer, plot, notifier=None):
                                             and not voxel_restored_actual_debug.get("fallback", False)
                                         )
 
-                                        subtree_compression_source_xyz = subtree_voxel_state_xyz
+                                        full_cloud_splice_actual_xyz, full_cloud_splice_actual_coords, full_cloud_splice_actual_debug = (
+                                            _sparsepcgc_full_cloud_splice_actual_from_voxel_state(
+                                                args,
+                                                writer,
+                                                model,
+                                                subtree_tree=subtree_tree,
+                                                full_octree_context=full_octree_context,
+                                                like_xyz=input_xyz[:, :3, :],
+                                                prefix=f"FullCloudSpliceActual[subtree={subtree_key_int}]",
+                                            )
+                                        )
+                                        full_cloud_splice_actual_used = bool(
+                                            isinstance(full_cloud_splice_actual_debug, dict)
+                                            and full_cloud_splice_actual_debug.get("full_cloud_splice_actual_used", False)
+                                            and torch.is_tensor(full_cloud_splice_actual_xyz)
+                                        )
+
+                                        subtree_compression_source_xyz = (
+                                            full_cloud_splice_actual_xyz
+                                            if full_cloud_splice_actual_used
+                                            else subtree_voxel_state_xyz
+                                        )
+                                        subtree_compression_gt_xyz = (
+                                            input_xyz[:, :3, :]
+                                            if full_cloud_splice_actual_used
+                                            else subtree_xyz[:, :3, :]
+                                        )
+                                        subtree_actual_gen_xyz_for_loss = (
+                                            full_cloud_splice_actual_xyz
+                                            if full_cloud_splice_actual_used
+                                            else subtree_voxel_state_xyz
+                                        )
+                                        subtree_compression_cache_key = (
+                                            f"{cache_key}|full_cloud_splice|subtree_depth={int(subtree_ref['depth'][0].item())}|subtree_key={subtree_key_int}"
+                                            if full_cloud_splice_actual_used
+                                            else subtree_cache_key
+                                        )
+                                        subtree_actual_scope = "full_cloud_splice" if full_cloud_splice_actual_used else "subtree"
 
                                         # ============================================================
                                         # 空点群ガード:
@@ -10317,10 +11348,14 @@ def train(model, args, loss, writer, plot, notifier=None):
                                             subtree_compression_source_xyz = subtree_xyz[:, :3, :].detach()
 
                                             # actual_gen_xyz 側も空にしない。
-                                            subtree_voxel_state_xyz = subtree_compression_source_xyz
+                                            subtree_actual_gen_xyz_for_loss = subtree_compression_source_xyz
 
                                             # このstepは voxel state を使った圧縮評価ではない扱いにする。
                                             subtree_voxel_state_used = False
+                                            full_cloud_splice_actual_used = False
+                                            subtree_compression_gt_xyz = subtree_xyz[:, :3, :].detach()
+                                            subtree_compression_cache_key = subtree_cache_key
+                                            subtree_actual_scope = "subtree"
 
                                             # final_w が全0だと、ここでも再び空扱いになる可能性がある。
                                             # そのため空点群退避時は final_w を圧縮損失へ渡さない。
@@ -10337,7 +11372,11 @@ def train(model, args, loss, writer, plot, notifier=None):
                                             # voxel state 復元点群はすでに Prune/Add/Move 反映後の occupied voxel 集合である。
                                             # ここへ final_w_sub_loss をさらに渡すと、Prune が二重反映される危険がある。
                                             # fallback時だけ従来の final_w_sub_loss を使う。
-                                            final_w_sub_compression = None if subtree_voxel_state_used else final_w_sub_loss
+                                            final_w_sub_compression = (
+                                                None
+                                                if (subtree_voxel_state_used or full_cloud_splice_actual_used)
+                                                else final_w_sub_loss
+                                            )
 
                                         compression_subtree_xyz, noise_debug_sub = prepare_compression_points(
                                             subtree_compression_source_xyz,
@@ -10355,32 +11394,53 @@ def train(model, args, loss, writer, plot, notifier=None):
 
                                         voxel_restored_actual_debug.update(
                                             {
-                                                "actual_scope": "subtree",
-                                                "actual_input_source": "voxel_edit_state" if subtree_voxel_state_used else "gen_subtree_xyz_fallback",
+                                                "actual_scope": subtree_actual_scope,
+                                                "actual_input_source": (
+                                                    "full_cloud_splice_voxel_edit_state"
+                                                    if full_cloud_splice_actual_used
+                                                    else ("voxel_edit_state" if subtree_voxel_state_used else "gen_subtree_xyz_fallback")
+                                                ),
                                                 "voxel_restored_actual_used": bool(subtree_voxel_state_used),
                                                 "voxel_restored_actual_fallback": bool(voxel_restored_actual_debug.get("fallback", False)),
                                                 "voxel_restored_actual_fallback_reason": str(voxel_restored_actual_debug.get("reason", "")),
                                                 "subtree_proxy_uses_voxel_state": bool(subtree_voxel_state_used),
                                                 "subtree_actual_uses_voxel_state": bool(subtree_voxel_state_used),
                                                 "subtree_final_w_disabled_for_voxel_state": bool(subtree_voxel_state_used),
+                                                "full_cloud_splice_geometry_used": bool(full_cloud_splice_geom_used),
+                                                "full_cloud_splice_actual_used": bool(full_cloud_splice_actual_used),
                                             }
                                         )
+                                        if isinstance(full_cloud_splice_actual_debug, dict):
+                                            voxel_restored_actual_debug.update(full_cloud_splice_actual_debug)
 
                                         try:
                                             setattr(args, "_last_voxel_restored_actual_debug", dict(voxel_restored_actual_debug))
                                         except Exception:
                                             pass
-                                        args._current_exact_teacher_mode = "local_subtree"
-                                        args._current_exact_teacher_uses_full_context = False
-                                        args._current_exact_teacher_fallback_reason = "subtree_training_step"
+                                        args._current_teacher_scope = (
+                                            "full_cloud_splice"
+                                            if full_cloud_splice_actual_used
+                                            else "subtree_local"
+                                        )
+                                        args._current_exact_teacher_mode = (
+                                            "full_cloud_splice"
+                                            if full_cloud_splice_actual_used
+                                            else "local_subtree"
+                                        )
+                                        args._current_exact_teacher_uses_full_context = bool(full_cloud_splice_actual_used)
+                                        args._current_exact_teacher_fallback_reason = (
+                                            ""
+                                            if full_cloud_splice_actual_used
+                                            else "subtree_training_step"
+                                        )
                                         L_com_sub, loss_bit_sub, loss_single_sub, loss_nodes_sub, _, _ = loss.get_compression_loss(
                                             args,
                                             gen_xyz=compression_subtree_xyz,
-                                            gt_xyz=subtree_xyz[:, :3, :],
+                                            gt_xyz=subtree_compression_gt_xyz,
                                             final_w=final_w_sub_compression,
-                                            cache_key=subtree_cache_key,
+                                            cache_key=subtree_compression_cache_key,
                                             refresh_actual_gen=refresh_actual_gen,
-                                            actual_gen_xyz=subtree_voxel_state_xyz,
+                                            actual_gen_xyz=subtree_actual_gen_xyz_for_loss,
                                             subtree_tree=subtree_tree,
                                             full_octree_context=full_octree_context,
                                             octree_input_mode=octree_input_mode,
@@ -10425,6 +11485,64 @@ def train(model, args, loss, writer, plot, notifier=None):
                                         if isinstance(outcome_imitation_debug_sub, dict):
                                             subtree_outcome_imitation_debug_values.append(outcome_imitation_debug_sub)
                                             subtree_comp_debug.update(outcome_imitation_debug_sub)
+
+                                        subtree_used_amount_ratio = finite_float_or_none(
+                                            subtree_comp_debug.get(
+                                                "drop_ratio_hard",
+                                                outcome_terms.get(
+                                                    "drop_ratio_hard_for_outcome",
+                                                    outcome_terms.get(
+                                                        "drop_ratio_hard",
+                                                        subtree_comp_debug.get("hard_drop_target_ratio_value", None),
+                                                    ),
+                                                ),
+                                            )
+                                        )
+                                        amount_outcome_memory_debug = _sparsepcgc_update_amount_outcome_memory(
+                                            args,
+                                            amount_outcome_memory_key,
+                                            outcome_actual_percent,
+                                            subtree_used_amount_ratio,
+                                        )
+                                        subtree_comp_debug.update(amount_outcome_memory_debug)
+                                        subtree_outcome_memory_debug = _sparsepcgc_update_subtree_outcome_memory(
+                                            args,
+                                            cache_key,
+                                            subtree_key_int,
+                                            outcome_actual_percent,
+                                        )
+                                        subtree_comp_debug.update(subtree_outcome_memory_debug)
+                                        proposal_terms_sub = _sparsepcgc_proposal_terms_for_subtree(
+                                            args,
+                                            subtree_key_int,
+                                        )
+                                        L_proposal_sub, proposal_debug_sub, proposal_candidate_rows = (
+                                            _build_sparsepcgc_proposal_candidate_teacher_loss(
+                                                args,
+                                                proposal_terms_sub,
+                                                actual_percent=outcome_actual_percent,
+                                                actual_scope=subtree_actual_scope,
+                                                subtree_key=subtree_key_int,
+                                                cache_key=cache_key,
+                                                global_step=global_train_step,
+                                                episode=episode,
+                                                epoch=epoch,
+                                                step=step,
+                                                geom_loss=L_geom_sub,
+                                            )
+                                        )
+                                        if torch.is_tensor(L_proposal_sub):
+                                            L_actuator_sub = L_actuator_sub + L_proposal_sub
+                                        if isinstance(proposal_debug_sub, dict):
+                                            subtree_comp_debug.update(proposal_debug_sub)
+                                        if proposal_candidate_rows:
+                                            candidate_path = metric_csv_paths.get("proposal_candidate_step")
+                                            for proposal_candidate_row in proposal_candidate_rows:
+                                                append_csv_row(
+                                                    candidate_path,
+                                                    PROPOSAL_CANDIDATE_COLUMNS,
+                                                    proposal_candidate_row,
+                                                )
 
                                         subtree_filter_weight, subtree_filter_label_id, subtree_filter_label, subtree_filter_debug = (
                                             _resolve_subtree_actual_filter(args, subtree_comp_debug)
@@ -13018,6 +14136,11 @@ def train(model, args, loss, writer, plot, notifier=None):
                 plot_edit_stats["oracle_full_cloud_prune_ratio_percent"] = operation_metric_row.get(
                     "oracle_full_cloud_prune_ratio_percent",
                     0.0,
+                )
+                plot_edit_stats["selected_subtree_count"] = int(selected_subtree_count)
+                plot_edit_stats["proposal_selected_subtree_count"] = operation_metric_row.get(
+                    "proposal_selected_subtree_count",
+                    selected_subtree_count,
                 )
                 plot.record_point_edits("step", global_train_step + 1, plot_edit_stats) # 点操作統計をCSVに記録
                 plot.record_occupancy_metrics("step", global_train_step + 1, compression_metric_row) # 占有pattern/probability proxyと実hard octree統計をCSVに記録
