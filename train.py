@@ -74,6 +74,7 @@ from models.utils.training.metric_columns import (
     LOSS_GRAD_PROBE_COLUMNS,
     PHASE7_EVAL_SUMMARY_COLUMNS,
     PROPOSAL_CANDIDATE_COLUMNS,
+    FULL_CLOUD_AMOUNT_CANDIDATE_COLUMNS,
 )
 from models.utils.training.actual_codec_status import *
 from models.utils.training.metric_rows import *
@@ -867,6 +868,41 @@ def _sparsepcgc_proposal_amount_bins(args):
     return tuple(sorted(set(out)))
 
 
+def _sparsepcgc_full_cloud_amount_bins(args):
+    values = getattr(args, "sparsepcgc_full_cloud_amount_bin_values", None)
+    if not isinstance(values, (list, tuple)) or not values:
+        values = (0.0, 0.015, 0.021, 0.026, 0.031, 0.038, 0.044, 0.05)
+    out = [0.0]
+    for value in values:
+        try:
+            out.append(min(max(float(value), 0.0), 0.05))
+        except Exception:
+            continue
+    return tuple(sorted(set(out)))
+
+
+def _sample_full_cloud_amount_geom_points(points, max_points):
+    if not torch.is_tensor(points):
+        return points
+    try:
+        max_points = int(max_points)
+    except Exception:
+        max_points = 0
+    if max_points <= 0 or points.dim() < 3:
+        return points
+    n_points = int(points.shape[-1])
+    if n_points <= max_points:
+        return points
+    # Deterministic uniform sampling keeps step-to-step comparisons stable.
+    idx = torch.linspace(
+        0,
+        n_points - 1,
+        steps=max_points,
+        device=points.device,
+    ).round().long().clamp_(0, n_points - 1)
+    return points.index_select(-1, idx).contiguous()
+
+
 def _sparsepcgc_proposal_terms_for_subtree(args, subtree_key):
     terms = getattr(args, "_current_sparsepcgc_proposal_terms_by_key", None)
     if not isinstance(terms, dict):
@@ -882,7 +918,6 @@ def _build_sparsepcgc_proposal_candidate_teacher_loss(
     proposal_terms,
     *,
     actual_percent,
-    actual_scope="subtree",
     subtree_key,
     cache_key,
     global_step,
@@ -952,7 +987,6 @@ def _build_sparsepcgc_proposal_candidate_teacher_loss(
 
     actual_value = finite_float_or_none(actual_percent)
     actual_available = actual_value is not None and math.isfinite(float(actual_value))
-    actual_scope_text = str(actual_scope or ("subtree" if actual_available else "none"))
     noop_margin = max(float(getattr(args, "sparsepcgc_proposal_noop_margin", 0.0)), 0.0)
     if actual_available:
         if float(actual_value) < -float(noop_margin):
@@ -1029,7 +1063,7 @@ def _build_sparsepcgc_proposal_candidate_teacher_loss(
                 "teacher_is_best": bool(cls == teacher_class),
                 "teacher_label": int(teacher_class),
                 "candidate_source": cand_source,
-                "actual_scope": actual_scope_text if actual_available else "none",
+                "actual_scope": "subtree" if actual_available else "none",
                 "teacher_source": teacher_source,
             }
         )
@@ -1102,6 +1136,240 @@ def _build_sparsepcgc_proposal_candidate_teacher_loss(
             "proposal_total_loss": float(total_loss.detach().cpu()),
             "proposal_teacher_source": str(teacher_source),
             "verified_noop_guard_used": bool(verified_guard),
+        }
+    )
+    return total_loss, debug, rows
+
+
+def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
+    args,
+    amount_terms,
+    *,
+    actual_percent,
+    actual_available,
+    cache_key,
+    global_step,
+    episode,
+    epoch,
+    step,
+    input_points,
+    drop_count,
+    geom_loss=None,
+):
+    debug = {
+        "sparsepcgc_training_mode": str(getattr(args, "sparsepcgc_training_mode", "subtree_selector")),
+        "full_cloud_amount_enabled": False,
+        "full_cloud_amount_input_points": int(input_points or 0),
+        "full_cloud_amount_bin": float("nan"),
+        "full_cloud_amount_residual": float("nan"),
+        "full_cloud_amount_final_ratio": float("nan"),
+        "full_cloud_amount_drop_count": int(drop_count or 0),
+        "full_cloud_amount_noop_selected": False,
+        "full_cloud_amount_candidate_count": 0,
+        "full_cloud_amount_actual_eval_count": 0,
+        "full_cloud_amount_teacher_source": "none",
+        "full_cloud_amount_predicted_delta": float("nan"),
+        "full_cloud_amount_actual_delta": float("nan"),
+        "full_cloud_amount_surrogate_delta": float("nan"),
+        "full_cloud_amount_geom_loss": float("nan"),
+        "full_cloud_amount_cls_loss": 0.0,
+        "full_cloud_amount_value_loss": 0.0,
+        "full_cloud_amount_rank_loss": 0.0,
+        "full_cloud_amount_ratio_reg_loss": 0.0,
+        "full_cloud_amount_noop_guard_loss": 0.0,
+        "full_cloud_amount_total_loss": 0.0,
+        "full_cloud_verified_noop_guard_used": False,
+    }
+    rows = []
+    if not isinstance(amount_terms, dict):
+        return None, debug, rows
+
+    amount_logits = amount_terms.get("full_cloud_amount_bin_logits", None)
+    pred_per_amount = amount_terms.get("full_cloud_amount_predicted_delta_per_amount", None)
+    residual_tensor = amount_terms.get("full_cloud_amount_residual", None)
+    if not (torch.is_tensor(amount_logits) and torch.is_tensor(pred_per_amount)):
+        return None, debug, rows
+
+    amount_logits = amount_logits.reshape(-1) if amount_logits.dim() <= 1 else amount_logits.reshape(-1, amount_logits.shape[-1])[0]
+    pred_per_amount = (
+        pred_per_amount.reshape(-1)
+        if pred_per_amount.dim() <= 1
+        else pred_per_amount.reshape(-1, pred_per_amount.shape[-1])[0]
+    )
+    bins = _sparsepcgc_full_cloud_amount_bins(args)
+    class_count = min(int(amount_logits.numel()), int(pred_per_amount.numel()), len(bins))
+    if class_count <= 0:
+        return None, debug, rows
+
+    amount_logits = amount_logits[:class_count]
+    pred_per_amount = pred_per_amount[:class_count]
+    ref = amount_logits
+    bin_tensor = ref.new_tensor(list(bins[:class_count]))
+    selected_class = int(torch.argmax(amount_logits.detach()).item())
+    selected_class = min(max(selected_class, 0), class_count - 1)
+    selected_bin = bin_tensor[selected_class]
+
+    if torch.is_tensor(residual_tensor):
+        residual_value = residual_tensor.reshape(()).to(device=ref.device, dtype=ref.dtype)
+    else:
+        residual_value = ref.new_zeros(())
+    residual_value = torch.nan_to_num(residual_value, nan=0.0, posinf=0.0, neginf=0.0)
+    if selected_class == 0 or not bool(getattr(args, "sparsepcgc_full_cloud_amount_residual_enable", False)):
+        residual_value = residual_value * 0.0
+
+    final_ratio = torch.clamp(selected_bin + residual_value, 0.0, 0.05)
+    if selected_class == 0:
+        final_ratio = final_ratio * 0.0
+
+    actual_value = finite_float_or_none(actual_percent)
+    actual_available = bool(actual_available and actual_value is not None and math.isfinite(float(actual_value)))
+    max_actual = max(int(getattr(args, "sparsepcgc_full_cloud_amount_max_actual_candidates_per_step", 2)), 0)
+    actual_available = bool(actual_available and max_actual >= 1)
+    noop_margin = max(float(getattr(args, "sparsepcgc_full_cloud_amount_noop_margin", 0.0)), 0.0)
+
+    candidate_classes = {0, selected_class}
+    if bool(getattr(args, "sparsepcgc_proposal_eval_neighbor_amounts", True)):
+        candidate_classes.add(max(selected_class - 1, 0))
+        candidate_classes.add(min(selected_class + 1, class_count - 1))
+    if bool(getattr(args, "sparsepcgc_full_cloud_amount_use_surrogate_between_actual", True)):
+        candidate_classes.add(int(torch.argmin(pred_per_amount.detach()).item()))
+    candidate_classes = sorted(candidate_classes)
+
+    candidate_values = {}
+    for cls in candidate_classes:
+        if cls == 0:
+            candidate_values[int(cls)] = 0.0
+        elif actual_available and cls == selected_class:
+            candidate_values[int(cls)] = float(actual_value)
+        else:
+            candidate_values[int(cls)] = float(pred_per_amount.detach().flatten()[cls].cpu())
+
+    if candidate_values:
+        best_cls = min(candidate_values, key=lambda cls: candidate_values[cls])
+        best_value = float(candidate_values[best_cls])
+        if best_value >= float(noop_margin):
+            teacher_class = 0
+            teacher_delta = 0.0
+        else:
+            teacher_class = int(best_cls)
+            teacher_delta = float(best_value)
+    else:
+        teacher_class = 0
+        teacher_delta = 0.0
+    teacher_class = min(max(int(teacher_class), 0), class_count - 1)
+
+    if actual_available and teacher_class == selected_class:
+        teacher_source = "actual_full_cloud"
+    elif actual_available:
+        teacher_source = "actual_full_cloud_mixed_surrogate"
+    else:
+        teacher_source = "surrogate_fallback"
+
+    residual_float = float(residual_value.detach().float().cpu())
+    for cand_idx, cls in enumerate(candidate_classes):
+        is_noop = bool(cls == 0)
+        cand_bin = float(bin_tensor.detach().flatten()[cls].cpu())
+        cand_residual = 0.0 if is_noop else residual_float
+        cand_ratio = 0.0 if is_noop else min(max(cand_bin + cand_residual, 0.0), 0.05)
+        cand_actual = 0.0 if is_noop else (
+            float(actual_value) if actual_available and cls == selected_class else float("nan")
+        )
+        cand_surrogate = float(pred_per_amount.detach().flatten()[cls].cpu())
+        rows.append(
+            {
+                "global_step": int(global_step) + 1,
+                "episode": int(episode) + 1,
+                "epoch": int(epoch) + 1,
+                "step": int(step) + 1,
+                "sample_key": str(cache_key),
+                "candidate_id": int(cand_idx),
+                "candidate_source": (
+                    "noop"
+                    if is_noop
+                    else ("network_selected" if cls == selected_class else "neighbor_or_surrogate")
+                ),
+                "amount_bin": cand_bin,
+                "amount_residual": cand_residual,
+                "final_ratio": cand_ratio,
+                "is_noop": bool(is_noop),
+                "full_cloud_input_points": int(input_points or 0),
+                "full_cloud_drop_count": 0 if is_noop else int(drop_count or 0),
+                "actual_percent": cand_actual,
+                "surrogate_percent": cand_surrogate,
+                "geom_loss": case_float(geom_loss, float("nan")),
+                "predicted_delta": cand_surrogate,
+                "teacher_is_best": bool(cls == teacher_class),
+                "teacher_label": int(teacher_class),
+                "teacher_source": teacher_source,
+                "actual_scope": "full_cloud",
+            }
+        )
+
+    target = torch.tensor([teacher_class], device=amount_logits.device, dtype=torch.long)
+    cls_loss = torch.nn.functional.cross_entropy(amount_logits.view(1, -1).float(), target)
+    teacher_delta_tensor = ref.new_tensor(float(teacher_delta))
+    value_loss = torch.nn.functional.smooth_l1_loss(pred_per_amount[teacher_class], teacher_delta_tensor)
+
+    rank_terms = []
+    teacher_pred = pred_per_amount[teacher_class]
+    margin = ref.new_tensor(0.1)
+    for cls, value in candidate_values.items():
+        if int(cls) == int(teacher_class):
+            continue
+        if float(value) > float(teacher_delta) + 1e-9:
+            rank_terms.append(torch.relu(margin + teacher_pred - pred_per_amount[int(cls)]))
+    rank_loss = torch.stack(rank_terms).mean() if rank_terms else ref.new_zeros(())
+
+    geom_scalar = ref.new_zeros(())
+    if torch.is_tensor(geom_loss):
+        geom_scalar = torch.nan_to_num(geom_loss.detach().float().mean(), nan=0.0, posinf=0.0, neginf=0.0)
+    geom_term = torch.relu(geom_scalar)
+    nonnoop_prob = 1.0 - torch.softmax(amount_logits.float(), dim=0)[0]
+    geom_loss_term = nonnoop_prob * geom_term
+
+    ratio_target = min(max(float(getattr(args, "sparsepcgc_full_cloud_amount_ratio_reg_target", 0.05)), 0.0), 0.05)
+    ratio_reg_loss = torch.relu(final_ratio - ref.new_tensor(float(ratio_target))).pow(2)
+    log_probs = torch.log_softmax(amount_logits.float(), dim=0)
+    noop_guard_loss = -log_probs[0] if teacher_class == 0 else ref.new_zeros(())
+
+    total_loss = (
+        float(getattr(args, "sparsepcgc_full_cloud_amount_cls_loss_weight", 1.0)) * cls_loss
+        + float(getattr(args, "sparsepcgc_full_cloud_amount_value_loss_weight", 0.5)) * value_loss
+        + float(getattr(args, "sparsepcgc_full_cloud_amount_rank_loss_weight", 0.2)) * rank_loss
+        + float(getattr(args, "sparsepcgc_full_cloud_amount_geom_penalty_weight", 0.1)) * geom_loss_term
+        + float(getattr(args, "sparsepcgc_full_cloud_amount_ratio_reg_weight", 0.05)) * ratio_reg_loss
+        + float(getattr(args, "sparsepcgc_full_cloud_amount_noop_guard_weight", 0.5)) * noop_guard_loss
+    )
+    total_loss = torch.nan_to_num(total_loss, nan=0.0, posinf=0.0, neginf=0.0)
+
+    selected_surrogate = float(pred_per_amount.detach().flatten()[selected_class].cpu())
+    debug.update(
+        {
+            "full_cloud_amount_enabled": True,
+            "full_cloud_amount_bin": float(selected_bin.detach().cpu()),
+            "full_cloud_amount_residual": residual_float,
+            "full_cloud_amount_final_ratio": float(final_ratio.detach().cpu()),
+            "full_cloud_amount_drop_count": int(drop_count or 0),
+            "full_cloud_amount_noop_selected": bool(selected_class == 0),
+            "full_cloud_amount_candidate_count": int(len(rows)),
+            "full_cloud_amount_actual_eval_count": 1 if actual_available else 0,
+            "full_cloud_amount_teacher_source": str(teacher_source),
+            "full_cloud_amount_predicted_delta": selected_surrogate,
+            "full_cloud_amount_actual_delta": float(actual_value) if actual_available else float("nan"),
+            "full_cloud_amount_surrogate_delta": selected_surrogate,
+            "full_cloud_amount_geom_loss": float(geom_term.detach().cpu()),
+            "full_cloud_amount_cls_loss": float(cls_loss.detach().cpu()),
+            "full_cloud_amount_value_loss": float(value_loss.detach().cpu()),
+            "full_cloud_amount_rank_loss": float(rank_loss.detach().cpu()),
+            "full_cloud_amount_ratio_reg_loss": float(ratio_reg_loss.detach().cpu()),
+            "full_cloud_amount_noop_guard_loss": float(noop_guard_loss.detach().cpu()),
+            "full_cloud_amount_total_loss": float(total_loss.detach().cpu()),
+            "full_cloud_verified_noop_guard_used": bool(
+                str(getattr(args, "sparsepcgc_proposal_inference_mode", "fast")).strip().lower() == "verified"
+                and actual_available
+                and selected_class != 0
+                and float(actual_value) >= float(noop_margin)
+            ),
         }
     )
     return total_loss, debug, rows
@@ -4499,146 +4767,6 @@ def _sparsepcgc_splice_subtree_coords_into_full_cloud(full_coords_b3n, subtree_c
     if int(spliced.shape[0]) <= 0:
         return None
     return spliced
-
-
-def _sparsepcgc_splice_subtree_xyz_into_full_cloud(full_xyz_b3n, point_idx, candidate_xyz_b3m):
-    if not torch.is_tensor(full_xyz_b3n) or not torch.is_tensor(candidate_xyz_b3m):
-        return None
-    if full_xyz_b3n.ndim != 3 or candidate_xyz_b3m.ndim != 3:
-        return None
-    if full_xyz_b3n.shape[0] != candidate_xyz_b3m.shape[0] or full_xyz_b3n.shape[1] != 3 or candidate_xyz_b3m.shape[1] != 3:
-        return None
-    if not torch.is_tensor(point_idx):
-        return None
-    if full_xyz_b3n.shape[0] != 1:
-        return None
-    idx = point_idx.detach().to(device=full_xyz_b3n.device, dtype=torch.long).reshape(-1)
-    if idx.numel() <= 0:
-        return None
-    valid = (idx >= 0) & (idx < full_xyz_b3n.shape[-1])
-    idx = idx[valid]
-    if idx.numel() <= 0:
-        return None
-    keep_mask = torch.ones((full_xyz_b3n.shape[-1],), device=full_xyz_b3n.device, dtype=torch.bool)
-    keep_mask[idx] = False
-    keep_idx = keep_mask.nonzero(as_tuple=False).reshape(-1)
-    full_without_subtree = full_xyz_b3n.index_select(2, keep_idx)
-    candidate_xyz_b3m = candidate_xyz_b3m.to(device=full_xyz_b3n.device, dtype=full_xyz_b3n.dtype)
-    if candidate_xyz_b3m.shape[-1] <= 0:
-        return full_without_subtree.contiguous()
-    return torch.cat([full_without_subtree, candidate_xyz_b3m], dim=2).contiguous()
-
-
-def _sparsepcgc_full_cloud_splice_actual_from_voxel_state(
-    args,
-    writer,
-    model,
-    *,
-    subtree_tree,
-    full_octree_context,
-    like_xyz,
-    prefix="FullCloudSpliceActual",
-):
-    debug = {
-        "full_cloud_splice_loss_enabled": bool(getattr(args, "sparsepcgc_subtree_full_cloud_splice_loss", True)),
-        "full_cloud_splice_actual_used": False,
-        "full_cloud_splice_actual_fallback": False,
-        "full_cloud_splice_actual_reason": "",
-        "full_cloud_splice_actual_points": 0,
-        "full_cloud_splice_subtree_before_voxels": 0,
-        "full_cloud_splice_subtree_after_voxels": 0,
-        "full_cloud_splice_full_voxels": 0,
-    }
-    if not bool(debug["full_cloud_splice_loss_enabled"]):
-        debug["full_cloud_splice_actual_reason"] = "disabled"
-        return None, None, debug
-    if not isinstance(subtree_tree, dict) or not isinstance(full_octree_context, dict):
-        debug["full_cloud_splice_actual_fallback"] = True
-        debug["full_cloud_splice_actual_reason"] = "missing_context"
-        return None, None, debug
-    subtree_coords = subtree_tree.get("global_voxel_coords", None)
-    full_coords = full_octree_context.get("full_global_voxel_coords", None)
-    if not torch.is_tensor(subtree_coords) or not torch.is_tensor(full_coords):
-        debug["full_cloud_splice_actual_fallback"] = True
-        debug["full_cloud_splice_actual_reason"] = "missing_global_voxel_coords"
-        return None, None, debug
-    base_model = model.module if hasattr(model, "module") else model
-    voxel_state = getattr(base_model, "last_actuator_voxel_state", None)
-    if not isinstance(voxel_state, dict):
-        debug["full_cloud_splice_actual_fallback"] = True
-        debug["full_cloud_splice_actual_reason"] = "last_actuator_voxel_state_missing"
-        return None, None, debug
-    final_voxel_coords = voxel_state.get("final_voxel_coords", None)
-    if not torch.is_tensor(final_voxel_coords) or final_voxel_coords.ndim != 3 or final_voxel_coords.shape[1] != 3:
-        debug["full_cloud_splice_actual_fallback"] = True
-        debug["full_cloud_splice_actual_reason"] = "final_voxel_coords_missing_or_invalid"
-        return None, None, debug
-    final_voxel_valid_mask = voxel_state.get("final_voxel_valid_mask", None)
-    coords = final_voxel_coords.detach().to(device=like_xyz.device, dtype=torch.long)
-    if torch.is_tensor(final_voxel_valid_mask):
-        valid_mask = final_voxel_valid_mask.detach().to(device=coords.device, dtype=torch.bool)
-        if valid_mask.ndim == 3:
-            valid_mask = valid_mask.squeeze(1)
-        if valid_mask.ndim != 2 or valid_mask.shape[0] != coords.shape[0] or valid_mask.shape[1] != coords.shape[2]:
-            debug["full_cloud_splice_actual_fallback"] = True
-            debug["full_cloud_splice_actual_reason"] = "invalid_final_voxel_valid_mask"
-            return None, None, debug
-    else:
-        valid_mask = torch.ones((coords.shape[0], coords.shape[2]), device=coords.device, dtype=torch.bool)
-    if coords.shape[0] != 1:
-        debug["full_cloud_splice_actual_fallback"] = True
-        debug["full_cloud_splice_actual_reason"] = "batch_size_not_supported"
-        return None, None, debug
-    valid_b = valid_mask[0]
-    if int(valid_b.sum().detach().cpu()) <= 0:
-        debug["full_cloud_splice_actual_fallback"] = True
-        debug["full_cloud_splice_actual_reason"] = "empty_final_voxel_coords"
-        return None, None, debug
-    candidate_coords = coords[0, :, valid_b].transpose(0, 1).contiguous()
-    if subtree_coords.ndim == 3:
-        subtree_coords_n3 = subtree_coords[0].transpose(0, 1).contiguous() if subtree_coords.shape[1] == 3 else subtree_coords[0].contiguous()
-    else:
-        subtree_coords_n3 = subtree_coords.transpose(0, 1).contiguous() if subtree_coords.shape[0] == 3 else subtree_coords.contiguous()
-    spliced_coords_n3 = _sparsepcgc_splice_subtree_coords_into_full_cloud(
-        full_coords,
-        subtree_coords_n3,
-        candidate_coords,
-    )
-    if not torch.is_tensor(spliced_coords_n3) or int(spliced_coords_n3.shape[0]) <= 0:
-        debug["full_cloud_splice_actual_fallback"] = True
-        debug["full_cloud_splice_actual_reason"] = "splice_failed"
-        return None, None, debug
-    spliced_coords_b3n = spliced_coords_n3.transpose(0, 1).contiguous().unsqueeze(0)
-    spliced_xyz = _restore_codec_xyz_from_global_voxels(
-        args,
-        spliced_coords_b3n,
-        full_octree_context,
-        like_xyz,
-    )
-    if not torch.is_tensor(spliced_xyz) or spliced_xyz.ndim != 3 or spliced_xyz.shape[-1] <= 0:
-        debug["full_cloud_splice_actual_fallback"] = True
-        debug["full_cloud_splice_actual_reason"] = "restore_failed"
-        return None, spliced_coords_b3n, debug
-    debug.update(
-        {
-            "full_cloud_splice_actual_used": True,
-            "full_cloud_splice_actual_fallback": False,
-            "full_cloud_splice_actual_reason": "ok",
-            "full_cloud_splice_actual_points": int(spliced_xyz.shape[-1]),
-            "full_cloud_splice_subtree_before_voxels": int(subtree_coords_n3.shape[0]),
-            "full_cloud_splice_subtree_after_voxels": int(candidate_coords.shape[0]),
-            "full_cloud_splice_full_voxels": int(spliced_coords_n3.shape[0]),
-        }
-    )
-    if writer is not None and hasattr(writer, "write") and bool(getattr(args, "_log_this_step", True)):
-        writer.write(
-            f"{prefix}: used=True, "
-            f"full_voxels={int(spliced_coords_n3.shape[0])}, "
-            f"subtree_before={int(subtree_coords_n3.shape[0])}, "
-            f"subtree_after={int(candidate_coords.shape[0])}, "
-            f"points={int(spliced_xyz.shape[-1])}"
-        )
-    return spliced_xyz.contiguous(), spliced_coords_b3n, debug
 
 def _attach_sparsepcgc_actual_oracle_drop(
     *,
@@ -10120,6 +10248,12 @@ def train(model, args, loss, writer, plot, notifier=None):
                 cache_key = make_step_cache_key(file_path, args) # ファイルパスと設定から一意なキーを作り、前処理結果、Codec結果、Patch情報などのキャッシュ参照に使う
                 raw_pts_num = int(pts.shape[1] if pts.dim() == 3 else pts.shape[0]) # 受け取ったデータの元点数を数え、点数比較やログに使用
                 subtree_mode = bool(getattr(args, "train_patch_subset_enable", False)) # Octree Subtreeの部分学修を行うか否かの判定
+                sparsepcgc_training_mode = str(
+                    getattr(args, "sparsepcgc_training_mode", "subtree_selector")
+                ).strip().lower()
+                full_cloud_amount_mode = bool(sparsepcgc_training_mode == "full_cloud_amount")
+                if full_cloud_amount_mode:
+                    subtree_mode = True
 
                 """ログ判定"""
                 log_this_step = should_log_step(step + 1, num_steps, args.print_rate) # このStepで通常ログを出すか判定
@@ -10229,6 +10363,29 @@ def train(model, args, loss, writer, plot, notifier=None):
                     global_train_step == 0
                     or (actual_refresh_interval > 0 and global_train_step % actual_refresh_interval == 0)
                 ) # 実Codec/Surrogateの出力側更新は間引いて計算時間を抑える
+                full_cloud_amount_actual_interval_active = actual_refresh_interval
+                full_cloud_amount_actual_step = False
+                if full_cloud_amount_mode:
+                    warmup_actual_steps = max(
+                        int(getattr(args, "sparsepcgc_full_cloud_amount_warmup_steps", 20)),
+                        0,
+                    )
+                    interval_name = (
+                        "sparsepcgc_full_cloud_amount_warmup_actual_interval"
+                        if int(global_train_step) < warmup_actual_steps
+                        else "sparsepcgc_full_cloud_amount_actual_interval"
+                    )
+                    full_cloud_amount_actual_interval_active = max(int(getattr(args, interval_name, 5)), 1)
+                    refresh_actual_gen = bool(
+                        global_train_step == 0
+                        or int(global_train_step) % int(full_cloud_amount_actual_interval_active) == 0
+                    )
+                    full_cloud_amount_actual_step = bool(refresh_actual_gen)
+                    try:
+                        setattr(args, "_full_cloud_amount_actual_interval_active", int(full_cloud_amount_actual_interval_active))
+                        setattr(args, "_full_cloud_amount_actual_step", bool(full_cloud_amount_actual_step))
+                    except Exception:
+                        pass
 
                 """変数の初期化と設定"""
                 subset_step = False # 部分学習か否か
@@ -10263,6 +10420,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                     full_cloud_anchor_every_step_shadow = bool(
                         getattr(args, "train_full_cloud_anchor_every_step_shadow", False)
                     )
+                    if full_cloud_amount_mode:
+                        full_cloud_anchor_every_step = True
+                        full_cloud_anchor_every_step_shadow = False
                     full_cloud_anchor_only_step = bool(
                         full_cloud_anchor_every_step
                         and not full_cloud_anchor_every_step_shadow
@@ -10390,6 +10550,9 @@ def train(model, args, loss, writer, plot, notifier=None):
 
                     """Subtree分割学習の再セットアップ"""
                     is_anchor_step, anchor_reason = should_use_full_cloud_anchor( args, global_step=global_train_step, cache_key=cache_key) # このStepをSubtree学習が全点群学習にするか判定
+                    if full_cloud_amount_mode:
+                        is_anchor_step = True
+                        anchor_reason = "full_cloud_amount_training_mode"
                     if ( min_points_miss and eligible_subtree_count <= 0 and bool(getattr(args, "train_subtree_anchor_on_min_points_miss", False))): # 最小点群数を満たすSubtreeがない
                         is_anchor_step = True
                         anchor_reason = "min_points_miss_full_anchor"
@@ -10742,6 +10905,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                     loss_single = input_xyz.new_zeros(())
                     loss_nodes = input_xyz.new_zeros(())
                     L_full_context_subtree_delta = input_xyz.new_zeros(())
+                    L_full_cloud_amount = input_xyz.new_zeros(())
+                    full_cloud_amount_debug = {}
+                    full_cloud_amount_candidate_rows = []
                     full_context_subtree_delta_debug = {}
                     full_cloud_correction_loss = input_xyz.new_zeros(())
                     full_cloud_correction_debug = {}
@@ -10786,6 +10952,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 args,
                                 full_cloud_canonical_context,
                             )
+                            if full_cloud_amount_mode:
+                                full_cloud_anchor_no_grad = False
+                                full_cloud_anchor_no_grad_reason = "full_cloud_amount_train_branch_requires_grad"
 
                             if not compact_step_text_log:
                                 writer.write(
@@ -10880,6 +11049,62 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 )
                                 if full_cloud_oracle_fast_path:
                                     L_geom = input_xyz.new_zeros(())
+                                elif full_cloud_amount_mode:
+                                    geom_mode = str(
+                                        getattr(args, "sparsepcgc_full_cloud_amount_geometry_mode", "sampled")
+                                    ).strip().lower()
+                                    if geom_mode == "off":
+                                        L_geom = input_xyz.new_zeros(())
+                                        full_cloud_geometry_teacher_debug.update(
+                                            {
+                                                "full_cloud_amount_geometry_mode": "off",
+                                                "full_cloud_amount_geom_sample_points": 0,
+                                            }
+                                        )
+                                    else:
+                                        run_full_geom = bool(
+                                            geom_mode == "interval_full"
+                                            and (
+                                                int(global_train_step)
+                                                % max(int(getattr(args, "sparsepcgc_full_cloud_amount_geom_interval", 20)), 1)
+                                                == 0
+                                            )
+                                        )
+                                        if geom_mode == "sampled" or not run_full_geom:
+                                            geom_sample_points = max(
+                                                int(getattr(args, "sparsepcgc_full_cloud_amount_geom_sample_points", 20000)),
+                                                1,
+                                            )
+                                            geom_gen = _sample_full_cloud_amount_geom_points(gen_xyz, geom_sample_points)
+                                            geom_gt = _sample_full_cloud_amount_geom_points(input_xyz[:, :3, :], geom_sample_points)
+                                            geom_final_w = None
+                                            L_geom = loss.get_geometry_loss(
+                                                args,
+                                                gen_pts=geom_gen,
+                                                gt_pts=geom_gt,
+                                                final_w=geom_final_w,
+                                                out_label=out_label,
+                                            )
+                                            full_cloud_geometry_teacher_debug.update(
+                                                {
+                                                    "full_cloud_amount_geometry_mode": "sampled",
+                                                    "full_cloud_amount_geom_sample_points": int(geom_sample_points),
+                                                }
+                                            )
+                                        else:
+                                            L_geom = loss.get_geometry_loss(
+                                                args,
+                                                gen_pts=gen_xyz,
+                                                gt_pts=input_xyz[:, :3, :],
+                                                final_w=final_w_for_loss,
+                                                out_label=out_label,
+                                            )
+                                            full_cloud_geometry_teacher_debug.update(
+                                                {
+                                                    "full_cloud_amount_geometry_mode": "interval_full",
+                                                    "full_cloud_amount_geom_sample_points": int(input_xyz.shape[-1]),
+                                                }
+                                            )
                                 else:
                                     L_geom = loss.get_geometry_loss(
                                         args,
@@ -11227,15 +11452,6 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 gen_subtree_xyz = gen_subtree_pts[:, :3, :]
                                 base_model_for_full_context = model.module if hasattr(model, "module") else model
                                 actuator_voxel_state_sub = getattr(base_model_for_full_context, "last_actuator_voxel_state", None)
-                                full_cloud_splice_geom_xyz = None
-                                full_cloud_splice_geom_used = False
-                                if bool(getattr(args, "sparsepcgc_subtree_full_cloud_splice_geometry", False)):
-                                    full_cloud_splice_geom_xyz = _sparsepcgc_splice_subtree_xyz_into_full_cloud(
-                                        input_xyz[:, :3, :],
-                                        point_idx,
-                                        gen_subtree_xyz,
-                                    )
-                                    full_cloud_splice_geom_used = torch.is_tensor(full_cloud_splice_geom_xyz)
                                 subtree_edit_stats = summarize_point_edits( input_xyz=subtree_xyz[:, :3, :], gen_pts=gen_subtree_pts, final_w=final_w_sub, args=args) # Subtree入力とSubtree出力を比較し、操作などを計算する
                                 add_point_edit_sums(subtree_edit_sums, subtree_edit_stats) # 現在Subtreeの編集統計を、Step全体の編集統計に累積する
                                 final_w_sub_loss = None
@@ -11246,16 +11462,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 autocast_ctx = torch.cuda.amp.autocast(dtype=amp_dtype, enabled=use_amp) if use_cuda else nullcontext() # Subtree損失計算用のAMP文脈を作る
                                 with autocast_ctx:
                                     """形状損失の計算"""
-                                    if full_cloud_splice_geom_used:
-                                        L_geom_sub = loss.get_geometry_loss(
-                                            args,
-                                            gen_pts=full_cloud_splice_geom_xyz,
-                                            gt_pts=input_xyz[:, :3, :],
-                                            final_w=None,
-                                            out_label=None,
-                                        )
-                                    else:
-                                        L_geom_sub = loss.get_geometry_loss( args, gen_pts=gen_subtree_xyz, gt_pts=subtree_xyz[:, :3, :], final_w=final_w_sub_loss, out_label=out_label_sub)
+                                    L_geom_sub = loss.get_geometry_loss( args, gen_pts=gen_subtree_xyz, gt_pts=subtree_xyz[:, :3, :], final_w=final_w_sub_loss, out_label=out_label_sub)
                                     if stage_factors["com"] != 0.0:
                                         """圧縮損失の計算"""
 
@@ -11279,44 +11486,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                                             and not voxel_restored_actual_debug.get("fallback", False)
                                         )
 
-                                        full_cloud_splice_actual_xyz, full_cloud_splice_actual_coords, full_cloud_splice_actual_debug = (
-                                            _sparsepcgc_full_cloud_splice_actual_from_voxel_state(
-                                                args,
-                                                writer,
-                                                model,
-                                                subtree_tree=subtree_tree,
-                                                full_octree_context=full_octree_context,
-                                                like_xyz=input_xyz[:, :3, :],
-                                                prefix=f"FullCloudSpliceActual[subtree={subtree_key_int}]",
-                                            )
-                                        )
-                                        full_cloud_splice_actual_used = bool(
-                                            isinstance(full_cloud_splice_actual_debug, dict)
-                                            and full_cloud_splice_actual_debug.get("full_cloud_splice_actual_used", False)
-                                            and torch.is_tensor(full_cloud_splice_actual_xyz)
-                                        )
-
-                                        subtree_compression_source_xyz = (
-                                            full_cloud_splice_actual_xyz
-                                            if full_cloud_splice_actual_used
-                                            else subtree_voxel_state_xyz
-                                        )
-                                        subtree_compression_gt_xyz = (
-                                            input_xyz[:, :3, :]
-                                            if full_cloud_splice_actual_used
-                                            else subtree_xyz[:, :3, :]
-                                        )
-                                        subtree_actual_gen_xyz_for_loss = (
-                                            full_cloud_splice_actual_xyz
-                                            if full_cloud_splice_actual_used
-                                            else subtree_voxel_state_xyz
-                                        )
-                                        subtree_compression_cache_key = (
-                                            f"{cache_key}|full_cloud_splice|subtree_depth={int(subtree_ref['depth'][0].item())}|subtree_key={subtree_key_int}"
-                                            if full_cloud_splice_actual_used
-                                            else subtree_cache_key
-                                        )
-                                        subtree_actual_scope = "full_cloud_splice" if full_cloud_splice_actual_used else "subtree"
+                                        subtree_compression_source_xyz = subtree_voxel_state_xyz
 
                                         # ============================================================
                                         # 空点群ガード:
@@ -11348,14 +11518,10 @@ def train(model, args, loss, writer, plot, notifier=None):
                                             subtree_compression_source_xyz = subtree_xyz[:, :3, :].detach()
 
                                             # actual_gen_xyz 側も空にしない。
-                                            subtree_actual_gen_xyz_for_loss = subtree_compression_source_xyz
+                                            subtree_voxel_state_xyz = subtree_compression_source_xyz
 
                                             # このstepは voxel state を使った圧縮評価ではない扱いにする。
                                             subtree_voxel_state_used = False
-                                            full_cloud_splice_actual_used = False
-                                            subtree_compression_gt_xyz = subtree_xyz[:, :3, :].detach()
-                                            subtree_compression_cache_key = subtree_cache_key
-                                            subtree_actual_scope = "subtree"
 
                                             # final_w が全0だと、ここでも再び空扱いになる可能性がある。
                                             # そのため空点群退避時は final_w を圧縮損失へ渡さない。
@@ -11372,11 +11538,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                                             # voxel state 復元点群はすでに Prune/Add/Move 反映後の occupied voxel 集合である。
                                             # ここへ final_w_sub_loss をさらに渡すと、Prune が二重反映される危険がある。
                                             # fallback時だけ従来の final_w_sub_loss を使う。
-                                            final_w_sub_compression = (
-                                                None
-                                                if (subtree_voxel_state_used or full_cloud_splice_actual_used)
-                                                else final_w_sub_loss
-                                            )
+                                            final_w_sub_compression = None if subtree_voxel_state_used else final_w_sub_loss
 
                                         compression_subtree_xyz, noise_debug_sub = prepare_compression_points(
                                             subtree_compression_source_xyz,
@@ -11394,53 +11556,32 @@ def train(model, args, loss, writer, plot, notifier=None):
 
                                         voxel_restored_actual_debug.update(
                                             {
-                                                "actual_scope": subtree_actual_scope,
-                                                "actual_input_source": (
-                                                    "full_cloud_splice_voxel_edit_state"
-                                                    if full_cloud_splice_actual_used
-                                                    else ("voxel_edit_state" if subtree_voxel_state_used else "gen_subtree_xyz_fallback")
-                                                ),
+                                                "actual_scope": "subtree",
+                                                "actual_input_source": "voxel_edit_state" if subtree_voxel_state_used else "gen_subtree_xyz_fallback",
                                                 "voxel_restored_actual_used": bool(subtree_voxel_state_used),
                                                 "voxel_restored_actual_fallback": bool(voxel_restored_actual_debug.get("fallback", False)),
                                                 "voxel_restored_actual_fallback_reason": str(voxel_restored_actual_debug.get("reason", "")),
                                                 "subtree_proxy_uses_voxel_state": bool(subtree_voxel_state_used),
                                                 "subtree_actual_uses_voxel_state": bool(subtree_voxel_state_used),
                                                 "subtree_final_w_disabled_for_voxel_state": bool(subtree_voxel_state_used),
-                                                "full_cloud_splice_geometry_used": bool(full_cloud_splice_geom_used),
-                                                "full_cloud_splice_actual_used": bool(full_cloud_splice_actual_used),
                                             }
                                         )
-                                        if isinstance(full_cloud_splice_actual_debug, dict):
-                                            voxel_restored_actual_debug.update(full_cloud_splice_actual_debug)
 
                                         try:
                                             setattr(args, "_last_voxel_restored_actual_debug", dict(voxel_restored_actual_debug))
                                         except Exception:
                                             pass
-                                        args._current_teacher_scope = (
-                                            "full_cloud_splice"
-                                            if full_cloud_splice_actual_used
-                                            else "subtree_local"
-                                        )
-                                        args._current_exact_teacher_mode = (
-                                            "full_cloud_splice"
-                                            if full_cloud_splice_actual_used
-                                            else "local_subtree"
-                                        )
-                                        args._current_exact_teacher_uses_full_context = bool(full_cloud_splice_actual_used)
-                                        args._current_exact_teacher_fallback_reason = (
-                                            ""
-                                            if full_cloud_splice_actual_used
-                                            else "subtree_training_step"
-                                        )
+                                        args._current_exact_teacher_mode = "local_subtree"
+                                        args._current_exact_teacher_uses_full_context = False
+                                        args._current_exact_teacher_fallback_reason = "subtree_training_step"
                                         L_com_sub, loss_bit_sub, loss_single_sub, loss_nodes_sub, _, _ = loss.get_compression_loss(
                                             args,
                                             gen_xyz=compression_subtree_xyz,
-                                            gt_xyz=subtree_compression_gt_xyz,
+                                            gt_xyz=subtree_xyz[:, :3, :],
                                             final_w=final_w_sub_compression,
-                                            cache_key=subtree_compression_cache_key,
+                                            cache_key=subtree_cache_key,
                                             refresh_actual_gen=refresh_actual_gen,
-                                            actual_gen_xyz=subtree_actual_gen_xyz_for_loss,
+                                            actual_gen_xyz=subtree_voxel_state_xyz,
                                             subtree_tree=subtree_tree,
                                             full_octree_context=full_octree_context,
                                             octree_input_mode=octree_input_mode,
@@ -11521,7 +11662,6 @@ def train(model, args, loss, writer, plot, notifier=None):
                                                 args,
                                                 proposal_terms_sub,
                                                 actual_percent=outcome_actual_percent,
-                                                actual_scope=subtree_actual_scope,
                                                 subtree_key=subtree_key_int,
                                                 cache_key=cache_key,
                                                 global_step=global_train_step,
@@ -12038,6 +12178,71 @@ def train(model, args, loss, writer, plot, notifier=None):
                 }
                 compression_tensor_debug.update(full_cloud_geometry_teacher_debug)
                 compression_tensor_debug.update(surrogate_trust_debug)
+                if full_cloud_amount_mode and bool(is_anchor_step) and not bool(full_cloud_anchor_shadow_train_active):
+                    base_model_for_full_cloud_amount = _unwrap_train_model(model)
+                    full_cloud_amount_terms = dict(
+                        getattr(base_model_for_full_cloud_amount, "last_actuator_soft_terms", {}) or {}
+                    )
+                    full_cloud_amount_structure_debug = dict(
+                        getattr(base_model_for_full_cloud_amount, "last_structure_debug", {}) or {}
+                    )
+                    actual_percent_for_full_cloud_amount = _sparsepcgc_outcome_actual_percent(compression_debug_terms)
+                    actual_available_for_full_cloud_amount = bool(
+                        full_cloud_amount_actual_step
+                        and actual_percent_for_full_cloud_amount is not None
+                        and not bool(compression_debug_terms.get("actual_codec_fallback_to_proxy", False))
+                    )
+                    full_cloud_amount_drop_count = case_int(
+                        full_cloud_amount_structure_debug.get(
+                            "hard_drop_count",
+                            full_cloud_amount_structure_debug.get(
+                                "selected_drop_count_hard",
+                                full_cloud_amount_structure_debug.get(
+                                    "voxel_edit_drop_count",
+                                    0,
+                                ),
+                            ),
+                        ),
+                        0,
+                    )
+                    (
+                        L_full_cloud_amount,
+                        full_cloud_amount_debug,
+                        full_cloud_amount_candidate_rows,
+                    ) = _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
+                        args,
+                        full_cloud_amount_terms,
+                        actual_percent=actual_percent_for_full_cloud_amount,
+                        actual_available=actual_available_for_full_cloud_amount,
+                        cache_key=cache_key,
+                        global_step=global_train_step,
+                        episode=episode,
+                        epoch=epoch,
+                        step=step,
+                        input_points=int(input_xyz.shape[-1]),
+                        drop_count=int(full_cloud_amount_drop_count),
+                        geom_loss=L_geom,
+                    )
+                    if not torch.is_tensor(L_full_cloud_amount):
+                        L_full_cloud_amount = input_xyz.new_zeros(())
+                    if isinstance(full_cloud_amount_debug, dict):
+                        full_cloud_amount_debug.update(
+                            {
+                                "sparsepcgc_training_mode": "full_cloud_amount",
+                                "actual_scope": "full_cloud",
+                                "full_cloud_amount_actual_interval": int(full_cloud_amount_actual_interval_active),
+                                "full_cloud_amount_actual_step": bool(full_cloud_amount_actual_step),
+                            }
+                        )
+                        compression_tensor_debug.update(full_cloud_amount_debug)
+                    if full_cloud_amount_candidate_rows:
+                        candidate_path = metric_csv_paths.get("full_cloud_amount_candidate_step")
+                        for full_cloud_amount_candidate_row in full_cloud_amount_candidate_rows:
+                            append_csv_row(
+                                candidate_path,
+                                FULL_CLOUD_AMOUNT_CANDIDATE_COLUMNS,
+                                full_cloud_amount_candidate_row,
+                            )
 
                 """形状損失を合成"""
                 legacy_L_downstream = (
@@ -12878,9 +13083,24 @@ def train(model, args, loss, writer, plot, notifier=None):
                             and full_cloud_correction_loss.requires_grad
                         )
 
+                if full_cloud_amount_mode and torch.is_tensor(L_full_cloud_amount):
+                    L = L + L_full_cloud_amount
+                    if isinstance(full_cloud_amount_debug, dict):
+                        full_cloud_amount_debug["full_cloud_amount_loss_added_to_total"] = True
+                        full_cloud_amount_debug["full_cloud_amount_loss_requires_grad"] = bool(
+                            L_full_cloud_amount.requires_grad
+                        )
 
                 """情報精査"""
                 comp_debug = dict(getattr(loss, "last_compression_debug", {}) or {}) # 直前の圧縮Debug情報を取り出す
+                if isinstance(full_cloud_amount_debug, dict) and full_cloud_amount_debug:
+                    comp_debug.update(full_cloud_amount_debug)
+                    comp_debug["actual_scope"] = "full_cloud" if full_cloud_amount_mode else comp_debug.get("actual_scope", "")
+                    comp_debug["teacher_scope"] = (
+                        "full_cloud_amount"
+                        if full_cloud_amount_mode
+                        else comp_debug.get("teacher_scope", "")
+                    )
                 # ============================================================
                 # Direct Network Prune debug
                 # ============================================================
@@ -12909,6 +13129,10 @@ def train(model, args, loss, writer, plot, notifier=None):
                         + step_timing_breakdown.get("subtree_potential_select_time", 0.0)
                         + step_timing_breakdown.get("selected_metadata_oracle_time", 0.0)
                     )
+                    if full_cloud_amount_mode:
+                        comp_debug["full_cloud_amount_step_time"] = float(
+                            step_timing_breakdown.get("full_cloud_anchor_block_time", 0.0)
+                        )
                 if isinstance(full_cloud_anchor_runtime_timing, dict) and full_cloud_anchor_runtime_timing:
                     comp_debug["full_cloud_anchor_runtime_timing"] = dict(full_cloud_anchor_runtime_timing)
                     for runtime_key, runtime_value in full_cloud_anchor_runtime_timing.items():
@@ -13741,6 +13965,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                     ("L_com_objective", L_com_objective),
                     ("full_context_subtree_delta", L_full_context_subtree_delta),
                     ("full_context_subtree_delta", L_full_context_subtree_delta),
+                    ("full_cloud_amount", L_full_cloud_amount),
                     ("full_cloud_actual_correction", full_cloud_correction_loss),
                     ("L_attr", L_attr),
                     ("L_policy", L_policy),
@@ -14136,11 +14361,6 @@ def train(model, args, loss, writer, plot, notifier=None):
                 plot_edit_stats["oracle_full_cloud_prune_ratio_percent"] = operation_metric_row.get(
                     "oracle_full_cloud_prune_ratio_percent",
                     0.0,
-                )
-                plot_edit_stats["selected_subtree_count"] = int(selected_subtree_count)
-                plot_edit_stats["proposal_selected_subtree_count"] = operation_metric_row.get(
-                    "proposal_selected_subtree_count",
-                    selected_subtree_count,
                 )
                 plot.record_point_edits("step", global_train_step + 1, plot_edit_stats) # 点操作統計をCSVに記録
                 plot.record_occupancy_metrics("step", global_train_step + 1, compression_metric_row) # 占有pattern/probability proxyと実hard octree統計をCSVに記録

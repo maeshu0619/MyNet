@@ -2436,6 +2436,7 @@ class StructureRepairActuator(nn.Module):
         selection_mask=None,
         octree_context=None,
         full_octree_context=None,
+        full_cloud_amount_terms=None,
     ):
         timing_enabled = bool(getattr(self.args, "debug_timing", False))
         runtime_timing = {}
@@ -3154,17 +3155,28 @@ class StructureRepairActuator(nn.Module):
             amount_mode = "network"
         amount_mode_id = {"network": 1, "blend": 2, "max": 3}.get(amount_mode, 0)
         amount_mode_network = bool(amount_mode == "network")
+        sparsepcgc_training_mode = str(
+            getattr(self.args, "sparsepcgc_training_mode", "subtree_selector")
+        ).strip().lower()
+        full_cloud_amount_mode = bool(sparsepcgc_training_mode == "full_cloud_amount")
+        full_cloud_amount_terms = full_cloud_amount_terms if isinstance(full_cloud_amount_terms, dict) else {}
+        full_cloud_amount_override_enabled = bool(
+            full_cloud_amount_mode
+            and bool(full_cloud_amount_terms.get("enabled", False))
+            and prune_enabled
+            and codec_prune_prior_enabled
+        )
         warmup_force_codec_prior_amount = bool(
             getattr(self.args, "sparsepcgc_warmup_force_codec_prior_amount", True)
         )
         algorithmic_proposal_selector_enabled = bool(
-            self._algorithmic_proposal_selector_enabled()
+            (self._algorithmic_proposal_selector_enabled() or full_cloud_amount_override_enabled)
             and prune_enabled
             and codec_prune_prior_enabled
         )
         algorithmic_proposal_selector_active = bool(
             algorithmic_proposal_selector_enabled
-            and float(codec_prune_prior_phase) <= 0.0
+            and (float(codec_prune_prior_phase) <= 0.0 or full_cloud_amount_override_enabled)
         )
         algorithmic_proposal_where_source_id = 1 if algorithmic_proposal_selector_active else 0
 
@@ -3221,6 +3233,26 @@ class StructureRepairActuator(nn.Module):
         algorithmic_amount_selector_logits = self.algorithmic_amount_selector_head(
             actuator_features
         ).mean(dim=2)
+        full_cloud_amount_logits = full_cloud_amount_terms.get("amount_bin_logits", None)
+        if full_cloud_amount_override_enabled and torch.is_tensor(full_cloud_amount_logits):
+            full_cloud_amount_logits = full_cloud_amount_logits.to(
+                device=actuator_features.device,
+                dtype=actuator_features.dtype,
+            )
+            if full_cloud_amount_logits.ndim == 1:
+                full_cloud_amount_logits = full_cloud_amount_logits.view(1, -1)
+            if int(full_cloud_amount_logits.shape[0]) == 1 and int(actuator_features.shape[0]) > 1:
+                full_cloud_amount_logits = full_cloud_amount_logits.expand(
+                    int(actuator_features.shape[0]),
+                    -1,
+                ).contiguous()
+            if (
+                full_cloud_amount_logits.ndim == 2
+                and int(full_cloud_amount_logits.shape[0]) == int(actuator_features.shape[0])
+            ):
+                algorithmic_amount_selector_logits = full_cloud_amount_logits[
+                    :, : int(algorithmic_amount_selector_logits.shape[1])
+                ]
         algorithmic_amount_selector_prob = torch.softmax(
             algorithmic_amount_selector_logits.float(),
             dim=1,
@@ -3247,13 +3279,37 @@ class StructureRepairActuator(nn.Module):
             algorithmic_amount_selected_bin_ratio_value = float(
                 algorithmic_amount_bin_values_t.detach().flatten()[selected_bin_idx].cpu()
             )
-        algorithmic_amount_residual_scale = min(
-            max(float(getattr(self.args, "sparsepcgc_algorithmic_amount_residual_scale", 0.005)), 0.0),
-            float(max_drop_ratio),
-        )
+        if full_cloud_amount_override_enabled:
+            algorithmic_amount_residual_scale = (
+                min(
+                    max(float(getattr(self.args, "sparsepcgc_full_cloud_amount_residual_max", 0.0025)), 0.0),
+                    float(max_drop_ratio),
+                )
+                if bool(getattr(self.args, "sparsepcgc_full_cloud_amount_residual_enable", False))
+                else 0.0
+            )
+        else:
+            algorithmic_amount_residual_scale = min(
+                max(float(getattr(self.args, "sparsepcgc_algorithmic_amount_residual_scale", 0.005)), 0.0),
+                float(max_drop_ratio),
+            )
         algorithmic_amount_residual_raw = self.algorithmic_amount_residual_head(
             actuator_features.mean(dim=2, keepdim=True)
         )
+        full_cloud_amount_residual_raw = full_cloud_amount_terms.get("amount_residual_raw", None)
+        if full_cloud_amount_override_enabled and torch.is_tensor(full_cloud_amount_residual_raw):
+            full_cloud_amount_residual_raw = full_cloud_amount_residual_raw.to(
+                device=actuator_features.device,
+                dtype=actuator_features.dtype,
+            ).reshape(-1, 1, 1)
+            if int(full_cloud_amount_residual_raw.shape[0]) == 1 and int(actuator_features.shape[0]) > 1:
+                full_cloud_amount_residual_raw = full_cloud_amount_residual_raw.expand(
+                    int(actuator_features.shape[0]),
+                    -1,
+                    -1,
+                ).contiguous()
+            if int(full_cloud_amount_residual_raw.shape[0]) == int(actuator_features.shape[0]):
+                algorithmic_amount_residual_raw = full_cloud_amount_residual_raw
         algorithmic_amount_residual_t = (
             torch.tanh(algorithmic_amount_residual_raw)
             * float(algorithmic_amount_residual_scale)
@@ -3303,6 +3359,12 @@ class StructureRepairActuator(nn.Module):
         algorithmic_amount_selector_teacher_ratio_value = float("nan")
         algorithmic_amount_selector_teacher_loss = pts_xyz.new_zeros(())
         algorithmic_amount_residual_teacher_loss = pts_xyz.new_zeros(())
+        full_cloud_amount_predicted_delta_raw = full_cloud_amount_terms.get("predicted_delta", None)
+        full_cloud_amount_predicted_delta_value = float("nan")
+        if torch.is_tensor(full_cloud_amount_predicted_delta_raw) and full_cloud_amount_predicted_delta_raw.numel() > 0:
+            full_cloud_amount_predicted_delta_value = float(
+                full_cloud_amount_predicted_delta_raw.detach().float().mean().cpu()
+            )
         post_warmup_amount_strategy = self._post_warmup_amount_strategy()
         if post_warmup_amount_strategy == "fixed_blend":
             post_warmup_amount_strategy_id = 1
@@ -3338,6 +3400,7 @@ class StructureRepairActuator(nn.Module):
             and codec_prune_prior_enabled
             and float(codec_prune_prior_phase) <= 0.0
             and not self._direct_network_prune_mode()
+            and not full_cloud_amount_override_enabled
         ):
             post_tail_steps = max(
                 int(getattr(self.args, "sparsepcgc_post_warmup_amount_tail_steps", 5000)),
@@ -3639,6 +3702,20 @@ class StructureRepairActuator(nn.Module):
                         hard_drop_target_ratio_source = "algorithmic_selector_bin_residual"
                         hard_drop_target_ratio_source_id = 11
                     amount_explore_used_teacher = False
+        if full_cloud_amount_override_enabled:
+            effective_drop_ratio_forward = algorithmic_amount_selector_ratio_forward
+            effective_drop_ratio_for_hard_count = (
+                effective_drop_ratio_forward.detach()
+                + algorithmic_amount_selector_ratio_forward
+                - algorithmic_amount_selector_ratio_forward.detach()
+            )
+            hard_drop_target_ratio_source = (
+                "full_cloud_amount_selector_noop"
+                if algorithmic_amount_selected_class_value <= 0
+                else "full_cloud_amount_selector_bin_residual"
+            )
+            hard_drop_target_ratio_source_id = 12
+            post_warmup_amount_hybrid_applied = False
         if (
             self.training
             and prune_enabled
@@ -7321,6 +7398,38 @@ class StructureRepairActuator(nn.Module):
             ).detach(),
             "algorithmic_amount_selector_teacher_loss": algorithmic_amount_selector_teacher_loss.detach(),
             "algorithmic_amount_residual_teacher_loss": algorithmic_amount_residual_teacher_loss.detach(),
+            "full_cloud_amount_enabled": pts_xyz.new_tensor(
+                float(full_cloud_amount_override_enabled)
+            ).detach(),
+            "full_cloud_amount_input_points": pts_xyz.new_tensor(float(N)).detach(),
+            "full_cloud_amount_selected_class": pts_xyz.new_tensor(
+                float(algorithmic_amount_selected_class_value)
+            ).detach(),
+            "full_cloud_amount_bin": pts_xyz.new_tensor(
+                float(algorithmic_amount_selected_bin_ratio_value)
+            ).detach(),
+            "full_cloud_amount_residual": pts_xyz.new_tensor(
+                float(algorithmic_amount_residual_value)
+            ).detach(),
+            "full_cloud_amount_final_ratio": pts_xyz.new_tensor(
+                float(algorithmic_amount_selector_final_ratio_value)
+            ).detach(),
+            "full_cloud_amount_noop_selected": pts_xyz.new_tensor(
+                float(full_cloud_amount_override_enabled and algorithmic_amount_selected_class_value <= 0)
+            ).detach(),
+            "full_cloud_amount_selected_prob": pts_xyz.new_tensor(
+                float(algorithmic_amount_selector_selected_prob_value)
+            ).detach(),
+            "full_cloud_amount_predicted_delta": pts_xyz.new_tensor(
+                float(full_cloud_amount_predicted_delta_value)
+            ).detach(),
+            "full_cloud_amount_bin_logits": algorithmic_amount_selector_logits.detach(),
+            "full_cloud_amount_predicted_delta_per_amount": (
+                full_cloud_amount_terms.get("predicted_delta_per_amount").detach()
+                if torch.is_tensor(full_cloud_amount_terms.get("predicted_delta_per_amount", None))
+                else pts_xyz.new_zeros((1, int(algorithmic_amount_selector_logits.shape[1])))
+            ),
+            "full_cloud_amount_ratio_reg_loss": pts_xyz.new_tensor(0.0).detach(),
             "actual_gate_prune_enabled": pts_xyz.new_tensor(
                 float(require_actual_gate_prune)
             ).detach(),
@@ -7998,6 +8107,24 @@ class StructureRepairActuator(nn.Module):
             ),
             "algorithmic_amount_selector_teacher_loss": algorithmic_amount_selector_teacher_loss,
             "algorithmic_amount_residual_teacher_loss": algorithmic_amount_residual_teacher_loss,
+            "full_cloud_amount_enabled": pts_xyz.new_tensor(float(full_cloud_amount_override_enabled)),
+            "full_cloud_amount_input_points": pts_xyz.new_tensor(float(N)),
+            "full_cloud_amount_selected_class": pts_xyz.new_tensor(float(algorithmic_amount_selected_class_value)),
+            "full_cloud_amount_bin": pts_xyz.new_tensor(float(algorithmic_amount_selected_bin_ratio_value)),
+            "full_cloud_amount_residual": pts_xyz.new_tensor(float(algorithmic_amount_residual_value)),
+            "full_cloud_amount_final_ratio": pts_xyz.new_tensor(float(algorithmic_amount_selector_final_ratio_value)),
+            "full_cloud_amount_noop_selected": pts_xyz.new_tensor(
+                float(full_cloud_amount_override_enabled and algorithmic_amount_selected_class_value <= 0)
+            ),
+            "full_cloud_amount_selected_prob": pts_xyz.new_tensor(float(algorithmic_amount_selector_selected_prob_value)),
+            "full_cloud_amount_predicted_delta": pts_xyz.new_tensor(float(full_cloud_amount_predicted_delta_value)),
+            "full_cloud_amount_bin_logits": algorithmic_amount_selector_logits,
+            "full_cloud_amount_predicted_delta_per_amount": (
+                full_cloud_amount_terms.get("predicted_delta_per_amount")
+                if torch.is_tensor(full_cloud_amount_terms.get("predicted_delta_per_amount", None))
+                else pts_xyz.new_zeros((1, int(algorithmic_amount_selector_logits.shape[1])))
+            ),
+            "full_cloud_amount_ratio_reg_loss": pts_xyz.new_tensor(0.0),
             "actual_gate_prune_enabled": pts_xyz.new_tensor(float(require_actual_gate_prune)),
             "actual_gate_prune_allowed": pts_xyz.new_tensor(float(hard_prune_actual_allowed)),
             "hard_prune_actual_allowed": pts_xyz.new_tensor(float(hard_prune_actual_allowed)),

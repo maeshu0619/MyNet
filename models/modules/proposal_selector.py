@@ -65,3 +65,62 @@ class AlgorithmicProposalSelector(nn.Module):
             "amount_residual_raw": self.amount_residual_raw(h).squeeze(-1),
             "predicted_delta_per_amount": self.predicted_delta_per_amount(h),
         }
+
+
+class FullCloudAmountSelector(nn.Module):
+    """
+    Amount-only selector for full-cloud SparsePCGC preprocessing.
+
+    It predicts no-op / amount-bin / residual / delta for the whole cloud.  The
+    voxel-level Where is intentionally left to the codec prior/block algorithm.
+    """
+
+    def __init__(self, feature_dim, hidden_dim=64, amount_bin_count=8):
+        super().__init__()
+        self.feature_dim = int(feature_dim)
+        self.amount_bin_count = max(int(amount_bin_count), 1)
+        hidden_dim = max(int(hidden_dim), 8)
+
+        self.trunk = nn.Sequential(
+            nn.Linear(self.feature_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+        )
+        self.amount_bin_logits = nn.Linear(hidden_dim, self.amount_bin_count)
+        self.amount_residual_raw = nn.Linear(hidden_dim, 1)
+        self.predicted_delta = nn.Linear(hidden_dim, 1)
+        self.predicted_delta_per_amount = nn.Linear(hidden_dim, self.amount_bin_count)
+
+        nn.init.zeros_(self.amount_bin_logits.weight)
+        nn.init.zeros_(self.amount_bin_logits.bias)
+        if self.amount_bin_count > 1:
+            init_class = min(max(self.amount_bin_count // 2, 1), self.amount_bin_count - 1)
+            with torch.no_grad():
+                self.amount_bin_logits.bias[0] = -1.0
+                self.amount_bin_logits.bias[init_class] = 1.0
+        nn.init.zeros_(self.amount_residual_raw.weight)
+        nn.init.zeros_(self.amount_residual_raw.bias)
+        nn.init.zeros_(self.predicted_delta.weight)
+        nn.init.zeros_(self.predicted_delta.bias)
+        nn.init.zeros_(self.predicted_delta_per_amount.weight)
+        nn.init.zeros_(self.predicted_delta_per_amount.bias)
+
+    def forward(self, full_cloud_features):
+        if full_cloud_features.ndim == 1:
+            full_cloud_features = full_cloud_features.view(1, -1)
+        if full_cloud_features.ndim != 2:
+            raise ValueError("full_cloud_features must have shape [B, F] or [F].")
+        if int(full_cloud_features.shape[-1]) != self.feature_dim:
+            raise ValueError(
+                f"full_cloud_features last dim must be {self.feature_dim}, "
+                f"got {int(full_cloud_features.shape[-1])}."
+            )
+
+        h = self.trunk(full_cloud_features.float())
+        return {
+            "amount_bin_logits": self.amount_bin_logits(h),
+            "amount_residual_raw": self.amount_residual_raw(h).squeeze(-1),
+            "predicted_delta": self.predicted_delta(h).squeeze(-1),
+            "predicted_delta_per_amount": self.predicted_delta_per_amount(h),
+        }

@@ -520,13 +520,11 @@ def log_compact_step_summary(
     geom_debug = getattr(loss_obj, "last_geometry_debug", {}) or {}
     stage_factors = stage_factors or {}
 
-    actual_scope_text = str(comp_debug.get("actual_scope", "")).strip().lower()
     full_cloud = bool(
-        actual_scope_text in {"full_cloud", "full_cloud_splice"}
+        str(comp_debug.get("actual_scope", "")).strip().lower() == "full_cloud"
         or bool(comp_debug.get("full_cloud_actual_primary_used", False))
         or bool(comp_debug.get("full_cloud_teacher_used", False))
         or bool(comp_debug.get("full_cloud_anchor_shadow_train_used", False))
-        or bool(comp_debug.get("full_cloud_splice_actual_used", False))
     )
     eval_scope = str(
         comp_debug.get(
@@ -782,6 +780,19 @@ def log_compact_step_summary(
     proposal_rank_loss = _prefer_number("proposal_rank_loss")
     proposal_geom_loss = _prefer_number("proposal_geom_loss")
     verified_noop_guard = _prefer_number("verified_noop_guard_used", 0.0)
+    full_cloud_amount_enabled = _prefer_number("full_cloud_amount_enabled", 0.0)
+    full_cloud_amount_input_points = _prefer_number("full_cloud_amount_input_points", 0.0)
+    full_cloud_amount_final_ratio = _prefer_number("full_cloud_amount_final_ratio")
+    full_cloud_amount_drop_count = _prefer_number("full_cloud_amount_drop_count", 0.0)
+    full_cloud_amount_noop_selected = _prefer_number("full_cloud_amount_noop_selected", 0.0)
+    full_cloud_amount_candidate_count = _prefer_number("full_cloud_amount_candidate_count", 0.0)
+    full_cloud_amount_actual_eval_count = _prefer_number("full_cloud_amount_actual_eval_count", 0.0)
+    full_cloud_amount_teacher_source = _prefer_text("full_cloud_amount_teacher_source")
+    full_cloud_amount_predicted_delta = _prefer_number("full_cloud_amount_predicted_delta")
+    full_cloud_amount_actual_delta = _prefer_number("full_cloud_amount_actual_delta")
+    full_cloud_amount_surrogate_delta = _prefer_number("full_cloud_amount_surrogate_delta")
+    full_cloud_amount_total_loss = _prefer_number("full_cloud_amount_total_loss")
+    full_cloud_verified_noop_guard = _prefer_number("full_cloud_verified_noop_guard_used", 0.0)
     collapse_detected = bool(
         comp_debug.get("phase0_noop_only_collapse_detected", False)
         or structure_debug.get("phase0_noop_only_collapse_detected", False)
@@ -831,6 +842,19 @@ def log_compact_step_summary(
         f"ProposalRankLoss={_fmt(proposal_rank_loss, 5)}, "
         f"ProposalGeomLoss={_fmt(proposal_geom_loss, 5)}, "
         f"VerifiedNoopGuard={bool(round(_to_float(verified_noop_guard, 0.0)))}, "
+        f"FullCloudAmount={bool(round(_to_float(full_cloud_amount_enabled, 0.0)))}, "
+        f"FCAInput={_fmt_int(full_cloud_amount_input_points)}, "
+        f"FCAFinal={_fmt(full_cloud_amount_final_ratio, 5)}, "
+        f"FCADrop={_fmt_int(full_cloud_amount_drop_count)}, "
+        f"FCANoop={bool(round(_to_float(full_cloud_amount_noop_selected, 0.0)))}, "
+        f"FCACandidates={_fmt_int(full_cloud_amount_candidate_count)}, "
+        f"FCAActualEval={_fmt_int(full_cloud_amount_actual_eval_count)}, "
+        f"FCAPred={_fmt(full_cloud_amount_predicted_delta, 5)}, "
+        f"FCAActual={_fmt(full_cloud_amount_actual_delta, 5)}, "
+        f"FCASurr={_fmt(full_cloud_amount_surrogate_delta, 5)}, "
+        f"FCATeacher={full_cloud_amount_teacher_source}, "
+        f"FCALoss={_fmt(full_cloud_amount_total_loss, 5)}, "
+        f"FCAVerifiedNoop={bool(round(_to_float(full_cloud_verified_noop_guard, 0.0)))}, "
         f"CollapseDetected={collapse_detected}, "
         f"CollapseReason={collapse_reason}, "
         f"HardDropTrace={hard_drop_count_trace}, "

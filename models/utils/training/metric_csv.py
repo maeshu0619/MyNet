@@ -23,6 +23,7 @@ from .metric_columns import (
     SURROGATE_PRETRAIN_COLUMNS,
     LOSS_GRAD_PROBE_COLUMNS,
     PROPOSAL_CANDIDATE_COLUMNS,
+    FULL_CLOUD_AMOUNT_CANDIDATE_COLUMNS,
     )
 
 def init_csv_file(path, columns, writer, label):
@@ -51,6 +52,7 @@ def init_metric_csvs(args, plot, writer):
         "surrogate_pretrain_step": None,
         "loss_grad_probe": None,
         "proposal_candidate_step": None,
+        "full_cloud_amount_candidate_step": None,
     }
     os.makedirs(plot.save_dir, exist_ok=True)
     if bool(getattr(args, "save_compression_metric_csv", True)):
@@ -83,4 +85,8 @@ def init_metric_csvs(args, plot, writer):
         path = os.path.join(plot.save_dir, f"{args.time}_proposal_candidate_metrics_step.csv")
         init_csv_file(path, PROPOSAL_CANDIDATE_COLUMNS, writer, "ProposalCandidateMetricCSV")
         paths["proposal_candidate_step"] = path
+    if str(getattr(args, "sparsepcgc_training_mode", "subtree_selector")).strip().lower() == "full_cloud_amount":
+        path = os.path.join(plot.save_dir, f"{args.time}_full_cloud_amount_candidate_metrics_step.csv")
+        init_csv_file(path, FULL_CLOUD_AMOUNT_CANDIDATE_COLUMNS, writer, "FullCloudAmountCandidateMetricCSV")
+        paths["full_cloud_amount_candidate_step"] = path
     return paths

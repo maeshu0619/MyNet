@@ -144,6 +144,60 @@ def build_compression_metric_row(
         "proposal_total_loss": case_float(comp_debug.get("proposal_total_loss", float("nan")), float("nan")),
         "proposal_teacher_source": str(comp_debug.get("proposal_teacher_source", "")),
         "verified_noop_guard_used": bool(comp_debug.get("verified_noop_guard_used", False)),
+        "full_cloud_verified_noop_guard_used": bool(
+            comp_debug.get("full_cloud_verified_noop_guard_used", False)
+        ),
+        "sparsepcgc_training_mode": str(
+            comp_debug.get(
+                "sparsepcgc_training_mode",
+                getattr(args, "sparsepcgc_training_mode", "subtree_selector"),
+            )
+        ),
+        "full_cloud_amount_enabled": bool(comp_debug.get("full_cloud_amount_enabled", False)),
+        "full_cloud_amount_input_points": case_int(comp_debug.get("full_cloud_amount_input_points", 0), 0),
+        "full_cloud_amount_bin": case_float(comp_debug.get("full_cloud_amount_bin", float("nan")), float("nan")),
+        "full_cloud_amount_residual": case_float(
+            comp_debug.get("full_cloud_amount_residual", float("nan")),
+            float("nan"),
+        ),
+        "full_cloud_amount_final_ratio": case_float(
+            comp_debug.get("full_cloud_amount_final_ratio", float("nan")),
+            float("nan"),
+        ),
+        "full_cloud_amount_drop_count": case_int(comp_debug.get("full_cloud_amount_drop_count", 0), 0),
+        "full_cloud_amount_noop_selected": bool(comp_debug.get("full_cloud_amount_noop_selected", False)),
+        "full_cloud_amount_candidate_count": case_int(comp_debug.get("full_cloud_amount_candidate_count", 0), 0),
+        "full_cloud_amount_actual_eval_count": case_int(comp_debug.get("full_cloud_amount_actual_eval_count", 0), 0),
+        "full_cloud_amount_teacher_source": str(comp_debug.get("full_cloud_amount_teacher_source", "")),
+        "full_cloud_amount_predicted_delta": case_float(
+            comp_debug.get("full_cloud_amount_predicted_delta", float("nan")),
+            float("nan"),
+        ),
+        "full_cloud_amount_actual_delta": case_float(
+            comp_debug.get("full_cloud_amount_actual_delta", float("nan")),
+            float("nan"),
+        ),
+        "full_cloud_amount_surrogate_delta": case_float(
+            comp_debug.get("full_cloud_amount_surrogate_delta", float("nan")),
+            float("nan"),
+        ),
+        "full_cloud_amount_geom_loss": case_float(
+            comp_debug.get("full_cloud_amount_geom_loss", float("nan")),
+            float("nan"),
+        ),
+        "full_cloud_amount_cls_loss": case_float(comp_debug.get("full_cloud_amount_cls_loss", 0.0), 0.0),
+        "full_cloud_amount_value_loss": case_float(comp_debug.get("full_cloud_amount_value_loss", 0.0), 0.0),
+        "full_cloud_amount_rank_loss": case_float(comp_debug.get("full_cloud_amount_rank_loss", 0.0), 0.0),
+        "full_cloud_amount_ratio_reg_loss": case_float(
+            comp_debug.get("full_cloud_amount_ratio_reg_loss", 0.0),
+            0.0,
+        ),
+        "full_cloud_amount_noop_guard_loss": case_float(
+            comp_debug.get("full_cloud_amount_noop_guard_loss", 0.0),
+            0.0,
+        ),
+        "full_cloud_amount_total_loss": case_float(comp_debug.get("full_cloud_amount_total_loss", 0.0), 0.0),
+        "full_cloud_amount_step_time": case_float(comp_debug.get("full_cloud_amount_step_time", 0.0), 0.0),
         "actual_total_bit_percent_fresh": actual_delta if fresh_actual else None,
         "actual_total_bit_percent_cached": actual_delta if cached_actual else None,
         "full_cloud_actual_bit_percent": case_float(comp_debug.get("full_cloud_actual_bit_percent", float("nan")), float("nan")),
@@ -169,14 +223,6 @@ def build_compression_metric_row(
         "subtree_actual_bit_percent": case_float(comp_debug.get("subtree_actual_bit_percent", float("nan")), float("nan")),
         "local_proxy_percent": case_float(comp_debug.get("local_proxy_percent", float("nan")), float("nan")),
         "actual_scope": str(comp_debug.get("actual_scope", "")),
-        "full_cloud_splice_geometry_used": bool(comp_debug.get("full_cloud_splice_geometry_used", False)),
-        "full_cloud_splice_actual_used": bool(comp_debug.get("full_cloud_splice_actual_used", False)),
-        "full_cloud_splice_actual_fallback": bool(comp_debug.get("full_cloud_splice_actual_fallback", False)),
-        "full_cloud_splice_actual_reason": str(comp_debug.get("full_cloud_splice_actual_reason", "")),
-        "full_cloud_splice_actual_points": case_int(comp_debug.get("full_cloud_splice_actual_points", 0), 0),
-        "full_cloud_splice_full_voxels": case_int(comp_debug.get("full_cloud_splice_full_voxels", 0), 0),
-        "full_cloud_splice_subtree_before_voxels": case_int(comp_debug.get("full_cloud_splice_subtree_before_voxels", 0), 0),
-        "full_cloud_splice_subtree_after_voxels": case_int(comp_debug.get("full_cloud_splice_subtree_after_voxels", 0), 0),
         "teacher_scope": str(comp_debug.get("teacher_scope", "")),
         "full_cloud_actual_primary_used": bool(comp_debug.get("full_cloud_actual_primary_used", False)),
         "full_cloud_actual_primary_forward_value": case_float(comp_debug.get("full_cloud_actual_primary_forward_value", float("nan")), float("nan")),
@@ -1167,14 +1213,82 @@ def build_operation_metric_row(
         "proposal_total_loss": case_float(comp_debug.get("proposal_total_loss", float("nan")), float("nan")),
         "proposal_teacher_source": str(comp_debug.get("proposal_teacher_source", "")),
         "verified_noop_guard_used": bool(comp_debug.get("verified_noop_guard_used", False)),
-        "full_cloud_splice_geometry_used": bool(comp_debug.get("full_cloud_splice_geometry_used", False)),
-        "full_cloud_splice_actual_used": bool(comp_debug.get("full_cloud_splice_actual_used", False)),
-        "full_cloud_splice_actual_fallback": bool(comp_debug.get("full_cloud_splice_actual_fallback", False)),
-        "full_cloud_splice_actual_reason": str(comp_debug.get("full_cloud_splice_actual_reason", "")),
-        "full_cloud_splice_actual_points": case_int(comp_debug.get("full_cloud_splice_actual_points", 0), 0),
-        "full_cloud_splice_full_voxels": case_int(comp_debug.get("full_cloud_splice_full_voxels", 0), 0),
-        "full_cloud_splice_subtree_before_voxels": case_int(comp_debug.get("full_cloud_splice_subtree_before_voxels", 0), 0),
-        "full_cloud_splice_subtree_after_voxels": case_int(comp_debug.get("full_cloud_splice_subtree_after_voxels", 0), 0),
+        "full_cloud_verified_noop_guard_used": bool(
+            comp_debug.get("full_cloud_verified_noop_guard_used", False)
+        ),
+        "sparsepcgc_training_mode": str(
+            comp_debug.get(
+                "sparsepcgc_training_mode",
+                getattr(args, "sparsepcgc_training_mode", "subtree_selector"),
+            )
+        ),
+        "full_cloud_amount_enabled": bool(
+            comp_debug.get(
+                "full_cloud_amount_enabled",
+                structure_debug.get("full_cloud_amount_enabled", False),
+            )
+        ),
+        "full_cloud_amount_input_points": case_int(
+            comp_debug.get(
+                "full_cloud_amount_input_points",
+                structure_debug.get("full_cloud_amount_input_points", 0),
+            ),
+            0,
+        ),
+        "full_cloud_amount_bin": case_float(
+            comp_debug.get("full_cloud_amount_bin", structure_debug.get("full_cloud_amount_bin", float("nan"))),
+            float("nan"),
+        ),
+        "full_cloud_amount_residual": case_float(
+            comp_debug.get(
+                "full_cloud_amount_residual",
+                structure_debug.get("full_cloud_amount_residual", float("nan")),
+            ),
+            float("nan"),
+        ),
+        "full_cloud_amount_final_ratio": case_float(
+            comp_debug.get(
+                "full_cloud_amount_final_ratio",
+                structure_debug.get("full_cloud_amount_final_ratio", float("nan")),
+            ),
+            float("nan"),
+        ),
+        "full_cloud_amount_drop_count": case_int(comp_debug.get("full_cloud_amount_drop_count", 0), 0),
+        "full_cloud_amount_noop_selected": bool(
+            comp_debug.get(
+                "full_cloud_amount_noop_selected",
+                structure_debug.get("full_cloud_amount_noop_selected", False),
+            )
+        ),
+        "full_cloud_amount_candidate_count": case_int(comp_debug.get("full_cloud_amount_candidate_count", 0), 0),
+        "full_cloud_amount_actual_eval_count": case_int(comp_debug.get("full_cloud_amount_actual_eval_count", 0), 0),
+        "full_cloud_amount_teacher_source": str(comp_debug.get("full_cloud_amount_teacher_source", "")),
+        "full_cloud_amount_predicted_delta": case_float(
+            comp_debug.get(
+                "full_cloud_amount_predicted_delta",
+                structure_debug.get("full_cloud_amount_predicted_delta", float("nan")),
+            ),
+            float("nan"),
+        ),
+        "full_cloud_amount_actual_delta": case_float(
+            comp_debug.get("full_cloud_amount_actual_delta", float("nan")),
+            float("nan"),
+        ),
+        "full_cloud_amount_surrogate_delta": case_float(
+            comp_debug.get("full_cloud_amount_surrogate_delta", float("nan")),
+            float("nan"),
+        ),
+        "full_cloud_amount_geom_loss": case_float(comp_debug.get("full_cloud_amount_geom_loss", float("nan")), float("nan")),
+        "full_cloud_amount_cls_loss": case_float(comp_debug.get("full_cloud_amount_cls_loss", 0.0), 0.0),
+        "full_cloud_amount_value_loss": case_float(comp_debug.get("full_cloud_amount_value_loss", 0.0), 0.0),
+        "full_cloud_amount_rank_loss": case_float(comp_debug.get("full_cloud_amount_rank_loss", 0.0), 0.0),
+        "full_cloud_amount_ratio_reg_loss": case_float(comp_debug.get("full_cloud_amount_ratio_reg_loss", 0.0), 0.0),
+        "full_cloud_amount_noop_guard_loss": case_float(
+            comp_debug.get("full_cloud_amount_noop_guard_loss", 0.0),
+            0.0,
+        ),
+        "full_cloud_amount_total_loss": case_float(comp_debug.get("full_cloud_amount_total_loss", 0.0), 0.0),
+        "full_cloud_amount_step_time": case_float(comp_debug.get("full_cloud_amount_step_time", 0.0), 0.0),
         "actual_gate_prune_enabled": bool(structure_debug.get("actual_gate_prune_enabled", False)),
         "actual_gate_prune_allowed": bool(structure_debug.get("actual_gate_prune_allowed", False)),
         "hard_prune_actual_allowed": bool(structure_debug.get("hard_prune_actual_allowed", structure_debug.get("actual_gate_prune_allowed", False))),

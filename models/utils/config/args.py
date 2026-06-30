@@ -878,6 +878,13 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--sparsepcgc_codec_prune_prior_logit_weight', default=6.0, type=float)
     parser.add_argument('--sparsepcgc_codec_prune_prior_warmup_steps', default=0, type=int)
     parser.add_argument(
+        '--sparsepcgc_training_mode',
+        default='subtree_selector',
+        choices=['subtree_selector', 'full_cloud_amount', 'legacy'],
+        type=str,
+        help='SparsePCGC訓練branch。subtree_selectorは既存提案器、full_cloud_amountは全点群Amount-only、legacyは旧direct actuator',
+    )
+    parser.add_argument(
         '--sparsepcgc_algorithmic_proposal_selector',
         default=True,
         type=str2bool,
@@ -958,18 +965,28 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument('--sparsepcgc_proposal_accept_threshold', default=0.0, type=float)
     parser.add_argument('--sparsepcgc_proposal_selector_hidden_dim', default=64, type=int)
-    parser.add_argument(
-        '--sparsepcgc_subtree_full_cloud_splice_loss',
-        default=True,
-        type=str2bool,
-        help='TrueならSubtree出力をfull-cloud OctreeへspliceしてからSparsePCGC圧縮損失を評価する',
-    )
-    parser.add_argument(
-        '--sparsepcgc_subtree_full_cloud_splice_geometry',
-        default=False,
-        type=str2bool,
-        help='Trueなら幾何損失もSubtree出力をfull-cloud点群へ戻した上で評価する。大点群ではChamferが重いため既定はFalse',
-    )
+    parser.add_argument('--sparsepcgc_full_cloud_amount_bins', default='0.0,0.015,0.021,0.026,0.031,0.038,0.044,0.05', type=str)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_hidden_dim', default=64, type=int)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_residual_enable', default=False, type=str2bool)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_residual_max', default=0.0025, type=float)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_actual_interval', default=5, type=int)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_warmup_actual_interval', default=1, type=int)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_warmup_steps', default=20, type=int)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_max_actual_candidates_per_step', default=2, type=int)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_use_surrogate_between_actual', default=True, type=str2bool)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_noop_margin', default=0.0, type=float)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_geometry_mode', default='sampled', choices=['off', 'sampled', 'interval_full'], type=str)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_geom_sample_points', default=20000, type=int)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_geom_interval', default=20, type=int)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_cls_loss_weight', default=1.0, type=float)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_value_loss_weight', default=0.5, type=float)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_rank_loss_weight', default=0.2, type=float)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_geom_penalty_weight', default=0.1, type=float)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_ratio_reg_weight', default=0.05, type=float)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_noop_guard_weight', default=0.5, type=float)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_ratio_reg_target', default=0.05, type=float)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_curriculum', default=False, type=str2bool)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_curriculum_steps', default=200, type=int)
     parser.add_argument(
         '--sparsepcgc_warmup_force_codec_prior_amount',
         default=True,
@@ -4196,6 +4213,11 @@ def parse_pugan_args(parser, file_day, file_time):
         int(getattr(args, "sparsepcgc_codec_prune_prior_warmup_steps", 0)),
         0,
     )
+    args.sparsepcgc_training_mode = str(
+        getattr(args, "sparsepcgc_training_mode", "subtree_selector")
+    ).strip().lower()
+    if args.sparsepcgc_training_mode not in {"subtree_selector", "full_cloud_amount", "legacy"}:
+        args.sparsepcgc_training_mode = "subtree_selector"
     args.sparsepcgc_warmup_force_codec_prior_amount = bool(
         getattr(args, "sparsepcgc_warmup_force_codec_prior_amount", True)
     )
@@ -4274,11 +4296,15 @@ def parse_pugan_args(parser, file_day, file_time):
     args.sparsepcgc_legacy_direct_actuator_train = bool(
         getattr(args, "sparsepcgc_legacy_direct_actuator_train", False)
     )
+    if args.sparsepcgc_training_mode == "legacy":
+        args.sparsepcgc_legacy_direct_actuator_train = True
     args.sparsepcgc_algorithmic_proposal_selector = bool(
         getattr(args, "sparsepcgc_algorithmic_proposal_selector", True)
     )
     if args.sparsepcgc_legacy_direct_actuator_train:
         args.sparsepcgc_algorithmic_proposal_selector = False
+    if args.sparsepcgc_training_mode == "full_cloud_amount":
+        args.sparsepcgc_algorithmic_proposal_selector = True
     default_algorithmic_amount_bins = (0.015, 0.021, 0.026, 0.031, 0.038, 0.044, 0.05)
     parsed_algorithmic_bins = _parse_csv_float_list(
         getattr(
@@ -4348,6 +4374,99 @@ def parse_pugan_args(parser, file_day, file_time):
         f"{value:.6f}".rstrip("0").rstrip(".") if value != 0.0 else "0.0"
         for value in normalized_proposal_bins
     )
+    default_full_cloud_amount_bins = (0.0, 0.015, 0.021, 0.026, 0.031, 0.038, 0.044, 0.05)
+    parsed_full_cloud_bins = _parse_csv_float_list(
+        getattr(
+            args,
+            "sparsepcgc_full_cloud_amount_bins",
+            ",".join(str(v) for v in default_full_cloud_amount_bins),
+        ),
+        default_full_cloud_amount_bins,
+    )
+    normalized_full_cloud_bins = [0.0]
+    for ratio in parsed_full_cloud_bins:
+        try:
+            ratio_value = min(max(float(ratio), 0.0), 0.05)
+        except Exception:
+            continue
+        normalized_full_cloud_bins.append(ratio_value)
+    normalized_full_cloud_bins = sorted(set(normalized_full_cloud_bins))
+    args.sparsepcgc_full_cloud_amount_bin_values = tuple(normalized_full_cloud_bins)
+    args.sparsepcgc_full_cloud_amount_bins = ",".join(
+        f"{value:.6f}".rstrip("0").rstrip(".") if value != 0.0 else "0.0"
+        for value in normalized_full_cloud_bins
+    )
+    args.sparsepcgc_full_cloud_amount_hidden_dim = max(
+        int(getattr(args, "sparsepcgc_full_cloud_amount_hidden_dim", 64)),
+        8,
+    )
+    args.sparsepcgc_full_cloud_amount_residual_enable = bool(
+        getattr(args, "sparsepcgc_full_cloud_amount_residual_enable", False)
+    )
+    args.sparsepcgc_full_cloud_amount_residual_max = min(
+        max(float(getattr(args, "sparsepcgc_full_cloud_amount_residual_max", 0.0025)), 0.0),
+        0.01,
+    )
+    args.sparsepcgc_full_cloud_amount_actual_interval = max(
+        int(getattr(args, "sparsepcgc_full_cloud_amount_actual_interval", 5)),
+        0,
+    )
+    args.sparsepcgc_full_cloud_amount_warmup_actual_interval = max(
+        int(getattr(args, "sparsepcgc_full_cloud_amount_warmup_actual_interval", 1)),
+        0,
+    )
+    args.sparsepcgc_full_cloud_amount_warmup_steps = max(
+        int(getattr(args, "sparsepcgc_full_cloud_amount_warmup_steps", 20)),
+        0,
+    )
+    args.sparsepcgc_full_cloud_amount_max_actual_candidates_per_step = max(
+        int(getattr(args, "sparsepcgc_full_cloud_amount_max_actual_candidates_per_step", 2)),
+        1,
+    )
+    args.sparsepcgc_full_cloud_amount_use_surrogate_between_actual = bool(
+        getattr(args, "sparsepcgc_full_cloud_amount_use_surrogate_between_actual", True)
+    )
+    args.sparsepcgc_full_cloud_amount_noop_margin = max(
+        float(getattr(args, "sparsepcgc_full_cloud_amount_noop_margin", 0.0)),
+        0.0,
+    )
+    args.sparsepcgc_full_cloud_amount_geometry_mode = str(
+        getattr(args, "sparsepcgc_full_cloud_amount_geometry_mode", "sampled")
+    ).strip().lower()
+    if args.sparsepcgc_full_cloud_amount_geometry_mode not in {"off", "sampled", "interval_full"}:
+        args.sparsepcgc_full_cloud_amount_geometry_mode = "sampled"
+    args.sparsepcgc_full_cloud_amount_geom_sample_points = max(
+        int(getattr(args, "sparsepcgc_full_cloud_amount_geom_sample_points", 20000)),
+        1,
+    )
+    args.sparsepcgc_full_cloud_amount_geom_interval = max(
+        int(getattr(args, "sparsepcgc_full_cloud_amount_geom_interval", 20)),
+        1,
+    )
+    for _fc_amount_weight_name, _fc_amount_weight_default in (
+        ("sparsepcgc_full_cloud_amount_cls_loss_weight", 1.0),
+        ("sparsepcgc_full_cloud_amount_value_loss_weight", 0.5),
+        ("sparsepcgc_full_cloud_amount_rank_loss_weight", 0.2),
+        ("sparsepcgc_full_cloud_amount_geom_penalty_weight", 0.1),
+        ("sparsepcgc_full_cloud_amount_ratio_reg_weight", 0.05),
+        ("sparsepcgc_full_cloud_amount_noop_guard_weight", 0.5),
+    ):
+        setattr(
+            args,
+            _fc_amount_weight_name,
+            max(float(getattr(args, _fc_amount_weight_name, _fc_amount_weight_default)), 0.0),
+        )
+    args.sparsepcgc_full_cloud_amount_ratio_reg_target = min(
+        max(float(getattr(args, "sparsepcgc_full_cloud_amount_ratio_reg_target", 0.05)), 0.0),
+        0.05,
+    )
+    args.sparsepcgc_full_cloud_amount_curriculum = bool(
+        getattr(args, "sparsepcgc_full_cloud_amount_curriculum", False)
+    )
+    args.sparsepcgc_full_cloud_amount_curriculum_steps = max(
+        int(getattr(args, "sparsepcgc_full_cloud_amount_curriculum_steps", 200)),
+        1,
+    )
     args.sparsepcgc_proposal_amount_residual_enable = bool(
         getattr(args, "sparsepcgc_proposal_amount_residual_enable", True)
     )
@@ -4404,12 +4523,6 @@ def parse_pugan_args(parser, file_day, file_time):
     args.sparsepcgc_proposal_selector_hidden_dim = max(
         int(getattr(args, "sparsepcgc_proposal_selector_hidden_dim", 64)),
         8,
-    )
-    args.sparsepcgc_subtree_full_cloud_splice_loss = bool(
-        getattr(args, "sparsepcgc_subtree_full_cloud_splice_loss", True)
-    )
-    args.sparsepcgc_subtree_full_cloud_splice_geometry = bool(
-        getattr(args, "sparsepcgc_subtree_full_cloud_splice_geometry", False)
     )
     # ============================================================
     # Post-warmup Amount Hybrid 正規化

@@ -15,7 +15,7 @@ from .utils.pointcloud.sparsepcgc_voxel import (
 from .modules.cause_aggregation import CauseDiagnosisAggregation
 from .modules.cost_attribution import CAUSE_NAMES, CostAttributionModule
 from .modules.octree_structure import OctreeStructureAnalysis
-from .modules.proposal_selector import AlgorithmicProposalSelector
+from .modules.proposal_selector import AlgorithmicProposalSelector, FullCloudAmountSelector
 from .modules.structure_actuator import StructureRepairActuator
 from .modules.structure_policy import POLICY_NAMES, StructureRepairPolicy
 
@@ -76,6 +76,14 @@ class Network(nn.Module):
             feature_dim=12,
             hidden_dim=int(getattr(self.args, "sparsepcgc_proposal_selector_hidden_dim", 64)),
             amount_bin_count=len(proposal_amount_bins),
+        )
+        full_cloud_amount_bins = getattr(self.args, "sparsepcgc_full_cloud_amount_bin_values", None)
+        if not isinstance(full_cloud_amount_bins, (list, tuple)) or not full_cloud_amount_bins:
+            full_cloud_amount_bins = (0.0, 0.015, 0.021, 0.026, 0.031, 0.038, 0.044, 0.05)
+        self.full_cloud_amount_selector = FullCloudAmountSelector(
+            feature_dim=structure_dim + len(CAUSE_NAMES) + len(POLICY_NAMES) + self.cause_aggregator.priority_dim,
+            hidden_dim=int(getattr(self.args, "sparsepcgc_full_cloud_amount_hidden_dim", 64)),
+            amount_bin_count=len(full_cloud_amount_bins),
         )
 
         """旧モジュールセットアップ"""
@@ -2064,18 +2072,27 @@ class Network(nn.Module):
             if node_voxel_input_state.get("global_offset", None) is not None:
                 structure["global_offset"] = node_voxel_input_state.get("global_offset", None)
 
-        """点操作実行"""
-        actuator_input = torch.cat(
-            [structure_feat_full, subtree_scores_full, policy_probs_full, repair_priority_full],
-            dim=1,
-        ) # 構造特徴、原因スコアなどをチャネル方向に結合
-
         # ============================================================
         # FullCloud時は、Actuatorにもfull_octree_contextをoctree_contextとして渡す。
         # これにより、Actuator内部のvoxel_coordsもfull cloud canonical基準に固定する。
         # ============================================================
         octree_mode_text = str(octree_input_mode or "auto").strip().lower()
         is_full_cloud_forward = octree_mode_text == "full_cloud"
+
+        """点操作実行"""
+        actuator_input = torch.cat(
+            [structure_feat_full, subtree_scores_full, policy_probs_full, repair_priority_full],
+            dim=1,
+        ) # 構造特徴、原因スコアなどをチャネル方向に結合
+        full_cloud_amount_terms = None
+        if (
+            is_full_cloud_forward
+            and str(getattr(self.args, "sparsepcgc_training_mode", "subtree_selector")).strip().lower()
+            == "full_cloud_amount"
+        ):
+            pooled_full_cloud_amount = actuator_input.mean(dim=2)
+            full_cloud_amount_terms = self.full_cloud_amount_selector(pooled_full_cloud_amount)
+            full_cloud_amount_terms["enabled"] = True
 
         if is_full_cloud_forward:
             actuator_octree_context = full_octree_context
@@ -2116,6 +2133,7 @@ class Network(nn.Module):
             selection_mask=selection_mask,
             octree_context=actuator_octree_context,
             full_octree_context=full_octree_context,
+            full_cloud_amount_terms=full_cloud_amount_terms,
         )
         if isinstance(actuator_stats, dict):
             actuator_stats["actuator_octree_context_source"] = str(actuator_octree_context_source)
@@ -2404,6 +2422,18 @@ class Network(nn.Module):
             "post_warmup_amount_proposal_ratio",
             "post_warmup_amount_teacher_loss",
             "post_warmup_amount_teacher_weight_effective",
+            "full_cloud_amount_enabled",
+            "full_cloud_amount_input_points",
+            "full_cloud_amount_selected_class",
+            "full_cloud_amount_bin",
+            "full_cloud_amount_residual",
+            "full_cloud_amount_final_ratio",
+            "full_cloud_amount_noop_selected",
+            "full_cloud_amount_selected_prob",
+            "full_cloud_amount_predicted_delta",
+            "full_cloud_amount_bin_logits",
+            "full_cloud_amount_predicted_delta_per_amount",
+            "full_cloud_amount_ratio_reg_loss",
             "amount_explore_step",
             "amount_explore_prob",
             "amount_explore_candidate_ratio",

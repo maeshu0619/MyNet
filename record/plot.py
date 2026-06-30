@@ -67,8 +67,14 @@ class PlotMaker():
             "full_cloud_voxel_drop_ratio_percent",
             "adjusted_ratio_percent",
             "oracle_full_cloud_prune_ratio_percent",
-            "selected_subtree_count",
-            "proposal_selected_subtree_count",
+            "full_cloud_amount_final_ratio",
+            "full_cloud_amount_drop_count",
+            "full_cloud_amount_actual_delta",
+            "full_cloud_amount_surrogate_delta",
+            "full_cloud_amount_geom_loss",
+            "full_cloud_amount_total_loss",
+            "full_cloud_amount_noop_selected",
+            "full_cloud_amount_actual_eval_count",
         ]
         self.step_edit_his = [[] for _ in self.edit_keys]
         self.epo_edit_his = [[] for _ in self.edit_keys]
@@ -1033,8 +1039,6 @@ class PlotMaker():
             "full_cloud_voxel_drop_ratio_percent": "FullCloudVoxelPrune",
             "adjusted_ratio_percent": "Adjust",
             "oracle_full_cloud_prune_ratio_percent": "OracleFullPrune",
-            "selected_subtree_count": "SelectedSubtrees",
-            "proposal_selected_subtree_count": "ProposalSelectedSubtrees",
         }
         edit_colors = {
             "added_ratio_percent": "#2ca02c",
@@ -1042,8 +1046,6 @@ class PlotMaker():
             "full_cloud_voxel_drop_ratio_percent": "#ff7f0e",
             "adjusted_ratio_percent": "#1f77b4",
             "oracle_full_cloud_prune_ratio_percent": "#9467bd",
-            "selected_subtree_count": "#8c564b",
-            "proposal_selected_subtree_count": "#17becf",
         }
         fig, axes = plot_mod.subplots(
             len(self.edit_keys),
@@ -1072,12 +1074,8 @@ class PlotMaker():
             if not plotted:
                 ax.text(0.5, 0.5, "no point edit data", ha="center", va="center", transform=ax.transAxes, alpha=0.7)
             ax.set_xlabel(xl)
-            if key.endswith("_count"):
-                ax.set_ylabel(f"{edit_titles.get(key, key)} Count")
-                ax.set_title(f"{edit_titles.get(key, key)} Count")
-            else:
-                ax.set_ylabel(f"{edit_titles.get(key, key)} Ratio [%]")
-                ax.set_title(f"{edit_titles.get(key, key)} Ratio")
+            ax.set_ylabel(f"{edit_titles.get(key, key)} Ratio [%]")
+            ax.set_title(f"{edit_titles.get(key, key)} Ratio")
             ax.axhline(0.0, color="black", linewidth=0.7, alpha=0.4)
             ax.grid(True, alpha=0.35)
             if len(x_history) >= 2:
