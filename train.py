@@ -3619,9 +3619,42 @@ def _sparsepcgc_actual_oracle_pattern_plan_candidates(unique_coords, args, globa
     return candidates[: int(max_candidates)]
 
 
-def _sparsepcgc_splice_subtree_coords_into_full_cloud(full_coords_b3n, subtree_coords_n3, candidate_coords_n3):
-    if not torch.is_tensor(full_coords_b3n) or not torch.is_tensor(subtree_coords_n3) or not torch.is_tensor(candidate_coords_n3):
+def _sparsepcgc_rows_membership_mask_fast(query_n3, table_n3):
+    if (
+        not torch.is_tensor(query_n3)
+        or not torch.is_tensor(table_n3)
+        or query_n3.numel() <= 0
+        or table_n3.numel() <= 0
+    ):
+        device = query_n3.device if torch.is_tensor(query_n3) else torch.device("cpu")
+        query_rows = int(query_n3.reshape(-1, 3).shape[0]) if torch.is_tensor(query_n3) and query_n3.numel() > 0 else 0
+        return torch.zeros((query_rows,), device=device, dtype=torch.bool)
+
+    query = query_n3.to(dtype=torch.long).reshape(-1, 3).contiguous()
+    table = table_n3.to(device=query.device, dtype=torch.long).reshape(-1, 3).contiguous()
+    if query.numel() <= 0 or table.numel() <= 0:
+        return torch.zeros((query.shape[0],), device=query.device, dtype=torch.bool)
+
+    both = torch.cat([query, table], dim=0)
+    mins = both.amin(dim=0)
+    span = (both.amax(dim=0) - mins + 1).clamp_min(1)
+
+    def _key(values):
+        shifted = values - mins
+        return shifted[:, 0] * span[1] * span[2] + shifted[:, 1] * span[2] + shifted[:, 2]
+
+    table_keys = torch.unique(_key(table), sorted=True)
+    query_keys = _key(query)
+    pos = torch.searchsorted(table_keys, query_keys)
+    in_bounds = pos < table_keys.numel()
+    safe_pos = pos.clamp(max=max(int(table_keys.numel()) - 1, 0))
+    return in_bounds & (table_keys[safe_pos] == query_keys)
+
+
+def _sparsepcgc_prepare_full_cloud_splice_base(full_coords_b3n, subtree_coords_n3):
+    if not torch.is_tensor(full_coords_b3n) or not torch.is_tensor(subtree_coords_n3):
         return None
+
     if full_coords_b3n.ndim == 2:
         full_coords_b3n = (
             full_coords_b3n.transpose(0, 1).contiguous().unsqueeze(0)
@@ -3630,21 +3663,53 @@ def _sparsepcgc_splice_subtree_coords_into_full_cloud(full_coords_b3n, subtree_c
         )
     if full_coords_b3n.ndim != 3 or full_coords_b3n.shape[1] != 3 or full_coords_b3n.shape[0] != 1:
         return None
-    device = candidate_coords_n3.device
+
+    device = subtree_coords_n3.device
     full_coords = torch.unique(
         full_coords_b3n[0].transpose(0, 1).contiguous().to(device=device, dtype=torch.long),
         dim=0,
         sorted=True,
     )
-    subtree_coords = torch.unique(subtree_coords_n3.to(device=device, dtype=torch.long), dim=0, sorted=True)
-    candidate_coords = torch.unique(candidate_coords_n3.to(device=device, dtype=torch.long), dim=0, sorted=True)
-    if full_coords.numel() <= 0 or subtree_coords.numel() <= 0 or candidate_coords.numel() <= 0:
+    subtree_coords = torch.unique(
+        subtree_coords_n3.to(device=device, dtype=torch.long).reshape(-1, 3).contiguous(),
+        dim=0,
+        sorted=True,
+    )
+    if full_coords.numel() <= 0 or subtree_coords.numel() <= 0:
         return None
 
-    remove_keys = {tuple(int(v) for v in row) for row in subtree_coords.detach().cpu().tolist()}
-    keep_mask_cpu = [tuple(int(v) for v in row) not in remove_keys for row in full_coords.detach().cpu().tolist()]
-    keep_mask = torch.as_tensor(keep_mask_cpu, device=device, dtype=torch.bool)
-    spliced = torch.cat([full_coords[keep_mask], candidate_coords], dim=0)
+    keep_mask = ~_sparsepcgc_rows_membership_mask_fast(full_coords, subtree_coords)
+    full_without_subtree = full_coords[keep_mask]
+    return {
+        "full_coords": full_coords,
+        "subtree_coords": subtree_coords,
+        "full_without_subtree": full_without_subtree,
+    }
+
+
+def _sparsepcgc_splice_subtree_coords_into_full_cloud(full_coords_b3n, subtree_coords_n3, candidate_coords_n3, splice_base=None):
+    if not torch.is_tensor(full_coords_b3n) or not torch.is_tensor(subtree_coords_n3) or not torch.is_tensor(candidate_coords_n3):
+        return None
+    device = candidate_coords_n3.device
+    candidate_coords = torch.unique(
+        candidate_coords_n3.to(device=device, dtype=torch.long).reshape(-1, 3).contiguous(),
+        dim=0,
+        sorted=True,
+    )
+    if candidate_coords.numel() <= 0:
+        return None
+
+    prepared = splice_base
+    if not isinstance(prepared, dict):
+        prepared = _sparsepcgc_prepare_full_cloud_splice_base(full_coords_b3n, subtree_coords_n3)
+    if not isinstance(prepared, dict):
+        return None
+
+    full_without_subtree = prepared.get("full_without_subtree", None)
+    if not torch.is_tensor(full_without_subtree):
+        return None
+    full_without_subtree = full_without_subtree.to(device=device, dtype=torch.long)
+    spliced = torch.cat([full_without_subtree, candidate_coords], dim=0)
     spliced = torch.unique(spliced, dim=0, sorted=True)
     if int(spliced.shape[0]) <= 0:
         return None
@@ -3802,6 +3867,7 @@ def _attach_sparsepcgc_actual_oracle_drop(
         sorted=True,
         return_inverse=True,
     )
+    oracle_splice_base = None
     proxy_profile = {
         "enabled": False,
         "reason": "skipped_fast_diagnostic_only",
@@ -3816,10 +3882,45 @@ def _attach_sparsepcgc_actual_oracle_drop(
     full_eval_coords = None
     oracle_eval_scope = "subtree_local"
     if bool(getattr(args, "sparsepcgc_actual_oracle_eval_full_cloud_splice", True)) and isinstance(full_octree_context, dict):
+        splice_base_prepare_start = time.time()
+        full_cloud_cache_key = str(full_octree_context.get("actual_oracle_full_cloud_cache_key", "") or "")
+        splice_base_cache_key = _episode_input_common_cache_key(
+            cache_key or full_cloud_cache_key,
+            "actual_oracle_splice_base",
+            subtree_points=int(unique_coords.shape[0]),
+        )
+        splice_base_cache_enabled = bool(
+            _episode_input_common_cache_enabled(args)
+            and getattr(args, "episode_input_actual_oracle_splice_cache", True)
+            and splice_base_cache_key
+        )
+        if splice_base_cache_enabled:
+            oracle_splice_base = _episode_input_common_cache_fetch(
+                args,
+                splice_base_cache_key,
+                device=unique_coords.device,
+                section="actual_oracle_splice_base",
+            )
+        if isinstance(oracle_splice_base, dict):
+            debug["actual_oracle_splice_base_cache_hit"] = True
+        else:
+            oracle_splice_base = _sparsepcgc_prepare_full_cloud_splice_base(
+                full_octree_context.get("full_global_voxel_coords", None),
+                unique_coords,
+            )
+            debug["actual_oracle_splice_base_cache_hit"] = False
+            if splice_base_cache_enabled and isinstance(oracle_splice_base, dict):
+                _episode_input_common_cache_store(
+                    args,
+                    splice_base_cache_key,
+                    oracle_splice_base,
+                )
+        debug["actual_oracle_splice_base_prepare_time"] = float(time.time() - splice_base_prepare_start)
         spliced_base = _sparsepcgc_splice_subtree_coords_into_full_cloud(
             full_octree_context.get("full_global_voxel_coords", None),
             unique_coords,
             unique_coords,
+            splice_base=oracle_splice_base,
         )
         if torch.is_tensor(spliced_base) and int(spliced_base.shape[0]) > 0:
             full_eval_coords = spliced_base.detach()
@@ -3938,6 +4039,7 @@ def _attach_sparsepcgc_actual_oracle_drop(
                 full_octree_context.get("full_global_voxel_coords", None) if isinstance(full_octree_context, dict) else None,
                 unique_coords,
                 local_candidate_coords,
+                splice_base=oracle_splice_base,
             )
             if torch.is_tensor(spliced) and int(spliced.shape[0]) > 0:
                 return spliced
@@ -4573,41 +4675,6 @@ def _attach_sparsepcgc_actual_oracle_drop(
             debug["parent_prune_eval_max"] = int(parent_prune_eval_limit)
             debug["pattern_plan_eval_max"] = int(pattern_plan_eval_limit)
             debug["subtree_move_eval_max"] = int(subtree_move_eval_limit)
-            def _sparsepcgc_rows_membership_mask_fast(query_n3, table_n3):
-                """
-                query_n3 の各行が table_n3 に含まれるかを返す。
-                旧実装の {tuple(...)} + .cpu().tolist() を置き換える。
-                GPU TensorならGPU上で searchsorted するため、CPU往復をほぼ消せる。
-                """
-                if (
-                    not torch.is_tensor(query_n3)
-                    or not torch.is_tensor(table_n3)
-                    or query_n3.numel() <= 0
-                    or table_n3.numel() <= 0
-                ):
-                    device = query_n3.device if torch.is_tensor(query_n3) else torch.device("cpu")
-                    return torch.zeros((0,), device=device, dtype=torch.bool)
-
-                query = query_n3.to(dtype=torch.long).reshape(-1, 3).contiguous()
-                table = table_n3.to(device=query.device, dtype=torch.long).reshape(-1, 3).contiguous()
-                if query.numel() <= 0 or table.numel() <= 0:
-                    return torch.zeros((query.shape[0],), device=query.device, dtype=torch.bool)
-
-                both = torch.cat([query, table], dim=0)
-                mins = both.amin(dim=0)
-                span = (both.amax(dim=0) - mins + 1).clamp_min(1)
-
-                def _key(values):
-                    shifted = values - mins
-                    return shifted[:, 0] * span[1] * span[2] + shifted[:, 1] * span[2] + shifted[:, 2]
-
-                table_keys = torch.unique(_key(table), sorted=True)
-                query_keys = _key(query)
-                pos = torch.searchsorted(table_keys, query_keys)
-                in_bounds = pos < table_keys.numel()
-                safe_pos = pos.clamp(max=max(int(table_keys.numel()) - 1, 0))
-                return in_bounds & (table_keys[safe_pos] == query_keys)
-
             def _sparsepcgc_full_macro_candidate_cache_key():
                 context_key = ""
                 if isinstance(full_octree_context, dict):
