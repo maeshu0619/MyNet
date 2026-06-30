@@ -7,6 +7,20 @@ from .metric_columns import (
 from .scalar_utils import case_float
 
 
+COMPRESSION_EPISODE_COUNT_KEYS = {
+    "anchor_step_count",
+    "subtree_step_count",
+    "anchor_step_count",
+    "subtree_step_count",
+    "subtree_good_count",
+    "subtree_neutral_count",
+    "subtree_bad_count",
+    "outcome_good_count",
+    "outcome_bad_count",
+    "outcome_neutral_count",
+}
+
+
 def new_operation_episode_sum():
     return {
         "sums": {key: 0.0 for key in OPERATION_EPISODE_METRIC_COLUMNS},
@@ -88,5 +102,19 @@ def finalize_compression_episode_metrics(episode, stage, metric_sums):
         if key in row:
             continue
         count = int(metric_sums["counts"].get(key, 0))
-        row[key] = None if count <= 0 else float(metric_sums["sums"].get(key, 0.0)) / float(count)
+        if key in COMPRESSION_EPISODE_COUNT_KEYS:
+            row[key] = int(metric_sums["sums"].get(key, 0.0))
+        else:
+            row[key] = None if count <= 0 else float(metric_sums["sums"].get(key, 0.0)) / float(count)
+    anchor_step_count = int(row.get("anchor_step_count") or 0)
+    subtree_step_count = int(row.get("subtree_step_count") or 0)
+    row["mean_anchor_actual_raw"] = row.get("anchor_actual_raw", None)
+    row["mean_subtree_actual_raw"] = row.get("subtree_actual_raw", None)
+    row["mean_anchor_actual_used"] = row.get("full_cloud_actual_bit_percent", None)
+    row["mean_subtree_actual_used"] = row.get("subtree_actual_filter_used_percent", None)
+    row["outcome_imitation_used_rate"] = row.get("outcome_imitation_used", None)
+    row["surrogate_trust_mean"] = row.get("surrogate_trust_value", None)
+    row["stage_switch_guard_used_rate"] = row.get("stage_switch_guard_used", None)
+    row["anchor_step_count"] = anchor_step_count
+    row["subtree_step_count"] = subtree_step_count
     return row

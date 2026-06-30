@@ -1760,8 +1760,8 @@ class StructureRepairActuator(nn.Module):
             block_counts.append(int(unique_blocks.shape[0]))
         return prior, block_counts
 
-    @staticmethod
     def _hard_codec_block_drop_mask(
+        self,
         voxel_coords,
         point_scores,
         *,
@@ -1769,6 +1769,7 @@ class StructureRepairActuator(nn.Module):
         target_drop_ratio,
         selection_mask=None,
         max_hard_count=0,
+        min_hard_count=0,
     ):
         """Select complete coarse blocks without exceeding the point budget."""
         batch_size, _, point_count = voxel_coords.shape
@@ -1785,6 +1786,14 @@ class StructureRepairActuator(nn.Module):
             "hard_mask_count": 0.0,
             "candidate_count": 0.0,
             "final_hard_drop_count": 0.0,
+            "codec_block_valid_point_count": 0.0,
+            "codec_block_budget_points": 0.0,
+            "codec_block_count": 0.0,
+            "codec_block_selected_block_count": 0.0,
+            "codec_block_selected_point_count": 0.0,
+            "codec_block_budget_zero": False,
+            "codec_block_target_drop_ratio": float(target_drop_ratio),
+            "codec_block_under_selected": False,
         }
         ratio = min(max(float(target_drop_ratio), 0.0), 1.0)
         if ratio <= 0.0 or point_count <= 0:
@@ -1808,15 +1817,22 @@ class StructureRepairActuator(nn.Module):
             valid_count = int(valid_idx.numel())
             if valid_count <= 0:
                 continue
+            hard_drop_trace["codec_block_valid_point_count"] += float(valid_count)
             budget = int(math.floor(float(valid_count) * ratio))
             if int(max_hard_count) > 0:
                 budget = min(budget, int(max_hard_count))
-            if budget <= 0:
-                continue
             coords = voxel_coords[batch_idx].index_select(1, valid_idx).transpose(0, 1).contiguous().long()
             blocks = torch.div(coords, int(block_size), rounding_mode="floor")
             unique_blocks, inverse = torch.unique(blocks, dim=0, sorted=True, return_inverse=True)
             block_count = int(unique_blocks.shape[0])
+            hard_drop_trace["voxel_count"] += float(valid_count)
+            hard_drop_trace["pre_round_target_count"] += float(ratio * float(valid_count))
+            hard_drop_trace["post_round_target_count"] += float(max(budget, 0))
+            hard_drop_trace["codec_block_budget_points"] += float(max(budget, 0))
+            hard_drop_trace["codec_block_count"] += float(block_count)
+            hard_drop_trace["candidate_count"] += float(block_count)
+            if budget <= 0:
+                hard_drop_trace["codec_block_budget_zero"] = True
             counts = torch.bincount(inverse, minlength=block_count).long()
             scores = point_scores[batch_idx, 0].index_select(0, valid_idx).detach().float()
             score_sum = torch.zeros((block_count,), device=scores.device, dtype=scores.dtype)
@@ -1824,7 +1840,10 @@ class StructureRepairActuator(nn.Module):
             block_scores = score_sum / counts.to(dtype=scores.dtype).clamp_min(1.0)
             order = torch.argsort(block_scores, descending=True)
             cumulative = torch.cumsum(counts.index_select(0, order), dim=0)
-            take = int((cumulative <= int(budget)).sum().item())
+            take = int((cumulative <= int(max(budget, 0))).sum().item())
+            if take <= 0 and int(min_hard_count) > 0 and block_count > 0:
+                take = min(max(int(min_hard_count), 1), block_count)
+                hard_drop_trace["min_count_floor_applied"] = True
             if take <= 0:
                 continue
             selected_blocks = torch.zeros((block_count,), device=coords.device, dtype=torch.bool)
@@ -1832,8 +1851,13 @@ class StructureRepairActuator(nn.Module):
             selected_local = selected_blocks.index_select(0, inverse)
             selected_points = valid_idx[selected_local]
             hard_drop[batch_idx, 0, selected_points] = True
+            selected_block_count = int(take)
+            selected_point_count = int(selected_points.numel())
+            if budget > 0 and selected_point_count < min(valid_count, budget):
+                hard_drop_trace["codec_block_under_selected"] = True
             hard_drop_trace["hard_mask_count"] += float(selected_points.numel())
-            hard_drop_trace["candidate_count"] += float(block_count)
+            hard_drop_trace["codec_block_selected_block_count"] += float(selected_block_count)
+            hard_drop_trace["codec_block_selected_point_count"] += float(selected_point_count)
         hard_drop_trace["final_hard_drop_count"] = float(hard_drop.detach().sum().item())
         try:
             setattr(self, "_last_hard_drop_count_trace", hard_drop_trace)
@@ -3009,6 +3033,11 @@ class StructureRepairActuator(nn.Module):
         ).strip().lower()
         if amount_mode not in {"network", "blend", "max"}:
             amount_mode = "network"
+        amount_mode_id = {"network": 1, "blend": 2, "max": 3}.get(amount_mode, 0)
+        amount_mode_network = bool(amount_mode == "network")
+        warmup_force_codec_prior_amount = bool(
+            getattr(self.args, "sparsepcgc_warmup_force_codec_prior_amount", True)
+        )
 
         if amount_mode == "network":
             # warmup中だけprior量を使う。
@@ -3028,13 +3057,38 @@ class StructureRepairActuator(nn.Module):
 
         # Phase0以降は learned_drop_ratio_before_gate を使い、
         # operation gateでAmountがさらに潰れる経路を避ける。
-        effective_drop_ratio_for_hard_count = (
+        network_effective_drop_ratio_for_hard_count = (
             learned_drop_ratio_before_gate if phase0_network_prune_mode else learned_drop_ratio_after_gate
         )
+        effective_drop_ratio_for_hard_count = network_effective_drop_ratio_for_hard_count
+        hard_drop_target_ratio_source = "network_amount_phase0" if phase0_network_prune_mode else "network_amount"
+        hard_drop_target_ratio_source_id = 2
 
         codec_prior_amount_blend_applied = False
         codec_prior_amount_blend_alpha_value = 0.0
         codec_prior_amount_distill_loss = pts_xyz.new_zeros(())
+
+        if (
+            amount_mode == "network"
+            and warmup_force_codec_prior_amount
+            and self.training
+            and prune_enabled
+            and codec_prune_prior_enabled
+            and codec_prune_prior_active_ratio > 0.0
+            and float(codec_prune_prior_phase) > 0.0
+            and not self._direct_network_prune_mode()
+        ):
+            # warmup中だけforwardのhard count量をcodec priorへ戻し、
+            # backwardは既存のnetwork amount経路へ流す。
+            codec_prior_tensor = learned_drop_ratio.new_tensor(float(codec_prune_prior_active_ratio))
+            effective_drop_ratio_forward = codec_prior_tensor
+            effective_drop_ratio_for_hard_count = (
+                effective_drop_ratio_forward.detach()
+                + network_effective_drop_ratio_for_hard_count
+                - network_effective_drop_ratio_for_hard_count.detach()
+            )
+            hard_drop_target_ratio_source = "codec_prior_active_ratio_warmup"
+            hard_drop_target_ratio_source_id = 1
 
         if (
             self.training
@@ -3078,12 +3132,16 @@ class StructureRepairActuator(nn.Module):
                     + (1.0 - alpha_tensor) * effective_drop_ratio_for_hard_count
                 )
                 codec_prior_amount_blend_applied = True
+                hard_drop_target_ratio_source = "hybrid_blend"
+                hard_drop_target_ratio_source_id = 3
             else:
                 # 旧互換: maxで下支えする。
                 effective_drop_ratio_forward = torch.maximum(
                     effective_drop_ratio_for_hard_count,
                     codec_prior_tensor,
                 )
+                hard_drop_target_ratio_source = "hybrid_max"
+                hard_drop_target_ratio_source_id = 4
 
             effective_drop_ratio_for_hard_count = (
                 effective_drop_ratio_forward.detach()
@@ -3095,6 +3153,12 @@ class StructureRepairActuator(nn.Module):
         # HybridではPrune量固定を避けたいので、必要ならCLIで小さくする。
         if network_prune_floor_ratio > 0.0:
             network_floor_tensor = learned_drop_ratio.new_tensor(float(network_prune_floor_ratio))
+            floor_applied_to_ratio = bool(
+                (
+                    network_floor_tensor
+                    > effective_drop_ratio_for_hard_count.detach().mean()
+                ).item()
+            )
             effective_drop_ratio_forward = torch.maximum(
                 effective_drop_ratio_for_hard_count,
                 network_floor_tensor,
@@ -3104,6 +3168,9 @@ class StructureRepairActuator(nn.Module):
                 + effective_drop_ratio_for_hard_count
                 - effective_drop_ratio_for_hard_count.detach()
             )
+            if floor_applied_to_ratio:
+                hard_drop_target_ratio_source = "network_floor"
+                hard_drop_target_ratio_source_id = 5
         learned_drop_ratio = learned_drop_ratio_before_gate
         learned_drop_ratio_for_ops = self._scale_amount_downstream_grad(
             effective_drop_ratio_for_hard_count,
@@ -3136,6 +3203,11 @@ class StructureRepairActuator(nn.Module):
         learned_drop_ratio_value = (
             float(effective_drop_ratio_for_hard_count.detach().mean().cpu()) if prune_enabled else 0.0
         )
+        hard_drop_target_ratio_network_value = (
+            float(network_effective_drop_ratio_for_hard_count.detach().mean().cpu()) if prune_enabled else 0.0
+        )
+        hard_drop_target_ratio_codec_prior_value = float(codec_prune_prior_active_ratio) if prune_enabled else 0.0
+        hard_drop_target_ratio_value = float(learned_drop_ratio_value)
         if (
             self.training
             and prune_enabled
@@ -3578,13 +3650,22 @@ class StructureRepairActuator(nn.Module):
             )
         elif codec_prune_prior_phase > 0.0 and not direct_network_prune_mode:
             hard_drop_block_reason = "codec_prior_phase_hard_drop"
+            if amount_mode_network and warmup_force_codec_prior_amount:
+                hard_drop_target_ratio_value = float(codec_prune_prior_active_ratio)
+                hard_drop_target_ratio_source = "codec_prior_active_ratio_warmup"
+                hard_drop_target_ratio_source_id = 1
+            else:
+                hard_drop_target_ratio_value = float(learned_drop_ratio_value)
             hard_drop_mask = self._hard_codec_block_drop_mask(
                 voxel_coords,
                 drop_prob,
                 block_size=codec_prune_prior_block_size,
-                target_drop_ratio=learned_drop_ratio_value,
+                target_drop_ratio=hard_drop_target_ratio_value,
                 selection_mask=hard_delete_selection_mask,
                 max_hard_count=int(getattr(self.args, "repair_max_hard_drop_voxels", 0)),
+                min_hard_count=int(
+                    getattr(self.args, "sparsepcgc_codec_prior_warmup_min_hard_count", 0)
+                ),
             )
         elif (
             self.training
@@ -3612,21 +3693,24 @@ class StructureRepairActuator(nn.Module):
 
             if use_codec_block_action:
                 hard_drop_block_reason = "hybrid_codec_block_hard_drop"
+                hard_drop_target_ratio_value = float(learned_drop_ratio_value)
                 hard_drop_mask = self._hard_codec_block_drop_mask(
                     voxel_coords,
                     drop_prob,
                     block_size=codec_prune_prior_block_size,
-                    target_drop_ratio=learned_drop_ratio_value,
+                    target_drop_ratio=hard_drop_target_ratio_value,
                     selection_mask=hard_delete_selection_mask,
                     max_hard_count=int(getattr(self.args, "repair_max_hard_drop_voxels", 0)),
+                    min_hard_count=0,
                 )
             else:
                 hard_drop_block_reason = "hybrid_network_voxel_hard_drop"
+                hard_drop_target_ratio_value = float(learned_drop_ratio_value)
                 hard_drop_mask = self._hard_voxel_drop_mask(
                     voxel_coords,
                     drop_prob,
-                    target_drop_ratio=learned_drop_ratio_value,
-                    max_drop_ratio=learned_drop_ratio_value,
+                    target_drop_ratio=hard_drop_target_ratio_value,
+                    max_drop_ratio=hard_drop_target_ratio_value,
                     selection_mask=hard_delete_selection_mask,
                     hard_threshold=float(getattr(self.args, "repair_drop_hard_threshold", 0.5)),
                     voxel_cache=voxel_cache,
@@ -3637,11 +3721,12 @@ class StructureRepairActuator(nn.Module):
                 )
         else:
             hard_drop_block_reason = "network_learned_hard_drop"
+            hard_drop_target_ratio_value = float(learned_drop_ratio_value)
             hard_drop_mask = self._hard_voxel_drop_mask(
                 voxel_coords,
                 drop_prob,
-                target_drop_ratio=learned_drop_ratio_value,
-                max_drop_ratio=learned_drop_ratio_value,
+                target_drop_ratio=hard_drop_target_ratio_value,
+                max_drop_ratio=hard_drop_target_ratio_value,
                 selection_mask=hard_delete_selection_mask,
                 hard_threshold=float(getattr(self.args, "repair_drop_hard_threshold", 0.5)),
                 voxel_cache=voxel_cache,
@@ -5257,6 +5342,9 @@ class StructureRepairActuator(nn.Module):
         hard_drop_count_trace = (
             "codec_prune_prior_phase="
             f"{float(codec_prune_prior_phase):.6g}, "
+            f"codec_prune_prior_base_ratio={float(codec_prune_prior_ratio):.6g}, "
+            f"codec_prune_prior_active_ratio={float(codec_prune_prior_active_ratio):.6g}, "
+            f"codec_prune_prior_count_alpha={float(codec_prune_prior_count_alpha):.6g}, "
             f"raw_learned_drop_ratio={float(raw_learned_drop_ratio.detach().mean().item()):.6g}, "
             f"learned_drop_ratio_before_floor={float(learned_drop_ratio_before_floor.detach().mean().item()):.6g}, "
             f"learned_drop_ratio_after_floor={float(learned_drop_ratio_after_floor.detach().mean().item()):.6g}, "
@@ -5264,6 +5352,12 @@ class StructureRepairActuator(nn.Module):
             f"drop_operation_gate={float(drop_operation_gate.detach().mean().item()):.6g}, "
             f"learned_drop_ratio_after_gate={float(learned_drop_ratio_after_gate.detach().mean().item()):.6g}, "
             f"effective_drop_ratio_for_hard_count={float(effective_drop_ratio_for_hard_count.detach().mean().item()):.6g}, "
+            f"learned_drop_ratio_value={float(learned_drop_ratio_value):.6g}, "
+            f"hard_drop_target_ratio_source={hard_drop_target_ratio_source}, "
+            f"hard_drop_target_ratio_source_id={int(hard_drop_target_ratio_source_id)}, "
+            f"hard_drop_target_ratio_value={float(hard_drop_target_ratio_value):.6g}, "
+            f"hard_drop_target_ratio_network_value={float(hard_drop_target_ratio_network_value):.6g}, "
+            f"hard_drop_target_ratio_codec_prior_value={float(hard_drop_target_ratio_codec_prior_value):.6g}, "
             f"voxel_count={float(last_hard_drop_trace.get('voxel_count', 0.0)):.6g}, "
             f"pre_round_target_count={pre_round_target_count_value:.6g}, "
             f"post_round_target_count={post_round_target_count_value:.6g}, "
@@ -5271,6 +5365,14 @@ class StructureRepairActuator(nn.Module):
             f"delete_candidate_count={float(delete_candidate_voxel_count_value):.6g}, "
             f"hard_delete_selection_count={float(hard_delete_selection_voxel_count_value):.6g}, "
             f"delete_candidate_empty_reason={delete_candidate_empty_reason}, "
+            f"codec_block_valid_point_count={float(last_hard_drop_trace.get('codec_block_valid_point_count', 0.0)):.6g}, "
+            f"codec_block_budget_points={float(last_hard_drop_trace.get('codec_block_budget_points', 0.0)):.6g}, "
+            f"codec_block_count={float(last_hard_drop_trace.get('codec_block_count', 0.0)):.6g}, "
+            f"codec_block_selected_block_count={float(last_hard_drop_trace.get('codec_block_selected_block_count', 0.0)):.6g}, "
+            f"codec_block_selected_point_count={float(last_hard_drop_trace.get('codec_block_selected_point_count', 0.0)):.6g}, "
+            f"codec_block_budget_zero={bool(last_hard_drop_trace.get('codec_block_budget_zero', False))}, "
+            f"codec_block_target_drop_ratio={float(last_hard_drop_trace.get('codec_block_target_drop_ratio', 0.0)):.6g}, "
+            f"codec_block_under_selected={bool(last_hard_drop_trace.get('codec_block_under_selected', False))}, "
             f"hard_mask_count={hard_mask_count_value:.6g}, "
             f"final_hard_drop_count={float(last_hard_drop_trace.get('final_hard_drop_count', float(hard_drop_count_value))):.6g}, "
             f"selected_drop_count_hard={float(hard_drop_count_value):.6g}, "
@@ -6625,6 +6727,8 @@ class StructureRepairActuator(nn.Module):
             ).detach(),
             "codec_prune_prior_phase": pts_xyz.new_tensor(codec_prune_prior_phase).detach(),
             "codec_prune_prior_ratio": pts_xyz.new_tensor(codec_prune_prior_active_ratio).detach(),
+            "codec_prune_prior_base_ratio": pts_xyz.new_tensor(float(codec_prune_prior_ratio)).detach(),
+            "codec_prune_prior_active_ratio": pts_xyz.new_tensor(float(codec_prune_prior_active_ratio)).detach(),
             "codec_prune_prior_hybrid_alpha": pts_xyz.new_tensor(
                 float(codec_prune_prior_hybrid_alpha)
             ).detach(),
@@ -6634,11 +6738,25 @@ class StructureRepairActuator(nn.Module):
             "codec_prune_prior_hard_action_alpha": pts_xyz.new_tensor(
                 float(codec_prune_prior_hard_action_alpha)
             ).detach(),
+            "amount_mode_id": pts_xyz.new_tensor(float(amount_mode_id)).detach(),
+            "amount_mode_network": pts_xyz.new_tensor(float(amount_mode_network)).detach(),
             "codec_prior_amount_blend_applied": pts_xyz.new_tensor(
                 float(codec_prior_amount_blend_applied)
             ).detach(),
             "codec_prior_amount_blend_alpha": pts_xyz.new_tensor(
                 float(codec_prior_amount_blend_alpha_value)
+            ).detach(),
+            "hard_drop_target_ratio_source_id": pts_xyz.new_tensor(
+                float(hard_drop_target_ratio_source_id)
+            ).detach(),
+            "hard_drop_target_ratio_value": pts_xyz.new_tensor(
+                float(hard_drop_target_ratio_value)
+            ).detach(),
+            "hard_drop_target_ratio_network_value": pts_xyz.new_tensor(
+                float(hard_drop_target_ratio_network_value)
+            ).detach(),
+            "hard_drop_target_ratio_codec_prior_value": pts_xyz.new_tensor(
+                float(hard_drop_target_ratio_codec_prior_value)
             ).detach(),
             "codec_prior_where_distill_loss": codec_prior_where_distill_loss.detach(),
             "codec_prior_amount_distill_loss": codec_prior_amount_distill_loss.detach(),
@@ -6667,9 +6785,34 @@ class StructureRepairActuator(nn.Module):
             "learned_drop_ratio_after_floor": learned_drop_ratio_after_floor.mean().detach(),
             "learned_drop_ratio_before_gate": learned_drop_ratio_before_gate.mean().detach(),
             "learned_drop_ratio_after_gate": learned_drop_ratio_after_gate.mean().detach(),
+            "learned_drop_ratio_value": pts_xyz.new_tensor(float(learned_drop_ratio_value)).detach(),
             "effective_drop_ratio_for_hard_count": effective_drop_ratio_for_hard_count.mean().detach(),
             "voxel_count": pts_xyz.new_tensor(
                 float(last_hard_drop_trace.get("voxel_count", 0.0))
+            ).detach(),
+            "codec_block_valid_point_count": pts_xyz.new_tensor(
+                float(last_hard_drop_trace.get("codec_block_valid_point_count", 0.0))
+            ).detach(),
+            "codec_block_budget_points": pts_xyz.new_tensor(
+                float(last_hard_drop_trace.get("codec_block_budget_points", 0.0))
+            ).detach(),
+            "codec_block_count": pts_xyz.new_tensor(
+                float(last_hard_drop_trace.get("codec_block_count", 0.0))
+            ).detach(),
+            "codec_block_selected_block_count": pts_xyz.new_tensor(
+                float(last_hard_drop_trace.get("codec_block_selected_block_count", 0.0))
+            ).detach(),
+            "codec_block_selected_point_count": pts_xyz.new_tensor(
+                float(last_hard_drop_trace.get("codec_block_selected_point_count", 0.0))
+            ).detach(),
+            "codec_block_budget_zero": pts_xyz.new_tensor(
+                float(bool(last_hard_drop_trace.get("codec_block_budget_zero", False)))
+            ).detach(),
+            "codec_block_target_drop_ratio": pts_xyz.new_tensor(
+                float(last_hard_drop_trace.get("codec_block_target_drop_ratio", 0.0))
+            ).detach(),
+            "codec_block_under_selected": pts_xyz.new_tensor(
+                float(bool(last_hard_drop_trace.get("codec_block_under_selected", False)))
             ).detach(),
             "delete_candidate_initial_count": pts_xyz.new_tensor(float(delete_candidate_initial_count)).detach(),
             "delete_candidate_after_point_cap_count": pts_xyz.new_tensor(float(delete_candidate_after_point_cap_count)).detach(),
@@ -7166,6 +7309,19 @@ class StructureRepairActuator(nn.Module):
             "codec_prune_prior_enabled": pts_xyz.new_tensor(float(codec_prune_prior_enabled)),
             "codec_prune_prior_phase": pts_xyz.new_tensor(codec_prune_prior_phase),
             "codec_prune_prior_ratio": pts_xyz.new_tensor(codec_prune_prior_active_ratio),
+            "codec_prune_prior_base_ratio": pts_xyz.new_tensor(float(codec_prune_prior_ratio)),
+            "codec_prune_prior_active_ratio": pts_xyz.new_tensor(float(codec_prune_prior_active_ratio)),
+            "codec_prune_prior_count_alpha": pts_xyz.new_tensor(float(codec_prune_prior_count_alpha)),
+            "amount_mode_id": pts_xyz.new_tensor(float(amount_mode_id)),
+            "amount_mode_network": pts_xyz.new_tensor(float(amount_mode_network)),
+            "hard_drop_target_ratio_source_id": pts_xyz.new_tensor(float(hard_drop_target_ratio_source_id)),
+            "hard_drop_target_ratio_value": pts_xyz.new_tensor(float(hard_drop_target_ratio_value)),
+            "hard_drop_target_ratio_network_value": pts_xyz.new_tensor(
+                float(hard_drop_target_ratio_network_value)
+            ),
+            "hard_drop_target_ratio_codec_prior_value": pts_xyz.new_tensor(
+                float(hard_drop_target_ratio_codec_prior_value)
+            ),
             "codec_prune_prior_block_size": pts_xyz.new_tensor(float(codec_prune_prior_block_size)),
             "codec_prune_prior_block_count_mean": pts_xyz.new_tensor(
                 float(sum(codec_prune_prior_block_counts)) / max(float(len(codec_prune_prior_block_counts)), 1.0)
@@ -7189,8 +7345,33 @@ class StructureRepairActuator(nn.Module):
             "learned_drop_ratio_after_floor": learned_drop_ratio_after_floor.mean(),
             "learned_drop_ratio_before_gate": learned_drop_ratio_before_gate.mean(),
             "learned_drop_ratio_after_gate": learned_drop_ratio_after_gate.mean(),
+            "learned_drop_ratio_value": pts_xyz.new_tensor(float(learned_drop_ratio_value)),
             "effective_drop_ratio_for_hard_count": effective_drop_ratio_for_hard_count.mean(),
             "voxel_count": pts_xyz.new_tensor(float(last_hard_drop_trace.get("voxel_count", 0.0))),
+            "codec_block_valid_point_count": pts_xyz.new_tensor(
+                float(last_hard_drop_trace.get("codec_block_valid_point_count", 0.0))
+            ),
+            "codec_block_budget_points": pts_xyz.new_tensor(
+                float(last_hard_drop_trace.get("codec_block_budget_points", 0.0))
+            ),
+            "codec_block_count": pts_xyz.new_tensor(
+                float(last_hard_drop_trace.get("codec_block_count", 0.0))
+            ),
+            "codec_block_selected_block_count": pts_xyz.new_tensor(
+                float(last_hard_drop_trace.get("codec_block_selected_block_count", 0.0))
+            ),
+            "codec_block_selected_point_count": pts_xyz.new_tensor(
+                float(last_hard_drop_trace.get("codec_block_selected_point_count", 0.0))
+            ),
+            "codec_block_budget_zero": pts_xyz.new_tensor(
+                float(bool(last_hard_drop_trace.get("codec_block_budget_zero", False)))
+            ),
+            "codec_block_target_drop_ratio": pts_xyz.new_tensor(
+                float(last_hard_drop_trace.get("codec_block_target_drop_ratio", 0.0))
+            ),
+            "codec_block_under_selected": pts_xyz.new_tensor(
+                float(bool(last_hard_drop_trace.get("codec_block_under_selected", False)))
+            ),
             "delete_candidate_initial_count": pts_xyz.new_tensor(float(delete_candidate_initial_count)),
             "delete_candidate_after_point_cap_count": pts_xyz.new_tensor(float(delete_candidate_after_point_cap_count)),
             "delete_candidate_after_leaf_mask_count": pts_xyz.new_tensor(float(delete_candidate_after_leaf_mask_count)),

@@ -227,10 +227,21 @@ def log_codec_setup(writer, args):
             f"prune_after_prior_mode={getattr(args, 'sparsepcgc_prune_after_prior_mode', 'oracle')}, "
             f"codec_prior_enabled={bool(getattr(args, 'sparsepcgc_codec_prune_prior', False))}, "
             f"codec_prior_warmup_steps={int(getattr(args, 'sparsepcgc_codec_prune_prior_warmup_steps', 0))}, "
+            f"warmup_force_codec_prior_amount={bool(getattr(args, 'sparsepcgc_warmup_force_codec_prior_amount', True))}, "
+            f"hybrid_amount_mode={getattr(args, 'sparsepcgc_hybrid_amount_mode', 'network')}, "
+            f"hybrid_prior_amount_blend={bool(getattr(args, 'sparsepcgc_hybrid_prior_amount_blend', False))}, "
+            f"codec_prior_amount_distill_weight={float(getattr(args, 'sparsepcgc_codec_prior_amount_distill_weight', 0.0)):.6g}, "
             f"network_prune_ratio_floor={float(getattr(args, 'sparsepcgc_network_prune_ratio_floor', 0.0)):.6g}, "
             f"network_prune_min_hard_count={int(getattr(args, 'sparsepcgc_network_prune_min_hard_count', 0))}, "
+            f"codec_prior_warmup_min_hard_count={int(getattr(args, 'sparsepcgc_codec_prior_warmup_min_hard_count', 0))}, "
             f"network_prune_floor_steps={int(getattr(args, 'sparsepcgc_network_prune_floor_steps', 0))}, "
             f"network_prune_floor_decay_steps={int(getattr(args, 'sparsepcgc_network_prune_floor_decay_steps', 0))}"
+        )
+        writer.write(
+            "SparsePCGC Multi-Subtree/Outcome: "
+            f"multi_subtree_train={bool(getattr(args, 'sparsepcgc_multi_subtree_train', False))}, "
+            f"multi_subtree_topk={int(getattr(args, 'sparsepcgc_multi_subtree_topk', 0))}, "
+            f"outcome_imitation={bool(getattr(args, 'sparsepcgc_outcome_imitation', False))}"
         )
         writer.write(
             "SparsePCGC Exact Occupancy Teacher: "
@@ -283,5 +294,14 @@ def log_training_setup(writer, args, file_day, file_time):
         f"Two-Stage Training: enabled={bool(getattr(args, 'two_stage_training', False))}, "
         f"base_stage={args.training_stage}, diagnosis_ratio={getattr(args, 'diagnosis_episode_ratio', 0.0)}, "
         f"diagnosis_episodes={getattr(args, 'diagnosis_episodes', 0)}"
+    )
+    writer.write(
+        "SparsePCGC Train Guards: "
+        f"warmup_force_codec_prior_amount={bool(getattr(args, 'sparsepcgc_warmup_force_codec_prior_amount', True))}, "
+        f"hybrid_amount_mode={getattr(args, 'sparsepcgc_hybrid_amount_mode', '')}, "
+        f"subtree_actual_filter={bool(getattr(args, 'sparsepcgc_subtree_actual_filter', True))}, "
+        f"anchor_success_teacher={bool(getattr(args, 'sparsepcgc_anchor_success_teacher', True))}, "
+        f"stage_switch_guard={bool(getattr(args, 'sparsepcgc_stage_switch_guard', True))}, "
+        f"surrogate_trust_gate={bool(getattr(args, 'sparsepcgc_surrogate_trust_gate', True))}"
     )
     writer.write(f"Module BatchNorm Running Stats: {args.module_bn_use_running_stats}")

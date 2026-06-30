@@ -149,6 +149,172 @@ def _sparsepcgc_scalar_tensor(value, reference):
         return reference.new_zeros(())
 
 
+def _sparsepcgc_subtree_actual_filter_debug(raw_percent, used_percent, label_id, weight, used):
+    return {
+        "subtree_actual_filter_used": bool(used),
+        "subtree_actual_filter_label_id": int(label_id),
+        "subtree_actual_filter_weight": float(weight),
+        "subtree_actual_filter_raw_percent": float(raw_percent) if raw_percent is not None and math.isfinite(float(raw_percent)) else float("nan"),
+        "subtree_actual_filter_used_percent": float(used_percent) if used_percent is not None and math.isfinite(float(used_percent)) else float("nan"),
+    }
+
+
+def _resolve_subtree_actual_filter(args, subtree_comp_debug):
+    raw_percent = _sparsepcgc_outcome_actual_percent(subtree_comp_debug)
+    used_percent = finite_float_or_none(
+        subtree_comp_debug.get(
+            "compression_loss_used",
+            subtree_comp_debug.get("actual_bit_percent_used_for_loss", raw_percent),
+        )
+    )
+    if not bool(getattr(args, "sparsepcgc_subtree_actual_filter", True)):
+        return 1.0, 0, "disabled", _sparsepcgc_subtree_actual_filter_debug(
+            raw_percent, used_percent, 0, 1.0, False
+        )
+
+    good_margin = max(float(getattr(args, "sparsepcgc_subtree_good_margin", 0.25)), 0.0)
+    bad_margin = max(float(getattr(args, "sparsepcgc_subtree_bad_margin", 0.25)), 0.0)
+    if raw_percent is not None and raw_percent < -good_margin:
+        weight = max(float(getattr(args, "sparsepcgc_subtree_good_compression_weight", 1.0)), 0.0)
+        label_id, label = 1, "good"
+    elif raw_percent is not None and raw_percent > bad_margin:
+        weight = max(float(getattr(args, "sparsepcgc_subtree_bad_compression_weight", 0.0)), 0.0)
+        label_id, label = 3, "bad"
+    else:
+        weight = max(float(getattr(args, "sparsepcgc_subtree_neutral_compression_weight", 0.25)), 0.0)
+        label_id, label = 2, "neutral"
+    return weight, label_id, label, _sparsepcgc_subtree_actual_filter_debug(
+        raw_percent, used_percent, label_id, weight, True
+    )
+
+
+def _sparsepcgc_anchor_success_memory(args):
+    memory = getattr(args, "_sparsepcgc_anchor_success_memory", None)
+    if not isinstance(memory, OrderedDict):
+        memory = OrderedDict()
+        setattr(args, "_sparsepcgc_anchor_success_memory", memory)
+    return memory
+
+
+def _sparsepcgc_update_anchor_success_memory(
+    args,
+    *,
+    cache_key,
+    episode,
+    global_step,
+    anchor_debug,
+    structure_debug,
+    edit_stats,
+):
+    debug = {
+        "anchor_success_teacher_saved": False,
+        "anchor_success_teacher_percent": float("nan"),
+        "anchor_success_teacher_amount": float("nan"),
+        "anchor_success_memory_count": 0,
+    }
+    if (
+        not bool(getattr(args, "sparsepcgc_anchor_success_teacher", True))
+        or not cache_key
+        or not isinstance(anchor_debug, dict)
+    ):
+        return debug
+
+    anchor_actual_raw = finite_float_or_none(
+        anchor_debug.get("compression_loss_raw", anchor_debug.get("actual_bit_percent_raw", anchor_debug.get("actual_raw_percent", None)))
+    )
+    if anchor_actual_raw is None or anchor_actual_raw >= -max(float(getattr(args, "sparsepcgc_anchor_success_margin", 1.0)), 0.0):
+        memory = _sparsepcgc_anchor_success_memory(args)
+        debug["anchor_success_memory_count"] = int(len(memory))
+        return debug
+
+    amount = finite_float_or_none(
+        anchor_debug.get(
+            "hard_drop_target_ratio_value",
+            anchor_debug.get(
+                "drop_ratio_hard",
+                (edit_stats or {}).get("full_cloud_voxel_drop_ratio_percent", 0.0) / 100.0,
+            ),
+        )
+    )
+    amount = max(float(amount or 0.0), 0.0)
+    ema = min(max(float(getattr(args, "sparsepcgc_anchor_success_ema", 0.20)), 1e-4), 1.0)
+    memory = _sparsepcgc_anchor_success_memory(args)
+    prev = memory.get(cache_key, {})
+    prev_amount = finite_float_or_none(prev.get("amount", None))
+    updated_amount = amount if prev_amount is None else (1.0 - ema) * float(prev_amount) + ema * amount
+    memory[cache_key] = {
+        "episode": int(episode) + 1,
+        "global_step": int(global_step) + 1,
+        "anchor_actual_raw_percent": float(anchor_actual_raw),
+        "amount": float(updated_amount),
+        "full_cloud_prune_ratio": finite_float_or_none((edit_stats or {}).get("full_cloud_voxel_drop_ratio_percent", None)),
+        "local_prune_ratio": finite_float_or_none((edit_stats or {}).get("voxel_drop_ratio_percent", None)),
+        "hard_drop_target_ratio_value": finite_float_or_none(anchor_debug.get("hard_drop_target_ratio_value", None)),
+        "hard_drop_block_reason": str(anchor_debug.get("hard_drop_block_reason", (structure_debug or {}).get("hard_drop_block_reason", ""))),
+        "hard_drop_target_ratio_source_id": int(
+            finite_float_or_none(anchor_debug.get("hard_drop_target_ratio_source_id", (structure_debug or {}).get("hard_drop_target_ratio_source_id", 0))) or 0
+        ),
+        "selected_drop_count_hard": int(
+            finite_float_or_none(anchor_debug.get("selected_drop_count_hard", (structure_debug or {}).get("selected_drop_count_hard", 0))) or 0
+        ),
+        "final_hard_drop_count": int(
+            finite_float_or_none(anchor_debug.get("final_hard_drop_count", (structure_debug or {}).get("final_hard_drop_count", 0))) or 0
+        ),
+    }
+    memory.move_to_end(cache_key)
+    max_entries = max(int(getattr(args, "episode_input_common_cache_max_entries", 0)), 256)
+    while len(memory) > max_entries:
+        memory.popitem(last=False)
+    debug.update(
+        {
+            "anchor_success_teacher_saved": True,
+            "anchor_success_teacher_percent": float(anchor_actual_raw),
+            "anchor_success_teacher_amount": float(updated_amount),
+            "anchor_success_memory_count": int(len(memory)),
+        }
+    )
+    return debug
+
+
+def _sparsepcgc_anchor_success_teacher(args, cache_key):
+    memory = _sparsepcgc_anchor_success_memory(args)
+    entry = memory.get(cache_key, None)
+    if not isinstance(entry, dict):
+        return None
+    return entry
+
+
+def _sparsepcgc_surrogate_trust(args, comp_debug):
+    debug = {
+        "surrogate_trust_gate_used": False,
+        "surrogate_bit_error_for_trust": float("nan"),
+        "surrogate_trust_value": 1.0,
+    }
+    if not bool(getattr(args, "sparsepcgc_surrogate_trust_gate", True)):
+        return 1.0, debug
+    err = finite_float_or_none(comp_debug.get("surrogate_abs_bit_error", comp_debug.get("surrogate_bit_error", None)))
+    if err is None:
+        return 1.0, debug
+    low = max(float(getattr(args, "sparsepcgc_surrogate_error_threshold", 10.0)), 0.0)
+    high = max(float(getattr(args, "sparsepcgc_surrogate_error_disable_threshold", 13.0)), low)
+    min_trust = min(max(float(getattr(args, "sparsepcgc_surrogate_min_trust", 0.0)), 0.0), 1.0)
+    if err <= low:
+        trust = 1.0
+    elif err >= high:
+        trust = min_trust
+    else:
+        ratio = (err - low) / max(high - low, 1e-12)
+        trust = 1.0 + (min_trust - 1.0) * ratio
+    debug.update(
+        {
+            "surrogate_trust_gate_used": True,
+            "surrogate_bit_error_for_trust": float(err),
+            "surrogate_trust_value": float(trust),
+        }
+    )
+    return float(trust), debug
+
+
 def _episode_input_common_cache_enabled(args):
     return bool(getattr(args, "episode_input_common_cache", False))
 
@@ -399,6 +565,7 @@ def _build_sparsepcgc_outcome_weighted_imitation_loss(
         "outcome_amount_loss": 0.0,
         "outcome_amount_anticollapse_loss": 0.0,
         "outcome_success_amount_teacher": float("nan"),
+        "bad_amount_loss_disabled_no_success_memory": False,
     }
 
     if not bool(getattr(args, "sparsepcgc_outcome_imitation", True)):
@@ -540,13 +707,19 @@ def _build_sparsepcgc_outcome_weighted_imitation_loss(
         elif bad_weight > 0.0:
             # 悪化したStepでは軽くAmountを下げる。
             # ただし強すぎると0へ逃げるため、weightは非常に小さくする。
-            bad_target = (hard_ratio_t.detach() * 0.5).clamp(0.0, 0.95)
-            amount_loss = (raw_ratio_t - bad_target).pow(2)
-            total_loss = total_loss + (
-                float(getattr(args, "sparsepcgc_outcome_bad_amount_weight", 0.005))
-                * float(bad_weight)
-                * amount_loss
-            )
+            if (
+                bool(getattr(args, "sparsepcgc_disable_bad_amount_when_no_success_memory", True))
+                and not (success_teacher is not None and math.isfinite(float(success_teacher)))
+            ):
+                debug["bad_amount_loss_disabled_no_success_memory"] = True
+            else:
+                bad_target = (hard_ratio_t.detach() * 0.5).clamp(0.0, 0.95)
+                amount_loss = (raw_ratio_t - bad_target).pow(2)
+                total_loss = total_loss + (
+                    float(getattr(args, "sparsepcgc_outcome_bad_amount_weight", 0.005))
+                    * float(bad_weight)
+                    * amount_loss
+                )
 
         if success_teacher is not None and math.isfinite(float(success_teacher)):
             # 成功Amountより下がりすぎる場合だけ戻す。
@@ -8798,9 +8971,21 @@ def train(model, args, loss, writer, plot, notifier=None):
         args.training_stage = current_stage
         if current_stage != prev_stage: # 前EpisodeとStageが異なる場合
             stage_factors = stage_loss_factors(args) # 現在Stageでっ各損失をどの比率で扱うか取得する
+            stage_factors, stage_guard_debug = sparsepcgc_stage_guard_factors(
+                args,
+                current_stage,
+                stage_factors,
+            )
             writer.write(f"Training Stage Switch: episode={episode + 1}, stage={current_stage}")
             writer.write( "Stage Loss Factors: " f"geom={stage_factors['geom']}, com={stage_factors['com']}, " f"attr={stage_factors['attr']}, policy={stage_factors['policy']}, repair={stage_factors['repair']}")
             log_for_better_event( for_better_path, "stage_switch", episode=episode + 1, stage=current_stage, stage_factors=stage_factors)
+            if bool(stage_guard_debug.get("stage_switch_guard_used", False)):
+                writer.write(
+                    "StageSwitchGuard: "
+                    f"stage={current_stage}, "
+                    f"com={stage_guard_debug['compression_loss_factor_original']:.4f}->{stage_guard_debug['compression_loss_factor_effective']:.4f}, "
+                    f"policy={stage_guard_debug['policy_loss_factor_original']:.4f}->{stage_guard_debug['policy_loss_factor_effective']:.4f}"
+                )
             prev_stage = current_stage
 
         model.train()
@@ -8927,8 +9112,15 @@ def train(model, args, loss, writer, plot, notifier=None):
                 loss_mode = lossmode(args) # 損失モードの取得
                 compression_primary_mode = loss_mode == "compression_primary" # 圧縮損失重視
                 stage_factors = stage_loss_factors(args) # 現在の学習Stageに応じた損失項の比率
+                stage_factors, stage_guard_debug = sparsepcgc_stage_guard_factors(
+                    args,
+                    current_stage,
+                    stage_factors,
+                )
                 if compression_primary_mode and not bool(getattr(args, "cp_use_stage_factors", False)):
                     stage_factors = {name: 1.0 for name in stage_factors} # 全Stage係数を全て1.0にする
+                    stage_guard_debug["compression_loss_factor_effective"] = 1.0
+                    stage_guard_debug["policy_loss_factor_effective"] = 1.0
                 compute_compression = True # StageやModeに関係なく毎Stepで圧縮損失を計算する
                 actual_refresh_interval = max(int(getattr(args, "actual_eval_interval", 0)), 0)
                 refresh_actual_gen = bool(
@@ -9997,6 +10189,70 @@ def train(model, args, loss, writer, plot, notifier=None):
                                             subtree_outcome_imitation_debug_values.append(outcome_imitation_debug_sub)
                                             subtree_comp_debug.update(outcome_imitation_debug_sub)
 
+                                        subtree_filter_weight, subtree_filter_label_id, subtree_filter_label, subtree_filter_debug = (
+                                            _resolve_subtree_actual_filter(args, subtree_comp_debug)
+                                        )
+                                        subtree_comp_debug.update(subtree_filter_debug)
+                                        subtree_comp_debug["subtree_good_count"] = 1 if subtree_filter_label_id == 1 else 0
+                                        subtree_comp_debug["subtree_neutral_count"] = 1 if subtree_filter_label_id == 2 else 0
+                                        subtree_comp_debug["subtree_bad_count"] = 1 if subtree_filter_label_id == 3 else 0
+
+                                        anchor_success_debug = {
+                                            "anchor_success_teacher_used": False,
+                                            "anchor_success_teacher_percent": float("nan"),
+                                            "anchor_success_teacher_amount": float("nan"),
+                                            "anchor_success_teacher_loss": 0.0,
+                                            "anchor_success_memory_count": int(
+                                                len(_sparsepcgc_anchor_success_memory(args))
+                                            ),
+                                            "bad_amount_loss_disabled_no_success_memory": bool(
+                                                outcome_imitation_debug_sub.get(
+                                                    "bad_amount_loss_disabled_no_success_memory",
+                                                    False,
+                                                )
+                                            ) if isinstance(outcome_imitation_debug_sub, dict) else False,
+                                        }
+                                        anchor_teacher_entry = _sparsepcgc_anchor_success_teacher(args, cache_key)
+                                        if (
+                                            isinstance(anchor_teacher_entry, dict)
+                                            and bool(getattr(args, "sparsepcgc_anchor_success_teacher", True))
+                                        ):
+                                            anchor_amount = finite_float_or_none(anchor_teacher_entry.get("amount", None))
+                                            raw_drop_ratio = outcome_terms.get(
+                                                "raw_learned_drop_ratio_for_outcome",
+                                                outcome_terms.get("raw_learned_drop_ratio", None),
+                                            )
+                                            if anchor_amount is not None and torch.is_tensor(raw_drop_ratio):
+                                                raw_drop_ratio_t = _sparsepcgc_scalar_tensor(raw_drop_ratio, subtree_xyz)
+                                                anchor_amount_t = raw_drop_ratio_t.new_tensor(float(anchor_amount))
+                                                L_anchor_success_teacher_sub = (
+                                                    torch.relu(anchor_amount_t - raw_drop_ratio_t).pow(2)
+                                                    * float(getattr(args, "sparsepcgc_anchor_success_amount_weight", 0.05))
+                                                )
+                                                L_actuator_sub = L_actuator_sub + L_anchor_success_teacher_sub
+                                                anchor_success_debug.update(
+                                                    {
+                                                        "anchor_success_teacher_used": True,
+                                                        "anchor_success_teacher_percent": finite_float_or_none(
+                                                            anchor_teacher_entry.get("anchor_actual_raw_percent", None)
+                                                        ),
+                                                        "anchor_success_teacher_amount": float(anchor_amount),
+                                                        "anchor_success_teacher_loss": float(
+                                                            L_anchor_success_teacher_sub.detach().float().cpu()
+                                                        ),
+                                                        "anchor_success_memory_count": int(
+                                                            len(_sparsepcgc_anchor_success_memory(args))
+                                                        ),
+                                                    }
+                                                )
+                                        subtree_comp_debug.update(anchor_success_debug)
+
+                                        if subtree_filter_weight != 1.0:
+                                            L_com_sub = L_com_sub * float(subtree_filter_weight)
+                                            loss_bit_sub = loss_bit_sub * float(subtree_filter_weight)
+                                            loss_single_sub = loss_single_sub * float(subtree_filter_weight)
+                                            loss_nodes_sub = loss_nodes_sub * float(subtree_filter_weight)
+
                                         loss.last_compression_debug = subtree_comp_debug
 
                                         L_full_context_subtree_delta_sub, full_context_subtree_delta_debug_sub = build_full_context_subtree_delta_loss(
@@ -10344,6 +10600,26 @@ def train(model, args, loss, writer, plot, notifier=None):
                         )
                     
                 L_com_objective = compose_train_compression_objective(args, terms, L_com, La_fit) # actual/surrogateではL_com直結と内訳合成を半々で混ぜる
+                surrogate_trust_value, surrogate_trust_debug = _sparsepcgc_surrogate_trust(
+                    args,
+                    compression_debug_terms,
+                )
+                surrogate_loss_before_trust = finite_float_or_none(L_com_objective)
+                if float(surrogate_trust_value) < 1.0 and torch.is_tensor(L_com_objective):
+                    L_com_objective = (
+                        float(surrogate_trust_value) * L_com_objective
+                        + (1.0 - float(surrogate_trust_value)) * (float(getattr(args, "w_com", 1.0)) * L_com)
+                    )
+                surrogate_trust_debug["surrogate_loss_before_trust"] = (
+                    float(surrogate_loss_before_trust)
+                    if surrogate_loss_before_trust is not None
+                    else float("nan")
+                )
+                surrogate_trust_debug["surrogate_loss_after_trust"] = (
+                    float(finite_float_or_none(L_com_objective))
+                    if finite_float_or_none(L_com_objective) is not None
+                    else float("nan")
+                )
                 # ============================================================
                 # 非有限損失の保険
                 # ============================================================
@@ -10406,6 +10682,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                     ),
                 }
                 compression_tensor_debug.update(full_cloud_geometry_teacher_debug)
+                compression_tensor_debug.update(surrogate_trust_debug)
 
                 """形状損失を合成"""
                 legacy_L_downstream = (
@@ -11423,6 +11700,54 @@ def train(model, args, loss, writer, plot, notifier=None):
                     comp_debug["policy_full_cloud_actual_bit_percent"] = float(policy_full_actual)
                     comp_debug["oracle_full_cloud_override_used"] = False
                     comp_debug["policy_action_source"] = "network_actuator"
+
+                comp_debug.update(
+                    {
+                        "is_anchor_refresh_step": bool(is_anchor_step),
+                        "is_subtree_step": bool(subtree_mode and ((not is_anchor_step) or full_cloud_anchor_shadow_train_active)),
+                        "subtree_good_count": int(comp_debug.get("subtree_good_count", 0) or 0),
+                        "subtree_neutral_count": int(comp_debug.get("subtree_neutral_count", 0) or 0),
+                        "subtree_bad_count": int(comp_debug.get("subtree_bad_count", 0) or 0),
+                        "stage_switch_guard_used": bool(stage_guard_debug.get("stage_switch_guard_used", False)),
+                        "stage_original": str(stage_guard_debug.get("stage_original", current_stage)),
+                        "stage_effective": str(stage_guard_debug.get("stage_effective", current_stage)),
+                        "compression_loss_factor_original": float(
+                            stage_guard_debug.get("compression_loss_factor_original", stage_factors.get("com", 1.0))
+                        ),
+                        "compression_loss_factor_effective": float(
+                            stage_guard_debug.get("compression_loss_factor_effective", stage_factors.get("com", 1.0))
+                        ),
+                        "policy_loss_factor_original": float(
+                            stage_guard_debug.get("policy_loss_factor_original", stage_factors.get("policy", 1.0))
+                        ),
+                        "policy_loss_factor_effective": float(
+                            stage_guard_debug.get("policy_loss_factor_effective", stage_factors.get("policy", 1.0))
+                        ),
+                    }
+                )
+
+                anchor_debug_source = None
+                if isinstance(full_cloud_anchor_debug_snapshot, dict) and full_cloud_anchor_debug_snapshot:
+                    anchor_debug_source = full_cloud_anchor_debug_snapshot
+                elif bool(is_anchor_step) and str(comp_debug.get("actual_scope", "")) == "full_cloud":
+                    anchor_debug_source = comp_debug
+                anchor_success_update_debug = {
+                    "anchor_success_teacher_saved": False,
+                    "anchor_success_teacher_percent": float("nan"),
+                    "anchor_success_teacher_amount": float("nan"),
+                    "anchor_success_memory_count": int(len(_sparsepcgc_anchor_success_memory(args))),
+                }
+                if isinstance(anchor_debug_source, dict):
+                    anchor_success_update_debug = _sparsepcgc_update_anchor_success_memory(
+                        args,
+                        cache_key=cache_key,
+                        episode=episode,
+                        global_step=global_train_step,
+                        anchor_debug=anchor_debug_source,
+                        structure_debug=phase7_structure_debug,
+                        edit_stats=train_edit_stats,
+                    )
+                comp_debug.update(anchor_success_update_debug)
 
 
                 if cp_debug: # Compression Primaryモード用のDebug情報が存在するか判定
@@ -12626,6 +12951,19 @@ def train(model, args, loss, writer, plot, notifier=None):
         append_csv_row( metric_csv_paths.get("compression_episode"), COMPRESSION_EPISODE_METRIC_COLUMNS, compression_episode_metrics)
         operation_episode_metrics = finalize_operation_episode_metrics( episode, current_stage, episode_operation_sums)
         append_csv_row( metric_csv_paths.get("operation_episode"), OPERATION_EPISODE_METRIC_COLUMNS, operation_episode_metrics)
+        writer.write(
+            "EpisodeCompressionDiagnostics: "
+            f"episode={episode + 1}, "
+            f"anchor_raw={case_float(compression_episode_metrics.get('mean_anchor_actual_raw', float('nan')), float('nan')):.6f}, "
+            f"subtree_raw={case_float(compression_episode_metrics.get('mean_subtree_actual_raw', float('nan')), float('nan')):.6f}, "
+            f"subtree_good={int(case_float(compression_episode_metrics.get('subtree_good_count', 0), 0))}, "
+            f"subtree_neutral={int(case_float(compression_episode_metrics.get('subtree_neutral_count', 0), 0))}, "
+            f"subtree_bad={int(case_float(compression_episode_metrics.get('subtree_bad_count', 0), 0))}, "
+            f"outcome_good={int(case_float(compression_episode_metrics.get('outcome_good_count', 0), 0))}, "
+            f"outcome_bad={int(case_float(compression_episode_metrics.get('outcome_bad_count', 0), 0))}, "
+            f"surrogate_trust_mean={case_float(compression_episode_metrics.get('surrogate_trust_mean', float('nan')), float('nan')):.6f}, "
+            f"anchor_success_memory_count={int(case_float(compression_episode_metrics.get('anchor_success_memory_count', 0), 0))}"
+        )
 
         # 毎エピソードと最高スコアのモデルを保存
         best_loss, model_path, best_trackers = save_episode_checkpoint( model=model, ckpt_dir=ckpt_dir, plot=plot, writer=writer, episode=episode, best_loss=best_loss, args=args, stage=current_stage, checkpoint_metrics=checkpoint_metrics, best_trackers=best_trackers, loss=loss)

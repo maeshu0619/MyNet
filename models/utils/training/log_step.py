@@ -716,6 +716,16 @@ def log_compact_step_summary(
     if not bool(comp_debug.get("oracle_full_cloud_override_used", False)):
         oracle_full_drop = 0
         oracle_full_ratio = 0.0
+    local_prune_ratio = _first_value(
+        edit_stats,
+        ("voxel_drop_ratio_percent", "deleted_ratio_percent"),
+        float("nan"),
+    )
+    full_cloud_prune_ratio = _first_value(
+        edit_stats,
+        ("full_cloud_voxel_drop_ratio_percent",),
+        float("nan"),
+    )
     def _prefer_text(key):
         comp_value = str(comp_debug.get(key, "") or "").strip()
         if comp_value:
@@ -735,12 +745,29 @@ def log_compact_step_summary(
         f"input={_fmt_int(input_points)}, output={_fmt_int(output_points)}, "
         f"LocalAdd={_fmt_int(add_count)}, LocalPrune={_fmt_int(prune_count)}, "
         f"LocalAdjust={_fmt_int(adjust_count)}, "
+        f"LocalPruneRatio={_fmt(local_prune_ratio, 4)}%, "
+        f"FullCloudPruneRatio={_fmt(full_cloud_prune_ratio, 4)}%, "
         f"PruneMode={prune_after_prior_mode}, "
         f"HardPruneReason={hard_drop_reason}, "
         f"CollapseDetected={collapse_detected}, "
         f"CollapseReason={collapse_reason}, "
         f"HardDropTrace={hard_drop_count_trace}, "
         f"OracleFullPrune={_fmt_int(oracle_full_drop)}({100.0 * _to_float(oracle_full_ratio, 0.0):.2f}%)"
+    )
+    writer.write(
+        f"StepTrainDiag {step + 1}/{num_steps}: "
+        f"anchor={bool(comp_debug.get('is_anchor_refresh_step', False))}, "
+        f"subtree={bool(comp_debug.get('is_subtree_step', False))}, "
+        f"subtree_filter_label={int(_to_float(comp_debug.get('subtree_actual_filter_label_id', 0), 0))}, "
+        f"subtree_filter_weight={_fmt(comp_debug.get('subtree_actual_filter_weight', float('nan')))}, "
+        f"anchor_teacher_used={bool(comp_debug.get('anchor_success_teacher_used', False))}, "
+        f"anchor_teacher_amount={_fmt(comp_debug.get('anchor_success_teacher_amount', float('nan')))}, "
+        f"outcome_good={_fmt(comp_debug.get('outcome_good_weight', float('nan')))}, "
+        f"outcome_bad={_fmt(comp_debug.get('outcome_bad_weight', float('nan')))}, "
+        f"surrogate_trust={_fmt(comp_debug.get('surrogate_trust_value', float('nan')))}, "
+        f"stage_guard={bool(comp_debug.get('stage_switch_guard_used', False))}, "
+        f"com_factor={_fmt(comp_debug.get('compression_loss_factor_effective', float('nan')))}, "
+        f"policy_factor={_fmt(comp_debug.get('policy_loss_factor_effective', float('nan')))}"
     )
 
 

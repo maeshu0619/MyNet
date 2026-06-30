@@ -844,7 +844,13 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument('--sparsepcgc_codec_prune_prior_ratio', default=0.05, type=float)
     parser.add_argument('--sparsepcgc_codec_prune_prior_logit_weight', default=6.0, type=float)
-    parser.add_argument('--sparsepcgc_codec_prune_prior_warmup_steps', default=10, type=int)
+    parser.add_argument('--sparsepcgc_codec_prune_prior_warmup_steps', default=200, type=int)
+    parser.add_argument(
+        '--sparsepcgc_warmup_force_codec_prior_amount',
+        default=True,
+        type=str2bool,
+        help='Trueならcodec prior warmup中だけhard Prune個数をcodec_prune_prior_active_ratioで決める。Phase0以降はNetwork Amountを使う',
+    )
     parser.add_argument(
         '--sparsepcgc_prune_after_prior_mode',
         default='network',
@@ -855,13 +861,19 @@ def parse_pugan_args(parser, file_day, file_time):
         '--sparsepcgc_network_prune_ratio_floor',
         default=0.001,
         type=float,
-        help='Network Pruneの最低割合。Amountを固定しないため、通常は0.1%程度の0個回避用にする',
+        help='Network Pruneの最低割合。Amountを固定しないため、通常は0.1%%程度の0個回避用にする',
     )
     parser.add_argument(
         '--sparsepcgc_network_prune_min_hard_count',
         default=1,
         type=int,
         help='network modeでwarmup後も保証するhard Prune最小個数(train時のみ)',
+    )
+    parser.add_argument(
+        '--sparsepcgc_codec_prior_warmup_min_hard_count',
+        default=1,
+        type=int,
+        help='codec prior warmup中にtarget ratioが正で候補もあるのにhard dropが0になる場合の最低削除数。0なら無効',
     )
     parser.add_argument(
         '--sparsepcgc_network_prune_floor_steps',
@@ -885,7 +897,7 @@ def parse_pugan_args(parser, file_day, file_time):
         '--sparsepcgc_hybrid_prior_tail_alpha',
         default=0.35,
         type=float,
-        help='warmup終了直後に残すcodec prior混合率。0.35なら35%だけpriorを残す',
+        help='warmup終了直後に残すcodec prior混合率。0.35なら35%%だけpriorを残す',
     )
     parser.add_argument(
         '--sparsepcgc_hybrid_prior_tail_steps',
@@ -923,7 +935,7 @@ def parse_pugan_args(parser, file_day, file_time):
         '--sparsepcgc_hybrid_amount_min_network_keep',
         default=0.15,
         type=float,
-        help='Amount blend時に最低限残すNetwork比率。0.15ならpriorが強くてもNetworkを15%残す',
+        help='Amount blend時に最低限残すNetwork比率。0.15ならpriorが強くてもNetworkを15%%残す',
     )
     parser.add_argument(
         '--sparsepcgc_hybrid_hard_action',
@@ -1078,6 +1090,114 @@ def parse_pugan_args(parser, file_day, file_time):
         default=0.03,
         type=float,
         help='成功Amountより下がりすぎた場合に戻す補助loss重み',
+    )
+    parser.add_argument(
+        '--sparsepcgc_subtree_actual_filter',
+        default=True,
+        type=str2bool,
+        help='Trueならsubtree actualが悪化したstepをcompression教師として強く使わず、anti-imitation中心にする',
+    )
+    parser.add_argument(
+        '--sparsepcgc_subtree_good_margin',
+        default=0.25,
+        type=float,
+        help='subtree actual percentがこの値より負ならgood subtreeとして扱う',
+    )
+    parser.add_argument(
+        '--sparsepcgc_subtree_bad_margin',
+        default=0.25,
+        type=float,
+        help='subtree actual percentがこの値より正ならbad subtreeとして扱う',
+    )
+    parser.add_argument(
+        '--sparsepcgc_subtree_good_compression_weight',
+        default=1.0,
+        type=float,
+        help='good subtreeのcompression loss重み',
+    )
+    parser.add_argument(
+        '--sparsepcgc_subtree_neutral_compression_weight',
+        default=0.25,
+        type=float,
+        help='0付近subtreeのcompression loss重み',
+    )
+    parser.add_argument(
+        '--sparsepcgc_subtree_bad_compression_weight',
+        default=0.0,
+        type=float,
+        help='bad subtreeのcompression loss重み。0ならbad subtreeをcompression教師として使わない',
+    )
+    parser.add_argument(
+        '--sparsepcgc_anchor_success_teacher',
+        default=True,
+        type=str2bool,
+        help='Trueならanchor/full-cloud actualで改善した行動統計をNetwork/Subtree側の教師memoryへ反映する',
+    )
+    parser.add_argument(
+        '--sparsepcgc_anchor_success_margin',
+        default=1.0,
+        type=float,
+        help='anchor/full-cloud actual percentがこの値より負なら成功teacherとして保存する',
+    )
+    parser.add_argument(
+        '--sparsepcgc_anchor_success_ema',
+        default=0.20,
+        type=float,
+        help='anchor success teacher memoryのEMA更新率',
+    )
+    parser.add_argument(
+        '--sparsepcgc_anchor_success_amount_weight',
+        default=0.05,
+        type=float,
+        help='anchor成功Amountをsubtree/Network Amountへ反映する補助loss重み',
+    )
+    parser.add_argument(
+        '--sparsepcgc_disable_bad_amount_when_no_success_memory',
+        default=True,
+        type=str2bool,
+        help='Trueなら成功Amount memoryがない状態ではbad amount lossを無効にし、Prune量が0へ逃げるのを防ぐ',
+    )
+    parser.add_argument(
+        '--sparsepcgc_stage_switch_guard',
+        default=True,
+        type=str2bool,
+        help='TrueならSparsePCGC圧縮訓練でEpisode 61以降のstage切替によりcompression weightが弱くなりすぎないように保護する',
+    )
+    parser.add_argument(
+        '--sparsepcgc_min_compression_loss_factor',
+        default=1.0,
+        type=float,
+        help='SparsePCGC圧縮訓練で最低限維持するcompression loss factor',
+    )
+    parser.add_argument(
+        '--sparsepcgc_max_policy_loss_factor_in_compression',
+        default=0.25,
+        type=float,
+        help='SparsePCGC圧縮訓練でpolicy lossがcompressionを支配しないようにする上限',
+    )
+    parser.add_argument(
+        '--sparsepcgc_surrogate_trust_gate',
+        default=True,
+        type=str2bool,
+        help='Trueならsurrogate_bit_errorが大きいときにsurrogate由来のcompression勾配を弱め、actual teacherを優先する',
+    )
+    parser.add_argument(
+        '--sparsepcgc_surrogate_error_threshold',
+        default=10.0,
+        type=float,
+        help='このsurrogate_bit_errorを超えたらsurrogate信頼度を下げる',
+    )
+    parser.add_argument(
+        '--sparsepcgc_surrogate_error_disable_threshold',
+        default=13.0,
+        type=float,
+        help='このsurrogate_bit_errorを超えたらsurrogate勾配をほぼ使わない',
+    )
+    parser.add_argument(
+        '--sparsepcgc_surrogate_min_trust',
+        default=0.0,
+        type=float,
+        help='surrogate trust gateの最小信頼度',
     )
     parser.add_argument(
         '--prune_amount_soft_anchor_enable',
@@ -3786,8 +3906,11 @@ def parse_pugan_args(parser, file_day, file_time):
         0.0,
     )
     args.sparsepcgc_codec_prune_prior_warmup_steps = max(
-        int(getattr(args, "sparsepcgc_codec_prune_prior_warmup_steps", 10)),
+        int(getattr(args, "sparsepcgc_codec_prune_prior_warmup_steps", 200)),
         0,
+    )
+    args.sparsepcgc_warmup_force_codec_prior_amount = bool(
+        getattr(args, "sparsepcgc_warmup_force_codec_prior_amount", True)
     )
     args.sparsepcgc_prune_after_prior_mode = str(
         getattr(args, "sparsepcgc_prune_after_prior_mode", "oracle")
@@ -3800,6 +3923,10 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     args.sparsepcgc_network_prune_min_hard_count = max(
         int(getattr(args, "sparsepcgc_network_prune_min_hard_count", 1)),
+        0,
+    )
+    args.sparsepcgc_codec_prior_warmup_min_hard_count = max(
+        int(getattr(args, "sparsepcgc_codec_prior_warmup_min_hard_count", 1)),
         0,
     )
     args.sparsepcgc_network_prune_floor_steps = max(
@@ -3943,6 +4070,73 @@ def parse_pugan_args(parser, file_day, file_time):
     args.sparsepcgc_success_amount_anticollapse_weight = max(
         float(getattr(args, "sparsepcgc_success_amount_anticollapse_weight", 0.03)),
         0.0,
+    )
+    args.sparsepcgc_subtree_actual_filter = bool(
+        getattr(args, "sparsepcgc_subtree_actual_filter", True)
+    )
+    args.sparsepcgc_subtree_good_margin = max(
+        float(getattr(args, "sparsepcgc_subtree_good_margin", 0.25)),
+        0.0,
+    )
+    args.sparsepcgc_subtree_bad_margin = max(
+        float(getattr(args, "sparsepcgc_subtree_bad_margin", 0.25)),
+        0.0,
+    )
+    args.sparsepcgc_subtree_good_compression_weight = max(
+        float(getattr(args, "sparsepcgc_subtree_good_compression_weight", 1.0)),
+        0.0,
+    )
+    args.sparsepcgc_subtree_neutral_compression_weight = max(
+        float(getattr(args, "sparsepcgc_subtree_neutral_compression_weight", 0.25)),
+        0.0,
+    )
+    args.sparsepcgc_subtree_bad_compression_weight = max(
+        float(getattr(args, "sparsepcgc_subtree_bad_compression_weight", 0.0)),
+        0.0,
+    )
+    args.sparsepcgc_anchor_success_teacher = bool(
+        getattr(args, "sparsepcgc_anchor_success_teacher", True)
+    )
+    args.sparsepcgc_anchor_success_margin = max(
+        float(getattr(args, "sparsepcgc_anchor_success_margin", 1.0)),
+        0.0,
+    )
+    args.sparsepcgc_anchor_success_ema = min(
+        max(float(getattr(args, "sparsepcgc_anchor_success_ema", 0.20)), 1e-4),
+        1.0,
+    )
+    args.sparsepcgc_anchor_success_amount_weight = max(
+        float(getattr(args, "sparsepcgc_anchor_success_amount_weight", 0.05)),
+        0.0,
+    )
+    args.sparsepcgc_disable_bad_amount_when_no_success_memory = bool(
+        getattr(args, "sparsepcgc_disable_bad_amount_when_no_success_memory", True)
+    )
+    args.sparsepcgc_stage_switch_guard = bool(
+        getattr(args, "sparsepcgc_stage_switch_guard", True)
+    )
+    args.sparsepcgc_min_compression_loss_factor = max(
+        float(getattr(args, "sparsepcgc_min_compression_loss_factor", 1.0)),
+        0.0,
+    )
+    args.sparsepcgc_max_policy_loss_factor_in_compression = max(
+        float(getattr(args, "sparsepcgc_max_policy_loss_factor_in_compression", 0.25)),
+        0.0,
+    )
+    args.sparsepcgc_surrogate_trust_gate = bool(
+        getattr(args, "sparsepcgc_surrogate_trust_gate", True)
+    )
+    args.sparsepcgc_surrogate_error_threshold = max(
+        float(getattr(args, "sparsepcgc_surrogate_error_threshold", 10.0)),
+        0.0,
+    )
+    args.sparsepcgc_surrogate_error_disable_threshold = max(
+        float(getattr(args, "sparsepcgc_surrogate_error_disable_threshold", 13.0)),
+        args.sparsepcgc_surrogate_error_threshold,
+    )
+    args.sparsepcgc_surrogate_min_trust = min(
+        max(float(getattr(args, "sparsepcgc_surrogate_min_trust", 0.0)), 0.0),
+        1.0,
     )
     args.prune_amount_soft_anchor_enable = bool(
         getattr(args, "prune_amount_soft_anchor_enable", False)

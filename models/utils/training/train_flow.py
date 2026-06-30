@@ -12,6 +12,41 @@ def resolve_compression_fixed_stage(args):
     return stage or "joint"
 
 
+def sparsepcgc_stage_guard_factors(args, stage, stage_factors):
+    factors = dict(stage_factors or {})
+    debug = {
+        "stage_switch_guard_used": False,
+        "stage_original": str(stage),
+        "stage_effective": str(stage),
+        "compression_loss_factor_original": float(factors.get("com", 1.0)),
+        "compression_loss_factor_effective": float(factors.get("com", 1.0)),
+        "policy_loss_factor_original": float(factors.get("policy", 1.0)),
+        "policy_loss_factor_effective": float(factors.get("policy", 1.0)),
+    }
+    codec = str(getattr(args, "compress", "")).strip().lower().replace("-", "").replace("_", "")
+    if codec != "sparsepcgc" or not bool(getattr(args, "sparsepcgc_stage_switch_guard", True)):
+        return factors, debug
+
+    min_com = max(float(getattr(args, "sparsepcgc_min_compression_loss_factor", 1.0)), 0.0)
+    max_policy = max(float(getattr(args, "sparsepcgc_max_policy_loss_factor_in_compression", 0.25)), 0.0)
+    original_com = float(factors.get("com", 1.0))
+    original_policy = float(factors.get("policy", 1.0))
+    factors["com"] = max(original_com, min_com)
+    factors["policy"] = min(original_policy, max_policy)
+    debug.update(
+        {
+            "stage_switch_guard_used": bool(
+                abs(factors["com"] - original_com) > 1e-12
+                or abs(factors["policy"] - original_policy) > 1e-12
+            ),
+            "compression_loss_factor_effective": float(factors["com"]),
+            "policy_loss_factor_effective": float(factors["policy"]),
+            "stage_effective": str(stage),
+        }
+    )
+    return factors, debug
+
+
 def prepare_subtree_input_pcd(pts, use_cuda):
     # DataLoader出力をSubtree分割用の[B, N, C]形式にそろえる。
     input_pcd = pts if pts.dim() == 3 else pts.unsqueeze(0)
