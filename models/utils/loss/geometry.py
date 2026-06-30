@@ -122,7 +122,26 @@ class GeometryLossMixin:
             if out_label is None:
                 gt_inlinear = gt_pts
             else:
-                gt_inlinear = remove_outlier_points_by_label(gt_pts, out_label)
+                gt_inlinear = gt_pts
+
+                if out_label is not None:
+                    if out_label.dim() == 3:
+                        label_b = out_label.size(0)
+                        label_n = out_label.size(2)
+                    elif out_label.dim() == 2:
+                        label_b = out_label.size(0)
+                        label_n = out_label.size(1)
+                    else:
+                        label_b = None
+                        label_n = None
+
+                    if label_b == gt_pts.size(0) and label_n == gt_pts.size(2):
+                        gt_inlinear = remove_outlier_points_by_label(gt_pts, out_label)
+                    else:
+                        # gt_pts が 20000点にサンプリング済みで、
+                        # out_label が full-cloud 全体のラベルの場合は対応関係がない。
+                        # そのため外れ点除去はスキップする。
+                        pass
             if gt_inlinear.shape[-1] == 0:
                 self._set_geometry_debug(
                     mode="empty_gt_after_filter",

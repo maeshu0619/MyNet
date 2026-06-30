@@ -879,7 +879,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--sparsepcgc_codec_prune_prior_warmup_steps', default=0, type=int)
     parser.add_argument(
         '--sparsepcgc_training_mode',
-        default='subtree_selector',
+        default='full_cloud_amount',
         choices=['subtree_selector', 'full_cloud_amount', 'legacy'],
         type=str,
         help='SparsePCGC訓練branch。subtree_selectorは既存提案器、full_cloud_amountは全点群Amount-only、legacyは旧direct actuator',
@@ -4217,7 +4217,7 @@ def parse_pugan_args(parser, file_day, file_time):
         getattr(args, "sparsepcgc_training_mode", "subtree_selector")
     ).strip().lower()
     if args.sparsepcgc_training_mode not in {"subtree_selector", "full_cloud_amount", "legacy"}:
-        args.sparsepcgc_training_mode = "subtree_selector"
+        args.sparsepcgc_training_mode = "full_cloud_amount"
     args.sparsepcgc_warmup_force_codec_prior_amount = bool(
         getattr(args, "sparsepcgc_warmup_force_codec_prior_amount", True)
     )
