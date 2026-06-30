@@ -731,11 +731,25 @@ def log_compact_step_summary(
         if comp_value:
             return comp_value
         return str(structure_debug.get(key, "") or "").strip()
-
+    def _prefer_number(key, default=float("nan")):
+        comp_value = comp_debug.get(key, None)
+        comp_float = _to_float(comp_value, float("nan"))
+        if math.isfinite(comp_float):
+            return comp_float
+        struct_value = structure_debug.get(key, default)
+        return _to_float(struct_value, default)
     hard_drop_reason = _prefer_text("hard_drop_block_reason")
     prune_after_prior_mode = _prefer_text("prune_after_prior_mode")
     hard_drop_count_trace = _prefer_text("hard_drop_count_trace")
     collapse_reason = _prefer_text("collapse_reason")
+    hard_target_source_id = _prefer_number("hard_drop_target_ratio_source_id")
+    hard_target_ratio = _prefer_number("hard_drop_target_ratio_value")
+    hard_target_network = _prefer_number("hard_drop_target_ratio_network_value")
+    hard_target_prior = _prefer_number("hard_drop_target_ratio_codec_prior_value")
+    post_amount_used = _prefer_number("post_warmup_amount_hybrid_applied", 0.0)
+    post_amount_alpha = _prefer_number("post_warmup_amount_alpha")
+    post_amount_proposal = _prefer_number("post_warmup_amount_proposal_ratio")
+    post_amount_teacher = _prefer_number("post_warmup_amount_teacher_loss")
     collapse_detected = bool(
         comp_debug.get("phase0_noop_only_collapse_detected", False)
         or structure_debug.get("phase0_noop_only_collapse_detected", False)
@@ -745,10 +759,16 @@ def log_compact_step_summary(
         f"input={_fmt_int(input_points)}, output={_fmt_int(output_points)}, "
         f"LocalAdd={_fmt_int(add_count)}, LocalPrune={_fmt_int(prune_count)}, "
         f"LocalAdjust={_fmt_int(adjust_count)}, "
-        f"LocalPruneRatio={_fmt(local_prune_ratio, 4)}%, "
-        f"FullCloudPruneRatio={_fmt(full_cloud_prune_ratio, 4)}%, "
         f"PruneMode={prune_after_prior_mode}, "
         f"HardPruneReason={hard_drop_reason}, "
+        f"AmountSrc={_fmt_int(hard_target_source_id)}, "
+        f"AmountTarget={_fmt(hard_target_ratio, 5)}, "
+        f"AmountNet={_fmt(hard_target_network, 5)}, "
+        f"AmountPrior={_fmt(hard_target_prior, 5)}, "
+        f"PostAmountUsed={bool(round(_to_float(post_amount_used, 0.0)))}, "
+        f"PostAlpha={_fmt(post_amount_alpha, 5)}, "
+        f"PostProposal={_fmt(post_amount_proposal, 5)}, "
+        f"PostTeacher={_fmt(post_amount_teacher, 6)}, "
         f"CollapseDetected={collapse_detected}, "
         f"CollapseReason={collapse_reason}, "
         f"HardDropTrace={hard_drop_count_trace}, "

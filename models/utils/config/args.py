@@ -961,6 +961,71 @@ def parse_pugan_args(parser, file_day, file_time):
         type=int,
         help='hard action hybridの決定周期。20なら20step中alpha割合だけcodec block actionを使う',
     )
+    # ============================================================
+    # Post-warmup Amount Hybrid
+    # ============================================================
+    # 目的:
+    #   warmup終了後にPrune AmountがNetwork出力だけへ移行し、
+    #   0.2%付近へ潰れる問題を防ぐ。
+    #
+    # 方針:
+    #   Network Amountを完全には消さず、
+    #   codec prior由来のAmount proposalをtailとして混ぜる。
+    #
+    # 注意:
+    #   5%固定・2%固定へ戻す設定ではない。
+    #   Networkを最低限残しながら、post-warmup直後だけ
+    #   warmup中の探索的Amountを下支えする。
+    # ============================================================
+    parser.add_argument(
+        '--sparsepcgc_post_warmup_amount_hybrid',
+        default=True,
+        type=str2bool,
+        help='Trueならwarmup終了後もAmountにcodec prior由来proposalをtailとして混ぜる',
+    )
+    parser.add_argument(
+        '--sparsepcgc_post_warmup_amount_mode',
+        default='blend',
+        choices=['blend', 'max'],
+        type=str,
+        help='post-warmup Amountの混ぜ方。blendはNetworkとproposalを混ぜ、maxは弱い下限として使う',
+    )
+    parser.add_argument(
+        '--sparsepcgc_post_warmup_amount_start_ratio',
+        default=0.04,
+        type=float,
+        help='warmup終了直後のAmount proposal。0.04なら4%から開始する',
+    )
+    parser.add_argument(
+        '--sparsepcgc_post_warmup_amount_end_ratio',
+        default=0.006,
+        type=float,
+        help='tail終了直前のAmount proposal。0.006なら0.6%まで緩やかに下げる',
+    )
+    parser.add_argument(
+        '--sparsepcgc_post_warmup_amount_tail_steps',
+        default=5000,
+        type=int,
+        help='post-warmup Amount proposalをstartからendへ減衰させるstep数',
+    )
+    parser.add_argument(
+        '--sparsepcgc_post_warmup_amount_max_alpha',
+        default=0.65,
+        type=float,
+        help='post-warmup Amount proposalを混ぜる最大割合。0.65なら最低35%はNetwork Amountを残す',
+    )
+    parser.add_argument(
+        '--sparsepcgc_post_warmup_amount_min_network_keep',
+        default=0.30,
+        type=float,
+        help='Amount hybrid時に最低限残すNetwork比率。0.30ならproposalが強くても30%はNetworkを残す',
+    )
+    parser.add_argument(
+        '--sparsepcgc_post_warmup_amount_teacher_weight',
+        default=0.08,
+        type=float,
+        help='post-warmup Amount targetをdrop_amount_headへ蒸留する補助loss重み',
+    )
     parser.add_argument(
         '--sparsepcgc_codec_prior_distill_weight',
         default=0.05,
@@ -3913,12 +3978,12 @@ def parse_pugan_args(parser, file_day, file_time):
         getattr(args, "sparsepcgc_warmup_force_codec_prior_amount", True)
     )
     args.sparsepcgc_prune_after_prior_mode = str(
-        getattr(args, "sparsepcgc_prune_after_prior_mode", "oracle")
+        getattr(args, "sparsepcgc_prune_after_prior_mode", "network")
     ).strip().lower()
     if args.sparsepcgc_prune_after_prior_mode not in {"oracle", "network", "direct_network"}:
-        args.sparsepcgc_prune_after_prior_mode = "oracle"
+        args.sparsepcgc_prune_after_prior_mode = "network"
     args.sparsepcgc_network_prune_ratio_floor = min(
-        max(float(getattr(args, "sparsepcgc_network_prune_ratio_floor", 0.05)), 0.0),
+        max(float(getattr(args, "sparsepcgc_network_prune_ratio_floor", 0.001)), 0.0),
         0.95,
     )
     args.sparsepcgc_network_prune_min_hard_count = max(
@@ -3930,16 +3995,13 @@ def parse_pugan_args(parser, file_day, file_time):
         0,
     )
     args.sparsepcgc_network_prune_floor_steps = max(
-        int(getattr(args, "sparsepcgc_network_prune_floor_steps", 1000)),
+        int(getattr(args, "sparsepcgc_network_prune_floor_steps", 20)),
         0,
     )
     args.sparsepcgc_network_prune_floor_decay_steps = max(
-        int(getattr(args, "sparsepcgc_network_prune_floor_decay_steps", 1000)),
+        int(getattr(args, "sparsepcgc_network_prune_floor_decay_steps", 100)),
         0,
     )
-    # ============================================================
-    # SparsePCGC Hybrid Prune Prior 正規化
-    # ============================================================
     args.sparsepcgc_hybrid_prune_prior = bool(
         getattr(args, "sparsepcgc_hybrid_prune_prior", True)
     )
@@ -3952,12 +4014,8 @@ def parse_pugan_args(parser, file_day, file_time):
         0,
     )
     args.sparsepcgc_hybrid_prior_amount_blend = bool(
-        getattr(args, "sparsepcgc_hybrid_prior_amount_blend", True)
+        getattr(args, "sparsepcgc_hybrid_prior_amount_blend", False)
     )
-    # ============================================================
-    # SparsePCGC Hybrid 強化設定 正規化
-    # ============================================================
-
     args.sparsepcgc_prune_monotonic_floor = bool(
         getattr(args, "sparsepcgc_prune_monotonic_floor", False)
     )
@@ -3991,13 +4049,49 @@ def parse_pugan_args(parser, file_day, file_time):
         int(getattr(args, "sparsepcgc_hybrid_hard_action_period", 20)),
         1,
     )
+    # ============================================================
+    # Post-warmup Amount Hybrid 正規化
+    # ============================================================
+    args.sparsepcgc_post_warmup_amount_hybrid = bool(
+        getattr(args, "sparsepcgc_post_warmup_amount_hybrid", True)
+    )
 
+    args.sparsepcgc_post_warmup_amount_mode = str(
+        getattr(args, "sparsepcgc_post_warmup_amount_mode", "blend")
+    ).strip().lower()
+    if args.sparsepcgc_post_warmup_amount_mode not in {"blend", "max"}:
+        args.sparsepcgc_post_warmup_amount_mode = "blend"
+
+    args.sparsepcgc_post_warmup_amount_start_ratio = min(
+        max(float(getattr(args, "sparsepcgc_post_warmup_amount_start_ratio", 0.04)), 0.0),
+        0.05,
+    )
+    args.sparsepcgc_post_warmup_amount_end_ratio = min(
+        max(float(getattr(args, "sparsepcgc_post_warmup_amount_end_ratio", 0.006)), 0.0),
+        args.sparsepcgc_post_warmup_amount_start_ratio,
+    )
+    args.sparsepcgc_post_warmup_amount_tail_steps = max(
+        int(getattr(args, "sparsepcgc_post_warmup_amount_tail_steps", 5000)),
+        0,
+    )
+    args.sparsepcgc_post_warmup_amount_max_alpha = min(
+        max(float(getattr(args, "sparsepcgc_post_warmup_amount_max_alpha", 0.65)), 0.0),
+        1.0,
+    )
+    args.sparsepcgc_post_warmup_amount_min_network_keep = min(
+        max(float(getattr(args, "sparsepcgc_post_warmup_amount_min_network_keep", 0.30)), 0.0),
+        1.0,
+    )
+    args.sparsepcgc_post_warmup_amount_teacher_weight = max(
+        float(getattr(args, "sparsepcgc_post_warmup_amount_teacher_weight", 0.08)),
+        0.0,
+    )
     args.sparsepcgc_codec_prior_distill_weight = max(
         float(getattr(args, "sparsepcgc_codec_prior_distill_weight", 0.05)),
         0.0,
     )
     args.sparsepcgc_codec_prior_amount_distill_weight = max(
-        float(getattr(args, "sparsepcgc_codec_prior_amount_distill_weight", 0.02)),
+        float(getattr(args, "sparsepcgc_codec_prior_amount_distill_weight", 0.0)),
         0.0,
     )
     # ============================================================

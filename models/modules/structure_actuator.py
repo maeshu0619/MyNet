@@ -3067,7 +3067,19 @@ class StructureRepairActuator(nn.Module):
         codec_prior_amount_blend_applied = False
         codec_prior_amount_blend_alpha_value = 0.0
         codec_prior_amount_distill_loss = pts_xyz.new_zeros(())
-
+        # ============================================================
+        # Post-warmup Amount Hybrid 初期値
+        # ============================================================
+        # warmup終了後にAmountがNetworkだけへ移行して0.2%付近に潰れる問題を防ぐ。
+        # ここではforwardのhard countだけをproposalで下支えし、
+        # backwardはNetwork Amountへ流す。
+        # ============================================================
+        post_warmup_amount_hybrid_applied = False
+        post_warmup_amount_mode_id = 0
+        post_warmup_amount_tail_phase_value = 0.0
+        post_warmup_amount_alpha_value = 0.0
+        post_warmup_amount_proposal_ratio_value = 0.0
+        post_warmup_amount_teacher_loss = pts_xyz.new_zeros(())
         if (
             amount_mode == "network"
             and warmup_force_codec_prior_amount
@@ -3089,7 +3101,128 @@ class StructureRepairActuator(nn.Module):
             )
             hard_drop_target_ratio_source = "codec_prior_active_ratio_warmup"
             hard_drop_target_ratio_source_id = 1
+        if (
+            amount_mode == "network"
+            and bool(getattr(self.args, "sparsepcgc_post_warmup_amount_hybrid", True))
+            and self.training
+            and prune_enabled
+            and codec_prune_prior_enabled
+            and float(codec_prune_prior_phase) <= 0.0
+            and not self._direct_network_prune_mode()
+        ):
+            # ========================================================
+            # Post-warmup Amount Hybrid
+            # ========================================================
+            # 問題:
+            #   200Step以降にhard count用AmountがNetworkへ完全移行し、
+            #   raw/learned Amountが未成熟なため0.2%付近へ潰れる。
+            #
+            # 解決:
+            #   codec prior由来のAmount proposalをtailとして混ぜる。
+            #   ただしNetwork自由学習を壊さないため、forwardはhybrid値、
+            #   backwardはNetwork Amountへ流すSTEにする。
+            # ========================================================
+            post_tail_steps = max(
+                int(getattr(self.args, "sparsepcgc_post_warmup_amount_tail_steps", 5000)),
+                0,
+            )
+            post_tail_step = max(
+                int(current_train_step) - int(codec_prune_prior_warmup_steps),
+                0,
+            )
 
+            if post_tail_steps > 0:
+                post_tail_phase = max(
+                    1.0 - float(post_tail_step) / float(post_tail_steps),
+                    0.0,
+                )
+            else:
+                # tail_steps=0は「減衰なし」の明示指定として扱う。
+                post_tail_phase = 1.0
+
+            start_ratio = min(
+                max(float(getattr(self.args, "sparsepcgc_post_warmup_amount_start_ratio", 0.04)), 0.0),
+                float(max_drop_ratio),
+            )
+            end_ratio = min(
+                max(float(getattr(self.args, "sparsepcgc_post_warmup_amount_end_ratio", 0.006)), 0.0),
+                start_ratio,
+            )
+
+            proposal_ratio = end_ratio + (start_ratio - end_ratio) * float(post_tail_phase)
+            proposal_ratio = min(max(float(proposal_ratio), 0.0), float(max_drop_ratio))
+
+            max_alpha = min(
+                max(float(getattr(self.args, "sparsepcgc_post_warmup_amount_max_alpha", 0.65)), 0.0),
+                1.0,
+            )
+            min_network_keep = min(
+                max(float(getattr(self.args, "sparsepcgc_post_warmup_amount_min_network_keep", 0.30)), 0.0),
+                1.0,
+            )
+            post_amount_alpha = min(
+                float(max_alpha) * float(post_tail_phase),
+                1.0 - float(min_network_keep),
+            )
+            post_amount_alpha = min(max(float(post_amount_alpha), 0.0), 1.0)
+
+            if proposal_ratio > 0.0 and post_amount_alpha > 0.0:
+                proposal_tensor = learned_drop_ratio.new_tensor(float(proposal_ratio))
+                alpha_tensor = learned_drop_ratio.new_tensor(float(post_amount_alpha))
+
+                post_amount_mode = str(
+                    getattr(self.args, "sparsepcgc_post_warmup_amount_mode", "blend")
+                ).strip().lower()
+                if post_amount_mode not in {"blend", "max"}:
+                    post_amount_mode = "blend"
+
+                if post_amount_mode == "max":
+                    # maxモード:
+                    #   proposalそのものを固定下限にすると強すぎるため、
+                    #   alphaを掛けた弱い下限として使う。
+                    post_warmup_amount_mode_id = 2
+                    post_floor_tensor = proposal_tensor * alpha_tensor
+                    effective_drop_ratio_forward = torch.maximum(
+                        network_effective_drop_ratio_for_hard_count,
+                        post_floor_tensor,
+                    )
+                    hard_drop_target_ratio_source = "post_warmup_amount_max"
+                    hard_drop_target_ratio_source_id = 7
+                else:
+                    # blendモード:
+                    #   Network Amountを最低限残しながら、
+                    #   proposalをtailとして混ぜる。
+                    post_warmup_amount_mode_id = 1
+                    effective_drop_ratio_forward = (
+                        alpha_tensor * proposal_tensor
+                        + (1.0 - alpha_tensor) * network_effective_drop_ratio_for_hard_count
+                    )
+                    hard_drop_target_ratio_source = "post_warmup_amount_blend"
+                    hard_drop_target_ratio_source_id = 6
+
+                effective_drop_ratio_for_hard_count = (
+                    effective_drop_ratio_forward.detach()
+                    + network_effective_drop_ratio_for_hard_count
+                    - network_effective_drop_ratio_for_hard_count.detach()
+                )
+
+                # drop_amount_headへ弱く蒸留する。
+                # targetは実際にhard countへ使うforward値に合わせる。
+                # これにより、200Step以降もNetworkが0〜5%範囲のAmountを学ぶ材料を持つ。
+                post_warmup_amount_teacher_loss = (
+                    raw_learned_drop_ratio - effective_drop_ratio_forward.detach()
+                ).pow(2).mean() * float(post_amount_alpha)
+
+                post_warmup_amount_hybrid_applied = True
+                post_warmup_amount_tail_phase_value = float(post_tail_phase)
+                post_warmup_amount_alpha_value = float(post_amount_alpha)
+                post_warmup_amount_proposal_ratio_value = float(proposal_ratio)
+
+                # 既存ログ互換:
+                # codec_prior_amount_blend_* を見ていた既存ログでも
+                # post-warmup hybridが効いたことが分かるようにする。
+                codec_prior_amount_blend_applied = True
+                codec_prior_amount_blend_alpha_value = float(post_amount_alpha)
         if (
             self.training
             and prune_enabled
@@ -6079,6 +6212,7 @@ class StructureRepairActuator(nn.Module):
         )
         codec_prior_where_distill_loss = _finite_actuator_loss(codec_prior_where_distill_loss)
         codec_prior_amount_distill_loss = _finite_actuator_loss(codec_prior_amount_distill_loss)
+        post_warmup_amount_teacher_loss = _finite_actuator_loss(post_warmup_amount_teacher_loss)
         drop_amount_supervision_loss = _finite_actuator_loss(drop_amount_supervision_loss)
         drop_amount_soft_consistency_loss = _finite_actuator_loss(drop_amount_soft_consistency_loss)
         move_amount_supervision_loss = _finite_actuator_loss(move_amount_supervision_loss)
@@ -6124,7 +6258,8 @@ class StructureRepairActuator(nn.Module):
             + float(getattr(self.args, "repair_add_direction_ce_weight", 1e-3)) * add_direction_ce
             + float(getattr(self.args, "repair_drop_where_actuator_weight", 0.1)) * drop_where_actuator_loss
             + float(getattr(self.args, "sparsepcgc_codec_prior_distill_weight", 0.05)) * codec_prior_where_distill_loss
-            + float(getattr(self.args, "sparsepcgc_codec_prior_amount_distill_weight", 0.02)) * codec_prior_amount_distill_loss
+            + float(getattr(self.args, "sparsepcgc_codec_prior_amount_distill_weight", 0.0)) * codec_prior_amount_distill_loss
+            + float(getattr(self.args, "sparsepcgc_post_warmup_amount_teacher_weight", 0.08)) * post_warmup_amount_teacher_loss
             + float(getattr(self.args, "repair_add_where_actuator_weight", 0.1)) * add_where_actuator_loss
             + float(getattr(self.args, "repair_move_where_actuator_weight", 0.1)) * move_where_actuator_loss
             + float(getattr(self.args, "repair_operation_gate_oracle_weight", 0.1)) * operation_gate_oracle_loss
@@ -6746,6 +6881,22 @@ class StructureRepairActuator(nn.Module):
             "codec_prior_amount_blend_alpha": pts_xyz.new_tensor(
                 float(codec_prior_amount_blend_alpha_value)
             ).detach(),
+            "post_warmup_amount_hybrid_applied": pts_xyz.new_tensor(
+                float(post_warmup_amount_hybrid_applied)
+            ).detach(),
+            "post_warmup_amount_mode_id": pts_xyz.new_tensor(
+                float(post_warmup_amount_mode_id)
+            ).detach(),
+            "post_warmup_amount_tail_phase": pts_xyz.new_tensor(
+                float(post_warmup_amount_tail_phase_value)
+            ).detach(),
+            "post_warmup_amount_alpha": pts_xyz.new_tensor(
+                float(post_warmup_amount_alpha_value)
+            ).detach(),
+            "post_warmup_amount_proposal_ratio": pts_xyz.new_tensor(
+                float(post_warmup_amount_proposal_ratio_value)
+            ).detach(),
+            "post_warmup_amount_teacher_loss": post_warmup_amount_teacher_loss.detach(),
             "hard_drop_target_ratio_source_id": pts_xyz.new_tensor(
                 float(hard_drop_target_ratio_source_id)
             ).detach(),
@@ -7322,6 +7473,22 @@ class StructureRepairActuator(nn.Module):
             "hard_drop_target_ratio_codec_prior_value": pts_xyz.new_tensor(
                 float(hard_drop_target_ratio_codec_prior_value)
             ),
+            "post_warmup_amount_hybrid_applied": pts_xyz.new_tensor(
+                float(post_warmup_amount_hybrid_applied)
+            ),
+            "post_warmup_amount_mode_id": pts_xyz.new_tensor(
+                float(post_warmup_amount_mode_id)
+            ),
+            "post_warmup_amount_tail_phase": pts_xyz.new_tensor(
+                float(post_warmup_amount_tail_phase_value)
+            ),
+            "post_warmup_amount_alpha": pts_xyz.new_tensor(
+                float(post_warmup_amount_alpha_value)
+            ),
+            "post_warmup_amount_proposal_ratio": pts_xyz.new_tensor(
+                float(post_warmup_amount_proposal_ratio_value)
+            ),
+            "post_warmup_amount_teacher_loss": post_warmup_amount_teacher_loss.detach(),
             "codec_prune_prior_block_size": pts_xyz.new_tensor(float(codec_prune_prior_block_size)),
             "codec_prune_prior_block_count_mean": pts_xyz.new_tensor(
                 float(sum(codec_prune_prior_block_counts)) / max(float(len(codec_prune_prior_block_counts)), 1.0)

@@ -1059,6 +1059,29 @@ def build_operation_metric_row(
             structure_debug.get("hard_drop_target_ratio_codec_prior_value", float("nan")),
             float("nan"),
         ),
+        "post_warmup_amount_hybrid_applied": bool(
+            structure_debug.get("post_warmup_amount_hybrid_applied", False)
+        ),
+        "post_warmup_amount_mode_id": case_int(
+            structure_debug.get("post_warmup_amount_mode_id", 0),
+            0,
+        ),
+        "post_warmup_amount_tail_phase": case_float(
+            structure_debug.get("post_warmup_amount_tail_phase", float("nan")),
+            float("nan"),
+        ),
+        "post_warmup_amount_alpha": case_float(
+            structure_debug.get("post_warmup_amount_alpha", float("nan")),
+            float("nan"),
+        ),
+        "post_warmup_amount_proposal_ratio": case_float(
+            structure_debug.get("post_warmup_amount_proposal_ratio", float("nan")),
+            float("nan"),
+        ),
+        "post_warmup_amount_teacher_loss": case_float(
+            structure_debug.get("post_warmup_amount_teacher_loss", float("nan")),
+            float("nan"),
+        ),
         "amount_mode_id": case_int(structure_debug.get("amount_mode_id", 0), 0),
         "amount_mode_network": bool(structure_debug.get("amount_mode_network", False)),
         "voxel_count": case_int(structure_debug.get("voxel_count", 0), 0),
