@@ -1724,6 +1724,29 @@ class StructureRepairActuator(nn.Module):
         B, _, N = drop_scores.shape
         hard_drop = torch.zeros_like(drop_scores, dtype=torch.bool)
         hard_drop_trace = {
+            "where_mode": "block_only",
+            "effective_where_mode": "block_only",
+            "macro_micro_hybrid_fallback": False,
+            "macro_disabled_reason": "",
+            "macro_ratio": 0.0,
+            "micro_ratio": 0.0,
+            "macro_selected_block_count": 0.0,
+            "macro_drop_count": 0.0,
+            "micro_drop_count": 0.0,
+            "selected_block_count": 0.0,
+            "micro_selected_block_count": 0.0,
+            "max_drop_count_per_block": 0.0,
+            "mean_drop_count_per_selected_block": 0.0,
+            "drop_concentration_top1_block_ratio": 0.0,
+            "drop_concentration_top5_block_ratio": 0.0,
+            "hard_where_uses_network_score": False,
+            "heuristic_where_score_mean": 0.0,
+            "heuristic_where_score_std": 0.0,
+            "micro_quota_hit_block_count": 0.0,
+            "micro_min_selected_blocks": 0.0,
+            "micro_candidate_block_count": 0.0,
+            "micro_min_blocks_satisfied": False,
+            "micro_min_blocks_fallback_reason": "",
             "voxel_count": 0.0,
             "pre_round_target_count": 0.0,
             "post_round_target_count": 0.0,
@@ -1898,6 +1921,29 @@ class StructureRepairActuator(nn.Module):
             dtype=torch.bool,
         )
         hard_drop_trace = {
+            "where_mode": "block_only",
+            "effective_where_mode": "block_only",
+            "macro_micro_hybrid_fallback": False,
+            "macro_disabled_reason": "",
+            "macro_ratio": 0.0,
+            "micro_ratio": 0.0,
+            "macro_selected_block_count": 0.0,
+            "macro_drop_count": 0.0,
+            "micro_drop_count": 0.0,
+            "selected_block_count": 0.0,
+            "micro_selected_block_count": 0.0,
+            "max_drop_count_per_block": 0.0,
+            "mean_drop_count_per_selected_block": 0.0,
+            "drop_concentration_top1_block_ratio": 0.0,
+            "drop_concentration_top5_block_ratio": 0.0,
+            "hard_where_uses_network_score": False,
+            "heuristic_where_score_mean": 0.0,
+            "heuristic_where_score_std": 0.0,
+            "micro_quota_hit_block_count": 0.0,
+            "micro_min_selected_blocks": 0.0,
+            "micro_candidate_block_count": 0.0,
+            "micro_min_blocks_satisfied": False,
+            "micro_min_blocks_fallback_reason": "",
             "voxel_count": 0.0,
             "pre_round_target_count": 0.0,
             "post_round_target_count": 0.0,
@@ -1957,6 +2003,9 @@ class StructureRepairActuator(nn.Module):
             score_sum = torch.zeros((block_count,), device=scores.device, dtype=scores.dtype)
             score_sum.scatter_add_(0, inverse, scores)
             block_scores = score_sum / counts.to(dtype=scores.dtype).clamp_min(1.0)
+            if block_scores.numel() > 0:
+                hard_drop_trace["heuristic_where_score_mean"] += float(block_scores.mean().item())
+                hard_drop_trace["heuristic_where_score_std"] += float(block_scores.std(unbiased=False).item())
             order = torch.argsort(block_scores, descending=True)
             cumulative = torch.cumsum(counts.index_select(0, order), dim=0)
             take = int((cumulative <= int(max(budget, 0))).sum().item())
@@ -1978,11 +2027,89 @@ class StructureRepairActuator(nn.Module):
             hard_drop_trace["codec_block_selected_block_count"] += float(selected_block_count)
             hard_drop_trace["codec_block_selected_point_count"] += float(selected_point_count)
         hard_drop_trace["final_hard_drop_count"] = float(hard_drop.detach().sum().item())
+        selected_block_drop_counts = []
+        for batch_idx in range(batch_size):
+            selected_idx = hard_drop[batch_idx, 0].nonzero(as_tuple=False).reshape(-1)
+            if selected_idx.numel() <= 0:
+                continue
+            selected_coords = voxel_coords[batch_idx].index_select(1, selected_idx).transpose(0, 1).contiguous().long()
+            selected_blocks = torch.div(selected_coords, int(block_size), rounding_mode="floor")
+            _, selected_inverse = torch.unique(selected_blocks, dim=0, sorted=True, return_inverse=True)
+            block_drop_counts = torch.bincount(selected_inverse).detach().cpu().tolist()
+            selected_block_drop_counts.extend(int(v) for v in block_drop_counts)
+        selected_block_count = len(selected_block_drop_counts)
+        hard_drop_trace["selected_block_count"] = float(selected_block_count)
+        if selected_block_count > 0:
+            selected_block_drop_counts.sort(reverse=True)
+            total_drop = max(float(sum(selected_block_drop_counts)), 1.0)
+            hard_drop_trace["max_drop_count_per_block"] = float(selected_block_drop_counts[0])
+            hard_drop_trace["mean_drop_count_per_selected_block"] = (
+                float(sum(selected_block_drop_counts)) / float(selected_block_count)
+            )
+            hard_drop_trace["drop_concentration_top1_block_ratio"] = float(selected_block_drop_counts[0]) / total_drop
+            hard_drop_trace["drop_concentration_top5_block_ratio"] = (
+                float(sum(selected_block_drop_counts[:5])) / total_drop
+            )
         try:
             setattr(self, "_last_hard_drop_count_trace", hard_drop_trace)
         except Exception:
             pass
         return hard_drop
+
+    def _full_cloud_amount_action_temperature(self):
+        base_temp = min(
+            max(float(getattr(self.args, "sparsepcgc_full_cloud_amount_exploration_temperature", 1.0)), 0.05),
+            10.0,
+        )
+        min_temp = min(
+            max(float(getattr(self.args, "sparsepcgc_full_cloud_amount_min_temperature", 0.3)), 0.01),
+            base_temp,
+        )
+        decay_steps = max(
+            int(getattr(self.args, "sparsepcgc_full_cloud_amount_temperature_decay_steps", 3000)),
+            0,
+        )
+        if decay_steps <= 0:
+            return float(min_temp)
+        step = max(int(getattr(self.args, "_global_train_step", 0)), 0)
+        phase = max(0.0, 1.0 - float(step) / float(max(decay_steps, 1)))
+        return float(min_temp + (base_temp - min_temp) * phase)
+
+    def _sample_full_cloud_amount_action(self, logits):
+        logits = logits.float()
+        batch_size, class_count = int(logits.shape[0]), int(logits.shape[1])
+        temperature = max(float(self._full_cloud_amount_action_temperature()), 1e-6)
+        learning_mode = str(
+            getattr(self.args, "sparsepcgc_full_cloud_amount_learning_mode", "network_selected_bandit")
+        ).strip().lower()
+        sample_mode = str(
+            getattr(self.args, "sparsepcgc_full_cloud_amount_action_sample_mode", "categorical")
+        ).strip().lower()
+        if learning_mode != "network_selected_bandit":
+            sample_mode = "argmax"
+        scaled_logits = logits / float(temperature)
+        if sample_mode == "argmax" or (not self.training):
+            selected_class = torch.argmax(scaled_logits.detach(), dim=1)
+        elif sample_mode == "gumbel":
+            gumbel_noise = -torch.log(-torch.log(torch.rand_like(scaled_logits).clamp_min(1e-8)).clamp_min(1e-8))
+            selected_class = torch.argmax((scaled_logits + gumbel_noise).detach(), dim=1)
+        else:
+            selected_class = torch.distributions.Categorical(logits=scaled_logits.detach()).sample()
+        selected_class = selected_class.clamp(0, max(class_count - 1, 0))
+        log_probs = torch.log_softmax(scaled_logits, dim=1)
+        probs = torch.softmax(scaled_logits, dim=1)
+        selected_prob = probs.gather(1, selected_class.view(-1, 1)).squeeze(1)
+        selected_log_prob = log_probs.gather(1, selected_class.view(-1, 1)).squeeze(1)
+        entropy = -(probs * log_probs).sum(dim=1)
+        return {
+            "selected_class": selected_class,
+            "scaled_logits": scaled_logits,
+            "selected_prob": selected_prob,
+            "selected_log_prob": selected_log_prob,
+            "entropy": entropy,
+            "temperature": float(temperature),
+            "sample_mode": str(sample_mode),
+        }
 
     @staticmethod
     def build_codec_block_drop_ranking(
@@ -2005,6 +2132,29 @@ class StructureRepairActuator(nn.Module):
 
         batches = []
         trace_base = {
+            "where_mode": "block_only",
+            "effective_where_mode": "block_only",
+            "macro_micro_hybrid_fallback": False,
+            "macro_disabled_reason": "",
+            "macro_ratio": 0.0,
+            "micro_ratio": 0.0,
+            "macro_selected_block_count": 0.0,
+            "macro_drop_count": 0.0,
+            "micro_drop_count": 0.0,
+            "selected_block_count": 0.0,
+            "micro_selected_block_count": 0.0,
+            "max_drop_count_per_block": 0.0,
+            "mean_drop_count_per_selected_block": 0.0,
+            "drop_concentration_top1_block_ratio": 0.0,
+            "drop_concentration_top5_block_ratio": 0.0,
+            "hard_where_uses_network_score": False,
+            "heuristic_where_score_mean": 0.0,
+            "heuristic_where_score_std": 0.0,
+            "micro_quota_hit_block_count": 0.0,
+            "micro_min_selected_blocks": 0.0,
+            "micro_candidate_block_count": 0.0,
+            "micro_min_blocks_satisfied": False,
+            "micro_min_blocks_fallback_reason": "",
             "codec_block_valid_point_count": 0.0,
             "codec_block_count": 0.0,
             "codec_block_target_drop_ratio": 0.0,
@@ -2049,11 +2199,15 @@ class StructureRepairActuator(nn.Module):
                 )
                 trace_base["codec_block_valid_point_count"] += float(valid_count)
                 trace_base["codec_block_count"] += float(block_count)
+                if block_scores.numel() > 0:
+                    trace_base["heuristic_where_score_mean"] += float(block_scores.mean().item())
+                    trace_base["heuristic_where_score_std"] += float(block_scores.std(unbiased=False).item())
             batches.append(batch_state)
         return {
             "block_size": int(block_size),
             "point_count": int(point_count),
             "batch_size": int(batch_size),
+            "voxel_coords": voxel_coords,
             "batches": batches,
             "trace_base": trace_base,
         }
@@ -2146,6 +2300,32 @@ class StructureRepairActuator(nn.Module):
             trace["codec_block_selected_block_count"] += float(take)
             trace["codec_block_selected_point_count"] += float(selected_point_count)
         trace["final_hard_drop_count"] = float(hard_drop.detach().sum().item())
+        selected_block_drop_counts = []
+        block_size = max(int(ranking_state.get("block_size", 1)), 1)
+        voxel_coords = ranking_state.get("voxel_coords", None)
+        if torch.is_tensor(voxel_coords):
+            for batch_idx in range(batch_size):
+                selected_idx = hard_drop[batch_idx, 0].nonzero(as_tuple=False).reshape(-1)
+                if selected_idx.numel() <= 0:
+                    continue
+                selected_coords = voxel_coords[batch_idx].index_select(1, selected_idx).transpose(0, 1).contiguous().long()
+                selected_blocks = torch.div(selected_coords, int(block_size), rounding_mode="floor")
+                _, selected_inverse = torch.unique(selected_blocks, dim=0, sorted=True, return_inverse=True)
+                block_drop_counts = torch.bincount(selected_inverse).detach().cpu().tolist()
+                selected_block_drop_counts.extend(int(v) for v in block_drop_counts)
+        selected_block_count = len(selected_block_drop_counts)
+        trace["selected_block_count"] = float(selected_block_count)
+        if selected_block_count > 0:
+            selected_block_drop_counts.sort(reverse=True)
+            total_drop = max(float(sum(selected_block_drop_counts)), 1.0)
+            trace["max_drop_count_per_block"] = float(selected_block_drop_counts[0])
+            trace["mean_drop_count_per_selected_block"] = (
+                float(sum(selected_block_drop_counts)) / float(selected_block_count)
+            )
+            trace["drop_concentration_top1_block_ratio"] = float(selected_block_drop_counts[0]) / total_drop
+            trace["drop_concentration_top5_block_ratio"] = (
+                float(sum(selected_block_drop_counts[:5])) / total_drop
+            )
         return hard_drop, trace
 
     def build_macro_micro_where_mask(
@@ -2186,6 +2366,10 @@ class StructureRepairActuator(nn.Module):
         )
         micro_round_robin = bool(getattr(args, "sparsepcgc_where_micro_round_robin", True))
         micro_use_delete_prior = bool(getattr(args, "sparsepcgc_where_micro_use_delete_prior", True))
+        micro_min_selected_blocks = max(
+            int(getattr(args, "sparsepcgc_where_micro_min_selected_blocks", 8)),
+            1,
+        )
 
         if selection_mask is None:
             selection = torch.ones((batch_size, point_count), device=device, dtype=torch.bool)
@@ -2241,6 +2425,10 @@ class StructureRepairActuator(nn.Module):
             "heuristic_where_score_mean": 0.0,
             "heuristic_where_score_std": 0.0,
             "micro_quota_hit_block_count": 0.0,
+            "micro_min_selected_blocks": float(micro_min_selected_blocks),
+            "micro_candidate_block_count": 0.0,
+            "micro_min_blocks_satisfied": False,
+            "micro_min_blocks_fallback_reason": "",
             "voxel_count": 0.0,
             "pre_round_target_count": 0.0,
             "post_round_target_count": 0.0,
@@ -2370,12 +2558,26 @@ class StructureRepairActuator(nn.Module):
             if not block_items:
                 continue
             block_items.sort(key=lambda item: item[0], reverse=True)
+            trace["micro_candidate_block_count"] += float(len(block_items))
+            desired_min_blocks = min(
+                max(int(micro_min_selected_blocks), 1),
+                int(micro_budget),
+                len(block_items),
+            )
+            micro_min_blocks_fallback_reason = ""
+            if len(block_items) < int(micro_min_selected_blocks):
+                micro_min_blocks_fallback_reason = "candidate_block_shortage"
+            elif int(micro_budget) < int(micro_min_selected_blocks):
+                micro_min_blocks_fallback_reason = "budget_shortage"
             selected_local_positions = []
             if micro_round_robin:
+                primary_items = block_items[:desired_min_blocks]
+                secondary_items = block_items[desired_min_blocks:]
                 depth = 0
                 while len(selected_local_positions) < micro_budget:
                     added = False
-                    for _, _, limited in block_items:
+                    scan_items = primary_items if depth == 0 and primary_items else (primary_items + secondary_items)
+                    for _, _, limited in scan_items:
                         if depth < int(limited.numel()):
                             selected_local_positions.append(limited[depth])
                             added = True
@@ -2403,6 +2605,16 @@ class StructureRepairActuator(nn.Module):
             trace["micro_drop_count"] += float(micro_drop_count)
             trace["micro_selected_block_count"] += float(int(selected_micro_blocks.numel()))
             trace["micro_quota_hit_block_count"] += float(block_quota_hit)
+            min_blocks_satisfied = bool(int(selected_micro_blocks.numel()) >= int(desired_min_blocks))
+            trace["micro_min_blocks_satisfied"] = bool(
+                bool(trace.get("micro_min_blocks_satisfied", False)) or min_blocks_satisfied
+            )
+            if not min_blocks_satisfied and not trace.get("micro_min_blocks_fallback_reason", ""):
+                trace["micro_min_blocks_fallback_reason"] = (
+                    micro_min_blocks_fallback_reason or "round_robin_exhausted"
+                )
+            elif min_blocks_satisfied and not trace.get("micro_min_blocks_fallback_reason", ""):
+                trace["micro_min_blocks_fallback_reason"] = micro_min_blocks_fallback_reason
 
         final_mask = hard_drop.detach()
         trace["final_hard_drop_count"] = float(final_mask.sum().item())
@@ -2437,6 +2649,7 @@ class StructureRepairActuator(nn.Module):
                 trace["heuristic_where_score_mean"] = float(score_values.mean().item())
                 trace["heuristic_where_score_std"] = float(score_values.std(unbiased=False).item())
         trace["macro_disabled_reason"] = macro_disabled_reason
+        trace["effective_where_mode"] = effective_where_mode
         trace["codec_block_under_selected"] = bool(
             trace["final_hard_drop_count"] < min(float(trace["post_round_target_count"]), float(trace["voxel_count"]))
         )
@@ -3715,14 +3928,31 @@ class StructureRepairActuator(nn.Module):
                 algorithmic_amount_selector_logits = full_cloud_amount_logits[
                     :, : int(algorithmic_amount_selector_logits.shape[1])
                 ]
+        amount_action_debug = self._sample_full_cloud_amount_action(
+            algorithmic_amount_selector_logits
+        )
+        algorithmic_amount_selector_scaled_logits = amount_action_debug["scaled_logits"].to(
+            device=actuator_features.device,
+            dtype=actuator_features.dtype,
+        )
         algorithmic_amount_selector_prob = torch.softmax(
-            algorithmic_amount_selector_logits.float(),
+            algorithmic_amount_selector_scaled_logits.float(),
             dim=1,
         ).to(dtype=actuator_features.dtype)
-        algorithmic_amount_selected_class_t = torch.argmax(
-            algorithmic_amount_selector_prob.detach(),
-            dim=1,
+        algorithmic_amount_selected_class_t = amount_action_debug["selected_class"].to(
+            device=actuator_features.device,
+            dtype=torch.long,
         )
+        algorithmic_amount_selected_log_prob_t = amount_action_debug["selected_log_prob"].to(
+            device=actuator_features.device,
+            dtype=actuator_features.dtype,
+        )
+        algorithmic_amount_entropy_t = amount_action_debug["entropy"].to(
+            device=actuator_features.device,
+            dtype=actuator_features.dtype,
+        )
+        algorithmic_amount_temperature_value = float(amount_action_debug["temperature"])
+        algorithmic_amount_action_sample_mode = str(amount_action_debug["sample_mode"])
         algorithmic_amount_selected_class_value = int(
             algorithmic_amount_selected_class_t.detach().reshape(-1)[0].item()
         ) if int(algorithmic_amount_selected_class_t.numel()) > 0 else 0
@@ -3817,6 +4047,12 @@ class StructureRepairActuator(nn.Module):
                 ),
             ).detach().mean().cpu()
         ) if algorithmic_amount_selector_prob.numel() > 0 else 0.0
+        algorithmic_amount_selector_selected_log_prob_value = float(
+            algorithmic_amount_selected_log_prob_t.detach().mean().cpu()
+        ) if algorithmic_amount_selected_log_prob_t.numel() > 0 else float("nan")
+        algorithmic_amount_selector_entropy_value = float(
+            algorithmic_amount_entropy_t.detach().mean().cpu()
+        ) if algorithmic_amount_entropy_t.numel() > 0 else float("nan")
         algorithmic_amount_selector_teacher_class_id = -1
         algorithmic_amount_selector_teacher_ratio_value = float("nan")
         algorithmic_amount_selector_teacher_loss = pts_xyz.new_zeros(())
@@ -7943,6 +8179,16 @@ class StructureRepairActuator(nn.Module):
             "full_cloud_amount_selected_class": pts_xyz.new_tensor(
                 float(algorithmic_amount_selected_class_value)
             ).detach(),
+            "full_cloud_amount_action_log_prob": pts_xyz.new_tensor(
+                float(algorithmic_amount_selector_selected_log_prob_value)
+            ).detach(),
+            "full_cloud_amount_action_temperature": pts_xyz.new_tensor(
+                float(algorithmic_amount_temperature_value)
+            ).detach(),
+            "full_cloud_amount_action_entropy": pts_xyz.new_tensor(
+                float(algorithmic_amount_selector_entropy_value)
+            ).detach(),
+            "full_cloud_amount_action_sample_mode": str(algorithmic_amount_action_sample_mode),
             "full_cloud_amount_bin": pts_xyz.new_tensor(
                 float(algorithmic_amount_selected_bin_ratio_value)
             ).detach(),
@@ -8146,6 +8392,12 @@ class StructureRepairActuator(nn.Module):
             "heuristic_where_score_mean": pts_xyz.new_tensor(float(last_hard_drop_trace.get("heuristic_where_score_mean", 0.0))).detach(),
             "heuristic_where_score_std": pts_xyz.new_tensor(float(last_hard_drop_trace.get("heuristic_where_score_std", 0.0))).detach(),
             "micro_quota_hit_block_count": pts_xyz.new_tensor(float(last_hard_drop_trace.get("micro_quota_hit_block_count", 0.0))).detach(),
+            "micro_min_selected_blocks": pts_xyz.new_tensor(float(last_hard_drop_trace.get("micro_min_selected_blocks", 0.0))).detach(),
+            "micro_candidate_block_count": pts_xyz.new_tensor(float(last_hard_drop_trace.get("micro_candidate_block_count", 0.0))).detach(),
+            "micro_min_blocks_satisfied": pts_xyz.new_tensor(float(bool(last_hard_drop_trace.get("micro_min_blocks_satisfied", False)))).detach(),
+            "micro_min_blocks_fallback_reason": str(last_hard_drop_trace.get("micro_min_blocks_fallback_reason", "")),
+            "macro_micro_hybrid_fallback": pts_xyz.new_tensor(float(bool(last_hard_drop_trace.get("macro_micro_hybrid_fallback", False)))).detach(),
+            "effective_where_mode": str(last_hard_drop_trace.get("effective_where_mode", last_hard_drop_trace.get("where_mode", ""))),
             "macro_disabled_reason": str(last_hard_drop_trace.get("macro_disabled_reason", "")),
             "delete_candidate_initial_count": pts_xyz.new_tensor(float(delete_candidate_initial_count)).detach(),
             "delete_candidate_after_point_cap_count": pts_xyz.new_tensor(float(delete_candidate_after_point_cap_count)).detach(),
@@ -8674,6 +8926,10 @@ class StructureRepairActuator(nn.Module):
             "full_cloud_amount_enabled": pts_xyz.new_tensor(float(full_cloud_amount_override_enabled)),
             "full_cloud_amount_input_points": pts_xyz.new_tensor(float(N)),
             "full_cloud_amount_selected_class": pts_xyz.new_tensor(float(algorithmic_amount_selected_class_value)),
+            "full_cloud_amount_action_log_prob": pts_xyz.new_tensor(float(algorithmic_amount_selector_selected_log_prob_value)),
+            "full_cloud_amount_action_temperature": pts_xyz.new_tensor(float(algorithmic_amount_temperature_value)),
+            "full_cloud_amount_action_entropy": pts_xyz.new_tensor(float(algorithmic_amount_selector_entropy_value)),
+            "full_cloud_amount_action_sample_mode": str(algorithmic_amount_action_sample_mode),
             "full_cloud_amount_bin": pts_xyz.new_tensor(float(algorithmic_amount_selected_bin_ratio_value)),
             "full_cloud_amount_residual_raw": (
                 algorithmic_amount_residual_raw
@@ -8831,6 +9087,12 @@ class StructureRepairActuator(nn.Module):
             "heuristic_where_score_mean": pts_xyz.new_tensor(float(last_hard_drop_trace.get("heuristic_where_score_mean", 0.0))),
             "heuristic_where_score_std": pts_xyz.new_tensor(float(last_hard_drop_trace.get("heuristic_where_score_std", 0.0))),
             "micro_quota_hit_block_count": pts_xyz.new_tensor(float(last_hard_drop_trace.get("micro_quota_hit_block_count", 0.0))),
+            "micro_min_selected_blocks": pts_xyz.new_tensor(float(last_hard_drop_trace.get("micro_min_selected_blocks", 0.0))),
+            "micro_candidate_block_count": pts_xyz.new_tensor(float(last_hard_drop_trace.get("micro_candidate_block_count", 0.0))),
+            "micro_min_blocks_satisfied": pts_xyz.new_tensor(float(bool(last_hard_drop_trace.get("micro_min_blocks_satisfied", False)))),
+            "micro_min_blocks_fallback_reason": str(last_hard_drop_trace.get("micro_min_blocks_fallback_reason", "")),
+            "macro_micro_hybrid_fallback": pts_xyz.new_tensor(float(bool(last_hard_drop_trace.get("macro_micro_hybrid_fallback", False)))),
+            "effective_where_mode": str(last_hard_drop_trace.get("effective_where_mode", last_hard_drop_trace.get("where_mode", ""))),
             "macro_disabled_reason": str(last_hard_drop_trace.get("macro_disabled_reason", "")),
             "delete_candidate_initial_count": pts_xyz.new_tensor(float(delete_candidate_initial_count)),
             "delete_candidate_after_point_cap_count": pts_xyz.new_tensor(float(delete_candidate_after_point_cap_count)),

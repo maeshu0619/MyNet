@@ -666,6 +666,61 @@ def _sparsepcgc_full_cloud_sequence_amount_best(args, sequence_name):
     return topk[0] if topk else None
 
 
+def _sparsepcgc_full_cloud_sequence_baseline_memory(args):
+    memory = getattr(args, "_sparsepcgc_full_cloud_sequence_baseline_memory", None)
+    if not isinstance(memory, OrderedDict):
+        memory = OrderedDict()
+        setattr(args, "_sparsepcgc_full_cloud_sequence_baseline_memory", memory)
+    return memory
+
+
+def _sparsepcgc_full_cloud_sequence_baseline_get(args, sequence_name):
+    memory = _sparsepcgc_full_cloud_sequence_baseline_memory(args)
+    entry = memory.get(_sparsepcgc_full_cloud_sequence_amount_key(sequence_name), None)
+    if not isinstance(entry, dict):
+        return None
+    value = finite_float_or_none(entry.get("baseline", None))
+    return float(value) if value is not None else None
+
+
+def _sparsepcgc_update_full_cloud_sequence_baseline(
+    args,
+    *,
+    sequence_name,
+    rd_score,
+    global_step,
+):
+    rd_score = finite_float_or_none(rd_score)
+    if rd_score is None:
+        return None
+    memory = _sparsepcgc_full_cloud_sequence_baseline_memory(args)
+    key = _sparsepcgc_full_cloud_sequence_amount_key(sequence_name)
+    entry = memory.get(key, None)
+    if not isinstance(entry, dict):
+        entry = {
+            "baseline": float(rd_score),
+            "count": 0,
+            "source_step": 0,
+        }
+    momentum = min(
+        max(float(getattr(args, "sparsepcgc_full_cloud_amount_sequence_baseline_momentum", 0.9)), 0.0),
+        0.9999,
+    )
+    prev = finite_float_or_none(entry.get("baseline", None))
+    if prev is None:
+        entry["baseline"] = float(rd_score)
+    else:
+        entry["baseline"] = float(momentum) * float(prev) + (1.0 - float(momentum)) * float(rd_score)
+    entry["count"] = int(case_int(entry.get("count", 0), 0)) + 1
+    entry["source_step"] = int(global_step) + 1
+    memory[key] = entry
+    memory.move_to_end(key)
+    max_entries = max(int(getattr(args, "episode_input_common_cache_max_entries", 0)), 256)
+    while len(memory) > max_entries:
+        memory.popitem(last=False)
+    return float(entry["baseline"])
+
+
 def _sparsepcgc_full_cloud_sequence_memory_seen_count(args, sequence_name, ratio):
     memory = _sparsepcgc_full_cloud_sequence_amount_memory(args)
     entry = memory.get(_sparsepcgc_full_cloud_sequence_amount_key(sequence_name), None)
@@ -1404,6 +1459,23 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
         "full_cloud_amount_wide_probe_due": False,
         "full_cloud_amount_wide_probe_actual_count": 0,
         "full_cloud_amount_sequence_memory_ratio": float("nan"),
+        "amount_learning_mode": str(
+            getattr(args, "sparsepcgc_full_cloud_amount_learning_mode", "network_selected_bandit")
+        ),
+        "selected_amount_class": -1,
+        "selected_amount_bin": float("nan"),
+        "selected_amount_ratio": float("nan"),
+        "selected_action_log_prob": float("nan"),
+        "amount_temperature": float("nan"),
+        "amount_rd_score": float("nan"),
+        "amount_policy_loss": 0.0,
+        "amount_value_loss": 0.0,
+        "amount_advantage": float("nan"),
+        "sequence_amount_baseline": float("nan"),
+        "amount_class_histogram": "",
+        "amount_max_class_rate": float("nan"),
+        "amount_selected_ratio_mean": float("nan"),
+        "amount_selected_ratio_std": float("nan"),
         "full_cloud_amount_entropy": float("nan"),
         "full_cloud_amount_entropy_loss": 0.0,
         "full_cloud_amount_residual_loss": 0.0,
@@ -1446,6 +1518,12 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
         "heuristic_where_score_mean": 0.0,
         "heuristic_where_score_std": 0.0,
         "micro_quota_hit_block_count": 0,
+        "micro_min_selected_blocks": 0,
+        "micro_candidate_block_count": 0,
+        "micro_min_blocks_satisfied": False,
+        "micro_min_blocks_fallback_reason": "",
+        "macro_micro_hybrid_fallback": False,
+        "effective_where_mode": "",
         "macro_disabled_reason": "",
         "full_cloud_amount_predicted_delta": float("nan"),
         "full_cloud_amount_actual_delta": float("nan"),
@@ -1501,9 +1579,43 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
     pred_per_amount = pred_per_amount[:class_count]
     ref = amount_logits
     bin_tensor = ref.new_tensor(list(bins[:class_count]))
-    selected_class = int(torch.argmax(amount_logits.detach()).item())
-    selected_class = min(max(selected_class, 0), class_count - 1)
+    learning_mode = str(
+        getattr(args, "sparsepcgc_full_cloud_amount_learning_mode", "network_selected_bandit")
+    ).strip().lower()
+    if learning_mode not in {"multi_actual_teacher", "network_selected_bandit"}:
+        learning_mode = "network_selected_bandit"
+    selected_class = case_int(
+        amount_terms.get("full_cloud_amount_selected_class", None),
+        int(torch.argmax(amount_logits.detach()).item()),
+    )
+    selected_class = min(max(int(selected_class), 0), class_count - 1)
     selected_bin = bin_tensor[selected_class]
+    action_sample_mode = str(
+        amount_terms.get(
+            "full_cloud_amount_action_sample_mode",
+            getattr(args, "sparsepcgc_full_cloud_amount_action_sample_mode", "categorical"),
+        )
+    ).strip().lower()
+    if action_sample_mode not in {"argmax", "categorical", "gumbel"}:
+        action_sample_mode = "categorical"
+    amount_temperature = case_float(
+        amount_terms.get(
+            "full_cloud_amount_action_temperature",
+            getattr(args, "sparsepcgc_full_cloud_amount_exploration_temperature", 1.0),
+        ),
+        1.0,
+    )
+    amount_temperature = max(float(amount_temperature), 1e-6)
+    policy_logits = amount_logits.float() / float(amount_temperature)
+    policy_log_probs = torch.log_softmax(policy_logits, dim=0)
+    policy_probs = torch.softmax(policy_logits, dim=0)
+    selected_log_prob_t = policy_log_probs[selected_class]
+    selected_action_log_prob = float(selected_log_prob_t.detach().cpu())
+    amount_entropy_t = -(policy_probs * policy_log_probs).sum()
+    amount_class_histogram = ",".join(
+        f"{float(value):.4f}" for value in policy_probs.detach().cpu().tolist()
+    )
+    amount_max_class_rate = float(policy_probs.detach().max().cpu()) if policy_probs.numel() > 0 else float("nan")
 
     residual_enable = bool(getattr(args, "sparsepcgc_full_cloud_amount_residual_enable", True))
     residual_max = min(
@@ -1586,6 +1698,15 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
                 and ((int(global_step) + 1) % int(wide_probe_interval) == 0)
             )
         )
+    )
+    diagnostic_sweep_interval = max(
+        int(getattr(args, "sparsepcgc_full_cloud_amount_diagnostic_sweep_interval", 0)),
+        0,
+    )
+    diagnostic_sweep_due = bool(
+        learning_mode == "network_selected_bandit"
+        and diagnostic_sweep_interval > 0
+        and ((int(global_step) + 1) % int(diagnostic_sweep_interval) == 0)
     )
     sequence_memory_enable = bool(
         getattr(args, "sparsepcgc_full_cloud_amount_sequence_memory_enable", True)
@@ -2158,7 +2279,15 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
     if selected_class > 0 and selected_candidate_key in candidate_specs:
         _append_actual_candidate(selected_candidate_key, "network_selected")
 
-    if use_enhanced_actual_selection:
+    if learning_mode == "network_selected_bandit":
+        if diagnostic_sweep_due or wide_probe_due:
+            diagnostic_key = _pick_uncertainty_candidate(set(actual_candidate_keys))
+            wide_keys = _pick_wide_probe_candidates(set(actual_candidate_keys))
+            if wide_keys:
+                diagnostic_key = wide_keys[0]
+            if diagnostic_key is not None:
+                _append_actual_candidate(diagnostic_key, "diagnostic_sweep")
+    elif use_enhanced_actual_selection:
         sequence_memory_best_key = None
         if isinstance(sequence_memory_best_entry, dict):
             best_ratio = sequence_memory_best_entry.get("ratio", float("nan"))
@@ -2314,6 +2443,7 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
             "full_cloud_drop_count": int(cand_drop_count),
             "drop_count": int(cand_drop_count),
             "where_mode": str(cand_where_trace.get("where_mode", where_mode if not is_noop else "noop")),
+            "effective_where_mode": str(cand_where_trace.get("effective_where_mode", cand_where_trace.get("where_mode", where_mode if not is_noop else "noop"))),
             "macro_ratio": case_float(cand_where_trace.get("macro_ratio", 0.0), 0.0),
             "micro_ratio": case_float(cand_where_trace.get("micro_ratio", 0.0), 0.0),
             "macro_selected_block_count": case_int(cand_where_trace.get("macro_selected_block_count", 0), 0),
@@ -2339,6 +2469,11 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
             "heuristic_where_score_mean": case_float(cand_where_trace.get("heuristic_where_score_mean", 0.0), 0.0),
             "heuristic_where_score_std": case_float(cand_where_trace.get("heuristic_where_score_std", 0.0), 0.0),
             "micro_quota_hit_block_count": case_int(cand_where_trace.get("micro_quota_hit_block_count", 0), 0),
+            "micro_min_selected_blocks": case_int(cand_where_trace.get("micro_min_selected_blocks", 0), 0),
+            "micro_candidate_block_count": case_int(cand_where_trace.get("micro_candidate_block_count", 0), 0),
+            "micro_min_blocks_satisfied": bool(cand_where_trace.get("micro_min_blocks_satisfied", False)),
+            "micro_min_blocks_fallback_reason": str(cand_where_trace.get("micro_min_blocks_fallback_reason", "")),
+            "macro_micro_hybrid_fallback": bool(cand_where_trace.get("macro_micro_hybrid_fallback", False)),
             "macro_disabled_reason": str(cand_where_trace.get("macro_disabled_reason", "")),
             "actual_percent": 0.0 if is_noop else float("nan"),
             "actual_raw_percent": 0.0 if is_noop else float("nan"),
@@ -2529,32 +2664,23 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
     raw_oracle_best_ratio = float("nan")
     raw_oracle_gap = float("nan")
     selected_is_raw_best = False
+    selected_is_best_value = False
+    oracle_gap_value = float("nan")
+    teacher_base_bin = 0.0
+    teacher_residual_target = 0.0
+    teacher_residual_clamped = False
 
     actual_nonnoop_rows = [row for row in actual_pool_rows if not bool(row.get("is_noop", False))]
     raw_actual_nonnoop_rows = [row for row in raw_actual_pool_rows if not bool(row.get("is_noop", False))]
+    best_row = None
     if actual_pool_rows and actual_nonnoop_rows:
         best_row = min(actual_pool_rows, key=lambda row: float(row.get("_teacher_score", float("inf"))))
-        best_score = float(best_row.get("_teacher_score", float("inf")))
-        teacher_row = best_row
-        teacher_row_key = str(best_row.get("_candidate_key", "0:0.000000"))
-        if best_score >= float(noop_margin):
-            teacher_class = 0
-            teacher_delta = 0.0
-            teacher_ratio_value = 0.0
-        else:
-            teacher_class = int(best_row.get("candidate_base_class", 0))
-            teacher_delta = float(best_row.get("actual_objective_percent", best_row.get("actual_percent", 0.0)))
-            teacher_ratio_value = float(best_row.get("final_ratio", 0.0))
         oracle_best_ratio = float(best_row.get("final_ratio", 0.0))
         oracle_best_actual_delta = float(best_row.get("actual_percent", 0.0))
         oracle_best_objective_delta = float(best_row.get("actual_objective_percent", best_row.get("actual_percent", 0.0)))
         if bool(best_row.get("is_noop", False)):
             oracle_best_actual_delta = 0.0
             oracle_best_objective_delta = 0.0
-        if isinstance(selected_row, dict):
-            selected_actual_delta = case_float(selected_row.get("actual_percent", float("nan")), float("nan"))
-            selected_objective_delta = case_float(selected_row.get("actual_objective_percent", float("nan")), float("nan"))
-            selected_score = case_float(selected_row.get("_teacher_score", float("nan")), float("nan"))
         if oracle_sweep_due and len(actual_nonnoop_rows) > 1:
             teacher_source = "actual_full_cloud_oracle_sweep"
         elif len(actual_nonnoop_rows) > 1:
@@ -2563,24 +2689,9 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
             teacher_source = "actual_full_cloud_single"
     elif surrogate_pool_rows:
         best_row = min(surrogate_pool_rows, key=lambda row: float(row.get("_surrogate_teacher_score", float("inf"))))
-        best_score = float(best_row.get("_surrogate_teacher_score", float("inf")))
-        teacher_row = best_row
-        teacher_row_key = str(best_row.get("_candidate_key", "0:0.000000"))
-        if best_score >= float(noop_margin):
-            teacher_class = 0
-            teacher_delta = 0.0
-            teacher_ratio_value = 0.0
-        else:
-            teacher_class = int(best_row.get("candidate_base_class", 0))
-            teacher_delta = float(best_row.get("surrogate_percent", 0.0))
-            teacher_ratio_value = float(best_row.get("final_ratio", 0.0))
         oracle_best_ratio = float(best_row.get("final_ratio", 0.0))
         oracle_best_actual_delta = float(best_row.get("surrogate_percent", 0.0))
         oracle_best_objective_delta = float(best_row.get("surrogate_percent", 0.0))
-        if isinstance(selected_row, dict):
-            selected_actual_delta = case_float(selected_row.get("surrogate_percent", float("nan")), float("nan"))
-            selected_objective_delta = case_float(selected_row.get("surrogate_percent", float("nan")), float("nan"))
-            selected_score = case_float(selected_row.get("_surrogate_teacher_score", float("nan")), float("nan"))
         teacher_source = "surrogate_fallback"
 
     if raw_actual_pool_rows and raw_actual_nonnoop_rows:
@@ -2591,130 +2702,6 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
             raw_oracle_gap = float(selected_raw_score - raw_best_score)
             selected_is_raw_best = bool(str(selected_candidate_key) == str(raw_best_row.get("_candidate_key", "")))
 
-    teacher_class = min(max(int(teacher_class), 0), class_count - 1)
-    teacher_base_bin = 0.0
-    teacher_residual_target = 0.0
-    teacher_residual_clamped = False
-    if teacher_class > 0 and teacher_ratio_value > 0.0:
-        if residual_teacher_mode == "nearest_bin":
-            teacher_class, teacher_base_bin, teacher_residual_target = _best_base_for_ratio(teacher_ratio_value)
-        else:
-            teacher_class = int(case_int(teacher_row.get("candidate_base_class", teacher_class), teacher_class)) if isinstance(teacher_row, dict) else teacher_class
-            teacher_class = min(max(int(teacher_class), 1), class_count - 1)
-            teacher_base_bin = float(
-                case_float(
-                    teacher_row.get("candidate_base_bin", float(bin_tensor.detach().flatten()[teacher_class].cpu()))
-                    if isinstance(teacher_row, dict)
-                    else float(bin_tensor.detach().flatten()[teacher_class].cpu()),
-                    float(bin_tensor.detach().flatten()[teacher_class].cpu()),
-                )
-            )
-            teacher_residual_target = float(teacher_ratio_value - teacher_base_bin)
-        unclamped_teacher_residual = float(teacher_residual_target)
-        if residual_enable:
-            teacher_residual_target = min(
-                max(float(teacher_residual_target), -float(residual_max)),
-                float(residual_max),
-            )
-            teacher_residual_clamped = abs(float(unclamped_teacher_residual) - float(teacher_residual_target)) > 1e-9
-        else:
-            teacher_residual_target = 0.0
-            teacher_residual_clamped = abs(float(unclamped_teacher_residual)) > 1e-9
-    else:
-        teacher_class = 0
-        teacher_base_bin = 0.0
-        teacher_residual_target = 0.0
-
-    for row in rows:
-        row["teacher_is_best"] = bool(str(row.get("_candidate_key", "")) == str(teacher_row_key))
-        row["teacher_label"] = int(teacher_class)
-        row["teacher_source"] = str(teacher_source)
-        row["teacher_residual"] = float(teacher_residual_target)
-        row["residual_teacher_clamped"] = bool(teacher_residual_clamped)
-
-    target = torch.tensor([teacher_class], device=amount_logits.device, dtype=torch.long)
-    cls_loss = torch.nn.functional.cross_entropy(amount_logits.view(1, -1).float(), target)
-
-    supervised_rows = [
-        row for row in actual_pool_rows
-        if math.isfinite(case_float(row.get("actual_objective_percent", float("nan")), float("nan")))
-    ]
-    supervised_source = "actual"
-    if not supervised_rows:
-        supervised_rows = [
-            row for row in surrogate_pool_rows
-            if math.isfinite(case_float(row.get("surrogate_percent", float("nan")), float("nan")))
-        ]
-        supervised_source = "surrogate"
-    unique_supervised_rows = OrderedDict()
-    for row in supervised_rows:
-        cls = int(row.get("candidate_base_class", 0))
-        if cls < 0 or cls >= class_count:
-            continue
-        score_value = case_float(
-            row.get("_teacher_score", row.get("_surrogate_teacher_score", float("nan"))),
-            float("inf"),
-        )
-        prev = unique_supervised_rows.get(cls, None)
-        prev_score = case_float(
-            prev.get("_teacher_score", prev.get("_surrogate_teacher_score", float("nan"))) if isinstance(prev, dict) else float("inf"),
-            float("inf"),
-        )
-        if prev is None or score_value < prev_score:
-            unique_supervised_rows[cls] = row
-    value_terms = []
-    for cls, row in unique_supervised_rows.items():
-        target_value = (
-            float(row.get("actual_objective_percent", float("nan")))
-            if supervised_source == "actual" and math.isfinite(case_float(row.get("actual_objective_percent", float("nan")), float("nan")))
-            else float(row.get("surrogate_percent", 0.0))
-        )
-        value_terms.append(
-            torch.nn.functional.smooth_l1_loss(
-                pred_per_amount[int(cls)],
-                ref.new_tensor(float(target_value)),
-            )
-        )
-    value_loss = torch.stack(value_terms).mean() if value_terms else ref.new_zeros(())
-
-    rank_terms = []
-    rank_rows = list(unique_supervised_rows.values())
-    margin = ref.new_tensor(0.1)
-    for good_row in rank_rows:
-        for bad_row in rank_rows:
-            good_cls = int(good_row.get("candidate_base_class", 0))
-            bad_cls = int(bad_row.get("candidate_base_class", 0))
-            if good_cls == bad_cls:
-                continue
-            good_score = case_float(
-                good_row.get("_teacher_score", good_row.get("_surrogate_teacher_score", float("nan"))),
-                float("nan"),
-            )
-            bad_score = case_float(
-                bad_row.get("_teacher_score", bad_row.get("_surrogate_teacher_score", float("nan"))),
-                float("nan"),
-            )
-            if not (math.isfinite(good_score) and math.isfinite(bad_score) and good_score + 1e-9 < bad_score):
-                continue
-            rank_terms.append(torch.relu(margin + pred_per_amount[good_cls] - pred_per_amount[bad_cls]))
-    rank_loss = torch.stack(rank_terms).mean() if rank_terms else ref.new_zeros(())
-
-    penalty_vector = ref.new_zeros((class_count,))
-    for cls in range(class_count):
-        if cls == 0:
-            continue
-        cand_ratio = float(bin_tensor.detach().flatten()[cls].cpu())
-        cand_geom_penalty, _ = _candidate_geometry_penalty(unique_count, 0, cand_ratio)
-        penalty_vector[cls] = float(cand_geom_penalty)
-    amount_prob = torch.softmax(amount_logits.float(), dim=0)
-    geom_loss_term = (amount_prob * penalty_vector.float()).sum().to(dtype=ref.dtype)
-
-    ratio_target = min(max(float(getattr(args, "sparsepcgc_full_cloud_amount_ratio_reg_target", 0.05)), 0.0), 0.05)
-    ratio_reg_loss = torch.relu(final_ratio - ref.new_tensor(float(ratio_target))).pow(2)
-    log_probs = torch.log_softmax(amount_logits.float(), dim=0)
-    noop_guard_loss = -log_probs[0] if teacher_class == 0 else ref.new_zeros(())
-    entropy = -(amount_prob * torch.log(amount_prob.clamp_min(1e-8))).sum()
-    entropy_norm = entropy / max(math.log(float(class_count)), 1e-6) if class_count > 1 else ref.new_zeros(())
     entropy_decay_steps = max(int(getattr(args, "sparsepcgc_full_cloud_amount_entropy_decay_steps", 2000)), 0)
     min_entropy_weight = max(
         float(getattr(args, "sparsepcgc_full_cloud_amount_min_entropy_weight", 0.001)),
@@ -2733,16 +2720,269 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
         float(min_entropy_weight),
         float(base_entropy_weight) * float(entropy_decay),
     )
+    entropy_norm = amount_entropy_t / max(math.log(float(class_count)), 1e-6) if class_count > 1 else ref.new_zeros(())
     entropy_loss = (1.0 - entropy_norm.to(dtype=ref.dtype))
+    cls_loss = ref.new_zeros(())
+    value_loss = ref.new_zeros(())
+    rank_loss = ref.new_zeros(())
+    geom_loss_term = ref.new_zeros(())
+    ratio_reg_loss = ref.new_zeros(())
+    noop_guard_loss = ref.new_zeros(())
     residual_loss = ref.new_zeros(())
-    if residual_enable and residual_loss_weight > 0.0 and teacher_class > 0:
-        residual_loss = torch.nn.functional.smooth_l1_loss(
-            pred_residual_t,
-            ref.new_tensor(float(teacher_residual_target)),
+    amount_policy_loss = ref.new_zeros(())
+    amount_rd_score_value = float("nan")
+    amount_advantage_value = float("nan")
+    debug_geom_cost_value = 0.0
+    sequence_baseline_value = _sparsepcgc_full_cloud_sequence_baseline_get(args, sequence_name)
+
+    if learning_mode == "network_selected_bandit":
+        selected_actual_objective = case_float(
+            selected_row.get("actual_objective_percent", float("nan")) if isinstance(selected_row, dict) else float("nan"),
+            float("nan"),
         )
+        selected_surrogate_objective = case_float(
+            selected_row.get("surrogate_percent", float("nan")) if isinstance(selected_row, dict) else float("nan"),
+            float("nan"),
+        )
+        selected_geom_cost = case_float(
+            selected_row.get("geom_loss", 0.0) if isinstance(selected_row, dict) else 0.0,
+            0.0,
+        )
+        debug_geom_cost_value = float(selected_geom_cost)
+        selected_ratio_cost = float(selected_ratio_value)
+        observed_objective = (
+            selected_actual_objective
+            if math.isfinite(selected_actual_objective)
+            else selected_surrogate_objective
+        )
+        if not math.isfinite(observed_objective):
+            observed_objective = 0.0
+        amount_rd_score_value = (
+            float(observed_objective)
+            + float(getattr(args, "sparsepcgc_full_cloud_amount_geom_cost_weight", 0.0)) * float(selected_geom_cost)
+            + float(getattr(args, "sparsepcgc_full_cloud_amount_ratio_cost_weight", 0.05)) * float(selected_ratio_cost)
+        )
+        if sequence_baseline_value is None or not math.isfinite(sequence_baseline_value):
+            sequence_baseline_value = float(amount_rd_score_value)
+        advantage_t = ref.new_tensor(-(float(amount_rd_score_value) - float(sequence_baseline_value)))
+        amount_advantage_value = float(advantage_t.detach().cpu())
+        value_loss = torch.nn.functional.smooth_l1_loss(
+            pred_per_amount[int(selected_class)],
+            ref.new_tensor(float(amount_rd_score_value)),
+        )
+        if action_sample_mode == "argmax":
+            amount_policy_loss = ref.new_zeros(())
+        else:
+            amount_policy_loss = -(selected_log_prob_t.to(dtype=ref.dtype) * advantage_t.detach())
+        if (
+            isinstance(selected_row, dict)
+            and bool(selected_row.get("actual_finished", False))
+            and math.isfinite(selected_actual_objective)
+        ):
+            updated_baseline = _sparsepcgc_update_full_cloud_sequence_baseline(
+                args,
+                sequence_name=sequence_name,
+                rd_score=amount_rd_score_value,
+                global_step=global_step,
+            )
+            if updated_baseline is not None:
+                sequence_baseline_value = float(updated_baseline)
+        teacher_row = selected_row if isinstance(selected_row, dict) else teacher_row
+        teacher_row_key = str(selected_candidate_key)
+        teacher_class = int(selected_class)
+        teacher_ratio_value = float(selected_ratio_value)
+        teacher_base_bin = float(selected_bin.detach().cpu())
+        teacher_residual_target = float(pred_residual_float) if residual_enable and selected_class > 0 else 0.0
+        teacher_source = (
+            "bandit_selected_actual"
+            if isinstance(selected_row, dict)
+            and bool(selected_row.get("actual_finished", False))
+            and math.isfinite(selected_actual_objective)
+            else "bandit_selected_surrogate"
+        )
+        selected_is_best_value = bool(
+            isinstance(best_row, dict)
+            and str(best_row.get("_candidate_key", "")) == str(selected_candidate_key)
+        ) if best_row is not None else True
+        oracle_gap_value = float("nan")
+        if isinstance(best_row, dict) and math.isfinite(selected_score):
+            best_teacher_score = case_float(
+                best_row.get("_teacher_score", best_row.get("_surrogate_teacher_score", float("nan"))),
+                float("nan"),
+            )
+            if math.isfinite(best_teacher_score):
+                oracle_gap_value = float(selected_score - best_teacher_score)
+    else:
+        if actual_pool_rows and actual_nonnoop_rows:
+            best_score = float(best_row.get("_teacher_score", float("inf"))) if isinstance(best_row, dict) else float("inf")
+            teacher_row = best_row
+            teacher_row_key = str(best_row.get("_candidate_key", "0:0.000000")) if isinstance(best_row, dict) else "0:0.000000"
+            if best_score >= float(noop_margin):
+                teacher_class = 0
+                teacher_delta = 0.0
+                teacher_ratio_value = 0.0
+            else:
+                teacher_class = int(best_row.get("candidate_base_class", 0))
+                teacher_delta = float(best_row.get("actual_objective_percent", best_row.get("actual_percent", 0.0)))
+                teacher_ratio_value = float(best_row.get("final_ratio", 0.0))
+            if isinstance(selected_row, dict):
+                selected_actual_delta = case_float(selected_row.get("actual_percent", float("nan")), float("nan"))
+                selected_objective_delta = case_float(selected_row.get("actual_objective_percent", float("nan")), float("nan"))
+                selected_score = case_float(selected_row.get("_teacher_score", float("nan")), float("nan"))
+        elif surrogate_pool_rows:
+            teacher_row = best_row
+            teacher_row_key = str(best_row.get("_candidate_key", "0:0.000000")) if isinstance(best_row, dict) else "0:0.000000"
+            best_score = float(best_row.get("_surrogate_teacher_score", float("inf"))) if isinstance(best_row, dict) else float("inf")
+            if best_score >= float(noop_margin):
+                teacher_class = 0
+                teacher_delta = 0.0
+                teacher_ratio_value = 0.0
+            else:
+                teacher_class = int(best_row.get("candidate_base_class", 0))
+                teacher_delta = float(best_row.get("surrogate_percent", 0.0))
+                teacher_ratio_value = float(best_row.get("final_ratio", 0.0))
+            if isinstance(selected_row, dict):
+                selected_actual_delta = case_float(selected_row.get("surrogate_percent", float("nan")), float("nan"))
+                selected_objective_delta = case_float(selected_row.get("surrogate_percent", float("nan")), float("nan"))
+                selected_score = case_float(selected_row.get("_surrogate_teacher_score", float("nan")), float("nan"))
+
+        teacher_class = min(max(int(teacher_class), 0), class_count - 1)
+        if teacher_class > 0 and teacher_ratio_value > 0.0:
+            if residual_teacher_mode == "nearest_bin":
+                teacher_class, teacher_base_bin, teacher_residual_target = _best_base_for_ratio(teacher_ratio_value)
+            else:
+                teacher_class = int(case_int(teacher_row.get("candidate_base_class", teacher_class), teacher_class)) if isinstance(teacher_row, dict) else teacher_class
+                teacher_class = min(max(int(teacher_class), 1), class_count - 1)
+                teacher_base_bin = float(
+                    case_float(
+                        teacher_row.get("candidate_base_bin", float(bin_tensor.detach().flatten()[teacher_class].cpu()))
+                        if isinstance(teacher_row, dict)
+                        else float(bin_tensor.detach().flatten()[teacher_class].cpu()),
+                        float(bin_tensor.detach().flatten()[teacher_class].cpu()),
+                    )
+                )
+                teacher_residual_target = float(teacher_ratio_value - teacher_base_bin)
+            unclamped_teacher_residual = float(teacher_residual_target)
+            if residual_enable:
+                teacher_residual_target = min(
+                    max(float(teacher_residual_target), -float(residual_max)),
+                    float(residual_max),
+                )
+                teacher_residual_clamped = abs(float(unclamped_teacher_residual) - float(teacher_residual_target)) > 1e-9
+            else:
+                teacher_residual_target = 0.0
+                teacher_residual_clamped = abs(float(unclamped_teacher_residual)) > 1e-9
+        else:
+            teacher_class = 0
+            teacher_base_bin = 0.0
+            teacher_residual_target = 0.0
+
+        target = torch.tensor([teacher_class], device=amount_logits.device, dtype=torch.long)
+        cls_loss = torch.nn.functional.cross_entropy(amount_logits.view(1, -1).float(), target)
+
+        supervised_rows = [
+            row for row in actual_pool_rows
+            if math.isfinite(case_float(row.get("actual_objective_percent", float("nan")), float("nan")))
+        ]
+        supervised_source = "actual"
+        if not supervised_rows:
+            supervised_rows = [
+                row for row in surrogate_pool_rows
+                if math.isfinite(case_float(row.get("surrogate_percent", float("nan")), float("nan")))
+            ]
+            supervised_source = "surrogate"
+        unique_supervised_rows = OrderedDict()
+        for row in supervised_rows:
+            cls = int(row.get("candidate_base_class", 0))
+            if cls < 0 or cls >= class_count:
+                continue
+            score_value = case_float(
+                row.get("_teacher_score", row.get("_surrogate_teacher_score", float("nan"))),
+                float("inf"),
+            )
+            prev = unique_supervised_rows.get(cls, None)
+            prev_score = case_float(
+                prev.get("_teacher_score", prev.get("_surrogate_teacher_score", float("nan"))) if isinstance(prev, dict) else float("inf"),
+                float("inf"),
+            )
+            if prev is None or score_value < prev_score:
+                unique_supervised_rows[cls] = row
+        value_terms = []
+        for cls, row in unique_supervised_rows.items():
+            target_value = (
+                float(row.get("actual_objective_percent", float("nan")))
+                if supervised_source == "actual" and math.isfinite(case_float(row.get("actual_objective_percent", float("nan")), float("nan")))
+                else float(row.get("surrogate_percent", 0.0))
+            )
+            value_terms.append(
+                torch.nn.functional.smooth_l1_loss(
+                    pred_per_amount[int(cls)],
+                    ref.new_tensor(float(target_value)),
+                )
+            )
+        value_loss = torch.stack(value_terms).mean() if value_terms else ref.new_zeros(())
+
+        rank_terms = []
+        rank_rows = list(unique_supervised_rows.values())
+        margin = ref.new_tensor(0.1)
+        for good_row in rank_rows:
+            for bad_row in rank_rows:
+                good_cls = int(good_row.get("candidate_base_class", 0))
+                bad_cls = int(bad_row.get("candidate_base_class", 0))
+                if good_cls == bad_cls:
+                    continue
+                good_score = case_float(
+                    good_row.get("_teacher_score", good_row.get("_surrogate_teacher_score", float("nan"))),
+                    float("nan"),
+                )
+                bad_score = case_float(
+                    bad_row.get("_teacher_score", bad_row.get("_surrogate_teacher_score", float("nan"))),
+                    float("nan"),
+                )
+                if not (math.isfinite(good_score) and math.isfinite(bad_score) and good_score + 1e-9 < bad_score):
+                    continue
+                rank_terms.append(torch.relu(margin + pred_per_amount[good_cls] - pred_per_amount[bad_cls]))
+        rank_loss = torch.stack(rank_terms).mean() if rank_terms else ref.new_zeros(())
+
+        penalty_vector = ref.new_zeros((class_count,))
+        for cls in range(class_count):
+            if cls == 0:
+                continue
+            cand_ratio = float(bin_tensor.detach().flatten()[cls].cpu())
+            cand_geom_penalty, _ = _candidate_geometry_penalty(unique_count, 0, cand_ratio)
+            penalty_vector[cls] = float(cand_geom_penalty)
+        geom_loss_term = (policy_probs * penalty_vector.float()).sum().to(dtype=ref.dtype)
+        debug_geom_cost_value = float(geom_loss_term.detach().cpu())
+
+        ratio_target = min(max(float(getattr(args, "sparsepcgc_full_cloud_amount_ratio_reg_target", 0.05)), 0.0), 0.05)
+        ratio_reg_loss = torch.relu(final_ratio - ref.new_tensor(float(ratio_target))).pow(2)
+        noop_guard_loss = -policy_log_probs[0] if teacher_class == 0 else ref.new_zeros(())
+        if residual_enable and residual_loss_weight > 0.0 and teacher_class > 0:
+            residual_loss = torch.nn.functional.smooth_l1_loss(
+                pred_residual_t,
+                ref.new_tensor(float(teacher_residual_target)),
+            )
+        amount_policy_loss = ref.new_zeros(())
+        selected_is_best_value = bool(str(selected_candidate_key) == str(teacher_row_key))
+        oracle_gap_value = float("nan")
+        if isinstance(teacher_row, dict) and math.isfinite(selected_score):
+            best_teacher_score = case_float(
+                teacher_row.get("_teacher_score", teacher_row.get("_surrogate_teacher_score", float("nan"))),
+                float("nan"),
+            )
+            if math.isfinite(best_teacher_score):
+                oracle_gap_value = float(selected_score - best_teacher_score)
+
+    for row in rows:
+        row["teacher_is_best"] = bool(str(row.get("_candidate_key", "")) == str(teacher_row_key))
+        row["teacher_label"] = int(teacher_class)
+        row["teacher_source"] = str(teacher_source)
+        row["teacher_residual"] = float(teacher_residual_target)
+        row["residual_teacher_clamped"] = bool(teacher_residual_clamped)
 
     total_loss = (
         float(getattr(args, "sparsepcgc_full_cloud_amount_cls_loss_weight", 1.0)) * cls_loss
+        + float(getattr(args, "sparsepcgc_full_cloud_amount_policy_loss_weight", 1.0)) * amount_policy_loss
         + float(getattr(args, "sparsepcgc_full_cloud_amount_value_loss_weight", 0.5)) * value_loss
         + float(getattr(args, "sparsepcgc_full_cloud_amount_rank_loss_weight", 0.2)) * rank_loss
         + float(getattr(args, "sparsepcgc_full_cloud_amount_geom_penalty_weight", 0.1)) * geom_loss_term
@@ -2779,15 +3019,6 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
         and bool(row.get("is_wide_probe", False))
         and math.isfinite(case_float(row.get("actual_objective_percent", float("nan")), float("nan")))
     )
-    selected_is_best = bool(str(selected_candidate_key) == str(teacher_row_key))
-    oracle_gap = float("nan")
-    if isinstance(teacher_row, dict) and math.isfinite(case_float(selected_score, float("nan"))):
-        best_teacher_score = case_float(
-            teacher_row.get("_teacher_score", teacher_row.get("_surrogate_teacher_score", float("nan"))),
-            float("nan"),
-        )
-        if math.isfinite(best_teacher_score):
-            oracle_gap = float(selected_score - best_teacher_score)
     residual_error = float("nan")
     if teacher_class > 0 and residual_enable:
         residual_error = float(abs(pred_residual_float - float(teacher_residual_target)))
@@ -2796,8 +3027,8 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
         selected_where_row = {}
 
     for row in rows:
-        row["selected_is_best"] = bool(selected_is_best)
-        row["oracle_gap"] = float(oracle_gap)
+        row["selected_is_best"] = bool(selected_is_best_value)
+        row["oracle_gap"] = float(oracle_gap_value)
         if teacher_class > 0 and residual_enable:
             row["residual_error"] = float(abs(float(row.get("predicted_residual", 0.0)) - float(teacher_residual_target)))
 
@@ -2828,8 +3059,8 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
             "full_cloud_amount_selected_ratio": float(selected_ratio_value),
             "full_cloud_amount_selected_actual_delta": float(selected_actual_delta),
             "full_cloud_amount_selected_objective_delta": float(selected_objective_delta),
-            "full_cloud_amount_oracle_gap": float(oracle_gap),
-            "full_cloud_amount_selected_is_best": bool(selected_is_best),
+            "full_cloud_amount_oracle_gap": float(oracle_gap_value),
+            "full_cloud_amount_selected_is_best": bool(selected_is_best_value),
             "full_cloud_amount_selected_is_raw_best": bool(selected_is_raw_best),
             "full_cloud_amount_raw_oracle_gap": float(raw_oracle_gap),
             "full_cloud_amount_actual_finished_nonselected_count": int(actual_finished_nonselected_count),
@@ -2840,7 +3071,23 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
                 if isinstance(sequence_memory_best_entry, dict)
                 else float("nan")
             ),
+            "amount_learning_mode": str(learning_mode),
+            "selected_amount_class": int(selected_class),
+            "selected_amount_bin": float(selected_bin.detach().cpu()),
+            "selected_amount_ratio": float(selected_ratio_value),
+            "selected_action_log_prob": float(selected_action_log_prob),
+            "amount_temperature": float(amount_temperature),
+            "amount_rd_score": float(amount_rd_score_value),
+            "amount_policy_loss": float(amount_policy_loss.detach().cpu()),
+            "amount_value_loss": float(value_loss.detach().cpu()),
+            "amount_advantage": float(amount_advantage_value),
+            "sequence_amount_baseline": float(sequence_baseline_value) if sequence_baseline_value is not None else float("nan"),
+            "amount_class_histogram": str(amount_class_histogram),
+            "amount_max_class_rate": float(amount_max_class_rate),
+            "amount_selected_ratio_mean": float(selected_ratio_value),
+            "amount_selected_ratio_std": 0.0,
             "where_mode": str(selected_where_row.get("where_mode", where_mode)),
+            "effective_where_mode": str(selected_where_row.get("effective_where_mode", selected_where_row.get("where_mode", where_mode))),
             "macro_ratio": case_float(selected_where_row.get("macro_ratio", 0.0), 0.0),
             "micro_ratio": case_float(selected_where_row.get("micro_ratio", 0.0), 0.0),
             "macro_selected_block_count": case_int(selected_where_row.get("macro_selected_block_count", 0), 0),
@@ -2866,8 +3113,13 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
             "heuristic_where_score_mean": case_float(selected_where_row.get("heuristic_where_score_mean", 0.0), 0.0),
             "heuristic_where_score_std": case_float(selected_where_row.get("heuristic_where_score_std", 0.0), 0.0),
             "micro_quota_hit_block_count": case_int(selected_where_row.get("micro_quota_hit_block_count", 0), 0),
+            "micro_min_selected_blocks": case_int(selected_where_row.get("micro_min_selected_blocks", 0), 0),
+            "micro_candidate_block_count": case_int(selected_where_row.get("micro_candidate_block_count", 0), 0),
+            "micro_min_blocks_satisfied": bool(selected_where_row.get("micro_min_blocks_satisfied", False)),
+            "micro_min_blocks_fallback_reason": str(selected_where_row.get("micro_min_blocks_fallback_reason", "")),
+            "macro_micro_hybrid_fallback": bool(selected_where_row.get("macro_micro_hybrid_fallback", False)),
             "macro_disabled_reason": str(selected_where_row.get("macro_disabled_reason", "")),
-            "full_cloud_amount_entropy": float(entropy.detach().cpu()),
+            "full_cloud_amount_entropy": float(amount_entropy_t.detach().cpu()),
             "full_cloud_amount_entropy_loss": float(entropy_loss.detach().cpu()),
             "full_cloud_amount_residual_loss": float(residual_loss.detach().cpu()),
             "full_cloud_amount_residual_error": float(residual_error),
@@ -2888,7 +3140,7 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
             "full_cloud_amount_actual_delta": float(selected_actual_delta),
             "full_cloud_amount_actual_objective_delta": float(selected_objective_delta),
             "full_cloud_amount_surrogate_delta": selected_surrogate,
-            "full_cloud_amount_geom_loss": float(geom_loss_term.detach().cpu()),
+            "full_cloud_amount_geom_loss": float(debug_geom_cost_value),
             "full_cloud_amount_cls_loss": float(cls_loss.detach().cpu()),
             "full_cloud_amount_value_loss": float(value_loss.detach().cpu()),
             "full_cloud_amount_rank_loss": float(rank_loss.detach().cpu()),
@@ -16024,6 +16276,29 @@ def train(model, args, loss, writer, plot, notifier=None):
                             "_wide_probe_actual_count_count": 0,
                             "_sequence_memory_ratio_sum": 0.0,
                             "_sequence_memory_ratio_count": 0,
+                            "_amount_rd_score_sum": 0.0,
+                            "_amount_rd_score_count": 0,
+                            "_amount_temperature_sum": 0.0,
+                            "_amount_temperature_count": 0,
+                            "_sequence_amount_baseline_sum": 0.0,
+                            "_sequence_amount_baseline_count": 0,
+                            "_selected_action_log_prob_sum": 0.0,
+                            "_selected_action_log_prob_count": 0,
+                            "_amount_entropy_sum": 0.0,
+                            "_amount_entropy_count": 0,
+                            "_amount_policy_loss_sum": 0.0,
+                            "_amount_policy_loss_count": 0,
+                            "_amount_value_loss_sum": 0.0,
+                            "_amount_value_loss_count": 0,
+                            "_amount_advantage_sum": 0.0,
+                            "_amount_advantage_count": 0,
+                            "_selected_amount_class_sum": 0.0,
+                            "_selected_amount_class_count": 0,
+                            "_amount_max_class_rate_sum": 0.0,
+                            "_amount_max_class_rate_count": 0,
+                            "_selected_ratio_sq_sum": 0.0,
+                            "_selected_ratio_sq_count": 0,
+                            "_amount_class_histogram_last": "",
                         }
                         episode_sequence_summary[sequence_name] = seq_summary
                     seq_summary["step_count"] += 1
@@ -16055,6 +16330,8 @@ def train(model, args, loss, writer, plot, notifier=None):
                     if math.isfinite(row_selected_ratio):
                         seq_summary["_selected_ratio_sum"] += float(row_selected_ratio)
                         seq_summary["_selected_ratio_count"] += 1
+                        seq_summary["_selected_ratio_sq_sum"] += float(row_selected_ratio) * float(row_selected_ratio)
+                        seq_summary["_selected_ratio_sq_count"] += 1
                     row_teacher_ratio = case_float(
                         compression_metric_row.get("full_cloud_amount_teacher_ratio", float("nan")),
                         float("nan"),
@@ -16115,6 +16392,79 @@ def train(model, args, loss, writer, plot, notifier=None):
                     if math.isfinite(row_sequence_memory_ratio):
                         seq_summary["_sequence_memory_ratio_sum"] += float(row_sequence_memory_ratio)
                         seq_summary["_sequence_memory_ratio_count"] += 1
+                    row_amount_rd_score = case_float(
+                        compression_metric_row.get("amount_rd_score", float("nan")),
+                        float("nan"),
+                    )
+                    if math.isfinite(row_amount_rd_score):
+                        seq_summary["_amount_rd_score_sum"] += float(row_amount_rd_score)
+                        seq_summary["_amount_rd_score_count"] += 1
+                    row_amount_temperature = case_float(
+                        compression_metric_row.get("amount_temperature", float("nan")),
+                        float("nan"),
+                    )
+                    if math.isfinite(row_amount_temperature):
+                        seq_summary["_amount_temperature_sum"] += float(row_amount_temperature)
+                        seq_summary["_amount_temperature_count"] += 1
+                    row_sequence_baseline = case_float(
+                        compression_metric_row.get("sequence_amount_baseline", float("nan")),
+                        float("nan"),
+                    )
+                    if math.isfinite(row_sequence_baseline):
+                        seq_summary["_sequence_amount_baseline_sum"] += float(row_sequence_baseline)
+                        seq_summary["_sequence_amount_baseline_count"] += 1
+                    row_selected_log_prob = case_float(
+                        compression_metric_row.get("selected_action_log_prob", float("nan")),
+                        float("nan"),
+                    )
+                    if math.isfinite(row_selected_log_prob):
+                        seq_summary["_selected_action_log_prob_sum"] += float(row_selected_log_prob)
+                        seq_summary["_selected_action_log_prob_count"] += 1
+                    row_amount_entropy = case_float(
+                        compression_metric_row.get("full_cloud_amount_entropy", float("nan")),
+                        float("nan"),
+                    )
+                    if math.isfinite(row_amount_entropy):
+                        seq_summary["_amount_entropy_sum"] += float(row_amount_entropy)
+                        seq_summary["_amount_entropy_count"] += 1
+                    row_amount_policy_loss = case_float(
+                        compression_metric_row.get("amount_policy_loss", float("nan")),
+                        float("nan"),
+                    )
+                    if math.isfinite(row_amount_policy_loss):
+                        seq_summary["_amount_policy_loss_sum"] += float(row_amount_policy_loss)
+                        seq_summary["_amount_policy_loss_count"] += 1
+                    row_amount_value_loss = case_float(
+                        compression_metric_row.get("amount_value_loss", float("nan")),
+                        float("nan"),
+                    )
+                    if math.isfinite(row_amount_value_loss):
+                        seq_summary["_amount_value_loss_sum"] += float(row_amount_value_loss)
+                        seq_summary["_amount_value_loss_count"] += 1
+                    row_amount_advantage = case_float(
+                        compression_metric_row.get("amount_advantage", float("nan")),
+                        float("nan"),
+                    )
+                    if math.isfinite(row_amount_advantage):
+                        seq_summary["_amount_advantage_sum"] += float(row_amount_advantage)
+                        seq_summary["_amount_advantage_count"] += 1
+                    row_selected_amount_class = case_float(
+                        compression_metric_row.get("selected_amount_class", float("nan")),
+                        float("nan"),
+                    )
+                    if math.isfinite(row_selected_amount_class):
+                        seq_summary["_selected_amount_class_sum"] += float(row_selected_amount_class)
+                        seq_summary["_selected_amount_class_count"] += 1
+                    row_amount_max_class_rate = case_float(
+                        compression_metric_row.get("amount_max_class_rate", float("nan")),
+                        float("nan"),
+                    )
+                    if math.isfinite(row_amount_max_class_rate):
+                        seq_summary["_amount_max_class_rate_sum"] += float(row_amount_max_class_rate)
+                        seq_summary["_amount_max_class_rate_count"] += 1
+                    seq_summary["_amount_class_histogram_last"] = str(
+                        compression_metric_row.get("amount_class_histogram", "")
+                    )
                 maybe_record_case_debug( args, writer, case_debug_path, case_debug_counts, global_step=global_train_step, episode=episode, epoch=epoch, step=step, file_path=file_path, comp_debug=comp_debug, structure_debug=structure_debug, edit_stats=train_edit_stats, L=L, L_geom=L_geom, L_com=L_com, L_actuator=L_actuator) # 圧縮改善が良いケース・悪いケースを条件に応じてCase Debag CSVへ保存
 
                 """損失ログの記録"""
@@ -16388,6 +16738,70 @@ def train(model, args, loss, writer, plot, notifier=None):
                         "wide_probe_actual_count": (
                             seq_summary["_wide_probe_actual_count_sum"] / max(seq_summary["_wide_probe_actual_count_count"], 1)
                             if int(seq_summary.get("_wide_probe_actual_count_count", 0)) > 0
+                            else None
+                        ),
+                        "mean_amount_rd_score": (
+                            seq_summary["_amount_rd_score_sum"] / max(seq_summary["_amount_rd_score_count"], 1)
+                            if int(seq_summary.get("_amount_rd_score_count", 0)) > 0
+                            else None
+                        ),
+                        "mean_amount_temperature": (
+                            seq_summary["_amount_temperature_sum"] / max(seq_summary["_amount_temperature_count"], 1)
+                            if int(seq_summary.get("_amount_temperature_count", 0)) > 0
+                            else None
+                        ),
+                        "mean_sequence_amount_baseline": (
+                            seq_summary["_sequence_amount_baseline_sum"] / max(seq_summary["_sequence_amount_baseline_count"], 1)
+                            if int(seq_summary.get("_sequence_amount_baseline_count", 0)) > 0
+                            else None
+                        ),
+                        "mean_selected_action_log_prob": (
+                            seq_summary["_selected_action_log_prob_sum"] / max(seq_summary["_selected_action_log_prob_count"], 1)
+                            if int(seq_summary.get("_selected_action_log_prob_count", 0)) > 0
+                            else None
+                        ),
+                        "mean_amount_entropy": (
+                            seq_summary["_amount_entropy_sum"] / max(seq_summary["_amount_entropy_count"], 1)
+                            if int(seq_summary.get("_amount_entropy_count", 0)) > 0
+                            else None
+                        ),
+                        "mean_amount_policy_loss": (
+                            seq_summary["_amount_policy_loss_sum"] / max(seq_summary["_amount_policy_loss_count"], 1)
+                            if int(seq_summary.get("_amount_policy_loss_count", 0)) > 0
+                            else None
+                        ),
+                        "mean_amount_value_loss": (
+                            seq_summary["_amount_value_loss_sum"] / max(seq_summary["_amount_value_loss_count"], 1)
+                            if int(seq_summary.get("_amount_value_loss_count", 0)) > 0
+                            else None
+                        ),
+                        "mean_amount_advantage": (
+                            seq_summary["_amount_advantage_sum"] / max(seq_summary["_amount_advantage_count"], 1)
+                            if int(seq_summary.get("_amount_advantage_count", 0)) > 0
+                            else None
+                        ),
+                        "mean_selected_amount_class": (
+                            seq_summary["_selected_amount_class_sum"] / max(seq_summary["_selected_amount_class_count"], 1)
+                            if int(seq_summary.get("_selected_amount_class_count", 0)) > 0
+                            else None
+                        ),
+                        "amount_class_histogram_last": str(seq_summary.get("_amount_class_histogram_last", "")),
+                        "amount_max_class_rate_mean": (
+                            seq_summary["_amount_max_class_rate_sum"] / max(seq_summary["_amount_max_class_rate_count"], 1)
+                            if int(seq_summary.get("_amount_max_class_rate_count", 0)) > 0
+                            else None
+                        ),
+                        "amount_selected_ratio_std": (
+                            math.sqrt(
+                                max(
+                                    0.0,
+                                    seq_summary["_selected_ratio_sq_sum"] / max(seq_summary["_selected_ratio_sq_count"], 1)
+                                    - (
+                                        seq_summary["_selected_ratio_sum"] / max(seq_summary["_selected_ratio_count"], 1)
+                                    ) ** 2,
+                                )
+                            )
+                            if int(seq_summary.get("_selected_ratio_sq_count", 0)) > 0
                             else None
                         ),
                     },

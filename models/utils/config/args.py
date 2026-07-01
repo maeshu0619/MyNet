@@ -1074,10 +1074,30 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--sparsepcgc_where_micro_min_selected_blocks', default=8, type=int)
     parser.add_argument('--sparsepcgc_where_micro_round_robin', default=True, type=str2bool)
     parser.add_argument('--sparsepcgc_where_micro_use_delete_prior', default=True, type=str2bool)
+    parser.add_argument(
+        '--sparsepcgc_full_cloud_amount_learning_mode',
+        default='network_selected_bandit',
+        choices=['multi_actual_teacher', 'network_selected_bandit'],
+        type=str,
+    )
+    parser.add_argument(
+        '--sparsepcgc_full_cloud_amount_action_sample_mode',
+        default='categorical',
+        choices=['argmax', 'categorical', 'gumbel'],
+        type=str,
+    )
+    parser.add_argument('--sparsepcgc_full_cloud_amount_exploration_temperature', default=1.0, type=float)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_temperature_decay_steps', default=3000, type=int)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_min_temperature', default=0.3, type=float)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_diagnostic_sweep_interval', default=0, type=int)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_geom_cost_weight', default=0.0, type=float)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_ratio_cost_weight', default=0.05, type=float)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_sequence_baseline_momentum', default=0.9, type=float)
     parser.add_argument('--sparsepcgc_full_cloud_amount_geometry_mode', default='sampled', choices=['off', 'sampled', 'interval_full'], type=str)
     parser.add_argument('--sparsepcgc_full_cloud_amount_geom_sample_points', default=20000, type=int)
     parser.add_argument('--sparsepcgc_full_cloud_amount_geom_interval', default=20, type=int)
     parser.add_argument('--sparsepcgc_full_cloud_amount_cls_loss_weight', default=1.0, type=float)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_policy_loss_weight', default=1.0, type=float)
     parser.add_argument('--sparsepcgc_full_cloud_amount_value_loss_weight', default=0.5, type=float)
     parser.add_argument('--sparsepcgc_full_cloud_amount_rank_loss_weight', default=0.2, type=float)
     parser.add_argument('--sparsepcgc_full_cloud_amount_geom_penalty_weight', default=0.1, type=float)
@@ -4773,11 +4793,60 @@ def parse_pugan_args(parser, file_day, file_time):
     args.sparsepcgc_where_micro_use_delete_prior = bool(
         getattr(args, "sparsepcgc_where_micro_use_delete_prior", True)
     )
+    args.sparsepcgc_full_cloud_amount_learning_mode = str(
+        getattr(args, "sparsepcgc_full_cloud_amount_learning_mode", "network_selected_bandit")
+    ).strip().lower()
+    if args.sparsepcgc_full_cloud_amount_learning_mode not in {
+        "multi_actual_teacher",
+        "network_selected_bandit",
+    }:
+        args.sparsepcgc_full_cloud_amount_learning_mode = "network_selected_bandit"
+    args.sparsepcgc_full_cloud_amount_action_sample_mode = str(
+        getattr(args, "sparsepcgc_full_cloud_amount_action_sample_mode", "categorical")
+    ).strip().lower()
+    if args.sparsepcgc_full_cloud_amount_action_sample_mode not in {
+        "argmax",
+        "categorical",
+        "gumbel",
+    }:
+        args.sparsepcgc_full_cloud_amount_action_sample_mode = "categorical"
+    args.sparsepcgc_full_cloud_amount_exploration_temperature = min(
+        max(float(getattr(args, "sparsepcgc_full_cloud_amount_exploration_temperature", 1.0)), 0.05),
+        10.0,
+    )
+    args.sparsepcgc_full_cloud_amount_temperature_decay_steps = max(
+        int(getattr(args, "sparsepcgc_full_cloud_amount_temperature_decay_steps", 3000)),
+        0,
+    )
+    args.sparsepcgc_full_cloud_amount_min_temperature = min(
+        max(float(getattr(args, "sparsepcgc_full_cloud_amount_min_temperature", 0.3)), 0.01),
+        float(args.sparsepcgc_full_cloud_amount_exploration_temperature),
+    )
+    args.sparsepcgc_full_cloud_amount_diagnostic_sweep_interval = max(
+        int(getattr(args, "sparsepcgc_full_cloud_amount_diagnostic_sweep_interval", 0)),
+        0,
+    )
+    args.sparsepcgc_full_cloud_amount_geom_cost_weight = max(
+        float(getattr(args, "sparsepcgc_full_cloud_amount_geom_cost_weight", 0.0)),
+        0.0,
+    )
+    args.sparsepcgc_full_cloud_amount_ratio_cost_weight = max(
+        float(getattr(args, "sparsepcgc_full_cloud_amount_ratio_cost_weight", 0.05)),
+        0.0,
+    )
+    args.sparsepcgc_full_cloud_amount_sequence_baseline_momentum = min(
+        max(float(getattr(args, "sparsepcgc_full_cloud_amount_sequence_baseline_momentum", 0.9)), 0.0),
+        0.9999,
+    )
     args.sparsepcgc_full_cloud_amount_use_surrogate_between_actual = bool(
         getattr(args, "sparsepcgc_full_cloud_amount_use_surrogate_between_actual", True)
     )
     args.sparsepcgc_full_cloud_amount_noop_margin = max(
         float(getattr(args, "sparsepcgc_full_cloud_amount_noop_margin", 0.0)),
+        0.0,
+    )
+    args.sparsepcgc_full_cloud_amount_policy_loss_weight = max(
+        float(getattr(args, "sparsepcgc_full_cloud_amount_policy_loss_weight", 1.0)),
         0.0,
     )
     args.sparsepcgc_full_cloud_amount_geometry_mode = str(

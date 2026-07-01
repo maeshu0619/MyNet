@@ -825,13 +825,29 @@ def log_compact_step_summary(
     full_cloud_amount_selected_objective_delta = _prefer_number("full_cloud_amount_selected_objective_delta")
     full_cloud_amount_oracle_best_objective_delta = _prefer_number("full_cloud_amount_oracle_best_objective_delta")
     full_cloud_amount_surrogate_delta = _prefer_number("full_cloud_amount_surrogate_delta")
+    full_cloud_amount_entropy = _prefer_number("full_cloud_amount_entropy")
     full_cloud_amount_residual_loss = _prefer_number("full_cloud_amount_residual_loss")
     full_cloud_amount_residual_enabled = _prefer_number("full_cloud_amount_residual_enabled", 0.0)
     full_cloud_amount_total_loss = _prefer_number("full_cloud_amount_total_loss")
     full_cloud_amount_actual_wall = _prefer_number("full_cloud_amount_actual_wall_time_total")
     full_cloud_amount_parallel_mode = _prefer_text("sparsepcgc_actual_parallel_mode")
     full_cloud_verified_noop_guard = _prefer_number("full_cloud_verified_noop_guard_used", 0.0)
+    amount_learning_mode = _prefer_text("amount_learning_mode") or str(
+        getattr(args, "sparsepcgc_full_cloud_amount_learning_mode", "network_selected_bandit")
+    )
+    selected_amount_class = _prefer_number("selected_amount_class", -1.0)
+    selected_amount_bin = _prefer_number("selected_amount_bin")
+    selected_amount_ratio = _prefer_number("selected_amount_ratio")
+    selected_action_log_prob = _prefer_number("selected_action_log_prob")
+    amount_temperature = _prefer_number("amount_temperature")
+    amount_rd_score = _prefer_number("amount_rd_score")
+    amount_policy_loss = _prefer_number("amount_policy_loss", 0.0)
+    amount_value_loss = _prefer_number("amount_value_loss", 0.0)
+    amount_advantage = _prefer_number("amount_advantage")
+    sequence_amount_baseline = _prefer_number("sequence_amount_baseline")
+    amount_max_class_rate = _prefer_number("amount_max_class_rate")
     where_mode = _prefer_text("where_mode") or str(getattr(args, "sparsepcgc_where_mode", "block_only"))
+    effective_where_mode = _prefer_text("effective_where_mode") or where_mode
     macro_ratio = _prefer_number("macro_ratio")
     micro_ratio = _prefer_number("micro_ratio")
     macro_selected_block_count = _prefer_number("macro_selected_block_count", 0.0)
@@ -840,6 +856,7 @@ def log_compact_step_summary(
     selected_block_count = _prefer_number("selected_block_count", 0.0)
     max_drop_count_per_block = _prefer_number("max_drop_count_per_block", 0.0)
     drop_concentration_top1 = _prefer_number("drop_concentration_top1_block_ratio", 0.0)
+    micro_min_blocks_satisfied = _prefer_number("micro_min_blocks_satisfied", 0.0)
     hard_where_uses_network_score = _prefer_number("hard_where_uses_network_score", 0.0)
     actual_bit_objective = _prefer_text("actual_bit_objective") or str(
         getattr(args, "sparsepcgc_actual_bit_objective", "raw")
@@ -939,7 +956,21 @@ def log_compact_step_summary(
         f"FCAActualWall={_fmt(full_cloud_amount_actual_wall, 4)}, "
         f"FCAParallelMode={full_cloud_amount_parallel_mode}, "
         f"FCAVerifiedNoop={bool(round(_to_float(full_cloud_verified_noop_guard, 0.0)))}, "
+        f"AmtMode={amount_learning_mode}, "
+        f"AmtClass={_fmt_int(selected_amount_class)}, "
+        f"AmtBin={_fmt(selected_amount_bin, 5)}, "
+        f"AmtRatio={_fmt(selected_amount_ratio, 5)}, "
+        f"AmtLogP={_fmt(selected_action_log_prob, 5)}, "
+        f"AmtTemp={_fmt(amount_temperature, 4)}, "
+        f"AmtEnt={_fmt(full_cloud_amount_entropy, 5)}, "
+        f"AmtRD={_fmt(amount_rd_score, 5)}, "
+        f"AmtPolLoss={_fmt(amount_policy_loss, 5)}, "
+        f"AmtValLoss={_fmt(amount_value_loss, 5)}, "
+        f"AmtAdv={_fmt(amount_advantage, 5)}, "
+        f"AmtBase={_fmt(sequence_amount_baseline, 5)}, "
+        f"AmtMaxRate={_fmt(amount_max_class_rate, 4)}, "
         f"WhereMode={where_mode}, "
+        f"WhereEff={effective_where_mode}, "
         f"MacroRatio={_fmt(macro_ratio, 5)}, "
         f"MicroRatio={_fmt(micro_ratio, 5)}, "
         f"MacroBlk={_fmt_int(macro_selected_block_count)}, "
@@ -948,6 +979,7 @@ def log_compact_step_summary(
         f"WhereBlocks={_fmt_int(selected_block_count)}, "
         f"MaxBlkDrop={_fmt_int(max_drop_count_per_block)}, "
         f"Top1Conc={_fmt(drop_concentration_top1, 4)}, "
+        f"MicroMinOK={bool(round(_to_float(micro_min_blocks_satisfied, 0.0)))}, "
         f"WhereNet={bool(round(_to_float(hard_where_uses_network_score, 0.0)))}, "
         f"CollapseDetected={collapse_detected}, "
         f"CollapseReason={collapse_reason}, "

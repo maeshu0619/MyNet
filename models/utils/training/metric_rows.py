@@ -299,6 +299,23 @@ def build_compression_metric_row(
             comp_debug.get("full_cloud_amount_sequence_memory_ratio", float("nan")),
             float("nan"),
         ),
+        "amount_learning_mode": str(
+            comp_debug.get("amount_learning_mode", getattr(args, "sparsepcgc_full_cloud_amount_learning_mode", "network_selected_bandit"))
+        ),
+        "selected_amount_class": case_int(comp_debug.get("selected_amount_class", -1), -1),
+        "selected_amount_bin": case_float(comp_debug.get("selected_amount_bin", float("nan")), float("nan")),
+        "selected_amount_ratio": case_float(comp_debug.get("selected_amount_ratio", float("nan")), float("nan")),
+        "selected_action_log_prob": case_float(comp_debug.get("selected_action_log_prob", float("nan")), float("nan")),
+        "amount_temperature": case_float(comp_debug.get("amount_temperature", float("nan")), float("nan")),
+        "amount_rd_score": case_float(comp_debug.get("amount_rd_score", float("nan")), float("nan")),
+        "amount_policy_loss": case_float(comp_debug.get("amount_policy_loss", 0.0), 0.0),
+        "amount_value_loss": case_float(comp_debug.get("amount_value_loss", 0.0), 0.0),
+        "amount_advantage": case_float(comp_debug.get("amount_advantage", float("nan")), float("nan")),
+        "sequence_amount_baseline": case_float(comp_debug.get("sequence_amount_baseline", float("nan")), float("nan")),
+        "amount_class_histogram": str(comp_debug.get("amount_class_histogram", "")),
+        "amount_max_class_rate": case_float(comp_debug.get("amount_max_class_rate", float("nan")), float("nan")),
+        "amount_selected_ratio_mean": case_float(comp_debug.get("amount_selected_ratio_mean", float("nan")), float("nan")),
+        "amount_selected_ratio_std": case_float(comp_debug.get("amount_selected_ratio_std", float("nan")), float("nan")),
         "full_cloud_amount_entropy": case_float(
             comp_debug.get("full_cloud_amount_entropy", float("nan")),
             float("nan"),
@@ -393,6 +410,7 @@ def build_compression_metric_row(
             comp_debug.get("full_cloud_amount_reuse_where_ranking_reason", "")
         ),
         "where_mode": str(comp_debug.get("where_mode", "")),
+        "effective_where_mode": str(comp_debug.get("effective_where_mode", comp_debug.get("where_mode", ""))),
         "macro_ratio": case_float(comp_debug.get("macro_ratio", float("nan")), float("nan")),
         "micro_ratio": case_float(comp_debug.get("micro_ratio", float("nan")), float("nan")),
         "macro_selected_block_count": case_int(comp_debug.get("macro_selected_block_count", 0), 0),
@@ -424,6 +442,11 @@ def build_compression_metric_row(
             float("nan"),
         ),
         "micro_quota_hit_block_count": case_int(comp_debug.get("micro_quota_hit_block_count", 0), 0),
+        "micro_min_selected_blocks": case_int(comp_debug.get("micro_min_selected_blocks", 0), 0),
+        "micro_candidate_block_count": case_int(comp_debug.get("micro_candidate_block_count", 0), 0),
+        "micro_min_blocks_satisfied": bool(comp_debug.get("micro_min_blocks_satisfied", False)),
+        "micro_min_blocks_fallback_reason": str(comp_debug.get("micro_min_blocks_fallback_reason", "")),
+        "macro_micro_hybrid_fallback": bool(comp_debug.get("macro_micro_hybrid_fallback", False)),
         "macro_disabled_reason": str(comp_debug.get("macro_disabled_reason", "")),
         "sparsepcgc_actual_parallel_mode": str(
             comp_debug.get(
@@ -1717,6 +1740,12 @@ def build_operation_metric_row(
         "where_mode": str(
             comp_debug.get("where_mode", structure_debug.get("where_mode", ""))
         ),
+        "effective_where_mode": str(
+            comp_debug.get(
+                "effective_where_mode",
+                structure_debug.get("effective_where_mode", comp_debug.get("where_mode", structure_debug.get("where_mode", ""))),
+            )
+        ),
         "macro_ratio": case_float(
             comp_debug.get("macro_ratio", structure_debug.get("macro_ratio", float("nan"))),
             float("nan"),
@@ -1801,9 +1830,61 @@ def build_operation_metric_row(
             ),
             0,
         ),
+        "micro_min_selected_blocks": case_int(
+            comp_debug.get(
+                "micro_min_selected_blocks",
+                structure_debug.get("micro_min_selected_blocks", 0),
+            ),
+            0,
+        ),
+        "micro_candidate_block_count": case_int(
+            comp_debug.get(
+                "micro_candidate_block_count",
+                structure_debug.get("micro_candidate_block_count", 0),
+            ),
+            0,
+        ),
+        "micro_min_blocks_satisfied": bool(
+            comp_debug.get(
+                "micro_min_blocks_satisfied",
+                structure_debug.get("micro_min_blocks_satisfied", False),
+            )
+        ),
+        "micro_min_blocks_fallback_reason": str(
+            comp_debug.get(
+                "micro_min_blocks_fallback_reason",
+                structure_debug.get("micro_min_blocks_fallback_reason", ""),
+            )
+        ),
+        "macro_micro_hybrid_fallback": bool(
+            comp_debug.get(
+                "macro_micro_hybrid_fallback",
+                structure_debug.get("macro_micro_hybrid_fallback", False),
+            )
+        ),
         "macro_disabled_reason": str(
             comp_debug.get("macro_disabled_reason", structure_debug.get("macro_disabled_reason", ""))
         ),
+        "amount_learning_mode": str(
+            comp_debug.get(
+                "amount_learning_mode",
+                getattr(args, "sparsepcgc_full_cloud_amount_learning_mode", "network_selected_bandit"),
+            )
+        ),
+        "selected_amount_class": case_int(comp_debug.get("selected_amount_class", -1), -1),
+        "selected_amount_bin": case_float(comp_debug.get("selected_amount_bin", float("nan")), float("nan")),
+        "selected_amount_ratio": case_float(comp_debug.get("selected_amount_ratio", float("nan")), float("nan")),
+        "selected_action_log_prob": case_float(comp_debug.get("selected_action_log_prob", float("nan")), float("nan")),
+        "amount_temperature": case_float(comp_debug.get("amount_temperature", float("nan")), float("nan")),
+        "amount_rd_score": case_float(comp_debug.get("amount_rd_score", float("nan")), float("nan")),
+        "amount_policy_loss": case_float(comp_debug.get("amount_policy_loss", 0.0), 0.0),
+        "amount_value_loss": case_float(comp_debug.get("amount_value_loss", 0.0), 0.0),
+        "amount_advantage": case_float(comp_debug.get("amount_advantage", float("nan")), float("nan")),
+        "sequence_amount_baseline": case_float(comp_debug.get("sequence_amount_baseline", float("nan")), float("nan")),
+        "amount_class_histogram": str(comp_debug.get("amount_class_histogram", "")),
+        "amount_max_class_rate": case_float(comp_debug.get("amount_max_class_rate", float("nan")), float("nan")),
+        "amount_selected_ratio_mean": case_float(comp_debug.get("amount_selected_ratio_mean", float("nan")), float("nan")),
+        "amount_selected_ratio_std": case_float(comp_debug.get("amount_selected_ratio_std", float("nan")), float("nan")),
         "codec_block_budget_zero": bool(structure_debug.get("codec_block_budget_zero", False)),
         "codec_block_target_drop_ratio": case_float(
             structure_debug.get("codec_block_target_drop_ratio", float("nan")),
