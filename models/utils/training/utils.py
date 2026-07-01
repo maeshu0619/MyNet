@@ -216,16 +216,27 @@ def actual_compression_plot_metric(loss_obj, device):
     comp_debug = getattr(loss_obj, "last_compression_debug", {}) or {} # 直近Stepの圧縮debug辞書を取り出す
     if "surrogate_teacher_is_actual" in comp_debug and not bool(comp_debug.get("surrogate_teacher_is_actual", False)): # local_proxyなど実codecでない教師は除外する
         return None # 実圧縮ではない値をactual_compressionグラフへ混ぜない
-    actual_value = comp_debug.get(
+    for key in (
+        "actual_train_objective_percent",
+        "actual_total_bit_percent",
+        "compression_loss_used",
+        "actual_bit_percent_used_for_loss",
+        "actual_forward_value",
         "compression_loss_L_com",
-        comp_debug.get(
-            "actual_train_objective_percent",
-            comp_debug.get("actual_total_bit_percent", None),
-        ),
-    ) # L_comに使った実codec objectiveを取り出す
-    if actual_value is None:
-        return None # 実圧縮値が無いStepはplot集計から除外する
-    return metric_tensor(actual_value, device) # plot/CSVに渡せるscalar tensorへ正規化する
+        "compression_loss_raw",
+        "actual_bit_percent_raw",
+        "actual_bit_percent",
+    ):
+        actual_value = comp_debug.get(key, None)
+        if actual_value is None:
+            continue
+        try:
+            actual_float = float(actual_value)
+        except Exception:
+            continue
+        if math.isfinite(actual_float):
+            return metric_tensor(actual_float, device) # plot/CSVに渡せるscalar tensorへ正規化する
+    return None # 実圧縮値が無いStepはplot集計から除外する
 
 
 def policy_actual_compression_plot_metric(loss_obj, device):

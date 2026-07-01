@@ -154,6 +154,20 @@ def build_compression_metric_row(
             )
         ),
         "full_cloud_amount_enabled": bool(comp_debug.get("full_cloud_amount_enabled", False)),
+        "full_cloud_amount_fresh_actual_every_step": bool(
+            comp_debug.get(
+                "full_cloud_amount_fresh_actual_every_step",
+                getattr(args, "sparsepcgc_full_cloud_amount_fresh_actual_every_step", True),
+            )
+        ),
+        "full_cloud_amount_actual_step": bool(comp_debug.get("full_cloud_amount_actual_step", False)),
+        "full_cloud_amount_actual_interval": case_int(
+            comp_debug.get(
+                "full_cloud_amount_actual_interval",
+                getattr(args, "_full_cloud_amount_actual_interval_active", 0),
+            ),
+            0,
+        ),
         "full_cloud_amount_input_points": case_int(comp_debug.get("full_cloud_amount_input_points", 0), 0),
         "full_cloud_amount_bin": case_float(comp_debug.get("full_cloud_amount_bin", float("nan")), float("nan")),
         "full_cloud_amount_residual": case_float(
@@ -168,7 +182,46 @@ def build_compression_metric_row(
         "full_cloud_amount_noop_selected": bool(comp_debug.get("full_cloud_amount_noop_selected", False)),
         "full_cloud_amount_candidate_count": case_int(comp_debug.get("full_cloud_amount_candidate_count", 0), 0),
         "full_cloud_amount_actual_eval_count": case_int(comp_debug.get("full_cloud_amount_actual_eval_count", 0), 0),
+        "full_cloud_amount_actual_requested_count": case_int(
+            comp_debug.get("full_cloud_amount_actual_requested_count", 0),
+            0,
+        ),
+        "full_cloud_amount_actual_finished_count": case_int(
+            comp_debug.get("full_cloud_amount_actual_finished_count", 0),
+            0,
+        ),
         "full_cloud_amount_teacher_source": str(comp_debug.get("full_cloud_amount_teacher_source", "")),
+        "full_cloud_amount_teacher_ratio": case_float(
+            comp_debug.get("full_cloud_amount_teacher_ratio", float("nan")),
+            float("nan"),
+        ),
+        "full_cloud_amount_oracle_best_ratio": case_float(
+            comp_debug.get("full_cloud_amount_oracle_best_ratio", float("nan")),
+            float("nan"),
+        ),
+        "full_cloud_amount_oracle_best_actual_delta": case_float(
+            comp_debug.get("full_cloud_amount_oracle_best_actual_delta", float("nan")),
+            float("nan"),
+        ),
+        "full_cloud_amount_selected_ratio": case_float(
+            comp_debug.get("full_cloud_amount_selected_ratio", float("nan")),
+            float("nan"),
+        ),
+        "full_cloud_amount_selected_actual_delta": case_float(
+            comp_debug.get("full_cloud_amount_selected_actual_delta", float("nan")),
+            float("nan"),
+        ),
+        "full_cloud_amount_oracle_gap": case_float(
+            comp_debug.get("full_cloud_amount_oracle_gap", float("nan")),
+            float("nan"),
+        ),
+        "full_cloud_amount_selected_is_best": bool(
+            comp_debug.get("full_cloud_amount_selected_is_best", False)
+        ),
+        "full_cloud_amount_entropy": case_float(
+            comp_debug.get("full_cloud_amount_entropy", float("nan")),
+            float("nan"),
+        ),
         "full_cloud_amount_predicted_delta": case_float(
             comp_debug.get("full_cloud_amount_predicted_delta", float("nan")),
             float("nan"),
@@ -188,6 +241,10 @@ def build_compression_metric_row(
         "full_cloud_amount_cls_loss": case_float(comp_debug.get("full_cloud_amount_cls_loss", 0.0), 0.0),
         "full_cloud_amount_value_loss": case_float(comp_debug.get("full_cloud_amount_value_loss", 0.0), 0.0),
         "full_cloud_amount_rank_loss": case_float(comp_debug.get("full_cloud_amount_rank_loss", 0.0), 0.0),
+        "full_cloud_amount_geom_guard_loss": case_float(
+            comp_debug.get("full_cloud_amount_geom_guard_loss", 0.0),
+            0.0,
+        ),
         "full_cloud_amount_ratio_reg_loss": case_float(
             comp_debug.get("full_cloud_amount_ratio_reg_loss", 0.0),
             0.0,
@@ -196,8 +253,50 @@ def build_compression_metric_row(
             comp_debug.get("full_cloud_amount_noop_guard_loss", 0.0),
             0.0,
         ),
+        "full_cloud_amount_entropy_loss": case_float(
+            comp_debug.get("full_cloud_amount_entropy_loss", 0.0),
+            0.0,
+        ),
         "full_cloud_amount_total_loss": case_float(comp_debug.get("full_cloud_amount_total_loss", 0.0), 0.0),
         "full_cloud_amount_step_time": case_float(comp_debug.get("full_cloud_amount_step_time", 0.0), 0.0),
+        "full_cloud_amount_actual_wall_time_total": case_float(
+            comp_debug.get("full_cloud_amount_actual_wall_time_total", 0.0),
+            0.0,
+        ),
+        "full_cloud_amount_actual_wall_time_max": case_float(
+            comp_debug.get("full_cloud_amount_actual_wall_time_max", 0.0),
+            0.0,
+        ),
+        "full_cloud_amount_actual_dispatch_time": case_float(
+            comp_debug.get("full_cloud_amount_actual_dispatch_time", 0.0),
+            0.0,
+        ),
+        "full_cloud_amount_actual_gather_time": case_float(
+            comp_debug.get("full_cloud_amount_actual_gather_time", 0.0),
+            0.0,
+        ),
+        "full_cloud_amount_reuse_where_ranking": bool(
+            comp_debug.get("full_cloud_amount_reuse_where_ranking", False)
+        ),
+        "full_cloud_amount_reuse_where_ranking_reason": str(
+            comp_debug.get("full_cloud_amount_reuse_where_ranking_reason", "")
+        ),
+        "sparsepcgc_actual_parallel_mode": str(
+            comp_debug.get(
+                "sparsepcgc_actual_parallel_mode",
+                getattr(args, "sparsepcgc_actual_parallel_mode", "single"),
+            )
+        ),
+        "sparsepcgc_actual_parallel_candidates": case_int(
+            comp_debug.get(
+                "sparsepcgc_actual_parallel_candidates",
+                getattr(args, "sparsepcgc_actual_parallel_candidates", 1),
+            ),
+            1,
+        ),
+        "sparsepcgc_actual_worker_pool_used": bool(
+            comp_debug.get("sparsepcgc_actual_worker_pool_used", False)
+        ),
         "actual_total_bit_percent_fresh": actual_delta if fresh_actual else None,
         "actual_total_bit_percent_cached": actual_delta if cached_actual else None,
         "full_cloud_actual_bit_percent": case_float(comp_debug.get("full_cloud_actual_bit_percent", float("nan")), float("nan")),
@@ -1227,6 +1326,31 @@ def build_operation_metric_row(
                 "full_cloud_amount_enabled",
                 structure_debug.get("full_cloud_amount_enabled", False),
             )
+        ),
+        "full_cloud_amount_fresh_actual_every_step": bool(
+            comp_debug.get(
+                "full_cloud_amount_fresh_actual_every_step",
+                structure_debug.get(
+                    "full_cloud_amount_fresh_actual_every_step",
+                    getattr(args, "sparsepcgc_full_cloud_amount_fresh_actual_every_step", True),
+                ),
+            )
+        ),
+        "full_cloud_amount_actual_step": bool(
+            comp_debug.get(
+                "full_cloud_amount_actual_step",
+                structure_debug.get("full_cloud_amount_actual_step", False),
+            )
+        ),
+        "full_cloud_amount_actual_interval": case_int(
+            comp_debug.get(
+                "full_cloud_amount_actual_interval",
+                structure_debug.get(
+                    "full_cloud_amount_actual_interval",
+                    getattr(args, "_full_cloud_amount_actual_interval_active", 0),
+                ),
+            ),
+            0,
         ),
         "full_cloud_amount_input_points": case_int(
             comp_debug.get(

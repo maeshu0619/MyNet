@@ -75,6 +75,10 @@ class PlotMaker():
             "full_cloud_amount_total_loss",
             "full_cloud_amount_noop_selected",
             "full_cloud_amount_actual_eval_count",
+            "full_cloud_amount_teacher_ratio",
+            "full_cloud_amount_oracle_best_ratio",
+            "full_cloud_amount_oracle_gap",
+            "full_cloud_amount_actual_finished_count",
         ]
         self.step_edit_his = [[] for _ in self.edit_keys]
         self.epo_edit_his = [[] for _ in self.edit_keys]

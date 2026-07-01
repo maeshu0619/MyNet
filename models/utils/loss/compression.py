@@ -899,6 +899,75 @@ class CompressionLossMixin:
             )
         return result
 
+    def _encode_actual_many(self, args, xyz_list):
+        encoder = self._get_actual_encoder(args)
+        candidate_payload = []
+        point_tensors = []
+        for candidate_idx, xyz in enumerate(list(xyz_list or [])):
+            if not torch.is_tensor(xyz):
+                candidate_payload.append({"candidate_id": int(candidate_idx)})
+                point_tensors.append(None)
+                continue
+            pts_b = xyz.to(torch.float32)
+            candidate_payload.append(
+                {
+                    "candidate_id": int(candidate_idx),
+                    "pts": pts_b,
+                }
+            )
+            point_tensors.append(pts_b)
+
+        with torch.inference_mode():
+            if hasattr(encoder, "encode_bits_many"):
+                raw_stats_list = list(
+                    encoder.encode_bits_many(
+                        candidate_payload,
+                        max_parallel=int(getattr(args, "sparsepcgc_actual_parallel_candidates", 1)),
+                        mode=str(getattr(args, "sparsepcgc_actual_parallel_mode", "single")),
+                        fallback_to_single=bool(
+                            getattr(args, "sparsepcgc_actual_parallel_fallback_to_single", True)
+                        ),
+                    )
+                )
+            else:
+                raw_stats_list = []
+                for payload in candidate_payload:
+                    pts_b = payload.get("pts", None)
+                    if not torch.is_tensor(pts_b):
+                        raw_stats_list.append(
+                            {
+                                "candidate_id": payload.get("candidate_id", -1),
+                                "actual_requested": False,
+                                "actual_finished": False,
+                                "actual_worker_id": -1,
+                                "actual_wall_time": 0.0,
+                                "actual_error_reason": "candidate_tensor_missing",
+                                "actual_parallel_mode_effective": "single",
+                            }
+                        )
+                        continue
+                    stats = dict(encoder.encode_bits(pts_b))
+                    stats.update(
+                        {
+                            "candidate_id": payload.get("candidate_id", -1),
+                            "actual_requested": True,
+                            "actual_finished": True,
+                            "actual_worker_id": -1,
+                            "actual_wall_time": float(stats.get("encode_time", 0.0) or 0.0),
+                            "actual_error_reason": "",
+                            "actual_parallel_mode_effective": "single",
+                        }
+                    )
+                    raw_stats_list.append(stats)
+
+        stats_list = []
+        for pts_b, raw_stats in zip(point_tensors, raw_stats_list):
+            stats = dict(raw_stats or {})
+            if torch.is_tensor(pts_b) and bool(stats.get("actual_finished", False)):
+                stats = self._attach_octree_aux_stats(args, pts_b, stats)
+            stats_list.append(stats)
+        return stats_list
+
     def _actual_octree_stat_qs(self, args, codec_name):
         codec_key = str(codec_name).strip().lower()
         if codec_key == "sparsepcgc":

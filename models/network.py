@@ -2384,6 +2384,7 @@ class Network(nn.Module):
             "voxel_soft_edit_count_proxy",
 
             "network_drop_logit_for_outcome",
+            "codec_prune_prior_score_for_outcome",
             "hard_drop_mask_for_outcome",
             "hard_delete_selection_mask_for_outcome",
             "drop_ratio_hard_for_outcome",

@@ -205,6 +205,15 @@ class _OctAttentionActualEncoder:
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
+    def encode_bits_many(self, candidates, *, max_parallel=1, mode="single", fallback_to_single=True):
+        return _encode_bits_many_sequential(
+            self,
+            candidates,
+            max_parallel=max_parallel,
+            mode=mode,
+            fallback_to_single=fallback_to_single,
+        )
+
     @staticmethod
     def _single_child_count(oct_data_seq):
         oct_code = oct_data_seq[:, -1, 0].astype(np.int32)
@@ -726,6 +735,15 @@ class _SparsePCGCActualEncoder:
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
+    def encode_bits_many(self, candidates, *, max_parallel=1, mode="single", fallback_to_single=True):
+        return _encode_bits_many_sequential(
+            self,
+            candidates,
+            max_parallel=max_parallel,
+            mode=mode,
+            fallback_to_single=fallback_to_single,
+        )
+
     def close(self):
         proc = self._proc
         self._proc = None
@@ -778,6 +796,15 @@ class _GPCCActualEncoder:
     def encode_bits(self, pts_3n):
         return self.encoder.encode_tensor(pts_3n)
 
+    def encode_bits_many(self, candidates, *, max_parallel=1, mode="single", fallback_to_single=True):
+        return _encode_bits_many_sequential(
+            self,
+            candidates,
+            max_parallel=max_parallel,
+            mode=mode,
+            fallback_to_single=fallback_to_single,
+        )
+
 
 class _DracoActualEncoder:
     codec_name = "draco"
@@ -802,6 +829,15 @@ class _DracoActualEncoder:
     def encode_bits(self, pts_3n):
         return self.encoder.encode_tensor(pts_3n)
 
+    def encode_bits_many(self, candidates, *, max_parallel=1, mode="single", fallback_to_single=True):
+        return _encode_bits_many_sequential(
+            self,
+            candidates,
+            max_parallel=max_parallel,
+            mode=mode,
+            fallback_to_single=fallback_to_single,
+        )
+
 
 def _actual_codec_key(args):
     backend = str(getattr(args, "compression_loss_backend", "")).strip().lower()
@@ -824,3 +860,72 @@ def build_actual_encoder(args, writer=None):
     if codec_key == "draco":
         return _DracoActualEncoder(args, writer=writer)
     return _OctAttentionActualEncoder(args, writer=writer)
+
+
+def _candidate_tensor_from_many_item(item):
+    if torch.is_tensor(item):
+        value = item
+    elif isinstance(item, dict):
+        value = None
+        for key in ("pts", "xyz", "points", "candidate_xyz"):
+            maybe_value = item.get(key, None)
+            if torch.is_tensor(maybe_value):
+                value = maybe_value
+                break
+    else:
+        value = None
+    if not torch.is_tensor(value):
+        return None
+    if value.ndim == 3 and value.shape[0] == 1 and value.shape[1] == 3:
+        value = value.squeeze(0)
+    if value.ndim == 2 and value.shape[0] == 3:
+        return value
+    if value.ndim == 2 and value.shape[1] == 3:
+        return value.transpose(0, 1).contiguous()
+    if value.ndim == 3 and value.shape[1] == 3:
+        return value[0].contiguous()
+    return value
+
+
+def _encode_bits_many_sequential(encoder, candidates, *, max_parallel=1, mode="single", fallback_to_single=True):
+    requested_mode = str(mode).strip().lower()
+    effective_mode = "single"
+    if requested_mode not in {"single", "worker_pool"}:
+        requested_mode = "single"
+    if requested_mode == "worker_pool" and int(max_parallel) > 1:
+        if not bool(fallback_to_single):
+            raise RuntimeError("worker_pool actual backend is not implemented in this patch.")
+        effective_mode = "single_fallback"
+
+    results = []
+    for candidate_idx, candidate in enumerate(list(candidates or [])):
+        pts_3n = _candidate_tensor_from_many_item(candidate)
+        base_result = {
+            "candidate_index": int(candidate_idx),
+            "actual_requested": pts_3n is not None,
+            "actual_finished": False,
+            "actual_worker_id": -1,
+            "actual_wall_time": 0.0,
+            "actual_error_reason": "",
+            "actual_parallel_mode_effective": effective_mode,
+        }
+        if isinstance(candidate, dict):
+            for key in ("candidate_id", "candidate_class", "candidate_source"):
+                if key in candidate:
+                    base_result[key] = candidate.get(key)
+
+        if pts_3n is None:
+            base_result["actual_error_reason"] = "candidate_tensor_missing"
+            results.append(base_result)
+            continue
+
+        wall_t0 = time.time()
+        try:
+            stats = dict(encoder.encode_bits(pts_3n))
+            base_result.update(stats)
+            base_result["actual_finished"] = True
+        except Exception as exc:
+            base_result["actual_error_reason"] = str(exc)
+        base_result["actual_wall_time"] = float(time.time() - wall_t0)
+        results.append(base_result)
+    return results

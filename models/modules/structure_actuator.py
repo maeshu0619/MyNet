@@ -1985,6 +1985,170 @@ class StructureRepairActuator(nn.Module):
         return hard_drop
 
     @staticmethod
+    def build_codec_block_drop_ranking(
+        voxel_coords,
+        point_scores,
+        *,
+        block_size,
+        selection_mask=None,
+    ):
+        batch_size, _, point_count = voxel_coords.shape
+        if selection_mask is None:
+            selection = torch.ones(
+                (batch_size, point_count),
+                device=voxel_coords.device,
+                dtype=torch.bool,
+            )
+        else:
+            selection = selection_mask.squeeze(1) if selection_mask.ndim == 3 else selection_mask
+            selection = selection.to(device=voxel_coords.device, dtype=torch.bool)
+
+        batches = []
+        trace_base = {
+            "codec_block_valid_point_count": 0.0,
+            "codec_block_count": 0.0,
+            "codec_block_target_drop_ratio": 0.0,
+            "codec_block_selected_block_count": 0.0,
+            "codec_block_selected_point_count": 0.0,
+            "codec_block_budget_points": 0.0,
+            "codec_block_budget_zero": False,
+            "codec_block_under_selected": False,
+        }
+        for batch_idx in range(batch_size):
+            valid_idx = selection[batch_idx].nonzero(as_tuple=False).reshape(-1)
+            valid_count = int(valid_idx.numel())
+            batch_state = {
+                "valid_idx": valid_idx,
+                "valid_count": int(valid_count),
+                "point_count": int(point_count),
+                "counts": None,
+                "order": None,
+                "inverse": None,
+                "block_scores": None,
+                "block_count": 0,
+            }
+            if valid_count > 0:
+                coords = voxel_coords[batch_idx].index_select(1, valid_idx).transpose(0, 1).contiguous().long()
+                blocks = torch.div(coords, int(block_size), rounding_mode="floor")
+                unique_blocks, inverse = torch.unique(blocks, dim=0, sorted=True, return_inverse=True)
+                block_count = int(unique_blocks.shape[0])
+                counts = torch.bincount(inverse, minlength=block_count).long()
+                scores = point_scores[batch_idx, 0].index_select(0, valid_idx).detach().float()
+                score_sum = torch.zeros((block_count,), device=scores.device, dtype=scores.dtype)
+                score_sum.scatter_add_(0, inverse, scores)
+                block_scores = score_sum / counts.to(dtype=scores.dtype).clamp_min(1.0)
+                order = torch.argsort(block_scores, descending=True)
+                batch_state.update(
+                    {
+                        "counts": counts,
+                        "order": order,
+                        "inverse": inverse,
+                        "block_scores": block_scores,
+                        "block_count": int(block_count),
+                    }
+                )
+                trace_base["codec_block_valid_point_count"] += float(valid_count)
+                trace_base["codec_block_count"] += float(block_count)
+            batches.append(batch_state)
+        return {
+            "block_size": int(block_size),
+            "point_count": int(point_count),
+            "batch_size": int(batch_size),
+            "batches": batches,
+            "trace_base": trace_base,
+        }
+
+    @staticmethod
+    def mask_from_codec_block_ranking(
+        ranking_state,
+        *,
+        target_drop_ratio,
+        max_hard_count=0,
+        min_hard_count=0,
+    ):
+        if not isinstance(ranking_state, dict):
+            raise ValueError("ranking_state must be a dict returned by build_codec_block_drop_ranking().")
+        batch_size = int(ranking_state.get("batch_size", 0))
+        point_count = int(ranking_state.get("point_count", 0))
+        device = None
+        for batch_state in ranking_state.get("batches", []):
+            valid_idx = batch_state.get("valid_idx", None)
+            if torch.is_tensor(valid_idx):
+                device = valid_idx.device
+                break
+        if device is None:
+            device = torch.device("cpu")
+        hard_drop = torch.zeros((batch_size, 1, point_count), device=device, dtype=torch.bool)
+        ratio = min(max(float(target_drop_ratio), 0.0), 1.0)
+        trace = dict(ranking_state.get("trace_base", {}) or {})
+        trace.update(
+            {
+                "voxel_count": 0.0,
+                "pre_round_target_count": 0.0,
+                "post_round_target_count": 0.0,
+                "min_count_floor_applied": False,
+                "hard_mask_count": 0.0,
+                "candidate_count": 0.0,
+                "final_hard_drop_count": 0.0,
+                "codec_block_budget_points": 0.0,
+                "codec_block_selected_block_count": 0.0,
+                "codec_block_selected_point_count": 0.0,
+                "codec_block_budget_zero": False,
+                "codec_block_target_drop_ratio": float(ratio),
+                "codec_block_under_selected": False,
+            }
+        )
+        if ratio <= 0.0 or point_count <= 0:
+            return hard_drop, trace
+
+        for batch_idx, batch_state in enumerate(ranking_state.get("batches", [])):
+            valid_idx = batch_state.get("valid_idx", None)
+            counts = batch_state.get("counts", None)
+            order = batch_state.get("order", None)
+            inverse = batch_state.get("inverse", None)
+            valid_count = int(batch_state.get("valid_count", 0))
+            block_count = int(batch_state.get("block_count", 0))
+            if (
+                not torch.is_tensor(valid_idx)
+                or not torch.is_tensor(counts)
+                or not torch.is_tensor(order)
+                or not torch.is_tensor(inverse)
+                or valid_count <= 0
+                or block_count <= 0
+            ):
+                continue
+            budget = int(math.floor(float(valid_count) * ratio))
+            if int(max_hard_count) > 0:
+                budget = min(budget, int(max_hard_count))
+            trace["voxel_count"] += float(valid_count)
+            trace["pre_round_target_count"] += float(ratio * float(valid_count))
+            trace["post_round_target_count"] += float(max(budget, 0))
+            trace["codec_block_budget_points"] += float(max(budget, 0))
+            trace["candidate_count"] += float(block_count)
+            if budget <= 0:
+                trace["codec_block_budget_zero"] = True
+            cumulative = torch.cumsum(counts.index_select(0, order), dim=0)
+            take = int((cumulative <= int(max(budget, 0))).sum().item())
+            if take <= 0 and int(min_hard_count) > 0 and block_count > 0:
+                take = min(max(int(min_hard_count), 1), block_count)
+                trace["min_count_floor_applied"] = True
+            if take <= 0:
+                continue
+            selected_blocks = torch.zeros((block_count,), device=valid_idx.device, dtype=torch.bool)
+            selected_blocks[order[:take]] = True
+            selected_local = selected_blocks.index_select(0, inverse)
+            selected_points = valid_idx[selected_local]
+            hard_drop[batch_idx, 0, selected_points] = True
+            selected_point_count = int(selected_points.numel())
+            if budget > 0 and selected_point_count < min(valid_count, budget):
+                trace["codec_block_under_selected"] = True
+            trace["hard_mask_count"] += float(selected_point_count)
+            trace["codec_block_selected_block_count"] += float(take)
+            trace["codec_block_selected_point_count"] += float(selected_point_count)
+        trace["final_hard_drop_count"] = float(hard_drop.detach().sum().item())
+        return hard_drop, trace
+
+    @staticmethod
     def _priority_topk_gate(priority, target_ratio, tau):
         B, _, N = priority.shape
         if N <= 0:
@@ -7810,6 +7974,7 @@ class StructureRepairActuator(nn.Module):
             # Adjust Soft状態
             "learned_drop_ratio_requires_grad": pts_xyz.new_tensor(float(learned_drop_ratio.requires_grad)),
             "network_drop_logit_for_outcome": network_drop_logit_for_distill,
+            "codec_prune_prior_score_for_outcome": codec_prune_prior_score.detach(),
             "hard_drop_mask_for_outcome": hard_drop_mask.detach(),
             "hard_delete_selection_mask_for_outcome": hard_delete_selection_mask.detach(),
             "drop_ratio_hard_for_outcome": drop_ratio_hard.detach(),

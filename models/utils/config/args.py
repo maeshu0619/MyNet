@@ -969,10 +969,41 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--sparsepcgc_full_cloud_amount_hidden_dim', default=64, type=int)
     parser.add_argument('--sparsepcgc_full_cloud_amount_residual_enable', default=False, type=str2bool)
     parser.add_argument('--sparsepcgc_full_cloud_amount_residual_max', default=0.0025, type=float)
+    parser.add_argument(
+        '--sparsepcgc_full_cloud_amount_fresh_actual_every_step',
+        default=True,
+        type=str2bool,
+        help='Trueならfull_cloud_amount modeで毎Step fresh actual SparsePCGC評価を行い、Training Actual Objectiveを欠損させない',
+    )
     parser.add_argument('--sparsepcgc_full_cloud_amount_actual_interval', default=5, type=int)
     parser.add_argument('--sparsepcgc_full_cloud_amount_warmup_actual_interval', default=1, type=int)
     parser.add_argument('--sparsepcgc_full_cloud_amount_warmup_steps', default=20, type=int)
     parser.add_argument('--sparsepcgc_full_cloud_amount_max_actual_candidates_per_step', default=2, type=int)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_multi_actual_enable', default=True, type=str2bool)
+    parser.add_argument(
+        '--sparsepcgc_full_cloud_amount_actual_candidate_policy',
+        default='selected_plus_surrogate_topk',
+        choices=[
+            'selected_only',
+            'selected_plus_neighbors',
+            'selected_plus_surrogate_topk',
+            'selected_neighbors_memory_surrogate',
+            'all_bins',
+        ],
+        type=str,
+    )
+    parser.add_argument('--sparsepcgc_full_cloud_amount_actual_topk', default=2, type=int)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_warmup_max_actual_candidates_per_step', default=4, type=int)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_multi_actual_warmup_steps', default=100, type=int)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_oracle_sweep_interval', default=0, type=int)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_oracle_sweep_max_bins', default=8, type=int)
+    parser.add_argument('--sparsepcgc_reuse_where_ranking_for_amounts', default=True, type=str2bool)
+    parser.add_argument('--sparsepcgc_actual_parallel_mode', default='single', choices=['single', 'worker_pool'], type=str)
+    parser.add_argument('--sparsepcgc_actual_parallel_candidates', default=1, type=int)
+    parser.add_argument('--sparsepcgc_actual_parallel_fallback_to_single', default=True, type=str2bool)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_teacher_actual_priority', default=True, type=str2bool)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_entropy_weight', default=0.01, type=float)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_entropy_decay_steps', default=500, type=int)
     parser.add_argument('--sparsepcgc_full_cloud_amount_use_surrogate_between_actual', default=True, type=str2bool)
     parser.add_argument('--sparsepcgc_full_cloud_amount_noop_margin', default=0.0, type=float)
     parser.add_argument('--sparsepcgc_full_cloud_amount_geometry_mode', default='sampled', choices=['off', 'sampled', 'interval_full'], type=str)
@@ -4407,6 +4438,9 @@ def parse_pugan_args(parser, file_day, file_time):
         max(float(getattr(args, "sparsepcgc_full_cloud_amount_residual_max", 0.0025)), 0.0),
         0.01,
     )
+    args.sparsepcgc_full_cloud_amount_fresh_actual_every_step = bool(
+        getattr(args, "sparsepcgc_full_cloud_amount_fresh_actual_every_step", True)
+    )
     args.sparsepcgc_full_cloud_amount_actual_interval = max(
         int(getattr(args, "sparsepcgc_full_cloud_amount_actual_interval", 5)),
         0,
@@ -4422,6 +4456,70 @@ def parse_pugan_args(parser, file_day, file_time):
     args.sparsepcgc_full_cloud_amount_max_actual_candidates_per_step = max(
         int(getattr(args, "sparsepcgc_full_cloud_amount_max_actual_candidates_per_step", 2)),
         1,
+    )
+    args.sparsepcgc_full_cloud_amount_multi_actual_enable = bool(
+        getattr(args, "sparsepcgc_full_cloud_amount_multi_actual_enable", True)
+    )
+    args.sparsepcgc_full_cloud_amount_actual_candidate_policy = str(
+        getattr(
+            args,
+            "sparsepcgc_full_cloud_amount_actual_candidate_policy",
+            "selected_plus_surrogate_topk",
+        )
+    ).strip().lower()
+    if args.sparsepcgc_full_cloud_amount_actual_candidate_policy not in {
+        "selected_only",
+        "selected_plus_neighbors",
+        "selected_plus_surrogate_topk",
+        "selected_neighbors_memory_surrogate",
+        "all_bins",
+    }:
+        args.sparsepcgc_full_cloud_amount_actual_candidate_policy = "selected_plus_surrogate_topk"
+    args.sparsepcgc_full_cloud_amount_actual_topk = max(
+        int(getattr(args, "sparsepcgc_full_cloud_amount_actual_topk", 2)),
+        0,
+    )
+    args.sparsepcgc_full_cloud_amount_warmup_max_actual_candidates_per_step = max(
+        int(getattr(args, "sparsepcgc_full_cloud_amount_warmup_max_actual_candidates_per_step", 4)),
+        1,
+    )
+    args.sparsepcgc_full_cloud_amount_multi_actual_warmup_steps = max(
+        int(getattr(args, "sparsepcgc_full_cloud_amount_multi_actual_warmup_steps", 100)),
+        0,
+    )
+    args.sparsepcgc_full_cloud_amount_oracle_sweep_interval = max(
+        int(getattr(args, "sparsepcgc_full_cloud_amount_oracle_sweep_interval", 0)),
+        0,
+    )
+    args.sparsepcgc_full_cloud_amount_oracle_sweep_max_bins = max(
+        int(getattr(args, "sparsepcgc_full_cloud_amount_oracle_sweep_max_bins", 8)),
+        1,
+    )
+    args.sparsepcgc_reuse_where_ranking_for_amounts = bool(
+        getattr(args, "sparsepcgc_reuse_where_ranking_for_amounts", True)
+    )
+    args.sparsepcgc_actual_parallel_mode = str(
+        getattr(args, "sparsepcgc_actual_parallel_mode", "single")
+    ).strip().lower()
+    if args.sparsepcgc_actual_parallel_mode not in {"single", "worker_pool"}:
+        args.sparsepcgc_actual_parallel_mode = "single"
+    args.sparsepcgc_actual_parallel_candidates = max(
+        int(getattr(args, "sparsepcgc_actual_parallel_candidates", 1)),
+        1,
+    )
+    args.sparsepcgc_actual_parallel_fallback_to_single = bool(
+        getattr(args, "sparsepcgc_actual_parallel_fallback_to_single", True)
+    )
+    args.sparsepcgc_full_cloud_amount_teacher_actual_priority = bool(
+        getattr(args, "sparsepcgc_full_cloud_amount_teacher_actual_priority", True)
+    )
+    args.sparsepcgc_full_cloud_amount_entropy_weight = max(
+        float(getattr(args, "sparsepcgc_full_cloud_amount_entropy_weight", 0.01)),
+        0.0,
+    )
+    args.sparsepcgc_full_cloud_amount_entropy_decay_steps = max(
+        int(getattr(args, "sparsepcgc_full_cloud_amount_entropy_decay_steps", 500)),
+        0,
     )
     args.sparsepcgc_full_cloud_amount_use_surrogate_between_actual = bool(
         getattr(args, "sparsepcgc_full_cloud_amount_use_surrogate_between_actual", True)
