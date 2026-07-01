@@ -7,14 +7,14 @@ from cfgs.utils import str2bool
 
 # sparsepcgc_move_existing_target_only
 
-pretrained_date = "20260617"
-pretrained_time = "145838"
+pretrained_date = "20260701"
+pretrained_time = "230148"
 
 surrogate_date = "20260701"
 surrogate_time = "230148"
 
-model_date = "20260627"
-model_time = "000915"
+model_date = "20260701"
+model_time = "230148"
 
 # method_com = "OctAttention"
 method_com = "SparsePCGC"
