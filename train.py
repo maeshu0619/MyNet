@@ -142,6 +142,30 @@ def _sparsepcgc_outcome_actual_percent(debug):
     return None
 
 
+def _sparsepcgc_actual_bit_objective_mode(args):
+    mode = str(getattr(args, "sparsepcgc_actual_bit_objective", "raw")).strip().lower()
+    if mode not in {"raw", "billed"}:
+        mode = "raw"
+    return mode
+
+
+def _sparsepcgc_pick_objective_percent(args, raw_percent=None, billed_percent=None):
+    mode = _sparsepcgc_actual_bit_objective_mode(args)
+    raw_value = finite_float_or_none(raw_percent)
+    billed_value = finite_float_or_none(billed_percent)
+    if mode == "raw":
+        if raw_value is not None:
+            return float(raw_value), "raw"
+        if billed_value is not None:
+            return float(billed_value), "billed_fallback"
+        return None, "raw_missing"
+    if billed_value is not None:
+        return float(billed_value), "billed"
+    if raw_value is not None:
+        return float(raw_value), "raw_fallback"
+    return None, "billed_missing"
+
+
 def _sparsepcgc_scalar_tensor(value, reference):
     """
     Tensor/floatをreferenceと同じdevice/dtypeのscalar Tensorへ揃える。
@@ -1167,6 +1191,7 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
     drop_count,
     geom_loss=None,
 ):
+    objective_mode = _sparsepcgc_actual_bit_objective_mode(args)
     debug = {
         "sparsepcgc_training_mode": str(getattr(args, "sparsepcgc_training_mode", "subtree_selector")),
         "full_cloud_amount_enabled": False,
@@ -1221,6 +1246,7 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
         "full_cloud_amount_reuse_where_ranking_reason": "",
         "full_cloud_amount_predicted_delta": float("nan"),
         "full_cloud_amount_actual_delta": float("nan"),
+        "full_cloud_amount_actual_objective_delta": float("nan"),
         "full_cloud_amount_surrogate_delta": float("nan"),
         "full_cloud_amount_geom_loss": float("nan"),
         "full_cloud_amount_cls_loss": 0.0,
@@ -1236,6 +1262,9 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
             max(int(getattr(args, "sparsepcgc_actual_parallel_candidates", 1)), 1)
         ),
         "sparsepcgc_actual_worker_pool_used": False,
+        "actual_bit_objective": str(objective_mode),
+        "actual_objective_percent": float("nan"),
+        "actual_objective_bit_source": "",
     }
     rows = []
     if not isinstance(amount_terms, dict):
@@ -1667,6 +1696,7 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
     ):
         row["actual_scope"] = str(actual_scope)
         row["actual_bit_source"] = str(bit_source or "")
+        row["actual_bit_objective"] = str(objective_mode)
         row["actual_gt_bits"] = float(base_bit) if base_bit is not None else float("nan")
         row["actual_base_bits"] = float(base_bit) if base_bit is not None else float("nan")
         row["actual_total_bits_before"] = float(base_bit) if base_bit is not None else float("nan")
@@ -1691,9 +1721,18 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
             )
             row["actual_raw_percent"] = float(raw_percent_value)
             row["actual_percent"] = float(billed_percent_value)
+        objective_percent_value, objective_source = _sparsepcgc_pick_objective_percent(
+            args,
+            row.get("actual_raw_percent", float("nan")),
+            row.get("actual_percent", float("nan")),
+        )
+        row["actual_objective_percent"] = (
+            float(objective_percent_value) if objective_percent_value is not None else float("nan")
+        )
+        row["actual_objective_bit_source"] = str(objective_source)
         row["teacher_compared_in_actual_pool"] = bool(
             bool(row.get("actual_finished", False))
-            and math.isfinite(case_float(row.get("actual_percent", float("nan")), float("nan")))
+            and math.isfinite(case_float(row.get("actual_objective_percent", float("nan")), float("nan")))
         )
 
     unique_count = int(initial_voxel_coords.shape[-1]) if torch.is_tensor(initial_voxel_coords) else int(
@@ -1833,6 +1872,9 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
             "drop_count": int(cand_drop_count),
             "actual_percent": 0.0 if is_noop else float("nan"),
             "actual_raw_percent": 0.0 if is_noop else float("nan"),
+            "actual_objective_percent": 0.0 if is_noop else float("nan"),
+            "actual_bit_objective": str(objective_mode),
+            "actual_objective_bit_source": "noop_baseline",
             "actual_total_bits_before": float(base_bit) if base_bit is not None else float("nan"),
             "actual_total_bits_after": float(base_bit) if (is_noop and base_bit is not None) else float("nan"),
             "actual_base_bits": float(base_bit) if base_bit is not None else float("nan"),
@@ -1944,7 +1986,7 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
             _sparsepcgc_update_amount_outcome_memory(
                 args,
                 amount_memory_key,
-                row.get("actual_percent", float("nan")),
+                row.get("actual_objective_percent", row.get("actual_percent", float("nan"))),
                 row.get("final_ratio", 0.0),
             )
 
@@ -1958,9 +2000,9 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
             actual_pool_rows.append(row)
             surrogate_pool_rows.append(row)
             continue
-        if bool(row.get("teacher_compared_in_actual_pool", False)) and math.isfinite(case_float(row.get("actual_percent", float("nan")), float("nan"))):
+        if bool(row.get("teacher_compared_in_actual_pool", False)) and math.isfinite(case_float(row.get("actual_objective_percent", float("nan")), float("nan"))):
             row["_teacher_score"] = (
-                float(row["actual_percent"])
+                float(row.get("actual_objective_percent", row["actual_percent"]))
                 + float(getattr(args, "sparsepcgc_full_cloud_amount_geom_penalty_weight", 0.1)) * float(row.get("geom_loss", 0.0))
                 + float(getattr(args, "sparsepcgc_full_cloud_amount_ratio_reg_weight", 0.05))
                 * (max(float(row.get("final_ratio", 0.0)) - float(getattr(args, "sparsepcgc_full_cloud_amount_ratio_reg_target", 0.05)), 0.0) ** 2)
@@ -1979,9 +2021,14 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
     teacher_source = "surrogate_fallback"
     oracle_best_ratio = 0.0
     oracle_best_actual_delta = 0.0
+    oracle_best_objective_delta = 0.0
     selected_row = rows_by_key.get(str(selected_candidate_key), None)
     selected_actual_delta = case_float(
         selected_row.get("actual_percent", float("nan")) if isinstance(selected_row, dict) else float("nan"),
+        float("nan"),
+    )
+    selected_objective_delta = case_float(
+        selected_row.get("actual_objective_percent", float("nan")) if isinstance(selected_row, dict) else float("nan"),
         float("nan"),
     )
     selected_score = case_float(
@@ -2001,14 +2048,17 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
             teacher_ratio_value = 0.0
         else:
             teacher_class = int(best_row.get("candidate_base_class", 0))
-            teacher_delta = float(best_row.get("actual_percent", 0.0))
+            teacher_delta = float(best_row.get("actual_objective_percent", best_row.get("actual_percent", 0.0)))
             teacher_ratio_value = float(best_row.get("final_ratio", 0.0))
         oracle_best_ratio = float(best_row.get("final_ratio", 0.0))
         oracle_best_actual_delta = float(best_row.get("actual_percent", 0.0))
+        oracle_best_objective_delta = float(best_row.get("actual_objective_percent", best_row.get("actual_percent", 0.0)))
         if bool(best_row.get("is_noop", False)):
             oracle_best_actual_delta = 0.0
+            oracle_best_objective_delta = 0.0
         if isinstance(selected_row, dict):
             selected_actual_delta = case_float(selected_row.get("actual_percent", float("nan")), float("nan"))
+            selected_objective_delta = case_float(selected_row.get("actual_objective_percent", float("nan")), float("nan"))
             selected_score = case_float(selected_row.get("_teacher_score", float("nan")), float("nan"))
         if oracle_sweep_due and len(actual_nonnoop_rows) > 1:
             teacher_source = "actual_full_cloud_oracle_sweep"
@@ -2031,8 +2081,10 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
             teacher_ratio_value = float(best_row.get("final_ratio", 0.0))
         oracle_best_ratio = float(best_row.get("final_ratio", 0.0))
         oracle_best_actual_delta = float(best_row.get("surrogate_percent", 0.0))
+        oracle_best_objective_delta = float(best_row.get("surrogate_percent", 0.0))
         if isinstance(selected_row, dict):
             selected_actual_delta = case_float(selected_row.get("surrogate_percent", float("nan")), float("nan"))
+            selected_objective_delta = case_float(selected_row.get("surrogate_percent", float("nan")), float("nan"))
             selected_score = case_float(selected_row.get("_surrogate_teacher_score", float("nan")), float("nan"))
         teacher_source = "surrogate_fallback"
 
@@ -2082,7 +2134,7 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
 
     supervised_rows = [
         row for row in actual_pool_rows
-        if math.isfinite(case_float(row.get("actual_percent", float("nan")), float("nan")))
+        if math.isfinite(case_float(row.get("actual_objective_percent", float("nan")), float("nan")))
     ]
     supervised_source = "actual"
     if not supervised_rows:
@@ -2110,8 +2162,8 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
     value_terms = []
     for cls, row in unique_supervised_rows.items():
         target_value = (
-            float(row.get("actual_percent", float("nan")))
-            if supervised_source == "actual" and math.isfinite(case_float(row.get("actual_percent", float("nan")), float("nan")))
+            float(row.get("actual_objective_percent", float("nan")))
+            if supervised_source == "actual" and math.isfinite(case_float(row.get("actual_objective_percent", float("nan")), float("nan")))
             else float(row.get("surrogate_percent", 0.0))
         )
         value_terms.append(
@@ -2194,7 +2246,7 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
         for row in rows
         if bool(row.get("actual_finished", False))
         and not bool(row.get("is_noop", False))
-        and math.isfinite(case_float(row.get("actual_percent", float("nan")), float("nan")))
+        and math.isfinite(case_float(row.get("actual_objective_percent", float("nan")), float("nan")))
     )
     selected_is_best = bool(str(selected_candidate_key) == str(teacher_row_key))
     oracle_gap = float("nan")
@@ -2237,8 +2289,10 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
             "full_cloud_amount_teacher_residual": float(teacher_residual_target),
             "full_cloud_amount_oracle_best_ratio": float(oracle_best_ratio),
             "full_cloud_amount_oracle_best_actual_delta": float(oracle_best_actual_delta),
+            "full_cloud_amount_oracle_best_objective_delta": float(oracle_best_objective_delta),
             "full_cloud_amount_selected_ratio": float(selected_ratio_value),
             "full_cloud_amount_selected_actual_delta": float(selected_actual_delta),
+            "full_cloud_amount_selected_objective_delta": float(selected_objective_delta),
             "full_cloud_amount_oracle_gap": float(oracle_gap),
             "full_cloud_amount_selected_is_best": bool(selected_is_best),
             "full_cloud_amount_entropy": float(entropy.detach().cpu()),
@@ -2260,6 +2314,7 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
             "full_cloud_amount_reuse_where_ranking_reason": str(reuse_where_ranking_reason),
             "full_cloud_amount_predicted_delta": selected_surrogate,
             "full_cloud_amount_actual_delta": float(selected_actual_delta),
+            "full_cloud_amount_actual_objective_delta": float(selected_objective_delta),
             "full_cloud_amount_surrogate_delta": selected_surrogate,
             "full_cloud_amount_geom_loss": float(geom_loss_term.detach().cpu()),
             "full_cloud_amount_cls_loss": float(cls_loss.detach().cpu()),
@@ -2275,6 +2330,17 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
                 and selected_class != 0
                 and float(actual_value) >= float(noop_margin)
             ),
+            "actual_bit_objective": str(objective_mode),
+            "actual_objective_percent": float(selected_objective_delta),
+            "actual_objective_bit_source": str(
+                selected_row.get("actual_objective_bit_source", objective_mode)
+                if isinstance(selected_row, dict)
+                else objective_mode
+            ),
+            "actual_train_objective_percent": float(selected_objective_delta),
+            "actual_bit_percent_used_for_loss": float(selected_objective_delta),
+            "actual_forward_value": float(selected_objective_delta),
+            "compression_loss_used": float(selected_objective_delta),
         }
     )
     if not math.isfinite(debug["full_cloud_amount_actual_wall_time_total"]):
@@ -12186,14 +12252,25 @@ def train(model, args, loss, writer, plot, notifier=None):
                                                 else:
                                                     edited_actual_bit_for_log = float(final_encoded_bit or 0.0)
                                                     override_bit_source = "fresh_final_full_cloud_encode_fallback"
-                                            billed_tensor = L_com.new_tensor(float(billed_percent))
-                                            L_com = billed_tensor + (L_com - L_com.detach())
-                                            loss_bit = billed_tensor + (loss_bit - loss_bit.detach())
+                                            objective_percent, objective_bit_source = _sparsepcgc_pick_objective_percent(
+                                                args,
+                                                raw_percent,
+                                                billed_percent,
+                                            )
+                                            if objective_percent is None:
+                                                objective_percent = float(billed_percent)
+                                                objective_bit_source = "billed_fallback_missing"
+                                            objective_tensor = L_com.new_tensor(float(objective_percent))
+                                            L_com = objective_tensor + (L_com - L_com.detach())
+                                            loss_bit = objective_tensor + (loss_bit - loss_bit.detach())
                                             billed_debug.update(
                                                 {
                                                     "total_bit": float(billed_percent),
                                                     "actual_total_bit_percent": float(billed_percent),
-                                                    "actual_train_objective_percent": float(billed_percent),
+                                                    "actual_train_objective_percent": float(objective_percent),
+                                                    "actual_objective_percent": float(objective_percent),
+                                                    "actual_bit_objective": str(_sparsepcgc_actual_bit_objective_mode(args)),
+                                                    "actual_objective_bit_source": str(objective_bit_source),
                                                     "actual_bit_percent": float(billed_percent),
                                                     "actual_delta_percent": float(billed_percent),
                                                     "actual_raw_percent": float(raw_percent)
@@ -12204,10 +12281,12 @@ def train(model, args, loss, writer, plot, notifier=None):
                                                     "gen_actual_bit": float(edited_actual_bit_for_log),
                                                     "gen_total_bit_with_edit_record": float(edited_actual_bit_for_log)
                                                     + float(edit_record_bits),
-                                                    "actual_target": float(billed_percent),
-                                                    "actual_forward_value": float(billed_percent),
-                                                    "compression_forward_teacher_percent": float(billed_percent),
-                                                    "forward_display_value": float(billed_percent),
+                                                    "actual_target": float(objective_percent),
+                                                    "actual_forward_value": float(objective_percent),
+                                                    "actual_bit_percent_used_for_loss": float(objective_percent),
+                                                    "compression_loss_used": float(objective_percent),
+                                                    "compression_forward_teacher_percent": float(objective_percent),
+                                                    "forward_display_value": float(objective_percent),
                                                     "policy_actual_percent": policy_final_billed_percent,
                                                     "oracle_teacher_actual_percent": float(oracle_billed_percent),
                                                     "policy_full_cloud_actual_bit_percent": policy_final_billed_percent,
@@ -13198,6 +13277,21 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 "full_cloud_amount_actual_step": bool(full_cloud_amount_actual_step),
                             }
                         )
+                        objective_value = finite_float_or_none(
+                            full_cloud_amount_debug.get(
+                                "actual_objective_percent",
+                                full_cloud_amount_debug.get("actual_train_objective_percent", None),
+                            )
+                        )
+                        if objective_value is not None:
+                            if torch.is_tensor(L_com):
+                                L_com = L_com.new_tensor(float(objective_value)) + (L_com - L_com.detach())
+                            if torch.is_tensor(loss_bit):
+                                loss_bit = loss_bit.new_tensor(float(objective_value)) + (loss_bit - loss_bit.detach())
+                            if torch.is_tensor(L_com_objective):
+                                L_com_objective = L_com_objective.new_tensor(float(objective_value)) + (
+                                    L_com_objective - L_com_objective.detach()
+                                )
                         compression_tensor_debug.update(full_cloud_amount_debug)
                     if full_cloud_amount_candidate_rows:
                         candidate_path = metric_csv_paths.get("full_cloud_amount_candidate_step")

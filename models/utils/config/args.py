@@ -27,9 +27,9 @@ dataname = "8i"
 # dataname = "MVUB"
 # dataname = "UVG"
 
-dataset_name = "longdress"
+# dataset_name = "longdress"
 # dataset_name = "loot"
-# dataset_name = "redandblack"
+dataset_name = "redandblack"
 # dataset_name = "soldier"
 
 # dataset_name = "andrew"
@@ -1030,6 +1030,13 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--sparsepcgc_full_cloud_amount_entropy_decay_steps', default=500, type=int)
     parser.add_argument('--sparsepcgc_full_cloud_amount_use_surrogate_between_actual', default=True, type=str2bool)
     parser.add_argument('--sparsepcgc_full_cloud_amount_noop_margin', default=0.0, type=float)
+    parser.add_argument(
+        '--sparsepcgc_actual_bit_objective',
+        default='raw',
+        choices=['raw', 'billed'],
+        type=str,
+        help='actual codec teacher/compression objectiveでraw bitsを使うか、edit_record_bits込みbilled bitsを使うか',
+    )
     parser.add_argument('--sparsepcgc_full_cloud_amount_geometry_mode', default='sampled', choices=['off', 'sampled', 'interval_full'], type=str)
     parser.add_argument('--sparsepcgc_full_cloud_amount_geom_sample_points', default=20000, type=int)
     parser.add_argument('--sparsepcgc_full_cloud_amount_geom_interval', default=20, type=int)
@@ -2993,6 +3000,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--codec_eval_interval', default=0, type=int, help='test.pyでactual codec評価を行う間隔。0なら無効、1なら全sample')
     parser.add_argument('--profile_test', default=False, type=str2bool, help='test.pyでsample別の処理時間/GPUメモリをログ出力するか')
     parser.add_argument('--save_test_ply', default=True, type=str2bool, help='test.pyで編集後PLYを保存するか')
+    parser.add_argument('--test_apply_post_hardening', default=False, type=str2bool, help='Trueならtest.pyで旧来のfinal_w後処理hardeningを追加適用する。既定Falseでtrain出力フローに合わせる')
     parser.add_argument('--test_drop_threshold', default=0.50, type=float, help='test.pyで点削除ゲートをhard化するしきい値。全点keep/全点dropになる場合はsum(final_w)ベースのexpected_keepへ自動フォールバック')
     parser.add_argument('--test_adjust_threshold', default=1e-6, type=float, help='test.pyで点が調整されたと数える最小移動距離')
     parser.add_argument('--test_inference_mode', default='full_cloud', type=str, help='推論方法(auto/full_cloud/subtree_merge/patch/direct/legacy/verified)')
@@ -4618,6 +4626,11 @@ def parse_pugan_args(parser, file_day, file_time):
         int(getattr(args, "sparsepcgc_full_cloud_amount_entropy_decay_steps", 500)),
         0,
     )
+    args.sparsepcgc_actual_bit_objective = str(
+        getattr(args, "sparsepcgc_actual_bit_objective", "raw")
+    ).strip().lower()
+    if args.sparsepcgc_actual_bit_objective not in {"raw", "billed"}:
+        args.sparsepcgc_actual_bit_objective = "raw"
     args.sparsepcgc_full_cloud_amount_use_surrogate_between_actual = bool(
         getattr(args, "sparsepcgc_full_cloud_amount_use_surrogate_between_actual", True)
     )

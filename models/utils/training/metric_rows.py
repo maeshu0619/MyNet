@@ -29,6 +29,10 @@ def build_compression_metric_row(
     sequence_step=None,
 ):
     actual_delta = case_float(comp_debug.get("actual_total_bit_percent", float("nan")), float("nan"))
+    actual_objective_percent = case_float(
+        comp_debug.get("actual_objective_percent", comp_debug.get("actual_train_objective_percent", actual_delta)),
+        float("nan"),
+    )
     gt_actual_bits = case_float(comp_debug.get("gt_actual_bit", comp_debug.get("gt_bit_abs", float("nan"))), float("nan"))
     gen_actual_bits_raw = case_float(comp_debug.get("gen_actual_bit", comp_debug.get("gen_bit_abs", float("nan"))), float("nan"))
     gen_actual_bits = case_float(
@@ -91,7 +95,14 @@ def build_compression_metric_row(
         "fresh_actual": bool(fresh_actual),
         "cached_actual": bool(cached_actual),
         "actual_total_bit_percent": actual_delta if math.isfinite(actual_delta) else None,
-        "actual_train_objective_percent": actual_delta if math.isfinite(actual_delta) else None,
+        "actual_train_objective_percent": (
+            actual_objective_percent if math.isfinite(actual_objective_percent) else None
+        ),
+        "actual_objective_percent": (
+            actual_objective_percent if math.isfinite(actual_objective_percent) else None
+        ),
+        "actual_bit_objective": str(comp_debug.get("actual_bit_objective", getattr(args, "sparsepcgc_actual_bit_objective", "raw"))),
+        "actual_objective_bit_source": str(comp_debug.get("actual_objective_bit_source", "")),
         "policy_actual_percent": policy_actual_percent if math.isfinite(policy_actual_percent) else None,
         "oracle_teacher_actual_percent": (
             oracle_teacher_actual_percent if math.isfinite(oracle_teacher_actual_percent) else None
@@ -233,12 +244,26 @@ def build_compression_metric_row(
             comp_debug.get("full_cloud_amount_oracle_best_actual_delta", float("nan")),
             float("nan"),
         ),
+        "full_cloud_amount_oracle_best_objective_delta": case_float(
+            comp_debug.get(
+                "full_cloud_amount_oracle_best_objective_delta",
+                comp_debug.get("full_cloud_amount_oracle_best_actual_delta", float("nan")),
+            ),
+            float("nan"),
+        ),
         "full_cloud_amount_selected_ratio": case_float(
             comp_debug.get("full_cloud_amount_selected_ratio", float("nan")),
             float("nan"),
         ),
         "full_cloud_amount_selected_actual_delta": case_float(
             comp_debug.get("full_cloud_amount_selected_actual_delta", float("nan")),
+            float("nan"),
+        ),
+        "full_cloud_amount_selected_objective_delta": case_float(
+            comp_debug.get(
+                "full_cloud_amount_selected_objective_delta",
+                comp_debug.get("full_cloud_amount_selected_actual_delta", float("nan")),
+            ),
             float("nan"),
         ),
         "full_cloud_amount_oracle_gap": case_float(
@@ -399,6 +424,12 @@ def build_compression_metric_row(
         "sign_match_proxy_full": comp_debug.get("sign_match_proxy_full", None),
         "actual_oracle_force_no_edit_used": bool(comp_debug.get("actual_oracle_force_no_edit_used", False)),
         "actual_raw_percent": case_float(comp_debug.get("actual_raw_percent", actual_delta), float("nan")),
+        "actual_objective_percent": case_float(
+            comp_debug.get("actual_objective_percent", comp_debug.get("actual_train_objective_percent", actual_delta)),
+            float("nan"),
+        ),
+        "actual_bit_objective": str(comp_debug.get("actual_bit_objective", getattr(args, "sparsepcgc_actual_bit_objective", "raw"))),
+        "actual_objective_bit_source": str(comp_debug.get("actual_objective_bit_source", "")),
         "actual_bit_percent_raw": case_float(comp_debug.get("actual_bit_percent_raw", comp_debug.get("actual_bit_percent", actual_delta)), float("nan")),
         "actual_bit_percent_used_for_loss": case_float(comp_debug.get("actual_bit_percent_used_for_loss", comp_debug.get("actual_forward_value", actual_delta)), float("nan")),
         "actual_edit_record_bits": case_float(comp_debug.get("actual_edit_record_bits", 0.0), 0.0),

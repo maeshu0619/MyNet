@@ -28,11 +28,10 @@ from models.utils.testing.utils import (
     _adapt_encoder_state_dict_for_sparse_input,
     _adapt_model_state_dict_for_sparse_input,
     _adapt_state_dict_to_model_shapes,
-    _compute_drop_hardening,
     _downsample_input_batch,
     _run_named_inference_mode,
-    _summarize_point_edits,
 )
+from models.utils.training.utils import summarize_point_edits as summarize_point_edits_train
 from record.write import Writing
 
 def terminal_log(message):
@@ -570,6 +569,18 @@ def test(model, args, writer):
             )
             _sync_cuda(use_cuda)
             model_forward_total_time = time.perf_counter() - forward_start
+
+            full_cloud_context = inference_result.get("full_octree_context", None)
+            if isinstance(full_cloud_context, dict):
+                global_voxel_coords = full_cloud_context.get("global_voxel_coords", None)
+                if torch.is_tensor(global_voxel_coords) and global_voxel_coords.ndim == 3:
+                    try:
+                        voxel_count_value = int(global_voxel_coords.shape[-1])
+                    except Exception:
+                        voxel_count_value = 0
+                    setattr(args, "_full_cloud_canonical_coords_count", voxel_count_value)
+                    setattr(args, "_full_cloud_input_voxel_count", voxel_count_value)
+                    setattr(args, "_full_cloud_voxel_count", voxel_count_value)
             terminal_log(
                 "Step Forward Done: "
                 f"step={step + 1}/{total_files}, "
@@ -581,21 +592,35 @@ def test(model, args, writer):
             gen_pts = inference_result["gen_pts"]
             final_w = inference_result["final_w"]
             pre_harden_gen_pts = gen_pts
-            keep_mask, hardening_info = _compute_drop_hardening(final_w, args)
-            if final_w is not None:
-                keep_count = hardening_info["keep_count"]
-                total_count = hardening_info["total_count"]
-                if 0 < keep_count < total_count:
-                    gen_pts = gen_pts[:, :, keep_mask].contiguous()
+            keep_mask = None
+            hardening_info = {
+                "mode": "disabled",
+                "threshold": float(getattr(args, "test_drop_threshold", 0.5)),
+                "keep_count": None if gen_pts is None else int(gen_pts.shape[-1]),
+                "total_count": None if gen_pts is None else int(gen_pts.shape[-1]),
+            }
+            if bool(getattr(args, "test_apply_post_hardening", False)):
+                from models.utils.testing.utils import _compute_drop_hardening
 
-            edit_stats = _summarize_point_edits(
+                keep_mask, hardening_info = _compute_drop_hardening(final_w, args)
+                if final_w is not None:
+                    keep_count = hardening_info["keep_count"]
+                    total_count = hardening_info["total_count"]
+                    if 0 < keep_count < total_count:
+                        gen_pts = gen_pts[:, :, keep_mask].contiguous()
+
+            edit_stats = summarize_point_edits_train(
                 input_xyz=input_pcd[:, :3, :],
-                pre_harden_gen_pts=pre_harden_gen_pts,
-                final_gen_pts=gen_pts,
-                edit_ref_xyz=inference_result.get("edit_ref_xyz"),
-                keep_mask=keep_mask,
+                gen_pts=gen_pts,
+                final_w=final_w,
                 args=args,
+                edit_ref_xyz=inference_result.get("edit_ref_xyz"),
             )
+            if isinstance(edit_stats, dict):
+                edit_stats["test_post_hardening_applied"] = bool(
+                    getattr(args, "test_apply_post_hardening", False)
+                )
+                edit_stats["test_post_hardening_mode"] = str(hardening_info.get("mode", "disabled"))
             postprocess_time = time.perf_counter() - post_start
             terminal_log(
                 "Step Postprocess Done: "

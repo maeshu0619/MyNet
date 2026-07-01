@@ -187,6 +187,12 @@ def log_compression_stats(writer, step, num_steps, comp_debug):
         ("actual_total_bit_percent", "actual_train_objective_percent", "actual_bit_percent"),
         float("nan"),
     )
+    actual_objective_percent = _first_value(
+        comp_debug,
+        ("actual_objective_percent", "actual_train_objective_percent", "compression_loss_used", "actual_total_bit_percent"),
+        float("nan"),
+    )
+    actual_bit_objective = str(_first_value(comp_debug, ("actual_bit_objective",), "") or "raw")
     actual_raw_percent = _first_value(
         comp_debug,
         ("actual_raw_percent", "actual_total_bit_percent"),
@@ -214,6 +220,8 @@ def log_compression_stats(writer, step, num_steps, comp_debug):
         f"->{_fmt(gen_actual_bit, 6)}, "
         f"actual_bit_percent={_fmt(actual_total_bit_percent, 6)}, "
         f"actual_raw_percent={_fmt(actual_raw_percent, 6)}, "
+        f"actual_objective_percent={_fmt(actual_objective_percent, 6)}, "
+        f"actual_bit_objective={actual_bit_objective}, "
         f"actual_used_for_loss={_fmt(actual_used_percent, 6)}, "
         f"compression_loss_raw={_fmt(compression_loss_raw, 6)}, "
         f"compression_loss_used={_fmt(compression_loss_used, 6)}, "
@@ -801,6 +809,8 @@ def log_compact_step_summary(
     full_cloud_amount_selected_is_best = _prefer_number("full_cloud_amount_selected_is_best", 0.0)
     full_cloud_amount_predicted_delta = _prefer_number("full_cloud_amount_predicted_delta")
     full_cloud_amount_actual_delta = _prefer_number("full_cloud_amount_actual_delta")
+    full_cloud_amount_selected_objective_delta = _prefer_number("full_cloud_amount_selected_objective_delta")
+    full_cloud_amount_oracle_best_objective_delta = _prefer_number("full_cloud_amount_oracle_best_objective_delta")
     full_cloud_amount_surrogate_delta = _prefer_number("full_cloud_amount_surrogate_delta")
     full_cloud_amount_residual_loss = _prefer_number("full_cloud_amount_residual_loss")
     full_cloud_amount_residual_enabled = _prefer_number("full_cloud_amount_residual_enabled", 0.0)
@@ -808,6 +818,13 @@ def log_compact_step_summary(
     full_cloud_amount_actual_wall = _prefer_number("full_cloud_amount_actual_wall_time_total")
     full_cloud_amount_parallel_mode = _prefer_text("sparsepcgc_actual_parallel_mode")
     full_cloud_verified_noop_guard = _prefer_number("full_cloud_verified_noop_guard_used", 0.0)
+    actual_bit_objective = _prefer_text("actual_bit_objective") or str(
+        getattr(args, "sparsepcgc_actual_bit_objective", "raw")
+    )
+    actual_objective_percent = _prefer_number("actual_objective_percent")
+    actual_raw_percent = _prefer_number("actual_raw_percent")
+    actual_billed_percent = _prefer_number("actual_total_bit_percent")
+    actual_edit_record_bits = _prefer_number("actual_edit_record_bits")
     collapse_detected = bool(
         comp_debug.get("phase0_noop_only_collapse_detected", False)
         or structure_debug.get("phase0_noop_only_collapse_detected", False)
@@ -877,11 +894,18 @@ def log_compact_step_summary(
         f"FCASelectedIsBest={bool(round(_to_float(full_cloud_amount_selected_is_best, 0.0)))}, "
         f"FCAPred={_fmt(full_cloud_amount_predicted_delta, 5)}, "
         f"FCAActual={_fmt(full_cloud_amount_actual_delta, 5)}, "
+        f"FCAObj={_fmt(full_cloud_amount_selected_objective_delta, 5)}, "
         f"FCASurr={_fmt(full_cloud_amount_surrogate_delta, 5)}, "
         f"FCATeacher={full_cloud_amount_teacher_source}, "
         f"FCAResLoss={_fmt(full_cloud_amount_residual_loss, 6)}, "
         f"FCAResOn={bool(round(_to_float(full_cloud_amount_residual_enabled, 0.0)))}, "
         f"FCALoss={_fmt(full_cloud_amount_total_loss, 5)}, "
+        f"ObjBit={actual_bit_objective}, "
+        f"ActRaw={_fmt(actual_raw_percent, 5)}, "
+        f"ActBilled={_fmt(actual_billed_percent, 5)}, "
+        f"EditBits={_fmt(actual_edit_record_bits, 2)}, "
+        f"ObjPct={_fmt(actual_objective_percent, 5)}, "
+        f"FCAOracleObj={_fmt(full_cloud_amount_oracle_best_objective_delta, 5)}, "
         f"FCAActualWall={_fmt(full_cloud_amount_actual_wall, 4)}, "
         f"FCAParallelMode={full_cloud_amount_parallel_mode}, "
         f"FCAVerifiedNoop={bool(round(_to_float(full_cloud_verified_noop_guard, 0.0)))}, "

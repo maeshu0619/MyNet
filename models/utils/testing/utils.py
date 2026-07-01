@@ -830,6 +830,7 @@ def _run_full_cloud_inference(model, input_pcd, args, cache_key, use_cuda, use_a
         "encoder_debug_chunks": encoder_debug_chunks,
         "structure_debug_chunks": structure_debug_chunks,
         "edit_ref_xyz": _aligned_edit_ref_xyz(input_xyz, model_out[0].shape[-1]),
+        "full_octree_context": full_octree_context,
     }
     return result
 
