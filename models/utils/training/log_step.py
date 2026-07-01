@@ -782,6 +782,9 @@ def log_compact_step_summary(
     verified_noop_guard = _prefer_number("verified_noop_guard_used", 0.0)
     full_cloud_amount_enabled = _prefer_number("full_cloud_amount_enabled", 0.0)
     full_cloud_amount_input_points = _prefer_number("full_cloud_amount_input_points", 0.0)
+    full_cloud_amount_base_bin = _prefer_number("full_cloud_amount_selected_base_bin")
+    full_cloud_amount_selected_residual = _prefer_number("full_cloud_amount_selected_residual")
+    full_cloud_amount_pred_residual = _prefer_number("full_cloud_amount_pred_residual")
     full_cloud_amount_final_ratio = _prefer_number("full_cloud_amount_final_ratio")
     full_cloud_amount_drop_count = _prefer_number("full_cloud_amount_drop_count", 0.0)
     full_cloud_amount_noop_selected = _prefer_number("full_cloud_amount_noop_selected", 0.0)
@@ -791,12 +794,16 @@ def log_compact_step_summary(
     full_cloud_amount_actual_finished_count = _prefer_number("full_cloud_amount_actual_finished_count", 0.0)
     full_cloud_amount_teacher_source = _prefer_text("full_cloud_amount_teacher_source")
     full_cloud_amount_teacher_ratio = _prefer_number("full_cloud_amount_teacher_ratio")
+    full_cloud_amount_teacher_base_bin = _prefer_number("full_cloud_amount_teacher_base_bin")
+    full_cloud_amount_teacher_residual = _prefer_number("full_cloud_amount_teacher_residual")
     full_cloud_amount_oracle_best_ratio = _prefer_number("full_cloud_amount_oracle_best_ratio")
     full_cloud_amount_oracle_gap = _prefer_number("full_cloud_amount_oracle_gap")
     full_cloud_amount_selected_is_best = _prefer_number("full_cloud_amount_selected_is_best", 0.0)
     full_cloud_amount_predicted_delta = _prefer_number("full_cloud_amount_predicted_delta")
     full_cloud_amount_actual_delta = _prefer_number("full_cloud_amount_actual_delta")
     full_cloud_amount_surrogate_delta = _prefer_number("full_cloud_amount_surrogate_delta")
+    full_cloud_amount_residual_loss = _prefer_number("full_cloud_amount_residual_loss")
+    full_cloud_amount_residual_enabled = _prefer_number("full_cloud_amount_residual_enabled", 0.0)
     full_cloud_amount_total_loss = _prefer_number("full_cloud_amount_total_loss")
     full_cloud_amount_actual_wall = _prefer_number("full_cloud_amount_actual_wall_time_total")
     full_cloud_amount_parallel_mode = _prefer_text("sparsepcgc_actual_parallel_mode")
@@ -852,6 +859,9 @@ def log_compact_step_summary(
         f"VerifiedNoopGuard={bool(round(_to_float(verified_noop_guard, 0.0)))}, "
         f"FullCloudAmount={bool(round(_to_float(full_cloud_amount_enabled, 0.0)))}, "
         f"FCAInput={_fmt_int(full_cloud_amount_input_points)}, "
+        f"FCABase={_fmt(full_cloud_amount_base_bin, 5)}, "
+        f"FCARes={_fmt(full_cloud_amount_selected_residual, 5)}, "
+        f"FCAPredRes={_fmt(full_cloud_amount_pred_residual, 5)}, "
         f"FCAFinal={_fmt(full_cloud_amount_final_ratio, 5)}, "
         f"FCADrop={_fmt_int(full_cloud_amount_drop_count)}, "
         f"FCANoop={bool(round(_to_float(full_cloud_amount_noop_selected, 0.0)))}, "
@@ -860,6 +870,8 @@ def log_compact_step_summary(
         f"FCAActualFinished={_fmt_int(full_cloud_amount_actual_finished_count)}, "
         f"FCAActualEval={_fmt_int(full_cloud_amount_actual_eval_count)}, "
         f"FCATeacherRatio={_fmt(full_cloud_amount_teacher_ratio, 5)}, "
+        f"FCATeacherBase={_fmt(full_cloud_amount_teacher_base_bin, 5)}, "
+        f"FCATeacherRes={_fmt(full_cloud_amount_teacher_residual, 5)}, "
         f"FCAOracleBestRatio={_fmt(full_cloud_amount_oracle_best_ratio, 5)}, "
         f"FCAOracleGap={_fmt(full_cloud_amount_oracle_gap, 5)}, "
         f"FCASelectedIsBest={bool(round(_to_float(full_cloud_amount_selected_is_best, 0.0)))}, "
@@ -867,6 +879,8 @@ def log_compact_step_summary(
         f"FCAActual={_fmt(full_cloud_amount_actual_delta, 5)}, "
         f"FCASurr={_fmt(full_cloud_amount_surrogate_delta, 5)}, "
         f"FCATeacher={full_cloud_amount_teacher_source}, "
+        f"FCAResLoss={_fmt(full_cloud_amount_residual_loss, 6)}, "
+        f"FCAResOn={bool(round(_to_float(full_cloud_amount_residual_enabled, 0.0)))}, "
         f"FCALoss={_fmt(full_cloud_amount_total_loss, 5)}, "
         f"FCAActualWall={_fmt(full_cloud_amount_actual_wall, 4)}, "
         f"FCAParallelMode={full_cloud_amount_parallel_mode}, "

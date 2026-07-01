@@ -7572,6 +7572,11 @@ class StructureRepairActuator(nn.Module):
             "full_cloud_amount_bin": pts_xyz.new_tensor(
                 float(algorithmic_amount_selected_bin_ratio_value)
             ).detach(),
+            "full_cloud_amount_residual_raw": (
+                algorithmic_amount_residual_raw.detach()
+                if torch.is_tensor(algorithmic_amount_residual_raw)
+                else pts_xyz.new_zeros((int(actuator_features.shape[0]),), dtype=pts_xyz.dtype, device=pts_xyz.device)
+            ),
             "full_cloud_amount_residual": pts_xyz.new_tensor(
                 float(algorithmic_amount_residual_value)
             ).detach(),
@@ -8276,6 +8281,11 @@ class StructureRepairActuator(nn.Module):
             "full_cloud_amount_input_points": pts_xyz.new_tensor(float(N)),
             "full_cloud_amount_selected_class": pts_xyz.new_tensor(float(algorithmic_amount_selected_class_value)),
             "full_cloud_amount_bin": pts_xyz.new_tensor(float(algorithmic_amount_selected_bin_ratio_value)),
+            "full_cloud_amount_residual_raw": (
+                algorithmic_amount_residual_raw
+                if torch.is_tensor(algorithmic_amount_residual_raw)
+                else pts_xyz.new_zeros((int(actuator_features.shape[0]),), dtype=pts_xyz.dtype, device=pts_xyz.device)
+            ),
             "full_cloud_amount_residual": pts_xyz.new_tensor(float(algorithmic_amount_residual_value)),
             "full_cloud_amount_final_ratio": pts_xyz.new_tensor(float(algorithmic_amount_selector_final_ratio_value)),
             "full_cloud_amount_noop_selected": pts_xyz.new_tensor(

@@ -25,6 +25,8 @@ def build_compression_metric_row(
     stage,
     comp_debug,
     L_com,
+    sequence_name=None,
+    sequence_step=None,
 ):
     actual_delta = case_float(comp_debug.get("actual_total_bit_percent", float("nan")), float("nan"))
     gt_actual_bits = case_float(comp_debug.get("gt_actual_bit", comp_debug.get("gt_bit_abs", float("nan"))), float("nan"))
@@ -78,6 +80,10 @@ def build_compression_metric_row(
         "episode": int(episode) + 1,
         "epoch": int(epoch) + 1,
         "step": int(step) + 1,
+        "episode_index": int(episode),
+        "epoch_index": int(epoch),
+        "sequence_step": (int(sequence_step) + 1) if sequence_step is not None else int(step) + 1,
+        "sequence_name": str(sequence_name or ""),
         "stage": str(stage),
         "codec": str(comp_debug.get("teacher_codec", getattr(args, "compress", "unknown"))),
         "backend": str(getattr(args, "compression_loss_backend", "proxy")),
@@ -174,6 +180,22 @@ def build_compression_metric_row(
             comp_debug.get("full_cloud_amount_residual", float("nan")),
             float("nan"),
         ),
+        "full_cloud_amount_pred_residual": case_float(
+            comp_debug.get("full_cloud_amount_pred_residual", float("nan")),
+            float("nan"),
+        ),
+        "full_cloud_amount_pred_residual_raw": case_float(
+            comp_debug.get("full_cloud_amount_pred_residual_raw", float("nan")),
+            float("nan"),
+        ),
+        "full_cloud_amount_selected_base_bin": case_float(
+            comp_debug.get("full_cloud_amount_selected_base_bin", float("nan")),
+            float("nan"),
+        ),
+        "full_cloud_amount_selected_residual": case_float(
+            comp_debug.get("full_cloud_amount_selected_residual", float("nan")),
+            float("nan"),
+        ),
         "full_cloud_amount_final_ratio": case_float(
             comp_debug.get("full_cloud_amount_final_ratio", float("nan")),
             float("nan"),
@@ -193,6 +215,14 @@ def build_compression_metric_row(
         "full_cloud_amount_teacher_source": str(comp_debug.get("full_cloud_amount_teacher_source", "")),
         "full_cloud_amount_teacher_ratio": case_float(
             comp_debug.get("full_cloud_amount_teacher_ratio", float("nan")),
+            float("nan"),
+        ),
+        "full_cloud_amount_teacher_base_bin": case_float(
+            comp_debug.get("full_cloud_amount_teacher_base_bin", float("nan")),
+            float("nan"),
+        ),
+        "full_cloud_amount_teacher_residual": case_float(
+            comp_debug.get("full_cloud_amount_teacher_residual", float("nan")),
             float("nan"),
         ),
         "full_cloud_amount_oracle_best_ratio": case_float(
@@ -256,6 +286,36 @@ def build_compression_metric_row(
         "full_cloud_amount_entropy_loss": case_float(
             comp_debug.get("full_cloud_amount_entropy_loss", 0.0),
             0.0,
+        ),
+        "full_cloud_amount_residual_loss": case_float(
+            comp_debug.get("full_cloud_amount_residual_loss", 0.0),
+            0.0,
+        ),
+        "full_cloud_amount_residual_error": case_float(
+            comp_debug.get("full_cloud_amount_residual_error", float("nan")),
+            float("nan"),
+        ),
+        "full_cloud_amount_residual_enabled": bool(
+            comp_debug.get("full_cloud_amount_residual_enabled", False)
+        ),
+        "full_cloud_amount_residual_max": case_float(
+            comp_debug.get("full_cloud_amount_residual_max", float("nan")),
+            float("nan"),
+        ),
+        "full_cloud_amount_residual_teacher_clamped": bool(
+            comp_debug.get("full_cloud_amount_residual_teacher_clamped", False)
+        ),
+        "full_cloud_amount_ratio_hist_selected": str(
+            comp_debug.get("full_cloud_amount_ratio_hist_selected", "")
+        ),
+        "full_cloud_amount_ratio_hist_teacher": str(
+            comp_debug.get("full_cloud_amount_ratio_hist_teacher", "")
+        ),
+        "full_cloud_amount_fine_probe_enabled": bool(
+            comp_debug.get("full_cloud_amount_fine_probe_enabled", False)
+        ),
+        "full_cloud_amount_residual_probe_enabled": bool(
+            comp_debug.get("full_cloud_amount_residual_probe_enabled", False)
         ),
         "full_cloud_amount_total_loss": case_float(comp_debug.get("full_cloud_amount_total_loss", 0.0), 0.0),
         "full_cloud_amount_step_time": case_float(comp_debug.get("full_cloud_amount_step_time", 0.0), 0.0),
@@ -953,6 +1013,8 @@ def build_operation_metric_row(
     comp_debug,
     structure_debug,
     edit_stats,
+    sequence_name=None,
+    sequence_step=None,
 ):
     actual_delta = case_float(comp_debug.get("actual_total_bit_percent", float("nan")), float("nan"))
     unique_before = case_int(comp_debug.get("gt_unique_coord_count", 0))
@@ -1085,6 +1147,10 @@ def build_operation_metric_row(
             structure_debug.get("actual_oracle_accepted_add_count", 0)
         )
     return {
+        "episode_index": int(episode),
+        "epoch_index": int(epoch),
+        "sequence_step": (int(sequence_step) + 1) if sequence_step is not None else int(step) + 1,
+        "sequence_name": str(sequence_name or ""),
         "global_step": int(global_step) + 1,
         "episode": int(episode) + 1,
         "epoch": int(epoch) + 1,

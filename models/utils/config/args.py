@@ -1,4 +1,5 @@
 import argparse
+import math
 import os
 import sys
 from pathlib import Path
@@ -967,8 +968,31 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--sparsepcgc_proposal_selector_hidden_dim', default=64, type=int)
     parser.add_argument('--sparsepcgc_full_cloud_amount_bins', default='0.0,0.015,0.021,0.026,0.031,0.038,0.044,0.05', type=str)
     parser.add_argument('--sparsepcgc_full_cloud_amount_hidden_dim', default=64, type=int)
-    parser.add_argument('--sparsepcgc_full_cloud_amount_residual_enable', default=False, type=str2bool)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_residual_enable', default=True, type=str2bool)
     parser.add_argument('--sparsepcgc_full_cloud_amount_residual_max', default=0.0025, type=float)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_residual_loss_weight', default=1.0, type=float)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_residual_probe_enable', default=True, type=str2bool)
+    parser.add_argument(
+        '--sparsepcgc_full_cloud_amount_residual_probe_offsets',
+        default='-1.0,0.0,1.0',
+        type=str,
+        help='selected bin周辺で試すresidual probe。selected_bin + offset * residual_max',
+    )
+    parser.add_argument('--sparsepcgc_full_cloud_amount_fine_ratio_probe_enable', default=True, type=str2bool)
+    parser.add_argument(
+        '--sparsepcgc_full_cloud_amount_fine_ratios',
+        default='0.028,0.030,0.032,0.034',
+        type=str,
+        help='3.1%%近傍のfine ratio actual probe候補',
+    )
+    parser.add_argument('--sparsepcgc_full_cloud_amount_fine_ratio_warmup_steps', default=200, type=int)
+    parser.add_argument(
+        '--sparsepcgc_full_cloud_amount_residual_teacher_mode',
+        default='candidate_ratio',
+        choices=['candidate_ratio', 'nearest_bin'],
+        type=str,
+        help='actual best ratioからteacher_bin/teacher_residualを作る方法',
+    )
     parser.add_argument(
         '--sparsepcgc_full_cloud_amount_fresh_actual_every_step',
         default=True,
@@ -4432,12 +4456,85 @@ def parse_pugan_args(parser, file_day, file_time):
         8,
     )
     args.sparsepcgc_full_cloud_amount_residual_enable = bool(
-        getattr(args, "sparsepcgc_full_cloud_amount_residual_enable", False)
+        getattr(args, "sparsepcgc_full_cloud_amount_residual_enable", True)
     )
     args.sparsepcgc_full_cloud_amount_residual_max = min(
         max(float(getattr(args, "sparsepcgc_full_cloud_amount_residual_max", 0.0025)), 0.0),
         0.01,
     )
+    args.sparsepcgc_full_cloud_amount_residual_loss_weight = max(
+        float(getattr(args, "sparsepcgc_full_cloud_amount_residual_loss_weight", 1.0)),
+        0.0,
+    )
+    args.sparsepcgc_full_cloud_amount_residual_probe_enable = bool(
+        getattr(args, "sparsepcgc_full_cloud_amount_residual_probe_enable", True)
+    )
+    parsed_full_cloud_residual_probe_offsets = _parse_csv_float_list(
+        getattr(
+            args,
+            "sparsepcgc_full_cloud_amount_residual_probe_offsets",
+            "-1.0,0.0,1.0",
+        ),
+        (-1.0, 0.0, 1.0),
+    )
+    normalized_full_cloud_residual_probe_offsets = []
+    for offset in parsed_full_cloud_residual_probe_offsets:
+        try:
+            offset_value = float(offset)
+        except Exception:
+            continue
+        if math.isfinite(offset_value):
+            normalized_full_cloud_residual_probe_offsets.append(offset_value)
+    if not normalized_full_cloud_residual_probe_offsets:
+        normalized_full_cloud_residual_probe_offsets = [-1.0, 0.0, 1.0]
+    args.sparsepcgc_full_cloud_amount_residual_probe_offset_values = tuple(
+        normalized_full_cloud_residual_probe_offsets
+    )
+    args.sparsepcgc_full_cloud_amount_residual_probe_offsets = ",".join(
+        f"{value:.6f}".rstrip("0").rstrip(".")
+        for value in normalized_full_cloud_residual_probe_offsets
+    )
+    args.sparsepcgc_full_cloud_amount_fine_ratio_probe_enable = bool(
+        getattr(args, "sparsepcgc_full_cloud_amount_fine_ratio_probe_enable", True)
+    )
+    parsed_full_cloud_fine_ratios = _parse_csv_float_list(
+        getattr(
+            args,
+            "sparsepcgc_full_cloud_amount_fine_ratios",
+            "0.028,0.030,0.032,0.034",
+        ),
+        (0.028, 0.030, 0.032, 0.034),
+    )
+    normalized_full_cloud_fine_ratios = []
+    for ratio in parsed_full_cloud_fine_ratios:
+        try:
+            ratio_value = min(max(float(ratio), 0.0), 0.05)
+        except Exception:
+            continue
+        if math.isfinite(ratio_value):
+            normalized_full_cloud_fine_ratios.append(ratio_value)
+    normalized_full_cloud_fine_ratios = sorted(set(normalized_full_cloud_fine_ratios))
+    args.sparsepcgc_full_cloud_amount_fine_ratio_values = tuple(normalized_full_cloud_fine_ratios)
+    args.sparsepcgc_full_cloud_amount_fine_ratios = ",".join(
+        f"{value:.6f}".rstrip("0").rstrip(".")
+        for value in normalized_full_cloud_fine_ratios
+    )
+    args.sparsepcgc_full_cloud_amount_fine_ratio_warmup_steps = max(
+        int(getattr(args, "sparsepcgc_full_cloud_amount_fine_ratio_warmup_steps", 200)),
+        0,
+    )
+    args.sparsepcgc_full_cloud_amount_residual_teacher_mode = str(
+        getattr(
+            args,
+            "sparsepcgc_full_cloud_amount_residual_teacher_mode",
+            "candidate_ratio",
+        )
+    ).strip().lower()
+    if args.sparsepcgc_full_cloud_amount_residual_teacher_mode not in {
+        "candidate_ratio",
+        "nearest_bin",
+    }:
+        args.sparsepcgc_full_cloud_amount_residual_teacher_mode = "candidate_ratio"
     args.sparsepcgc_full_cloud_amount_fresh_actual_every_step = bool(
         getattr(args, "sparsepcgc_full_cloud_amount_fresh_actual_every_step", True)
     )

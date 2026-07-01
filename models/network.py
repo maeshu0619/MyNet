@@ -2427,6 +2427,7 @@ class Network(nn.Module):
             "full_cloud_amount_input_points",
             "full_cloud_amount_selected_class",
             "full_cloud_amount_bin",
+            "full_cloud_amount_residual_raw",
             "full_cloud_amount_residual",
             "full_cloud_amount_final_ratio",
             "full_cloud_amount_noop_selected",
