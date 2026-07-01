@@ -392,6 +392,39 @@ def build_compression_metric_row(
         "full_cloud_amount_reuse_where_ranking_reason": str(
             comp_debug.get("full_cloud_amount_reuse_where_ranking_reason", "")
         ),
+        "where_mode": str(comp_debug.get("where_mode", "")),
+        "macro_ratio": case_float(comp_debug.get("macro_ratio", float("nan")), float("nan")),
+        "micro_ratio": case_float(comp_debug.get("micro_ratio", float("nan")), float("nan")),
+        "macro_selected_block_count": case_int(comp_debug.get("macro_selected_block_count", 0), 0),
+        "macro_drop_count": case_int(comp_debug.get("macro_drop_count", 0), 0),
+        "micro_drop_count": case_int(comp_debug.get("micro_drop_count", 0), 0),
+        "total_drop_count": case_int(comp_debug.get("total_drop_count", 0), 0),
+        "selected_block_count": case_int(comp_debug.get("selected_block_count", 0), 0),
+        "micro_selected_block_count": case_int(comp_debug.get("micro_selected_block_count", 0), 0),
+        "max_drop_count_per_block": case_int(comp_debug.get("max_drop_count_per_block", 0), 0),
+        "mean_drop_count_per_selected_block": case_float(
+            comp_debug.get("mean_drop_count_per_selected_block", float("nan")),
+            float("nan"),
+        ),
+        "drop_concentration_top1_block_ratio": case_float(
+            comp_debug.get("drop_concentration_top1_block_ratio", float("nan")),
+            float("nan"),
+        ),
+        "drop_concentration_top5_block_ratio": case_float(
+            comp_debug.get("drop_concentration_top5_block_ratio", float("nan")),
+            float("nan"),
+        ),
+        "hard_where_uses_network_score": bool(comp_debug.get("hard_where_uses_network_score", False)),
+        "heuristic_where_score_mean": case_float(
+            comp_debug.get("heuristic_where_score_mean", float("nan")),
+            float("nan"),
+        ),
+        "heuristic_where_score_std": case_float(
+            comp_debug.get("heuristic_where_score_std", float("nan")),
+            float("nan"),
+        ),
+        "micro_quota_hit_block_count": case_int(comp_debug.get("micro_quota_hit_block_count", 0), 0),
+        "macro_disabled_reason": str(comp_debug.get("macro_disabled_reason", "")),
         "sparsepcgc_actual_parallel_mode": str(
             comp_debug.get(
                 "sparsepcgc_actual_parallel_mode",
@@ -1680,6 +1713,96 @@ def build_operation_metric_row(
         "codec_block_selected_point_count": case_int(
             structure_debug.get("codec_block_selected_point_count", 0),
             0,
+        ),
+        "where_mode": str(
+            comp_debug.get("where_mode", structure_debug.get("where_mode", ""))
+        ),
+        "macro_ratio": case_float(
+            comp_debug.get("macro_ratio", structure_debug.get("macro_ratio", float("nan"))),
+            float("nan"),
+        ),
+        "micro_ratio": case_float(
+            comp_debug.get("micro_ratio", structure_debug.get("micro_ratio", float("nan"))),
+            float("nan"),
+        ),
+        "macro_selected_block_count": case_int(
+            comp_debug.get("macro_selected_block_count", structure_debug.get("macro_selected_block_count", 0)),
+            0,
+        ),
+        "macro_drop_count": case_int(
+            comp_debug.get("macro_drop_count", structure_debug.get("macro_drop_count", 0)),
+            0,
+        ),
+        "micro_drop_count": case_int(
+            comp_debug.get("micro_drop_count", structure_debug.get("micro_drop_count", 0)),
+            0,
+        ),
+        "total_drop_count": case_int(
+            comp_debug.get("total_drop_count", structure_debug.get("total_drop_count", 0)),
+            0,
+        ),
+        "selected_block_count": case_int(
+            comp_debug.get("selected_block_count", structure_debug.get("selected_block_count", 0)),
+            0,
+        ),
+        "micro_selected_block_count": case_int(
+            comp_debug.get("micro_selected_block_count", structure_debug.get("micro_selected_block_count", 0)),
+            0,
+        ),
+        "max_drop_count_per_block": case_int(
+            comp_debug.get("max_drop_count_per_block", structure_debug.get("max_drop_count_per_block", 0)),
+            0,
+        ),
+        "mean_drop_count_per_selected_block": case_float(
+            comp_debug.get(
+                "mean_drop_count_per_selected_block",
+                structure_debug.get("mean_drop_count_per_selected_block", float("nan")),
+            ),
+            float("nan"),
+        ),
+        "drop_concentration_top1_block_ratio": case_float(
+            comp_debug.get(
+                "drop_concentration_top1_block_ratio",
+                structure_debug.get("drop_concentration_top1_block_ratio", float("nan")),
+            ),
+            float("nan"),
+        ),
+        "drop_concentration_top5_block_ratio": case_float(
+            comp_debug.get(
+                "drop_concentration_top5_block_ratio",
+                structure_debug.get("drop_concentration_top5_block_ratio", float("nan")),
+            ),
+            float("nan"),
+        ),
+        "hard_where_uses_network_score": bool(
+            comp_debug.get(
+                "hard_where_uses_network_score",
+                structure_debug.get("hard_where_uses_network_score", False),
+            )
+        ),
+        "heuristic_where_score_mean": case_float(
+            comp_debug.get(
+                "heuristic_where_score_mean",
+                structure_debug.get("heuristic_where_score_mean", float("nan")),
+            ),
+            float("nan"),
+        ),
+        "heuristic_where_score_std": case_float(
+            comp_debug.get(
+                "heuristic_where_score_std",
+                structure_debug.get("heuristic_where_score_std", float("nan")),
+            ),
+            float("nan"),
+        ),
+        "micro_quota_hit_block_count": case_int(
+            comp_debug.get(
+                "micro_quota_hit_block_count",
+                structure_debug.get("micro_quota_hit_block_count", 0),
+            ),
+            0,
+        ),
+        "macro_disabled_reason": str(
+            comp_debug.get("macro_disabled_reason", structure_debug.get("macro_disabled_reason", ""))
         ),
         "codec_block_budget_zero": bool(structure_debug.get("codec_block_budget_zero", False)),
         "codec_block_target_drop_ratio": case_float(

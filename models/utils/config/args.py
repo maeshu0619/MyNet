@@ -10,8 +10,8 @@ from cfgs.utils import str2bool
 pretrained_date = "20260617"
 pretrained_time = "145838"
 
-surrogate_date = "20260617"
-surrogate_time = "145838"
+surrogate_date = "20260701"
+surrogate_time = "230148"
 
 model_date = "20260627"
 model_time = "000915"
@@ -1058,6 +1058,22 @@ def parse_pugan_args(parser, file_day, file_time):
         type=str,
         help='actual codec teacher/compression objectiveでraw bitsを使うか、edit_record_bits込みbilled bitsを使うか',
     )
+    parser.add_argument(
+        '--sparsepcgc_where_mode',
+        default='block_only',
+        choices=['block_only', 'macro_micro_heuristic', 'macro_micro_hybrid'],
+        type=str,
+        help='full_cloud_amount hard Where。block_onlyは旧codec block丸ごと削除、macro_micro_heuristicはmacro block制限+micro voxel分散削除',
+    )
+    parser.add_argument('--sparsepcgc_where_macro_max_ratio', default=0.01, type=float)
+    parser.add_argument('--sparsepcgc_where_macro_share', default=0.25, type=float)
+    parser.add_argument('--sparsepcgc_where_macro_max_blocks', default=1, type=int)
+    parser.add_argument('--sparsepcgc_where_macro_min_total_ratio', default=0.015, type=float)
+    parser.add_argument('--sparsepcgc_where_micro_exclude_macro_blocks', default=True, type=str2bool)
+    parser.add_argument('--sparsepcgc_where_micro_block_quota_fraction', default=0.10, type=float)
+    parser.add_argument('--sparsepcgc_where_micro_min_selected_blocks', default=8, type=int)
+    parser.add_argument('--sparsepcgc_where_micro_round_robin', default=True, type=str2bool)
+    parser.add_argument('--sparsepcgc_where_micro_use_delete_prior', default=True, type=str2bool)
     parser.add_argument('--sparsepcgc_full_cloud_amount_geometry_mode', default='sampled', choices=['off', 'sampled', 'interval_full'], type=str)
     parser.add_argument('--sparsepcgc_full_cloud_amount_geom_sample_points', default=20000, type=int)
     parser.add_argument('--sparsepcgc_full_cloud_amount_geom_interval', default=20, type=int)
@@ -4715,6 +4731,48 @@ def parse_pugan_args(parser, file_day, file_time):
     ).strip().lower()
     if args.sparsepcgc_actual_bit_objective not in {"raw", "billed"}:
         args.sparsepcgc_actual_bit_objective = "raw"
+    args.sparsepcgc_where_mode = str(
+        getattr(args, "sparsepcgc_where_mode", "block_only")
+    ).strip().lower()
+    if args.sparsepcgc_where_mode not in {
+        "block_only",
+        "macro_micro_heuristic",
+        "macro_micro_hybrid",
+    }:
+        args.sparsepcgc_where_mode = "block_only"
+    args.sparsepcgc_where_macro_max_ratio = min(
+        max(float(getattr(args, "sparsepcgc_where_macro_max_ratio", 0.01)), 0.0),
+        0.30,
+    )
+    args.sparsepcgc_where_macro_share = min(
+        max(float(getattr(args, "sparsepcgc_where_macro_share", 0.25)), 0.0),
+        1.0,
+    )
+    args.sparsepcgc_where_macro_max_blocks = max(
+        int(getattr(args, "sparsepcgc_where_macro_max_blocks", 1)),
+        0,
+    )
+    args.sparsepcgc_where_macro_min_total_ratio = min(
+        max(float(getattr(args, "sparsepcgc_where_macro_min_total_ratio", 0.015)), 0.0),
+        1.0,
+    )
+    args.sparsepcgc_where_micro_exclude_macro_blocks = bool(
+        getattr(args, "sparsepcgc_where_micro_exclude_macro_blocks", True)
+    )
+    args.sparsepcgc_where_micro_block_quota_fraction = min(
+        max(float(getattr(args, "sparsepcgc_where_micro_block_quota_fraction", 0.10)), 0.0),
+        1.0,
+    )
+    args.sparsepcgc_where_micro_min_selected_blocks = max(
+        int(getattr(args, "sparsepcgc_where_micro_min_selected_blocks", 8)),
+        1,
+    )
+    args.sparsepcgc_where_micro_round_robin = bool(
+        getattr(args, "sparsepcgc_where_micro_round_robin", True)
+    )
+    args.sparsepcgc_where_micro_use_delete_prior = bool(
+        getattr(args, "sparsepcgc_where_micro_use_delete_prior", True)
+    )
     args.sparsepcgc_full_cloud_amount_use_surrogate_between_actual = bool(
         getattr(args, "sparsepcgc_full_cloud_amount_use_surrogate_between_actual", True)
     )

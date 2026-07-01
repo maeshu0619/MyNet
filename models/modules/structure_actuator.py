@@ -2148,6 +2148,304 @@ class StructureRepairActuator(nn.Module):
         trace["final_hard_drop_count"] = float(hard_drop.detach().sum().item())
         return hard_drop, trace
 
+    def build_macro_micro_where_mask(
+        self,
+        voxel_coords,
+        total_drop_ratio,
+        codec_prune_prior_score,
+        *,
+        delete_prior=None,
+        selection_mask=None,
+        block_size=64,
+        args=None,
+        max_hard_count=0,
+        min_hard_count=0,
+    ):
+        """Full-cloud Where helper: limited macro block prune + scattered micro voxel prune."""
+        args = args if args is not None else self.args
+        batch_size, _, point_count = voxel_coords.shape
+        device = voxel_coords.device
+        hard_drop = torch.zeros((batch_size, 1, point_count), device=device, dtype=torch.bool)
+
+        where_mode = str(getattr(args, "sparsepcgc_where_mode", "block_only")).strip().lower()
+        hybrid_fallback = bool(where_mode == "macro_micro_hybrid")
+        effective_where_mode = "macro_micro_heuristic" if hybrid_fallback else where_mode
+        ratio = min(max(float(total_drop_ratio), 0.0), 1.0)
+        block_size = max(int(block_size), 1)
+        macro_share = min(max(float(getattr(args, "sparsepcgc_where_macro_share", 0.25)), 0.0), 1.0)
+        macro_max_ratio = min(max(float(getattr(args, "sparsepcgc_where_macro_max_ratio", 0.01)), 0.0), 1.0)
+        macro_max_blocks = max(int(getattr(args, "sparsepcgc_where_macro_max_blocks", 1)), 0)
+        macro_min_total_ratio = min(
+            max(float(getattr(args, "sparsepcgc_where_macro_min_total_ratio", 0.015)), 0.0),
+            1.0,
+        )
+        micro_exclude_macro = bool(getattr(args, "sparsepcgc_where_micro_exclude_macro_blocks", True))
+        micro_quota_fraction = min(
+            max(float(getattr(args, "sparsepcgc_where_micro_block_quota_fraction", 0.10)), 0.0),
+            1.0,
+        )
+        micro_round_robin = bool(getattr(args, "sparsepcgc_where_micro_round_robin", True))
+        micro_use_delete_prior = bool(getattr(args, "sparsepcgc_where_micro_use_delete_prior", True))
+
+        if selection_mask is None:
+            selection = torch.ones((batch_size, point_count), device=device, dtype=torch.bool)
+        else:
+            selection = selection_mask.squeeze(1) if selection_mask.ndim == 3 else selection_mask
+            selection = selection.to(device=device, dtype=torch.bool)
+
+        if torch.is_tensor(delete_prior) and micro_use_delete_prior:
+            micro_score_all = delete_prior.to(device=device, dtype=torch.float32)
+        else:
+            micro_score_all = codec_prune_prior_score.to(device=device, dtype=torch.float32)
+        if micro_score_all.ndim == 2:
+            micro_score_all = micro_score_all.unsqueeze(1)
+        micro_score_finite_all = torch.isfinite(micro_score_all)
+        micro_score_all = torch.nan_to_num(micro_score_all, nan=-1e9, posinf=1e9, neginf=-1e9)
+        codec_score_all = torch.nan_to_num(
+            codec_prune_prior_score.to(device=device, dtype=torch.float32),
+            nan=-1e9,
+            posinf=1e9,
+            neginf=-1e9,
+        )
+        if codec_score_all.ndim == 2:
+            codec_score_all = codec_score_all.unsqueeze(1)
+
+        macro_ratio = 0.0
+        macro_disabled_reason = "none"
+        if ratio < macro_min_total_ratio:
+            macro_disabled_reason = "ratio_below_min"
+        elif macro_max_blocks <= 0 or macro_share <= 0.0 or macro_max_ratio <= 0.0:
+            macro_disabled_reason = "macro_disabled_by_config"
+        else:
+            macro_ratio = min(float(ratio) * macro_share, macro_max_ratio, float(ratio))
+        micro_ratio = max(float(ratio) - float(macro_ratio), 0.0)
+
+        trace = {
+            "where_mode": effective_where_mode,
+            "where_mode_id": 1.0,
+            "macro_micro_hybrid_fallback": hybrid_fallback,
+            "macro_disabled_reason": macro_disabled_reason,
+            "macro_ratio": float(macro_ratio),
+            "micro_ratio": float(micro_ratio),
+            "macro_selected_block_count": 0.0,
+            "macro_drop_count": 0.0,
+            "micro_drop_count": 0.0,
+            "total_drop_count": 0.0,
+            "selected_block_count": 0.0,
+            "micro_selected_block_count": 0.0,
+            "max_drop_count_per_block": 0.0,
+            "mean_drop_count_per_selected_block": 0.0,
+            "drop_concentration_top1_block_ratio": 0.0,
+            "drop_concentration_top5_block_ratio": 0.0,
+            "hard_where_uses_network_score": False,
+            "heuristic_where_score_mean": 0.0,
+            "heuristic_where_score_std": 0.0,
+            "micro_quota_hit_block_count": 0.0,
+            "voxel_count": 0.0,
+            "pre_round_target_count": 0.0,
+            "post_round_target_count": 0.0,
+            "min_count_floor_applied": False,
+            "hard_mask_count": 0.0,
+            "candidate_count": 0.0,
+            "final_hard_drop_count": 0.0,
+            "codec_block_valid_point_count": 0.0,
+            "codec_block_budget_points": 0.0,
+            "codec_block_count": 0.0,
+            "codec_block_selected_block_count": 0.0,
+            "codec_block_selected_point_count": 0.0,
+            "codec_block_budget_zero": False,
+            "codec_block_target_drop_ratio": float(ratio),
+            "codec_block_under_selected": False,
+        }
+        selected_block_drop_counts = []
+        heuristic_score_values = []
+        if ratio <= 0.0 or point_count <= 0:
+            try:
+                setattr(self, "_last_hard_drop_count_trace", trace)
+            except Exception:
+                pass
+            return hard_drop, trace
+
+        for batch_idx in range(batch_size):
+            valid_idx = selection[batch_idx].nonzero(as_tuple=False).reshape(-1)
+            valid_count = int(valid_idx.numel())
+            if valid_count <= 0:
+                continue
+            total_budget = int(math.floor(float(valid_count) * ratio))
+            if int(max_hard_count) > 0:
+                total_budget = min(total_budget, int(max_hard_count))
+            if total_budget <= 0 and int(min_hard_count) > 0:
+                total_budget = min(valid_count, int(min_hard_count))
+                trace["min_count_floor_applied"] = True
+            total_budget = max(total_budget, 0)
+            trace["voxel_count"] += float(valid_count)
+            trace["pre_round_target_count"] += float(ratio * float(valid_count))
+            trace["post_round_target_count"] += float(total_budget)
+            trace["codec_block_valid_point_count"] += float(valid_count)
+            trace["codec_block_budget_points"] += float(total_budget)
+            if total_budget <= 0:
+                trace["codec_block_budget_zero"] = True
+                continue
+
+            coords = voxel_coords[batch_idx].index_select(1, valid_idx).transpose(0, 1).contiguous().long()
+            blocks = torch.div(coords, int(block_size), rounding_mode="floor")
+            unique_blocks, inverse = torch.unique(blocks, dim=0, sorted=True, return_inverse=True)
+            block_count = int(unique_blocks.shape[0])
+            if block_count <= 0:
+                continue
+            counts = torch.bincount(inverse, minlength=block_count).long()
+            codec_scores = codec_score_all[batch_idx, 0].index_select(0, valid_idx).detach().float()
+            codec_score_sum = torch.zeros((block_count,), device=device, dtype=codec_scores.dtype)
+            codec_score_sum.scatter_add_(0, inverse, codec_scores)
+            block_scores = codec_score_sum / counts.to(dtype=codec_scores.dtype).clamp_min(1.0)
+            order = torch.argsort(block_scores, descending=True)
+            trace["codec_block_count"] += float(block_count)
+            trace["candidate_count"] += float(block_count)
+
+            macro_drop_local = torch.zeros((valid_count,), device=device, dtype=torch.bool)
+            selected_macro_blocks = torch.zeros((block_count,), device=device, dtype=torch.bool)
+            macro_budget = min(int(math.floor(float(valid_count) * float(macro_ratio))), total_budget)
+            if int(max_hard_count) > 0:
+                macro_budget = min(macro_budget, int(max_hard_count), total_budget)
+            macro_take_points = 0
+            if macro_ratio > 0.0 and macro_budget > 0 and macro_max_blocks > 0:
+                selected_count = 0
+                for block_idx_tensor in order:
+                    if selected_count >= macro_max_blocks:
+                        break
+                    block_idx = int(block_idx_tensor.item())
+                    block_points = int(counts[block_idx].item())
+                    if block_points <= 0:
+                        continue
+                    if macro_take_points + block_points > macro_budget:
+                        if selected_count <= 0:
+                            macro_disabled_reason = "first_block_exceeds_budget"
+                        continue
+                    selected_macro_blocks[block_idx] = True
+                    macro_take_points += block_points
+                    selected_count += 1
+                if selected_count > 0:
+                    macro_drop_local = selected_macro_blocks.index_select(0, inverse)
+                    macro_points = valid_idx[macro_drop_local]
+                    hard_drop[batch_idx, 0, macro_points] = True
+                    trace["macro_selected_block_count"] += float(selected_count)
+                    trace["macro_drop_count"] += float(int(macro_points.numel()))
+                    trace["codec_block_selected_block_count"] += float(selected_count)
+                    trace["codec_block_selected_point_count"] += float(int(macro_points.numel()))
+
+            micro_budget = max(total_budget - int(macro_drop_local.sum().item()), 0)
+            if micro_budget <= 0:
+                continue
+            micro_scores = micro_score_all[batch_idx, 0].index_select(0, valid_idx).detach().float()
+            finite_score = micro_score_finite_all[batch_idx, 0].index_select(0, valid_idx).detach().bool()
+            micro_candidate_local = finite_score.clone()
+            if micro_exclude_macro and bool(selected_macro_blocks.any().item()):
+                micro_candidate_local = micro_candidate_local & (~selected_macro_blocks.index_select(0, inverse))
+            heuristic_score_values.append(micro_scores[micro_candidate_local].detach())
+
+            block_items = []
+            block_quota_hit = 0
+            for block_idx in range(block_count):
+                local_positions = (inverse == int(block_idx)).nonzero(as_tuple=False).reshape(-1)
+                if local_positions.numel() <= 0:
+                    continue
+                local_positions = local_positions[micro_candidate_local.index_select(0, local_positions)]
+                if local_positions.numel() <= 0:
+                    continue
+                block_voxel_count = int(counts[block_idx].item())
+                quota = max(1, int(math.ceil(float(block_voxel_count) * float(micro_quota_fraction))))
+                quota = min(quota, int(local_positions.numel()))
+                local_scores = micro_scores.index_select(0, local_positions)
+                local_order = torch.argsort(local_scores, descending=True)
+                limited = local_positions.index_select(0, local_order[:quota])
+                if int(local_positions.numel()) > quota:
+                    block_quota_hit += 1
+                top_score = (
+                    float(local_scores.index_select(0, local_order[:1]).detach().cpu().reshape(-1)[0].item())
+                    if local_scores.numel() > 0
+                    else -1e9
+                )
+                block_items.append((top_score, int(block_idx), limited))
+
+            if not block_items:
+                continue
+            block_items.sort(key=lambda item: item[0], reverse=True)
+            selected_local_positions = []
+            if micro_round_robin:
+                depth = 0
+                while len(selected_local_positions) < micro_budget:
+                    added = False
+                    for _, _, limited in block_items:
+                        if depth < int(limited.numel()):
+                            selected_local_positions.append(limited[depth])
+                            added = True
+                            if len(selected_local_positions) >= micro_budget:
+                                break
+                    if not added:
+                        break
+                    depth += 1
+            else:
+                flat_positions = torch.cat([item[2] for item in block_items], dim=0)
+                flat_scores = micro_scores.index_select(0, flat_positions)
+                flat_order = torch.argsort(flat_scores, descending=True)
+                take = min(int(micro_budget), int(flat_positions.numel()))
+                selected_local_positions = [
+                    pos for pos in flat_positions.index_select(0, flat_order[:take])
+                ]
+
+            if not selected_local_positions:
+                continue
+            selected_local = torch.stack(selected_local_positions).to(device=device, dtype=torch.long)
+            selected_global = valid_idx.index_select(0, selected_local)
+            hard_drop[batch_idx, 0, selected_global] = True
+            selected_micro_blocks = torch.unique(inverse.index_select(0, selected_local))
+            micro_drop_count = int(selected_global.numel())
+            trace["micro_drop_count"] += float(micro_drop_count)
+            trace["micro_selected_block_count"] += float(int(selected_micro_blocks.numel()))
+            trace["micro_quota_hit_block_count"] += float(block_quota_hit)
+
+        final_mask = hard_drop.detach()
+        trace["final_hard_drop_count"] = float(final_mask.sum().item())
+        trace["total_drop_count"] = float(final_mask.sum().item())
+        trace["hard_mask_count"] = float(final_mask.sum().item())
+        for batch_idx in range(batch_size):
+            selected_idx = final_mask[batch_idx, 0].nonzero(as_tuple=False).reshape(-1)
+            if selected_idx.numel() <= 0:
+                continue
+            selected_coords = voxel_coords[batch_idx].index_select(1, selected_idx).transpose(0, 1).contiguous().long()
+            selected_blocks = torch.div(selected_coords, int(block_size), rounding_mode="floor")
+            _, selected_inverse = torch.unique(selected_blocks, dim=0, sorted=True, return_inverse=True)
+            block_drop_counts = torch.bincount(selected_inverse).detach().cpu().tolist()
+            selected_block_drop_counts.extend(int(v) for v in block_drop_counts)
+        selected_block_count = len(selected_block_drop_counts)
+        trace["selected_block_count"] = float(selected_block_count)
+        if selected_block_count > 0:
+            selected_block_drop_counts.sort(reverse=True)
+            total_drop = max(float(sum(selected_block_drop_counts)), 1.0)
+            trace["max_drop_count_per_block"] = float(selected_block_drop_counts[0])
+            trace["mean_drop_count_per_selected_block"] = float(sum(selected_block_drop_counts)) / float(selected_block_count)
+            trace["drop_concentration_top1_block_ratio"] = float(selected_block_drop_counts[0]) / total_drop
+            trace["drop_concentration_top5_block_ratio"] = float(sum(selected_block_drop_counts[:5])) / total_drop
+        score_value_chunks = [
+            v.reshape(-1).float().cpu()
+            for v in heuristic_score_values
+            if torch.is_tensor(v) and v.numel() > 0
+        ]
+        if score_value_chunks:
+            score_values = torch.cat(score_value_chunks, dim=0)
+            if score_values.numel() > 0:
+                trace["heuristic_where_score_mean"] = float(score_values.mean().item())
+                trace["heuristic_where_score_std"] = float(score_values.std(unbiased=False).item())
+        trace["macro_disabled_reason"] = macro_disabled_reason
+        trace["codec_block_under_selected"] = bool(
+            trace["final_hard_drop_count"] < min(float(trace["post_round_target_count"]), float(trace["voxel_count"]))
+        )
+        try:
+            setattr(self, "_last_hard_drop_count_trace", trace)
+        except Exception:
+            pass
+        return hard_drop, trace
+
     @staticmethod
     def _priority_topk_gate(priority, target_ratio, tau):
         B, _, N = priority.shape
@@ -4446,29 +4744,105 @@ class StructureRepairActuator(nn.Module):
                 hard_drop_target_ratio_source_id = 1
             else:
                 hard_drop_target_ratio_value = float(learned_drop_ratio_value)
-            hard_drop_mask = self._hard_codec_block_drop_mask(
-                voxel_coords,
-                drop_prob,
-                block_size=codec_prune_prior_block_size,
-                target_drop_ratio=hard_drop_target_ratio_value,
-                selection_mask=hard_delete_selection_mask,
-                max_hard_count=int(getattr(self.args, "repair_max_hard_drop_voxels", 0)),
-                min_hard_count=int(
-                    getattr(self.args, "sparsepcgc_codec_prior_warmup_min_hard_count", 0)
-                ),
-            )
+            full_cloud_where_mode = str(
+                getattr(self.args, "sparsepcgc_where_mode", "block_only")
+            ).strip().lower()
+            if full_cloud_amount_mode and full_cloud_where_mode in {
+                "macro_micro_heuristic",
+                "macro_micro_hybrid",
+            }:
+                hard_drop_block_reason = (
+                    "codec_prior_phase_macro_micro_hybrid_fallback"
+                    if full_cloud_where_mode == "macro_micro_hybrid"
+                    else "codec_prior_phase_macro_micro_heuristic"
+                )
+                try:
+                    hard_drop_mask, _macro_micro_trace = self.build_macro_micro_where_mask(
+                        voxel_coords,
+                        hard_drop_target_ratio_value,
+                        codec_prune_prior_score,
+                        delete_prior=delete_prior,
+                        selection_mask=hard_delete_selection_mask,
+                        block_size=codec_prune_prior_block_size,
+                        args=self.args,
+                        max_hard_count=int(getattr(self.args, "repair_max_hard_drop_voxels", 0)),
+                        min_hard_count=int(
+                            getattr(self.args, "sparsepcgc_codec_prior_warmup_min_hard_count", 0)
+                        ),
+                    )
+                except Exception:
+                    hard_drop_block_reason = "codec_prior_phase_macro_micro_fallback_codec_block"
+                    hard_drop_mask = self._hard_codec_block_drop_mask(
+                        voxel_coords,
+                        drop_prob,
+                        block_size=codec_prune_prior_block_size,
+                        target_drop_ratio=hard_drop_target_ratio_value,
+                        selection_mask=hard_delete_selection_mask,
+                        max_hard_count=int(getattr(self.args, "repair_max_hard_drop_voxels", 0)),
+                        min_hard_count=int(
+                            getattr(self.args, "sparsepcgc_codec_prior_warmup_min_hard_count", 0)
+                        ),
+                    )
+            else:
+                hard_drop_mask = self._hard_codec_block_drop_mask(
+                    voxel_coords,
+                    drop_prob,
+                    block_size=codec_prune_prior_block_size,
+                    target_drop_ratio=hard_drop_target_ratio_value,
+                    selection_mask=hard_delete_selection_mask,
+                    max_hard_count=int(getattr(self.args, "repair_max_hard_drop_voxels", 0)),
+                    min_hard_count=int(
+                        getattr(self.args, "sparsepcgc_codec_prior_warmup_min_hard_count", 0)
+                    ),
+                )
         elif algorithmic_proposal_selector_active:
-            hard_drop_block_reason = "algorithmic_proposal_codec_block_drop"
             hard_drop_target_ratio_value = float(learned_drop_ratio_value)
-            hard_drop_mask = self._hard_codec_block_drop_mask(
-                voxel_coords,
-                codec_prune_prior_score,
-                block_size=codec_prune_prior_block_size,
-                target_drop_ratio=hard_drop_target_ratio_value,
-                selection_mask=hard_delete_selection_mask,
-                max_hard_count=int(getattr(self.args, "repair_max_hard_drop_voxels", 0)),
-                min_hard_count=0,
-            )
+            full_cloud_where_mode = str(
+                getattr(self.args, "sparsepcgc_where_mode", "block_only")
+            ).strip().lower()
+            if full_cloud_amount_mode and full_cloud_where_mode in {
+                "macro_micro_heuristic",
+                "macro_micro_hybrid",
+            }:
+                hard_drop_block_reason = (
+                    "algorithmic_proposal_macro_micro_hybrid_fallback"
+                    if full_cloud_where_mode == "macro_micro_hybrid"
+                    else "algorithmic_proposal_macro_micro_heuristic"
+                )
+                try:
+                    hard_drop_mask, _macro_micro_trace = self.build_macro_micro_where_mask(
+                        voxel_coords,
+                        hard_drop_target_ratio_value,
+                        codec_prune_prior_score,
+                        delete_prior=delete_prior,
+                        selection_mask=hard_delete_selection_mask,
+                        block_size=codec_prune_prior_block_size,
+                        args=self.args,
+                        max_hard_count=int(getattr(self.args, "repair_max_hard_drop_voxels", 0)),
+                        min_hard_count=0,
+                    )
+                except Exception:
+                    hard_drop_block_reason = "algorithmic_proposal_macro_micro_fallback_codec_block"
+                    hard_drop_mask = self._hard_codec_block_drop_mask(
+                        voxel_coords,
+                        codec_prune_prior_score,
+                        block_size=codec_prune_prior_block_size,
+                        target_drop_ratio=hard_drop_target_ratio_value,
+                        selection_mask=hard_delete_selection_mask,
+                        max_hard_count=int(getattr(self.args, "repair_max_hard_drop_voxels", 0)),
+                        min_hard_count=0,
+                    )
+            else:
+                hard_drop_block_reason = "algorithmic_proposal_codec_block_drop"
+                hard_drop_mask = self._hard_codec_block_drop_mask(
+                    voxel_coords,
+                    codec_prune_prior_score,
+                    block_size=codec_prune_prior_block_size,
+                    target_drop_ratio=hard_drop_target_ratio_value,
+                    selection_mask=hard_delete_selection_mask,
+                    max_hard_count=int(getattr(self.args, "repair_max_hard_drop_voxels", 0)),
+                    min_hard_count=0,
+                )
         elif (
             self.training
             and prune_enabled
@@ -7754,6 +8128,25 @@ class StructureRepairActuator(nn.Module):
             "codec_block_under_selected": pts_xyz.new_tensor(
                 float(bool(last_hard_drop_trace.get("codec_block_under_selected", False)))
             ).detach(),
+            "where_mode": str(last_hard_drop_trace.get("where_mode", getattr(self.args, "sparsepcgc_where_mode", "block_only"))),
+            "where_mode_id": pts_xyz.new_tensor(float(last_hard_drop_trace.get("where_mode_id", 0.0))).detach(),
+            "macro_ratio": pts_xyz.new_tensor(float(last_hard_drop_trace.get("macro_ratio", 0.0))).detach(),
+            "micro_ratio": pts_xyz.new_tensor(float(last_hard_drop_trace.get("micro_ratio", 0.0))).detach(),
+            "macro_selected_block_count": pts_xyz.new_tensor(float(last_hard_drop_trace.get("macro_selected_block_count", 0.0))).detach(),
+            "macro_drop_count": pts_xyz.new_tensor(float(last_hard_drop_trace.get("macro_drop_count", 0.0))).detach(),
+            "micro_drop_count": pts_xyz.new_tensor(float(last_hard_drop_trace.get("micro_drop_count", 0.0))).detach(),
+            "total_drop_count": pts_xyz.new_tensor(float(last_hard_drop_trace.get("total_drop_count", last_hard_drop_trace.get("final_hard_drop_count", 0.0)))).detach(),
+            "selected_block_count": pts_xyz.new_tensor(float(last_hard_drop_trace.get("selected_block_count", 0.0))).detach(),
+            "micro_selected_block_count": pts_xyz.new_tensor(float(last_hard_drop_trace.get("micro_selected_block_count", 0.0))).detach(),
+            "max_drop_count_per_block": pts_xyz.new_tensor(float(last_hard_drop_trace.get("max_drop_count_per_block", 0.0))).detach(),
+            "mean_drop_count_per_selected_block": pts_xyz.new_tensor(float(last_hard_drop_trace.get("mean_drop_count_per_selected_block", 0.0))).detach(),
+            "drop_concentration_top1_block_ratio": pts_xyz.new_tensor(float(last_hard_drop_trace.get("drop_concentration_top1_block_ratio", 0.0))).detach(),
+            "drop_concentration_top5_block_ratio": pts_xyz.new_tensor(float(last_hard_drop_trace.get("drop_concentration_top5_block_ratio", 0.0))).detach(),
+            "hard_where_uses_network_score": pts_xyz.new_tensor(float(bool(last_hard_drop_trace.get("hard_where_uses_network_score", False)))).detach(),
+            "heuristic_where_score_mean": pts_xyz.new_tensor(float(last_hard_drop_trace.get("heuristic_where_score_mean", 0.0))).detach(),
+            "heuristic_where_score_std": pts_xyz.new_tensor(float(last_hard_drop_trace.get("heuristic_where_score_std", 0.0))).detach(),
+            "micro_quota_hit_block_count": pts_xyz.new_tensor(float(last_hard_drop_trace.get("micro_quota_hit_block_count", 0.0))).detach(),
+            "macro_disabled_reason": str(last_hard_drop_trace.get("macro_disabled_reason", "")),
             "delete_candidate_initial_count": pts_xyz.new_tensor(float(delete_candidate_initial_count)).detach(),
             "delete_candidate_after_point_cap_count": pts_xyz.new_tensor(float(delete_candidate_after_point_cap_count)).detach(),
             "delete_candidate_after_leaf_mask_count": pts_xyz.new_tensor(float(delete_candidate_after_leaf_mask_count)).detach(),
@@ -7980,6 +8373,7 @@ class StructureRepairActuator(nn.Module):
             "learned_drop_ratio_requires_grad": pts_xyz.new_tensor(float(learned_drop_ratio.requires_grad)),
             "network_drop_logit_for_outcome": network_drop_logit_for_distill,
             "codec_prune_prior_score_for_outcome": codec_prune_prior_score.detach(),
+            "delete_prior_for_outcome": delete_prior.detach(),
             "hard_drop_mask_for_outcome": hard_drop_mask.detach(),
             "hard_delete_selection_mask_for_outcome": hard_delete_selection_mask.detach(),
             "drop_ratio_hard_for_outcome": drop_ratio_hard.detach(),
@@ -8419,6 +8813,25 @@ class StructureRepairActuator(nn.Module):
             "codec_block_under_selected": pts_xyz.new_tensor(
                 float(bool(last_hard_drop_trace.get("codec_block_under_selected", False)))
             ),
+            "where_mode": str(last_hard_drop_trace.get("where_mode", getattr(self.args, "sparsepcgc_where_mode", "block_only"))),
+            "where_mode_id": pts_xyz.new_tensor(float(last_hard_drop_trace.get("where_mode_id", 0.0))),
+            "macro_ratio": pts_xyz.new_tensor(float(last_hard_drop_trace.get("macro_ratio", 0.0))),
+            "micro_ratio": pts_xyz.new_tensor(float(last_hard_drop_trace.get("micro_ratio", 0.0))),
+            "macro_selected_block_count": pts_xyz.new_tensor(float(last_hard_drop_trace.get("macro_selected_block_count", 0.0))),
+            "macro_drop_count": pts_xyz.new_tensor(float(last_hard_drop_trace.get("macro_drop_count", 0.0))),
+            "micro_drop_count": pts_xyz.new_tensor(float(last_hard_drop_trace.get("micro_drop_count", 0.0))),
+            "total_drop_count": pts_xyz.new_tensor(float(last_hard_drop_trace.get("total_drop_count", last_hard_drop_trace.get("final_hard_drop_count", 0.0)))),
+            "selected_block_count": pts_xyz.new_tensor(float(last_hard_drop_trace.get("selected_block_count", 0.0))),
+            "micro_selected_block_count": pts_xyz.new_tensor(float(last_hard_drop_trace.get("micro_selected_block_count", 0.0))),
+            "max_drop_count_per_block": pts_xyz.new_tensor(float(last_hard_drop_trace.get("max_drop_count_per_block", 0.0))),
+            "mean_drop_count_per_selected_block": pts_xyz.new_tensor(float(last_hard_drop_trace.get("mean_drop_count_per_selected_block", 0.0))),
+            "drop_concentration_top1_block_ratio": pts_xyz.new_tensor(float(last_hard_drop_trace.get("drop_concentration_top1_block_ratio", 0.0))),
+            "drop_concentration_top5_block_ratio": pts_xyz.new_tensor(float(last_hard_drop_trace.get("drop_concentration_top5_block_ratio", 0.0))),
+            "hard_where_uses_network_score": pts_xyz.new_tensor(float(bool(last_hard_drop_trace.get("hard_where_uses_network_score", False)))),
+            "heuristic_where_score_mean": pts_xyz.new_tensor(float(last_hard_drop_trace.get("heuristic_where_score_mean", 0.0))),
+            "heuristic_where_score_std": pts_xyz.new_tensor(float(last_hard_drop_trace.get("heuristic_where_score_std", 0.0))),
+            "micro_quota_hit_block_count": pts_xyz.new_tensor(float(last_hard_drop_trace.get("micro_quota_hit_block_count", 0.0))),
+            "macro_disabled_reason": str(last_hard_drop_trace.get("macro_disabled_reason", "")),
             "delete_candidate_initial_count": pts_xyz.new_tensor(float(delete_candidate_initial_count)),
             "delete_candidate_after_point_cap_count": pts_xyz.new_tensor(float(delete_candidate_after_point_cap_count)),
             "delete_candidate_after_leaf_mask_count": pts_xyz.new_tensor(float(delete_candidate_after_leaf_mask_count)),

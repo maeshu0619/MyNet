@@ -1429,6 +1429,24 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
         "full_cloud_amount_actual_gather_time": 0.0,
         "full_cloud_amount_reuse_where_ranking": False,
         "full_cloud_amount_reuse_where_ranking_reason": "",
+        "where_mode": str(getattr(args, "sparsepcgc_where_mode", "block_only")),
+        "macro_ratio": 0.0,
+        "micro_ratio": 0.0,
+        "macro_selected_block_count": 0,
+        "macro_drop_count": 0,
+        "micro_drop_count": 0,
+        "total_drop_count": 0,
+        "selected_block_count": 0,
+        "micro_selected_block_count": 0,
+        "max_drop_count_per_block": 0,
+        "mean_drop_count_per_selected_block": 0.0,
+        "drop_concentration_top1_block_ratio": 0.0,
+        "drop_concentration_top5_block_ratio": 0.0,
+        "hard_where_uses_network_score": False,
+        "heuristic_where_score_mean": 0.0,
+        "heuristic_where_score_std": 0.0,
+        "micro_quota_hit_block_count": 0,
+        "macro_disabled_reason": "",
         "full_cloud_amount_predicted_delta": float("nan"),
         "full_cloud_amount_actual_delta": float("nan"),
         "full_cloud_amount_actual_objective_delta": float("nan"),
@@ -1849,13 +1867,17 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
                 initial_voxel_coords = value.detach().to(device=ref.device, dtype=torch.long)
                 break
     codec_prior_score = amount_terms.get("codec_prune_prior_score_for_outcome", None)
+    delete_prior_for_outcome = amount_terms.get("delete_prior_for_outcome", None)
     hard_delete_selection_mask = amount_terms.get("hard_delete_selection_mask_for_outcome", None)
     ranking_state = None
     reuse_where_ranking_used = False
     reuse_where_ranking_reason = ""
+    where_mode = str(getattr(args, "sparsepcgc_where_mode", "block_only")).strip().lower()
+    macro_micro_where = where_mode in {"macro_micro_heuristic", "macro_micro_hybrid"}
     if (
         multi_actual_enable
         and bool(getattr(args, "sparsepcgc_reuse_where_ranking_for_amounts", True))
+        and not macro_micro_where
         and torch.is_tensor(initial_voxel_coords)
         and torch.is_tensor(codec_prior_score)
         and hasattr(actuator, "build_codec_block_drop_ranking")
@@ -1872,6 +1894,8 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
         except Exception as exc:
             ranking_state = None
             reuse_where_ranking_reason = str(exc)
+    elif macro_micro_where:
+        reuse_where_ranking_reason = "macro_micro_where_mode"
 
     def _candidate_drop_mask_and_coords(candidate_ratio):
         if (
@@ -1882,7 +1906,19 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
         ):
             return None, None, 0, {}
         try:
-            if ranking_state is not None and reuse_where_ranking_used:
+            if macro_micro_where and hasattr(actuator, "build_macro_micro_where_mask"):
+                hard_drop_mask, trace = actuator.build_macro_micro_where_mask(
+                    initial_voxel_coords,
+                    float(candidate_ratio),
+                    codec_prior_score,
+                    delete_prior=delete_prior_for_outcome,
+                    selection_mask=hard_delete_selection_mask,
+                    block_size=max(int(structure_debug.get("codec_prune_prior_block_size", 4)), 1),
+                    args=args,
+                    max_hard_count=int(getattr(args, "repair_max_hard_drop_voxels", 0)),
+                    min_hard_count=0,
+                )
+            elif ranking_state is not None and reuse_where_ranking_used:
                 hard_drop_mask, trace = actuator.mask_from_codec_block_ranking(
                     ranking_state,
                     target_drop_ratio=float(candidate_ratio),
@@ -2208,13 +2244,14 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
             cand_geom_penalty = 0.0
             cand_ratio_penalty = 0.0
             cand_coords = None
+            cand_where_trace = {}
             cand_requested = False
             cand_finished = True
             cand_error = ""
             cand_wall = 0.0
             compared_in_actual_pool = True
         else:
-            _, cand_coords, cand_drop_count, _ = _candidate_drop_mask_and_coords(cand_ratio)
+            _, cand_coords, cand_drop_count, cand_where_trace = _candidate_drop_mask_and_coords(cand_ratio)
             if candidate_key == str(selected_candidate_key) and int(drop_count or 0) > 0 and cand_drop_count <= 0:
                 cand_drop_count = int(drop_count or 0)
             cand_geom_penalty, cand_ratio_penalty = _candidate_geometry_penalty(
@@ -2276,6 +2313,33 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
             "full_cloud_input_points": int(input_points or 0),
             "full_cloud_drop_count": int(cand_drop_count),
             "drop_count": int(cand_drop_count),
+            "where_mode": str(cand_where_trace.get("where_mode", where_mode if not is_noop else "noop")),
+            "macro_ratio": case_float(cand_where_trace.get("macro_ratio", 0.0), 0.0),
+            "micro_ratio": case_float(cand_where_trace.get("micro_ratio", 0.0), 0.0),
+            "macro_selected_block_count": case_int(cand_where_trace.get("macro_selected_block_count", 0), 0),
+            "macro_drop_count": case_int(cand_where_trace.get("macro_drop_count", 0), 0),
+            "micro_drop_count": case_int(cand_where_trace.get("micro_drop_count", 0), 0),
+            "total_drop_count": case_int(cand_where_trace.get("total_drop_count", cand_drop_count), int(cand_drop_count)),
+            "selected_block_count": case_int(cand_where_trace.get("selected_block_count", 0), 0),
+            "micro_selected_block_count": case_int(cand_where_trace.get("micro_selected_block_count", 0), 0),
+            "max_drop_count_per_block": case_int(cand_where_trace.get("max_drop_count_per_block", 0), 0),
+            "mean_drop_count_per_selected_block": case_float(
+                cand_where_trace.get("mean_drop_count_per_selected_block", 0.0),
+                0.0,
+            ),
+            "drop_concentration_top1_block_ratio": case_float(
+                cand_where_trace.get("drop_concentration_top1_block_ratio", 0.0),
+                0.0,
+            ),
+            "drop_concentration_top5_block_ratio": case_float(
+                cand_where_trace.get("drop_concentration_top5_block_ratio", 0.0),
+                0.0,
+            ),
+            "hard_where_uses_network_score": bool(cand_where_trace.get("hard_where_uses_network_score", False)),
+            "heuristic_where_score_mean": case_float(cand_where_trace.get("heuristic_where_score_mean", 0.0), 0.0),
+            "heuristic_where_score_std": case_float(cand_where_trace.get("heuristic_where_score_std", 0.0), 0.0),
+            "micro_quota_hit_block_count": case_int(cand_where_trace.get("micro_quota_hit_block_count", 0), 0),
+            "macro_disabled_reason": str(cand_where_trace.get("macro_disabled_reason", "")),
             "actual_percent": 0.0 if is_noop else float("nan"),
             "actual_raw_percent": 0.0 if is_noop else float("nan"),
             "actual_objective_percent": 0.0 if is_noop else float("nan"),
@@ -2727,6 +2791,9 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
     residual_error = float("nan")
     if teacher_class > 0 and residual_enable:
         residual_error = float(abs(pred_residual_float - float(teacher_residual_target)))
+    selected_where_row = rows_by_key.get(str(selected_candidate_key), {}) if isinstance(rows_by_key, dict) else {}
+    if not isinstance(selected_where_row, dict):
+        selected_where_row = {}
 
     for row in rows:
         row["selected_is_best"] = bool(selected_is_best)
@@ -2773,6 +2840,33 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
                 if isinstance(sequence_memory_best_entry, dict)
                 else float("nan")
             ),
+            "where_mode": str(selected_where_row.get("where_mode", where_mode)),
+            "macro_ratio": case_float(selected_where_row.get("macro_ratio", 0.0), 0.0),
+            "micro_ratio": case_float(selected_where_row.get("micro_ratio", 0.0), 0.0),
+            "macro_selected_block_count": case_int(selected_where_row.get("macro_selected_block_count", 0), 0),
+            "macro_drop_count": case_int(selected_where_row.get("macro_drop_count", 0), 0),
+            "micro_drop_count": case_int(selected_where_row.get("micro_drop_count", 0), 0),
+            "total_drop_count": case_int(selected_where_row.get("total_drop_count", drop_count or 0), int(drop_count or 0)),
+            "selected_block_count": case_int(selected_where_row.get("selected_block_count", 0), 0),
+            "micro_selected_block_count": case_int(selected_where_row.get("micro_selected_block_count", 0), 0),
+            "max_drop_count_per_block": case_int(selected_where_row.get("max_drop_count_per_block", 0), 0),
+            "mean_drop_count_per_selected_block": case_float(
+                selected_where_row.get("mean_drop_count_per_selected_block", 0.0),
+                0.0,
+            ),
+            "drop_concentration_top1_block_ratio": case_float(
+                selected_where_row.get("drop_concentration_top1_block_ratio", 0.0),
+                0.0,
+            ),
+            "drop_concentration_top5_block_ratio": case_float(
+                selected_where_row.get("drop_concentration_top5_block_ratio", 0.0),
+                0.0,
+            ),
+            "hard_where_uses_network_score": bool(selected_where_row.get("hard_where_uses_network_score", False)),
+            "heuristic_where_score_mean": case_float(selected_where_row.get("heuristic_where_score_mean", 0.0), 0.0),
+            "heuristic_where_score_std": case_float(selected_where_row.get("heuristic_where_score_std", 0.0), 0.0),
+            "micro_quota_hit_block_count": case_int(selected_where_row.get("micro_quota_hit_block_count", 0), 0),
+            "macro_disabled_reason": str(selected_where_row.get("macro_disabled_reason", "")),
             "full_cloud_amount_entropy": float(entropy.detach().cpu()),
             "full_cloud_amount_entropy_loss": float(entropy_loss.detach().cpu()),
             "full_cloud_amount_residual_loss": float(residual_loss.detach().cpu()),

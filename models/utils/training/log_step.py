@@ -831,6 +831,16 @@ def log_compact_step_summary(
     full_cloud_amount_actual_wall = _prefer_number("full_cloud_amount_actual_wall_time_total")
     full_cloud_amount_parallel_mode = _prefer_text("sparsepcgc_actual_parallel_mode")
     full_cloud_verified_noop_guard = _prefer_number("full_cloud_verified_noop_guard_used", 0.0)
+    where_mode = _prefer_text("where_mode") or str(getattr(args, "sparsepcgc_where_mode", "block_only"))
+    macro_ratio = _prefer_number("macro_ratio")
+    micro_ratio = _prefer_number("micro_ratio")
+    macro_selected_block_count = _prefer_number("macro_selected_block_count", 0.0)
+    macro_drop_count = _prefer_number("macro_drop_count", 0.0)
+    micro_drop_count = _prefer_number("micro_drop_count", 0.0)
+    selected_block_count = _prefer_number("selected_block_count", 0.0)
+    max_drop_count_per_block = _prefer_number("max_drop_count_per_block", 0.0)
+    drop_concentration_top1 = _prefer_number("drop_concentration_top1_block_ratio", 0.0)
+    hard_where_uses_network_score = _prefer_number("hard_where_uses_network_score", 0.0)
     actual_bit_objective = _prefer_text("actual_bit_objective") or str(
         getattr(args, "sparsepcgc_actual_bit_objective", "raw")
     )
@@ -929,6 +939,16 @@ def log_compact_step_summary(
         f"FCAActualWall={_fmt(full_cloud_amount_actual_wall, 4)}, "
         f"FCAParallelMode={full_cloud_amount_parallel_mode}, "
         f"FCAVerifiedNoop={bool(round(_to_float(full_cloud_verified_noop_guard, 0.0)))}, "
+        f"WhereMode={where_mode}, "
+        f"MacroRatio={_fmt(macro_ratio, 5)}, "
+        f"MicroRatio={_fmt(micro_ratio, 5)}, "
+        f"MacroBlk={_fmt_int(macro_selected_block_count)}, "
+        f"MacroDrop={_fmt_int(macro_drop_count)}, "
+        f"MicroDrop={_fmt_int(micro_drop_count)}, "
+        f"WhereBlocks={_fmt_int(selected_block_count)}, "
+        f"MaxBlkDrop={_fmt_int(max_drop_count_per_block)}, "
+        f"Top1Conc={_fmt(drop_concentration_top1, 4)}, "
+        f"WhereNet={bool(round(_to_float(hard_where_uses_network_score, 0.0)))}, "
         f"CollapseDetected={collapse_detected}, "
         f"CollapseReason={collapse_reason}, "
         f"HardDropTrace={hard_drop_count_trace}, "
