@@ -75,11 +75,14 @@ class FullCloudAmountSelector(nn.Module):
     voxel-level Where is intentionally left to the codec prior/block algorithm.
     """
 
-    def __init__(self, feature_dim, hidden_dim=64, amount_bin_count=8):
+    def __init__(self, feature_dim, hidden_dim=64, amount_bin_count=8, init_bias_mode="center"):
         super().__init__()
         self.feature_dim = int(feature_dim)
         self.amount_bin_count = max(int(amount_bin_count), 1)
         hidden_dim = max(int(hidden_dim), 8)
+        self.init_bias_mode = str(init_bias_mode).strip().lower()
+        if self.init_bias_mode not in {"center", "uniform", "weak_center"}:
+            self.init_bias_mode = "center"
 
         self.trunk = nn.Sequential(
             nn.Linear(self.feature_dim, hidden_dim),
@@ -97,8 +100,12 @@ class FullCloudAmountSelector(nn.Module):
         if self.amount_bin_count > 1:
             init_class = min(max(self.amount_bin_count // 2, 1), self.amount_bin_count - 1)
             with torch.no_grad():
-                self.amount_bin_logits.bias[0] = -1.0
-                self.amount_bin_logits.bias[init_class] = 1.0
+                if self.init_bias_mode == "center":
+                    self.amount_bin_logits.bias[0] = -1.0
+                    self.amount_bin_logits.bias[init_class] = 1.0
+                elif self.init_bias_mode == "weak_center":
+                    self.amount_bin_logits.bias[0] = -0.2
+                    self.amount_bin_logits.bias[init_class] = 0.2
         nn.init.zeros_(self.amount_residual_raw.weight)
         nn.init.zeros_(self.amount_residual_raw.bias)
         nn.init.zeros_(self.predicted_delta.weight)

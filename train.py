@@ -590,6 +590,183 @@ def _sparsepcgc_full_cloud_amount_memory_key(cache_key):
     return f"{str(cache_key)}|full_cloud_amount"
 
 
+def _sparsepcgc_full_cloud_sequence_amount_memory(args):
+    memory = getattr(args, "_sparsepcgc_full_cloud_sequence_amount_memory", None)
+    if not isinstance(memory, OrderedDict):
+        memory = OrderedDict()
+        setattr(args, "_sparsepcgc_full_cloud_sequence_amount_memory", memory)
+    return memory
+
+
+def _sparsepcgc_full_cloud_sequence_amount_key(sequence_name):
+    name = str(sequence_name or "").strip()
+    return name if name else "__unknown_sequence__"
+
+
+def _sparsepcgc_full_cloud_sequence_amount_topk(args, sequence_name):
+    if not bool(getattr(args, "sparsepcgc_full_cloud_amount_sequence_memory_enable", True)):
+        return []
+    memory = _sparsepcgc_full_cloud_sequence_amount_memory(args)
+    entry = memory.get(_sparsepcgc_full_cloud_sequence_amount_key(sequence_name), None)
+    if not isinstance(entry, dict):
+        return []
+    items = entry.get("items", {})
+    if not isinstance(items, dict) or not items:
+        return []
+
+    ranked = []
+    for ratio_key, bucket in items.items():
+        if not isinstance(bucket, dict):
+            continue
+        ratio = finite_float_or_none(bucket.get("ratio", ratio_key))
+        if ratio is None or ratio <= 0.0:
+            continue
+        raw_score = finite_float_or_none(bucket.get("raw_score_ema", None))
+        objective_score = finite_float_or_none(bucket.get("objective_score_ema", None))
+        billed_score = finite_float_or_none(bucket.get("billed_score_ema", None))
+        primary_score = raw_score
+        primary_source = "raw"
+        if primary_score is None:
+            primary_score = objective_score
+            primary_source = "objective"
+        if primary_score is None:
+            primary_score = billed_score
+            primary_source = "billed"
+        if primary_score is None:
+            continue
+        ranked.append(
+            {
+                "ratio": float(ratio),
+                "base_class": int(case_int(bucket.get("base_class", 0), 0)),
+                "base_bin": float(case_float(bucket.get("base_bin", 0.0), 0.0)),
+                "residual": float(case_float(bucket.get("residual", 0.0), 0.0)),
+                "objective_percent": objective_score,
+                "raw_percent": raw_score,
+                "billed_percent": billed_score,
+                "selected_is_best": float(case_float(bucket.get("selected_is_best_ema", 0.0), 0.0)),
+                "count": int(case_int(bucket.get("count", 0), 0)),
+                "source_step": int(case_int(bucket.get("source_step", 0), 0)),
+                "score": float(primary_score),
+                "score_source": str(primary_source),
+            }
+        )
+    ranked.sort(
+        key=lambda item: (
+            float(item.get("score", float("inf"))),
+            -int(item.get("count", 0)),
+            float(item.get("ratio", 0.0)),
+        )
+    )
+    topk = max(int(getattr(args, "sparsepcgc_full_cloud_amount_sequence_memory_topk", 3)), 1)
+    return ranked[:topk]
+
+
+def _sparsepcgc_full_cloud_sequence_amount_best(args, sequence_name):
+    topk = _sparsepcgc_full_cloud_sequence_amount_topk(args, sequence_name)
+    return topk[0] if topk else None
+
+
+def _sparsepcgc_full_cloud_sequence_memory_seen_count(args, sequence_name, ratio):
+    memory = _sparsepcgc_full_cloud_sequence_amount_memory(args)
+    entry = memory.get(_sparsepcgc_full_cloud_sequence_amount_key(sequence_name), None)
+    if not isinstance(entry, dict):
+        return 0
+    items = entry.get("items", {})
+    if not isinstance(items, dict):
+        return 0
+    key = f"{float(max(min(float(ratio), 0.05), 0.0)):.6f}"
+    bucket = items.get(key, None)
+    if not isinstance(bucket, dict):
+        return 0
+    return int(case_int(bucket.get("count", 0), 0))
+
+
+def _sparsepcgc_update_full_cloud_sequence_amount_memory(
+    args,
+    *,
+    sequence_name,
+    row,
+    global_step,
+):
+    if not bool(getattr(args, "sparsepcgc_full_cloud_amount_sequence_memory_enable", True)):
+        return None
+    if not isinstance(row, dict) or bool(row.get("is_noop", False)):
+        return None
+
+    ratio = finite_float_or_none(row.get("final_ratio", None))
+    if ratio is None or ratio <= 0.0:
+        return None
+
+    raw_percent = finite_float_or_none(
+        row.get("actual_raw_percent", row.get("actual_objective_percent", None))
+    )
+    objective_percent = finite_float_or_none(
+        row.get("actual_objective_percent", row.get("actual_percent", raw_percent))
+    )
+    billed_percent = finite_float_or_none(
+        row.get("actual_percent", row.get("actual_objective_percent", raw_percent))
+    )
+    if raw_percent is None and objective_percent is None and billed_percent is None:
+        return None
+
+    memory = _sparsepcgc_full_cloud_sequence_amount_memory(args)
+    sequence_key = _sparsepcgc_full_cloud_sequence_amount_key(sequence_name)
+    entry = memory.get(sequence_key, None)
+    if not isinstance(entry, dict):
+        entry = {"items": {}}
+    items = entry.setdefault("items", {})
+    ratio_key = f"{float(max(min(float(ratio), 0.05), 0.0)):.6f}"
+    bucket = items.get(ratio_key, None)
+    if not isinstance(bucket, dict):
+        bucket = {
+            "ratio": float(ratio),
+            "base_class": int(case_int(row.get("candidate_base_class", 0), 0)),
+            "base_bin": float(case_float(row.get("candidate_base_bin", 0.0), 0.0)),
+            "residual": float(case_float(row.get("candidate_residual", 0.0), 0.0)),
+            "objective_score_ema": objective_percent,
+            "raw_score_ema": raw_percent,
+            "billed_score_ema": billed_percent,
+            "selected_is_best_ema": float(bool(row.get("selected_is_best", False))),
+            "count": 0,
+            "source_step": 0,
+        }
+
+    momentum = min(
+        max(float(getattr(args, "sparsepcgc_full_cloud_amount_sequence_memory_momentum", 0.7)), 0.0),
+        0.9999,
+    )
+
+    def _ema_update(prev_value, new_value):
+        prev_value = finite_float_or_none(prev_value)
+        new_value = finite_float_or_none(new_value)
+        if new_value is None:
+            return prev_value
+        if prev_value is None:
+            return float(new_value)
+        return float(momentum) * float(prev_value) + (1.0 - float(momentum)) * float(new_value)
+
+    bucket["ratio"] = float(ratio)
+    bucket["base_class"] = int(case_int(row.get("candidate_base_class", bucket.get("base_class", 0)), 0))
+    bucket["base_bin"] = float(case_float(row.get("candidate_base_bin", bucket.get("base_bin", 0.0)), 0.0))
+    bucket["residual"] = float(case_float(row.get("candidate_residual", bucket.get("residual", 0.0)), 0.0))
+    bucket["objective_score_ema"] = _ema_update(bucket.get("objective_score_ema", None), objective_percent)
+    bucket["raw_score_ema"] = _ema_update(bucket.get("raw_score_ema", None), raw_percent)
+    bucket["billed_score_ema"] = _ema_update(bucket.get("billed_score_ema", None), billed_percent)
+    bucket["selected_is_best_ema"] = _ema_update(
+        bucket.get("selected_is_best_ema", None),
+        float(bool(row.get("selected_is_best", False))),
+    )
+    bucket["count"] = int(case_int(bucket.get("count", 0), 0)) + 1
+    bucket["source_step"] = int(global_step) + 1
+    items[ratio_key] = bucket
+    memory[sequence_key] = entry
+    memory.move_to_end(sequence_key)
+    max_entries = max(int(getattr(args, "episode_input_common_cache_max_entries", 0)), 256)
+    while len(memory) > max_entries:
+        memory.popitem(last=False)
+    return bucket
+
+
 def _sparsepcgc_quantize_amount_ratio(args, ratio):
     try:
         ratio_value = float(ratio)
@@ -1187,6 +1364,7 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
     episode,
     epoch,
     step,
+    sequence_name,
     input_points,
     drop_count,
     geom_loss=None,
@@ -1214,11 +1392,18 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
         "full_cloud_amount_teacher_base_bin": float("nan"),
         "full_cloud_amount_teacher_residual": float("nan"),
         "full_cloud_amount_oracle_best_ratio": float("nan"),
+        "full_cloud_amount_raw_oracle_best_ratio": float("nan"),
         "full_cloud_amount_oracle_best_actual_delta": float("nan"),
         "full_cloud_amount_selected_ratio": float("nan"),
         "full_cloud_amount_selected_actual_delta": float("nan"),
         "full_cloud_amount_oracle_gap": float("nan"),
         "full_cloud_amount_selected_is_best": False,
+        "full_cloud_amount_selected_is_raw_best": False,
+        "full_cloud_amount_raw_oracle_gap": float("nan"),
+        "full_cloud_amount_actual_finished_nonselected_count": 0,
+        "full_cloud_amount_wide_probe_due": False,
+        "full_cloud_amount_wide_probe_actual_count": 0,
+        "full_cloud_amount_sequence_memory_ratio": float("nan"),
         "full_cloud_amount_entropy": float("nan"),
         "full_cloud_amount_entropy_loss": 0.0,
         "full_cloud_amount_residual_loss": 0.0,
@@ -1355,6 +1540,38 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
     if (not multi_actual_enable) or policy == "selected_only" or max_actual_default <= 1:
         max_actual = 1
     actual_topk = max(int(getattr(args, "sparsepcgc_full_cloud_amount_actual_topk", 2)), 0)
+    wide_probe_enable = bool(
+        getattr(args, "sparsepcgc_full_cloud_amount_wide_probe_enable", True)
+    )
+    wide_probe_ratios = tuple(
+        getattr(args, "sparsepcgc_full_cloud_amount_wide_probe_ratio_values", ())
+    )
+    wide_probe_interval = max(
+        int(getattr(args, "sparsepcgc_full_cloud_amount_wide_probe_interval", 50)),
+        0,
+    )
+    wide_probe_sequence_head_steps = max(
+        int(getattr(args, "sparsepcgc_full_cloud_amount_wide_probe_sequence_head_steps", 2)),
+        0,
+    )
+    wide_probe_max_actual = max(
+        int(getattr(args, "sparsepcgc_full_cloud_amount_wide_probe_max_actual", 3)),
+        1,
+    )
+    wide_probe_due = bool(
+        wide_probe_enable
+        and multi_actual_enable
+        and (
+            int(step) < int(wide_probe_sequence_head_steps)
+            or (
+                wide_probe_interval > 0
+                and ((int(global_step) + 1) % int(wide_probe_interval) == 0)
+            )
+        )
+    )
+    sequence_memory_enable = bool(
+        getattr(args, "sparsepcgc_full_cloud_amount_sequence_memory_enable", True)
+    )
     teacher_actual_priority = bool(
         getattr(args, "sparsepcgc_full_cloud_amount_teacher_actual_priority", True)
     )
@@ -1391,6 +1608,13 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
     if residual_teacher_mode not in {"candidate_ratio", "nearest_bin"}:
         residual_teacher_mode = "candidate_ratio"
     amount_memory_key = _sparsepcgc_full_cloud_amount_memory_key(cache_key)
+    sequence_memory_entries = (
+        _sparsepcgc_full_cloud_sequence_amount_topk(args, sequence_name)
+        if sequence_memory_enable
+        else []
+    )
+    sequence_memory_best_entry = sequence_memory_entries[0] if sequence_memory_entries else None
+    amount_prob = torch.softmax(amount_logits.detach().float(), dim=0)
 
     nonnoop_bin_items = [
         (int(cls), float(bin_tensor.detach().flatten()[cls].cpu()))
@@ -1545,6 +1769,22 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
                         2,
                     )
 
+    if sequence_memory_enable and sequence_memory_entries:
+        for mem_rank, memory_entry in enumerate(sequence_memory_entries):
+            memory_ratio = memory_entry.get("ratio", float("nan"))
+            memory_base_class = memory_entry.get("base_class", None)
+            memory_base_bin = memory_entry.get("base_bin", None)
+            memory_residual = memory_entry.get("residual", None)
+            source = "sequence_memory_best" if mem_rank == 0 else f"sequence_memory_top{mem_rank + 1}"
+            _register_candidate_ratio(
+                memory_ratio,
+                source,
+                1 if mem_rank == 0 else 2,
+                base_class=memory_base_class,
+                base_bin=memory_base_bin,
+                candidate_residual=memory_residual,
+            )
+
     if policy == "all_bins":
         for cls in range(1, class_count):
             _register_bin_class(int(cls), "all_bins", 5)
@@ -1571,6 +1811,10 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
     if fine_ratio_probe_enable and multi_actual_enable and residual_enable:
         for fine_ratio in fine_ratio_values:
             _register_candidate_ratio(float(fine_ratio), f"fine_ratio_probe_{float(fine_ratio):.3f}", 1)
+
+    if wide_probe_due:
+        for wide_ratio in wide_probe_ratios:
+            _register_candidate_ratio(float(wide_ratio), f"wide_probe_{float(wide_ratio):.3f}", 2)
 
     if oracle_sweep_due:
         for cls in range(1, min(class_count, oracle_sweep_max_bins + 1)):
@@ -1739,13 +1983,12 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
         structure_debug.get("input_voxel_count", input_points or 0)
     )
 
-    actual_candidate_keys = []
-    if selected_class > 0 and selected_candidate_key in candidate_specs:
-        actual_candidate_keys.append(str(selected_candidate_key))
-    nonnoop_candidate_keys = [
-        key for key, entry in candidate_specs.items()
-        if not bool(entry.get("is_noop", False)) and str(key) != str(selected_candidate_key)
-    ]
+    def _candidate_sources(entry):
+        return [str(source) for source in list((entry or {}).get("sources", []))]
+
+    def _candidate_has_source(candidate_key, prefix):
+        entry = candidate_specs.get(str(candidate_key), {}) or {}
+        return any(str(source).startswith(str(prefix)) for source in _candidate_sources(entry))
 
     def _candidate_sort_key(candidate_key):
         entry = candidate_specs.get(str(candidate_key), {}) or {}
@@ -1753,20 +1996,179 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
         primary = int(entry.get("priority", 99))
         predicted = float(pred_per_amount.detach().flatten()[base_class].cpu()) if base_class > 0 else 0.0
         ratio_gap = abs(float(entry.get("final_ratio", 0.0)) - float(selected_ratio_value))
-        return (primary, predicted, ratio_gap, str(candidate_key))
+        alt_prob = -float(amount_prob[base_class].detach().cpu()) if base_class > 0 else 0.0
+        return (primary, predicted, alt_prob, ratio_gap, str(candidate_key))
 
-    if teacher_actual_priority:
-        nonnoop_candidate_keys = sorted(nonnoop_candidate_keys, key=_candidate_sort_key)
-    else:
-        nonnoop_candidate_keys = sorted(
+    nonnoop_candidate_keys = [
+        key for key, entry in candidate_specs.items()
+        if not bool(entry.get("is_noop", False))
+    ]
+    sorted_candidate_keys = (
+        sorted(nonnoop_candidate_keys, key=_candidate_sort_key)
+        if teacher_actual_priority
+        else sorted(
             nonnoop_candidate_keys,
-            key=lambda key: float(pred_per_amount.detach().flatten()[int(candidate_specs[key]["base_class"])].cpu()),
+            key=lambda key: float(
+                pred_per_amount.detach().flatten()[int(candidate_specs[key]["base_class"])].cpu()
+            ),
         )
+    )
+    candidate_priority_rank = {
+        str(candidate_key): int(rank)
+        for rank, candidate_key in enumerate(sorted_candidate_keys)
+    }
 
-    for candidate_key in nonnoop_candidate_keys:
-        if str(candidate_key) not in actual_candidate_keys:
-            actual_candidate_keys.append(str(candidate_key))
-    actual_candidate_keys = actual_candidate_keys[: max(int(max_actual), 0)]
+    actual_candidate_keys = []
+    actual_candidate_reason = {}
+    use_enhanced_actual_selection = bool(
+        wide_probe_enable or sequence_memory_enable or wide_probe_due
+    ) and multi_actual_enable and max_actual > 1 and policy != "selected_only"
+
+    def _append_actual_candidate(candidate_key, reason):
+        candidate_key = str(candidate_key)
+        if candidate_key not in candidate_specs:
+            return False
+        entry = candidate_specs.get(candidate_key, {}) or {}
+        if bool(entry.get("is_noop", False)):
+            return False
+        if candidate_key in actual_candidate_keys:
+            return False
+        if len(actual_candidate_keys) >= int(max_actual):
+            return False
+        actual_candidate_keys.append(candidate_key)
+        actual_candidate_reason[candidate_key] = str(reason)
+        return True
+
+    def _candidate_ratio_distance(candidate_key):
+        entry = candidate_specs.get(str(candidate_key), {}) or {}
+        return abs(float(entry.get("final_ratio", 0.0)) - float(selected_ratio_value))
+
+    def _candidate_base_class(candidate_key):
+        entry = candidate_specs.get(str(candidate_key), {}) or {}
+        return int(entry.get("base_class", 0))
+
+    def _pick_nonselected_predicted_candidate(excluded_keys):
+        best_key = None
+        best_tuple = None
+        for candidate_key in sorted_candidate_keys:
+            candidate_key = str(candidate_key)
+            if candidate_key in excluded_keys or candidate_key == str(selected_candidate_key):
+                continue
+            entry = candidate_specs.get(candidate_key, {}) or {}
+            if bool(entry.get("is_noop", False)):
+                continue
+            base_class = int(entry.get("base_class", 0))
+            if base_class <= 0:
+                continue
+            ranking = (
+                0 if base_class != int(selected_class) else 1,
+                float(pred_per_amount.detach().flatten()[base_class].cpu()),
+                int(entry.get("priority", 99)),
+                -_candidate_ratio_distance(candidate_key),
+                candidate_key,
+            )
+            if best_tuple is None or ranking < best_tuple:
+                best_tuple = ranking
+                best_key = candidate_key
+        return best_key
+
+    def _pick_uncertainty_candidate(excluded_keys):
+        best_key = None
+        best_tuple = None
+        for candidate_key in sorted_candidate_keys:
+            candidate_key = str(candidate_key)
+            if candidate_key in excluded_keys or candidate_key == str(selected_candidate_key):
+                continue
+            entry = candidate_specs.get(candidate_key, {}) or {}
+            if bool(entry.get("is_noop", False)):
+                continue
+            base_class = int(entry.get("base_class", 0))
+            if base_class <= 0:
+                continue
+            ranking = (
+                0 if base_class != int(selected_class) else 1,
+                -float(amount_prob[base_class].detach().cpu()),
+                float(pred_per_amount.detach().flatten()[base_class].cpu()),
+                candidate_key,
+            )
+            if best_tuple is None or ranking < best_tuple:
+                best_tuple = ranking
+                best_key = candidate_key
+        return best_key
+
+    def _pick_wide_probe_candidates(excluded_keys):
+        candidates = []
+        for candidate_key in sorted_candidate_keys:
+            candidate_key = str(candidate_key)
+            if candidate_key in excluded_keys:
+                continue
+            entry = candidate_specs.get(candidate_key, {}) or {}
+            if bool(entry.get("is_noop", False)) or not _candidate_has_source(candidate_key, "wide_probe_"):
+                continue
+            ratio_value = float(entry.get("final_ratio", 0.0))
+            ranking = (
+                int(_sparsepcgc_full_cloud_sequence_memory_seen_count(args, sequence_name, ratio_value)),
+                min(abs(ratio_value - 0.010), abs(ratio_value - 0.040)),
+                -abs(ratio_value - float(selected_ratio_value)),
+                float(pred_per_amount.detach().flatten()[int(entry.get("base_class", 0))].cpu())
+                if int(entry.get("base_class", 0)) > 0
+                else 0.0,
+                candidate_key,
+            )
+            candidates.append((ranking, candidate_key))
+        candidates.sort(key=lambda item: item[0])
+        return [candidate_key for _, candidate_key in candidates[: max(int(wide_probe_max_actual), 0)]]
+
+    if selected_class > 0 and selected_candidate_key in candidate_specs:
+        _append_actual_candidate(selected_candidate_key, "network_selected")
+
+    if use_enhanced_actual_selection:
+        sequence_memory_best_key = None
+        if isinstance(sequence_memory_best_entry, dict):
+            best_ratio = sequence_memory_best_entry.get("ratio", float("nan"))
+            best_ratio_key = None
+            for candidate_key, entry in candidate_specs.items():
+                if bool(entry.get("is_noop", False)):
+                    continue
+                if abs(float(entry.get("final_ratio", 0.0)) - float(best_ratio)) <= 1e-6:
+                    best_ratio_key = str(candidate_key)
+                    break
+            sequence_memory_best_key = best_ratio_key
+            if sequence_memory_best_key is not None:
+                _append_actual_candidate(sequence_memory_best_key, "sequence_memory_best")
+
+        predicted_key = _pick_nonselected_predicted_candidate(set(actual_candidate_keys))
+        if predicted_key is not None:
+            _append_actual_candidate(predicted_key, "predicted_top")
+
+        uncertainty_key = _pick_uncertainty_candidate(set(actual_candidate_keys))
+        if uncertainty_key is not None:
+            _append_actual_candidate(uncertainty_key, "uncertainty_alt")
+
+        if wide_probe_due:
+            for candidate_key in _pick_wide_probe_candidates(set(actual_candidate_keys)):
+                if len(actual_candidate_keys) >= int(max_actual):
+                    break
+                _append_actual_candidate(candidate_key, "wide_probe_due")
+
+        for candidate_key in sorted_candidate_keys:
+            if len(actual_candidate_keys) >= int(max_actual):
+                break
+            candidate_key = str(candidate_key)
+            if candidate_key in actual_candidate_keys:
+                continue
+            too_close = any(
+                abs(float(candidate_specs[candidate_key]["final_ratio"]) - float(candidate_specs[other_key]["final_ratio"])) <= 5e-4
+                for other_key in actual_candidate_keys
+            )
+            if too_close and len(actual_candidate_keys) > 0:
+                continue
+            _append_actual_candidate(candidate_key, "fallback_diversified")
+    else:
+        for candidate_key in sorted_candidate_keys:
+            if len(actual_candidate_keys) >= int(max_actual):
+                break
+            _append_actual_candidate(candidate_key, "legacy_priority")
 
     rows_by_key = {}
     candidate_encode_xyz = []
@@ -1853,6 +2255,10 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
             "sample_key": str(cache_key),
             "candidate_id": int(cand_idx),
             "candidate_source": "+".join(entry.get("sources", [])),
+            "candidate_priority_rank": int(candidate_priority_rank.get(candidate_key, len(candidate_specs))),
+            "candidate_selected_for_actual_reason": str(actual_candidate_reason.get(candidate_key, "")),
+            "is_wide_probe": bool(any(str(source).startswith("wide_probe_") for source in entry.get("sources", []))),
+            "is_sequence_memory": bool(any(str(source).startswith("sequence_memory_") for source in entry.get("sources", []))),
             "candidate_base_class": int(base_class),
             "candidate_base_bin": float(base_bin),
             "candidate_residual": float(candidate_residual),
@@ -1989,16 +2395,25 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
                 row.get("actual_objective_percent", row.get("actual_percent", float("nan"))),
                 row.get("final_ratio", 0.0),
             )
+            _sparsepcgc_update_full_cloud_sequence_amount_memory(
+                args,
+                sequence_name=sequence_name,
+                row=row,
+                global_step=global_step,
+            )
 
     actual_pool_rows = []
     surrogate_pool_rows = []
+    raw_actual_pool_rows = []
     for row in rows:
         if bool(row.get("is_noop", False)):
             row["_teacher_score"] = 0.0
             row["_surrogate_teacher_score"] = 0.0
+            row["_raw_teacher_score"] = 0.0
             row["teacher_compared_in_actual_pool"] = True
             actual_pool_rows.append(row)
             surrogate_pool_rows.append(row)
+            raw_actual_pool_rows.append(row)
             continue
         if bool(row.get("teacher_compared_in_actual_pool", False)) and math.isfinite(case_float(row.get("actual_objective_percent", float("nan")), float("nan"))):
             row["_teacher_score"] = (
@@ -2008,6 +2423,14 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
                 * (max(float(row.get("final_ratio", 0.0)) - float(getattr(args, "sparsepcgc_full_cloud_amount_ratio_reg_target", 0.05)), 0.0) ** 2)
             )
             actual_pool_rows.append(row)
+        if bool(row.get("teacher_compared_in_actual_pool", False)) and math.isfinite(case_float(row.get("actual_raw_percent", float("nan")), float("nan"))):
+            row["_raw_teacher_score"] = (
+                float(row.get("actual_raw_percent", row.get("actual_objective_percent", float("nan"))))
+                + float(getattr(args, "sparsepcgc_full_cloud_amount_geom_penalty_weight", 0.1)) * float(row.get("geom_loss", 0.0))
+                + float(getattr(args, "sparsepcgc_full_cloud_amount_ratio_reg_weight", 0.05))
+                * (max(float(row.get("final_ratio", 0.0)) - float(getattr(args, "sparsepcgc_full_cloud_amount_ratio_reg_target", 0.05)), 0.0) ** 2)
+            )
+            raw_actual_pool_rows.append(row)
         surrogate_score = float(row.get("surrogate_percent", float("nan")))
         if math.isfinite(surrogate_score):
             row["_surrogate_teacher_score"] = surrogate_score
@@ -2035,8 +2458,16 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
         selected_row.get("_teacher_score", float("nan")) if isinstance(selected_row, dict) else float("nan"),
         float("nan"),
     )
+    selected_raw_score = case_float(
+        selected_row.get("_raw_teacher_score", float("nan")) if isinstance(selected_row, dict) else float("nan"),
+        float("nan"),
+    )
+    raw_oracle_best_ratio = float("nan")
+    raw_oracle_gap = float("nan")
+    selected_is_raw_best = False
 
     actual_nonnoop_rows = [row for row in actual_pool_rows if not bool(row.get("is_noop", False))]
+    raw_actual_nonnoop_rows = [row for row in raw_actual_pool_rows if not bool(row.get("is_noop", False))]
     if actual_pool_rows and actual_nonnoop_rows:
         best_row = min(actual_pool_rows, key=lambda row: float(row.get("_teacher_score", float("inf"))))
         best_score = float(best_row.get("_teacher_score", float("inf")))
@@ -2087,6 +2518,14 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
             selected_objective_delta = case_float(selected_row.get("surrogate_percent", float("nan")), float("nan"))
             selected_score = case_float(selected_row.get("_surrogate_teacher_score", float("nan")), float("nan"))
         teacher_source = "surrogate_fallback"
+
+    if raw_actual_pool_rows and raw_actual_nonnoop_rows:
+        raw_best_row = min(raw_actual_pool_rows, key=lambda row: float(row.get("_raw_teacher_score", float("inf"))))
+        raw_oracle_best_ratio = float(raw_best_row.get("final_ratio", 0.0))
+        raw_best_score = case_float(raw_best_row.get("_raw_teacher_score", float("nan")), float("nan"))
+        if math.isfinite(raw_best_score) and math.isfinite(selected_raw_score):
+            raw_oracle_gap = float(selected_raw_score - raw_best_score)
+            selected_is_raw_best = bool(str(selected_candidate_key) == str(raw_best_row.get("_candidate_key", "")))
 
     teacher_class = min(max(int(teacher_class), 0), class_count - 1)
     teacher_base_bin = 0.0
@@ -2212,13 +2651,25 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
     noop_guard_loss = -log_probs[0] if teacher_class == 0 else ref.new_zeros(())
     entropy = -(amount_prob * torch.log(amount_prob.clamp_min(1e-8))).sum()
     entropy_norm = entropy / max(math.log(float(class_count)), 1e-6) if class_count > 1 else ref.new_zeros(())
-    entropy_decay_steps = max(int(getattr(args, "sparsepcgc_full_cloud_amount_entropy_decay_steps", 500)), 0)
+    entropy_decay_steps = max(int(getattr(args, "sparsepcgc_full_cloud_amount_entropy_decay_steps", 2000)), 0)
+    min_entropy_weight = max(
+        float(getattr(args, "sparsepcgc_full_cloud_amount_min_entropy_weight", 0.001)),
+        0.0,
+    )
+    base_entropy_weight = max(
+        float(getattr(args, "sparsepcgc_full_cloud_amount_entropy_weight", 0.01)),
+        0.0,
+    )
     entropy_decay = (
         max(0.0, 1.0 - float(global_step) / float(max(entropy_decay_steps, 1)))
         if entropy_decay_steps > 0
         else 0.0
     )
-    entropy_loss = (1.0 - entropy_norm.to(dtype=ref.dtype)) * float(entropy_decay)
+    entropy_weight_effective = max(
+        float(min_entropy_weight),
+        float(base_entropy_weight) * float(entropy_decay),
+    )
+    entropy_loss = (1.0 - entropy_norm.to(dtype=ref.dtype))
     residual_loss = ref.new_zeros(())
     if residual_enable and residual_loss_weight > 0.0 and teacher_class > 0:
         residual_loss = torch.nn.functional.smooth_l1_loss(
@@ -2233,7 +2684,7 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
         + float(getattr(args, "sparsepcgc_full_cloud_amount_geom_penalty_weight", 0.1)) * geom_loss_term
         + float(getattr(args, "sparsepcgc_full_cloud_amount_ratio_reg_weight", 0.05)) * ratio_reg_loss
         + float(getattr(args, "sparsepcgc_full_cloud_amount_noop_guard_weight", 0.5)) * noop_guard_loss
-        + float(getattr(args, "sparsepcgc_full_cloud_amount_entropy_weight", 0.01)) * entropy_loss
+        + float(entropy_weight_effective) * entropy_loss
         + float(residual_loss_weight) * residual_loss
     )
     total_loss = torch.nan_to_num(total_loss, nan=0.0, posinf=0.0, neginf=0.0)
@@ -2246,6 +2697,22 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
         for row in rows
         if bool(row.get("actual_finished", False))
         and not bool(row.get("is_noop", False))
+        and math.isfinite(case_float(row.get("actual_objective_percent", float("nan")), float("nan")))
+    )
+    actual_finished_nonselected_count = sum(
+        1
+        for row in rows
+        if bool(row.get("actual_finished", False))
+        and not bool(row.get("is_noop", False))
+        and str(row.get("_candidate_key", "")) != str(selected_candidate_key)
+        and math.isfinite(case_float(row.get("actual_objective_percent", float("nan")), float("nan")))
+    )
+    wide_probe_actual_count = sum(
+        1
+        for row in rows
+        if bool(row.get("actual_finished", False))
+        and not bool(row.get("is_noop", False))
+        and bool(row.get("is_wide_probe", False))
         and math.isfinite(case_float(row.get("actual_objective_percent", float("nan")), float("nan")))
     )
     selected_is_best = bool(str(selected_candidate_key) == str(teacher_row_key))
@@ -2288,6 +2755,7 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
             "full_cloud_amount_teacher_base_bin": float(teacher_base_bin),
             "full_cloud_amount_teacher_residual": float(teacher_residual_target),
             "full_cloud_amount_oracle_best_ratio": float(oracle_best_ratio),
+            "full_cloud_amount_raw_oracle_best_ratio": float(raw_oracle_best_ratio),
             "full_cloud_amount_oracle_best_actual_delta": float(oracle_best_actual_delta),
             "full_cloud_amount_oracle_best_objective_delta": float(oracle_best_objective_delta),
             "full_cloud_amount_selected_ratio": float(selected_ratio_value),
@@ -2295,6 +2763,16 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
             "full_cloud_amount_selected_objective_delta": float(selected_objective_delta),
             "full_cloud_amount_oracle_gap": float(oracle_gap),
             "full_cloud_amount_selected_is_best": bool(selected_is_best),
+            "full_cloud_amount_selected_is_raw_best": bool(selected_is_raw_best),
+            "full_cloud_amount_raw_oracle_gap": float(raw_oracle_gap),
+            "full_cloud_amount_actual_finished_nonselected_count": int(actual_finished_nonselected_count),
+            "full_cloud_amount_wide_probe_due": bool(wide_probe_due),
+            "full_cloud_amount_wide_probe_actual_count": int(wide_probe_actual_count),
+            "full_cloud_amount_sequence_memory_ratio": (
+                float(sequence_memory_best_entry.get("ratio", float("nan")))
+                if isinstance(sequence_memory_best_entry, dict)
+                else float("nan")
+            ),
             "full_cloud_amount_entropy": float(entropy.detach().cpu()),
             "full_cloud_amount_entropy_loss": float(entropy_loss.detach().cpu()),
             "full_cloud_amount_residual_loss": float(residual_loss.detach().cpu()),
@@ -13259,6 +13737,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                         episode=episode,
                         epoch=epoch,
                         step=step,
+                        sequence_name=sequence_name,
                         input_points=int(input_xyz.shape[-1]),
                         drop_count=int(full_cloud_amount_drop_count),
                         geom_loss=L_geom,
@@ -15435,10 +15914,22 @@ def train(model, args, loss, writer, plot, notifier=None):
                             "_teacher_ratio_count": 0,
                             "_oracle_ratio_sum": 0.0,
                             "_oracle_ratio_count": 0,
+                            "_selected_ratio_sum": 0.0,
+                            "_selected_ratio_count": 0,
+                            "_raw_oracle_ratio_sum": 0.0,
+                            "_raw_oracle_ratio_count": 0,
                             "_selected_best_sum": 0.0,
                             "_selected_best_count": 0,
+                            "_selected_raw_best_sum": 0.0,
+                            "_selected_raw_best_count": 0,
                             "_oracle_gap_sum": 0.0,
                             "_oracle_gap_count": 0,
+                            "_raw_oracle_gap_sum": 0.0,
+                            "_raw_oracle_gap_count": 0,
+                            "_wide_probe_actual_count_sum": 0.0,
+                            "_wide_probe_actual_count_count": 0,
+                            "_sequence_memory_ratio_sum": 0.0,
+                            "_sequence_memory_ratio_count": 0,
                         }
                         episode_sequence_summary[sequence_name] = seq_summary
                     seq_summary["step_count"] += 1
@@ -15463,6 +15954,13 @@ def train(model, args, loss, writer, plot, notifier=None):
                     if math.isfinite(row_ratio):
                         seq_summary["_ratio_sum"] += float(row_ratio)
                         seq_summary["_ratio_count"] += 1
+                    row_selected_ratio = case_float(
+                        compression_metric_row.get("full_cloud_amount_selected_ratio", float("nan")),
+                        float("nan"),
+                    )
+                    if math.isfinite(row_selected_ratio):
+                        seq_summary["_selected_ratio_sum"] += float(row_selected_ratio)
+                        seq_summary["_selected_ratio_count"] += 1
                     row_teacher_ratio = case_float(
                         compression_metric_row.get("full_cloud_amount_teacher_ratio", float("nan")),
                         float("nan"),
@@ -15477,10 +15975,24 @@ def train(model, args, loss, writer, plot, notifier=None):
                     if math.isfinite(row_oracle_ratio):
                         seq_summary["_oracle_ratio_sum"] += float(row_oracle_ratio)
                         seq_summary["_oracle_ratio_count"] += 1
+                    row_raw_oracle_ratio = case_float(
+                        compression_metric_row.get("full_cloud_amount_raw_oracle_best_ratio", float("nan")),
+                        float("nan"),
+                    )
+                    if math.isfinite(row_raw_oracle_ratio):
+                        seq_summary["_raw_oracle_ratio_sum"] += float(row_raw_oracle_ratio)
+                        seq_summary["_raw_oracle_ratio_count"] += 1
                     seq_summary["_selected_best_sum"] += float(
                         bool(compression_metric_row.get("full_cloud_amount_selected_is_best", False))
                     )
                     seq_summary["_selected_best_count"] += 1
+                    row_selected_raw_best = compression_metric_row.get(
+                        "full_cloud_amount_selected_is_raw_best",
+                        None,
+                    )
+                    if row_selected_raw_best is not None:
+                        seq_summary["_selected_raw_best_sum"] += float(bool(row_selected_raw_best))
+                        seq_summary["_selected_raw_best_count"] += 1
                     row_oracle_gap = case_float(
                         compression_metric_row.get("full_cloud_amount_oracle_gap", float("nan")),
                         float("nan"),
@@ -15488,6 +16000,27 @@ def train(model, args, loss, writer, plot, notifier=None):
                     if math.isfinite(row_oracle_gap):
                         seq_summary["_oracle_gap_sum"] += float(row_oracle_gap)
                         seq_summary["_oracle_gap_count"] += 1
+                    row_raw_oracle_gap = case_float(
+                        compression_metric_row.get("full_cloud_amount_raw_oracle_gap", float("nan")),
+                        float("nan"),
+                    )
+                    if math.isfinite(row_raw_oracle_gap):
+                        seq_summary["_raw_oracle_gap_sum"] += float(row_raw_oracle_gap)
+                        seq_summary["_raw_oracle_gap_count"] += 1
+                    row_wide_probe_actual = case_float(
+                        compression_metric_row.get("full_cloud_amount_wide_probe_actual_count", float("nan")),
+                        float("nan"),
+                    )
+                    if math.isfinite(row_wide_probe_actual):
+                        seq_summary["_wide_probe_actual_count_sum"] += float(row_wide_probe_actual)
+                        seq_summary["_wide_probe_actual_count_count"] += 1
+                    row_sequence_memory_ratio = case_float(
+                        compression_metric_row.get("full_cloud_amount_sequence_memory_ratio", float("nan")),
+                        float("nan"),
+                    )
+                    if math.isfinite(row_sequence_memory_ratio):
+                        seq_summary["_sequence_memory_ratio_sum"] += float(row_sequence_memory_ratio)
+                        seq_summary["_sequence_memory_ratio_count"] += 1
                 maybe_record_case_debug( args, writer, case_debug_path, case_debug_counts, global_step=global_train_step, episode=episode, epoch=epoch, step=step, file_path=file_path, comp_debug=comp_debug, structure_debug=structure_debug, edit_stats=train_edit_stats, L=L, L_geom=L_geom, L_com=L_com, L_actuator=L_actuator) # 圧縮改善が良いケース・悪いケースを条件に応じてCase Debag CSVへ保存
 
                 """損失ログの記録"""
@@ -15682,6 +16215,10 @@ def train(model, args, loss, writer, plot, notifier=None):
         append_csv_row( metric_csv_paths.get("compression_episode"), COMPRESSION_EPISODE_METRIC_COLUMNS, compression_episode_metrics)
         if episode_sequence_summary:
             for seq_summary in episode_sequence_summary.values():
+                current_sequence_memory_best = _sparsepcgc_full_cloud_sequence_amount_best(
+                    args,
+                    seq_summary.get("sequence_name", ""),
+                )
                 append_csv_row(
                     metric_csv_paths.get("full_cloud_amount_sequence_summary"),
                     FULL_CLOUD_AMOUNT_SEQUENCE_SUMMARY_COLUMNS,
@@ -15705,6 +16242,11 @@ def train(model, args, loss, writer, plot, notifier=None):
                             if int(seq_summary.get("_ratio_count", 0)) > 0
                             else None
                         ),
+                        "mean_selected_ratio": (
+                            seq_summary["_selected_ratio_sum"] / max(seq_summary["_selected_ratio_count"], 1)
+                            if int(seq_summary.get("_selected_ratio_count", 0)) > 0
+                            else None
+                        ),
                         "mean_teacher_ratio": (
                             seq_summary["_teacher_ratio_sum"] / max(seq_summary["_teacher_ratio_count"], 1)
                             if int(seq_summary.get("_teacher_ratio_count", 0)) > 0
@@ -15715,14 +16257,43 @@ def train(model, args, loss, writer, plot, notifier=None):
                             if int(seq_summary.get("_oracle_ratio_count", 0)) > 0
                             else None
                         ),
+                        "mean_raw_oracle_best_ratio": (
+                            seq_summary["_raw_oracle_ratio_sum"] / max(seq_summary["_raw_oracle_ratio_count"], 1)
+                            if int(seq_summary.get("_raw_oracle_ratio_count", 0)) > 0
+                            else None
+                        ),
                         "selected_is_best_rate": (
                             seq_summary["_selected_best_sum"] / max(seq_summary["_selected_best_count"], 1)
                             if int(seq_summary.get("_selected_best_count", 0)) > 0
                             else None
                         ),
+                        "selected_is_raw_best_rate": (
+                            seq_summary["_selected_raw_best_sum"] / max(seq_summary["_selected_raw_best_count"], 1)
+                            if int(seq_summary.get("_selected_raw_best_count", 0)) > 0
+                            else None
+                        ),
                         "mean_oracle_gap": (
                             seq_summary["_oracle_gap_sum"] / max(seq_summary["_oracle_gap_count"], 1)
                             if int(seq_summary.get("_oracle_gap_count", 0)) > 0
+                            else None
+                        ),
+                        "mean_raw_oracle_gap": (
+                            seq_summary["_raw_oracle_gap_sum"] / max(seq_summary["_raw_oracle_gap_count"], 1)
+                            if int(seq_summary.get("_raw_oracle_gap_count", 0)) > 0
+                            else None
+                        ),
+                        "sequence_memory_best_ratio": (
+                            float(current_sequence_memory_best.get("ratio", float("nan")))
+                            if isinstance(current_sequence_memory_best, dict)
+                            else (
+                                seq_summary["_sequence_memory_ratio_sum"] / max(seq_summary["_sequence_memory_ratio_count"], 1)
+                                if int(seq_summary.get("_sequence_memory_ratio_count", 0)) > 0
+                                else None
+                            )
+                        ),
+                        "wide_probe_actual_count": (
+                            seq_summary["_wide_probe_actual_count_sum"] / max(seq_summary["_wide_probe_actual_count_count"], 1)
+                            if int(seq_summary.get("_wide_probe_actual_count_count", 0)) > 0
                             else None
                         ),
                     },

@@ -84,6 +84,9 @@ class Network(nn.Module):
             feature_dim=structure_dim + len(CAUSE_NAMES) + len(POLICY_NAMES) + self.cause_aggregator.priority_dim,
             hidden_dim=int(getattr(self.args, "sparsepcgc_full_cloud_amount_hidden_dim", 64)),
             amount_bin_count=len(full_cloud_amount_bins),
+            init_bias_mode=str(
+                getattr(self.args, "sparsepcgc_full_cloud_amount_init_bias_mode", "weak_center")
+            ),
         )
 
         """旧モジュールセットアップ"""

@@ -805,8 +805,21 @@ def log_compact_step_summary(
     full_cloud_amount_teacher_base_bin = _prefer_number("full_cloud_amount_teacher_base_bin")
     full_cloud_amount_teacher_residual = _prefer_number("full_cloud_amount_teacher_residual")
     full_cloud_amount_oracle_best_ratio = _prefer_number("full_cloud_amount_oracle_best_ratio")
+    full_cloud_amount_raw_oracle_best_ratio = _prefer_number("full_cloud_amount_raw_oracle_best_ratio")
     full_cloud_amount_oracle_gap = _prefer_number("full_cloud_amount_oracle_gap")
     full_cloud_amount_selected_is_best = _prefer_number("full_cloud_amount_selected_is_best", 0.0)
+    full_cloud_amount_selected_is_raw_best = _prefer_number("full_cloud_amount_selected_is_raw_best", 0.0)
+    full_cloud_amount_raw_oracle_gap = _prefer_number("full_cloud_amount_raw_oracle_gap")
+    full_cloud_amount_actual_finished_nonselected_count = _prefer_number(
+        "full_cloud_amount_actual_finished_nonselected_count",
+        0.0,
+    )
+    full_cloud_amount_wide_probe_due = _prefer_number("full_cloud_amount_wide_probe_due", 0.0)
+    full_cloud_amount_wide_probe_actual_count = _prefer_number(
+        "full_cloud_amount_wide_probe_actual_count",
+        0.0,
+    )
+    full_cloud_amount_sequence_memory_ratio = _prefer_number("full_cloud_amount_sequence_memory_ratio")
     full_cloud_amount_predicted_delta = _prefer_number("full_cloud_amount_predicted_delta")
     full_cloud_amount_actual_delta = _prefer_number("full_cloud_amount_actual_delta")
     full_cloud_amount_selected_objective_delta = _prefer_number("full_cloud_amount_selected_objective_delta")
@@ -890,8 +903,15 @@ def log_compact_step_summary(
         f"FCATeacherBase={_fmt(full_cloud_amount_teacher_base_bin, 5)}, "
         f"FCATeacherRes={_fmt(full_cloud_amount_teacher_residual, 5)}, "
         f"FCAOracleBestRatio={_fmt(full_cloud_amount_oracle_best_ratio, 5)}, "
+        f"FCARawBestRatio={_fmt(full_cloud_amount_raw_oracle_best_ratio, 5)}, "
         f"FCAOracleGap={_fmt(full_cloud_amount_oracle_gap, 5)}, "
+        f"FCARawGap={_fmt(full_cloud_amount_raw_oracle_gap, 5)}, "
         f"FCASelectedIsBest={bool(round(_to_float(full_cloud_amount_selected_is_best, 0.0)))}, "
+        f"FCASelectedIsRawBest={bool(round(_to_float(full_cloud_amount_selected_is_raw_best, 0.0)))}, "
+        f"FCANonSelActual={_fmt_int(full_cloud_amount_actual_finished_nonselected_count)}, "
+        f"FCAWideDue={bool(round(_to_float(full_cloud_amount_wide_probe_due, 0.0)))}, "
+        f"FCAWideActual={_fmt_int(full_cloud_amount_wide_probe_actual_count)}, "
+        f"FCAMemRatio={_fmt(full_cloud_amount_sequence_memory_ratio, 5)}, "
         f"FCAPred={_fmt(full_cloud_amount_predicted_delta, 5)}, "
         f"FCAActual={_fmt(full_cloud_amount_actual_delta, 5)}, "
         f"FCAObj={_fmt(full_cloud_amount_selected_objective_delta, 5)}, "

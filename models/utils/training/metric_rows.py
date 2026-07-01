@@ -240,6 +240,10 @@ def build_compression_metric_row(
             comp_debug.get("full_cloud_amount_oracle_best_ratio", float("nan")),
             float("nan"),
         ),
+        "full_cloud_amount_raw_oracle_best_ratio": case_float(
+            comp_debug.get("full_cloud_amount_raw_oracle_best_ratio", float("nan")),
+            float("nan"),
+        ),
         "full_cloud_amount_oracle_best_actual_delta": case_float(
             comp_debug.get("full_cloud_amount_oracle_best_actual_delta", float("nan")),
             float("nan"),
@@ -272,6 +276,28 @@ def build_compression_metric_row(
         ),
         "full_cloud_amount_selected_is_best": bool(
             comp_debug.get("full_cloud_amount_selected_is_best", False)
+        ),
+        "full_cloud_amount_selected_is_raw_best": bool(
+            comp_debug.get("full_cloud_amount_selected_is_raw_best", False)
+        ),
+        "full_cloud_amount_raw_oracle_gap": case_float(
+            comp_debug.get("full_cloud_amount_raw_oracle_gap", float("nan")),
+            float("nan"),
+        ),
+        "full_cloud_amount_actual_finished_nonselected_count": case_int(
+            comp_debug.get("full_cloud_amount_actual_finished_nonselected_count", 0),
+            0,
+        ),
+        "full_cloud_amount_wide_probe_due": bool(
+            comp_debug.get("full_cloud_amount_wide_probe_due", False)
+        ),
+        "full_cloud_amount_wide_probe_actual_count": case_int(
+            comp_debug.get("full_cloud_amount_wide_probe_actual_count", 0),
+            0,
+        ),
+        "full_cloud_amount_sequence_memory_ratio": case_float(
+            comp_debug.get("full_cloud_amount_sequence_memory_ratio", float("nan")),
+            float("nan"),
         ),
         "full_cloud_amount_entropy": case_float(
             comp_debug.get("full_cloud_amount_entropy", float("nan")),

@@ -968,6 +968,13 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--sparsepcgc_proposal_selector_hidden_dim', default=64, type=int)
     parser.add_argument('--sparsepcgc_full_cloud_amount_bins', default='0.0,0.015,0.021,0.026,0.031,0.038,0.044,0.05', type=str)
     parser.add_argument('--sparsepcgc_full_cloud_amount_hidden_dim', default=64, type=int)
+    parser.add_argument(
+        '--sparsepcgc_full_cloud_amount_init_bias_mode',
+        default='weak_center',
+        choices=['center', 'uniform', 'weak_center'],
+        type=str,
+        help='full_cloud_amount_selector の amount bin bias 初期化。weak_center は 0.031 近傍への固定化を弱める',
+    )
     parser.add_argument('--sparsepcgc_full_cloud_amount_residual_enable', default=True, type=str2bool)
     parser.add_argument('--sparsepcgc_full_cloud_amount_residual_max', default=0.0025, type=float)
     parser.add_argument('--sparsepcgc_full_cloud_amount_residual_loss_weight', default=1.0, type=float)
@@ -1002,7 +1009,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--sparsepcgc_full_cloud_amount_actual_interval', default=5, type=int)
     parser.add_argument('--sparsepcgc_full_cloud_amount_warmup_actual_interval', default=1, type=int)
     parser.add_argument('--sparsepcgc_full_cloud_amount_warmup_steps', default=20, type=int)
-    parser.add_argument('--sparsepcgc_full_cloud_amount_max_actual_candidates_per_step', default=2, type=int)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_max_actual_candidates_per_step', default=4, type=int)
     parser.add_argument('--sparsepcgc_full_cloud_amount_multi_actual_enable', default=True, type=str2bool)
     parser.add_argument(
         '--sparsepcgc_full_cloud_amount_actual_candidate_policy',
@@ -1017,17 +1024,31 @@ def parse_pugan_args(parser, file_day, file_time):
         type=str,
     )
     parser.add_argument('--sparsepcgc_full_cloud_amount_actual_topk', default=2, type=int)
-    parser.add_argument('--sparsepcgc_full_cloud_amount_warmup_max_actual_candidates_per_step', default=4, type=int)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_warmup_max_actual_candidates_per_step', default=5, type=int)
     parser.add_argument('--sparsepcgc_full_cloud_amount_multi_actual_warmup_steps', default=100, type=int)
     parser.add_argument('--sparsepcgc_full_cloud_amount_oracle_sweep_interval', default=0, type=int)
     parser.add_argument('--sparsepcgc_full_cloud_amount_oracle_sweep_max_bins', default=8, type=int)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_wide_probe_enable', default=True, type=str2bool)
+    parser.add_argument(
+        '--sparsepcgc_full_cloud_amount_wide_probe_ratios',
+        default='0.005,0.010,0.015,0.020,0.025,0.030,0.035,0.040,0.045,0.050',
+        type=str,
+        help='interval または sequence 先頭で teacher 校正用に候補へ追加する広域 Amount',
+    )
+    parser.add_argument('--sparsepcgc_full_cloud_amount_wide_probe_interval', default=50, type=int)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_wide_probe_sequence_head_steps', default=2, type=int)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_wide_probe_max_actual', default=3, type=int)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_sequence_memory_enable', default=True, type=str2bool)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_sequence_memory_topk', default=3, type=int)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_sequence_memory_momentum', default=0.7, type=float)
     parser.add_argument('--sparsepcgc_reuse_where_ranking_for_amounts', default=True, type=str2bool)
     parser.add_argument('--sparsepcgc_actual_parallel_mode', default='single', choices=['single', 'worker_pool'], type=str)
     parser.add_argument('--sparsepcgc_actual_parallel_candidates', default=1, type=int)
     parser.add_argument('--sparsepcgc_actual_parallel_fallback_to_single', default=True, type=str2bool)
     parser.add_argument('--sparsepcgc_full_cloud_amount_teacher_actual_priority', default=True, type=str2bool)
     parser.add_argument('--sparsepcgc_full_cloud_amount_entropy_weight', default=0.01, type=float)
-    parser.add_argument('--sparsepcgc_full_cloud_amount_entropy_decay_steps', default=500, type=int)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_entropy_decay_steps', default=2000, type=int)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_min_entropy_weight', default=0.001, type=float)
     parser.add_argument('--sparsepcgc_full_cloud_amount_use_surrogate_between_actual', default=True, type=str2bool)
     parser.add_argument('--sparsepcgc_full_cloud_amount_noop_margin', default=0.0, type=float)
     parser.add_argument(
@@ -4463,6 +4484,15 @@ def parse_pugan_args(parser, file_day, file_time):
         int(getattr(args, "sparsepcgc_full_cloud_amount_hidden_dim", 64)),
         8,
     )
+    args.sparsepcgc_full_cloud_amount_init_bias_mode = str(
+        getattr(args, "sparsepcgc_full_cloud_amount_init_bias_mode", "weak_center")
+    ).strip().lower()
+    if args.sparsepcgc_full_cloud_amount_init_bias_mode not in {
+        "center",
+        "uniform",
+        "weak_center",
+    }:
+        args.sparsepcgc_full_cloud_amount_init_bias_mode = "weak_center"
     args.sparsepcgc_full_cloud_amount_residual_enable = bool(
         getattr(args, "sparsepcgc_full_cloud_amount_residual_enable", True)
     )
@@ -4600,6 +4630,56 @@ def parse_pugan_args(parser, file_day, file_time):
         int(getattr(args, "sparsepcgc_full_cloud_amount_oracle_sweep_max_bins", 8)),
         1,
     )
+    args.sparsepcgc_full_cloud_amount_wide_probe_enable = bool(
+        getattr(args, "sparsepcgc_full_cloud_amount_wide_probe_enable", True)
+    )
+    parsed_full_cloud_wide_probe_ratios = _parse_csv_float_list(
+        getattr(
+            args,
+            "sparsepcgc_full_cloud_amount_wide_probe_ratios",
+            "0.005,0.010,0.015,0.020,0.025,0.030,0.035,0.040,0.045,0.050",
+        ),
+        (0.005, 0.010, 0.015, 0.020, 0.025, 0.030, 0.035, 0.040, 0.045, 0.050),
+    )
+    normalized_full_cloud_wide_probe_ratios = []
+    for ratio in parsed_full_cloud_wide_probe_ratios:
+        try:
+            ratio_value = min(max(float(ratio), 0.0), 0.05)
+        except Exception:
+            continue
+        if math.isfinite(ratio_value) and ratio_value > 0.0:
+            normalized_full_cloud_wide_probe_ratios.append(ratio_value)
+    normalized_full_cloud_wide_probe_ratios = sorted(set(normalized_full_cloud_wide_probe_ratios))
+    args.sparsepcgc_full_cloud_amount_wide_probe_ratio_values = tuple(
+        normalized_full_cloud_wide_probe_ratios
+    )
+    args.sparsepcgc_full_cloud_amount_wide_probe_ratios = ",".join(
+        f"{value:.6f}".rstrip("0").rstrip(".")
+        for value in normalized_full_cloud_wide_probe_ratios
+    )
+    args.sparsepcgc_full_cloud_amount_wide_probe_interval = max(
+        int(getattr(args, "sparsepcgc_full_cloud_amount_wide_probe_interval", 50)),
+        0,
+    )
+    args.sparsepcgc_full_cloud_amount_wide_probe_sequence_head_steps = max(
+        int(getattr(args, "sparsepcgc_full_cloud_amount_wide_probe_sequence_head_steps", 2)),
+        0,
+    )
+    args.sparsepcgc_full_cloud_amount_wide_probe_max_actual = max(
+        int(getattr(args, "sparsepcgc_full_cloud_amount_wide_probe_max_actual", 3)),
+        1,
+    )
+    args.sparsepcgc_full_cloud_amount_sequence_memory_enable = bool(
+        getattr(args, "sparsepcgc_full_cloud_amount_sequence_memory_enable", True)
+    )
+    args.sparsepcgc_full_cloud_amount_sequence_memory_topk = max(
+        int(getattr(args, "sparsepcgc_full_cloud_amount_sequence_memory_topk", 3)),
+        1,
+    )
+    args.sparsepcgc_full_cloud_amount_sequence_memory_momentum = min(
+        max(float(getattr(args, "sparsepcgc_full_cloud_amount_sequence_memory_momentum", 0.7)), 0.0),
+        0.9999,
+    )
     args.sparsepcgc_reuse_where_ranking_for_amounts = bool(
         getattr(args, "sparsepcgc_reuse_where_ranking_for_amounts", True)
     )
@@ -4623,8 +4703,12 @@ def parse_pugan_args(parser, file_day, file_time):
         0.0,
     )
     args.sparsepcgc_full_cloud_amount_entropy_decay_steps = max(
-        int(getattr(args, "sparsepcgc_full_cloud_amount_entropy_decay_steps", 500)),
+        int(getattr(args, "sparsepcgc_full_cloud_amount_entropy_decay_steps", 2000)),
         0,
+    )
+    args.sparsepcgc_full_cloud_amount_min_entropy_weight = max(
+        float(getattr(args, "sparsepcgc_full_cloud_amount_min_entropy_weight", 0.001)),
+        0.0,
     )
     args.sparsepcgc_actual_bit_objective = str(
         getattr(args, "sparsepcgc_actual_bit_objective", "raw")
