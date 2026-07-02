@@ -161,6 +161,33 @@ def _lookup_occupied(query: torch.Tensor, occupied_keys: torch.Tensor) -> torch.
     return in_bounds & (occupied_keys[safe] == query)
 
 
+def _candidate_nn_stats(candidates: torch.Tensor, coords: torch.Tensor, radius: int = 3) -> Tuple[torch.Tensor, torch.Tensor]:
+    if candidates.numel() <= 0:
+        return (
+            torch.empty((0,), device=coords.device, dtype=torch.float32),
+            torch.empty((0,), device=coords.device, dtype=torch.long),
+        )
+    radius = max(int(radius), 1)
+    keys, occupied = _coord_key_setup(coords)
+    offsets = []
+    for dx in range(-radius, radius + 1):
+        for dy in range(-radius, radius + 1):
+            for dz in range(-radius, radius + 1):
+                if dx == 0 and dy == 0 and dz == 0:
+                    continue
+                offsets.append((dx, dy, dz))
+    offset_t = torch.tensor(offsets, device=coords.device, dtype=torch.long)
+    dist_t = torch.norm(offset_t.to(dtype=torch.float32), dim=1)
+    best = torch.full((candidates.shape[0],), float("inf"), device=coords.device, dtype=torch.float32)
+    neighbor_count = torch.zeros((candidates.shape[0],), device=coords.device, dtype=torch.long)
+    for off, dist in zip(offset_t, dist_t):
+        occ = _lookup_occupied(keys(candidates + off.view(1, 3)), occupied)
+        best = torch.where(occ, torch.minimum(best, best.new_full(best.shape, float(dist.item()))), best)
+        if float(dist.item()) <= math.sqrt(3.0):
+            neighbor_count += occ.to(dtype=torch.long)
+    return best, neighbor_count
+
+
 def _neighbor_count(coords: torch.Tensor) -> torch.Tensor:
     if coords.numel() <= 0:
         return torch.empty((0,), device=coords.device, dtype=torch.long)
@@ -498,6 +525,63 @@ def _small_macro_plus_context_drop(
     return mask, debug
 
 
+def _small_macro_rate_anchor_drop(
+    coords: torch.Tensor,
+    target: int,
+    block_size: int,
+    *,
+    macro_ratio_cap: float,
+    macro_max_blocks: int,
+    block_candidate_top_ratio: float,
+    geometry_level: str = "off",
+) -> Tuple[torch.Tensor, Mapping[str, object]]:
+    unique_block, inverse_block, block_counts = _block_info(coords, block_size)
+    n = int(coords.shape[0])
+    cap_count = min(int(target), int(math.ceil(n * float(macro_ratio_cap))))
+    out = torch.zeros((n,), device=coords.device, dtype=torch.bool)
+    if cap_count <= 0:
+        return out, {"operation_type": "small_macro", "under_drop_reason": "zero_macro_cap"}
+    block_count = int(unique_block.shape[0])
+    take = min(max(1, int(math.ceil(block_count * float(block_candidate_top_ratio)))), block_count)
+    sparse_order = torch.argsort(block_counts, descending=False)[:take]
+    neigh = _neighbor_count(coords).to(dtype=torch.float32)
+    block_neigh = torch.zeros((block_count,), device=coords.device, dtype=torch.float32)
+    block_neigh.scatter_add_(0, inverse_block, neigh)
+    block_neigh = block_neigh / block_counts.to(dtype=torch.float32).clamp_min(1.0)
+    geometry_level = str(geometry_level).lower()
+    if geometry_level == "strict":
+        geom_ok = block_neigh <= 2.75
+    elif geometry_level == "medium":
+        geom_ok = block_neigh <= 3.25
+    else:
+        geom_ok = torch.ones((block_count,), device=coords.device, dtype=torch.bool)
+    selected = torch.zeros((block_count,), device=coords.device, dtype=torch.bool)
+    dropped = 0
+    selected_count = 0
+    for b_raw in sparse_order.detach().cpu().tolist():
+        if selected_count >= int(macro_max_blocks) or dropped >= cap_count:
+            break
+        b = int(b_raw)
+        count = int(block_counts[b].item())
+        if count <= 0 or not bool(geom_ok[b].item()):
+            continue
+        if dropped + count > max(cap_count, 1) * 1.25:
+            continue
+        selected[b] = True
+        dropped += count
+        selected_count += 1
+    out = selected.index_select(0, inverse_block)
+    return out, {
+        "operation_type": "small_macro",
+        "macro_ratio_cap": float(macro_ratio_cap),
+        "macro_selected_block_count": int(selected.sum().item()),
+        "macro_drop_count": int(out.sum().item()),
+        "selected_candidate_block_count": int(take),
+        "geometry_level": geometry_level,
+        "under_drop_reason": "macro_under_target" if int(out.sum().item()) < int(target) else "",
+    }
+
+
 def _sibling_simplify_drop(coords: torch.Tensor, target: int) -> torch.Tensor:
     unique_parent, inverse_parent, slots, occ, patterns, parent_pop = _parent_info(coords)
     pattern_freq = torch.bincount(patterns, minlength=256).to(device=coords.device, dtype=torch.float32)
@@ -541,6 +625,64 @@ def _high_nll_branch_prune(coords: torch.Tensor, target: int) -> Tuple[torch.Ten
         "occupied_nll_removed": float(table["parent_nll"][mask].sum().item()) if bool(mask.any().item()) else 0.0,
         "delta_pattern_nll": float(table["delete_gain"][mask].sum().item()) if bool(mask.any().item()) else 0.0,
         "score_proxy": float(score[mask].sum().item()) if bool(mask.any().item()) else 0.0,
+    }
+
+
+def _high_nll_branch_prune_v2(
+    coords: torch.Tensor,
+    target: int,
+    *,
+    nll_quantile: float,
+    parent_max_pop: int,
+    geometry_level: str = "off",
+) -> Tuple[torch.Tensor, Mapping[str, object]]:
+    table = _pattern_proxy_tables(coords)
+    parent_pop = table["parent_pop"]
+    parent_code = table["patterns"].clamp(0, 255)
+    parent_nll = table["code_nll"].index_select(0, parent_code)
+    empty_gain = parent_nll - table["code_nll"][0]
+    threshold = torch.quantile(parent_nll.to(dtype=torch.float32), min(max(float(nll_quantile), 0.0), 1.0))
+    neigh = _neighbor_count(coords).to(dtype=torch.float32)
+    parent_neigh = torch.zeros((parent_pop.shape[0],), device=coords.device, dtype=torch.float32)
+    parent_neigh.scatter_add_(0, table["inverse_parent"], neigh)
+    parent_neigh = parent_neigh / parent_pop.to(dtype=torch.float32).clamp_min(1.0)
+    geometry_level = str(geometry_level).lower()
+    if geometry_level == "strict":
+        geom_ok = parent_neigh <= 2.50
+    elif geometry_level == "medium":
+        geom_ok = parent_neigh <= 3.00
+    else:
+        geom_ok = torch.ones_like(parent_neigh, dtype=torch.bool)
+    valid = (parent_pop <= int(parent_max_pop)) & (parent_nll >= threshold) & (empty_gain > 0.0) & geom_ok
+    score = empty_gain + 0.25 * parent_nll - 0.10 * parent_neigh
+    order = torch.argsort(torch.where(valid, score, score.new_full(score.shape, -1e9)), descending=True)
+    selected_parent = torch.zeros_like(parent_pop, dtype=torch.bool)
+    dropped = 0
+    gain_sum = 0.0
+    for p_raw in order.detach().cpu().tolist():
+        p = int(p_raw)
+        if not bool(valid[p].item()):
+            break
+        pop = int(parent_pop[p].item())
+        if pop <= 0 or dropped + pop > int(target):
+            continue
+        selected_parent[p] = True
+        dropped += pop
+        gain_sum += float(score[p].item())
+        if dropped >= int(target):
+            break
+    mask = selected_parent.index_select(0, table["inverse_parent"])
+    return coords[~mask], {
+        "operation_type": "prune",
+        "affected_voxel_count": int(mask.sum().item()),
+        "parent_projection_count": int(selected_parent.sum().item()),
+        "delta_pattern_nll": float(gain_sum),
+        "occupied_nll_removed": float(parent_nll[selected_parent].sum().item()) if bool(selected_parent.any().item()) else 0.0,
+        "score_proxy": float(gain_sum),
+        "parent_max_pop": int(parent_max_pop),
+        "nll_quantile": float(nll_quantile),
+        "geometry_level": geometry_level,
+        "under_drop_reason": "high_nll_safe_under_target" if int(mask.sum().item()) < int(target) else "",
     }
 
 
@@ -713,6 +855,85 @@ def _limited_add_pattern_repair(coords: torch.Tensor, target: int) -> Tuple[torc
     }
 
 
+def _limited_add_pattern_repair_v2(
+    coords: torch.Tensor,
+    budget: int,
+    *,
+    min_gain: float,
+    max_nn_distance: float,
+    density_guard: str = "off",
+) -> Tuple[torch.Tensor, Mapping[str, object]]:
+    table = _pattern_proxy_tables(coords)
+    offsets = _slot_offsets(coords.device)
+    raw_rows: List[Tuple[float, int, int, torch.Tensor]] = []
+    parent_scan_score = table["code_nll"].index_select(0, table["patterns"].clamp(0, 255))
+    scan_limit = min(int(table["unique_parent"].shape[0]), max(int(budget) * 16, 4096))
+    parent_scan = torch.argsort(parent_scan_score, descending=True)[:scan_limit].detach().cpu().tolist()
+    density_guard = str(density_guard).lower()
+    for p_raw in parent_scan:
+        p = int(p_raw)
+        cur_code = int(table["patterns"][p].item())
+        for target_slot in range(8):
+            if bool(table["occ"][p, target_slot].item()):
+                continue
+            add_code = cur_code | (1 << target_slot)
+            gain = float((table["code_nll"][cur_code] - table["code_nll"][add_code]).item())
+            if gain < float(min_gain):
+                continue
+            add_coord = table["unique_parent"][p] * 2 + offsets[int(target_slot)]
+            raw_rows.append((gain, p, target_slot, add_coord))
+    raw_rows.sort(reverse=True, key=lambda x: x[0])
+    rows: List[Tuple[float, int, int, torch.Tensor, float, int]] = []
+    # Geometry checks are comparatively expensive; apply them only after the
+    # cheap pattern-NLL prefilter.
+    for gain, p, target_slot, add_coord in raw_rows[: max(int(budget) * 8, 256)]:
+        nn_dist, nn_count = _candidate_nn_stats(
+            add_coord.view(1, 3),
+            coords,
+            radius=max(3, int(math.ceil(float(max_nn_distance)))),
+        )
+        dist = float(nn_dist[0].item())
+        count = int(nn_count[0].item())
+        if not math.isfinite(dist) or dist > float(max_nn_distance):
+            continue
+        if density_guard == "strict" and count < 2:
+            continue
+        if density_guard == "medium" and count < 1:
+            continue
+        score = gain - 0.10 * dist + 0.01 * min(count, 6)
+        rows.append((score, p, target_slot, add_coord, dist, count))
+        if len(rows) >= max(int(budget) * 2, int(budget)):
+            break
+    rows.sort(reverse=True, key=lambda x: x[0])
+    add_coords: List[torch.Tensor] = []
+    gain_sum = 0.0
+    dist_sum = 0.0
+    density_sum = 0
+    for score, _p, _slot, add_coord, dist, count in rows[: max(int(budget), 0)]:
+        add_coords.append(add_coord)
+        gain_sum += float(score)
+        dist_sum += float(dist)
+        density_sum += int(count)
+    if add_coords:
+        add_tensor = torch.stack(add_coords, dim=0)
+        cand = torch.unique(torch.cat([coords, add_tensor], dim=0), dim=0, sorted=True)
+    else:
+        cand = coords
+    add_count = int(len(add_coords))
+    return cand, {
+        "operation_type": "add",
+        "affected_voxel_count": add_count,
+        "add_count": add_count,
+        "delta_pattern_nll": float(gain_sum),
+        "score_proxy": float(gain_sum),
+        "add_geometry_proxy": float(dist_sum / max(add_count, 1)),
+        "add_density_mean": float(density_sum / max(add_count, 1)),
+        "min_pattern_nll_gain": float(min_gain),
+        "max_added_nn_distance": float(max_nn_distance),
+        "density_guard": density_guard,
+    }
+
+
 def build_candidate_coords(
     method: str,
     coords: torch.Tensor,
@@ -727,6 +948,17 @@ def build_candidate_coords(
     op_target = min(target, max(int(max_operation_edits), 0))
     if method == "high_nll_branch_prune":
         cand, debug = _high_nll_branch_prune(coords, op_target)
+    elif re.match(r"hnllv2_q(\d+)_pop(\d+)_geom(off|medium|strict)$", method):
+        match = re.match(r"hnllv2_q(\d+)_pop(\d+)_geom(off|medium|strict)$", method)
+        assert match is not None
+        q, pop, geom = int(match.group(1)), int(match.group(2)), str(match.group(3))
+        cand, debug = _high_nll_branch_prune_v2(
+            coords,
+            op_target,
+            nll_quantile=float(q) / 100.0,
+            parent_max_pop=pop,
+            geometry_level=geom,
+        )
     elif method == "pattern_projection_prune":
         cand, debug = _pattern_projection_prune(coords, op_target)
     elif method == "snap_move_likely_sibling":
@@ -735,6 +967,20 @@ def build_candidate_coords(
         cand, debug = _voxel_merge_snap(coords, op_target)
     elif method == "limited_add_pattern_repair":
         cand, debug = _limited_add_pattern_repair(coords, op_target)
+    elif re.match(r"addv2_n(\d+)_g([0-9p]+)_nn(\d+)_dens(off|medium|strict)$", method):
+        match = re.match(r"addv2_n(\d+)_g([0-9p]+)_nn(\d+)_dens(off|medium|strict)$", method)
+        assert match is not None
+        budget = min(int(match.group(1)), max(int(max_operation_edits), 0))
+        gain = float(match.group(2).replace("p", "."))
+        nn_dist = float(match.group(3))
+        dens = str(match.group(4))
+        cand, debug = _limited_add_pattern_repair_v2(
+            coords,
+            budget,
+            min_gain=gain,
+            max_nn_distance=nn_dist,
+            density_guard=dens,
+        )
     else:
         drop_mask, debug = build_drop_mask(method, coords, ratio, block_size=block_size, seed=seed)
         return torch.unique(coords[~drop_mask], dim=0, sorted=True), drop_mask, dict(debug)
@@ -773,6 +1019,19 @@ def build_drop_mask(method: str, coords: torch.Tensor, ratio: float, *, block_si
         return _parent_emptying_drop(coords, target, block_size, max_parent_pop=4, quota_fraction=0.15, geometry_guard=True), {}
     if method == "grouped_micro_with_limited_scatter":
         return _parent_emptying_drop(coords, target, block_size, max_parent_pop=3, quota_fraction=0.10), {}
+    match = re.match(r"smacro_cap([0-9p]+)_maxb(\d+)_top(\d+)_geom(off|medium|strict)$", method)
+    if match:
+        cap = float(match.group(1).replace("p", "."))
+        maxb, top, geom = int(match.group(2)), int(match.group(3)), str(match.group(4))
+        return _small_macro_rate_anchor_drop(
+            coords,
+            target,
+            block_size,
+            macro_ratio_cap=cap,
+            macro_max_blocks=maxb,
+            block_candidate_top_ratio=float(top) / 100.0,
+            geometry_level=geom,
+        )
     match = re.match(r"ctxA_pop(\d+)_top(\d+)_maxg(\d+)$", method)
     if match:
         pop, top, maxg = (int(match.group(1)), int(match.group(2)), int(match.group(3)))
@@ -996,6 +1255,8 @@ def main() -> int:
                         "merge_count": method_debug.get("merge_count", 0),
                         "add_count": method_debug.get("add_count", 0),
                         "move_distance_mean": method_debug.get("move_distance_mean", 0.0),
+                        "add_geometry_proxy": method_debug.get("add_geometry_proxy", 0.0),
+                        "add_density_mean": method_debug.get("add_density_mean", 0.0),
                         "delta_pattern_nll": method_debug.get("delta_pattern_nll", 0.0),
                         "occupied_nll_removed": method_debug.get("occupied_nll_removed", 0.0),
                         "score_proxy": method_debug.get("score_proxy", 0.0),
@@ -1028,6 +1289,10 @@ def main() -> int:
                             "selected_candidate_block_count": method_debug.get("selected_candidate_block_count", ""),
                             "candidate_block_top_ratio": method_debug.get("candidate_block_top_ratio", ""),
                             "parent_max_pop": method_debug.get("parent_max_pop", ""),
+                            "nll_quantile": method_debug.get("nll_quantile", ""),
+                            "min_pattern_nll_gain": method_debug.get("min_pattern_nll_gain", ""),
+                            "max_added_nn_distance": method_debug.get("max_added_nn_distance", ""),
+                            "density_guard": method_debug.get("density_guard", ""),
                             "max_groups_per_block": method_debug.get("max_groups_per_block", ""),
                             "geometry_level": method_debug.get("geometry_level", ""),
                             "min_codec_prior_quantile": method_debug.get("min_codec_prior_quantile", ""),
