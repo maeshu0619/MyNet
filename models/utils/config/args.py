@@ -249,7 +249,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--dataset_name', default=dataset_name, type=str, help='データセット内シーケンスの名称')
     parser.add_argument(
         '--train_8i_sequence_mode',
-        default='first3',
+        default='all4',
         choices=['first3', 'all4'],
         type=str,
         help='8i学習時に使うsequence数。first3は従来どおり先頭3つ、all4は4つ全部を使う',
@@ -4788,12 +4788,6 @@ def parse_pugan_args(parser, file_day, file_time):
         "macro_micro_hybrid",
     }:
         args.sparsepcgc_where_mode = "block_only"
-    if (
-        str(getattr(args, "sparsepcgc_training_mode", "subtree_selector")).strip().lower()
-        == "full_cloud_amount"
-        and not _cli_option_was_provided("--sparsepcgc_where_mode")
-    ):
-        args.sparsepcgc_where_mode = "macro_micro_heuristic"
     args.sparsepcgc_where_macro_max_ratio = min(
         max(float(getattr(args, "sparsepcgc_where_macro_max_ratio", 0.01)), 0.0),
         0.30,
