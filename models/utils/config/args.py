@@ -247,6 +247,13 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--print_rate', default=1, type=int, help='ログ出力頻度（1なら毎ステップ、0なら最初と最後のみ）')
     parser.add_argument('--dataname', default=dataname, type=str, help='データセットの名称')
     parser.add_argument('--dataset_name', default=dataset_name, type=str, help='データセット内シーケンスの名称')
+    parser.add_argument(
+        '--train_8i_sequence_mode',
+        default='first3',
+        choices=['first3', 'all4'],
+        type=str,
+        help='8i学習時に使うsequence数。first3は従来どおり先頭3つ、all4は4つ全部を使う',
+    )
     parser.add_argument('--more_training', default=True, type=str2bool, help='学習済みモデルの途中から訓練を再開するか否か')
 
     parser.add_argument(
@@ -975,6 +982,12 @@ def parse_pugan_args(parser, file_day, file_time):
         type=str,
         help='full_cloud_amount_selector の amount bin bias 初期化。weak_center は 0.031 近傍への固定化を弱める',
     )
+    parser.add_argument(
+        '--sparsepcgc_full_cloud_amount_reset_heads_on_more_training',
+        default=True,
+        type=str2bool,
+        help='network_selected_bandit で MoreTraining resume する際、collapsed な full_cloud_amount heads を引き継がず再初期化する',
+    )
     parser.add_argument('--sparsepcgc_full_cloud_amount_residual_enable', default=True, type=str2bool)
     parser.add_argument('--sparsepcgc_full_cloud_amount_residual_max', default=0.0025, type=float)
     parser.add_argument('--sparsepcgc_full_cloud_amount_residual_loss_weight', default=1.0, type=float)
@@ -1079,6 +1092,12 @@ def parse_pugan_args(parser, file_day, file_time):
         default='network_selected_bandit',
         choices=['multi_actual_teacher', 'network_selected_bandit'],
         type=str,
+    )
+    parser.add_argument(
+        '--sparsepcgc_full_cloud_amount_bandit_aux_actual_teacher',
+        default=True,
+        type=str2bool,
+        help='network_selected_bandit で diagnostic/wide actual により selected 以外の候補が良かった場合、補助teacherとして class/value/residual へ返す',
     )
     parser.add_argument(
         '--sparsepcgc_full_cloud_amount_action_sample_mode',
@@ -4529,6 +4548,15 @@ def parse_pugan_args(parser, file_day, file_time):
         "weak_center",
     }:
         args.sparsepcgc_full_cloud_amount_init_bias_mode = "weak_center"
+    if (
+        str(getattr(args, "sparsepcgc_full_cloud_amount_learning_mode", "network_selected_bandit")).strip().lower()
+        == "network_selected_bandit"
+        and not _cli_option_was_provided("--sparsepcgc_full_cloud_amount_init_bias_mode")
+    ):
+        args.sparsepcgc_full_cloud_amount_init_bias_mode = "uniform"
+    args.sparsepcgc_full_cloud_amount_reset_heads_on_more_training = bool(
+        getattr(args, "sparsepcgc_full_cloud_amount_reset_heads_on_more_training", True)
+    )
     args.sparsepcgc_full_cloud_amount_residual_enable = bool(
         getattr(args, "sparsepcgc_full_cloud_amount_residual_enable", True)
     )
@@ -4760,6 +4788,11 @@ def parse_pugan_args(parser, file_day, file_time):
         "macro_micro_hybrid",
     }:
         args.sparsepcgc_where_mode = "block_only"
+    if (
+        str(getattr(args, "sparsepcgc_training_mode", "subtree_selector")).strip().lower() == "full_cloud_amount"
+        and not _cli_option_was_provided("--sparsepcgc_where_mode")
+    ):
+        args.sparsepcgc_where_mode = "macro_micro_heuristic"
     args.sparsepcgc_where_macro_max_ratio = min(
         max(float(getattr(args, "sparsepcgc_where_macro_max_ratio", 0.01)), 0.0),
         0.30,
@@ -4810,6 +4843,11 @@ def parse_pugan_args(parser, file_day, file_time):
         "gumbel",
     }:
         args.sparsepcgc_full_cloud_amount_action_sample_mode = "categorical"
+    args.train_8i_sequence_mode = str(
+        getattr(args, "train_8i_sequence_mode", "first3")
+    ).strip().lower()
+    if args.train_8i_sequence_mode not in {"first3", "all4"}:
+        args.train_8i_sequence_mode = "first3"
     args.sparsepcgc_full_cloud_amount_exploration_temperature = min(
         max(float(getattr(args, "sparsepcgc_full_cloud_amount_exploration_temperature", 1.0)), 0.05),
         10.0,
@@ -4825,6 +4863,9 @@ def parse_pugan_args(parser, file_day, file_time):
     args.sparsepcgc_full_cloud_amount_diagnostic_sweep_interval = max(
         int(getattr(args, "sparsepcgc_full_cloud_amount_diagnostic_sweep_interval", 0)),
         0,
+    )
+    args.sparsepcgc_full_cloud_amount_bandit_aux_actual_teacher = bool(
+        getattr(args, "sparsepcgc_full_cloud_amount_bandit_aux_actual_teacher", True)
     )
     args.sparsepcgc_full_cloud_amount_geom_cost_weight = max(
         float(getattr(args, "sparsepcgc_full_cloud_amount_geom_cost_weight", 0.0)),

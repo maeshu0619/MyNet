@@ -95,6 +95,9 @@ class FullCloudAmountSelector(nn.Module):
         self.predicted_delta = nn.Linear(hidden_dim, 1)
         self.predicted_delta_per_amount = nn.Linear(hidden_dim, self.amount_bin_count)
 
+        self.reset_amount_heads()
+
+    def reset_amount_heads(self):
         nn.init.zeros_(self.amount_bin_logits.weight)
         nn.init.zeros_(self.amount_bin_logits.bias)
         if self.amount_bin_count > 1:

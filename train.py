@@ -110,8 +110,11 @@ STEP_GRAD_COLUMNS = [
 ]
 
 def _limit_training_seq_dirs(seq_dirs, args):
-    # 8iは4シーケンスのうち先頭3つだけを学習に使う。
+    # 8iは従来既定では先頭3シーケンスのみを使うが、argsで4つ全部へ切替可能にする。
     if str(getattr(args, "dataname", "")).strip().lower() == "8i":
+        mode = str(getattr(args, "train_8i_sequence_mode", "first3")).strip().lower()
+        if mode == "all4":
+            return list(seq_dirs)
         return list(seq_dirs[:3])
     return list(seq_dirs)
 
@@ -2280,12 +2283,34 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
         _append_actual_candidate(selected_candidate_key, "network_selected")
 
     if learning_mode == "network_selected_bandit":
+        if len(actual_candidate_keys) < int(max_actual):
+            sequence_memory_best_key = None
+            if isinstance(sequence_memory_best_entry, dict):
+                best_ratio = sequence_memory_best_entry.get("ratio", float("nan"))
+                for candidate_key, entry in candidate_specs.items():
+                    if bool(entry.get("is_noop", False)):
+                        continue
+                    if abs(float(entry.get("final_ratio", 0.0)) - float(best_ratio)) <= 1e-6:
+                        if int(entry.get("base_class", 0)) != int(selected_class):
+                            sequence_memory_best_key = str(candidate_key)
+                            break
+            if sequence_memory_best_key is not None:
+                _append_actual_candidate(sequence_memory_best_key, "bandit_sequence_memory")
+
+        if len(actual_candidate_keys) < int(max_actual):
+            predicted_key = _pick_nonselected_predicted_candidate(set(actual_candidate_keys))
+            if predicted_key is not None:
+                _append_actual_candidate(predicted_key, "bandit_predicted_alt")
+
+        if len(actual_candidate_keys) < int(max_actual):
+            uncertainty_key = _pick_uncertainty_candidate(set(actual_candidate_keys))
+            if uncertainty_key is not None:
+                _append_actual_candidate(uncertainty_key, "bandit_uncertainty_alt")
+
         if diagnostic_sweep_due or wide_probe_due:
-            diagnostic_key = _pick_uncertainty_candidate(set(actual_candidate_keys))
-            wide_keys = _pick_wide_probe_candidates(set(actual_candidate_keys))
-            if wide_keys:
-                diagnostic_key = wide_keys[0]
-            if diagnostic_key is not None:
+            for diagnostic_key in _pick_wide_probe_candidates(set(actual_candidate_keys)):
+                if len(actual_candidate_keys) >= int(max_actual):
+                    break
                 _append_actual_candidate(diagnostic_key, "diagnostic_sweep")
     elif use_enhanced_actual_selection:
         sequence_memory_best_key = None
@@ -2734,6 +2759,9 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
     amount_advantage_value = float("nan")
     debug_geom_cost_value = 0.0
     sequence_baseline_value = _sparsepcgc_full_cloud_sequence_baseline_get(args, sequence_name)
+    bandit_aux_actual_teacher = bool(
+        getattr(args, "sparsepcgc_full_cloud_amount_bandit_aux_actual_teacher", True)
+    )
 
     if learning_mode == "network_selected_bandit":
         selected_actual_objective = case_float(
@@ -2812,6 +2840,121 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
             )
             if math.isfinite(best_teacher_score):
                 oracle_gap_value = float(selected_score - best_teacher_score)
+        if bandit_aux_actual_teacher:
+            actual_supervised_rows = [
+                row for row in actual_pool_rows
+                if math.isfinite(case_float(row.get("actual_objective_percent", float("nan")), float("nan")))
+            ]
+            actual_supervised_nonselected_rows = [
+                row for row in actual_supervised_rows
+                if not bool(row.get("is_noop", False))
+                and str(row.get("_candidate_key", "")) != str(selected_candidate_key)
+            ]
+            if actual_supervised_rows and actual_supervised_nonselected_rows:
+                bandit_best_row = min(
+                    actual_supervised_rows,
+                    key=lambda row: float(row.get("_teacher_score", float("inf"))),
+                )
+                bandit_best_score = case_float(
+                    bandit_best_row.get("_teacher_score", float("nan")),
+                    float("nan"),
+                )
+                teacher_row = bandit_best_row
+                teacher_row_key = str(bandit_best_row.get("_candidate_key", "0:0.000000"))
+                if (not math.isfinite(bandit_best_score)) or bandit_best_score >= float(noop_margin):
+                    teacher_class = 0
+                    teacher_ratio_value = 0.0
+                else:
+                    teacher_class = int(bandit_best_row.get("candidate_base_class", 0))
+                    teacher_ratio_value = float(bandit_best_row.get("final_ratio", 0.0))
+                teacher_class = min(max(int(teacher_class), 0), class_count - 1)
+                if teacher_class > 0 and teacher_ratio_value > 0.0:
+                    if residual_teacher_mode == "nearest_bin":
+                        teacher_class, teacher_base_bin, teacher_residual_target = _best_base_for_ratio(teacher_ratio_value)
+                    else:
+                        teacher_class = int(case_int(bandit_best_row.get("candidate_base_class", teacher_class), teacher_class))
+                        teacher_class = min(max(int(teacher_class), 1), class_count - 1)
+                        teacher_base_bin = float(
+                            case_float(
+                                bandit_best_row.get(
+                                    "candidate_base_bin",
+                                    float(bin_tensor.detach().flatten()[teacher_class].cpu()),
+                                ),
+                                float(bin_tensor.detach().flatten()[teacher_class].cpu()),
+                            )
+                        )
+                        teacher_residual_target = float(teacher_ratio_value - teacher_base_bin)
+                    unclamped_teacher_residual = float(teacher_residual_target)
+                    if residual_enable:
+                        teacher_residual_target = min(
+                            max(float(teacher_residual_target), -float(residual_max)),
+                            float(residual_max),
+                        )
+                        teacher_residual_clamped = (
+                            abs(float(unclamped_teacher_residual) - float(teacher_residual_target)) > 1e-9
+                        )
+                    else:
+                        teacher_residual_target = 0.0
+                        teacher_residual_clamped = abs(float(unclamped_teacher_residual)) > 1e-9
+                else:
+                    teacher_class = 0
+                    teacher_base_bin = 0.0
+                    teacher_residual_target = 0.0
+
+                target = torch.tensor([teacher_class], device=amount_logits.device, dtype=torch.long)
+                cls_loss = torch.nn.functional.cross_entropy(amount_logits.view(1, -1).float(), target)
+
+                unique_supervised_rows = OrderedDict()
+                for row in actual_supervised_rows:
+                    cls = int(row.get("candidate_base_class", 0))
+                    if cls < 0 or cls >= class_count:
+                        continue
+                    score_value = case_float(row.get("_teacher_score", float("nan")), float("inf"))
+                    prev = unique_supervised_rows.get(cls, None)
+                    prev_score = case_float(
+                        prev.get("_teacher_score", float("nan")) if isinstance(prev, dict) else float("inf"),
+                        float("inf"),
+                    )
+                    if prev is None or score_value < prev_score:
+                        unique_supervised_rows[cls] = row
+                value_terms = []
+                for cls, row in unique_supervised_rows.items():
+                    target_value = float(row.get("actual_objective_percent", 0.0))
+                    value_terms.append(
+                        torch.nn.functional.smooth_l1_loss(
+                            pred_per_amount[int(cls)],
+                            ref.new_tensor(float(target_value)),
+                        )
+                    )
+                if value_terms:
+                    value_loss = torch.stack(value_terms).mean()
+
+                rank_terms = []
+                rank_rows = list(unique_supervised_rows.values())
+                margin = ref.new_tensor(0.1)
+                for good_row in rank_rows:
+                    for bad_row in rank_rows:
+                        good_cls = int(good_row.get("candidate_base_class", 0))
+                        bad_cls = int(bad_row.get("candidate_base_class", 0))
+                        if good_cls == bad_cls:
+                            continue
+                        good_score = case_float(good_row.get("_teacher_score", float("nan")), float("nan"))
+                        bad_score = case_float(bad_row.get("_teacher_score", float("nan")), float("nan"))
+                        if not (math.isfinite(good_score) and math.isfinite(bad_score) and good_score + 1e-9 < bad_score):
+                            continue
+                        rank_terms.append(torch.relu(margin + pred_per_amount[good_cls] - pred_per_amount[bad_cls]))
+                if rank_terms:
+                    rank_loss = torch.stack(rank_terms).mean()
+
+                if residual_enable and residual_loss_weight > 0.0 and teacher_class > 0:
+                    residual_loss = torch.nn.functional.smooth_l1_loss(
+                        pred_residual_t,
+                        ref.new_tensor(float(teacher_residual_target)),
+                    )
+                teacher_source = "bandit_aux_actual_best"
+                selected_is_best_value = bool(str(selected_candidate_key) == str(teacher_row_key))
+                if math.isfinite(selected_score) and math.isfinite(bandit_best_score):
+                    oracle_gap_value = float(selected_score - bandit_best_score)
     else:
         if actual_pool_rows and actual_nonnoop_rows:
             best_score = float(best_row.get("_teacher_score", float("inf"))) if isinstance(best_row, dict) else float("inf")
@@ -11882,6 +12025,26 @@ def load_more_training_checkpoint(model, args, writer):
         writer.write("MoreTraining: unexpected_keys_detail=" + ", ".join(unexpected_keys[:50]))
         if len(unexpected_keys) > 50:
             writer.write(f"MoreTraining: unexpected_keys_detail_truncated=True total={len(unexpected_keys)}")
+
+    reset_full_cloud_amount_heads = bool(
+        getattr(args, "sparsepcgc_full_cloud_amount_reset_heads_on_more_training", True)
+    )
+    training_mode = str(getattr(args, "sparsepcgc_training_mode", "subtree_selector")).strip().lower()
+    amount_learning_mode = str(
+        getattr(args, "sparsepcgc_full_cloud_amount_learning_mode", "network_selected_bandit")
+    ).strip().lower()
+    if (
+        reset_full_cloud_amount_heads
+        and training_mode == "full_cloud_amount"
+        and amount_learning_mode == "network_selected_bandit"
+    ):
+        selector = getattr(model, "full_cloud_amount_selector", None)
+        if selector is not None and hasattr(selector, "reset_amount_heads"):
+            selector.reset_amount_heads()
+            writer.write(
+                "MoreTraining: reset full_cloud_amount_selector amount heads after checkpoint load "
+                "(full_cloud_amount + network_selected_bandit)."
+            )
 
     writer.write("MoreTraining: model parameters loaded. Training will continue from this checkpoint.")
     writer.write("=========================================")
