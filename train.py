@@ -2283,34 +2283,12 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
         _append_actual_candidate(selected_candidate_key, "network_selected")
 
     if learning_mode == "network_selected_bandit":
-        if len(actual_candidate_keys) < int(max_actual):
-            sequence_memory_best_key = None
-            if isinstance(sequence_memory_best_entry, dict):
-                best_ratio = sequence_memory_best_entry.get("ratio", float("nan"))
-                for candidate_key, entry in candidate_specs.items():
-                    if bool(entry.get("is_noop", False)):
-                        continue
-                    if abs(float(entry.get("final_ratio", 0.0)) - float(best_ratio)) <= 1e-6:
-                        if int(entry.get("base_class", 0)) != int(selected_class):
-                            sequence_memory_best_key = str(candidate_key)
-                            break
-            if sequence_memory_best_key is not None:
-                _append_actual_candidate(sequence_memory_best_key, "bandit_sequence_memory")
-
-        if len(actual_candidate_keys) < int(max_actual):
-            predicted_key = _pick_nonselected_predicted_candidate(set(actual_candidate_keys))
-            if predicted_key is not None:
-                _append_actual_candidate(predicted_key, "bandit_predicted_alt")
-
-        if len(actual_candidate_keys) < int(max_actual):
-            uncertainty_key = _pick_uncertainty_candidate(set(actual_candidate_keys))
-            if uncertainty_key is not None:
-                _append_actual_candidate(uncertainty_key, "bandit_uncertainty_alt")
-
         if diagnostic_sweep_due or wide_probe_due:
-            for diagnostic_key in _pick_wide_probe_candidates(set(actual_candidate_keys)):
-                if len(actual_candidate_keys) >= int(max_actual):
-                    break
+            diagnostic_key = _pick_uncertainty_candidate(set(actual_candidate_keys))
+            wide_keys = _pick_wide_probe_candidates(set(actual_candidate_keys))
+            if wide_keys:
+                diagnostic_key = wide_keys[0]
+            if diagnostic_key is not None:
                 _append_actual_candidate(diagnostic_key, "diagnostic_sweep")
     elif use_enhanced_actual_selection:
         sequence_memory_best_key = None
