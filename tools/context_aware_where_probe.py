@@ -908,11 +908,13 @@ def _limited_add_pattern_repair_v2(
     add_coords: List[torch.Tensor] = []
     gain_sum = 0.0
     dist_sum = 0.0
+    dist_max = 0.0
     density_sum = 0
     for score, _p, _slot, add_coord, dist, count in rows[: max(int(budget), 0)]:
         add_coords.append(add_coord)
         gain_sum += float(score)
         dist_sum += float(dist)
+        dist_max = max(float(dist_max), float(dist))
         density_sum += int(count)
     if add_coords:
         add_tensor = torch.stack(add_coords, dim=0)
@@ -920,14 +922,21 @@ def _limited_add_pattern_repair_v2(
     else:
         cand = coords
     add_count = int(len(add_coords))
+    added_nn_mean = float(dist_sum / max(add_count, 1))
+    added_density_mean = float(density_sum / max(add_count, 1))
+    base_density = _neighbor_count(coords).to(dtype=torch.float32)
+    base_density_mean = float(base_density.mean().item()) if base_density.numel() else 0.0
     return cand, {
         "operation_type": "add",
         "affected_voxel_count": add_count,
         "add_count": add_count,
         "delta_pattern_nll": float(gain_sum),
         "score_proxy": float(gain_sum),
-        "add_geometry_proxy": float(dist_sum / max(add_count, 1)),
-        "add_density_mean": float(density_sum / max(add_count, 1)),
+        "add_geometry_proxy": added_nn_mean,
+        "added_point_nn_distance_mean": added_nn_mean,
+        "added_point_nn_distance_max": float(dist_max),
+        "add_density_mean": added_density_mean,
+        "add_density_delta": float(added_density_mean - base_density_mean),
         "min_pattern_nll_gain": float(min_gain),
         "max_added_nn_distance": float(max_nn_distance),
         "density_guard": density_guard,
@@ -1167,6 +1176,151 @@ def geometry_proxy(coords: torch.Tensor, keep_mask: torch.Tensor, drop_mask: tor
     return float(dists.min(dim=1).values.mean().item())
 
 
+def _safe_float(value, default: float = float("nan")) -> float:
+    try:
+        if value is None or value == "":
+            return float(default)
+        out = float(value)
+        return out if math.isfinite(out) else float(default)
+    except Exception:
+        return float(default)
+
+
+def _phase1_rule_candidate_score(row: Mapping[str, object]) -> Tuple[bool, float, str]:
+    method = str(row.get("method", ""))
+    if method in {"block_only"} or method.startswith("smacro_") or method.startswith("smacro"):
+        return False, float("-inf"), "baseline_or_diagnostic_only"
+    if method == "noop":
+        return True, 0.0, "noop_baseline"
+
+    operation = str(row.get("operation_type", ""))
+    partial = _safe_float(row.get("partial_context_damage_ratio"), 1.0)
+    parent_emptying = _safe_float(row.get("parent_emptying_ratio"), 0.0)
+    move_distance = _safe_float(row.get("move_distance_mean"), float("inf"))
+    add_count = int(_safe_float(row.get("add_count"), 0.0))
+    add_nn_max = _safe_float(row.get("added_point_nn_distance_max"), _safe_float(row.get("add_geometry_proxy"), float("inf")))
+    add_density = str(row.get("density_guard", ""))
+    score_proxy = _safe_float(row.get("score_proxy"), 0.0)
+
+    if method == "high_nll_branch_prune":
+        if partial <= 0.60 and parent_emptying >= 0.45:
+            return True, 1000.0 + parent_emptying * 100.0 - partial * 100.0 + min(score_proxy, 10000.0) * 1e-4, "guarded_high_nll"
+        return False, float("-inf"), "high_nll_guard_reject"
+
+    if method == "voxel_merge_snap":
+        if move_distance <= 1.0 and partial <= 0.60:
+            return True, 800.0 - partial * 100.0 + min(score_proxy, 10000.0) * 1e-4, "guarded_merge_snap"
+        return False, float("-inf"), "merge_guard_reject"
+
+    add_match = re.match(r"addv2_n(\d+)_g([0-9p]+)_nn(\d+)_dens(off|medium|strict)$", method)
+    if add_match or operation == "add":
+        budget = int(add_match.group(1)) if add_match else add_count
+        density_ok = add_density in {"medium", "strict"}
+        if add_count > 0 and add_nn_max <= 1.0 and density_ok:
+            add_priority = 900.0 + min(float(budget), 512.0) / 512.0 * 50.0
+            return True, add_priority + min(score_proxy, 10000.0) * 1e-4, "guarded_add"
+        return False, float("-inf"), "add_guard_reject"
+
+    return False, float("-inf"), "unsupported_by_phase1_rule"
+
+
+def _finalize_phase1_candidate_groups(rows: List[Mapping[str, object]]) -> None:
+    groups: Dict[Tuple[str, str, str, float], List[Mapping[str, object]]] = {}
+    for row in rows:
+        file_path = str(row.get("file", ""))
+        group_key = (
+            file_path,
+            str(row.get("sequence", "")),
+            str(row.get("frame_id", Path(file_path).stem if file_path else "")),
+            _safe_float(row.get("target_amount"), 0.0),
+        )
+        groups.setdefault(group_key, []).append(row)
+
+    for group_index, (group_key, group_rows) in enumerate(groups.items()):
+        file_path, sequence, frame_id, amount = group_key
+        mixed_group_id = f"{sequence}:{frame_id}:amount={amount:.6f}:group={group_index}"
+        sorted_by_actual = sorted(
+            group_rows,
+            key=lambda r: (
+                _safe_float(r.get("actual_raw_percent"), float("inf")),
+                str(r.get("method", "")),
+            ),
+        )
+        all_best = sorted_by_actual[0] if sorted_by_actual else None
+        block_rows = [r for r in group_rows if str(r.get("method", "")) == "block_only"]
+        block_baseline = (
+            _safe_float(block_rows[0].get("actual_raw_percent"), float("nan"))
+            if block_rows
+            else float("nan")
+        )
+        nonblock_pool = [
+            r for r in group_rows
+            if str(r.get("method", "")) != "block_only"
+        ]
+        nonblock_oracle = min(
+            nonblock_pool,
+            key=lambda r: (
+                _safe_float(r.get("actual_raw_percent"), float("inf")),
+                str(r.get("method", "")),
+            ),
+            default=None,
+        )
+        nonblock_oracle_raw = (
+            _safe_float(nonblock_oracle.get("actual_raw_percent"), 0.0)
+            if nonblock_oracle is not None
+            else float("nan")
+        )
+
+        rule_rows: List[Tuple[float, Mapping[str, object], str]] = []
+        for row in group_rows:
+            eligible, score, reason = _phase1_rule_candidate_score(row)
+            row["rule_candidate_eligible"] = bool(eligible)
+            row["rule_candidate_reason"] = str(reason)
+            row["rule_candidate_score"] = float(score) if math.isfinite(score) else ""
+            if eligible:
+                rule_rows.append((float(score), row, reason))
+        rule_rows.sort(key=lambda item: (item[0], str(item[1].get("method", ""))), reverse=True)
+        rule_selected = rule_rows[0][1] if rule_rows else None
+        rule_name = str(rule_rows[0][2]) if rule_rows else "no_rule_candidate"
+        rule_score = float(rule_rows[0][0]) if rule_rows else float("-inf")
+        no_op_guard_used = False
+        if (
+            rule_selected is not None
+            and str(rule_selected.get("method", "")) != "noop"
+            and _safe_float(rule_selected.get("actual_raw_percent"), 0.0) >= 0.0
+        ):
+            noop_rows = [r for r in group_rows if str(r.get("method", "")) == "noop"]
+            if noop_rows:
+                rule_selected = noop_rows[0]
+                rule_name = "noop_guard"
+                rule_score = 0.0
+                no_op_guard_used = True
+        rule_selected_raw = (
+            _safe_float(rule_selected.get("actual_raw_percent"), 0.0)
+            if rule_selected is not None
+            else float("nan")
+        )
+        rule_oracle_gap = (
+            rule_selected_raw - nonblock_oracle_raw
+            if math.isfinite(rule_selected_raw) and math.isfinite(nonblock_oracle_raw)
+            else float("nan")
+        )
+        rank_lookup = {id(row): rank for rank, row in enumerate(sorted_by_actual, start=1)}
+        for row in group_rows:
+            row["mixed_group_id"] = mixed_group_id
+            row["candidate_rank"] = int(rank_lookup.get(id(row), 0))
+            row["actual_best_in_group"] = bool(all_best is not None and row is all_best)
+            row["selected_by_actual"] = bool(nonblock_oracle is not None and row is nonblock_oracle)
+            row["block_only_baseline_raw_percent"] = block_baseline
+            row["nonblock_oracle_raw_percent"] = nonblock_oracle_raw
+            row["selected_by_rule"] = bool(rule_selected is not None and row is rule_selected)
+            row["rule_name"] = rule_name
+            row["rule_score"] = rule_score if math.isfinite(rule_score) else ""
+            row["no_op_guard_used"] = bool(no_op_guard_used)
+            row["rule_selected_actual_raw_percent"] = rule_selected_raw
+            row["rule_oracle_gap"] = rule_oracle_gap
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--files", nargs="+", required=True)
@@ -1208,14 +1362,19 @@ def main() -> int:
     args.sparsepcgc_exact_occupancy_interval = 1
 
     amounts = _parse_csv_floats(cli.amounts)
-    methods = _parse_csv_text(cli.methods)
-    rows: List[Mapping[str, object]] = []
+    methods_list = list(_parse_csv_text(cli.methods))
+    for required_method in ("noop", "block_only"):
+        if required_method not in methods_list:
+            methods_list.insert(0, required_method)
+    methods = tuple(dict.fromkeys(methods_list))
+    rows: List[Dict[str, object]] = []
     encoder = build_actual_encoder(args)
     try:
         for file_idx, file_path in enumerate(cli.files):
             xyz = torch.as_tensor(load_ply(file_path, return_color=False), dtype=torch.float32)
             coords, meta = _unique_coords(xyz, args)
             sequence = Path(file_path).parent.name
+            frame_id = Path(file_path).stem
             base_xyz = _coords_to_xyz(coords, meta, args)
             base_stats = encoder.encode_bits(base_xyz)
             base_bits = float(base_stats.get("bit", 0.0))
@@ -1237,26 +1396,47 @@ def main() -> int:
                     bit = float(stats.get("bit", 0.0))
                     metrics = dict(context_metrics(coords, drop_mask, block_size=int(cli.block_size)))
                     geom = geometry_proxy(coords, keep_mask, drop_mask, max_samples=int(cli.max_geometry_samples))
+                    actual_raw_percent = 100.0 * (bit - base_bits) / max(base_bits, 1.0)
+                    add_count = int(method_debug.get("add_count", 0) or 0)
+                    move_count = int(method_debug.get("move_count", 0) or 0)
+                    merge_count = int(method_debug.get("merge_count", 0) or 0)
+                    drop_count = int(metrics.get("drop_count", 0) or 0)
+                    operation_type = str(method_debug.get("operation_type", "prune" if method != "noop" else "noop"))
+                    prune_count = drop_count if operation_type in {"prune", "small_macro"} else 0
+                    added_nn_mean = float(method_debug.get("added_point_nn_distance_mean", method_debug.get("add_geometry_proxy", 0.0)) or 0.0)
+                    added_nn_max = float(method_debug.get("added_point_nn_distance_max", method_debug.get("add_geometry_proxy", 0.0)) or 0.0)
+                    sampled_chamfer_proxy = (
+                        (float(geom) * float(drop_count) + float(added_nn_mean) * float(add_count))
+                        / max(float(drop_count + add_count), 1.0)
+                    )
                     row = {
                         "file": str(file_path),
                         "sequence": sequence,
+                        "frame_id": frame_id,
                         "method": method,
-                        "operation_type": method_debug.get("operation_type", "prune" if method != "noop" else "noop"),
+                        "operation_type": operation_type,
                         "target_amount": float(amount),
                         "requested_ratio": float(amount),
                         "input_voxels": int(coords.shape[0]),
                         "candidate_voxels": int(cand_coords.shape[0]),
                         "base_bit": base_bits,
                         "raw_bit": bit,
-                        "actual_raw_percent": 100.0 * (bit - base_bits) / max(base_bits, 1.0),
+                        "actual_raw_percent": actual_raw_percent,
+                        "actual_objective_percent": actual_raw_percent,
                         "geometry_missing_nn_mean": geom,
                         "affected_voxel_count": method_debug.get("affected_voxel_count", int(drop_mask.sum().item())),
-                        "move_count": method_debug.get("move_count", 0),
-                        "merge_count": method_debug.get("merge_count", 0),
-                        "add_count": method_debug.get("add_count", 0),
+                        "prune_count": int(prune_count),
+                        "move_count": int(move_count),
+                        "merge_count": int(merge_count),
+                        "add_count": int(add_count),
+                        "add_ratio": float(add_count) / max(float(coords.shape[0]), 1.0),
                         "move_distance_mean": method_debug.get("move_distance_mean", 0.0),
                         "add_geometry_proxy": method_debug.get("add_geometry_proxy", 0.0),
+                        "added_point_nn_distance_mean": added_nn_mean,
+                        "added_point_nn_distance_max": added_nn_max,
                         "add_density_mean": method_debug.get("add_density_mean", 0.0),
+                        "add_density_delta": method_debug.get("add_density_delta", 0.0),
+                        "sampled_chamfer_proxy": sampled_chamfer_proxy,
                         "delta_pattern_nll": method_debug.get("delta_pattern_nll", 0.0),
                         "occupied_nll_removed": method_debug.get("occupied_nll_removed", 0.0),
                         "score_proxy": method_debug.get("score_proxy", 0.0),
@@ -1268,6 +1448,16 @@ def main() -> int:
                         "sparsepcgc_exact_occupancy_nll": stats.get("sparsepcgc_exact_occupancy_nll", ""),
                         "sparsepcgc_exact_prob_true_mean": stats.get("sparsepcgc_exact_prob_true_mean", ""),
                         "sparsepcgc_exact_low_prob_ratio": stats.get("sparsepcgc_exact_low_prob_ratio", ""),
+                        "sparsepcgc_occupied_low_prob_ratio": stats.get("sparsepcgc_occupied_low_prob_ratio", ""),
+                        "sparsepcgc_bits_by_depth_json": stats.get("sparsepcgc_bits_by_depth_json", ""),
+                        "sparsepcgc_candidates_by_depth_json": stats.get("sparsepcgc_candidates_by_depth_json", ""),
+                        "sparsepcgc_occupied_by_depth_json": stats.get("sparsepcgc_occupied_by_depth_json", ""),
+                        "sparsepcgc_low_prob_occupied_by_depth_json": stats.get("sparsepcgc_low_prob_occupied_by_depth_json", ""),
+                        "sparsepcgc_high_bit_nodes_by_depth_json": stats.get("sparsepcgc_high_bit_nodes_by_depth_json", ""),
+                        "sparsepcgc_bits_by_parent_popcount_json": stats.get("sparsepcgc_bits_by_parent_popcount_json", ""),
+                        "sparsepcgc_bits_by_child_pattern_topk_json": stats.get("sparsepcgc_bits_by_child_pattern_topk_json", ""),
+                        "sparsepcgc_bits_by_block_topk_json": stats.get("sparsepcgc_bits_by_block_topk_json", ""),
+                        "sparsepcgc_top_high_bit_nodes_json": stats.get("sparsepcgc_top_high_bit_nodes_json", ""),
                     }
                     row.update(metrics)
                     applied_ratio = float(metrics.get("actual_drop_ratio", 0.0))
@@ -1302,6 +1492,7 @@ def main() -> int:
                         }
                     )
                     rows.append(row)
+                    _finalize_phase1_candidate_groups(rows)
                     Path(cli.output_csv).parent.mkdir(parents=True, exist_ok=True)
                     with open(cli.output_csv, "w", newline="", encoding="utf-8") as f:
                         fieldnames = []

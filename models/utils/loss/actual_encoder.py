@@ -614,6 +614,28 @@ class _SparsePCGCActualEncoder:
                     f"{response.get('message', response)}. See stderr log: {self._stderr_path}"
                 )
             result = response.get("result", {})
+            decoded_copy_dir = str(getattr(self.args, "sparsepcgc_decoded_copy_dir", "") or "").strip()
+            if decoded_copy_dir:
+                decoded_path_text = str(result.get("decoded_path", "") or "")
+                decoded_candidates = [
+                    item.strip()
+                    for item in decoded_path_text.split(",")
+                    if item.strip() and item.strip() != "(decode skipped)"
+                ]
+                copied_paths = []
+                os.makedirs(decoded_copy_dir, exist_ok=True)
+                for idx, decoded_path in enumerate(decoded_candidates):
+                    if not os.path.exists(decoded_path):
+                        continue
+                    stem = os.path.splitext(os.path.basename(decoded_path))[0]
+                    copy_path = os.path.join(
+                        decoded_copy_dir,
+                        f"request_{self._request_id:06d}_{idx}_{stem}.ply",
+                    )
+                    shutil.copy2(decoded_path, copy_path)
+                    copied_paths.append(copy_path)
+                if copied_paths:
+                    result["decoded_copy_path"] = ", ".join(copied_paths)
             bit = float(result.get("file_size", result.get("bit", 0.0)))
             point_count = int(result.get("point_count", result.get("num_points_raw", pts_3n.shape[-1])))
             # ============================================================
@@ -714,6 +736,14 @@ class _SparsePCGCActualEncoder:
                     or key_text.startswith("worker_gpu_")
                     or key_text.startswith("sparsepcgc_worker_cuda_")
                     or key_text.startswith("sparsepcgc_worker_gpu_")
+                    or key_text
+                    in {
+                        "bitstream_path",
+                        "decoded_path",
+                        "decoded_copy_path",
+                        "decoded_point_count",
+                        "decoded_codec_point_count",
+                    }
                 )
 
                 if keep_key:
