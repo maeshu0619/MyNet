@@ -14,6 +14,7 @@ import copy
 import csv
 import json
 import math
+import re
 import sys
 import time
 from pathlib import Path
@@ -39,7 +40,9 @@ from tools.phase2u_high_bit_candidate_rewrite_rd_probe import (
 )
 
 
-DEFAULT_SETTINGS = "default:1.0:1,vox2:2.0:1,posq2:1.0:2"
+DEFAULT_SETTINGS = "default:1.0:1"
+DEFAULT_AUTO_VOXEL_SIZES = "0.75,0.875,1.0,1.125,1.25,1.375,1.5,1.75,2.0"
+DEFAULT_AUTO_POS_QUANTSCALES = "1,2,3"
 DEFAULT_FILE = "/data/maejima/data/ground/8i/loot/loot_vox10_1000.ply"
 DEFAULT_OUTPUT = "/data/maejima/log/PHASE2V_sparsepcgc_setting_sweep_smoke.csv"
 
@@ -66,6 +69,218 @@ def _parse_settings(text: str) -> list[Tuple[str, float, int]]:
             raise ValueError(f"pos_quantscale must be > 0 in setting {raw!r}")
         settings.append((setting_id, voxel, quant))
     return settings
+
+
+def _parse_float_list(text: str) -> list[float]:
+    values: list[float] = []
+    for raw in _parse_csv_text(text):
+        if str(raw).strip() == "":
+            continue
+        values.append(float(raw))
+    return values
+
+
+def _parse_int_list(text: str) -> list[int]:
+    values: list[int] = []
+    for raw in _parse_csv_text(text):
+        if str(raw).strip() == "":
+            continue
+        values.append(int(float(raw)))
+    return values
+
+
+def _dedupe_settings(settings: Sequence[Tuple[str, float, int]]) -> list[Tuple[str, float, int]]:
+    """同じvoxel_size/pos_quantscaleの重複を除く。"""
+    seen: set[tuple[float, int]] = set()
+    out: list[Tuple[str, float, int]] = []
+    for setting_id, voxel, quant in settings:
+        key = (round(float(voxel), 8), int(quant))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((str(setting_id), float(voxel), int(quant)))
+    return out
+
+
+def _generate_auto_settings(
+    *,
+    voxel_sizes: Sequence[float],
+    pos_quantscales: Sequence[int],
+    include_pair_grid: bool,
+) -> list[Tuple[str, float, int]]:
+    """default近傍を中心に、単変数sweepと軽い2変数gridを作る。"""
+    settings: list[Tuple[str, float, int]] = []
+    for voxel in voxel_sizes:
+        settings.append((f"vox{float(voxel):g}_pq1", float(voxel), 1))
+    for quant in pos_quantscales:
+        settings.append((f"vox1_pq{int(quant)}", 1.0, int(quant)))
+    if include_pair_grid:
+        # 組み合わせ爆発を防ぐため、実用的な近傍だけに絞る。
+        pair_voxels = [v for v in voxel_sizes if 0.875 <= float(v) <= 1.5]
+        pair_quants = [q for q in pos_quantscales if int(q) in (1, 2)]
+        for voxel in pair_voxels:
+            for quant in pair_quants:
+                settings.append((f"vox{float(voxel):g}_pq{int(quant)}", float(voxel), int(quant)))
+    return _dedupe_settings(settings)
+
+
+def _repo_candidate_paths() -> list[Path]:
+    """SparsePCGCとactual encoder周辺の設定確認対象を返す。"""
+    return [
+        REPO_ROOT.parent / "compress/octree/SparsePCGC/encoder_multiple.py",
+        REPO_ROOT / "models/utils/loss/actual_encoder.py",
+        REPO_ROOT / "tools/phase2v_sparsepcgc_setting_sweep.py",
+    ]
+
+
+def _scan_setting_inventory() -> list[Dict[str, object]]:
+    """設定らしき語を軽くgrepしてCSV化する。研究用の在庫表。"""
+    patterns = [
+        "voxel", "voxel_size", "pos_quantscale", "pos_quantscale_list",
+        "psnr_resolution", "resolution", "depth", "max_depth", "octree",
+        "quant", "quantization", "scale", "dense_scale",
+        "dense_scale_ae_list", "dense_scale_sr_list", "block", "block_size",
+        "cube", "root", "normalize", "checkpoint", "ckpt", "model",
+        "entropy", "coder", "bitstream", "lossless", "lossy",
+    ]
+    rows: list[Dict[str, object]] = []
+    regex = re.compile("|".join(re.escape(p) for p in patterns), re.IGNORECASE)
+    for path in _repo_candidate_paths():
+        if not path.exists():
+            rows.append({
+                "file": str(path),
+                "line": "",
+                "setting_name": "",
+                "snippet": "file_not_found",
+                "kind_guess": "",
+                "risk_guess": "unknown",
+            })
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except Exception as exc:
+            rows.append({
+                "file": str(path),
+                "line": "",
+                "setting_name": "",
+                "snippet": f"read_error:{type(exc).__name__}:{exc}",
+                "kind_guess": "",
+                "risk_guess": "unknown",
+            })
+            continue
+        for idx, line in enumerate(lines, start=1):
+            if not regex.search(line):
+                continue
+            snippet = line.strip()
+            name_match = re.search(r"--([A-Za-z0-9_\\-]+)|args\\.([A-Za-z0-9_]+)|sparsepcgc_([A-Za-z0-9_]+)", snippet)
+            setting_name = ""
+            if name_match:
+                setting_name = next((g for g in name_match.groups() if g), "")
+            lower = snippet.lower()
+            if "psnr" in lower:
+                kind = "evaluation_or_resolution"
+            elif "checkpoint" in lower or "ckpt" in lower or "model" in lower:
+                kind = "model_compatibility"
+            elif "voxel" in lower or "quant" in lower or "scale" in lower or "depth" in lower:
+                kind = "codec_or_quantization_candidate"
+            else:
+                kind = "unknown"
+            risk = "low"
+            if kind == "model_compatibility":
+                risk = "high"
+            elif "dense_scale" in lower:
+                risk = "medium_high"
+            elif "psnr" in lower:
+                risk = "medium"
+            rows.append({
+                "file": str(path),
+                "line": idx,
+                "setting_name": setting_name,
+                "snippet": snippet[:240],
+                "kind_guess": kind,
+                "risk_guess": risk,
+            })
+    return rows
+
+
+def _write_inventory_csv(path: str, rows: Sequence[Mapping[str, object]]) -> None:
+    if not path:
+        return
+    _write_csv(path, [dict(r) for r in rows])
+
+
+def _candidate_prefix(candidate: str, budget: float) -> str:
+    """CSV列名に使う安全なprefixを作る。"""
+    budget_pct = float(budget) * 100.0
+    label = f"{budget_pct:.3f}".replace(".", "p").rstrip("0").rstrip("p")
+    return f"{candidate}_b{label}pct"
+
+
+def _parse_candidate_budgets(text: str) -> list[float]:
+    budgets: list[float] = []
+    for raw in _parse_csv_text(text):
+        value = float(raw)
+        if value <= 0:
+            raise ValueError(f"budget must be > 0, got {raw!r}")
+        # 1.0以上を百分率指定とみなし、1なら1%に変換する。
+        if value >= 1.0:
+            value = value / 100.0
+        budgets.append(float(value))
+    return budgets
+
+
+def _safe_num(value: object, default: float = float("nan")) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _print_summary(output_csv: str, *, topk: int = 12) -> None:
+    rows = _read_rows(output_csv)
+    if not rows:
+        print("[Phase2V/summary] no rows")
+        return
+    raw_keys = sorted({k for row in rows for k in row.keys() if k.endswith("_raw_percent")})
+    print("\\n[Phase2V/summary] rows:", len(rows))
+    print("[Phase2V/summary] raw columns:", ", ".join(raw_keys) if raw_keys else "(none)")
+    scored: list[tuple[float, str, str, str, float, float, float]] = []
+    for row in rows:
+        setting_id = str(row.get("setting_id", ""))
+        codec_id = str(row.get("codec_setting_id", ""))
+        d1 = _safe_num(row.get("no_op_decoded_D1_PSNR"))
+        top3 = _safe_num(row.get("top3p_high_bit_symbol_bit_share"))
+        for key in raw_keys:
+            raw = _safe_num(row.get(key))
+            if math.isnan(raw):
+                continue
+            # 小さいほどよいraw改善、ただしno-op品質が壊れすぎた設定は後で人間が除外できるようD1も出す。
+            scored.append((raw, setting_id, codec_id, key, d1, top3, _safe_num(row.get("no_op_actual_bit_size"))))
+    scored.sort(key=lambda x: x[0])
+    print("[Phase2V/summary] top raw-improvement candidates:")
+    for raw, setting_id, codec_id, key, d1, top3, bits in scored[:topk]:
+        print(f"  raw={raw:+.4f}%  setting={setting_id}  {key}  D1={d1:.3f}  top3={top3:.4f}  bits={bits:.0f}  {codec_id}")
+
+    default_d1 = None
+    for row in rows:
+        if str(row.get("setting_id", "")).startswith("default"):
+            default_d1 = _safe_num(row.get("no_op_decoded_D1_PSNR"))
+            break
+    if default_d1 is not None and not math.isnan(default_d1):
+        print("[Phase2V/summary] quality-safe settings within default D1 - 3dB:")
+        safe_rows = []
+        for row in rows:
+            d1 = _safe_num(row.get("no_op_decoded_D1_PSNR"))
+            if not math.isnan(d1) and d1 >= default_d1 - 3.0:
+                safe_rows.append(row)
+        for row in safe_rows[:topk]:
+            print(
+                f"  setting={row.get('setting_id')} D1={_safe_num(row.get('no_op_decoded_D1_PSNR')):.3f} "
+                f"acc={row.get('no_op_occupancy_acc_at_0p5')} top3={row.get('top3p_high_bit_symbol_bit_share')} "
+                f"bits={row.get('no_op_actual_bit_size')}"
+            )
 
 
 def _setting_args(base_args, *, voxel_size: float, pos_quantscale: int, psnr_resolution: int, decode: bool, topk: int):
@@ -164,6 +379,26 @@ def run_phase2v(cli: argparse.Namespace) -> int:
     rows = _read_rows(cli.output_csv) if bool(cli.append_output) else []
 
     settings = _parse_settings(cli.settings)
+    if bool(cli.auto_settings):
+        settings.extend(_generate_auto_settings(
+            voxel_sizes=_parse_float_list(cli.voxel_size_values),
+            pos_quantscales=_parse_int_list(cli.pos_quantscale_values),
+            include_pair_grid=bool(cli.include_pair_grid),
+        ))
+    settings = _dedupe_settings(settings)
+    if int(cli.max_settings) > 0:
+        settings = settings[: int(cli.max_settings)]
+
+    inventory_rows = _scan_setting_inventory()
+    _write_inventory_csv(cli.inventory_csv, inventory_rows)
+    print(f"[Phase2V] setting inventory rows: {len(inventory_rows)} -> {cli.inventory_csv}")
+    print(f"[Phase2V] settings to evaluate: {len(settings)}")
+    for setting_id, voxel_size, pos_q in settings:
+        print(f"  - {setting_id}: voxel_size={voxel_size:g}, pos_quantscale={pos_q}")
+
+    candidate_names = [str(x) for x in _parse_csv_text(cli.candidates)]
+    candidate_budgets = _parse_candidate_budgets(cli.candidate_budgets)
+
     file_path = str(cli.file)
     xyz = torch.as_tensor(load_ply(file_path, return_color=False), dtype=torch.float32)
     coords, meta = _unique_coords(xyz, base_args)
@@ -264,29 +499,36 @@ def run_phase2v(cli: argparse.Namespace) -> int:
             else:
                 row.update({"lossless": "", "proposed_unavailable_reason": "decode_path_missing"})
 
-            for candidate in ("high_bit_raw_prune", "low_prob_snap_to_existing"):
-                try:
-                    raw_percent, debug = _candidate_raw_percent(
-                        candidate_name=candidate,
-                        coords=coords,
-                        meta=meta,
-                        base_stats=base_stats,
-                        base_bits=base_bits,
-                        bit_encoder=bit_encoder,
-                        args=base_args,
-                        budget=float(cli.budget),
-                        pool=int(cli.pool),
-                        block_size=int(cli.block_size),
-                        seed=int(cli.seed) + int(setting_index),
-                    )
-                    prefix = "high_bit_raw_1p" if candidate == "high_bit_raw_prune" else "low_prob_snap_to_existing_1p"
-                    row[f"{prefix}_raw_percent"] = raw_percent
-                    row[f"{prefix}_bit_size"] = debug.get(f"{candidate}_bit_size", "")
-                    row[f"{prefix}_actual_edit_ratio"] = debug.get(f"{candidate}_actual_edit_ratio", "")
-                    row[f"{prefix}_selected_bit_sum"] = debug.get("selected_bit_sum", "")
-                except Exception as exc:
-                    row[f"{candidate}_unavailable_reason"] = f"{type(exc).__name__}:{exc}"
+            for budget in candidate_budgets:
+                for candidate in candidate_names:
+                    try:
+                        raw_percent, debug = _candidate_raw_percent(
+                            candidate_name=candidate,
+                            coords=coords,
+                            meta=meta,
+                            base_stats=base_stats,
+                            base_bits=base_bits,
+                            bit_encoder=bit_encoder,
+                            args=base_args,
+                            budget=float(budget),
+                            pool=int(cli.pool),
+                            block_size=int(cli.block_size),
+                            seed=int(cli.seed) + int(setting_index),
+                        )
+                        prefix = _candidate_prefix(candidate, float(budget))
+                        row[f"{prefix}_raw_percent"] = raw_percent
+                        row[f"{prefix}_bit_size"] = debug.get(f"{candidate}_bit_size", "")
+                        row[f"{prefix}_actual_edit_ratio"] = debug.get(f"{candidate}_actual_edit_ratio", "")
+                        row[f"{prefix}_selected_bit_sum"] = debug.get("selected_bit_sum", "")
+                    except Exception as exc:
+                        prefix = _candidate_prefix(candidate, float(budget))
+                        row[f"{prefix}_unavailable_reason"] = f"{type(exc).__name__}:{exc}"
             row["elapsed_sec"] = float(time.time() - t0)
+            print(
+                f"[Phase2V] done setting={setting_id} bits={row.get('no_op_actual_bit_size')} "
+                f"acc={row.get('no_op_occupancy_acc_at_0p5')} D1={row.get('no_op_decoded_D1_PSNR')} "
+                f"elapsed={row['elapsed_sec']:.1f}s"
+            )
         finally:
             for encoder in (debug_encoder, decode_encoder, bit_encoder):
                 close = getattr(encoder, "close", None)
@@ -294,6 +536,7 @@ def run_phase2v(cli: argparse.Namespace) -> int:
                     close()
         rows.append(row)
         _write_csv(cli.output_csv, rows)
+    _print_summary(cli.output_csv, topk=int(cli.summary_topk))
     return 0
 
 
@@ -301,7 +544,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Phase2V minimal SparsePCGC setting headroom sweep")
     parser.add_argument("--file", default=DEFAULT_FILE)
     parser.add_argument("--settings", default=DEFAULT_SETTINGS, help="Comma list of id:voxel_size:pos_quantscale")
-    parser.add_argument("--budget", type=float, default=0.010)
+    parser.add_argument("--auto-settings", action="store_true", default=True, help="Generate detailed voxel_size/pos_quantscale sweep")
+    parser.add_argument("--no-auto-settings", dest="auto_settings", action="store_false")
+    parser.add_argument("--voxel-size-values", default=DEFAULT_AUTO_VOXEL_SIZES)
+    parser.add_argument("--pos-quantscale-values", default=DEFAULT_AUTO_POS_QUANTSCALES)
+    parser.add_argument("--include-pair-grid", action="store_true", default=True)
+    parser.add_argument("--no-include-pair-grid", dest="include_pair_grid", action="store_false")
+    parser.add_argument("--max-settings", type=int, default=0, help="0 means no limit")
+    parser.add_argument("--candidates", default="high_bit_raw_prune,low_prob_snap_to_existing")
+    parser.add_argument("--candidate-budgets", default="0.01", help="Comma list. Use 0.01 or 1 for 1 percent")
+    parser.add_argument("--budget", type=float, default=0.010, help="Backward compatible; use --candidate-budgets for new runs")
     parser.add_argument("--pool", type=int, default=8192)
     parser.add_argument("--block-size", type=int, default=16)
     parser.add_argument("--seed", type=int, default=123)
@@ -314,6 +566,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--use-pc-error", action="store_true", default=False)
     parser.add_argument("--decoded-dir", default="/data/maejima/log/phase2v_decoded")
     parser.add_argument("--output-csv", default=DEFAULT_OUTPUT)
+    parser.add_argument("--inventory-csv", default="/data/maejima/log/PHASE2V_sparsepcgc_setting_inventory.csv")
+    parser.add_argument("--summary-topk", type=int, default=12)
     parser.add_argument("--append-output", action="store_true", default=False)
     return parser
 
