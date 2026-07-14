@@ -550,9 +550,10 @@ class CompressionLossMixin:
     def _get_cached_actual_gt(self, cache_key):
         if not self.gt_cache_enabled or not cache_key:
             return None
-        cache_entry = self.actual_gt_cache.get(cache_key)
+        memory_key = self._actual_gt_cache_fingerprint(cache_key)
+        cache_entry = self.actual_gt_cache.get(memory_key)
         if cache_entry is not None:
-            self.actual_gt_cache.move_to_end(cache_key)
+            self.actual_gt_cache.move_to_end(memory_key)
             return dict(cache_entry)
         disk_path = self._actual_gt_disk_cache_path(cache_key)
         if disk_path:
@@ -561,8 +562,8 @@ class CompressionLossMixin:
                     payload = json.load(handle)
                 stats = payload.get("stats", None)
                 if payload.get("fingerprint") == self._actual_gt_cache_fingerprint(cache_key) and isinstance(stats, dict):
-                    self.actual_gt_cache[cache_key] = dict(stats)
-                    self.actual_gt_cache.move_to_end(cache_key)
+                    self.actual_gt_cache[memory_key] = dict(stats)
+                    self.actual_gt_cache.move_to_end(memory_key)
                     return dict(stats)
             except (OSError, ValueError, TypeError):
                 pass
@@ -571,8 +572,9 @@ class CompressionLossMixin:
     def _store_cached_actual_gt(self, cache_key, cache_entry):
         if not self.gt_cache_enabled or not cache_key or self.gt_cache_max_entries <= 0:
             return
-        self.actual_gt_cache[cache_key] = dict(cache_entry)
-        self.actual_gt_cache.move_to_end(cache_key)
+        memory_key = self._actual_gt_cache_fingerprint(cache_key)
+        self.actual_gt_cache[memory_key] = dict(cache_entry)
+        self.actual_gt_cache.move_to_end(memory_key)
         while len(self.actual_gt_cache) > self.gt_cache_max_entries:
             self.actual_gt_cache.popitem(last=False)
         disk_path = self._actual_gt_disk_cache_path(cache_key)
@@ -617,10 +619,21 @@ class CompressionLossMixin:
             [
                 str(cache_key),
                 source_identity,
-                str(getattr(args, "sparsepcgc_mode", "dense_lossless")),
+                str(getattr(args, "sparsepcgc_mode", "dense_lossy")),
                 str(getattr(args, "sparsepcgc_ckptdir", "")),
+                str(getattr(args, "sparsepcgc_ckptdir_sr", "")),
+                str(getattr(args, "sparsepcgc_ckptdir_ae", "")),
+                str(int(getattr(args, "sparsepcgc_scale_m", 8))),
+                str(int(getattr(args, "sparsepcgc_scale_ae", 0))),
+                str(int(getattr(args, "sparsepcgc_scale_sr", 2))),
+                str(getattr(args, "sparsepcgc_dense_scale_ae_list", "0")),
+                str(getattr(args, "sparsepcgc_dense_scale_sr_list", "2")),
                 str(float(getattr(args, "sparsepcgc_voxel_size", 1.0))),
                 str(int(getattr(args, "sparsepcgc_pos_quantscale", 1))),
+                str(int(getattr(args, "sparsepcgc_psnr_resolution", 1023))),
+                str(bool(getattr(args, "sparsepcgc_test_d2", False))),
+                str(bool(getattr(args, "sparsepcgc_skip_decode", True))),
+                str(bool(getattr(args, "sparsepcgc_offset", False))),
             ]
         )
 
@@ -1711,6 +1724,10 @@ class CompressionLossMixin:
             "actuator_voxel_state_available": bool(
                 self._get_actuator_voxel_state(args, gen_xyz.device) is not None
             ),
+            "sparsepcgc_scale_m": int(stats_gen.get("sparsepcgc_scale_m", getattr(args, "sparsepcgc_scale_m", 8))),
+            "sparsepcgc_scale_ae": int(stats_gen.get("sparsepcgc_scale_ae", getattr(args, "sparsepcgc_scale_ae", 0))),
+            "sparsepcgc_scale_sr": int(stats_gen.get("sparsepcgc_scale_sr", getattr(args, "sparsepcgc_scale_sr", 2))),
+            "sparsepcgc_mode_effective": str(stats_gen.get("sparsepcgc_mode_effective", getattr(args, "sparsepcgc_mode", "dense_lossy"))),
         }
         self.last_compression_debug.update(exact_fallback_debug)
 

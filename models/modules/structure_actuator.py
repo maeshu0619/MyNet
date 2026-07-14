@@ -2864,6 +2864,68 @@ class StructureRepairActuator(nn.Module):
         else:
             gate = gate_prob
         return gate[:, 0:1], gate[:, 1:2], gate[:, 2:3], gate_prob, gate_hard, gate_logit
+
+    def _heuristic_guidance_state(self, structure):
+        guidance = structure.get("heuristic_guidance") if isinstance(structure, dict) else None
+        if not isinstance(guidance, dict) or not bool(guidance.get("enabled", False)):
+            return None
+        if not bool(getattr(self.args, "heuristic_guidance_enabled", True)):
+            return None
+        return guidance
+
+    def _fit_heuristic_where_prior(self, guidance, operation, like_tensor):
+        if not isinstance(guidance, dict):
+            return torch.zeros_like(like_tensor)
+        where = guidance.get("where_prior", {})
+        value = where.get(operation) if isinstance(where, dict) else None
+        if not torch.is_tensor(value):
+            return torch.zeros_like(like_tensor)
+        return self._fit_leaf_pattern_map(value, like_tensor).clamp(0.0, 1.0).detach()
+
+    def _apply_heuristic_action_guidance(
+        self, guidance, drop_gate, add_gate, move_gate, *, prune_enabled, add_enabled, move_enabled
+    ):
+        if not isinstance(guidance, dict):
+            return drop_gate, add_gate, move_gate
+        strength = min(max(float(getattr(self.args, "heuristic_guidance_action_strength", 0.50)), 0.0), 1.0)
+        if strength <= 0.0:
+            return drop_gate, add_gate, move_gate
+        priors = guidance.get("action_gate_prior", {})
+        outputs = []
+        for gate, operation, enabled in (
+            (drop_gate, "Prune", prune_enabled),
+            (add_gate, "Add", add_enabled),
+            (move_gate, "Adjust", move_enabled),
+        ):
+            if not enabled:
+                outputs.append(torch.zeros_like(gate))
+                continue
+            prior_value = min(max(float(priors.get(operation, 0.5)), 0.0), 1.0) if isinstance(priors, dict) else 0.5
+            prior = gate.new_full(gate.shape, prior_value)
+            outputs.append(((1.0 - strength) * gate + strength * prior).clamp(0.0, 1.0))
+        return tuple(outputs)
+
+    def _apply_heuristic_amount_guidance(self, ratio, guidance, operation, max_ratio):
+        if not isinstance(guidance, dict) or float(max_ratio) <= 0.0:
+            return ratio
+        priors = guidance.get("amount_prior", {})
+        if not isinstance(priors, dict) or operation not in priors:
+            return ratio
+        prior_value = min(max(float(priors.get(operation, 0.0)), 0.0), float(max_ratio))
+        residual_fraction = max(float(getattr(self.args, "heuristic_guidance_amount_residual_fraction", 0.50)), 0.0)
+        min_residual = max(float(getattr(self.args, "heuristic_guidance_amount_min_residual", 0.0001)), 0.0)
+        residual_limit = min(max(prior_value * residual_fraction, min_residual), float(max_ratio))
+        lower = max(prior_value - residual_limit, 0.0)
+        upper = min(prior_value + residual_limit, float(max_ratio))
+        guided_forward = ratio.detach().clamp(lower, upper)
+        grad_scale = max(float(getattr(self.args, "heuristic_guidance_amount_grad_scale", 1.0)), 0.0)
+        # forwardだけをHeuristic近傍へ制限し、backwardはAmount headへ残すSTEである。
+        return guided_forward + grad_scale * (ratio - ratio.detach())
+
+    def _heuristic_where_logit_bias(self, guidance, operation, like_tensor):
+        prior = self._fit_heuristic_where_prior(guidance, operation, like_tensor)
+        weight = max(float(getattr(self.args, "heuristic_guidance_where_weight", 1.0)), 0.0)
+        return weight * (2.0 * prior - 1.0)
     
     def _scale_amount_downstream_grad(self, ratio, op_name=""):
         # Amount ratio のforward値は変えず、backwardだけ強める。
@@ -3523,6 +3585,20 @@ class StructureRepairActuator(nn.Module):
             add_enabled=add_enabled,
             move_enabled=disp_enabled,
         )
+        heuristic_guidance = self._heuristic_guidance_state(structure)
+        drop_operation_gate, add_operation_gate, move_operation_gate = self._apply_heuristic_action_guidance(
+            heuristic_guidance,
+            drop_operation_gate,
+            add_operation_gate,
+            move_operation_gate,
+            prune_enabled=prune_enabled,
+            add_enabled=add_enabled,
+            move_enabled=disp_enabled,
+        )
+        operation_gate_prob = torch.cat([drop_operation_gate, add_operation_gate, move_operation_gate], dim=1)
+        operation_gate_hard = (
+            operation_gate_prob >= min(max(float(getattr(self.args, "repair_operation_gate_hard_threshold", 0.5)), 0.0), 1.0)
+        ).to(dtype=operation_gate_prob.dtype)
         if actual_oracle_enabled and actual_oracle_apply_teacher_actions:
             if prune_after_prior_mode != "network":
                 if actual_oracle_has_drop and prune_enabled:
@@ -3809,8 +3885,16 @@ class StructureRepairActuator(nn.Module):
                 + learned_drop_ratio_after_floor
                 - learned_drop_ratio_after_floor.detach()
             )
-        learned_drop_ratio_before_gate = learned_drop_ratio_after_floor
-        learned_drop_ratio_after_gate = learned_drop_ratio_before_gate * drop_operation_gate
+        learned_drop_ratio_before_gate_raw = learned_drop_ratio_after_floor
+        # Phase0 network modeはoperation gateをhard countへ掛けないため、
+        # gate前とgate後の両方に同じHeuristic Amount中心を用意する。
+        learned_drop_ratio_before_gate = self._apply_heuristic_amount_guidance(
+            learned_drop_ratio_before_gate_raw, heuristic_guidance, "Prune", max_drop_ratio
+        )
+        learned_drop_ratio_after_gate_raw = learned_drop_ratio_before_gate_raw * drop_operation_gate
+        learned_drop_ratio_after_gate = self._apply_heuristic_amount_guidance(
+            learned_drop_ratio_after_gate_raw, heuristic_guidance, "Prune", max_drop_ratio
+        )
         # ============================================================
         # Network自由Amountモード
         # ============================================================
@@ -4495,7 +4579,13 @@ class StructureRepairActuator(nn.Module):
             if floor_applied_to_ratio:
                 hard_drop_target_ratio_source = "network_floor"
                 hard_drop_target_ratio_source_id = 5
-        learned_drop_ratio = learned_drop_ratio_before_gate
+        # Heuristic無効時は従来どおりgate前Amountをsoft lossへ使い、完全互換を保つ。
+        # Heuristic有効時だけhard countと同じguided Amountをsoft経路へ渡す。
+        learned_drop_ratio = (
+            effective_drop_ratio_for_hard_count
+            if heuristic_guidance is not None
+            else learned_drop_ratio_before_gate
+        )
         learned_drop_ratio_for_ops = self._scale_amount_downstream_grad(
             effective_drop_ratio_for_hard_count,
             op_name="drop",
@@ -4565,6 +4655,10 @@ class StructureRepairActuator(nn.Module):
             if phase0_network_prune_mode
             else 0
         )
+        if heuristic_guidance is not None:
+            delete_prior = delete_prior + self._heuristic_where_logit_bias(
+                heuristic_guidance, "Prune", delete_prior
+            )
         delete_prior = torch.sigmoid(delete_prior.clamp(-8.0, 8.0))
         if not phase0_network_prune_mode:
             delete_prior = delete_prior * drop_operation_gate
@@ -5356,7 +5450,16 @@ class StructureRepairActuator(nn.Module):
                 - learned_move_ratio.detach()
             )
         learned_move_ratio = learned_move_ratio * move_operation_gate
+        # 最終Action gate後のAmountをana_den6初期値の近傍へ置く。
+        learned_move_ratio = self._apply_heuristic_amount_guidance(
+            learned_move_ratio, heuristic_guidance, "Adjust", max_move_ratio
+        )
         move_score = move_score * move_operation_gate
+        if heuristic_guidance is not None:
+            move_score = torch.sigmoid(
+                self._safe_logit(move_score.clamp(1e-6, 1.0 - 1e-6))
+                + self._heuristic_where_logit_bias(heuristic_guidance, "Adjust", move_score)
+            )
         learned_move_ratio_for_ops = self._scale_amount_downstream_grad(
             learned_move_ratio,
             op_name="move",
@@ -5945,6 +6048,10 @@ class StructureRepairActuator(nn.Module):
                 .item()
             )
         learned_add_ratio = learned_add_ratio * add_operation_gate
+        # 最終Action gate後のAmountをana_den6初期値の近傍へ置く。
+        learned_add_ratio = self._apply_heuristic_amount_guidance(
+            learned_add_ratio, heuristic_guidance, "Add", max_add_ratio_value
+        )
         learned_add_ratio_for_ops = self._scale_amount_downstream_grad(
             learned_add_ratio,
             op_name="add",
@@ -6039,6 +6146,10 @@ class StructureRepairActuator(nn.Module):
                 add_prior = torch.zeros_like(add_prior)
             # Add量の学習結果を位置logitに足し、どのVoxelへ追加するかの勾配も残す。
             add_logit = learned_add_logit + add_prior + self._ratio_bias(learned_add_ratio_for_ops, max_add_ratio_value)
+            if heuristic_guidance is not None:
+                add_logit = add_logit + self._heuristic_where_logit_bias(
+                    heuristic_guidance, "Add", add_logit
+                )
             if self.training and add_score_noise > 0.0:
                 add_logit = add_logit + self._gumbel_like(add_logit) * add_score_noise
             add_voxel_logits = self.add_voxel_head(actuator_features)
@@ -8016,6 +8127,14 @@ class StructureRepairActuator(nn.Module):
             ).abs(),
             "operation_gate_prob": operation_gate_prob.detach(),
             "operation_gate_hard": operation_gate_hard.detach(),
+            "heuristic_guidance_enabled": bool(heuristic_guidance is not None),
+            "heuristic_guidance_dataset": str((heuristic_guidance or {}).get("dataset", "")),
+            "heuristic_guidance_scale_m": int((heuristic_guidance or {}).get("scale_m", -1)),
+            "heuristic_guidance_profile_source": str((heuristic_guidance or {}).get("profile_source", "")),
+            "heuristic_guidance_total_ratio": float((heuristic_guidance or {}).get("total_ratio", 0.0)),
+            "heuristic_guidance_add_amount_prior": float(((heuristic_guidance or {}).get("amount_prior", {}) or {}).get("Add", 0.0)),
+            "heuristic_guidance_prune_amount_prior": float(((heuristic_guidance or {}).get("amount_prior", {}) or {}).get("Prune", 0.0)),
+            "heuristic_guidance_adjust_amount_prior": float(((heuristic_guidance or {}).get("amount_prior", {}) or {}).get("Adjust", 0.0)),
             "operation_gate_logit": operation_gate_logit.detach(),
             "drop_operation_gate": drop_operation_gate.detach().mean(),
             "add_operation_gate": add_operation_gate.detach().mean(),
@@ -8777,6 +8896,14 @@ class StructureRepairActuator(nn.Module):
             ).abs(),
             "operation_gate_prob": operation_gate_prob,
             "operation_gate_hard": operation_gate_hard.detach(),
+            "heuristic_guidance_enabled": bool(heuristic_guidance is not None),
+            "heuristic_guidance_dataset": str((heuristic_guidance or {}).get("dataset", "")),
+            "heuristic_guidance_scale_m": int((heuristic_guidance or {}).get("scale_m", -1)),
+            "heuristic_guidance_profile_source": str((heuristic_guidance or {}).get("profile_source", "")),
+            "heuristic_guidance_total_ratio": float((heuristic_guidance or {}).get("total_ratio", 0.0)),
+            "heuristic_guidance_operation_heuristics": dict((heuristic_guidance or {}).get("operation_heuristics", {}) or {}),
+            "heuristic_guidance_amount_prior": dict((heuristic_guidance or {}).get("amount_prior", {}) or {}),
+            "heuristic_guidance_action_gate_prior": dict((heuristic_guidance or {}).get("action_gate_prior", {}) or {}),
             "operation_gate_logit": operation_gate_logit,
             "drop_operation_gate": drop_operation_gate.mean(),
             "add_operation_gate": add_operation_gate.mean(),

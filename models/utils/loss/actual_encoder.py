@@ -441,6 +441,12 @@ class _SparsePCGCActualEncoder:
             self._csv_arg(getattr(self.args, "sparsepcgc_dense_scale_sr_list", "0,1,1,2,2,3")),
             "--pos-quantscale-list",
             self._csv_arg(getattr(self.args, "sparsepcgc_pos_quantscale_list", "4")),
+            "--scale-m",
+            str(int(getattr(self.args, "sparsepcgc_scale_m", 8))),
+            "--scale-ae",
+            str(int(getattr(self.args, "sparsepcgc_scale_ae", 0))),
+            "--scale-sr",
+            str(int(getattr(self.args, "sparsepcgc_scale_sr", 2))),
         ]
         if bool(getattr(self.args, "sparsepcgc_worker_gpu_stats", True)):
             cmd.append("--gpu-stats")
@@ -502,7 +508,10 @@ class _SparsePCGCActualEncoder:
         if self.writer is not None and hasattr(self.writer, "write"):
             self.writer.write(
                 "SparsePCGC actual encoder loaded: "
-                f"mode={getattr(self.args, 'sparsepcgc_mode', 'dense_lossless')}, "
+                f"mode={getattr(self.args, 'sparsepcgc_mode', 'dense_lossy')}, "
+                f"m={int(getattr(self.args, 'sparsepcgc_scale_m', 8))}, "
+                f"AE={int(getattr(self.args, 'sparsepcgc_scale_ae', 0))}, "
+                f"SR={int(getattr(self.args, 'sparsepcgc_scale_sr', 2))}, "
                 f"device={getattr(self.args, 'sparsepcgc_device', 'auto')}, "
                 f"python={' '.join(self._python_command())}, stderr={self._stderr_path}"
             )
@@ -614,6 +623,10 @@ class _SparsePCGCActualEncoder:
                     f"{response.get('message', response)}. See stderr log: {self._stderr_path}"
                 )
             result = response.get("result", {})
+            result["sparsepcgc_scale_m"] = int(getattr(self.args, "sparsepcgc_scale_m", 8))
+            result["sparsepcgc_scale_ae"] = int(getattr(self.args, "sparsepcgc_scale_ae", 0))
+            result["sparsepcgc_scale_sr"] = int(getattr(self.args, "sparsepcgc_scale_sr", 2))
+            result["sparsepcgc_mode_effective"] = str(getattr(self.args, "sparsepcgc_mode", "dense_lossy"))
             decoded_copy_dir = str(getattr(self.args, "sparsepcgc_decoded_copy_dir", "") or "").strip()
             if decoded_copy_dir:
                 decoded_path_text = str(result.get("decoded_path", "") or "")

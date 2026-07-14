@@ -2651,8 +2651,8 @@ def parse_pugan_args(parser, file_day, file_time):
     # Octree Compression
     parser.add_argument('--max_gpu_mem_it', type=int, default=2**9, help='GPUメモリ制限に応じた反復回数')
     parser.add_argument('--oa_subprocess', default=False, type=str2bool, help='サブプロセスで圧縮を行うか')
-    parser.add_argument('--surrogate', default=True, type=str2bool, help='TrueならproxyではなくOctAttention surrogateを圧縮損失に使う')
-    parser.add_argument('--compression_loss_backend', default='proxy', type=str, help='圧縮損失の計算方法(proxy/octattention_actual/octattention_actual_ste/octattention_surrogate/sparsepcgc_actual/sparsepcgc_actual_ste/sparsepcgc_surrogate/gpcc_actual/gpcc_actual_ste/gpcc_surrogate/draco_actual/draco_actual_ste/draco_surrogate)。surrogateは実圧縮教師の百分率を周期的に模倣する')
+    parser.add_argument('--surrogate', default=False, type=str2bool, help='TrueならSurrogateを使う。SparsePCGC提案手法の既定はactual STEでありFalse')
+    parser.add_argument('--compression_loss_backend', default='sparsepcgc_actual_ste', type=str, help='圧縮損失の計算方法。既定はSparsePCGC実圧縮値をforward、既存proxyをbackwardへ使うactual STE')
     parser.add_argument('--compression_grad_probe', default=False, type=str2bool, help='圧縮損失から出力点群へ勾配が流れるか各stepで表示するか')
     parser.add_argument('--compression_grad_probe_every', default=10, type=int, help='圧縮損失の勾配診断を何回に1回表示するか')
     parser.add_argument('--octattention_actualcode', default=False, type=str2bool, help='OctAttention実圧縮で算術符号化後の実bitを使うか（学習中はFalse推奨）')
@@ -2661,7 +2661,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--sparsepcgc_env', default='sparsepcgc', type=str, help='SparsePCGC teacherを実行するconda環境名')
     parser.add_argument('--sparsepcgc_python', default='', type=str, help='SparsePCGC teacher用Pythonの絶対パス（空ならsparsepcgc_envから探索）')
     parser.add_argument('--sparsepcgc_root', default=str(_DEFAULT_SPARSEPCGC_ROOT), type=str, help='SparsePCGCリポジトリのパス')
-    parser.add_argument('--sparsepcgc_mode', default='dense_lossless', type=str, help='SparsePCGC mode(dense_lossless/dense_lossy/sparse_lossless/sparse_lossy_gpcc)')
+    parser.add_argument('--sparsepcgc_mode', default='dense_lossy', type=str, help='SparsePCGC mode。提案手法の既定はdense_lossy')
     parser.add_argument('--sparsepcgc_device', default='auto', type=str, help='SparsePCGC teacherの実行先(auto/cuda/cpu/cuda:0など)')
     parser.add_argument('--sparsepcgc_tmp_dir', default='', type=str, help='SparsePCGC teacher用一時ディレクトリ（空なら/dev/shm優先）')
     parser.add_argument('--sparsepcgc_timeout', default=600.0, type=float, help='SparsePCGC teacherの1リクエスト待ち時間（秒）')
@@ -2726,6 +2726,18 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--sparsepcgc_dense_scale_ae_list', default='1,0,1,0,1,0', type=str, help='SparsePCGC dense_lossy用AE scale list')
     parser.add_argument('--sparsepcgc_dense_scale_sr_list', default='0,1,1,2,2,3', type=str, help='SparsePCGC dense_lossy用SR scale list')
     parser.add_argument('--sparsepcgc_pos_quantscale_list', default='4', type=str, help='SparsePCGC sparse_lossy_gpcc用posQuantscale list')
+    parser.add_argument('--sparsepcgc_scale_m', default=8, type=int, help='SparsePCGC dense lossyの有効m。既定8')
+    parser.add_argument('--sparsepcgc_scale_ae', default=0, type=int, choices=[0, 1], help='mからAE/SRを決める際のAE scale。ana_den6と同じ既定0')
+    parser.add_argument('--sparsepcgc_native_bit_depth', default=0, type=int, help='m=bit_depth-(AE+SR)を計算するnative bit depth。0は8i/MVUB=10、UVG=9を自動選択')
+    parser.add_argument('--heuristic_guidance_enabled', default=True, type=str2bool, help='ana_den6由来HeuristicをWhere/Amount/Actionのpriorとして使う')
+    parser.add_argument('--heuristic_guidance_where_weight', default=1.0, type=float, help='Heuristic Where scoreを既存Actuator logitへ加える重み')
+    parser.add_argument('--heuristic_guidance_action_strength', default=0.50, type=float, help='Action gateをHeuristic構成比へ寄せる強さ。0でNetworkのみ、1でprior gate')
+    parser.add_argument('--heuristic_guidance_amount_residual_fraction', default=0.50, type=float, help='NetworkがHeuristic Amountから上下へ変更できる相対幅')
+    parser.add_argument('--heuristic_guidance_amount_min_residual', default=0.0001, type=float, help='Amount residual探索幅の最小値')
+    parser.add_argument('--heuristic_guidance_amount_grad_scale', default=1.0, type=float, help='Heuristic Amount範囲制限のSTEでAmount headへ返す勾配倍率')
+    parser.add_argument('--heuristic_guidance_total_ratio_percent', default=-1.0, type=float, help='合計操作割合の上書き[%]。負ならデータセット/m別ana_den6初期値')
+    parser.add_argument('--heuristic_guidance_operation_shares', default='', type=str, help='Add,Prune,Adjust構成比の上書き。例0.4,0.4,0.2')
+    parser.add_argument('--heuristic_guidance_operation_heuristics', default='', type=str, help='Add,Prune,AdjustのHeuristic名上書き。3項目をカンマ区切り')
     parser.add_argument('--gpcc_root', default=str(_DEFAULT_GPCC_ROOT), type=str, help='G-PCCリポジトリのパス')
     parser.add_argument('--gpcc_encoder_path', default=str(_DEFAULT_GPCC_ENCODER), type=str, help='G-PCC tmc3 encoderのパス')
     parser.add_argument('--gpcc_cfg_dir', default=str(_DEFAULT_GPCC_CFG_DIR), type=str, help='G-PCC encoder.cfgを含む設定ディレクトリ')
@@ -2863,7 +2875,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--sparsepcgc_aux_min_corr', default=0.30, type=float, help='proxy aux backpropを許可する最小rolling相関')
     parser.add_argument('--sparsepcgc_aux_min_sign_match', default=0.50, type=float, help='proxy aux backpropを許可する最小rolling符号一致率')
     parser.add_argument('--sparsepcgc_aux_gating_window', default=100, type=int, help='proxy aux gateに使うrollingサンプル数')
-    parser.add_argument('--sparsepcgc_disable_add', default=False, type=str2bool, help='SparsePCGCでは新規active coordinate増加を避けるため追加操作を既定で止める')
+    parser.add_argument('--sparsepcgc_disable_add', default=False, type=str2bool, help='SparsePCGCでAddを止めるか。Heuristic-guided混合操作の既定はFalse')
     parser.add_argument('--surrogate_step', default=0, type=int, help='main network更新前にSurrogateだけをactual teacherへfitさせるstep数')
     parser.add_argument('--surrogate_pretrain_lr', default=1e-4, type=float, help='Surrogate pretrain中のlearning rate')
     parser.add_argument('--surrogate_pretrain_actual_refresh_interval', default=10, type=int, help='Surrogate pretrain中のactual teacher refresh間隔')
@@ -2942,8 +2954,8 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--compression_bad_step_penalty_scale', default=1.25, type=float, help='実bit悪化stepの主圧縮勾配倍率')
     parser.add_argument('--compression_boost_requires_surrogate_frozen', default=True, type=str2bool, help='good/bad勾配倍率をSurrogate frozen後だけ有効にする')
     parser.add_argument('--compression_boost_max_abs_error', default=1.0, type=float, help='good/bad勾配倍率を許可するSurrogate abs error上限')
-    parser.add_argument('--sparsepcgc_enable_add_experiment', default=False, type=str2bool, help='SparsePCGCでもAddを実験的に許可する。defaultは必ずFalse')
-    parser.add_argument('--sparsepcgc_add_only_when_compression_primary', default=True, type=str2bool, help='SparsePCGC Add実験をcompression_primary時だけ許可するか')
+    parser.add_argument('--sparsepcgc_enable_add_experiment', default=False, type=str2bool, help='SparsePCGCでもAddを実験的に許可する。Heuristic guidance有効時は後処理でTrueへ切り替える')
+    parser.add_argument('--sparsepcgc_add_only_when_compression_primary', default=True, type=str2bool, help='SparsePCGC Addをcompression_primary時だけに限定するか。Heuristic guidance有効時はFalseへ切り替える')
     parser.add_argument('--sparsepcgc_add_target_ratio', default=0.005, type=float, help='SparsePCGC Add実験のtarget add ratio')
     parser.add_argument('--sparsepcgc_add_max_ratio', default=0.50, type=float, help='SparsePCGC Add実験のmax add ratio')
     parser.add_argument('--sparsepcgc_add_warmup_steps', default=0, type=int, help='SparsePCGC Add実験のratio warmup step数')
@@ -3619,6 +3631,45 @@ def parse_pugan_args(parser, file_day, file_time):
                 "--surrogate=True currently supports --compress OctAttention, SparsePCGC, or G-PCC "
                 f"(got {args.compress})"
             )
+    # ana_den6と同じm代表設定を実圧縮teacherへ固定する。
+    # native bit depth=10, AE=0, m=8ならSR=2となる。
+    args.sparsepcgc_scale_m = int(getattr(args, "sparsepcgc_scale_m", 8))
+    args.sparsepcgc_scale_ae = int(getattr(args, "sparsepcgc_scale_ae", 0))
+    requested_native_bit_depth = int(getattr(args, "sparsepcgc_native_bit_depth", 0))
+    if requested_native_bit_depth <= 0:
+        dataset_key_for_m = str(getattr(args, "dataname", "8i")).strip().lower()
+        # den6の実測設定に合わせ、UVGは9-bit、8i/MVUBは10-bitを使う。
+        requested_native_bit_depth = 9 if dataset_key_for_m == "uvg" else 10
+    args.sparsepcgc_native_bit_depth = max(requested_native_bit_depth, 1)
+    if not _cli_option_was_provided("--sparsepcgc_psnr_resolution"):
+        args.sparsepcgc_psnr_resolution = 511 if dataset_key_for_m == "uvg" else 1023
+    sparsepcgc_scale_sr = args.sparsepcgc_native_bit_depth - args.sparsepcgc_scale_m - args.sparsepcgc_scale_ae
+    if sparsepcgc_scale_sr < 0:
+        raise ValueError(
+            "SparsePCGC dense lossy設定が不正である: "
+            f"bit_depth={args.sparsepcgc_native_bit_depth}, AE={args.sparsepcgc_scale_ae}, "
+            f"m={args.sparsepcgc_scale_m}"
+        )
+    args.sparsepcgc_scale_sr = int(sparsepcgc_scale_sr)
+    if not _cli_option_was_provided("--sparsepcgc_dense_scale_ae_list"):
+        args.sparsepcgc_dense_scale_ae_list = str(args.sparsepcgc_scale_ae)
+    if not _cli_option_was_provided("--sparsepcgc_dense_scale_sr_list"):
+        args.sparsepcgc_dense_scale_sr_list = str(args.sparsepcgc_scale_sr)
+    args.heuristic_guidance_enabled = bool(getattr(args, "heuristic_guidance_enabled", True))
+    args.heuristic_guidance_where_weight = max(float(getattr(args, "heuristic_guidance_where_weight", 1.0)), 0.0)
+    args.heuristic_guidance_action_strength = min(max(float(getattr(args, "heuristic_guidance_action_strength", 0.50)), 0.0), 1.0)
+    args.heuristic_guidance_amount_residual_fraction = max(float(getattr(args, "heuristic_guidance_amount_residual_fraction", 0.50)), 0.0)
+    args.heuristic_guidance_amount_min_residual = max(float(getattr(args, "heuristic_guidance_amount_min_residual", 0.0001)), 0.0)
+    args.heuristic_guidance_amount_grad_scale = max(float(getattr(args, "heuristic_guidance_amount_grad_scale", 1.0)), 0.0)
+    if args.heuristic_guidance_enabled and compress_key == "sparsepcgc":
+        # Add/Prune/Adjustを同時候補として残す。各操作量はHeuristic prior周辺でNetworkが微調整する。
+        if not _cli_option_was_provided("--sparsepcgc_disable_add"):
+            args.sparsepcgc_disable_add = False
+        if not _cli_option_was_provided("--sparsepcgc_enable_add_experiment"):
+            args.sparsepcgc_enable_add_experiment = True
+        if not _cli_option_was_provided("--sparsepcgc_add_only_when_compression_primary"):
+            args.sparsepcgc_add_only_when_compression_primary = False
+
     args.method_name = str(getattr(args, "method_name", method_name)).strip() or method_name
     args.surrogate_name = _compress_display_name(args.compress)
     args.run_name = str(getattr(args, "run_name", "")).strip()
@@ -5659,9 +5710,11 @@ def parse_pugan_args(parser, file_day, file_time):
         if not _cli_option_was_provided("--repair_output_voxel_restored_points"):
             args.repair_output_voxel_restored_points = True
         if not _cli_option_was_provided("--leaf_pattern_operation_mask"):
-            args.leaf_pattern_operation_mask = True
+            # Heuristic Whereはsoft biasとして使うため、候補を消すhard maskは既定で無効にする。
+            args.leaf_pattern_operation_mask = not bool(args.heuristic_guidance_enabled)
         if not _cli_option_was_provided("--leaf_pattern_target_direction_mask"):
-            args.leaf_pattern_target_direction_mask = True
+            # target方向もNetworkが微調整できるよう、Heuristic有効時はsoft priorだけを残す。
+            args.leaf_pattern_target_direction_mask = not bool(args.heuristic_guidance_enabled)
         if not _cli_option_was_provided("--repair_add_pattern_prior_weight"):
             args.repair_add_pattern_prior_weight = 1.75
         if not _cli_option_was_provided("--repair_add_pair_pattern_prior_weight"):
@@ -5681,9 +5734,17 @@ def parse_pugan_args(parser, file_day, file_time):
                 else 256
             )
         if not _cli_option_was_provided("--repair_max_hard_move_voxels"):
-            args.repair_max_hard_move_voxels = 1
+            # den6初期割合を実行可能にする。0はratio上限のみで、無制限ではない。
+            args.repair_max_hard_move_voxels = 0 if args.heuristic_guidance_enabled else 1
         if not _cli_option_was_provided("--sparsepcgc_actual_oracle_edit"):
-            args.sparsepcgc_actual_oracle_edit = True
+            # Heuristicが探索範囲を与えるため、重い候補別actual oracleは既定で走らせない。
+            # actual圧縮loss自体はactual_eval_intervalで継続する。
+            args.sparsepcgc_actual_oracle_edit = not bool(args.heuristic_guidance_enabled)
+        if args.heuristic_guidance_enabled:
+            if not _cli_option_was_provided("--sparsepcgc_actual_gate_non_prune"):
+                args.sparsepcgc_actual_gate_non_prune = False
+            if not _cli_option_was_provided("--sparsepcgc_actual_gate_prune"):
+                args.sparsepcgc_actual_gate_prune = False
         if not _cli_option_was_provided("--sparsepcgc_actual_oracle_max_candidates"):
             args.sparsepcgc_actual_oracle_max_candidates = 12
         if not _cli_option_was_provided("--sparsepcgc_actual_oracle_actual_eval_max"):

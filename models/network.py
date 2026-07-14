@@ -1613,6 +1613,10 @@ class Network(nn.Module):
             lowprob_proxy_full_list = []
             occupancy_nll_proxy_full_list = []
             quant_proxy_full_list = []
+            # OctreeStructureAnalysisで作ったHeuristic Where priorを、
+            # Sparse Tensor経路でも全点群座標へ揃えて保持する。
+            heuristic_where_full_lists = {"Add": [], "Prune": [], "Adjust": []}
+            heuristic_guidance_template = None
             cause_scores_means = []
             subtree_scores_means = []
             policy_probs_means = []
@@ -1725,6 +1729,29 @@ class Network(nn.Module):
 
                 """点操作前処理"""
                 full_xyz_b = pts_xyz[b:b + 1]
+                guidance_b = structure_b.get("heuristic_guidance", None) if isinstance(structure_b, dict) else None
+                if isinstance(guidance_b, dict) and bool(guidance_b.get("enabled", False)):
+                    if heuristic_guidance_template is None:
+                        heuristic_guidance_template = {
+                            key: value
+                            for key, value in guidance_b.items()
+                            if key not in {"where_prior", "where_prior_mean"}
+                        }
+                    where_b = guidance_b.get("where_prior", {})
+                    prior_channels = []
+                    for operation in ("Add", "Prune", "Adjust"):
+                        prior_b = where_b.get(operation) if isinstance(where_b, dict) else None
+                        if not torch.is_tensor(prior_b):
+                            prior_b = analysis_xyz_b.new_zeros((1, 1, analysis_count))
+                        prior_channels.append(prior_b.to(device=pts_xyz.device, dtype=pts_xyz.dtype))
+                    # 3操作を一度に伝播し、同じKNN探索の重複を避ける。
+                    prior_b3 = torch.cat(prior_channels, dim=1)
+                    if analysis_xyz_b.shape[-1] != full_xyz_b.shape[-1]:
+                        prior_b3 = self._propagate_encoder_features(full_xyz_b, analysis_xyz_b, prior_b3)
+                    for channel_index, operation in enumerate(("Add", "Prune", "Adjust")):
+                        heuristic_where_full_lists[operation].append(
+                            prior_b3[:, channel_index:channel_index + 1, :].detach()
+                        )
                 if analysis_xyz_b.shape[-1] == full_xyz_b.shape[-1]:
                     structure_feat_full_list.append(structure_feat_b)
                     subtree_scores_full_list.append(subtree_scores_b)
@@ -1846,6 +1873,22 @@ class Network(nn.Module):
                 "leaf_move_gain_mean": float(structure_b.get("leaf_move_gain_mean", 0.0) or 0.0) if structure_b is not None else 0.0,
                 "leaf_high_gain_candidate_ratio": float(structure_b.get("leaf_high_gain_candidate_ratio", 0.0) or 0.0) if structure_b is not None else 0.0,
             }
+            if heuristic_guidance_template is not None and all(
+                len(heuristic_where_full_lists[operation]) == int(pts_xyz.shape[0])
+                for operation in ("Add", "Prune", "Adjust")
+            ):
+                structure["heuristic_guidance"] = {
+                    **heuristic_guidance_template,
+                    "where_prior": {
+                        operation: torch.cat(heuristic_where_full_lists[operation], dim=0)
+                        for operation in ("Add", "Prune", "Adjust")
+                    },
+                    "where_prior_mean": {},
+                }
+            elif structure_b is not None and isinstance(structure_b.get("heuristic_guidance", None), dict):
+                # disabled理由などTensorを含まないsummaryはそのまま保持する。
+                structure["heuristic_guidance"] = dict(structure_b["heuristic_guidance"])
+
             cause_mean = torch.stack(cause_scores_means, dim=0).mean(dim=0).squeeze(0).detach().cpu()
             subtree_mean = torch.stack(subtree_scores_means, dim=0).mean(dim=0).squeeze(0).detach().cpu()
             policy_mean = torch.stack(policy_probs_means, dim=0).mean(dim=0).squeeze(0).detach().cpu()
@@ -2083,6 +2126,14 @@ class Network(nn.Module):
         is_full_cloud_forward = octree_mode_text == "full_cloud"
 
         """点操作実行"""
+        if isinstance(structure, dict):
+            guidance = structure.get("heuristic_guidance", None)
+            if isinstance(guidance, dict):
+                structure["heuristic_guidance_enabled"] = bool(guidance.get("enabled", False))
+                structure["heuristic_guidance_dataset"] = str(guidance.get("dataset", ""))
+                structure["heuristic_guidance_scale_m"] = int(guidance.get("scale_m", -1))
+                structure["heuristic_guidance_profile_source"] = str(guidance.get("profile_source", ""))
+                structure["heuristic_guidance_total_ratio"] = float(guidance.get("total_ratio", 0.0))
         actuator_input = torch.cat(
             [structure_feat_full, subtree_scores_full, policy_probs_full, repair_priority_full],
             dim=1,
@@ -2200,6 +2251,14 @@ class Network(nn.Module):
                 "raw_learned_drop_ratio",
                 "raw_learned_add_ratio",
                 "raw_learned_move_ratio",
+                "heuristic_guidance_enabled",
+                "heuristic_guidance_dataset",
+                "heuristic_guidance_scale_m",
+                "heuristic_guidance_profile_source",
+                "heuristic_guidance_total_ratio",
+                "heuristic_guidance_operation_heuristics",
+                "heuristic_guidance_amount_prior",
+                "heuristic_guidance_action_gate_prior",
             )
             if actuator_stats.get(key, None) is not None
         }
@@ -2971,6 +3030,13 @@ class Network(nn.Module):
                     "sparsepcgc_exact_teacher_mode": str(getattr(self.args, "_current_exact_teacher_mode", getattr(self.args, "sparsepcgc_exact_teacher_mode", "auto"))),
                     "exact_teacher_uses_full_context": bool(getattr(self.args, "_current_exact_teacher_uses_full_context", False)),
                     "exact_teacher_fallback_reason": str(getattr(self.args, "_current_exact_teacher_fallback_reason", "")),
+                    "heuristic_guidance_enabled": bool(actuator_stats.get("heuristic_guidance_enabled", False)),
+                    "heuristic_guidance_dataset": str(actuator_stats.get("heuristic_guidance_dataset", "")),
+                    "heuristic_guidance_scale_m": int(actuator_stats.get("heuristic_guidance_scale_m", -1)),
+                    "heuristic_guidance_profile_source": str(actuator_stats.get("heuristic_guidance_profile_source", "")),
+                    "heuristic_guidance_total_ratio": float(actuator_stats.get("heuristic_guidance_total_ratio", 0.0)),
+                    "heuristic_guidance_operation_heuristics": str(actuator_stats.get("heuristic_guidance_operation_heuristics", {})),
+                    "heuristic_guidance_amount_prior": str(actuator_stats.get("heuristic_guidance_amount_prior", {})),
                 }
                 for key in (
                     "actual_oracle_bad_candidate_count",

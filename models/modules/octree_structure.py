@@ -3,6 +3,7 @@ import torch.nn as nn
 from contextlib import nullcontext
 from ..utils.pointcloud.utils_repkpu import get_knn_pts
 from ..utils.compression.proxy_octree import ProxyOctreeConfig, SoftOctreeRateProxy
+from .heuristic_guidance import build_heuristic_guidance
 
 
 class OctreeStructureAnalysis(nn.Module):
@@ -1998,7 +1999,7 @@ class OctreeStructureAnalysis(nn.Module):
                         dtype=torch.long,
                     )
                     phase4_structural_key_source = "global_voxel_coords_hash"
-        return {
+        result = {
             "features": feature.to(dtype=input_dtype),
             "cause_targets": cause_targets.to(dtype=input_dtype),
             "oct_ctx": oct_ctx.to(dtype=input_dtype),
@@ -2099,3 +2100,7 @@ class OctreeStructureAnalysis(nn.Module):
             "leaf_feature_best_gain_mean": float(leaf_feature_best_gain_mean),
             "leaf_feature_best_gain_max": float(leaf_feature_best_gain_max),
         }
+        # ana_den6の式を既存proxyへ写像したpriorである。
+        # 追加のactual codec呼出やKNNは行わないため、Step時間への影響を小さく保つ。
+        result["heuristic_guidance"] = build_heuristic_guidance(result, self.args)
+        return result

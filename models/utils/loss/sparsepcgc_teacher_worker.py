@@ -105,6 +105,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--dense-scale-ae-list", default="1,0,1,0,1,0")
     parser.add_argument("--dense-scale-sr-list", default="0,1,1,2,2,3")
     parser.add_argument("--pos-quantscale-list", default="4")
+    parser.add_argument("--scale-m", type=int, default=8)
+    parser.add_argument("--scale-ae", type=int, default=0)
+    parser.add_argument("--scale-sr", type=int, default=2)
     parser.add_argument("--decode", action="store_true")
     parser.add_argument(
         "--gpu-stats",
@@ -143,8 +146,16 @@ def _build_encoder(args: argparse.Namespace):
         pos_quantscale=int(args.pos_quantscale),
         psnr_resolution=int(args.psnr_resolution),
         test_d2=bool(args.test_d2),
-        dense_scale_ae_list=_csv_int_list(args.dense_scale_ae_list),
-        dense_scale_sr_list=_csv_int_list(args.dense_scale_sr_list),
+        dense_scale_ae_list=(
+            [int(args.scale_ae)]
+            if str(args.mode).strip().lower() == "dense_lossy"
+            else _csv_int_list(args.dense_scale_ae_list)
+        ),
+        dense_scale_sr_list=(
+            [int(args.scale_sr)]
+            if str(args.mode).strip().lower() == "dense_lossy"
+            else _csv_int_list(args.dense_scale_sr_list)
+        ),
         pos_quantscale_list=_csv_int_list(args.pos_quantscale_list),
         skip_decode=not bool(args.decode),
     )
@@ -173,6 +184,9 @@ def main() -> int:
         "status": "ready",
         "mode": args.mode,
         "device": args.device,
+        "scale_m": int(args.scale_m),
+        "scale_ae": int(args.scale_ae),
+        "scale_sr": int(args.scale_sr),
     }
     if bool(args.gpu_stats):
         ready_payload.update(_collect_cuda_stats("sparsepcgc_worker_init"))
@@ -218,6 +232,11 @@ def main() -> int:
 
             if not isinstance(result, dict):
                 result = {"sparsepcgc_worker_raw_result": result}
+
+            result["sparsepcgc_scale_m"] = int(args.scale_m)
+            result["sparsepcgc_scale_ae"] = int(args.scale_ae)
+            result["sparsepcgc_scale_sr"] = int(args.scale_sr)
+            result["sparsepcgc_mode_effective"] = str(args.mode)
 
             if bool(args.gpu_stats):
                 result.update(gpu_before)
