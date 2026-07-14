@@ -373,7 +373,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--sparse_tensor_keep_after_encoder', default=True, type=str2bool, help='Encoder後も診断/方策決定まではUpsampling後のSparse Tensor経路を維持するか')
     parser.add_argument('--network_voxel_node_input', default=True, type=str2bool, help='Network入力を点群中心ではなくVoxel/Node中心にする')
     parser.add_argument('--network_voxel_node_fallback_point', default=False, type=str2bool, help='Node/Voxel入力情報が不足した場合に点群経路へfallbackする')
-    parser.add_argument('--network_voxel_node_debug', default=True, type=str2bool, help='Node/Voxel入力経路のdebug情報を出す')
+    parser.add_argument('--network_voxel_node_debug', default=False, type=str2bool, help='Node/Voxel入力経路のdebug情報を出す。通常学習ではGPU同期を避けるため既定False')
     parser.add_argument(
         '--full_cloud_anchor_allow_grad',
         default=False,
@@ -443,10 +443,10 @@ def parse_pugan_args(parser, file_day, file_time):
         help='aggregation unit_count=1をPhase5 guardの停止対象にする',
     )
     # Phase7-3 debug / metric
-    parser.add_argument('--phase7_debug', default=True, type=str2bool, help='Phase7接続修正後の経路・loss・actual入力debugを出す')
+    parser.add_argument('--phase7_debug', default=False, type=str2bool, help='Phase7接続修正後の経路・loss・actual入力debugを出す。通常学習では既定False')
     parser.add_argument('--phase7_grad_debug', default=False, type=str2bool, help='Phase7でActuator/Policy/CostAttributorのgrad normを出す')
     parser.add_argument('--phase7_debug_every', default=10, type=int, help='Phase7 debugを何stepごとに出すか')
-    parser.add_argument('--phase7_debug_print', default=True, type=str2bool, help='Phase7 debugを標準出力にも出す')
+    parser.add_argument('--phase7_debug_print', default=False, type=str2bool, help='Phase7 debugを標準出力にも出す。通常学習ではGPU同期を避けるため既定False')
     # Phase7-4 ablation / sanity check
     parser.add_argument(
         '--phase7_ablation_mode',
@@ -472,9 +472,9 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--phase7_grad_sanity_check',
-        default=True,
+        default=False,
         type=str2bool,
-        help='Phase7で主要moduleのgrad sanity checkを行う',
+        help='Phase7で主要moduleのgrad sanity checkを行う。全parameter走査を避けるため通常学習では既定False',
     )
     parser.add_argument(
         '--phase7_grad_sanity_every',
@@ -520,9 +520,9 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--leaf_pattern_diagnosis_debug',
-        default=True,
+        default=False,
         type=str2bool,
-        help='leaf pattern診断の集計値をstructure debugへ出す',
+        help='leaf pattern診断の集計値をstructure debugへ出す。候補Tensor自体は維持し、CPU同期を伴う集計だけを既定で止める',
     )
     parser.add_argument(
         '--leaf_pattern_candidate_diagnosis',
@@ -2332,7 +2332,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--full_context_subtree_loss_weight', default=0.2, type=float, help='full-context subtree delta lossの重み')
     parser.add_argument('--full_context_subtree_loss_grad_weight', default=0.1, type=float, help='full-context subtree delta lossのproxy勾配重み')
     parser.add_argument('--full_context_subtree_loss_require_context', default=True, type=str2bool, help='subtree_tree/full_octree_contextがない場合はfull-context subtree lossを無効化する')
-    parser.add_argument('--full_context_subtree_loss_log', default=True, type=str2bool, help='full-context subtree delta lossのdebugログを出す')
+    parser.add_argument('--full_context_subtree_loss_log', default=False, type=str2bool, help='full-context subtree delta lossのdebugログを出す。通常学習では既定False')
     parser.add_argument('--full_context_subtree_loss_node_weight', default=0.05, type=float, help='full-context subtree loss内のnode count差分重み')
     parser.add_argument('--full_context_subtree_loss_single_weight', default=0.10, type=float, help='full-context subtree loss内のsingle-child差分重み')
     parser.add_argument('--full_context_subtree_loss_entropy_weight', default=0.20, type=float, help='full-context subtree loss内のoccupancy entropy差分重み')
@@ -2353,7 +2353,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--full_cloud_actual_correction_warmup_steps', default=0, type=int, help='full cloud actual correctionを有効化するまでのwarmup step')
     parser.add_argument('--full_cloud_actual_correction_ema', default=0.90, type=float, help='full cloud actual gapのEMA係数')
     parser.add_argument('--full_cloud_actual_correction_clip', default=5.0, type=float, help='full cloud actual correction値のclip上限')
-    parser.add_argument('--full_cloud_actual_correction_debug', default=True, type=str2bool, help='full cloud actual correctionのdebugログを出す')
+    parser.add_argument('--full_cloud_actual_correction_debug', default=False, type=str2bool, help='full cloud actual correctionのdebugログを出す。通常学習では既定False')
     parser.add_argument('--full_cloud_actual_correction_loss_enable', default=True, type=str2bool, help='full cloud actual correctionを実際にlossへ足すか')
     parser.add_argument('--full_cloud_actual_correction_penalize_move', default=True, type=str2bool, help='full cloud actual悪化時にMove量を補正ペナルティの観測対象にする')
     parser.add_argument('--full_cloud_actual_correction_penalize_add', default=True, type=str2bool, help='full cloud actual悪化時にAdd量を補正ペナルティの観測対象にする')
@@ -2666,14 +2666,21 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--sparsepcgc_tmp_dir', default='', type=str, help='SparsePCGC teacher用一時ディレクトリ（空なら/dev/shm優先）')
     parser.add_argument('--sparsepcgc_timeout', default=600.0, type=float, help='SparsePCGC teacherの1リクエスト待ち時間（秒）')
     parser.add_argument('--sparsepcgc_skip_decode', default=True, type=str2bool, help='SparsePCGC teacherで復号を省略してbitだけ計測するか')
-    parser.add_argument('--sparsepcgc_actual_gt_disk_cache', default=False, type=str2bool, help='静的GTの実SparsePCGC統計をcodec条件付きで永続cacheするか')
+    parser.add_argument('--sparsepcgc_inner_psnr', default=False, type=str2bool, help='SparsePCGC内部の復号・PSNR計算を有効化するか。圧縮lossのbit教師には不要なので既定False')
+    parser.add_argument('--sparsepcgc_fast_binary_ply', default=True, type=str2bool, help='worker入力PLYを同じfloat32座標のbinary little-endianで保存しI/Oを高速化するか')
+    parser.add_argument('--sparsepcgc_binary_ply_fallback_ascii', default=True, type=str2bool, help='環境側readerがbinary PLYを読めない場合にASCIIへ一度だけ自動fallbackするか')
+    parser.add_argument('--sparsepcgc_reuse_workspace', default=True, type=str2bool, help='actual worker用一時directoryをrequest間で再利用するか')
+    parser.add_argument('--sparsepcgc_actual_result_cache', default=True, type=str2bool, help='同一Voxel集合・同一codec設定のactual結果をprocess内LRU cacheで再利用するか')
+    parser.add_argument('--sparsepcgc_actual_result_cache_max_entries', default=256, type=int, help='SparsePCGC actual結果LRU cacheの最大件数')
+    parser.add_argument('--sparsepcgc_omp_threads', default=12, type=int, help='SparsePCGC workerのOMP thread数')
+    parser.add_argument('--sparsepcgc_actual_gt_disk_cache', default=True, type=str2bool, help='静的GTの実SparsePCGC統計をcodec条件付きで永続cacheするか')
     parser.add_argument('--sparsepcgc_actual_gt_disk_cache_dir', default=str((_DATA_ROOT / 'cache' / 'sparsepcgc_actual_gt').resolve()), type=str, help='実SparsePCGC GT統計の永続cache先')
     parser.add_argument('--sparsepcgc_actual_oracle_release_cuda_cache', default=False, type=str2bool, help='actual oracle直前にmyNet側の未使用CUDA予約領域を解放するか（同期コストが大きいため既定False）')
     parser.add_argument(
         '--sparsepcgc_worker_gpu_stats',
-        default=True,
+        default=False,
         type=str2bool,
-        help='SparsePCGC worker側のCUDA/GPU使用量をworker resultへ含める',
+        help='SparsePCGC worker側のCUDA/GPU使用量をworker resultへ含める。毎回CUDA同期するため通常学習では既定False',
     )
     parser.add_argument(
         '--sparsepcgc_worker_gpu_stats_print',
@@ -2960,7 +2967,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--sparsepcgc_add_max_ratio', default=0.50, type=float, help='SparsePCGC Add実験のmax add ratio')
     parser.add_argument('--sparsepcgc_add_warmup_steps', default=0, type=int, help='SparsePCGC Add実験のratio warmup step数')
     parser.add_argument('--sparsepcgc_add_use_candidate_score', default=True, type=str2bool, help='SparsePCGC Add実験で既存candidate scoreを使うか')
-    parser.add_argument('--sparsepcgc_add_log_candidates', default=True, type=str2bool, help='SparsePCGC Add候補/scoreログを出すか')
+    parser.add_argument('--sparsepcgc_add_log_candidates', default=False, type=str2bool, help='SparsePCGC Add候補/scoreログを出すか。通常学習では既定False')
     parser.add_argument('--sparsepcgc_add_active_coord_safety_gate', default=True, type=str2bool, help='SparsePCGC Add実験時にactive coord増加を安全gate/ログ対象にするか')
     parser.add_argument('--sparsepcgc_add_unique_coord_safety_gate', default=True, type=str2bool, help='SparsePCGC Add実験時にunique coord増加を安全gate/ログ対象にするか')
     parser.add_argument('--sparsepcgc_move_existing_target_only', default=False, type=str2bool, help='SparsePCGCでmove targetを既存occupied voxelへ寄せる旧実験設定。点潰れを避けるため既定ではFalse')
@@ -3005,11 +3012,11 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--log_gpu_memory', default=True, type=str2bool, help='一定間隔でGPUメモリ使用量をログ出力するか')
     parser.add_argument('--profile_interval', default=100, type=int, help='時間/GPU profileログの出力間隔')
     parser.add_argument('--train_subtree_anchor_on_min_points_miss', default=False, type=str2bool, help='subtreeがmin_pointsを満たせないdepthでは1点subtree学習を避けfull-cloud anchorへ切り替える')
-    parser.add_argument('--for_better_log', default=True, type=str2bool, help='原因追跡用ForBetter.txtを通常ログとは別に出力するか')
+    parser.add_argument('--for_better_log', default=False, type=str2bool, help='原因追跡用ForBetter.txtを通常ログとは別に出力するか。毎Step大量I/Oを避けるため既定False')
     parser.add_argument('--for_better_log_interval', default=1, type=int, help='ForBetter.txtへtrain step診断を書く間隔')
     parser.add_argument('--for_better_spike_ratio', default=2.0, type=float, help='ForBetter.txtの急増event判定倍率')
     parser.add_argument('--for_better_spike_window', default=20, type=int, help='ForBetter.txtの急増event判定rolling window')
-    parser.add_argument('--actual_eval_interval', default=10, type=int, help='train時のactual codec教師refresh間隔。0なら初回以外refreshしない')
+    parser.add_argument('--actual_eval_interval', default=1, type=int, help='train時のactual codec教師refresh間隔。既定1で毎Step実圧縮する。0なら初回以外refreshしない')
     parser.add_argument('--disable_actual_codec_during_train', default=False, type=str2bool, help='train中のactual codec呼び出しをproxyへ置き換えて無効化するか')
     parser.add_argument(
         '--use_voxel_restored_points_for_actual',
@@ -3025,9 +3032,9 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--use_voxel_restored_points_for_actual_debug',
-        default=True,
+        default=False,
         type=str2bool,
-        help='voxel復元actual入力のdebugログを出す',
+        help='voxel復元actual入力のdebugログを出す。通常学習では既定False',
     )
     parser.add_argument(
         '--voxel_restored_actual_require_state',
@@ -3035,7 +3042,7 @@ def parse_pugan_args(parser, file_day, file_time):
         type=str2bool,
         help='final_voxel_coordsが無い場合にエラーにするかfallbackするか',
     )
-    parser.add_argument('--actual_codec_fallback_to_proxy_on_error', default=True, type=str2bool, help='actual/surrogate teacherがtimeout等で失敗した場合にproxy lossへfallbackしてtrainを継続する')
+    parser.add_argument('--actual_codec_fallback_to_proxy_on_error', default=False, type=str2bool, help='actual/surrogate teacherがtimeout等で失敗した場合にproxy lossへfallbackしてtrainを継続するか。毎Step actual保証を優先して既定False')
     parser.add_argument('--skip_optimizer_on_actual_fallback', default=True, type=str2bool, help='actual/surrogate teacher失敗でproxy fallbackしたstepはoptimizer更新をスキップする')
     parser.add_argument('--actual_compression_guard', default=True, type=str2bool, help='episode平均のfresh actual圧縮損失が悪化し続けたらbestへ戻してLRを下げる')
     parser.add_argument('--actual_guard_patience', default=2, type=int, help='actual圧縮悪化を何episode連続で許容するか')
@@ -3164,7 +3171,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--pin_memory', default=True, type=str2bool, help='CPU→GPU転送高速化のためメモリ固定するか')
     parser.add_argument('--persistent_workers', default=True, type=str2bool, help='ワーカーを維持するか')
     parser.add_argument('--dataset_cache', default=False, type=str2bool, help='データセットをメモリにキャッシュするか')
-    parser.add_argument('--episode_input_common_cache', default=False, type=str2bool, help='同じ入力データをEpisodeごとに繰り返すとき、入力依存の共通前処理をCPUキャッシュして再利用するか')
+    parser.add_argument('--episode_input_common_cache', default=True, type=str2bool, help='同じ入力データをEpisodeごとに繰り返すとき、入力依存の共通前処理をCPUキャッシュして再利用するか')
     parser.add_argument('--episode_input_common_cache_enable_dataset_cache', default=True, type=str2bool, help='episode_input_common_cache=True時にPLY dataset_cacheも自動で有効化するか')
     parser.add_argument('--episode_input_common_cache_max_entries', default=0, type=int, help='Episode共通前処理キャッシュの最大件数(0なら学習ファイル数まで自動設定)')
     parser.add_argument('--episode_input_common_cache_max_memory_mb', default=2048, type=int, help='Episode共通前処理キャッシュのCPUメモリ上限(MB, 0で無制限)')
@@ -3197,7 +3204,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--warmup_log_rate', default=8, type=int, help='ウォームアップログ間隔')
     parser.add_argument('--log_flush_every', default=32, type=int, help='ログ書き込みフラッシュ間隔')
     parser.add_argument('--log_sync_every', default=0, type=int, help='ログ同期間隔')
-    parser.add_argument('--verbose_step_logs', default=True, type=str2bool, help='詳細ログを出すか')
+    parser.add_argument('--verbose_step_logs', default=False, type=str2bool, help='詳細ログを出すか。通常学習ではGPU同期と大量I/Oを避けるため既定False')
     parser.add_argument('--compact_step_text_log', default=True, type=str2bool, help='train.txtのStep本文ログを要点だけの短い行へ絞る')
     parser.add_argument('--epoch_plot_rate', default=1, type=int, help='エポックごとのプロット保存間隔')
     parser.add_argument('--episode_plot_rate', default=1, type=int, help='エピソードごとのプロット保存間隔')
@@ -4157,8 +4164,16 @@ def parse_pugan_args(parser, file_day, file_time):
     # 通常ログにhard統計を連動させるかをboolへ正規化する。
     args.sparsepcgc_hard_debug_on_log = bool(getattr(args, "sparsepcgc_hard_debug_on_log", False))
     args.actual_eval_interval = max(int(getattr(args, "actual_eval_interval", 1000)), 0)
+    args.sparsepcgc_inner_psnr = bool(getattr(args, "sparsepcgc_inner_psnr", False))
+    args.sparsepcgc_fast_binary_ply = bool(getattr(args, "sparsepcgc_fast_binary_ply", True))
+    args.sparsepcgc_binary_ply_fallback_ascii = bool(getattr(args, "sparsepcgc_binary_ply_fallback_ascii", True))
+    args.sparsepcgc_reuse_workspace = bool(getattr(args, "sparsepcgc_reuse_workspace", True))
+    args.sparsepcgc_actual_result_cache = bool(getattr(args, "sparsepcgc_actual_result_cache", True))
+    args.sparsepcgc_actual_result_cache_max_entries = max(int(getattr(args, "sparsepcgc_actual_result_cache_max_entries", 256)), 1)
+    args.sparsepcgc_omp_threads = max(int(getattr(args, "sparsepcgc_omp_threads", 12)), 1)
+    args.sparsepcgc_worker_gpu_stats = bool(getattr(args, "sparsepcgc_worker_gpu_stats", False))
     args.disable_actual_codec_during_train = bool(getattr(args, "disable_actual_codec_during_train", False))
-    args.actual_codec_fallback_to_proxy_on_error = bool(getattr(args, "actual_codec_fallback_to_proxy_on_error", True))
+    args.actual_codec_fallback_to_proxy_on_error = bool(getattr(args, "actual_codec_fallback_to_proxy_on_error", False))
     args.skip_optimizer_on_actual_fallback = bool(getattr(args, "skip_optimizer_on_actual_fallback", True))
     args.actual_compression_guard = bool(getattr(args, "actual_compression_guard", True))
     args.actual_guard_patience = max(int(getattr(args, "actual_guard_patience", 2)), 1)
@@ -5634,6 +5649,10 @@ def parse_pugan_args(parser, file_day, file_time):
         if args.compression_loss_backend.endswith("_surrogate") and not _cli_option_was_provided("--actual_eval_interval"):
             # train側のrefresh_actual_genがFalseだとsurrogate teacher更新自体が止まるため、
             # SparsePCGC surrogateではactual teacherを毎Step更新する。
+            args.actual_eval_interval = 1
+        if args.compression_loss_backend in {"sparsepcgc_actual", "sparsepcgc_actual_ste"} and not _cli_option_was_provided("--actual_eval_interval"):
+            # 提案手法では各StepのNetwork出力を実Codecで評価する。
+            # 速度はpersistent worker、decode/PSNR省略、GT/result cache、軽量I/Oで確保する。
             args.actual_eval_interval = 1
         if not _cli_option_was_provided("--compression_surrogate_forward_mode"):
             args.compression_surrogate_forward_mode = "teacher_ste"

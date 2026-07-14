@@ -108,6 +108,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--scale-m", type=int, default=8)
     parser.add_argument("--scale-ae", type=int, default=0)
     parser.add_argument("--scale-sr", type=int, default=2)
+    parser.add_argument(
+        "--inner-psnr",
+        action="store_true",
+        help="SparsePCGC内部でdecode/PSNRを計算する。学習時のbit教師では既定False",
+    )
     parser.add_argument("--decode", action="store_true")
     parser.add_argument(
         "--gpu-stats",
@@ -146,6 +151,16 @@ def _build_encoder(args: argparse.Namespace):
         pos_quantscale=int(args.pos_quantscale),
         psnr_resolution=int(args.psnr_resolution),
         test_d2=bool(args.test_d2),
+        # encoder_multiple.py互換。bit教師では復号・PSNRを行わない。
+        inner_psnr=bool(args.inner_psnr),
+        test_psnr=bool(args.inner_psnr),
+        decode=bool(args.decode),
+        scale_m=int(args.scale_m),
+        scale_ae=int(args.scale_ae),
+        scale_sr=int(args.scale_sr),
+        # encoder_multipleの版差に備えた互換alias。値は上記と同一である。
+        scale_AE=int(args.scale_ae),
+        scale_SR=int(args.scale_sr),
         dense_scale_ae_list=(
             [int(args.scale_ae)]
             if str(args.mode).strip().lower() == "dense_lossy"
@@ -187,6 +202,8 @@ def main() -> int:
         "scale_m": int(args.scale_m),
         "scale_ae": int(args.scale_ae),
         "scale_sr": int(args.scale_sr),
+        "inner_psnr": bool(args.inner_psnr),
+        "decode": bool(args.decode),
     }
     if bool(args.gpu_stats):
         ready_payload.update(_collect_cuda_stats("sparsepcgc_worker_init"))

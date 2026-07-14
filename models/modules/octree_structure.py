@@ -594,6 +594,14 @@ class OctreeStructureAnalysis(nn.Module):
         B, _, N = pts_xyz.shape
         device = pts_xyz.device
         dtype = pts_xyz.dtype
+        collect_debug_scalars = bool(
+            getattr(self.args, "leaf_pattern_diagnosis_debug", False)
+            or (
+                getattr(self.args, "verbose_step_logs", False)
+                and getattr(self.args, "_log_this_step", True)
+            )
+            or getattr(self.args, "_collect_structure_debug", False)
+        )
 
         if coords_b3n.ndim == 2:
             coords_n3 = self._normalize_global_coords_n3(
@@ -649,23 +657,6 @@ class OctreeStructureAnalysis(nn.Module):
         parent_freq_list = []
         parent_nll_list = []
         parent_coords_point_list = []
-        delete_pattern_gain_list = []
-        add_pattern_gain_list = []
-        move_pattern_gain_list = []
-        delete_nll_gain_list = []
-        add_nll_gain_list = []
-        move_nll_gain_list = []
-        delete_valid_mask_list = []
-        add_valid_mask_list = []
-        move_valid_mask_list = []
-        best_add_child_slot_list = []
-        best_move_target_child_slot_list = []
-        best_operation_hint_list = []
-
-        delete_gain_mean_values = []
-        add_gain_mean_values = []
-        move_gain_mean_values = []
-        high_gain_candidate_ratio_values = []
         delete_pattern_gain_list = []
         add_pattern_gain_list = []
         move_pattern_gain_list = []
@@ -792,27 +783,29 @@ class OctreeStructureAnalysis(nn.Module):
             best_operation_hint_list.append(candidate_scores["best_operation_hint"])
 
             unique_parent_count_max = max(unique_parent_count_max, int(unique_parents.shape[0]))
-            unique_pattern_count_max = max(
-                unique_pattern_count_max,
-                int(torch.unique(parent_pattern_code_unique).numel()),
-            )
-            mean_child_count_values.append(float(child_count_unique.detach().float().mean().cpu()))
-            single_child_ratio_values.append(float((child_count_unique <= 1.0).detach().float().mean().cpu()))
-            max_pattern_frequency_values.append(float(parent_pattern_frequency_unique.detach().float().max().cpu()))
-            gain_threshold = float(getattr(self.args, "leaf_pattern_candidate_gain_threshold", 0.05))
-            delete_gain = candidate_scores["delete_nll_gain"].detach().float()
-            add_gain = candidate_scores["add_nll_gain"].detach().float()
-            move_gain = candidate_scores["move_nll_gain"].detach().float()
-            best_gain = torch.maximum(torch.maximum(delete_gain, add_gain), move_gain)
-
-            delete_gain_mean_values.append(float(delete_gain.mean().cpu()) if delete_gain.numel() > 0 else 0.0)
-            add_gain_mean_values.append(float(add_gain.mean().cpu()) if add_gain.numel() > 0 else 0.0)
-            move_gain_mean_values.append(float(move_gain.mean().cpu()) if move_gain.numel() > 0 else 0.0)
-            high_gain_candidate_ratio_values.append(
-                float((best_gain > gain_threshold).to(torch.float32).mean().cpu())
-                if best_gain.numel() > 0
-                else 0.0
-            )
+            if collect_debug_scalars:
+                # 以下はログ専用であり、学習TensorやHeuristic順位には使わない。
+                # 通常StepではGPU同期を避け、ログ対象Stepだけ集計する。
+                unique_pattern_count_max = max(
+                    unique_pattern_count_max,
+                    int(torch.unique(parent_pattern_code_unique).numel()),
+                )
+                mean_child_count_values.append(float(child_count_unique.detach().float().mean().cpu()))
+                single_child_ratio_values.append(float((child_count_unique <= 1.0).detach().float().mean().cpu()))
+                max_pattern_frequency_values.append(float(parent_pattern_frequency_unique.detach().float().max().cpu()))
+                gain_threshold = float(getattr(self.args, "leaf_pattern_candidate_gain_threshold", 0.05))
+                delete_gain = candidate_scores["delete_nll_gain"].detach().float()
+                add_gain = candidate_scores["add_nll_gain"].detach().float()
+                move_gain = candidate_scores["move_nll_gain"].detach().float()
+                best_gain = torch.maximum(torch.maximum(delete_gain, add_gain), move_gain)
+                delete_gain_mean_values.append(float(delete_gain.mean().cpu()) if delete_gain.numel() > 0 else 0.0)
+                add_gain_mean_values.append(float(add_gain.mean().cpu()) if add_gain.numel() > 0 else 0.0)
+                move_gain_mean_values.append(float(move_gain.mean().cpu()) if move_gain.numel() > 0 else 0.0)
+                high_gain_candidate_ratio_values.append(
+                    float((best_gain > gain_threshold).to(torch.float32).mean().cpu())
+                    if best_gain.numel() > 0
+                    else 0.0
+                )
 
         child_slot_out = torch.stack(child_slot_list, dim=0)
         parent_code_out = torch.stack(parent_code_list, dim=0)
@@ -837,6 +830,7 @@ class OctreeStructureAnalysis(nn.Module):
             "available": True,
             "reason": "",
             "source": str(source),
+            "diagnostic_scalars_collected": bool(collect_debug_scalars),
             "voxel_coords": coords_b3n.detach(),
             "parent_coords": parent_coords_out.detach(),
             "child_slot": child_slot_out.detach(),
@@ -1905,8 +1899,17 @@ class OctreeStructureAnalysis(nn.Module):
             # shape_proxyは幾何保持側なので、rate gainだけで過剰に下げない。
             # ここでは触らず、Section4のActuator側でgeometry guardと一緒に使う。
             leaf_feature_integration_used = True
-            leaf_feature_best_gain_mean = float(best_gain_feat.detach().float().mean().cpu())
-            leaf_feature_best_gain_max = float(best_gain_feat.detach().float().max().cpu())
+            collect_leaf_feature_debug = bool(
+                getattr(self.args, "leaf_pattern_diagnosis_debug", False)
+                or (
+                    getattr(self.args, "verbose_step_logs", False)
+                    and getattr(self.args, "_log_this_step", True)
+                )
+                or getattr(self.args, "_collect_structure_debug", False)
+            )
+            if collect_leaf_feature_debug:
+                leaf_feature_best_gain_mean = float(best_gain_feat.detach().float().mean().cpu())
+                leaf_feature_best_gain_max = float(best_gain_feat.detach().float().max().cpu())
 
         cause_targets_raw = torch.cat(
             [

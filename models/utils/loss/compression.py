@@ -1947,6 +1947,63 @@ class CompressionLossMixin:
         }
         return xyz.contiguous(), debug
 
+    def _get_actual_codec_with_proxy_fallback(
+        self,
+        args,
+        *,
+        gen_xyz,
+        gt_xyz,
+        final_w,
+        cache_key,
+        use_proxy_surrogate,
+        actual_gen_xyz,
+        subtree_tree,
+        full_octree_context,
+        octree_input_mode,
+        requested_backend,
+    ):
+        """actual codec障害を1 Stepだけproxyへ退避し、学習全体の中断を防ぐ。"""
+        try:
+            return self._get_compression_loss_actual_codec(
+                args,
+                gen_xyz=gen_xyz,
+                gt_xyz=gt_xyz,
+                final_w=final_w,
+                cache_key=cache_key,
+                use_proxy_surrogate=bool(use_proxy_surrogate),
+                actual_gen_xyz=actual_gen_xyz,
+                subtree_tree=subtree_tree,
+                full_octree_context=full_octree_context,
+                octree_input_mode=octree_input_mode,
+            )
+        except Exception as exc:
+            if not bool(getattr(args, "actual_codec_fallback_to_proxy_on_error", True)):
+                raise
+            error_text = f"{type(exc).__name__}: {exc}"
+            self._reset_actual_encoder_after_error()
+            log_fn = getattr(self, "_log_surrogate_event", None)
+            if callable(log_fn):
+                log_fn(
+                    "actual codec failed; falling back to proxy loss for this step. "
+                    f"backend={requested_backend}, error={error_text[:500]}"
+                )
+            result = self._get_compression_loss_proxy(
+                args,
+                gen_xyz=gen_xyz,
+                gt_xyz=gt_xyz,
+                final_w=final_w,
+                cache_key=cache_key,
+                run_grad_probe=True,
+                actual_gen_xyz=actual_gen_xyz,
+                subtree_tree=subtree_tree,
+                full_octree_context=full_octree_context,
+                octree_input_mode=octree_input_mode,
+            )
+            self.last_compression_debug["actual_codec_error"] = error_text[:1000]
+            self.last_compression_debug["actual_codec_fallback_to_proxy"] = True
+            self.last_compression_debug["requested_backend"] = str(requested_backend)
+            return result
+
     def get_compression_loss(
         self,
         args,
@@ -2077,7 +2134,7 @@ class CompressionLossMixin:
                 self.last_compression_debug["requested_backend"] = backend
                 return L_com, loss_bit, loss_single, loss_nodes, cached_gt, stats_gt
         if backend in {"octattention_actual", "actual_octattention", "real_octattention", "sparsepcgc_actual", "gpcc_actual", "draco_actual"}:
-            return self._get_compression_loss_actual_codec(
+            return self._get_actual_codec_with_proxy_fallback(
                 args,
                 gen_xyz=gen_xyz,
                 gt_xyz=gt_xyz,
@@ -2088,9 +2145,10 @@ class CompressionLossMixin:
                 subtree_tree=subtree_tree,
                 full_octree_context=full_octree_context,
                 octree_input_mode=octree_input_mode,
+                requested_backend=backend,
             )
         if backend in {"octattention_actual_ste", "actual_octattention_ste", "real_octattention_ste", "sparsepcgc_actual_ste", "gpcc_actual_ste", "draco_actual_ste"}:
-            return self._get_compression_loss_actual_codec(
+            return self._get_actual_codec_with_proxy_fallback(
                 args,
                 gen_xyz=gen_xyz,
                 gt_xyz=gt_xyz,
@@ -2101,6 +2159,7 @@ class CompressionLossMixin:
                 subtree_tree=subtree_tree,
                 full_octree_context=full_octree_context,
                 octree_input_mode=octree_input_mode,
+                requested_backend=backend,
             )
         if backend != "proxy":
             raise ValueError(

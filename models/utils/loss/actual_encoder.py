@@ -1,4 +1,5 @@
 import atexit
+import hashlib
 import json
 import os
 import queue
@@ -8,6 +9,7 @@ import tempfile
 import threading
 import time
 import subprocess
+from collections import OrderedDict
 
 import numpy as np
 import torch
@@ -356,6 +358,11 @@ class _SparsePCGCActualEncoder:
         self._loaded = False
         self._stdout_queue = None
         self._stdout_thread = None
+        # SparsePCGC workerは逐次requestで使うため、一時workspaceを再利用する。
+        # 毎Stepのmkdir/rmtreeを避けるが、入力PLYと出力bitstreamはrequestごとに上書きする。
+        self._workspace_dir = None
+        self._workspace_lock = threading.Lock()
+        self._result_cache = OrderedDict()
 
     def _repo_root(self):
         return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
@@ -448,7 +455,9 @@ class _SparsePCGCActualEncoder:
             "--scale-sr",
             str(int(getattr(self.args, "sparsepcgc_scale_sr", 2))),
         ]
-        if bool(getattr(self.args, "sparsepcgc_worker_gpu_stats", True)):
+        if bool(getattr(self.args, "sparsepcgc_inner_psnr", False)):
+            cmd.append("--inner-psnr")
+        if bool(getattr(self.args, "sparsepcgc_worker_gpu_stats", False)):
             cmd.append("--gpu-stats")
         if bool(getattr(self.args, "sparsepcgc_worker_gpu_stats_print", False)):
             cmd.append("--gpu-stats-print")
@@ -480,7 +489,7 @@ class _SparsePCGCActualEncoder:
         self._stderr_file.write("CMD: " + " ".join(cmd) + "\n")
 
         env = os.environ.copy()
-        env.setdefault("OMP_NUM_THREADS", "8")
+        env.setdefault("OMP_NUM_THREADS", str(max(int(getattr(self.args, "sparsepcgc_omp_threads", 12)), 1)))
         env_prefix = self._direct_env_prefix(cmd)
         if env_prefix is not None:
             env["CONDA_PREFIX"] = env_prefix
@@ -550,20 +559,162 @@ class _SparsePCGCActualEncoder:
                     self.writer.write(f"SparsePCGC teacher non-json stdout: {line.strip()}")
         raise TimeoutError(f"SparsePCGC worker timed out after {timeout}s. See stderr log: {self._stderr_path}")
 
+    def _send_worker_request(self, request):
+        """Persistent workerへ1 requestを送り、対応するresponseだけを返す。"""
+        if self._proc is None or self._proc.stdin is None:
+            raise RuntimeError("SparsePCGC worker stdin is not available.")
+        self._request_id += 1
+        request = dict(request)
+        request["request_id"] = self._request_id
+        start = time.time()
+        self._proc.stdin.write(json.dumps(request, sort_keys=True) + "\n")
+        self._proc.stdin.flush()
+        response = self._read_worker_json(self.timeout)
+        while response.get("request_id") not in {None, self._request_id}:
+            response = self._read_worker_json(self.timeout)
+        return response, float(time.time() - start)
+
     def _write_ply(self, path, pts_3n):
+        """旧private API互換。既存呼出元のASCII PLY挙動を維持する。"""
         from models.utils.io.utils_ply import write_ply
 
         pts_np = (
             pts_3n.detach()
             .transpose(0, 1)
             .contiguous()
-            .to("cpu")
+            .to(device="cpu", dtype=torch.float32)
             .numpy()
-            .astype(np.float32, copy=False)
         )
         ok = write_ply(path, pts_np, ["x", "y", "z"])
         if not ok:
             raise RuntimeError(f"Failed to write SparsePCGC teacher PLY: {path}")
+
+    def _workspace(self):
+        if self._workspace_dir is not None:
+            return self._workspace_dir
+        root = self.tmp_root
+        if not root:
+            root = "/dev/shm/mynet_sparsepcgc_teacher" if os.path.isdir("/dev/shm") else None
+        if root:
+            os.makedirs(root, exist_ok=True)
+            self._workspace_dir = tempfile.mkdtemp(prefix="spgc_actual_worker_", dir=root)
+        else:
+            self._workspace_dir = tempfile.mkdtemp(prefix="spgc_actual_worker_")
+        return self._workspace_dir
+
+    @staticmethod
+    def _points_numpy_and_hash(pts_3n):
+        transfer_start = time.time()
+        pts_np = (
+            pts_3n.detach()
+            .transpose(0, 1)
+            .contiguous()
+            .to(device="cpu", dtype=torch.float32)
+            .numpy()
+        )
+        pts_np = np.ascontiguousarray(pts_np, dtype=np.float32)
+        digest = hashlib.sha256()
+        digest.update(str(tuple(pts_np.shape)).encode("ascii"))
+        digest.update(memoryview(pts_np).cast("B"))
+        return pts_np, digest.hexdigest(), float(time.time() - transfer_start)
+
+    def _write_ply_array(self, path, pts_np, *, binary=None):
+        write_start = time.time()
+        if binary is None:
+            binary = bool(getattr(self.args, "sparsepcgc_fast_binary_ply", True))
+        if bool(binary):
+            # 座標値は従来と同じfloat32であり、変えるのはPLYの保存形式だけである。
+            # binary little-endianにすることでASCII文字列化の時間と容量を削減する。
+            arr = np.asarray(pts_np, dtype="<f4", order="C")
+            header = (
+                "ply\n"
+                "format binary_little_endian 1.0\n"
+                f"element vertex {int(arr.shape[0])}\n"
+                "property float x\n"
+                "property float y\n"
+                "property float z\n"
+                "end_header\n"
+            ).encode("ascii")
+            with open(path, "wb", buffering=1024 * 1024) as handle:
+                handle.write(header)
+                arr.tofile(handle)
+        else:
+            from models.utils.io.utils_ply import write_ply
+            ok = write_ply(path, pts_np, ["x", "y", "z"])
+            if not ok:
+                raise RuntimeError(f"Failed to write SparsePCGC teacher PLY: {path}")
+        return float(time.time() - write_start)
+
+    def _result_cache_key(
+        self,
+        point_hash,
+        exact_occupancy,
+        exact_teacher_mode,
+        *,
+        occupancy_debug=False,
+        occupancy_low_prob_threshold=0.1,
+        exact_teacher_uses_full_context=False,
+        exact_teacher_fallback_reason="",
+    ):
+        # bitだけでなくexact occupancy教師もcache対象であるため、教師内容を変える条件を全て含める。
+        return "|".join(
+            [
+                str(point_hash),
+                str(getattr(self.args, "sparsepcgc_mode", "dense_lossy")),
+                str(int(getattr(self.args, "sparsepcgc_scale_m", 8))),
+                str(int(getattr(self.args, "sparsepcgc_scale_ae", 0))),
+                str(int(getattr(self.args, "sparsepcgc_scale_sr", 2))),
+                str(float(getattr(self.args, "sparsepcgc_voxel_size", 1.0))),
+                str(int(getattr(self.args, "sparsepcgc_pos_quantscale", 1))),
+                str(bool(exact_occupancy)),
+                str(exact_teacher_mode),
+                str(bool(occupancy_debug)),
+                f"{float(occupancy_low_prob_threshold):.12g}",
+                str(bool(exact_teacher_uses_full_context)),
+                str(exact_teacher_fallback_reason),
+            ]
+        )
+
+    @staticmethod
+    def _looks_like_ply_reader_error(response):
+        message = str(response.get("message", response)).lower()
+        markers = (
+            "ply",
+            "vertex",
+            "binary_little_endian",
+            "read_coords",
+            "read_ply",
+            "load_data",
+            "unable to read",
+            "failed to read",
+            "parse",
+        )
+        return any(marker in message for marker in markers)
+
+    def _get_cached_result(self, key):
+        if not bool(getattr(self.args, "sparsepcgc_actual_result_cache", True)):
+            return None
+        item = self._result_cache.get(key)
+        if item is None:
+            return None
+        self._result_cache.move_to_end(key)
+        out = dict(item)
+        out["sparsepcgc_actual_result_cache_hit"] = True
+        return out
+
+    def _store_cached_result(self, key, value):
+        if not bool(getattr(self.args, "sparsepcgc_actual_result_cache", True)):
+            return
+        clean = dict(value)
+        clean.pop("bitstream_path", None)
+        clean.pop("decoded_path", None)
+        clean.pop("decoded_copy_path", None)
+        clean["sparsepcgc_actual_result_cache_hit"] = False
+        self._result_cache[key] = clean
+        self._result_cache.move_to_end(key)
+        max_entries = max(int(getattr(self.args, "sparsepcgc_actual_result_cache_max_entries", 256)), 1)
+        while len(self._result_cache) > max_entries:
+            self._result_cache.popitem(last=False)
 
     def _exact_occupancy_enabled_this_step(self):
         if not bool(getattr(self.args, "enable_sparsepcgc_exact_occupancy_teacher", False)):
@@ -577,13 +728,13 @@ class _SparsePCGCActualEncoder:
     def encode_bits(self, pts_3n):
         self._lazy_init()
         encode_t0 = time.time()
-        tmp_dir = self._make_tmp_dir()
-        try:
-            ply_path = os.path.join(tmp_dir, "input.ply")
-            output_dir = os.path.join(tmp_dir, "encoded")
-            self._write_ply(ply_path, pts_3n)
+        with self._workspace_lock:
+            workspace = self._workspace() if bool(getattr(self.args, "sparsepcgc_reuse_workspace", True)) else self._make_tmp_dir()
+            remove_workspace_after = workspace != self._workspace_dir
+            ply_path = os.path.join(workspace, "input.ply")
+            output_dir = os.path.join(workspace, "encoded")
 
-            self._request_id += 1
+            pts_np, point_hash, input_prepare_time = self._points_numpy_and_hash(pts_3n)
             exact_occupancy = bool(self._exact_occupancy_enabled_this_step())
             exact_teacher_mode = str(
                 getattr(
@@ -592,32 +743,71 @@ class _SparsePCGCActualEncoder:
                     getattr(self.args, "sparsepcgc_exact_teacher_mode", "auto"),
                 )
             )
+            occupancy_debug = bool(
+                getattr(self.args, "enable_sparsepcgc_occupancy_debug", False) or exact_occupancy
+            )
+            occupancy_low_prob_threshold = float(
+                getattr(self.args, "sparsepcgc_occupancy_low_prob_threshold", 0.1)
+            )
+            exact_teacher_uses_full_context = bool(
+                getattr(self.args, "_current_exact_teacher_uses_full_context", False)
+            )
+            exact_teacher_fallback_reason = str(
+                getattr(self.args, "_current_exact_teacher_fallback_reason", "")
+            )
+            result_cache_key = self._result_cache_key(
+                point_hash,
+                exact_occupancy,
+                exact_teacher_mode,
+                occupancy_debug=occupancy_debug,
+                occupancy_low_prob_threshold=occupancy_low_prob_threshold,
+                exact_teacher_uses_full_context=exact_teacher_uses_full_context,
+                exact_teacher_fallback_reason=exact_teacher_fallback_reason,
+            )
+            cached = self._get_cached_result(result_cache_key)
+            if cached is not None:
+                cached["encode_time"] = float(time.time() - encode_t0)
+                cached["sparsepcgc_input_prepare_time"] = float(input_prepare_time)
+                cached["sparsepcgc_ply_write_time"] = 0.0
+                cached["sparsepcgc_worker_roundtrip_time"] = 0.0
+                if remove_workspace_after:
+                    shutil.rmtree(workspace, ignore_errors=True)
+                return cached
+
+            if os.path.isdir(output_dir):
+                shutil.rmtree(output_dir, ignore_errors=True)
+            os.makedirs(output_dir, exist_ok=True)
+            used_binary_ply = bool(getattr(self.args, "sparsepcgc_fast_binary_ply", True))
+            ply_write_time = self._write_ply_array(ply_path, pts_np, binary=used_binary_ply)
             request = {
-                "request_id": self._request_id,
                 "input_file": ply_path,
                 "output_dir": output_dir,
-                "occupancy_debug": bool(
-                    getattr(self.args, "enable_sparsepcgc_occupancy_debug", False) or exact_occupancy
-                ),
-                "occupancy_low_prob_threshold": float(
-                    getattr(self.args, "sparsepcgc_occupancy_low_prob_threshold", 0.1)
-                ),
+                "occupancy_debug": occupancy_debug,
+                "occupancy_low_prob_threshold": occupancy_low_prob_threshold,
                 "exact_occupancy": bool(exact_occupancy),
                 "exact_teacher_mode": exact_teacher_mode,
-                "exact_teacher_uses_full_context": bool(
-                    getattr(self.args, "_current_exact_teacher_uses_full_context", False)
-                ),
-                "exact_teacher_fallback_reason": str(
-                    getattr(self.args, "_current_exact_teacher_fallback_reason", "")
-                ),
+                "exact_teacher_uses_full_context": exact_teacher_uses_full_context,
+                "exact_teacher_fallback_reason": exact_teacher_fallback_reason,
             }
-            self._proc.stdin.write(json.dumps(request, sort_keys=True) + "\n")
-            self._proc.stdin.flush()
-
-            response = self._read_worker_json(self.timeout)
-            while response.get("request_id") not in {None, self._request_id}:
-                response = self._read_worker_json(self.timeout)
+            response, worker_roundtrip_time = self._send_worker_request(request)
+            ascii_fallback_used = False
+            ascii_fallback_write_time = 0.0
+            if (
+                response.get("status") != "ok"
+                and used_binary_ply
+                and bool(getattr(self.args, "sparsepcgc_binary_ply_fallback_ascii", True))
+                and self._looks_like_ply_reader_error(response)
+            ):
+                # reader互換性だけが原因の場合に限り、同じfloat32座標をASCIIへ書き直して再試行する。
+                # worker/modelは再起動しないため、失敗時の追加コストを最小限にする。
+                ascii_fallback_write_time = self._write_ply_array(ply_path, pts_np, binary=False)
+                retry_response, retry_time = self._send_worker_request(request)
+                worker_roundtrip_time += float(retry_time)
+                response = retry_response
+                ascii_fallback_used = True
             if response.get("status") != "ok":
+                if remove_workspace_after:
+                    shutil.rmtree(workspace, ignore_errors=True)
                 raise RuntimeError(
                     "SparsePCGC teacher encode failed: "
                     f"{response.get('message', response)}. See stderr log: {self._stderr_path}"
@@ -687,43 +877,6 @@ class _SparsePCGCActualEncoder:
                     result["sparsepcgc_exact_teacher_invalid_reason"] = "bits_non_finite"
                 else:
                     result["sparsepcgc_exact_teacher_invalid_reason"] = "unknown"
-            # ============================================================
-            # Phase2: SparsePCGC exact occupancy teacher の状態を明示する
-            # ============================================================
-            # SparsePCGC本体は変更しない。
-            # workerが返したexact candidateが有効かどうかだけをmyNet側で判定する。
-            exact_candidate_count = int(result.get("sparsepcgc_exact_candidate_count", 0) or 0)
-            exact_nll = result.get("sparsepcgc_exact_occupancy_nll", float("nan"))
-            exact_bits = result.get("sparsepcgc_exact_estimated_bits", float("nan"))
-
-            try:
-                exact_nll_float = float(exact_nll)
-            except Exception:
-                exact_nll_float = float("nan")
-
-            try:
-                exact_bits_float = float(exact_bits)
-            except Exception:
-                exact_bits_float = float("nan")
-
-            exact_valid = (
-                exact_candidate_count > 0
-                and np.isfinite(exact_nll_float)
-                and np.isfinite(exact_bits_float)
-            )
-
-            result["sparsepcgc_exact_teacher_valid"] = bool(exact_valid)
-            result["sparsepcgc_exact_teacher_invalid_reason"] = ""
-
-            if not exact_valid and bool(exact_occupancy):
-                if exact_candidate_count <= 0:
-                    result["sparsepcgc_exact_teacher_invalid_reason"] = "candidate_count_zero"
-                elif not np.isfinite(exact_nll_float):
-                    result["sparsepcgc_exact_teacher_invalid_reason"] = "nll_non_finite"
-                elif not np.isfinite(exact_bits_float):
-                    result["sparsepcgc_exact_teacher_invalid_reason"] = "bits_non_finite"
-                else:
-                    result["sparsepcgc_exact_teacher_invalid_reason"] = "unknown"
             node = float(result.get("node_count", result.get("node", 0.0)))
             single = float(result.get("single_child_count", result.get("single", 0.0)))
             stats = {
@@ -736,6 +889,13 @@ class _SparsePCGCActualEncoder:
                 "codec": self.codec_name,
                 "mode": str(getattr(self.args, "sparsepcgc_mode", "dense_lossless")),
                 "encode_time": float(time.time() - encode_t0),
+                "sparsepcgc_input_prepare_time": float(input_prepare_time),
+                "sparsepcgc_ply_write_time": float(ply_write_time + ascii_fallback_write_time),
+                "sparsepcgc_worker_roundtrip_time": float(worker_roundtrip_time),
+                "sparsepcgc_binary_ply_used": bool(used_binary_ply and not ascii_fallback_used),
+                "sparsepcgc_ascii_ply_fallback_used": bool(ascii_fallback_used),
+                "sparsepcgc_actual_result_cache_hit": False,
+                "sparsepcgc_point_sha256": str(point_hash),
             }
             for key, value in result.items():
                 key_text = str(key)
@@ -774,9 +934,10 @@ class _SparsePCGCActualEncoder:
                 stats["actual_sparsepcgc_worker_cuda_allocated_delta_mb"] = stats["sparsepcgc_worker_cuda_allocated_delta_mb"]
             if "sparsepcgc_worker_cuda_reserved_delta_mb" in stats:
                 stats["actual_sparsepcgc_worker_cuda_reserved_delta_mb"] = stats["sparsepcgc_worker_cuda_reserved_delta_mb"]
+            self._store_cached_result(result_cache_key, stats)
+            if remove_workspace_after:
+                shutil.rmtree(workspace, ignore_errors=True)
             return stats
-        finally:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
 
     def encode_bits_many(self, candidates, *, max_parallel=1, mode="single", fallback_to_single=True):
         return _encode_bits_many_sequential(
@@ -803,6 +964,10 @@ class _SparsePCGCActualEncoder:
                     proc.wait(timeout=5.0)
                 except Exception:
                     proc.kill()
+        if self._workspace_dir is not None:
+            shutil.rmtree(self._workspace_dir, ignore_errors=True)
+            self._workspace_dir = None
+        self._result_cache.clear()
         if self._stderr_file is not None:
             try:
                 self._stderr_file.close()
