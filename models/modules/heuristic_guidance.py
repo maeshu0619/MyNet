@@ -41,9 +41,9 @@ _PROFILES: Dict[tuple[str, int], HeuristicProfile] = {
         "ana_den6_25pattern_best",
     ),
     ("mvub", 8): HeuristicProfile(
-        "mvub", 8, 0.0025, 0.35, 0.30, 0.35,
+        "mvub", 8, 0.0025, 0.50, 0.40, 0.10,
         "subtree_collapse", "geometry_safe_rate", "direct_bit_density",
-        "ana_den6_25pattern_best",
+        "ana_den6_state_actual_0p25",
     ),
     ("mvub", 7): HeuristicProfile(
         "mvub", 7, 0.0010, 0.35, 0.30, 0.35,
@@ -299,5 +299,5 @@ def build_heuristic_guidance(structure: Mapping[str, Any], args: Any) -> Dict[st
         "action_gate_prior": action_gate_prior,
         "where_prior": where_prior,
         "where_prior_mean": where_prior_mean,
-        "formula_basis": "ana_den5_formula_mapped_to_existing_mynet_octree_proxy",
+        "formula_basis": "mynet_proxy_approximation_not_den6_editcandidate_ranking",
     }

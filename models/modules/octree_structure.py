@@ -1115,6 +1115,9 @@ class OctreeStructureAnalysis(nn.Module):
                 out["actual_oracle_override_move_count"] = int(
                     source_tree.get("actual_oracle_override_move_count", 0) or 0
                 )
+                out["actual_oracle_override_add_count"] = int(
+                    source_tree.get("actual_oracle_override_add_count", 0) or 0
+                )
                 out["actual_oracle_override_drop_count"] = int(
                     source_tree.get("actual_oracle_override_drop_count", 0) or 0
                 )

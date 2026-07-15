@@ -1451,8 +1451,17 @@ class CompressionLossMixin:
                 edit_record_bits = max(edit_record_bits, context_edit_record_bits, 0.0)
         gen_total_bit = gen_bit + edit_record_bits
         raw_loss_bit_percent = 100.0 * self._relative_ratio(gen_bit, gt_bit)
-        loss_bit_ratio = self._relative_ratio(gen_total_bit, gt_bit)
-        loss_bit_percent = 100.0 * loss_bit_ratio
+        billed_loss_bit_percent = 100.0 * self._relative_ratio(gen_total_bit, gt_bit)
+        # den6のactual rateは編集後PLYをSparsePCGCへ直接入力したbitだけである。
+        # --sparsepcgc_actual_bit_objective=raw のとき、編集記録の見積りを
+        # 学習目的へ混入させず、den6と同じ符号・分母で比較する。
+        objective_mode = str(getattr(args, "sparsepcgc_actual_bit_objective", "raw")).strip().lower()
+        if objective_mode not in {"raw", "billed"}:
+            objective_mode = "raw"
+        objective_bit = gen_bit if objective_mode == "raw" else gen_total_bit
+        loss_bit_percent = (
+            raw_loss_bit_percent if objective_mode == "raw" else billed_loss_bit_percent
+        )
         if not bool(getattr(args, "compression_loss_delta", True)):
             loss_bit_percent = 100.0 - loss_bit_percent
         policy_actual_noop_guard_used = False
@@ -1469,17 +1478,9 @@ class CompressionLossMixin:
             and bool(getattr(args, "sparsepcgc_policy_actual_noop_guard", True))
             and float(raw_loss_bit_percent) > float(policy_actual_noop_guard_margin)
         ):
-            # If the measured policy edit is worse than no-op, the codec action
-            # selected by training for this step is no-op.  The raw bad edit is
-            # still logged below so this cannot masquerade as an improvement.
+            # 悪化した実測を0へ置換すると負教師が失われるため、no-op候補の
+            # 診断だけを記録する。Networkが出したhard voxel集合のactual値は維持する。
             policy_actual_noop_guard_used = True
-            stats_gen = dict(cached_gt)
-            gen_bit = float(gt_bit)
-            edit_record_bits = 0.0
-            gen_total_bit = float(gt_bit)
-            raw_loss_bit_percent = 0.0
-            loss_bit_ratio = 0.0
-            loss_bit_percent = 0.0 if bool(getattr(args, "compression_loss_delta", True)) else 100.0
 
         L_com_hard = gen_xyz.new_tensor(loss_bit_percent)
         L_com = L_com_hard
@@ -1652,7 +1653,7 @@ class CompressionLossMixin:
                 voxel_actual_debug.get("voxel_state_final_voxel_recomputed_from_pts_out", True)
             ),
             "actual_final_w_source": "none_voxel_state_already_occupied" if actual_final_w is None else "point_final_w",
-            "metric": "actual_total_bit_percent",
+            "metric": "actual_objective_percent",
             "teacher_codec": codec_name,
             "total_bit": loss_bit_percent,
             "bpp": self._relative_percent(float(stats_gen["bpp"]), float(cached_gt["bpp"])),
@@ -1665,8 +1666,10 @@ class CompressionLossMixin:
             "actual_used_voxel_restored_points": bool(getattr(args, "_current_actual_uses_voxel_restored", False)),
             "actual_input_points": int(stats_gen.get("point_count", 0)),
             "actual_gen_oracle_cache_hit": bool(actual_gen_cache_hit),
-                "actual_total_bits": gen_total_bit,
-                "actual_raw_bits": gen_bit,
+            "actual_total_bits": gen_total_bit,
+            "actual_raw_bits": gen_bit,
+            "actual_objective_bits": objective_bit,
+            "actual_bit_objective": objective_mode,
             "actual_edit_record_bits": edit_record_bits,
             "policy_actual_noop_guard_used": bool(policy_actual_noop_guard_used),
             "policy_actual_noop_guard_margin": float(policy_actual_noop_guard_margin),
@@ -1680,7 +1683,7 @@ class CompressionLossMixin:
                     ref_min=1.0,
                 ),
                 "actual_bpp": float(stats_gen.get("bpp", 0.0)),
-                "actual_delta_percent": loss_bit_percent,
+            "actual_delta_percent": loss_bit_percent,
             "actual_occupancy_nll": float(stats_gen.get("octree_occupancy_nll", 0.0)),
             "actual_node_count": float(stats_gen.get("node", 0.0)),
             "actual_single_child_count": float(stats_gen.get("single", 0.0)),
@@ -1690,16 +1693,18 @@ class CompressionLossMixin:
             "gt_unique_coord_count": int(cached_gt.get("unique_coord_count", cached_gt.get("point_count", 0))),
             "gen_unique_coord_count": int(stats_gen.get("unique_coord_count", stats_gen.get("point_count", 0))),
             "gt_actual_bit": gt_bit,
-                "gen_actual_bit": gen_bit,
-                "gen_total_bit_with_edit_record": gen_total_bit,
-                "actual_total_bit_percent": loss_bit_percent,
-                "actual_raw_percent": raw_loss_bit_percent,
-                "actual_value_is_fresh": True,
+            "gen_actual_bit": gen_bit,
+            "gen_total_bit_with_edit_record": gen_total_bit,
+            "actual_total_bit_percent": billed_loss_bit_percent,
+            "actual_raw_percent": raw_loss_bit_percent,
+            "actual_objective_percent": loss_bit_percent,
+            "actual_objective_bit_source": objective_mode,
+            "actual_value_is_fresh": True,
             "actual_value_source": "actual_codec",
             "rate_proxy_before": gt_bit,
-                "rate_proxy_after": gen_total_bit,
-                "rate_proxy_after_raw": gen_bit,
-                "rate_proxy_delta": loss_bit_percent,
+            "rate_proxy_after": objective_bit,
+            "rate_proxy_after_raw": gen_bit,
+            "rate_proxy_delta": loss_bit_percent,
             "node_delta": float(stats_gen["node"]) - float(cached_gt["node"]),
             "single_delta": float(stats_gen["single"]) - float(cached_gt["single"]),
             "proxy_surrogate": proxy_debug,
@@ -2074,8 +2079,21 @@ class CompressionLossMixin:
             and str(getattr(args, "trainORtest", "train")).strip().lower() == "train"
         ):
             interval = max(int(getattr(args, "actual_eval_interval", 1000)), 0)
-            step = int(getattr(args, "_global_train_step", 0)) + 1
-            if interval <= 0 or (interval > 1 and step % interval != 0):
+            global_step = int(getattr(args, "_global_train_step", 0))
+            if self._is_sparsepcgc_context(args) and bool(
+                getattr(args, "sparsepcgc_actual_every_step", True)
+            ):
+                # SparsePCGCでは実際に選ばれたhard voxel集合を毎Step符号化する。
+                # baselineはcacheされるため、重複するGT encodeは発生しない。
+                refresh_actual = True
+            else:
+                scheduled_step = getattr(args, "_sparsepcgc_actual_refresh_global_step", None)
+                if scheduled_step is not None and int(scheduled_step) == global_step:
+                    refresh_actual = bool(getattr(args, "_sparsepcgc_actual_refresh_enabled", False))
+                else:
+                    step = global_step + 1
+                    refresh_actual = bool(interval > 0 and (interval <= 1 or step % interval == 0))
+            if not refresh_actual:
                 L_com, loss_bit, loss_single, loss_nodes, cached_gt, stats_gt = self._get_compression_loss_proxy(
                     args,
                     gen_xyz=gen_xyz,

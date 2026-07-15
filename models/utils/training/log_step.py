@@ -707,6 +707,16 @@ def log_compact_step_summary(
         ("move_source_voxel_count", "moved_different_voxel_count", "voxel_edit_move_count"),
         _first_value(comp_debug, ("voxel_edit_move_count", "actual_oracle_accepted_adjust_count"), 0),
     )
+    manifest_counts = getattr(args, "_ana_den6_reference_operation_counts", None)
+    if (
+        str(getattr(args, "_ana_den6_reference_anchor_source", ""))
+        == "ana_den6_candidate_plan_manifest"
+        and isinstance(manifest_counts, dict)
+    ):
+        # strict modeではActuatorの暫定maskではなく、den6 planの操作件数を表示する。
+        add_count = int(manifest_counts.get("Add", 0))
+        prune_count = int(manifest_counts.get("Prune", 0))
+        adjust_count = int(manifest_counts.get("Adjust", 0))
     oracle_full_drop = _first_value(
         comp_debug,
         (

@@ -91,6 +91,14 @@ def build_compression_metric_row(
         "stage": str(stage),
         "codec": str(comp_debug.get("teacher_codec", getattr(args, "compress", "unknown"))),
         "backend": str(getattr(args, "compression_loss_backend", "proxy")),
+        "heuristic_guidance_mode": str(getattr(args, "heuristic_guidance_mode", "proxy_prior")),
+        "ana_den6_reference_anchor_active": bool(
+            getattr(args, "_ana_den6_reference_anchor_active", False)
+        ),
+        "ana_den6_reference_expected_saved_percent": case_float(
+            getattr(args, "_ana_den6_reference_expected_saved_percent", float("nan")),
+            float("nan"),
+        ),
         "actual_value_source": str(comp_debug.get("actual_value_source", "unknown")),
         "fresh_actual": bool(fresh_actual),
         "cached_actual": bool(cached_actual),
@@ -1389,6 +1397,9 @@ def build_operation_metric_row(
         "actual_oracle_has_drop": bool(structure_debug.get("actual_oracle_has_drop", False)),
         "prune_after_prior_mode": str(structure_debug.get("prune_after_prior_mode", "")),
         "phase0_network_prune_mode": bool(structure_debug.get("phase0_network_prune_mode", False)),
+        "legacy_amount_selector_blocked_by_guidance": bool(
+            structure_debug.get("legacy_amount_selector_blocked_by_guidance", False)
+        ),
         "algorithmic_proposal_selector_enabled": bool(
             structure_debug.get("algorithmic_proposal_selector_enabled", False)
         ),

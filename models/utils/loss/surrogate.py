@@ -1072,12 +1072,11 @@ class SurrogateCompressionLossMixin:
             policy_actual_noop_guard_raw_edit_record_bits = float(actual_edit_record_bits)
             if (
                 str(teacher_codec).strip().lower() == "sparsepcgc"
-                and bool(getattr(args, "sparsepcgc_policy_actual_noop_guard", True))
+                and bool(getattr(args, "sparsepcgc_policy_actual_noop_guard", False))
                 and not bool(getattr(args, "direct_network_prune", False))
                 and float(actual_bit_percent) > float(policy_actual_noop_guard_margin)
             ):
                 policy_actual_noop_guard_used = True
-                policy_actual_noop_guard_percent = 0.0
             actual_bpp_percent = self._relative_percent(float(stats_gen["bpp"]), float(cached_gt["bpp"]))
             actual_single_percent = self._relative_percent(
                 float(stats_gen["single"]),

@@ -29,6 +29,23 @@ def log_basic_setup(writer, args, file_day, file_time):
         "Compression Delta Sign: "
         "delta_percent=(after_bits-before_bits)/before_bits*100; negative means improved compression."
     )
+    guidance_mode = str(getattr(args, "heuristic_guidance_mode", "proxy_prior"))
+    writer.write(
+        "Heuristic Guidance Mode: "
+        f"enabled={bool(getattr(args, 'heuristic_guidance_enabled', False))}, mode={guidance_mode}."
+    )
+    if guidance_mode == "ana_den6_reproduce":
+        writer.write(
+            "ana_den6 Reproduction: den6 candidate plan manifest is required; "
+            "input SHA256, AE/SR/m, Action counts, collision-free plan, and final voxel hash are verified."
+        )
+    elif guidance_mode == "ana_den6_reference_ply":
+        writer.write("Heuristic Guidance Warning: ana_den6_reference_ply applies only a saved final PLY and is not candidate-plan reproduction.")
+    elif bool(getattr(args, "heuristic_guidance_enabled", False)):
+        writer.write(
+            "Heuristic Guidance Warning: proxy_prior is not ana_den6 EditCandidate ranking and "
+            "must not be compared as an exact den6 reproduction."
+        )
     writer.write(
         f"Compression Loss Mode: compression_loss_delta={bool(getattr(args, 'compression_loss_delta', True))} "
         "(True keeps the standard delta, False uses 100-delta for the objective)."

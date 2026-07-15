@@ -363,6 +363,7 @@ class _SparsePCGCActualEncoder:
         self._workspace_dir = None
         self._workspace_lock = threading.Lock()
         self._result_cache = OrderedDict()
+        self._codec_fingerprint = None
 
     def _repo_root(self):
         return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
@@ -645,6 +646,44 @@ class _SparsePCGCActualEncoder:
                 raise RuntimeError(f"Failed to write SparsePCGC teacher PLY: {path}")
         return float(time.time() - write_start)
 
+    def _codec_cache_fingerprint(self):
+        """実測bitを変えうるcodec条件をLRU keyへ固定する。"""
+        if self._codec_fingerprint is not None:
+            return self._codec_fingerprint
+        checkpoint_fields = (
+            "sparsepcgc_ckptdir",
+            "sparsepcgc_ckptdir_sr",
+            "sparsepcgc_ckptdir_ae",
+            "sparsepcgc_ckptdir_low",
+            "sparsepcgc_ckptdir_high",
+            "sparsepcgc_ckptdir_offset",
+        )
+        checkpoints = {}
+        for field in checkpoint_fields:
+            path = os.path.abspath(os.path.expanduser(str(getattr(self.args, field, ""))))
+            try:
+                stat = os.stat(path)
+                checkpoints[field] = {"path": path, "size": int(stat.st_size), "mtime_ns": int(stat.st_mtime_ns)}
+            except OSError:
+                checkpoints[field] = {"path": path, "missing": True}
+        payload = {
+            "root": os.path.abspath(os.path.expanduser(str(getattr(self.args, "sparsepcgc_root", "")))),
+            "mode": str(getattr(self.args, "sparsepcgc_mode", "dense_lossy")),
+            "m": int(getattr(self.args, "sparsepcgc_scale_m", 8)),
+            "ae": int(getattr(self.args, "sparsepcgc_scale_ae", 0)),
+            "sr": int(getattr(self.args, "sparsepcgc_scale_sr", 2)),
+            "voxel_size": float(getattr(self.args, "sparsepcgc_voxel_size", 1.0)),
+            "pos_quantscale": int(getattr(self.args, "sparsepcgc_pos_quantscale", 1)),
+            "psnr_resolution": int(getattr(self.args, "sparsepcgc_psnr_resolution", 1023)),
+            "dense_scale_ae_list": str(getattr(self.args, "sparsepcgc_dense_scale_ae_list", "")),
+            "dense_scale_sr_list": str(getattr(self.args, "sparsepcgc_dense_scale_sr_list", "")),
+            "checkpoints": checkpoints,
+        }
+        self._codec_fingerprint = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        return self._codec_fingerprint
+
     def _result_cache_key(
         self,
         point_hash,
@@ -660,6 +699,7 @@ class _SparsePCGCActualEncoder:
         return "|".join(
             [
                 str(point_hash),
+                self._codec_cache_fingerprint(),
                 str(getattr(self.args, "sparsepcgc_mode", "dense_lossy")),
                 str(int(getattr(self.args, "sparsepcgc_scale_m", 8))),
                 str(int(getattr(self.args, "sparsepcgc_scale_ae", 0))),
@@ -896,6 +936,7 @@ class _SparsePCGCActualEncoder:
                 "sparsepcgc_ascii_ply_fallback_used": bool(ascii_fallback_used),
                 "sparsepcgc_actual_result_cache_hit": False,
                 "sparsepcgc_point_sha256": str(point_hash),
+                "sparsepcgc_codec_fingerprint": self._codec_cache_fingerprint(),
             }
             for key, value in result.items():
                 key_text = str(key)

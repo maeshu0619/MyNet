@@ -2917,9 +2917,22 @@ class StructureRepairActuator(nn.Module):
         residual_limit = min(max(prior_value * residual_fraction, min_residual), float(max_ratio))
         lower = max(prior_value - residual_limit, 0.0)
         upper = min(prior_value + residual_limit, float(max_ratio))
-        guided_forward = ratio.detach().clamp(lower, upper)
+        current_step = max(int(getattr(self.args, "_global_train_step", 0)), 0)
+        anchor_steps = max(int(getattr(self.args, "heuristic_guidance_anchor_steps", 0)), 0)
+        anchor_phase = (
+            max(1.0 - float(current_step) / float(anchor_steps), 0.0)
+            if anchor_steps > 0
+            else 0.0
+        )
+        # warmupでは操作別ana_den6比率をhard countの中心にし、
+        # 以降はclamp済みNetwork出力へ不連続なく移行する。
+        network_forward = ratio.detach().clamp(lower, upper)
+        guided_forward = (
+            ratio.new_full(ratio.shape, prior_value) * anchor_phase
+            + network_forward * (1.0 - anchor_phase)
+        )
         grad_scale = max(float(getattr(self.args, "heuristic_guidance_amount_grad_scale", 1.0)), 0.0)
-        # forwardだけをHeuristic近傍へ制限し、backwardはAmount headへ残すSTEである。
+        # forwardだけをHeuristic中心へ制限し、backwardはAmount headへ残すSTEである。
         return guided_forward + grad_scale * (ratio - ratio.detach())
 
     def _heuristic_where_logit_bias(self, guidance, operation, like_tensor):
@@ -3729,6 +3742,10 @@ class StructureRepairActuator(nn.Module):
             max(float(codec_prune_prior_hard_action_alpha), 0.0),
             1.0,
         )
+        if heuristic_guidance is not None:
+            # den6はcandidateをvoxel単位で順位付けして選ぶ。旧codec block actionは
+            # 同じAmountでもblock境界で操作数を減らすため、anchor中は混在させない。
+            codec_prune_prior_hard_action_alpha = 0.0
         codec_prune_prior_score = torch.zeros(
             (B, 1, N),
             device=pts_xyz.device,
@@ -3924,12 +3941,29 @@ class StructureRepairActuator(nn.Module):
             and bool(full_cloud_amount_terms.get("enabled", False))
             and prune_enabled
             and codec_prune_prior_enabled
+            # 旧selectorのbinは1.5--5.0%%であり、ana_den6の0.10%% Prune anchorを
+            # 上書きすると比率単位の不一致を再発させる。Heuristic無効時は旧挙動を保つ。
+            and not (
+                heuristic_guidance is not None
+                and bool(
+                    getattr(
+                        self.args,
+                        "heuristic_guidance_disable_full_cloud_amount_override",
+                        True,
+                    )
+                )
+            )
         )
         warmup_force_codec_prior_amount = bool(
             getattr(self.args, "sparsepcgc_warmup_force_codec_prior_amount", True)
         )
+        legacy_amount_selector_blocked_by_guidance = bool(
+            heuristic_guidance is not None
+            and bool(getattr(self.args, "heuristic_guidance_disable_full_cloud_amount_override", True))
+        )
         algorithmic_proposal_selector_enabled = bool(
-            (self._algorithmic_proposal_selector_enabled() or full_cloud_amount_override_enabled)
+            not legacy_amount_selector_blocked_by_guidance
+            and (self._algorithmic_proposal_selector_enabled() or full_cloud_amount_override_enabled)
             and prune_enabled
             and codec_prune_prior_enabled
         )
@@ -3939,7 +3973,11 @@ class StructureRepairActuator(nn.Module):
         )
         algorithmic_proposal_where_source_id = 1 if algorithmic_proposal_selector_active else 0
 
-        if amount_mode == "network":
+        if legacy_amount_selector_blocked_by_guidance:
+            # den6 anchor中に旧codec priorの5%級binをhard countへ混ぜない。
+            # Networkのresidualは_apply_heuristic_amount_guidanceのSTE経路だけで反映する。
+            codec_prune_prior_count_alpha = 0.0
+        elif amount_mode == "network":
             # warmup中だけprior量を使う。
             # Phase0以降はprior量をhard countへ混ぜない。
             codec_prune_prior_count_alpha = float(codec_prune_prior_phase)
@@ -4183,6 +4221,9 @@ class StructureRepairActuator(nn.Module):
             and float(codec_prune_prior_phase) <= 0.0
             and not self._direct_network_prune_mode()
             and not full_cloud_amount_override_enabled
+            # outcome_exploreは旧来の1.5--5.0%候補をhard countへ直接入れる。
+            # den6 anchorではAmount priorだけを探索中心にし、この別経路を混ぜない。
+            and not legacy_amount_selector_blocked_by_guidance
         ):
             post_tail_steps = max(
                 int(getattr(self.args, "sparsepcgc_post_warmup_amount_tail_steps", 5000)),
@@ -5844,6 +5885,24 @@ class StructureRepairActuator(nn.Module):
             move_allowed_weight = guarded_move_candidate_mask.unsqueeze(1).to(dtype=move_candidate_voxel_weight.dtype)
 
         move_target_ratio_for_hard = move_target_ratio
+        if heuristic_guidance is not None and move_target_ratio > 0.0:
+            # den6 profileのAdjust比率は入力全体のoccupied voxel基準である。
+            # 既存実装はguard後candidate数を分母にしたため、候補が少ないframeでは
+            # 0.05%が過小なhard countへ縮んでいた。hard選択の分母だけを候補数へ
+            # 換算し、要求するglobal voxel数は変えない。
+            global_voxel_count = max(
+                int(sum(int(item.get("voxel_count", 0)) for item in voxel_cache)),
+                1,
+            )
+            candidate_voxel_count = max(
+                float(valid_move_source_voxel_count_effective.detach().sum().item()),
+                1.0,
+            )
+            requested_global_count = float(move_target_ratio) * float(global_voxel_count)
+            move_target_ratio_for_hard = min(
+                max(requested_global_count / candidate_voxel_count, 0.0),
+                1.0,
+            )
         min_move_expected_voxels = max(
             float(getattr(self.args, "repair_move_min_hard_expected_voxels", 1.0)),
             0.0,
@@ -6677,6 +6736,7 @@ class StructureRepairActuator(nn.Module):
 
         actual_oracle_override_move_count_value = 0
         actual_oracle_override_drop_count_value = 0
+        actual_oracle_override_add_count_value = 0
         actual_oracle_override_subtree_prune_count_value = 0
         leaf_diag_for_override = structure.get("leaf_pattern_diag", {}) if isinstance(structure, dict) else {}
         actual_oracle_edit_record_bits_value = 0.0
@@ -6720,6 +6780,10 @@ class StructureRepairActuator(nn.Module):
                         int(leaf_diag_for_override.get("actual_oracle_override_drop_count", 0) or 0),
                         0,
                     )
+                    actual_oracle_override_add_count_value = max(
+                        int(leaf_diag_for_override.get("actual_oracle_override_add_count", 0) or 0),
+                        0,
+                    )
                     actual_oracle_override_subtree_prune_count_value = max(
                         int(
                             leaf_diag_for_override.get(
@@ -6741,7 +6805,7 @@ class StructureRepairActuator(nn.Module):
                         {
                             "initial_count": int(voxel_coords.shape[-1]),
                             "drop_count": int(actual_oracle_override_drop_count_value),
-                            "add_count": 0,
+                            "add_count": int(actual_oracle_override_add_count_value),
                             "move_count": int(actual_oracle_override_move_count_value),
                             "same_voxel_move_rejected": 0,
                             "existing_target_rejected": 0,
@@ -8253,6 +8317,9 @@ class StructureRepairActuator(nn.Module):
             "actual_oracle_has_drop": pts_xyz.new_tensor(float(actual_oracle_has_drop)).detach(),
             "prune_after_prior_mode": prune_after_prior_mode,
             "phase0_network_prune_mode": pts_xyz.new_tensor(float(phase0_network_prune_mode)).detach(),
+            "legacy_amount_selector_blocked_by_guidance": pts_xyz.new_tensor(
+                float(legacy_amount_selector_blocked_by_guidance)
+            ).detach(),
             "algorithmic_proposal_selector_enabled": pts_xyz.new_tensor(
                 float(algorithmic_proposal_selector_enabled)
             ).detach(),
@@ -9012,6 +9079,9 @@ class StructureRepairActuator(nn.Module):
             "actual_oracle_has_drop": pts_xyz.new_tensor(float(actual_oracle_has_drop)),
             "prune_after_prior_mode": prune_after_prior_mode,
             "phase0_network_prune_mode": pts_xyz.new_tensor(float(phase0_network_prune_mode)),
+            "legacy_amount_selector_blocked_by_guidance": pts_xyz.new_tensor(
+                float(legacy_amount_selector_blocked_by_guidance)
+            ),
             "algorithmic_proposal_selector_enabled": pts_xyz.new_tensor(
                 float(algorithmic_proposal_selector_enabled)
             ),

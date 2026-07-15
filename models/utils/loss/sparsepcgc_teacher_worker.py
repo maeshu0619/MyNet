@@ -134,7 +134,30 @@ def _build_encoder(args: argparse.Namespace):
     sys.path.insert(0, str(sparse_root / "test"))
 
     _debug("importing encoder_multiple.SparsePCGCEncoder")
-    from encoder_multiple import SparsePCGCEncoder
+    import encoder_multiple
+
+    if str(args.mode).strip().lower() == "dense_lossy":
+        # ana_den6はLossyCoderDense.testが返すdecoder-complete logical bitsを
+        # rateとして使う。一方encoder_multipleは表示用にfile_sizeを物理bin
+        # サイズへ上書きするため、worker境界でlogical値を復元して両者を分離する。
+        original_normalize = encoder_multiple._normalize_result
+
+        def normalize_with_den6_logical_rate(result, input_file, output_dir, bin_paths, dec_paths, normalize_args):
+            normalized = original_normalize(result, input_file, output_dir, bin_paths, dec_paths, normalize_args)
+            logical_bits = float(result.get("file_size", normalized.get("file_size", 0.0)))
+            main_bits = float(normalized.get("file_size", 0.0))
+            normalized["main_bin_bits"] = main_bits
+            normalized["logical_file_size"] = logical_bits
+            normalized["side_information_bits"] = max(logical_bits - main_bits, 0.0)
+            normalized["file_size"] = logical_bits
+            point_count = max(int(normalized.get("point_count", 0)), 1)
+            normalized["bpp"] = logical_bits / point_count
+            normalized["rate_definition"] = "decoder_complete_logical_bits_from_LossyCoderDense.test"
+            return normalized
+
+        encoder_multiple._normalize_result = normalize_with_den6_logical_rate
+
+    SparsePCGCEncoder = encoder_multiple.SparsePCGCEncoder
     _debug("imported SparsePCGCEncoder")
 
     encoder_args = SimpleNamespace(
@@ -254,6 +277,7 @@ def main() -> int:
             result["sparsepcgc_scale_ae"] = int(args.scale_ae)
             result["sparsepcgc_scale_sr"] = int(args.scale_sr)
             result["sparsepcgc_mode_effective"] = str(args.mode)
+            result.setdefault("sparsepcgc_rate_definition", result.get("rate_definition", "physical_bin_bits"))
 
             if bool(args.gpu_stats):
                 result.update(gpu_before)

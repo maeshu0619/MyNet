@@ -35,6 +35,7 @@ from models.utils.pointcloud.sparsepcgc_voxel import (
     attach_sparsepcgc_voxel_meta,
     restore_points_from_voxel_coords,
 )
+from models.utils.pointcloud.ana_den6_reference import attach_ana_den6_reference_anchor
 from models.utils.pointcloud.quant_noise import add_uniform_quantization_noise, resolve_uniform_noise_delta
 from models.utils.pointcloud.voxel_collision import (
     compute_voxel_collision_stats_batch,
@@ -117,6 +118,31 @@ def _limit_training_seq_dirs(seq_dirs, args):
             return list(seq_dirs)
         return list(seq_dirs[:3])
     return list(seq_dirs)
+
+
+def _select_den6_comparison_sequence(seq_dirs, args):
+    """den6照合時に--dataset_nameと異なる8i系列を学習しない。"""
+    strict = bool(
+        getattr(args, "heuristic_guidance_enabled", False)
+        and getattr(args, "heuristic_guidance_den6_codec_strict", False)
+    )
+    if not strict:
+        return list(seq_dirs)
+    requested = str(getattr(args, "dataset_name", "")).strip()
+    if not requested:
+        raise ValueError("den6 strict比較には--dataset_nameで対象系列を指定する必要がある")
+    selected = [
+        seq_dir for seq_dir in seq_dirs
+        if os.path.basename(os.path.normpath(str(seq_dir))).lower() == requested.lower()
+    ]
+    if not selected:
+        available = ", ".join(
+            os.path.basename(os.path.normpath(str(seq_dir))) for seq_dir in seq_dirs
+        )
+        raise ValueError(
+            f"den6 strict比較の対象系列が見つからない: {requested}; available={available}"
+        )
+    return selected
 
 def _sparsepcgc_outcome_actual_percent(debug):
     """
@@ -1647,21 +1673,24 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
     selected_surrogate = float(pred_per_amount.detach().flatten()[selected_class].cpu())
     actual_value = finite_float_or_none(actual_percent)
     actual_available = bool(actual_available and actual_value is not None and math.isfinite(float(actual_value)))
+    # interval非更新stepで候補ごとのactualを起動すると、圧縮loss側の間引きを打ち消す。
+    # このstepは既存surrogateとsequence memoryだけで教師を作り、fresh actualがあるstepだけ候補比較する。
+    actual_candidate_refresh = bool(actual_available)
     noop_margin = max(float(getattr(args, "sparsepcgc_full_cloud_amount_noop_margin", 0.0)), 0.0)
     policy = str(
         getattr(
             args,
             "sparsepcgc_full_cloud_amount_actual_candidate_policy",
-            "selected_plus_surrogate_topk",
+            "selected_only",
         )
     ).strip().lower()
-    multi_actual_enable = bool(getattr(args, "sparsepcgc_full_cloud_amount_multi_actual_enable", True))
+    multi_actual_enable = bool(getattr(args, "sparsepcgc_full_cloud_amount_multi_actual_enable", False))
     max_actual_default = max(
-        int(getattr(args, "sparsepcgc_full_cloud_amount_max_actual_candidates_per_step", 2)),
+        int(getattr(args, "sparsepcgc_full_cloud_amount_max_actual_candidates_per_step", 1)),
         1,
     )
     warmup_actual_max = max(
-        int(getattr(args, "sparsepcgc_full_cloud_amount_warmup_max_actual_candidates_per_step", 4)),
+        int(getattr(args, "sparsepcgc_full_cloud_amount_warmup_max_actual_candidates_per_step", 1)),
         1,
     )
     warmup_steps = max(
@@ -1672,7 +1701,7 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
     max_actual = warmup_actual_max if in_multi_actual_warmup else max_actual_default
     if (not multi_actual_enable) or policy == "selected_only" or max_actual_default <= 1:
         max_actual = 1
-    actual_topk = max(int(getattr(args, "sparsepcgc_full_cloud_amount_actual_topk", 2)), 0)
+    actual_topk = max(int(getattr(args, "sparsepcgc_full_cloud_amount_actual_topk", 0)), 0)
     wide_probe_enable = bool(
         getattr(args, "sparsepcgc_full_cloud_amount_wide_probe_enable", True)
     )
@@ -2143,6 +2172,14 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
         structure_debug.get("input_voxel_count", input_points or 0)
     )
 
+    def _estimated_candidate_drop_count(candidate_ratio):
+        """actual未評価候補の補助penalty用に、座標maskを作らず件数だけ見積もる。"""
+        expected = int(round(max(float(candidate_ratio), 0.0) * max(int(unique_count), 0)))
+        max_hard_count = max(int(getattr(args, "repair_max_hard_drop_voxels", 0)), 0)
+        if max_hard_count > 0:
+            expected = min(expected, max_hard_count)
+        return max(expected, 0)
+
     def _candidate_sources(entry):
         return [str(source) for source in list((entry or {}).get("sources", []))]
 
@@ -2279,10 +2316,10 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
         candidates.sort(key=lambda item: item[0])
         return [candidate_key for _, candidate_key in candidates[: max(int(wide_probe_max_actual), 0)]]
 
-    if selected_class > 0 and selected_candidate_key in candidate_specs:
+    if actual_candidate_refresh and selected_class > 0 and selected_candidate_key in candidate_specs:
         _append_actual_candidate(selected_candidate_key, "network_selected")
 
-    if learning_mode == "network_selected_bandit":
+    if actual_candidate_refresh and learning_mode == "network_selected_bandit":
         if diagnostic_sweep_due or wide_probe_due:
             diagnostic_key = _pick_uncertainty_candidate(set(actual_candidate_keys))
             wide_keys = _pick_wide_probe_candidates(set(actual_candidate_keys))
@@ -2290,7 +2327,7 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
                 diagnostic_key = wide_keys[0]
             if diagnostic_key is not None:
                 _append_actual_candidate(diagnostic_key, "diagnostic_sweep")
-    elif use_enhanced_actual_selection:
+    elif actual_candidate_refresh and use_enhanced_actual_selection:
         sequence_memory_best_key = None
         if isinstance(sequence_memory_best_entry, dict):
             best_ratio = sequence_memory_best_entry.get("ratio", float("nan"))
@@ -2332,7 +2369,7 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
             if too_close and len(actual_candidate_keys) > 0:
                 continue
             _append_actual_candidate(candidate_key, "fallback_diversified")
-    else:
+    elif actual_candidate_refresh:
         for candidate_key in sorted_candidate_keys:
             if len(actual_candidate_keys) >= int(max_actual):
                 break
@@ -2383,21 +2420,31 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
             cand_wall = 0.0
             compared_in_actual_pool = True
         else:
-            _, cand_coords, cand_drop_count, cand_where_trace = _candidate_drop_mask_and_coords(cand_ratio)
-            if candidate_key == str(selected_candidate_key) and int(drop_count or 0) > 0 and cand_drop_count <= 0:
-                cand_drop_count = int(drop_count or 0)
+            cand_requested = bool(candidate_key in actual_candidate_keys)
+            selected_candidate = candidate_key == str(selected_candidate_key)
+            # 選択済み操作はActuatorが作ったhard結果を再利用する。座標が必要なのは
+            # fresh actualで追加比較する候補だけであり、surrogate stepの全候補mask生成を避ける。
+            if selected_candidate:
+                cand_coords = None
+                cand_drop_count = max(int(drop_count or 0), 0)
+                cand_where_trace = dict(structure_debug)
+            elif cand_requested:
+                _, cand_coords, cand_drop_count, cand_where_trace = _candidate_drop_mask_and_coords(cand_ratio)
+            else:
+                cand_coords = None
+                cand_drop_count = _estimated_candidate_drop_count(cand_ratio)
+                cand_where_trace = {}
             cand_geom_penalty, cand_ratio_penalty = _candidate_geometry_penalty(
                 unique_count,
                 cand_drop_count,
                 cand_ratio,
             )
-            cand_requested = bool(candidate_key in actual_candidate_keys)
             cand_finished = False
             cand_error = ""
             cand_wall = 0.0
             compared_in_actual_pool = False
             if cand_requested:
-                if actual_available and candidate_key == str(selected_candidate_key):
+                if actual_available and selected_candidate:
                     cand_finished = True
                     compared_in_actual_pool = True
                 elif torch.is_tensor(cand_coords):
@@ -3169,6 +3216,10 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
             "full_cloud_amount_actual_eval_count": int(actual_finished_count),
             "full_cloud_amount_actual_requested_count": int(actual_requested_count),
             "full_cloud_amount_actual_finished_count": int(actual_finished_count),
+            "full_cloud_amount_actual_candidate_refresh": bool(actual_candidate_refresh),
+            "full_cloud_amount_actual_candidate_skip_reason": (
+                "" if actual_candidate_refresh else "compression_actual_unavailable_or_interval"
+            ),
             "full_cloud_amount_teacher_source": str(teacher_source),
             "full_cloud_amount_teacher_ratio": float(teacher_ratio_value),
             "full_cloud_amount_teacher_base_bin": float(teacher_base_bin),
@@ -3275,17 +3326,16 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
                 and selected_class != 0
                 and float(actual_value) >= float(noop_margin)
             ),
-            "actual_bit_objective": str(objective_mode),
-            "actual_objective_percent": float(selected_objective_delta),
-            "actual_objective_bit_source": str(
+            # 候補比較の結果はAmount teacherとして保存する。Networkが実際に出力した
+            # hard voxel編集のactual値を上書きしてはいけない。
+            "full_cloud_amount_teacher_bit_objective": str(objective_mode),
+            "full_cloud_amount_teacher_actual_objective_percent": float(selected_objective_delta),
+            "full_cloud_amount_teacher_objective_bit_source": str(
                 selected_row.get("actual_objective_bit_source", objective_mode)
                 if isinstance(selected_row, dict)
                 else objective_mode
             ),
-            "actual_train_objective_percent": float(selected_objective_delta),
-            "actual_bit_percent_used_for_loss": float(selected_objective_delta),
-            "actual_forward_value": float(selected_objective_delta),
-            "compression_loss_used": float(selected_objective_delta),
+            "full_cloud_amount_teacher_compression_loss_used": float(selected_objective_delta),
         }
     )
     if not math.isfinite(debug["full_cloud_amount_actual_wall_time_total"]):
@@ -3760,6 +3810,21 @@ def _resolve_full_cloud_anchor_no_grad(args, full_cloud_canonical_context):
         return True, f"full_cloud_anchor_node_limit_exceeded:{node_count}>{node_limit}", node_count, count_source
 
     return False, f"full_cloud_anchor_grad_allowed:{node_count}<={node_limit}", node_count, count_source
+
+
+def _is_sparsepcgc_full_cloud_amount_anchor_step(args, global_step):
+    """full-cloud Amount教師を走らせるstepを決める。
+
+    interval=1は従来の毎step全点forwardと完全に同じ判定にする。間のstepは
+    既存Subtree経路で学習するため、全点graphの計算・GPUメモリを比例して削減できる。
+    """
+    interval = max(
+        int(getattr(args, "sparsepcgc_full_cloud_amount_anchor_interval", 4)),
+        1,
+    )
+    step = max(int(global_step), 0)
+    return bool(step % interval == 0), interval, step // interval
+
 
 def _slice_full_cloud_canonical_context(
     full_cloud_canonical_context,
@@ -11765,6 +11830,7 @@ def run_episode_full_cloud_validation(
                 cache_key = f"{input_common_cache_key}|episode_full_cloud_validation"
                 args._global_train_step = int(global_step)
                 args._current_sample_name = os.path.basename(str(file_path))
+                args._current_input_file = str(file_path)
                 args._current_teacher_scope = "full_cloud"
                 args._current_teacher_anchor_reason = "episode_full_cloud_validation"
                 args._current_exact_teacher_mode = "full_cloud"
@@ -11797,6 +11863,11 @@ def run_episode_full_cloud_validation(
                                 _episode_input_common_cache_key(input_common_cache_key, "full_cloud_canonical"),
                                 full_octree_context,
                             )
+                        full_octree_context = attach_ana_den6_reference_anchor(
+                            full_octree_context,
+                            args,
+                            device=input_xyz.device,
+                        )
                         full_cloud_canonical_context = full_octree_context
                         _sparsepcgc_apply_amount_outcome_context(
                             args,
@@ -12042,7 +12113,8 @@ def train(model, args, loss, writer, plot, notifier=None):
     set_seed(args.seed, deterministic=getattr(args, "deterministic", False)) # ランスシードを固定し、学習結果の再現性を確保する
     best_loss = float('inf') # 後続の計算・ログのため
     raw_seq_dirs = collect_seq_dirs2(args.input_dir, dataset_name=args.dataname) # 入力ディレクトリから学習対象のシーケンスディレクトリ一覧を集める
-    seq_dirs = _limit_training_seq_dirs(raw_seq_dirs, args) # 8iだけ先頭3シーケンスに制限し、4つ目は使わない
+    comparison_seq_dirs = _select_den6_comparison_sequence(raw_seq_dirs, args)
+    seq_dirs = _limit_training_seq_dirs(comparison_seq_dirs, args) # 8iだけ先頭3シーケンスに制限し、4つ目は使わない
     if (
         _episode_input_common_cache_enabled(args)
         and bool(getattr(args, "episode_input_common_cache_enable_dataset_cache", True))
@@ -12051,11 +12123,16 @@ def train(model, args, loss, writer, plot, notifier=None):
         args.dataset_cache = True
     num_seq = len(seq_dirs)
     writer.write(f"Total seq directories: {num_seq}")
-    if len(seq_dirs) != len(raw_seq_dirs):
+    if len(comparison_seq_dirs) != len(raw_seq_dirs):
+        writer.write(
+            "den6 strict sequence selection applied: "
+            + ", ".join(os.path.basename(seq_dir) for seq_dir in comparison_seq_dirs)
+        )
+    if len(seq_dirs) != len(comparison_seq_dirs):
         kept_names = ", ".join(os.path.basename(seq_dir) for seq_dir in seq_dirs)
         writer.write(
             "8i training sequence limit applied: "
-            f"using {len(seq_dirs)} of {len(raw_seq_dirs)} sequence directories"
+            f"using {len(seq_dirs)} of {len(comparison_seq_dirs)} sequence directories"
         )
         writer.write(f"8i kept sequence dirs: {kept_names}")
     seq_datasets = [(seq_dir, PlyDirDataset(args, seq_dir)) for seq_dir in seq_dirs] # 各シーケンス内のPLY点群ファイルを読み込むデータセットを作る
@@ -12255,6 +12332,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                 """ログ用の変数セット"""
                 args._global_train_step = int(global_train_step) # 現在の累積Step番号を保存
                 args._current_sample_name = os.path.basename(str(file_path)) # teacher/debugログに点群ファイル名を残す
+                args._current_input_file = str(file_path) # den6再現・actual cache照合用に元フレームを保持する
                 args._current_teacher_scope = "full_cloud" # このStepのteacherが全点群か局所subtreeかをLoss側へ伝える初期値
                 args._sparsepcgc_full_cloud_actual_primary_active = False
                 args._log_this_step = False
@@ -12310,6 +12388,11 @@ def train(model, args, loss, writer, plot, notifier=None):
                         _episode_input_common_cache_key(cache_key, "full_cloud_canonical"),
                         full_cloud_canonical_context,
                     )
+                full_cloud_canonical_context = attach_ana_den6_reference_anchor(
+                    full_cloud_canonical_context,
+                    args,
+                    device=input_xyz.device,
+                )
                 step_timing_breakdown["full_cloud_canonical_build_time"] = float(time.time() - full_cloud_canonical_start)
 
                 try:
@@ -12372,6 +12455,13 @@ def train(model, args, loss, writer, plot, notifier=None):
                         setattr(args, "_full_cloud_amount_actual_step", bool(full_cloud_amount_actual_step))
                     except Exception:
                         pass
+                # compression.pyにも同じ判定を渡す。SparsePCGC actual backendは
+                # さらにevery-step設定を優先し、編集済みhard voxelを必ず実測する。
+                try:
+                    setattr(args, "_sparsepcgc_actual_refresh_global_step", int(global_train_step))
+                    setattr(args, "_sparsepcgc_actual_refresh_enabled", bool(refresh_actual_gen))
+                except Exception:
+                    pass
 
                 """変数の初期化と設定"""
                 subset_step = False # 部分学習か否か
@@ -14237,27 +14327,21 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 "sparsepcgc_training_mode": "full_cloud_amount",
                                 "actual_scope": "full_cloud",
                                 "full_cloud_amount_fresh_actual_every_step": bool(
-                                    getattr(args, "sparsepcgc_full_cloud_amount_fresh_actual_every_step", True)
+                                    getattr(args, "sparsepcgc_full_cloud_amount_fresh_actual_every_step", False)
                                 ),
                                 "full_cloud_amount_actual_interval": int(full_cloud_amount_actual_interval_active),
                                 "full_cloud_amount_actual_step": bool(full_cloud_amount_actual_step),
                             }
                         )
-                        objective_value = finite_float_or_none(
-                            full_cloud_amount_debug.get(
-                                "actual_objective_percent",
-                                full_cloud_amount_debug.get("actual_train_objective_percent", None),
-                            )
+                        # Amount候補比較のteacher値は補助損失だけに使う。ここでL_comを
+                        # no-op候補の値へ上書きすると、Training Actual ObjectiveがNetwork
+                        # 自身のhard voxel編集の実圧縮結果ではなくなる。
+                        full_cloud_amount_debug[
+                            "full_cloud_amount_teacher_actual_objective_percent"
+                        ] = full_cloud_amount_debug.get(
+                            "actual_objective_percent",
+                            full_cloud_amount_debug.get("actual_train_objective_percent", None),
                         )
-                        if objective_value is not None:
-                            if torch.is_tensor(L_com):
-                                L_com = L_com.new_tensor(float(objective_value)) + (L_com - L_com.detach())
-                            if torch.is_tensor(loss_bit):
-                                loss_bit = loss_bit.new_tensor(float(objective_value)) + (loss_bit - loss_bit.detach())
-                            if torch.is_tensor(L_com_objective):
-                                L_com_objective = L_com_objective.new_tensor(float(objective_value)) + (
-                                    L_com_objective - L_com_objective.detach()
-                                )
                         compression_tensor_debug.update(full_cloud_amount_debug)
                     if full_cloud_amount_candidate_rows:
                         candidate_path = metric_csv_paths.get("full_cloud_amount_candidate_step")

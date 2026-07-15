@@ -1017,16 +1017,16 @@ def parse_pugan_args(parser, file_day, file_time):
         '--sparsepcgc_full_cloud_amount_fresh_actual_every_step',
         default=True,
         type=str2bool,
-        help='Trueならfull_cloud_amount modeで毎Step fresh actual SparsePCGC評価を行い、Training Actual Objectiveを欠損させない',
+        help='Trueならfull_cloud_amount modeで毎Step fresh actual SparsePCGC評価を行う。GT baselineはhash cacheを再利用し、編集後hard voxelだけを毎Step評価する',
     )
-    parser.add_argument('--sparsepcgc_full_cloud_amount_actual_interval', default=5, type=int)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_actual_interval', default=1, type=int)
     parser.add_argument('--sparsepcgc_full_cloud_amount_warmup_actual_interval', default=1, type=int)
     parser.add_argument('--sparsepcgc_full_cloud_amount_warmup_steps', default=20, type=int)
-    parser.add_argument('--sparsepcgc_full_cloud_amount_max_actual_candidates_per_step', default=4, type=int)
-    parser.add_argument('--sparsepcgc_full_cloud_amount_multi_actual_enable', default=True, type=str2bool)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_max_actual_candidates_per_step', default=1, type=int)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_multi_actual_enable', default=False, type=str2bool)
     parser.add_argument(
         '--sparsepcgc_full_cloud_amount_actual_candidate_policy',
-        default='selected_plus_surrogate_topk',
+        default='selected_only',
         choices=[
             'selected_only',
             'selected_plus_neighbors',
@@ -1036,8 +1036,8 @@ def parse_pugan_args(parser, file_day, file_time):
         ],
         type=str,
     )
-    parser.add_argument('--sparsepcgc_full_cloud_amount_actual_topk', default=2, type=int)
-    parser.add_argument('--sparsepcgc_full_cloud_amount_warmup_max_actual_candidates_per_step', default=5, type=int)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_actual_topk', default=0, type=int)
+    parser.add_argument('--sparsepcgc_full_cloud_amount_warmup_max_actual_candidates_per_step', default=1, type=int)
     parser.add_argument('--sparsepcgc_full_cloud_amount_multi_actual_warmup_steps', default=100, type=int)
     parser.add_argument('--sparsepcgc_full_cloud_amount_oracle_sweep_interval', default=0, type=int)
     parser.add_argument('--sparsepcgc_full_cloud_amount_oracle_sweep_max_bins', default=8, type=int)
@@ -1692,9 +1692,9 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--sparsepcgc_policy_actual_noop_guard',
-        default=True,
+        default=False,
         type=str2bool,
-        help='Network編集がactual SparsePCGCでno-opより悪い場合は、そのStepの最終codec行動をno-opとして扱う',
+        help='互換用のno-op候補診断を有効にする。actualのraw圧縮値と学習教師は置換しない',
     )
     parser.add_argument(
         '--sparsepcgc_policy_actual_noop_guard_margin',
@@ -2737,12 +2737,42 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--sparsepcgc_scale_ae', default=0, type=int, choices=[0, 1], help='mからAE/SRを決める際のAE scale。ana_den6と同じ既定0')
     parser.add_argument('--sparsepcgc_native_bit_depth', default=0, type=int, help='m=bit_depth-(AE+SR)を計算するnative bit depth。0は8i/MVUB=10、UVG=9を自動選択')
     parser.add_argument('--heuristic_guidance_enabled', default=True, type=str2bool, help='ana_den6由来HeuristicをWhere/Amount/Actionのpriorとして使う')
+    parser.add_argument(
+        '--heuristic_guidance_mode',
+        default='ana_den6_reproduce',
+        choices=['proxy_prior', 'ana_den6_reproduce', 'ana_den6_reference_ply'],
+        help='Heuristic guidanceの実行形態。ana_den6_reproduceはden6 candidate plan manifestを厳密適用する',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_den6_plan_manifest',
+        default='',
+        type=str,
+        help='tools/ana_den6_reproduce.py --manifest-out が出力したden6 candidate plan JSON',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_den6_codec_strict',
+        default=True,
+        type=str2bool,
+        help='Heuristic guidance時にden6と異なるSparsePCGC codec条件を開始時にエラーにする',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_anchor_steps',
+        default=200,
+        type=int,
+        help='学習開始時にana_den6の操作別Amountを100%%からNetworkへ連続移行するstep数。0で無効',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_disable_full_cloud_amount_override',
+        default=True,
+        type=str2bool,
+        help='Heuristic有効時に旧full_cloud_amountの1.5%%以上のPrune bin上書きを無効化する',
+    )
     parser.add_argument('--heuristic_guidance_where_weight', default=1.0, type=float, help='Heuristic Where scoreを既存Actuator logitへ加える重み')
     parser.add_argument('--heuristic_guidance_action_strength', default=0.50, type=float, help='Action gateをHeuristic構成比へ寄せる強さ。0でNetworkのみ、1でprior gate')
     parser.add_argument('--heuristic_guidance_amount_residual_fraction', default=0.50, type=float, help='NetworkがHeuristic Amountから上下へ変更できる相対幅')
     parser.add_argument('--heuristic_guidance_amount_min_residual', default=0.0001, type=float, help='Amount residual探索幅の最小値')
     parser.add_argument('--heuristic_guidance_amount_grad_scale', default=1.0, type=float, help='Heuristic Amount範囲制限のSTEでAmount headへ返す勾配倍率')
-    parser.add_argument('--heuristic_guidance_total_ratio_percent', default=-1.0, type=float, help='合計操作割合の上書き[%]。負ならデータセット/m別ana_den6初期値')
+    parser.add_argument('--heuristic_guidance_total_ratio_percent', default=-1.0, type=float, help='合計操作割合の上書き[%%]。負ならデータセット/m別ana_den6初期値')
     parser.add_argument('--heuristic_guidance_operation_shares', default='', type=str, help='Add,Prune,Adjust構成比の上書き。例0.4,0.4,0.2')
     parser.add_argument('--heuristic_guidance_operation_heuristics', default='', type=str, help='Add,Prune,AdjustのHeuristic名上書き。3項目をカンマ区切り')
     parser.add_argument('--gpcc_root', default=str(_DEFAULT_GPCC_ROOT), type=str, help='G-PCCリポジトリのパス')
@@ -3017,6 +3047,12 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--for_better_spike_ratio', default=2.0, type=float, help='ForBetter.txtの急増event判定倍率')
     parser.add_argument('--for_better_spike_window', default=20, type=int, help='ForBetter.txtの急増event判定rolling window')
     parser.add_argument('--actual_eval_interval', default=1, type=int, help='train時のactual codec教師refresh間隔。既定1で毎Step実圧縮する。0なら初回以外refreshしない')
+    parser.add_argument(
+        '--sparsepcgc_actual_every_step',
+        default=True,
+        type=str2bool,
+        help='SparsePCGC actual/actual_ste backendで、actual_eval_intervalに関わらず毎Step edited hard voxelを実圧縮する',
+    )
     parser.add_argument('--disable_actual_codec_during_train', default=False, type=str2bool, help='train中のactual codec呼び出しをproxyへ置き換えて無効化するか')
     parser.add_argument(
         '--use_voxel_restored_points_for_actual',
@@ -3663,6 +3699,34 @@ def parse_pugan_args(parser, file_day, file_time):
     if not _cli_option_was_provided("--sparsepcgc_dense_scale_sr_list"):
         args.sparsepcgc_dense_scale_sr_list = str(args.sparsepcgc_scale_sr)
     args.heuristic_guidance_enabled = bool(getattr(args, "heuristic_guidance_enabled", True))
+    args.heuristic_guidance_mode = str(
+        getattr(args, "heuristic_guidance_mode", "proxy_prior")
+    ).strip().lower()
+    if args.heuristic_guidance_mode not in {"proxy_prior", "ana_den6_reproduce", "ana_den6_reference_ply"}:
+        raise ValueError(f"未知のheuristic_guidance_mode: {args.heuristic_guidance_mode}")
+    if (
+        args.heuristic_guidance_enabled
+        and args.heuristic_guidance_mode == "ana_den6_reproduce"
+        and not str(getattr(args, "heuristic_guidance_den6_plan_manifest", "")).strip()
+    ):
+        raise ValueError(
+            "ana_den6_reproduceには--heuristic_guidance_den6_plan_manifestが必要である。"
+            "proxy_priorで代替実行しないため、tools/ana_den6_reproduce.pyで対象frameのmanifestを生成すること。"
+        )
+    if args.heuristic_guidance_mode in {"ana_den6_reproduce", "ana_den6_reference_ply"}:
+        # 保存済みden6 hard voxel集合をActuatorへ適用する厳密anchorでは、
+        # proxy操作で最終集合を上書きさせない。
+        args.sparsepcgc_actual_oracle_apply_teacher_actions = True
+    args.heuristic_guidance_anchor_steps = max(
+        int(getattr(args, "heuristic_guidance_anchor_steps", 200)),
+        0,
+    )
+    args.heuristic_guidance_disable_full_cloud_amount_override = bool(
+        getattr(args, "heuristic_guidance_disable_full_cloud_amount_override", True)
+    )
+    args.sparsepcgc_actual_every_step = bool(
+        getattr(args, "sparsepcgc_actual_every_step", True)
+    )
     args.heuristic_guidance_where_weight = max(float(getattr(args, "heuristic_guidance_where_weight", 1.0)), 0.0)
     args.heuristic_guidance_action_strength = min(max(float(getattr(args, "heuristic_guidance_action_strength", 0.50)), 0.0), 1.0)
     args.heuristic_guidance_amount_residual_fraction = max(float(getattr(args, "heuristic_guidance_amount_residual_fraction", 0.50)), 0.0)
@@ -3792,6 +3856,44 @@ def parse_pugan_args(parser, file_day, file_time):
     args.sparsepcgc_voxel_size = max(float(getattr(args, "sparsepcgc_voxel_size", 1.0)), 1e-12)
     args.sparsepcgc_pos_quantscale = max(int(getattr(args, "sparsepcgc_pos_quantscale", 1)), 1)
     args.sparsepcgc_effective_qs = float(args.sparsepcgc_voxel_size) * float(args.sparsepcgc_pos_quantscale)
+    args.heuristic_guidance_den6_codec_strict = bool(
+        getattr(args, "heuristic_guidance_den6_codec_strict", True)
+    )
+    if (
+        args.heuristic_guidance_enabled
+        and compress_key == "sparsepcgc"
+        and args.heuristic_guidance_den6_codec_strict
+    ):
+        # den6の比較対象は native_vs1_pq1_ae0_sr{native-m}_m{m} であり、
+        # qs連動や別modeを許すと同じhard voxel集合でもbitが一致しない。
+        expected_sr = args.sparsepcgc_native_bit_depth - args.sparsepcgc_scale_m - args.sparsepcgc_scale_ae
+        mismatches = []
+        if args.sparsepcgc_mode != "dense_lossy":
+            mismatches.append(f"mode={args.sparsepcgc_mode} (expected dense_lossy)")
+        if bool(args.sparsepcgc_match_qs):
+            mismatches.append("sparsepcgc_match_qs=True (expected False)")
+        if not math.isclose(args.sparsepcgc_voxel_size, 1.0, abs_tol=1e-12):
+            mismatches.append(f"voxel_size={args.sparsepcgc_voxel_size} (expected 1.0)")
+        if args.sparsepcgc_pos_quantscale != 1:
+            mismatches.append(f"pos_quantscale={args.sparsepcgc_pos_quantscale} (expected 1)")
+        if args.sparsepcgc_scale_ae != 0 or args.sparsepcgc_scale_sr != expected_sr:
+            mismatches.append(
+                f"AE/SR={args.sparsepcgc_scale_ae}/{args.sparsepcgc_scale_sr} "
+                f"(expected 0/{expected_sr})"
+            )
+        expected_resolution = 511 if dataset_key_for_m == "uvg" else 1023
+        if int(args.sparsepcgc_psnr_resolution) != expected_resolution:
+            mismatches.append(
+                f"psnr_resolution={args.sparsepcgc_psnr_resolution} (expected {expected_resolution})"
+            )
+        if mismatches:
+            raise ValueError(
+                "ana_den6とactual bitを比較するHeuristic guidanceのcodec設定が不一致: "
+                + "; ".join(mismatches)
+            )
+        # den6はcodec bitのみをsaved percentとして比較する。編集記録は診断に残すが、
+        # forward objectiveへは加えない。
+        args.sparsepcgc_actual_bit_objective = "raw"
     args.repair_voxel_edit_state = bool(getattr(args, "repair_voxel_edit_state", True))
     args.repair_voxel_move_as_relocate = bool(getattr(args, "repair_voxel_move_as_relocate", True))
     args.repair_voxel_edit_require_empty_move_target = bool(
@@ -4707,7 +4809,7 @@ def parse_pugan_args(parser, file_day, file_time):
         getattr(args, "sparsepcgc_full_cloud_amount_fresh_actual_every_step", True)
     )
     args.sparsepcgc_full_cloud_amount_actual_interval = max(
-        int(getattr(args, "sparsepcgc_full_cloud_amount_actual_interval", 5)),
+        int(getattr(args, "sparsepcgc_full_cloud_amount_actual_interval", 1)),
         0,
     )
     args.sparsepcgc_full_cloud_amount_warmup_actual_interval = max(
@@ -4719,17 +4821,17 @@ def parse_pugan_args(parser, file_day, file_time):
         0,
     )
     args.sparsepcgc_full_cloud_amount_max_actual_candidates_per_step = max(
-        int(getattr(args, "sparsepcgc_full_cloud_amount_max_actual_candidates_per_step", 2)),
+        int(getattr(args, "sparsepcgc_full_cloud_amount_max_actual_candidates_per_step", 1)),
         1,
     )
     args.sparsepcgc_full_cloud_amount_multi_actual_enable = bool(
-        getattr(args, "sparsepcgc_full_cloud_amount_multi_actual_enable", True)
+        getattr(args, "sparsepcgc_full_cloud_amount_multi_actual_enable", False)
     )
     args.sparsepcgc_full_cloud_amount_actual_candidate_policy = str(
         getattr(
             args,
             "sparsepcgc_full_cloud_amount_actual_candidate_policy",
-            "selected_plus_surrogate_topk",
+            "selected_only",
         )
     ).strip().lower()
     if args.sparsepcgc_full_cloud_amount_actual_candidate_policy not in {
@@ -4739,13 +4841,13 @@ def parse_pugan_args(parser, file_day, file_time):
         "selected_neighbors_memory_surrogate",
         "all_bins",
     }:
-        args.sparsepcgc_full_cloud_amount_actual_candidate_policy = "selected_plus_surrogate_topk"
+        args.sparsepcgc_full_cloud_amount_actual_candidate_policy = "selected_only"
     args.sparsepcgc_full_cloud_amount_actual_topk = max(
-        int(getattr(args, "sparsepcgc_full_cloud_amount_actual_topk", 2)),
+        int(getattr(args, "sparsepcgc_full_cloud_amount_actual_topk", 0)),
         0,
     )
     args.sparsepcgc_full_cloud_amount_warmup_max_actual_candidates_per_step = max(
-        int(getattr(args, "sparsepcgc_full_cloud_amount_warmup_max_actual_candidates_per_step", 4)),
+        int(getattr(args, "sparsepcgc_full_cloud_amount_warmup_max_actual_candidates_per_step", 1)),
         1,
     )
     args.sparsepcgc_full_cloud_amount_multi_actual_warmup_steps = max(
@@ -5372,7 +5474,7 @@ def parse_pugan_args(parser, file_day, file_time):
         getattr(args, "sparsepcgc_actual_gate_prune", True)
     )
     args.sparsepcgc_policy_actual_noop_guard = bool(
-        getattr(args, "sparsepcgc_policy_actual_noop_guard", True)
+        getattr(args, "sparsepcgc_policy_actual_noop_guard", False)
     )
     args.sparsepcgc_policy_actual_noop_guard_margin = max(
         float(getattr(args, "sparsepcgc_policy_actual_noop_guard_margin", 0.0)),
@@ -5638,21 +5740,18 @@ def parse_pugan_args(parser, file_day, file_time):
             # SparsePCGC surrogateは実SparsePCGC bit教師が必要なので、既定ではactual teacherを止めない。
             args.disable_actual_codec_during_train = False
         if args.compression_loss_backend.endswith("_surrogate") and not _cli_option_was_provided("--surrogate_update_on_teacher_refresh_only"):
-            # SparsePCGCはactual teacherを毎Step取るため、teacher refresh時だけSurrogateを軽く合わせる。
+            # actual教師を毎Step更新し、Networkのhard voxel編集と同じ実測値を使う。
             args.surrogate_update_on_teacher_refresh_only = True
         if args.compression_loss_backend.endswith("_surrogate") and not _cli_option_was_provided("--compression_surrogate_replay_steps"):
-            # actual teacherを毎Step取る設計ではreplay更新は重複なので止める。
+            # periodic actual teacherとlast targetを併用するため、追加replay更新は重複なので止める。
             args.compression_surrogate_replay_steps = 0
         if args.compression_loss_backend.endswith("_surrogate") and not _cli_option_was_provided("--surrogate_pretrain_actual_refresh_interval"):
-            # 事前学習中はSparsePCGC teacherを毎Step更新し、ゼロ/ stale教師だけの学習を避ける。
+            # 事前学習もactual教師を毎Step更新し、stale targetを使わない。
             args.surrogate_pretrain_actual_refresh_interval = 1
         if args.compression_loss_backend.endswith("_surrogate") and not _cli_option_was_provided("--actual_eval_interval"):
-            # train側のrefresh_actual_genがFalseだとsurrogate teacher更新自体が止まるため、
-            # SparsePCGC surrogateではactual teacherを毎Step更新する。
             args.actual_eval_interval = 1
         if args.compression_loss_backend in {"sparsepcgc_actual", "sparsepcgc_actual_ste"} and not _cli_option_was_provided("--actual_eval_interval"):
-            # 提案手法では各StepのNetwork出力を実Codecで評価する。
-            # 速度はpersistent worker、decode/PSNR省略、GT/result cache、軽量I/Oで確保する。
+            # SparsePCGC actual backendはNetworkのhard voxel編集を毎Step実測する。
             args.actual_eval_interval = 1
         if not _cli_option_was_provided("--compression_surrogate_forward_mode"):
             args.compression_surrogate_forward_mode = "teacher_ste"
@@ -5664,7 +5763,7 @@ def parse_pugan_args(parser, file_day, file_time):
             # raw percentの外れ値(特にGT bitが0近傍のstep)でlossが爆発しないよう、既定で上限を入れる。
             args.surrogate_target_clip_percent = 100.0
         if not _cli_option_was_provided("--compression_surrogate_refresh_interval"):
-            # SparsePCGCの圧縮損失は必ず実Codec値で測る。速度はactual以外の更新回数を削って稼ぐ。
+            # SparsePCGCのfresh教師はactual更新stepで測り、surrogateは毎stepの勾配を維持する。
             args.compression_surrogate_refresh_interval = 1 if args.compression_loss_backend.endswith("_surrogate") else max(int(getattr(args, "compression_surrogate_refresh_interval", 0)), 50)
         if not _cli_option_was_provided("--lr_scheduler_enabled"):
             # ActualCompressionGuardとStepLRの二重LR低下を避けるため、SparsePCGC実験ではStepLRを既定で止める。
