@@ -12,6 +12,7 @@ from .utils.pointcloud.sparsepcgc_voxel import (
     unique_voxel_coords_batched,
     restore_points_from_voxel_coords,
 )
+from .utils.pointcloud.ana_den6_reference import attach_ana_den6_reference_anchor
 from .modules.cause_aggregation import CauseDiagnosisAggregation
 from .modules.cost_attribution import CAUSE_NAMES, CostAttributionModule
 from .modules.octree_structure import OctreeStructureAnalysis
@@ -1236,7 +1237,7 @@ class Network(nn.Module):
             "final_voxel_count": int(after_count),
             "after_occupied_voxel_count": int(after_count),
             "voxel_edit_drop_count": int(full_octree_context.get("actual_oracle_override_drop_count", 0) or 0),
-            "voxel_edit_add_count": int(full_octree_context.get("actual_oracle_override_add_count", 0) or 0),
+            "voxel_edit_add_count": int(full_octree_context.get("actual_oracle_accepted_add_count", 0) or 0),
             "voxel_edit_move_count": int(full_octree_context.get("actual_oracle_override_move_count", 0) or 0),
             "estimated_edit_record_bits": float(full_octree_context.get("actual_oracle_edit_record_bits", 0.0) or 0.0),
             "final_voxel_update_mode": "actual_oracle_full_cloud_override",
@@ -1274,16 +1275,6 @@ class Network(nn.Module):
             "network_voxel_node_count": int(after_count),
             "network_voxel_node_source": "actual_oracle_full_cloud_override",
             "full_cloud_oracle_fast_path": True,
-            # strict den6 manifestではNetworkの暫定maskでなく、検証済みplanのAction数を記録する。
-            "add_target_voxel_count": int(full_octree_context.get("actual_oracle_override_add_count", 0) or 0),
-            "delete_target_voxel_count": int(full_octree_context.get("actual_oracle_override_drop_count", 0) or 0),
-            "move_source_voxel_count": int(full_octree_context.get("actual_oracle_override_move_count", 0) or 0),
-            "voxel_edit_initial_count": int(before_count),
-            "voxel_edit_final_count": int(after_count),
-            "voxel_edit_add_count": int(full_octree_context.get("actual_oracle_override_add_count", 0) or 0),
-            "voxel_edit_drop_count": int(full_octree_context.get("actual_oracle_override_drop_count", 0) or 0),
-            "voxel_edit_move_count": int(full_octree_context.get("actual_oracle_override_move_count", 0) or 0),
-            "ana_den6_strict_manifest": bool(full_octree_context.get("ana_den6_reference_anchor_used", False)),
         }
         self.last_runtime_timing = {
             "encode": 0.0,
@@ -1332,6 +1323,25 @@ class Network(nn.Module):
             setattr(self.args, "_last_actuator_voxel_state", None)
         except Exception:
             pass
+
+        guidance_mode = str(
+            getattr(self.args, "heuristic_guidance_mode", "proxy_prior")
+        ).strip().lower()
+        if (
+            bool(getattr(self.args, "heuristic_guidance_enabled", True))
+            and guidance_mode in {
+                "ana_den6_residual", "ana_den6_reproduce", "ana_den6_reference_ply"
+            }
+        ):
+            if not isinstance(full_octree_context, dict):
+                raise RuntimeError(
+                    f"{guidance_mode}にはfull-cloud canonical contextが必要である"
+                )
+            full_octree_context = attach_ana_den6_reference_anchor(
+                full_octree_context,
+                self.args,
+                device=pts_xyz.device,
+            )
 
         fast_oracle_result = self._maybe_fast_full_cloud_oracle_forward(
             pts_xyz,
@@ -1623,10 +1633,6 @@ class Network(nn.Module):
             lowprob_proxy_full_list = []
             occupancy_nll_proxy_full_list = []
             quant_proxy_full_list = []
-            # OctreeStructureAnalysisで作ったHeuristic Where priorを、
-            # Sparse Tensor経路でも全点群座標へ揃えて保持する。
-            heuristic_where_full_lists = {"Add": [], "Prune": [], "Adjust": []}
-            heuristic_guidance_template = None
             cause_scores_means = []
             subtree_scores_means = []
             policy_probs_means = []
@@ -1739,29 +1745,6 @@ class Network(nn.Module):
 
                 """点操作前処理"""
                 full_xyz_b = pts_xyz[b:b + 1]
-                guidance_b = structure_b.get("heuristic_guidance", None) if isinstance(structure_b, dict) else None
-                if isinstance(guidance_b, dict) and bool(guidance_b.get("enabled", False)):
-                    if heuristic_guidance_template is None:
-                        heuristic_guidance_template = {
-                            key: value
-                            for key, value in guidance_b.items()
-                            if key not in {"where_prior", "where_prior_mean"}
-                        }
-                    where_b = guidance_b.get("where_prior", {})
-                    prior_channels = []
-                    for operation in ("Add", "Prune", "Adjust"):
-                        prior_b = where_b.get(operation) if isinstance(where_b, dict) else None
-                        if not torch.is_tensor(prior_b):
-                            prior_b = analysis_xyz_b.new_zeros((1, 1, analysis_count))
-                        prior_channels.append(prior_b.to(device=pts_xyz.device, dtype=pts_xyz.dtype))
-                    # 3操作を一度に伝播し、同じKNN探索の重複を避ける。
-                    prior_b3 = torch.cat(prior_channels, dim=1)
-                    if analysis_xyz_b.shape[-1] != full_xyz_b.shape[-1]:
-                        prior_b3 = self._propagate_encoder_features(full_xyz_b, analysis_xyz_b, prior_b3)
-                    for channel_index, operation in enumerate(("Add", "Prune", "Adjust")):
-                        heuristic_where_full_lists[operation].append(
-                            prior_b3[:, channel_index:channel_index + 1, :].detach()
-                        )
                 if analysis_xyz_b.shape[-1] == full_xyz_b.shape[-1]:
                     structure_feat_full_list.append(structure_feat_b)
                     subtree_scores_full_list.append(subtree_scores_b)
@@ -1866,6 +1849,16 @@ class Network(nn.Module):
                 "point_feature_voxel_key": structure_b.get("point_feature_voxel_key") if structure_b is not None else None,
                 "occupancy_nll_proxy_full": torch.cat(occupancy_nll_proxy_full_list, dim=0),
                 "leaf_pattern_diag": structure_b.get("leaf_pattern_diag") if structure_b is not None else None,
+                # sparse per-sample pathでden6 exact guidanceを落とさない。
+                "heuristic_guidance": structure_b.get("heuristic_guidance") if structure_b is not None else None,
+                "ana_den6_ranked_candidate_guidance": (
+                    structure_b.get("ana_den6_ranked_candidate_guidance")
+                    if structure_b is not None else None
+                ),
+                "global_voxel_coords": (
+                    structure_b.get("global_voxel_coords")
+                    if structure_b is not None else None
+                ),
 
                 # Section2:
                 # sparse pathでは最後に処理したstructure_bのsummaryをdebugとして持つ。
@@ -1883,22 +1876,6 @@ class Network(nn.Module):
                 "leaf_move_gain_mean": float(structure_b.get("leaf_move_gain_mean", 0.0) or 0.0) if structure_b is not None else 0.0,
                 "leaf_high_gain_candidate_ratio": float(structure_b.get("leaf_high_gain_candidate_ratio", 0.0) or 0.0) if structure_b is not None else 0.0,
             }
-            if heuristic_guidance_template is not None and all(
-                len(heuristic_where_full_lists[operation]) == int(pts_xyz.shape[0])
-                for operation in ("Add", "Prune", "Adjust")
-            ):
-                structure["heuristic_guidance"] = {
-                    **heuristic_guidance_template,
-                    "where_prior": {
-                        operation: torch.cat(heuristic_where_full_lists[operation], dim=0)
-                        for operation in ("Add", "Prune", "Adjust")
-                    },
-                    "where_prior_mean": {},
-                }
-            elif structure_b is not None and isinstance(structure_b.get("heuristic_guidance", None), dict):
-                # disabled理由などTensorを含まないsummaryはそのまま保持する。
-                structure["heuristic_guidance"] = dict(structure_b["heuristic_guidance"])
-
             cause_mean = torch.stack(cause_scores_means, dim=0).mean(dim=0).squeeze(0).detach().cpu()
             subtree_mean = torch.stack(subtree_scores_means, dim=0).mean(dim=0).squeeze(0).detach().cpu()
             policy_mean = torch.stack(policy_probs_means, dim=0).mean(dim=0).squeeze(0).detach().cpu()
@@ -2136,14 +2113,6 @@ class Network(nn.Module):
         is_full_cloud_forward = octree_mode_text == "full_cloud"
 
         """点操作実行"""
-        if isinstance(structure, dict):
-            guidance = structure.get("heuristic_guidance", None)
-            if isinstance(guidance, dict):
-                structure["heuristic_guidance_enabled"] = bool(guidance.get("enabled", False))
-                structure["heuristic_guidance_dataset"] = str(guidance.get("dataset", ""))
-                structure["heuristic_guidance_scale_m"] = int(guidance.get("scale_m", -1))
-                structure["heuristic_guidance_profile_source"] = str(guidance.get("profile_source", ""))
-                structure["heuristic_guidance_total_ratio"] = float(guidance.get("total_ratio", 0.0))
         actuator_input = torch.cat(
             [structure_feat_full, subtree_scores_full, policy_probs_full, repair_priority_full],
             dim=1,
@@ -2261,14 +2230,6 @@ class Network(nn.Module):
                 "raw_learned_drop_ratio",
                 "raw_learned_add_ratio",
                 "raw_learned_move_ratio",
-                "heuristic_guidance_enabled",
-                "heuristic_guidance_dataset",
-                "heuristic_guidance_scale_m",
-                "heuristic_guidance_profile_source",
-                "heuristic_guidance_total_ratio",
-                "heuristic_guidance_operation_heuristics",
-                "heuristic_guidance_amount_prior",
-                "heuristic_guidance_action_gate_prior",
             )
             if actuator_stats.get(key, None) is not None
         }
@@ -2469,7 +2430,6 @@ class Network(nn.Module):
             "move_operation_gate",
             "operation_gate_logit",
             "operation_gate_prob",
-            "legacy_amount_selector_blocked_by_guidance",
             "algorithmic_proposal_selector_enabled",
             "algorithmic_proposal_selector_active",
             "algorithmic_proposal_where_source_id",
@@ -3041,13 +3001,6 @@ class Network(nn.Module):
                     "sparsepcgc_exact_teacher_mode": str(getattr(self.args, "_current_exact_teacher_mode", getattr(self.args, "sparsepcgc_exact_teacher_mode", "auto"))),
                     "exact_teacher_uses_full_context": bool(getattr(self.args, "_current_exact_teacher_uses_full_context", False)),
                     "exact_teacher_fallback_reason": str(getattr(self.args, "_current_exact_teacher_fallback_reason", "")),
-                    "heuristic_guidance_enabled": bool(actuator_stats.get("heuristic_guidance_enabled", False)),
-                    "heuristic_guidance_dataset": str(actuator_stats.get("heuristic_guidance_dataset", "")),
-                    "heuristic_guidance_scale_m": int(actuator_stats.get("heuristic_guidance_scale_m", -1)),
-                    "heuristic_guidance_profile_source": str(actuator_stats.get("heuristic_guidance_profile_source", "")),
-                    "heuristic_guidance_total_ratio": float(actuator_stats.get("heuristic_guidance_total_ratio", 0.0)),
-                    "heuristic_guidance_operation_heuristics": str(actuator_stats.get("heuristic_guidance_operation_heuristics", {})),
-                    "heuristic_guidance_amount_prior": str(actuator_stats.get("heuristic_guidance_amount_prior", {})),
                 }
                 for key in (
                     "actual_oracle_bad_candidate_count",
@@ -3099,7 +3052,6 @@ class Network(nn.Module):
                     "post_warmup_amount_hybrid_applied",
                     "amount_explore_step",
                     "amount_explore_used_teacher",
-                    "legacy_amount_selector_blocked_by_guidance",
                     "algorithmic_proposal_selector_enabled",
                     "algorithmic_proposal_selector_active",
                     "algorithmic_proposal_noop_selected",

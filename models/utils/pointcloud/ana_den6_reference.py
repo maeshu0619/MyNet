@@ -1,8 +1,9 @@
 """ana_den6のcandidate planをmyNetのstrict hard voxel anchorへ接続する。
 
-``ana_den6_reproduce`` はden6本体が出力したplan manifestだけを受け付ける。
-保存済み編集PLYを直接使う旧経路は ``ana_den6_reference_ply`` と明示的に分離し、
-候補生成・順位・衝突回避を再現したものとして扱わない。
+``ana_den6_reproduce`` はden6本体が出力した固定planを厳密再生する。
+``ana_den6_residual`` はden6/den5が順位付けした全候補poolを探索空間として使い、
+Step 0ではden6 anchorを再現し、その後はNetwork residualだけで順位・量・Actionを微調整する。
+保存済み編集PLYを直接使う旧経路は ``ana_den6_reference_ply`` と明示的に分離する。
 """
 
 from __future__ import annotations
@@ -10,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -114,12 +116,26 @@ def _coord_hash(coords_b3n: torch.Tensor) -> str:
     return hashlib.sha256(values.tobytes(order="C")).hexdigest()
 
 
+_FILE_SHA256_CACHE: dict[tuple[str, int, int], str] = {}
+
+
 def _sha256_file(path: Path) -> str:
+    """不変な入力PLY・den6・manifestのSHA256をsize/mtime単位で再利用する。"""
+    resolved = path.expanduser().resolve()
+    stat = resolved.stat()
+    key = (str(resolved), int(stat.st_size), int(stat.st_mtime_ns))
+    cached = _FILE_SHA256_CACHE.get(key)
+    if cached is not None:
+        return cached
     digest = hashlib.sha256()
-    with path.open("rb") as stream:
+    with resolved.open("rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
-    return digest.hexdigest()
+    value = digest.hexdigest()
+    for old_key in [item for item in _FILE_SHA256_CACHE if item[0] == str(resolved) and item != key]:
+        _FILE_SHA256_CACHE.pop(old_key, None)
+    _FILE_SHA256_CACHE[key] = value
+    return value
 
 
 def _current_den6_sha256() -> str:
@@ -130,6 +146,153 @@ def _current_den6_sha256() -> str:
     return _sha256_file(den6_path)
 
 
+def _manifest_schema(manifest: Mapping[str, Any]) -> str:
+    return str(manifest.get("schema_version", ""))
+
+
+def _load_manifest_file(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"ana_den6 manifestを読めない: {path}") from exc
+    if not isinstance(value, dict):
+        raise RuntimeError(f"ana_den6 manifest rootがdictではない: {path}")
+    return value
+
+
+def _resolve_manifest_path(args: Any) -> Path:
+    """単一manifestまたはmanifest directoryから現在frameのv2 manifestを解決する。"""
+    explicit = str(getattr(args, "heuristic_guidance_den6_plan_manifest", "") or "").strip()
+    if explicit:
+        path = Path(explicit).expanduser().resolve()
+        if not path.is_file():
+            raise RuntimeError(f"ana_den6 manifestが存在しない: {path}")
+        return path
+
+    root_text = str(getattr(args, "heuristic_guidance_den6_manifest_dir", "") or "").strip()
+    if not root_text:
+        raise RuntimeError(
+            "ana_den6 modeには--heuristic_guidance_den6_plan_manifestまたは"
+            "--heuristic_guidance_den6_manifest_dirが必要である"
+        )
+    root = Path(root_text).expanduser().resolve()
+    if not root.is_dir():
+        raise RuntimeError(f"ana_den6 manifest directoryが存在しない: {root}")
+
+    input_file = Path(str(getattr(args, "_current_input_file", ""))).resolve()
+    if not input_file.is_file():
+        raise RuntimeError("現在の入力PLYを特定できないためmanifestを選べない")
+    input_sha = _sha256_file(input_file)
+    setting = _setting_id(args)
+    cache = getattr(args, "_ana_den6_manifest_index_cache", None)
+    cache_key = (str(root), input_sha, setting)
+    if isinstance(cache, dict) and cache_key in cache:
+        cached = Path(cache[cache_key])
+        if cached.is_file():
+            return cached
+    matches = []
+    for candidate in sorted(root.rglob("*.json")):
+        try:
+            manifest = _load_manifest_file(candidate)
+        except RuntimeError:
+            continue
+        if str(manifest.get("input_sha256", "")) != input_sha:
+            continue
+        if str(manifest.get("setting_id", "")) != setting:
+            continue
+        matches.append(candidate.resolve())
+    if len(matches) != 1:
+        raise RuntimeError(
+            "現在frame/codec設定に対応するana_den6 manifestを一意に選べない: "
+            f"root={root}, input={input_file}, setting={setting}, matches={len(matches)}"
+        )
+    if not isinstance(cache, dict):
+        cache = {}
+        setattr(args, "_ana_den6_manifest_index_cache", cache)
+    cache[cache_key] = str(matches[0])
+    return matches[0]
+
+
+def _validate_manifest_common(
+    manifest_path: Path,
+    manifest: Mapping[str, Any],
+    *,
+    args: Any,
+    initial: torch.Tensor,
+) -> None:
+    schema = _manifest_schema(manifest)
+    if schema not in {
+        "ana_den6_mixed_plan_manifest_v1",
+        "ana_den6_ranked_candidate_manifest_v2",
+    }:
+        raise RuntimeError(f"ana_den6 plan manifest schemaが不正: {schema} ({manifest_path})")
+    if str(manifest.get("den6_sha256", "")) != _current_den6_sha256():
+        raise RuntimeError("manifest生成時と現在のana_den6.pyのSHA256が一致しない")
+    input_file = Path(str(getattr(args, "_current_input_file", ""))).resolve()
+    if Path(str(manifest.get("input_file", ""))).resolve() != input_file:
+        raise RuntimeError("ana_den6 manifestとtrain入力PLYが一致しない")
+    if str(manifest.get("setting_id", "")) != _setting_id(args):
+        raise RuntimeError("ana_den6 manifestとAE/SR/m設定が一致しない")
+    if str(manifest.get("input_sha256", "")) != _sha256_file(input_file):
+        raise RuntimeError("ana_den6 manifestとtrain入力PLYのSHA256が一致しない")
+    if schema == "ana_den6_ranked_candidate_manifest_v2":
+        expected_input_hash = str(manifest.get("input_voxel_hash", ""))
+        if expected_input_hash and _coord_hash(initial) != expected_input_hash:
+            raise RuntimeError("ana_den6 manifestとtrain canonical input voxel集合が一致しない")
+
+
+def _candidate_guidance_from_manifest(
+    manifest_path: Path,
+    manifest: Mapping[str, Any],
+) -> dict[str, Any]:
+    """v2 manifestをTensor化前の軽量なexact candidate guidanceへ変換する。"""
+    if _manifest_schema(manifest) != "ana_den6_ranked_candidate_manifest_v2":
+        raise RuntimeError(
+            "ana_den6_residualには全順位付きcandidate poolを含むv2 manifestが必要である。"
+            "tools/ana_den6_reproduce.pyでmanifestを再生成すること"
+        )
+    pools = manifest.get("ranked_candidate_pools")
+    if not isinstance(pools, Mapping):
+        raise RuntimeError("v2 manifestにranked_candidate_poolsが無い")
+    normalized_pools = {}
+    for operation in ("Add", "Prune", "Adjust"):
+        rows = pools.get(operation)
+        if not isinstance(rows, list) or not rows:
+            raise RuntimeError(f"v2 manifestの{operation} candidate poolが空である")
+        normalized = []
+        for expected_rank, row in enumerate(rows):
+            if not isinstance(row, Mapping) or str(row.get("operation", "")) != operation:
+                raise RuntimeError(f"v2 manifestの{operation} candidate rowが不正")
+            item = dict(row)
+            if int(item.get("pool_rank", expected_rank)) != expected_rank:
+                raise RuntimeError(f"v2 manifestの{operation} rankが連続していない")
+            normalized.append(item)
+        normalized_pools[operation] = normalized
+    selected = manifest.get("selected_candidates")
+    if not isinstance(selected, list) or not selected:
+        raise RuntimeError("v2 manifestにanchor selected_candidatesが無い")
+    return {
+        "enabled": True,
+        "source": "ana_den6_exact_ranked_candidate_pool_v2",
+        "manifest_path": str(manifest_path),
+        "manifest_sha256": _sha256_file(manifest_path),
+        "dataset": str(manifest.get("dataset", "")),
+        "scale_m": int(manifest.get("scale_m", -1)),
+        "total_ratio": float(manifest.get("total_ratio_percent", 0.0)) / 100.0,
+        "operation_shares": dict(manifest.get("operation_shares") or {}),
+        "operation_heuristics": dict(manifest.get("operation_heuristics") or {}),
+        "requested_operation_counts": dict(manifest.get("requested_operation_counts") or {}),
+        "selected_operation_counts": dict(manifest.get("selected_operation_counts") or {}),
+        "operation_priority": list(manifest.get("operation_priority") or ("Add", "Prune", "Adjust")),
+        "plan_variants": int(manifest.get("plan_variants", 6) or 6),
+        "plan_metadata": dict(manifest.get("plan_metadata") or {}),
+        "ranked_candidate_pools": normalized_pools,
+        "selected_candidates": [dict(row) for row in selected],
+        "final_voxel_hash": str(manifest.get("final_voxel_hash", "")),
+        "reference_actual": dict(manifest.get("reference_actual") or {}),
+    }
+
+
 def _manifest_final_coords(
     manifest_path: Path,
     *,
@@ -137,18 +300,8 @@ def _manifest_final_coords(
     initial: torch.Tensor,
 ) -> tuple[torch.Tensor, Mapping[str, Any]]:
     """den6が出力したcandidate planを初期canonical集合へ厳密に適用する。"""
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if str(manifest.get("schema_version", "")) != "ana_den6_mixed_plan_manifest_v1":
-        raise RuntimeError(f"ana_den6 plan manifest schemaが不正: {manifest_path}")
-    if str(manifest.get("den6_sha256", "")) != _current_den6_sha256():
-        raise RuntimeError("ana_den6 plan manifest生成時と現在のana_den6.pyのSHA256が一致しない")
-    input_file = Path(str(getattr(args, "_current_input_file", ""))).resolve()
-    if Path(str(manifest.get("input_file", ""))).resolve() != input_file:
-        raise RuntimeError("ana_den6 plan manifestとtrain入力PLYが一致しない")
-    if str(manifest.get("setting_id", "")) != _setting_id(args):
-        raise RuntimeError("ana_den6 plan manifestとAE/SR/m設定が一致しない")
-    if str(manifest.get("input_sha256", "")) != _sha256_file(input_file):
-        raise RuntimeError("ana_den6 plan manifestとtrain入力PLYのSHA256が一致しない")
+    manifest = _load_manifest_file(manifest_path)
+    _validate_manifest_common(manifest_path, manifest, args=args, initial=initial)
 
     initial_rows = torch.unique(
         initial.detach().cpu().to(dtype=torch.long)[0].transpose(0, 1), dim=0, sorted=True
@@ -196,7 +349,7 @@ def attach_ana_den6_reference_anchor(
 ) -> dict[str, Any]:
     """検証済みden6 hard voxel集合をfull-cloud actual経路へ安全に付与する。"""
     mode = str(getattr(args, "heuristic_guidance_mode", "proxy_prior")).strip().lower()
-    if mode not in {"ana_den6_reproduce", "ana_den6_reference_ply"}:
+    if mode not in {"ana_den6_reproduce", "ana_den6_residual", "ana_den6_reference_ply"}:
         return dict(context)
     if not isinstance(context, Mapping):
         raise RuntimeError("ana_den6厳密anchorにはfull cloud canonical contextが必要")
@@ -210,13 +363,8 @@ def attach_ana_den6_reference_anchor(
     if int(torch.unique(initial[0].transpose(0, 1), dim=0).shape[0]) <= 0:
         raise RuntimeError("ana_den6厳密anchorの入力voxel集合が空である")
 
-    if mode == "ana_den6_reproduce":
-        manifest_path = Path(str(getattr(args, "heuristic_guidance_den6_plan_manifest", ""))).expanduser()
-        if not str(manifest_path) or not manifest_path.is_file():
-            raise RuntimeError(
-                "ana_den6_reproduceには--heuristic_guidance_den6_plan_manifestで、"
-                "tools/ana_den6_reproduce.pyが出力したplan manifestを指定する必要がある"
-            )
+    if mode in {"ana_den6_reproduce", "ana_den6_residual"}:
+        manifest_path = _resolve_manifest_path(args)
         # 同じargsを複数frameで共有しても、別入力へplanを誤適用しない。
         cache_key = "|".join((
             str(manifest_path.resolve()),
@@ -224,16 +372,39 @@ def attach_ana_den6_reference_anchor(
             _coord_hash(initial),
         ))
         cache = getattr(args, "_ana_den6_reference_anchor_cache", None)
-        if not isinstance(cache, dict):
-            cache = {}
+        if not isinstance(cache, OrderedDict):
+            cache = OrderedDict()
             setattr(args, "_ana_den6_reference_anchor_cache", cache)
         cached = cache.get(cache_key)
         if not isinstance(cached, dict):
             final, manifest = _manifest_final_coords(manifest_path.resolve(), args=args, initial=initial)
             cached = {"coords": final.cpu(), "manifest": manifest}
             cache[cache_key] = cached
-        edited = cached["coords"].to(device=device, dtype=torch.long, non_blocking=True)
+        cache.move_to_end(cache_key)
+        max_cache_entries = max(
+            int(getattr(args, "heuristic_guidance_tensor_cache_entries", 8)), 1
+        )
+        while len(cache) > max_cache_entries:
+            cache.popitem(last=False)
         manifest = cached["manifest"]
+        if mode == "ana_den6_residual":
+            guidance = cached.get("guidance")
+            if not isinstance(guidance, dict):
+                guidance = _candidate_guidance_from_manifest(manifest_path.resolve(), manifest)
+                guidance["anchor_final_voxel_coords"] = cached["coords"].cpu()
+                guidance["anchor_operation_counts"] = dict(manifest.get("selected_operation_counts") or {})
+                cached["guidance"] = guidance
+            out = dict(context)
+            out["ana_den6_ranked_candidate_guidance"] = guidance
+            out["ana_den6_reference_anchor_used"] = False
+            out["ana_den6_reference_anchor_source"] = guidance["source"]
+            setattr(args, "_ana_den6_reference_anchor_active", False)
+            setattr(args, "_ana_den6_reference_anchor_source", guidance["source"])
+            setattr(args, "_ana_den6_reference_expected_saved_percent", float(
+                guidance.get("reference_actual", {}).get("actual_saved_percent", float("nan"))
+            ))
+            return out
+        edited = cached["coords"].to(device=device, dtype=torch.long, non_blocking=True)
         actual_reference = manifest.get("reference_actual", {})
         if not isinstance(actual_reference, Mapping):
             actual_reference = {}
@@ -253,8 +424,8 @@ def attach_ana_den6_reference_anchor(
         reference = _load_reference(args)
         cache_key = str(Path(str(reference["edited_ply"])).resolve())
         cache = getattr(args, "_ana_den6_reference_anchor_cache", None)
-        if not isinstance(cache, dict):
-            cache = {}
+        if not isinstance(cache, OrderedDict):
+            cache = OrderedDict()
             setattr(args, "_ana_den6_reference_anchor_cache", cache)
         cached = cache.get(cache_key)
         if not isinstance(cached, dict):
@@ -263,6 +434,10 @@ def attach_ana_den6_reference_anchor(
                 raise RuntimeError(f"ana_den6参照PLYが存在しない: {edited_file}")
             cached = {"coords": _read_ply_coords(edited_file).cpu(), "reference": reference}
             cache[cache_key] = cached
+        cache.move_to_end(cache_key)
+        max_cache_entries = max(int(getattr(args, "heuristic_guidance_tensor_cache_entries", 8)), 1)
+        while len(cache) > max_cache_entries:
+            cache.popitem(last=False)
         edited = cached["coords"].to(device=device, dtype=torch.long, non_blocking=True)
         anchor_source = "saved_den6_final_ply_not_candidate_plan"
         final_hash = _coord_hash(edited)

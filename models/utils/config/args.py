@@ -2739,15 +2739,29 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--heuristic_guidance_enabled', default=True, type=str2bool, help='ana_den6由来HeuristicをWhere/Amount/Actionのpriorとして使う')
     parser.add_argument(
         '--heuristic_guidance_mode',
-        default='ana_den6_reproduce',
-        choices=['proxy_prior', 'ana_den6_reproduce', 'ana_den6_reference_ply'],
-        help='Heuristic guidanceの実行形態。ana_den6_reproduceはden6 candidate plan manifestを厳密適用する',
+        default='ana_den6_residual',
+        choices=[
+            'proxy_prior',
+            'ana_den6_residual',
+            'ana_den6_reproduce',
+            'ana_den6_reference_ply',
+        ],
+        help=(
+            'Heuristic guidanceの実行形態。ana_den6_residualはden6の全順位付きcandidate poolを'
+            '探索空間にし、NetworkがWhere/Amount/Action residualだけを学習する'
+        ),
     )
     parser.add_argument(
         '--heuristic_guidance_den6_plan_manifest',
         default='',
         type=str,
-        help='tools/ana_den6_reproduce.py --manifest-out が出力したden6 candidate plan JSON',
+        help='tools/ana_den6_reproduce.py --manifest-out が出力したv2 candidate pool JSON。単一frame固定時に使用する',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_den6_manifest_dir',
+        default='/data/maejima/log/mynet_den6_manifests',
+        type=str,
+        help='複数frame学習時に入力SHA256とAE/SR/mからv2 manifestを自動選択するディレクトリ',
     )
     parser.add_argument(
         '--heuristic_guidance_den6_codec_strict',
@@ -2759,7 +2773,49 @@ def parse_pugan_args(parser, file_day, file_time):
         '--heuristic_guidance_anchor_steps',
         default=200,
         type=int,
-        help='学習開始時にana_den6の操作別Amountを100%%からNetworkへ連続移行するstep数。0で無効',
+        help='den6 Where/Amount/Action priorをNetwork主体へ連続移行するstep数。0で即時residual主体',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_exact_anchor_steps',
+        default=1,
+        type=int,
+        help='先頭何stepのhard full-cloud voxel集合をden6 anchorと完全一致させるか。soft Network経路の勾配は維持する',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_final_prior_strength',
+        default=0.10,
+        type=float,
+        help='anchor移行後もActionに残すden6 prior強度',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_final_where_weight',
+        default=0.25,
+        type=float,
+        help='anchor移行後もWhere rankに残すden6 prior重み',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_network_residual_weight',
+        default=0.50,
+        type=float,
+        help='den6 candidate rankへ加えるNetwork残差scoreの最大重み。anchor中は0から連続的に増える',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_outside_pool_logit_penalty',
+        default=20.0,
+        type=float,
+        help='ana_den6_residualでden6 candidate pool外へ与える負logit。pool外へ探索範囲を再拡大しない',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_target_direction_weight',
+        default=12.0,
+        type=float,
+        help='den6 Add/Adjust source-target方向rankをActuator方向logitへ加える重み',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_tensor_cache_entries',
+        default=8,
+        type=int,
+        help='frame/subtree別にTensor化済みden6 candidate guidanceを保持する最大件数',
     )
     parser.add_argument(
         '--heuristic_guidance_disable_full_cloud_amount_override',
@@ -3700,18 +3756,27 @@ def parse_pugan_args(parser, file_day, file_time):
         args.sparsepcgc_dense_scale_sr_list = str(args.sparsepcgc_scale_sr)
     args.heuristic_guidance_enabled = bool(getattr(args, "heuristic_guidance_enabled", True))
     args.heuristic_guidance_mode = str(
-        getattr(args, "heuristic_guidance_mode", "proxy_prior")
+        getattr(args, "heuristic_guidance_mode", "ana_den6_residual")
     ).strip().lower()
-    if args.heuristic_guidance_mode not in {"proxy_prior", "ana_den6_reproduce", "ana_den6_reference_ply"}:
+    valid_guidance_modes = {
+        "proxy_prior",
+        "ana_den6_residual",
+        "ana_den6_reproduce",
+        "ana_den6_reference_ply",
+    }
+    if args.heuristic_guidance_mode not in valid_guidance_modes:
         raise ValueError(f"未知のheuristic_guidance_mode: {args.heuristic_guidance_mode}")
+    manifest_file = str(getattr(args, "heuristic_guidance_den6_plan_manifest", "")).strip()
+    manifest_dir = str(getattr(args, "heuristic_guidance_den6_manifest_dir", "")).strip()
     if (
         args.heuristic_guidance_enabled
-        and args.heuristic_guidance_mode == "ana_den6_reproduce"
-        and not str(getattr(args, "heuristic_guidance_den6_plan_manifest", "")).strip()
+        and args.heuristic_guidance_mode in {"ana_den6_residual", "ana_den6_reproduce"}
+        and not manifest_file
+        and not manifest_dir
     ):
         raise ValueError(
-            "ana_den6_reproduceには--heuristic_guidance_den6_plan_manifestが必要である。"
-            "proxy_priorで代替実行しないため、tools/ana_den6_reproduce.pyで対象frameのmanifestを生成すること。"
+            "ana_den6_residual/reproduceにはv2 manifestファイルまたはmanifestディレクトリが必要である。"
+            "proxy_priorで代替せず、tools/ana_den6_reproduce.pyで各frameのmanifestを生成すること。"
         )
     if args.heuristic_guidance_mode in {"ana_den6_reproduce", "ana_den6_reference_ply"}:
         # 保存済みden6 hard voxel集合をActuatorへ適用する厳密anchorでは、
@@ -3720,6 +3785,28 @@ def parse_pugan_args(parser, file_day, file_time):
     args.heuristic_guidance_anchor_steps = max(
         int(getattr(args, "heuristic_guidance_anchor_steps", 200)),
         0,
+    )
+    args.heuristic_guidance_exact_anchor_steps = max(
+        int(getattr(args, "heuristic_guidance_exact_anchor_steps", 1)),
+        0,
+    )
+    args.heuristic_guidance_final_prior_strength = min(max(
+        float(getattr(args, "heuristic_guidance_final_prior_strength", 0.10)), 0.0
+    ), 1.0)
+    args.heuristic_guidance_final_where_weight = max(
+        float(getattr(args, "heuristic_guidance_final_where_weight", 0.25)), 0.0
+    )
+    args.heuristic_guidance_network_residual_weight = max(
+        float(getattr(args, "heuristic_guidance_network_residual_weight", 0.50)), 0.0
+    )
+    args.heuristic_guidance_outside_pool_logit_penalty = max(
+        float(getattr(args, "heuristic_guidance_outside_pool_logit_penalty", 20.0)), 0.0
+    )
+    args.heuristic_guidance_target_direction_weight = max(
+        float(getattr(args, "heuristic_guidance_target_direction_weight", 12.0)), 0.0
+    )
+    args.heuristic_guidance_tensor_cache_entries = max(
+        int(getattr(args, "heuristic_guidance_tensor_cache_entries", 8)), 1
     )
     args.heuristic_guidance_disable_full_cloud_amount_override = bool(
         getattr(args, "heuristic_guidance_disable_full_cloud_amount_override", True)
@@ -3733,6 +3820,38 @@ def parse_pugan_args(parser, file_day, file_time):
     args.heuristic_guidance_amount_min_residual = max(float(getattr(args, "heuristic_guidance_amount_min_residual", 0.0001)), 0.0)
     args.heuristic_guidance_amount_grad_scale = max(float(getattr(args, "heuristic_guidance_amount_grad_scale", 1.0)), 0.0)
     if args.heuristic_guidance_enabled and compress_key == "sparsepcgc":
+        if args.heuristic_guidance_mode == "ana_den6_residual":
+            # den6 Amountは全点群比0.05%～0.25%級である。旧3%/5%初期値を混入させない。
+            profile_amounts = {
+                ("8i", 8): (0.0010, 0.0010, 0.0005),
+                ("8i", 7): (0.000175, 0.000150, 0.000175),
+                ("mvub", 8): (0.00125, 0.00100, 0.00025),
+                ("mvub", 7): (0.00035, 0.00030, 0.00035),
+                ("uvg", 8): (0.00125, 0.00350, 0.00025),
+                ("uvg", 7): (0.00100, 0.00125, 0.00025),
+            }
+            profile_key = (
+                str(getattr(args, "dataname", "8i")).strip().lower(),
+                int(getattr(args, "sparsepcgc_scale_m", 8)),
+            )
+            add_init, prune_init, move_init = profile_amounts.get(
+                profile_key, (0.0010, 0.0010, 0.0005)
+            )
+            if not _cli_option_was_provided("--repair_init_add_ratio"):
+                args.repair_init_add_ratio = float(add_init)
+            if not _cli_option_was_provided("--repair_init_drop_ratio"):
+                args.repair_init_drop_ratio = float(prune_init)
+            if not _cli_option_was_provided("--repair_init_move_ratio"):
+                args.repair_init_move_ratio = float(move_init)
+            if not _cli_option_was_provided("--repair_amount_target_mode"):
+                args.repair_amount_target_mode = "none"
+            # actual Rateはden6と同じfull-cloud基準で毎Step確認し、勾配は既存shadow subtreeへ流す。
+            if not _cli_option_was_provided("--train_full_cloud_anchor_every_step"):
+                args.train_full_cloud_anchor_every_step = True
+            if not _cli_option_was_provided("--train_full_cloud_anchor_every_step_shadow"):
+                args.train_full_cloud_anchor_every_step_shadow = True
+            if not _cli_option_was_provided("--full_cloud_anchor_train_shadow_subtree"):
+                args.full_cloud_anchor_train_shadow_subtree = True
         # Add/Prune/Adjustを同時候補として残す。各操作量はHeuristic prior周辺でNetworkが微調整する。
         if not _cli_option_was_provided("--sparsepcgc_disable_add"):
             args.sparsepcgc_disable_add = False
@@ -3863,6 +3982,9 @@ def parse_pugan_args(parser, file_day, file_time):
         args.heuristic_guidance_enabled
         and compress_key == "sparsepcgc"
         and args.heuristic_guidance_den6_codec_strict
+        and args.heuristic_guidance_mode in {
+            "ana_den6_residual", "ana_den6_reproduce", "ana_den6_reference_ply"
+        }
     ):
         # den6の比較対象は native_vs1_pq1_ae0_sr{native-m}_m{m} であり、
         # qs連動や別modeを許すと同じhard voxel集合でもbitが一致しない。
@@ -6843,4 +6965,51 @@ def parse_pugan_args(parser, file_day, file_time):
         args.direct_network_prune = False
         if str(getattr(args, "sparsepcgc_prune_after_prior_mode", "")).strip().lower() == "direct_network":
             args.sparsepcgc_prune_after_prior_mode = "network"
+
+    if (
+        bool(getattr(args, "heuristic_guidance_enabled", True))
+        and str(getattr(args, "heuristic_guidance_mode", "")).strip().lower()
+        == "ana_den6_residual"
+    ):
+        # 最後の汎用SparsePCGC後処理が旧3～5%探索値を再導入しないよう固定する。
+        profile_amounts = {
+            ("8i", 8): (0.0010, 0.0010, 0.0005),
+            ("8i", 7): (0.000175, 0.000150, 0.000175),
+            ("mvub", 8): (0.00125, 0.00100, 0.00025),
+            ("mvub", 7): (0.00035, 0.00030, 0.00035),
+            ("uvg", 8): (0.00125, 0.00350, 0.00025),
+            ("uvg", 7): (0.00100, 0.00125, 0.00025),
+        }
+        key = (
+            str(getattr(args, "dataname", "8i")).strip().lower(),
+            int(getattr(args, "sparsepcgc_scale_m", 8)),
+        )
+        add_anchor, prune_anchor, move_anchor = profile_amounts.get(
+            key, (0.0010, 0.0010, 0.0005)
+        )
+        residual_fraction = max(
+            float(getattr(args, "heuristic_guidance_amount_residual_fraction", 0.50)), 0.0
+        )
+        bound_scale = 1.0 + residual_fraction
+        if not _cli_option_was_provided("--max_add_ratio"):
+            args.max_add_ratio = min(max(add_anchor * bound_scale, add_anchor + 0.0001), 0.01)
+        if not _cli_option_was_provided("--max_drop_ratio"):
+            args.max_drop_ratio = min(max(prune_anchor * bound_scale, prune_anchor + 0.0001), 0.01)
+        if not _cli_option_was_provided("--max_move_ratio"):
+            args.max_move_ratio = min(max(move_anchor * bound_scale, move_anchor + 0.0001), 0.01)
+        if not _cli_option_was_provided("--repair_drop_ratio_floor"):
+            args.repair_drop_ratio_floor = 0.0
+        if not _cli_option_was_provided("--repair_add_ratio_floor"):
+            args.repair_add_ratio_floor = 0.0
+        if not _cli_option_was_provided("--repair_move_ratio_floor"):
+            args.repair_move_ratio_floor = 0.0
+        # den6候補pool外のrandom探索は許さず、pool内のNetwork residualだけを学習する。
+        if not _cli_option_was_provided("--repair_operation_gate_random_mix_start"):
+            args.repair_operation_gate_random_mix_start = 0.0
+        if not _cli_option_was_provided("--repair_operation_gate_random_mix_end"):
+            args.repair_operation_gate_random_mix_end = 0.0
+        if not _cli_option_was_provided("--repair_move_score_noise_start"):
+            args.repair_move_score_noise_start = 0.0
+        if not _cli_option_was_provided("--repair_move_score_noise_end"):
+            args.repair_move_score_noise_end = 0.0
     return args

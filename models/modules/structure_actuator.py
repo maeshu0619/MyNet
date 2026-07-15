@@ -1,4 +1,5 @@
 import hashlib
+import itertools
 import math
 import time
 
@@ -2871,7 +2872,23 @@ class StructureRepairActuator(nn.Module):
             return None
         if not bool(getattr(self.args, "heuristic_guidance_enabled", True)):
             return None
+        mode = str(getattr(self.args, "heuristic_guidance_mode", "proxy_prior")).strip().lower()
+        if mode == "ana_den6_residual":
+            if str(guidance.get("formula_basis", "")) != "ana_den6_exact_ranked_editcandidate_pool_v2":
+                raise RuntimeError(
+                    "ana_den6_residualでproxy近似guidanceがActuatorへ入った。"
+                    "exact ranked candidate pool以外は使用できない"
+                )
+            if not isinstance(guidance.get("exact_candidate_guidance"), dict):
+                raise RuntimeError("ana_den6_residualでexact_candidate_guidanceが欠落した")
         return guidance
+
+    def _heuristic_anchor_phase(self):
+        current_step = max(int(getattr(self.args, "_global_train_step", 0)), 0)
+        anchor_steps = max(int(getattr(self.args, "heuristic_guidance_anchor_steps", 0)), 0)
+        if anchor_steps <= 0:
+            return 0.0
+        return max(1.0 - float(current_step) / float(anchor_steps), 0.0)
 
     def _fit_heuristic_where_prior(self, guidance, operation, like_tensor):
         if not isinstance(guidance, dict):
@@ -2882,12 +2899,95 @@ class StructureRepairActuator(nn.Module):
             return torch.zeros_like(like_tensor)
         return self._fit_leaf_pattern_map(value, like_tensor).clamp(0.0, 1.0).detach()
 
+    def _fit_heuristic_candidate_mask(self, guidance, operation, like_tensor):
+        if not isinstance(guidance, dict):
+            return torch.ones_like(like_tensor, dtype=torch.bool)
+        masks = guidance.get("candidate_mask", {})
+        value = masks.get(operation) if isinstance(masks, dict) else None
+        if not torch.is_tensor(value):
+            return torch.ones_like(like_tensor, dtype=torch.bool)
+        fitted = self._fit_leaf_pattern_map(value, like_tensor)
+        return fitted.to(dtype=torch.bool).detach()
+
+    def _fit_heuristic_target_direction_prior(self, guidance, operation, like_tensor):
+        """den6 candidateのsparse source-target rankを既存方向logit形状へ展開する。"""
+        B, _, N = like_tensor.shape
+        K = int(self.neighbor_offsets.shape[0])
+        dense = like_tensor.new_zeros((B, K, N))
+        if not isinstance(guidance, dict):
+            return dense
+
+        sparse_all = guidance.get("target_direction_sparse", {})
+        sparse = sparse_all.get(operation) if isinstance(sparse_all, dict) else None
+        if isinstance(sparse, dict):
+            batch_index = sparse.get("batch_index")
+            source_index = sparse.get("source_index")
+            direction_index = sparse.get("direction_index")
+            rank_score = sparse.get("rank_score")
+            if all(torch.is_tensor(value) for value in (
+                batch_index, source_index, direction_index, rank_score
+            )):
+                batch_index = batch_index.to(device=like_tensor.device, dtype=torch.long)
+                source_index = source_index.to(device=like_tensor.device, dtype=torch.long)
+                direction_index = direction_index.to(device=like_tensor.device, dtype=torch.long)
+                rank_score = rank_score.to(device=like_tensor.device, dtype=like_tensor.dtype)
+                valid = (
+                    batch_index.ge(0) & batch_index.lt(B)
+                    & source_index.ge(0) & source_index.lt(N)
+                    & direction_index.ge(0) & direction_index.lt(K)
+                )
+                if bool(valid.any().item()):
+                    flat_index = (
+                        batch_index[valid] * (K * N)
+                        + direction_index[valid] * N
+                        + source_index[valid]
+                    )
+                    flat = dense.reshape(-1)
+                    values = rank_score[valid].clamp(0.0, 1.0)
+                    if hasattr(flat, "scatter_reduce_"):
+                        flat.scatter_reduce_(0, flat_index, values, reduce="amax", include_self=True)
+                    else:
+                        # 古いPyTorch向けfallback。candidate pair数だけを走査する。
+                        for index, value in zip(flat_index.tolist(), values.tolist()):
+                            flat[index] = max(float(flat[index]), float(value))
+                return dense
+
+        # v1互換。新規residual modeでは通常使用しない。
+        values = guidance.get("target_direction_prior", {})
+        value = values.get(operation) if isinstance(values, dict) else None
+        if not torch.is_tensor(value):
+            return dense
+        out = value.detach().to(device=like_tensor.device, dtype=like_tensor.dtype)
+        if out.ndim != 3:
+            return dense
+        if out.shape[1] == N and out.shape[2] == K:
+            out = out.permute(0, 2, 1).contiguous()
+        if out.shape[1] != K:
+            return dense
+        if out.shape[0] == 1 and B > 1:
+            out = out.expand(B, -1, -1).contiguous()
+        if out.shape[0] != B:
+            return dense
+        if out.shape[2] > N:
+            out = out[:, :, :N]
+        elif out.shape[2] < N:
+            out = torch.cat([out, out.new_zeros((B, K, N - out.shape[2]))], dim=2)
+        return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0).clamp(0.0, 1.0)
+
     def _apply_heuristic_action_guidance(
         self, guidance, drop_gate, add_gate, move_gate, *, prune_enabled, add_enabled, move_enabled
     ):
         if not isinstance(guidance, dict):
             return drop_gate, add_gate, move_gate
         strength = min(max(float(getattr(self.args, "heuristic_guidance_action_strength", 0.50)), 0.0), 1.0)
+        mode = str(getattr(self.args, "heuristic_guidance_mode", "proxy_prior")).strip().lower()
+        if mode == "ana_den6_residual":
+            final_strength = min(max(float(
+                getattr(self.args, "heuristic_guidance_final_prior_strength", 0.10)
+            ), 0.0), 1.0)
+            anchor_phase = self._heuristic_anchor_phase()
+            # Step 0はden6 Actionを100%使い、以降はNetwork主体へ連続移行する。
+            strength = final_strength + (1.0 - final_strength) * anchor_phase
         if strength <= 0.0:
             return drop_gate, add_gate, move_gate
         priors = guidance.get("action_gate_prior", {})
@@ -2938,8 +3038,365 @@ class StructureRepairActuator(nn.Module):
     def _heuristic_where_logit_bias(self, guidance, operation, like_tensor):
         prior = self._fit_heuristic_where_prior(guidance, operation, like_tensor)
         weight = max(float(getattr(self.args, "heuristic_guidance_where_weight", 1.0)), 0.0)
+        mode = str(getattr(self.args, "heuristic_guidance_mode", "proxy_prior")).strip().lower()
+        if mode == "ana_den6_residual":
+            final_weight = max(float(getattr(self.args, "heuristic_guidance_final_where_weight", 0.25)), 0.0)
+            anchor_phase = self._heuristic_anchor_phase()
+            weight = final_weight + (weight - final_weight) * anchor_phase
+            mask = self._fit_heuristic_candidate_mask(guidance, operation, like_tensor)
+            outside_penalty = max(float(
+                getattr(self.args, "heuristic_guidance_outside_pool_logit_penalty", 20.0)
+            ), 0.0)
+            # den6候補pool外へ探索空間が再拡大しないよう、hard候補を制限する。
+            return weight * (2.0 * prior - 1.0) - (~mask).to(like_tensor.dtype) * outside_penalty
         return weight * (2.0 * prior - 1.0)
     
+    @staticmethod
+    def _den6_allocate_counts(total_budget, shares):
+        """ana_den6._allocate_countsと同じ端数処理で3操作へbudgetを配分する。"""
+        operations = ("Add", "Prune", "Adjust")
+        total_budget = max(int(total_budget), len(operations))
+        raw = {name: total_budget * float(shares[name]) for name in operations}
+        counts = {name: max(1, int(math.floor(raw[name]))) for name in operations}
+        while sum(counts.values()) > total_budget:
+            reducible = [name for name in operations if counts[name] > 1]
+            if not reducible:
+                break
+            name = min(reducible, key=lambda key: (raw[key] - math.floor(raw[key]), counts[key]))
+            counts[name] -= 1
+        while sum(counts.values()) < total_budget:
+            name = max(operations, key=lambda key: (raw[key] - counts[key], raw[key]))
+            counts[name] += 1
+        return counts
+
+    @staticmethod
+    def _den6_candidate_coord_sets(candidate):
+        removes = {
+            tuple(int(value) for value in coord)
+            for coord in candidate.get("remove_coords", ())
+        }
+        adds = {
+            tuple(int(value) for value in coord)
+            for coord in candidate.get("add_coords", ())
+        }
+        return removes, adds
+
+    @staticmethod
+    def _den6_candidate_compatible(candidate, occupied, removes, adds):
+        """ana_den6._candidate_compatibleと同じ適用可能性・衝突条件を確認する。"""
+        candidate_removes, candidate_adds = StructureRepairActuator._den6_candidate_coord_sets(candidate)
+        if not candidate_removes.issubset(occupied):
+            return False
+        if candidate_adds & occupied:
+            return False
+        if removes & candidate_removes or adds & candidate_adds:
+            return False
+        if removes & candidate_adds or adds & candidate_removes:
+            return False
+        return True
+
+    @staticmethod
+    def _den6_pool_permutation_indices(order_indices, variant):
+        size = len(order_indices)
+        if size <= 1:
+            return list(order_indices)
+        start = int(variant) % size
+        possible = [1, 2, 3, 5, 7, 11, 13, 17]
+        offset = int(variant) % len(possible)
+        stride = next(
+            (
+                value
+                for value in possible[offset:] + possible[:offset]
+                if math.gcd(value, size) == 1
+            ),
+            1,
+        )
+        return [order_indices[(start + index * stride) % size] for index in range(size)]
+
+    @staticmethod
+    def _normalize_candidate_network_score(value):
+        value = torch.nan_to_num(value.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        if value.numel() <= 1:
+            return torch.zeros_like(value)
+        lower = value.amin()
+        upper = value.amax()
+        if float((upper - lower).detach().cpu()) <= 1e-12:
+            return torch.zeros_like(value)
+        return (value - lower) / (upper - lower).clamp_min(1e-12) - 0.5
+
+    def _exact_den6_candidate_scores(
+        self,
+        guidance,
+        drop_score,
+        move_score,
+        move_logits,
+        add_pair_logits,
+    ):
+        """den6各EditCandidateへ対応するNetwork residual scoreを作る。"""
+        maps = guidance.get("candidate_tensor_map", {}) if isinstance(guidance, dict) else {}
+        output = {}
+        for operation in ("Add", "Prune", "Adjust"):
+            mapping = maps.get(operation, {}) if isinstance(maps, dict) else {}
+            rank_score = mapping.get("rank_score")
+            if not torch.is_tensor(rank_score):
+                output[operation] = drop_score.new_zeros((0,))
+                continue
+            rank_score = rank_score.to(device=drop_score.device, dtype=torch.float32)
+            candidate_count = int(rank_score.numel())
+            network_score = rank_score.new_zeros((candidate_count,))
+            if operation == "Prune":
+                source = mapping.get("source_index")
+                if torch.is_tensor(source) and candidate_count > 0:
+                    source = source.to(device=drop_score.device, dtype=torch.long)
+                    valid = source.ge(0) & source.lt(drop_score.shape[-1])
+                    if bool(valid.any().item()):
+                        network_score[valid] = drop_score[0, 0].index_select(0, source[valid]).float()
+            elif operation == "Adjust":
+                source = mapping.get("source_index")
+                direction = mapping.get("direction_index")
+                if torch.is_tensor(source) and torch.is_tensor(direction) and candidate_count > 0:
+                    source = source.to(device=move_score.device, dtype=torch.long)
+                    direction = direction.to(device=move_score.device, dtype=torch.long)
+                    valid = (
+                        source.ge(0) & source.lt(move_score.shape[-1])
+                        & direction.ge(0) & direction.lt(move_logits.shape[1])
+                    )
+                    if bool(valid.any().item()):
+                        direction_prob = torch.softmax(move_logits.float(), dim=1)
+                        network_score[valid] = (
+                            move_score[0, 0].index_select(0, source[valid]).float()
+                            + direction_prob[0, direction[valid], source[valid]]
+                        )
+            else:
+                pair_candidate = mapping.get("pair_candidate_index")
+                pair_source = mapping.get("pair_source_index")
+                pair_direction = mapping.get("pair_direction_index")
+                if (
+                    torch.is_tensor(add_pair_logits)
+                    and torch.is_tensor(pair_candidate)
+                    and torch.is_tensor(pair_source)
+                    and torch.is_tensor(pair_direction)
+                    and candidate_count > 0
+                ):
+                    pair_candidate = pair_candidate.to(device=add_pair_logits.device, dtype=torch.long)
+                    pair_source = pair_source.to(device=add_pair_logits.device, dtype=torch.long)
+                    pair_direction = pair_direction.to(device=add_pair_logits.device, dtype=torch.long)
+                    valid = (
+                        pair_candidate.ge(0) & pair_candidate.lt(candidate_count)
+                        & pair_source.ge(0) & pair_source.lt(add_pair_logits.shape[1])
+                        & pair_direction.ge(0) & pair_direction.lt(add_pair_logits.shape[2])
+                    )
+                    if bool(valid.any().item()):
+                        pair_value = torch.sigmoid(
+                            add_pair_logits[0, pair_source[valid], pair_direction[valid]].float()
+                        )
+                        index = pair_candidate[valid]
+                        if hasattr(network_score, "scatter_reduce_"):
+                            network_score.scatter_reduce_(
+                                0, index, pair_value, reduce="amax", include_self=True
+                            )
+                        else:
+                            for candidate_index, value in zip(index.tolist(), pair_value.tolist()):
+                                network_score[candidate_index] = max(
+                                    float(network_score[candidate_index]), float(value)
+                                )
+            output[operation] = self._normalize_candidate_network_score(network_score)
+        return output
+
+    def _build_exact_den6_residual_plan(
+        self,
+        guidance,
+        voxel_coords,
+        learned_add_ratio,
+        learned_drop_ratio,
+        learned_move_ratio,
+        drop_score,
+        move_score,
+        move_logits,
+        add_pair_logits,
+    ):
+        """den6のcandidate pool・variant・conflict ruleを保ったhard planを構築する。"""
+        if not isinstance(guidance, dict):
+            return None
+        exact = guidance.get("exact_candidate_guidance")
+        if not isinstance(exact, dict) or voxel_coords.shape[0] != 1:
+            return None
+        pools = exact.get("ranked_candidate_pools")
+        if not isinstance(pools, dict):
+            return None
+        operations = ("Add", "Prune", "Adjust")
+        if any(not isinstance(pools.get(name), list) or not pools.get(name) for name in operations):
+            return None
+
+        point_count = int(voxel_coords.shape[-1])
+        ratio_values = {
+            "Add": max(float(learned_add_ratio.detach().mean().cpu()), 0.0),
+            "Prune": max(float(learned_drop_ratio.detach().mean().cpu()), 0.0),
+            "Adjust": max(float(learned_move_ratio.detach().mean().cpu()), 0.0),
+        }
+        total_ratio = sum(ratio_values.values())
+        if total_ratio <= 0.0:
+            ratio_values = dict(guidance.get("amount_prior") or {})
+            total_ratio = sum(max(float(value), 0.0) for value in ratio_values.values())
+        shares = {
+            name: max(float(ratio_values.get(name, 0.0)), 0.0) / max(total_ratio, 1e-12)
+            for name in operations
+        }
+        learned_budget = max(3, int(math.ceil(float(point_count) * float(total_ratio))))
+        learned_counts = self._den6_allocate_counts(learned_budget, shares)
+        anchor_counts = {
+            name: int((exact.get("anchor_operation_counts") or exact.get("selected_operation_counts") or {}).get(name, 0))
+            for name in operations
+        }
+        anchor_phase = self._heuristic_anchor_phase()
+        requested_counts = {
+            name: max(
+                1,
+                int(round(anchor_phase * anchor_counts[name] + (1.0 - anchor_phase) * learned_counts[name])),
+            )
+            for name in operations
+        }
+        for name in operations:
+            requested_counts[name] = min(requested_counts[name], len(pools[name]))
+
+        network_scores = self._exact_den6_candidate_scores(
+            guidance,
+            drop_score,
+            move_score,
+            move_logits,
+            add_pair_logits,
+        )
+        residual_weight = max(
+            float(getattr(self.args, "heuristic_guidance_network_residual_weight", 0.50)), 0.0
+        )
+        residual_alpha = 1.0 - anchor_phase
+        ordered_indices = {}
+        combined_scores = {}
+        for operation in operations:
+            mapping = guidance.get("candidate_tensor_map", {}).get(operation, {})
+            rank_score = mapping.get("rank_score")
+            if not torch.is_tensor(rank_score):
+                return None
+            combined = rank_score.float() + residual_alpha * residual_weight * network_scores[operation]
+            combined_detached = combined.detach()
+            combined_scores[operation] = combined_detached.cpu().tolist()
+            try:
+                order_tensor = torch.argsort(combined_detached, descending=True, stable=True)
+            except TypeError:
+                # 古いPyTorchではstable引数が無いため、candidate rankを微小tie-breakとして使う。
+                tie_break = torch.arange(
+                    combined_detached.numel(),
+                    device=combined_detached.device,
+                    dtype=combined_detached.dtype,
+                )
+                order_tensor = torch.argsort(
+                    combined_detached - tie_break * 1e-12, descending=True
+                )
+            ordered_indices[operation] = order_tensor.cpu().tolist()
+
+        priority = tuple(exact.get("operation_priority") or operations)
+        orders = list(itertools.permutations(operations))
+        if priority in orders:
+            orders.remove(priority)
+            orders.insert(0, priority)
+        variants = max(int(exact.get("plan_variants", 6) or 6), len(orders))
+        occupied = {
+            tuple(int(value) for value in row)
+            for row in voxel_coords[0].transpose(0, 1).detach().cpu().tolist()
+        }
+        best = None
+        for variant in range(variants):
+            operation_order = orders[variant % len(orders)]
+            pool_variant = variant // len(orders)
+            selected = []
+            removes = set()
+            adds = set()
+            counts = {name: 0 for name in operations}
+            score_sum = 0.0
+            for operation in operation_order:
+                permutation = self._den6_pool_permutation_indices(
+                    ordered_indices[operation], pool_variant + variant
+                )
+                for candidate_index in permutation:
+                    if counts[operation] >= requested_counts[operation]:
+                        break
+                    candidate = pools[operation][candidate_index]
+                    if not self._den6_candidate_compatible(candidate, occupied, removes, adds):
+                        continue
+                    candidate_removes, candidate_adds = self._den6_candidate_coord_sets(candidate)
+                    removes.update(candidate_removes)
+                    adds.update(candidate_adds)
+                    selected.append((operation, candidate_index, candidate))
+                    counts[operation] += 1
+                    score_sum += float(combined_scores[operation][candidate_index])
+            if any(counts[name] < requested_counts[name] for name in operations):
+                continue
+            normalized = score_sum / max(len(selected), 1)
+            if best is None or normalized > best[0]:
+                best = (normalized, selected, removes, adds, counts, operation_order, variant)
+        if best is None:
+            raise RuntimeError(
+                "ana_den6 exact candidate poolから要求Amountを満たすconflict-free planを構築できない"
+            )
+
+        _, selected, removes, adds, selected_counts, operation_order, variant = best
+        source_rows = voxel_coords[0].transpose(0, 1).contiguous().to(dtype=torch.long)
+        remove_rows = (
+            torch.as_tensor(sorted(removes), device=source_rows.device, dtype=torch.long)
+            if removes else source_rows.new_empty((0, 3))
+        )
+        if remove_rows.numel() > 0:
+            combined = torch.cat([source_rows, remove_rows], dim=0)
+            mins = combined.amin(dim=0)
+            spans = (combined.amax(dim=0) - mins + 1).clamp_min(1)
+            def keys(rows):
+                shifted = rows - mins
+                return shifted[:, 0] * spans[1] * spans[2] + shifted[:, 1] * spans[2] + shifted[:, 2]
+            source_keys = keys(source_rows)
+            remove_keys = torch.unique(keys(remove_rows), sorted=True)
+            positions = torch.searchsorted(remove_keys, source_keys)
+            in_bounds = positions < remove_keys.numel()
+            safe = positions.clamp(max=max(int(remove_keys.numel()) - 1, 0))
+            keep = ~(in_bounds & (remove_keys[safe] == source_keys))
+            source_rows = source_rows[keep]
+        add_rows = (
+            torch.as_tensor(sorted(adds), device=source_rows.device, dtype=torch.long)
+            if adds else source_rows.new_empty((0, 3))
+        )
+        final_rows = torch.unique(torch.cat([source_rows, add_rows], dim=0), dim=0, sorted=True)
+        final_coords = final_rows.transpose(0, 1).contiguous().unsqueeze(0)
+
+        selected_ids = [str(candidate.get("candidate_id", "")) for _, _, candidate in selected]
+        debug = {
+            "selected_counts": selected_counts,
+            "operation_order": ">".join(operation_order),
+            "variant_index": int(variant),
+            "selected_candidate_ids": selected_ids,
+            "residual_alpha": float(residual_alpha),
+            "anchor_phase": float(anchor_phase),
+            "requested_counts": requested_counts,
+            "removed_voxel_count": len(removes),
+            "added_voxel_count": len(adds),
+        }
+        if anchor_phase >= 1.0 - 1e-12:
+            expected_hash = str(exact.get("final_voxel_hash", ""))
+            if expected_hash:
+                values = final_rows.detach().cpu().numpy()
+                if values.shape[0] > 1:
+                    order = values[:, 2].argsort(kind="stable")
+                    values = values[order]
+                    order = values[:, 1].argsort(kind="stable")
+                    values = values[order]
+                    order = values[:, 0].argsort(kind="stable")
+                    values = values[order]
+                actual_hash = hashlib.sha256(values.astype("int64", copy=False).tobytes(order="C")).hexdigest()
+                if actual_hash != expected_hash:
+                    raise RuntimeError(
+                        "Network residual=0のden6 planがmanifest final voxel hashと一致しない: "
+                        f"actual={actual_hash}, expected={expected_hash}"
+                    )
+        return final_coords, debug
+
     def _scale_amount_downstream_grad(self, ratio, op_name=""):
         # Amount ratio のforward値は変えず、backwardだけ強める。
         # 操作ごとに圧縮損失への感度が違うため、Prune/Add/Moveで別々の倍率を使う。
@@ -3488,6 +3945,24 @@ class StructureRepairActuator(nn.Module):
         leaf_add_target_bias = leaf_target_direction_prior["add_target_bias"]
         leaf_move_target_bias = leaf_target_direction_prior["move_target_bias"]
 
+        # ana_den6_residualでは、proxy特徴ではなくden6の全順位付き候補poolを使う。
+        heuristic_guidance = self._heuristic_guidance_state(structure)
+        exact_den6_candidate_mode = bool(
+            isinstance(heuristic_guidance, dict)
+            and str(heuristic_guidance.get("formula_basis", ""))
+            == "ana_den6_exact_ranked_editcandidate_pool_v2"
+        )
+        exact_add_source_mask = self._fit_heuristic_candidate_mask(
+            heuristic_guidance, "Add", preserve
+        )
+        exact_prune_source_mask = self._fit_heuristic_candidate_mask(
+            heuristic_guidance, "Prune", preserve
+        )
+        exact_move_source_mask = self._fit_heuristic_candidate_mask(
+            heuristic_guidance, "Adjust", preserve
+        )
+        # target方向はN×26と大きいため、Add/Adjust処理直前にsparse poolから展開する。
+
         # leaf pattern診断を「参考bias」ではなく、操作候補集合の制限にも使う。
         leaf_operation_masks = self._leaf_pattern_operation_masks(
             structure,
@@ -3542,16 +4017,19 @@ class StructureRepairActuator(nn.Module):
             getattr(self.args, "sparsepcgc_actual_gate_prune", True)
         )
         hard_prune_actual_allowed = (
-            (not require_actual_gate_prune)
+            exact_den6_candidate_mode
+            or (not require_actual_gate_prune)
             or prune_after_prior_network_mode
             or (actual_oracle_enabled and actual_oracle_has_drop)
         )
         hard_add_actual_allowed = (
-            (not require_actual_gate_non_prune)
+            exact_den6_candidate_mode
+            or (not require_actual_gate_non_prune)
             or (actual_oracle_enabled and actual_oracle_has_add)
         )
         hard_move_actual_allowed = (
-            (not require_actual_gate_non_prune)
+            exact_den6_candidate_mode
+            or (not require_actual_gate_non_prune)
             or (actual_oracle_enabled and actual_oracle_has_move)
         )
         actual_oracle_add_direction_index = leaf_operation_masks.get(
@@ -3598,7 +4076,6 @@ class StructureRepairActuator(nn.Module):
             add_enabled=add_enabled,
             move_enabled=disp_enabled,
         )
-        heuristic_guidance = self._heuristic_guidance_state(structure)
         drop_operation_gate, add_operation_gate, move_operation_gate = self._apply_heuristic_action_guidance(
             heuristic_guidance,
             drop_operation_gate,
@@ -4895,8 +5372,13 @@ class StructureRepairActuator(nn.Module):
             )
         drop_prob_raw_for_amount = drop_prob
         delete_candidate_mask = selection_bool.clone()
+        if exact_den6_candidate_mode:
+            # den6 pool外を候補から完全に除外する。別のleaf proxyで再選別しない。
+            delete_candidate_mask = delete_candidate_mask & exact_prune_source_mask.squeeze(1)
         delete_candidate_initial_count = int(delete_candidate_mask.detach().sum().item())
-        delete_max_points = int(getattr(self.args, "repair_delete_max_points_per_voxel", 8))
+        delete_max_points = 0 if exact_den6_candidate_mode else int(
+            getattr(self.args, "repair_delete_max_points_per_voxel", 8)
+        )
         delete_candidate_after_point_cap_count = delete_candidate_initial_count
         if delete_max_points > 0:
             delete_candidate_mask = delete_candidate_mask & (
@@ -4907,7 +5389,7 @@ class StructureRepairActuator(nn.Module):
         # leaf pattern診断がDeleteを推奨したnode/voxelだけをDelete source候補にする。
         # これにより、圧縮率改善と無関係なDeleteを候補集合から除外する。
         delete_candidate_after_leaf_mask_count = delete_candidate_after_point_cap_count
-        if hard_leaf_operation_mask_enabled and not phase0_network_prune_mode:
+        if hard_leaf_operation_mask_enabled and not phase0_network_prune_mode and not exact_den6_candidate_mode:
             delete_candidate_mask = delete_candidate_mask & leaf_delete_op_mask.squeeze(1)
             delete_candidate_after_leaf_mask_count = int(delete_candidate_mask.detach().sum().item())
         delete_candidate_point_count_value = int(delete_candidate_mask.detach().sum().item())
@@ -5568,6 +6050,11 @@ class StructureRepairActuator(nn.Module):
             # 学習初期のsource探索を広げるため、Adjust scoreへannealされるノイズを入れる。
             move_score = torch.sigmoid(self._safe_logit(move_score) + torch.randn_like(move_score) * move_score_noise)
         move_score = self._voxel_mean_logits(move_score, voxel_coords, voxel_cache=voxel_cache).clamp(0.0, 1.0)
+        exact_move_target_bias = self._fit_heuristic_target_direction_prior(
+            heuristic_guidance, "Adjust", preserve
+        ) if exact_den6_candidate_mode else preserve.new_zeros(
+            (B, int(self.neighbor_offsets.shape[0]), N)
+        )
         if require_empty_move:
             valid_move_points = empty_target_mask & (~dropped_target_mask)
         elif prefer_occupied_move:
@@ -5575,7 +6062,12 @@ class StructureRepairActuator(nn.Module):
         else:
             valid_move_points = torch.ones_like(empty_target_mask, dtype=torch.bool) & (~dropped_target_mask)
 
-        if (
+        if exact_den6_candidate_mode:
+            # Adjust targetはden6 candidateが指定したsource→targetだけを許す。
+            valid_move_points = valid_move_points & (
+                exact_move_target_bias.permute(0, 2, 1) > 0
+            )
+        elif (
             bool(getattr(self.args, "leaf_pattern_target_direction_mask", False))
             and bool(leaf_target_direction_prior.get("enabled", False))
         ):
@@ -5591,13 +6083,17 @@ class StructureRepairActuator(nn.Module):
             move_score = move_score * has_valid_move_target
         base_move_candidate_mask = selection_bool & (~hard_drop_mask.squeeze(1))
         base_move_candidate_mask = base_move_candidate_mask & has_valid_move_target.squeeze(1).to(dtype=torch.bool)
+        if exact_den6_candidate_mode:
+            base_move_candidate_mask = base_move_candidate_mask & exact_move_source_mask.squeeze(1)
 
-        # leaf pattern診断がMoveを推奨したnode/voxelだけをMove source候補にする。
-        if hard_leaf_operation_mask_enabled:
+        # exact den6 modeでは別proxyのleaf maskでcandidate poolを壊さない。
+        if hard_leaf_operation_mask_enabled and not exact_den6_candidate_mode:
             base_move_candidate_mask = base_move_candidate_mask & leaf_move_op_mask.squeeze(1)
 
         move_candidate_mask = base_move_candidate_mask
-        move_max_points = int(getattr(self.args, "repair_move_max_points_per_voxel", 8))
+        move_max_points = 0 if exact_den6_candidate_mode else int(
+            getattr(self.args, "repair_move_max_points_per_voxel", 8)
+        )
 
         if move_max_points > 0:
             limited_move_candidate_mask = base_move_candidate_mask & (
@@ -5698,10 +6194,17 @@ class StructureRepairActuator(nn.Module):
         # Section5:
         # best_move_target_child_slotと一致するtarget方向を強める。
         # 方向そのものは上流の valid_move_points でmask済みである。
-        if bool(leaf_target_direction_prior.get("enabled", False)):
+        if bool(leaf_target_direction_prior.get("enabled", False)) and not exact_den6_candidate_mode:
             move_logits = move_logits + float(
                 getattr(self.args, "leaf_pattern_move_target_direction_weight", 1.25)
             ) * leaf_move_target_bias.permute(0, 2, 1).to(
+                device=move_logits.device,
+                dtype=move_logits.dtype,
+            )
+        if exact_den6_candidate_mode:
+            move_logits = move_logits + float(
+                getattr(self.args, "heuristic_guidance_target_direction_weight", 12.0)
+            ) * exact_move_target_bias.to(
                 device=move_logits.device,
                 dtype=move_logits.dtype,
             )
@@ -6161,6 +6664,7 @@ class StructureRepairActuator(nn.Module):
         add_target_hard_add = pts_xyz.new_zeros((B, 1, 0))
         add_target_add_st = pts_xyz.new_zeros((B, 1, 0))
         add_target_voxel_coords = voxel_coords.new_empty((B, 3, 0))
+        exact_add_pair_logits = None
         # Phase3: Addが実行されない場合でも、Voxel編集状態構築で参照できる空のAdd候補を用意する。
         voxel_edit_add_target_coords = add_target_voxel_coords.detach()
         voxel_edit_add_target_mask = torch.zeros((B, 0), device=pts_xyz.device, dtype=torch.bool)
@@ -6211,6 +6715,11 @@ class StructureRepairActuator(nn.Module):
                 )
             if self.training and add_score_noise > 0.0:
                 add_logit = add_logit + self._gumbel_like(add_logit) * add_score_noise
+            exact_add_target_bias = self._fit_heuristic_target_direction_prior(
+                heuristic_guidance, "Add", preserve
+            ) if exact_den6_candidate_mode else preserve.new_zeros(
+                (B, int(self.neighbor_offsets.shape[0]), N)
+            )
             add_voxel_logits = self.add_voxel_head(actuator_features)
             add_voxel_logits = self._scale_where_downstream_grad(
                 add_voxel_logits,
@@ -6219,10 +6728,17 @@ class StructureRepairActuator(nn.Module):
             add_logit = self._voxel_mean_logits(add_logit, voxel_coords, voxel_cache=voxel_cache)
             add_voxel_logits = self._voxel_mean_logits(add_voxel_logits, voxel_coords, voxel_cache=voxel_cache)
 
-            if bool(leaf_target_direction_prior.get("enabled", False)):
+            if bool(leaf_target_direction_prior.get("enabled", False)) and not exact_den6_candidate_mode:
                 add_voxel_logits = add_voxel_logits + float(
                     getattr(self.args, "leaf_pattern_add_target_direction_weight", 1.25)
                 ) * leaf_add_target_bias.permute(0, 2, 1).to(
+                    device=add_voxel_logits.device,
+                    dtype=add_voxel_logits.dtype,
+                )
+            if exact_den6_candidate_mode:
+                add_voxel_logits = add_voxel_logits + float(
+                    getattr(self.args, "heuristic_guidance_target_direction_weight", 12.0)
+                ) * exact_add_target_bias.to(
                     device=add_voxel_logits.device,
                     dtype=add_voxel_logits.dtype,
                 )
@@ -6232,6 +6748,7 @@ class StructureRepairActuator(nn.Module):
             pair_logits = pair_logits + float(
                 getattr(self.args, "repair_add_pair_pattern_prior_weight", 2.0)
             ) * add_pattern_prior
+            exact_add_pair_logits = pair_logits
             if selection_mask is None:
                 base_valid = torch.ones((B, N), device=pts_xyz.device, dtype=torch.bool)
             else:
@@ -6239,14 +6756,20 @@ class StructureRepairActuator(nn.Module):
                 base_valid = base_valid.to(device=pts_xyz.device, dtype=torch.bool)
             keep_threshold = float(getattr(self.args, "add_noop_keep_threshold", 0.5))
             base_valid = base_valid & (~hard_drop_mask.squeeze(1))
-            if keep_threshold > 0.0:
+            if keep_threshold > 0.0 and not exact_den6_candidate_mode:
                 base_valid = base_valid & (keep_prob.detach().squeeze(1) >= keep_threshold)
+            if exact_den6_candidate_mode:
+                base_valid = base_valid & exact_add_source_mask.squeeze(1)
 
-            # leaf pattern診断がAddを推奨したnode/voxelだけをAdd source候補にする。
-            if hard_leaf_operation_mask_enabled:
+            # exact den6 modeでは、den6候補のsource/target pair以外を許さない。
+            if hard_leaf_operation_mask_enabled and not exact_den6_candidate_mode:
                 base_valid = base_valid & leaf_add_op_mask.squeeze(1)
             valid_pair = empty_target_mask & base_valid.unsqueeze(2)
-            if (
+            if exact_den6_candidate_mode:
+                valid_pair = valid_pair & (
+                    exact_add_target_bias.permute(0, 2, 1) > 0
+                )
+            elif (
                 bool(getattr(self.args, "leaf_pattern_target_direction_mask", False))
                 and bool(leaf_target_direction_prior.get("enabled", False))
             ):
@@ -6749,13 +7272,114 @@ class StructureRepairActuator(nn.Module):
             actual_oracle_raw_percent_value = float(
                 leaf_diag_for_override.get("actual_oracle_raw_percent", 0.0) or 0.0
             )
+        exact_residual_plan_applied = False
+        exact_residual_plan_debug = {}
+        if (
+            exact_den6_candidate_mode
+            and str(structure.get("octree_input_mode", "")).strip().lower() == "full_cloud"
+        ):
+            exact_plan_result = self._build_exact_den6_residual_plan(
+                heuristic_guidance,
+                voxel_coords,
+                learned_add_ratio,
+                learned_drop_ratio,
+                learned_move_ratio,
+                drop_prob,
+                move_score,
+                move_logits,
+                exact_add_pair_logits,
+            )
+            if exact_plan_result is not None:
+                exact_plan_coords, exact_residual_plan_debug = exact_plan_result
+                exact_counts = exact_residual_plan_debug.get("selected_counts", {})
+                voxel_edit_final_coords = exact_plan_coords
+                voxel_edit_final_weights = pts_xyz.new_ones(
+                    (B, 1, int(exact_plan_coords.shape[-1]))
+                )
+                voxel_edit_valid_mask = torch.ones(
+                    (B, int(exact_plan_coords.shape[-1])),
+                    device=pts_xyz.device,
+                    dtype=torch.bool,
+                )
+                voxel_edit_debug_list = [{
+                    "initial_count": int(voxel_coords.shape[-1]),
+                    "drop_count": int(exact_counts.get("Prune", 0)),
+                    "add_count": int(exact_counts.get("Add", 0)),
+                    "move_count": int(exact_counts.get("Adjust", 0)),
+                    "same_voxel_move_rejected": 0,
+                    "existing_target_rejected": 0,
+                    "duplicate_target_rejected": 0,
+                    "final_count": int(exact_plan_coords.shape[-1]),
+                    "subtree_prune_count": 0,
+                }]
+                exact_residual_plan_applied = True
+
+        # den6 residual学習の開始時は、forward hard集合を厳密den6 anchorへ一致させる。
+        # Networkのsoft Where/Amount/Action経路は上で計算済みなのでbackwardは維持される。
+        exact_anchor_applied = False
+        exact_guidance = (
+            heuristic_guidance.get("exact_candidate_guidance", {})
+            if isinstance(heuristic_guidance, dict)
+            else {}
+        )
+        exact_anchor_steps = max(
+            int(getattr(self.args, "heuristic_guidance_exact_anchor_steps", 1)),
+            0,
+        )
+        exact_anchor_coords = (
+            exact_guidance.get("anchor_final_voxel_coords", None)
+            if isinstance(exact_guidance, dict)
+            else None
+        )
+        if (
+            exact_den6_candidate_mode
+            and (not exact_residual_plan_applied)
+            and str(structure.get("octree_input_mode", "")).strip().lower() == "full_cloud"
+            and int(getattr(self.args, "_global_train_step", 0)) < exact_anchor_steps
+            and torch.is_tensor(exact_anchor_coords)
+        ):
+            anchor_coords = exact_anchor_coords.detach().to(
+                device=pts_xyz.device, dtype=torch.long
+            )
+            if anchor_coords.ndim == 2:
+                anchor_coords = (
+                    anchor_coords.unsqueeze(0)
+                    if anchor_coords.shape[0] == 3
+                    else anchor_coords.transpose(0, 1).contiguous().unsqueeze(0)
+                )
+            elif anchor_coords.ndim == 3 and anchor_coords.shape[1] != 3 and anchor_coords.shape[-1] == 3:
+                anchor_coords = anchor_coords.permute(0, 2, 1).contiguous()
+            if anchor_coords.ndim != 3 or anchor_coords.shape[0] != 1 or anchor_coords.shape[1] != 3:
+                raise RuntimeError("ana_den6 exact anchorの座標shapeが不正である")
+            if B != 1:
+                raise RuntimeError("ana_den6 exact anchorはbatch=1 full-cloud学習だけを受け付ける")
+            anchor_counts = dict(exact_guidance.get("anchor_operation_counts") or {})
+            voxel_edit_final_coords = anchor_coords
+            voxel_edit_final_weights = pts_xyz.new_ones((1, 1, int(anchor_coords.shape[-1])))
+            voxel_edit_valid_mask = torch.ones(
+                (1, int(anchor_coords.shape[-1])), device=pts_xyz.device, dtype=torch.bool
+            )
+            voxel_edit_debug_list = [{
+                "initial_count": int(voxel_coords.shape[-1]),
+                "drop_count": int(anchor_counts.get("Prune", 0)),
+                "add_count": int(anchor_counts.get("Add", 0)),
+                "move_count": int(anchor_counts.get("Adjust", 0)),
+                "same_voxel_move_rejected": 0,
+                "existing_target_rejected": 0,
+                "duplicate_target_rejected": 0,
+                "final_count": int(anchor_coords.shape[-1]),
+                "subtree_prune_count": 0,
+            }]
+            exact_anchor_applied = True
+
         override_final_voxel_coords = (
             leaf_diag_for_override.get("actual_oracle_override_final_voxel_coords", None)
             if isinstance(leaf_diag_for_override, dict)
             else None
         )
         if (
-            actual_oracle_enabled
+            (not exact_anchor_applied)
+            and actual_oracle_enabled
             and actual_oracle_apply_teacher_actions
             and torch.is_tensor(override_final_voxel_coords)
         ):
@@ -8780,7 +9404,18 @@ class StructureRepairActuator(nn.Module):
             "policy_outlier_mean": p_outlier.mean().detach(),
             "actuator_target_mode": actuator_target_mode, 
             "voxel_edit_state_enabled": pts_xyz.new_tensor(float(voxel_edit_state_enabled)).detach(),
-            "voxel_edit_mode": voxel_edit_mode,
+            "voxel_edit_mode": (
+                "ana_den6_exact_residual_plan"
+                if exact_residual_plan_applied
+                else "ana_den6_exact_anchor_with_network_soft_backward"
+                if exact_anchor_applied else voxel_edit_mode
+            ),
+            "ana_den6_exact_candidate_mode": pts_xyz.new_tensor(
+                float(exact_den6_candidate_mode)
+            ).detach(),
+            "ana_den6_exact_anchor_applied": pts_xyz.new_tensor(
+                float(exact_anchor_applied)
+            ).detach(),
             "voxel_edit_initial_coords": voxel_edit_initial_coords,
             "voxel_edit_final_coords": voxel_edit_final_coords.detach(),
             "voxel_edit_final_weights": voxel_edit_final_weights.detach(),
@@ -9494,7 +10129,20 @@ class StructureRepairActuator(nn.Module):
             # Phase3: occupied voxel集合としての編集状態。
             # final_voxel_coords / final_voxel_weights は点対応ではなくoccupied voxel対応へ切り替える。
             "voxel_edit_state_enabled": bool(voxel_edit_state_enabled),
-            "voxel_edit_mode": voxel_edit_mode,
+            "voxel_edit_mode": (
+                "ana_den6_exact_residual_plan"
+                if exact_residual_plan_applied
+                else "ana_den6_exact_anchor_with_network_soft_backward"
+                if exact_anchor_applied else voxel_edit_mode
+            ),
+            "ana_den6_exact_candidate_mode": bool(exact_den6_candidate_mode),
+            "ana_den6_exact_anchor_applied": bool(exact_anchor_applied),
+            "ana_den6_exact_residual_plan_applied": bool(exact_residual_plan_applied),
+            "ana_den6_exact_residual_plan_debug": exact_residual_plan_debug,
+            "ana_den6_candidate_formula_basis": (
+                str(heuristic_guidance.get("formula_basis", ""))
+                if isinstance(heuristic_guidance, dict) else ""
+            ),
             "initial_voxel_coords": voxel_edit_initial_coords,
             "final_voxel_coords": voxel_edit_final_coords,
             "final_voxel_weights": voxel_edit_final_weights,

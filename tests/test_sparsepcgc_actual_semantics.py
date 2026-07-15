@@ -264,6 +264,154 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         self.assertEqual(result["actual_oracle_override_move_count"], 1)
         self.assertEqual(result["ana_den6_reference_anchor_source"], "ana_den6_candidate_plan_manifest")
 
+
+    def test_den6_residual_uses_exact_ranked_pool_not_proxy_formula(self):
+        """den6 v2 poolをsource/target候補へ写像し、proxy式へfallbackしない。"""
+        coords = torch.tensor(
+            [[[0, 1, 0], [0, 0, 1], [0, 0, 0]]], dtype=torch.long
+        )
+        exact = {
+            "source": "ana_den6_exact_ranked_candidate_pool_v2",
+            "manifest_sha256": "synthetic",
+            "dataset": "8I",
+            "scale_m": 8,
+            "total_ratio": 0.0025,
+            "operation_shares": {"Add": 0.4, "Prune": 0.4, "Adjust": 0.2},
+            "operation_heuristics": {
+                "Add": "geometry_safe_rate",
+                "Prune": "subtree_collapse",
+                "Adjust": "hotspot_cluster",
+            },
+            "ranked_candidate_pools": {
+                "Prune": [
+                    {"operation": "Prune", "pool_rank": 0, "remove_coords": [[0, 0, 0]], "add_coords": []},
+                    {"operation": "Prune", "pool_rank": 1, "remove_coords": [[1, 0, 0]], "add_coords": []},
+                ],
+                "Add": [
+                    {"operation": "Add", "pool_rank": 0, "remove_coords": [], "add_coords": [[1, 1, 0]]},
+                ],
+                "Adjust": [
+                    {"operation": "Adjust", "pool_rank": 0, "remove_coords": [[0, 1, 0]], "add_coords": [[0, 1, 1]]},
+                ],
+            },
+        }
+        structure = {
+            "occupancy_nll_proxy": torch.zeros((1, 1, 3), dtype=torch.float32),
+            "global_voxel_coords": coords,
+            "ana_den6_ranked_candidate_guidance": exact,
+        }
+        args = SimpleNamespace(
+            heuristic_guidance_mode="ana_den6_residual",
+            heuristic_guidance_enabled=True,
+            dataname="8i",
+            sparsepcgc_scale_m=8,
+            _current_subtree_id="",
+            heuristic_guidance_tensor_cache_entries=2,
+        )
+        guidance = build_heuristic_guidance(structure, args)
+        self.assertEqual(
+            guidance["formula_basis"],
+            "ana_den6_exact_ranked_editcandidate_pool_v2",
+        )
+        self.assertEqual(int(guidance["candidate_mask"]["Prune"].sum()), 2)
+        self.assertGreater(int(guidance["candidate_mask"]["Add"].sum()), 0)
+        self.assertEqual(int(guidance["candidate_mask"]["Adjust"].sum()), 1)
+        self.assertIn("target_direction_sparse", guidance)
+
+        actuator = StructureRepairActuator.__new__(StructureRepairActuator)
+        actuator.args = args
+        actuator.neighbor_offsets = torch.tensor(
+            [
+                (dx, dy, dz)
+                for dx in (-1, 0, 1)
+                for dy in (-1, 0, 1)
+                for dz in (-1, 0, 1)
+                if not (dx == 0 and dy == 0 and dz == 0)
+            ],
+            dtype=torch.float32,
+        )
+        direction = actuator._fit_heuristic_target_direction_prior(
+            guidance, "Adjust", structure["occupancy_nll_proxy"]
+        )
+        self.assertEqual(tuple(direction.shape), (1, 26, 3))
+        self.assertEqual(int((direction > 0).sum()), 1)
+
+    def test_den6_residual_rejects_missing_exact_candidate_pool(self):
+        structure = {"occupancy_nll_proxy": torch.zeros((1, 1, 4), dtype=torch.float32)}
+        args = SimpleNamespace(
+            heuristic_guidance_mode="ana_den6_residual",
+            heuristic_guidance_enabled=True,
+        )
+        with self.assertRaisesRegex(RuntimeError, "exact candidate guidance"):
+            build_heuristic_guidance(structure, args)
+
+    def test_den6_exact_residual_hard_plan_matches_anchor_when_residual_is_zero(self):
+        """Network残差0ではden6のpool順・衝突回避・最終Voxel集合を再現する。"""
+        coords = torch.tensor(
+            [[[0, 1, 0, 1, 0, 1], [0, 0, 1, 1, 0, 0], [0, 0, 0, 0, 1, 1]]],
+            dtype=torch.long,
+        )
+        expected = torch.tensor(
+            [[[0, 1, 0, 1, 2, 2], [1, 1, 0, 0, 0, 0], [0, 0, 1, 1, 0, 1]]],
+            dtype=torch.long,
+        )
+        exact = {
+            "source": "ana_den6_exact_ranked_candidate_pool_v2",
+            "manifest_sha256": "fixture",
+            "dataset": "8I",
+            "scale_m": 8,
+            "total_ratio": 0.0025,
+            "operation_shares": {"Add": 0.4, "Prune": 0.4, "Adjust": 0.2},
+            "operation_heuristics": {},
+            "operation_priority": ["Add", "Prune", "Adjust"],
+            "plan_variants": 6,
+            "selected_operation_counts": {"Add": 1, "Prune": 1, "Adjust": 1},
+            "anchor_operation_counts": {"Add": 1, "Prune": 1, "Adjust": 1},
+            "final_voxel_hash": _coord_hash(expected),
+            "ranked_candidate_pools": {
+                "Add": [{"candidate_id": "a0", "operation": "Add", "pool_rank": 0, "remove_coords": [], "add_coords": [[2, 0, 1]]}],
+                "Prune": [{"candidate_id": "p0", "operation": "Prune", "pool_rank": 0, "remove_coords": [[0, 0, 0]], "add_coords": []}],
+                "Adjust": [{"candidate_id": "m0", "operation": "Adjust", "pool_rank": 0, "remove_coords": [[1, 0, 0]], "add_coords": [[2, 0, 0]]}],
+            },
+        }
+        like = torch.zeros((1, 1, coords.shape[-1]), dtype=torch.float32)
+        guidance = build_heuristic_guidance(
+            {
+                "occupancy_nll_proxy": like,
+                "global_voxel_coords": coords,
+                "ana_den6_ranked_candidate_guidance": exact,
+            },
+            SimpleNamespace(
+                heuristic_guidance_mode="ana_den6_residual",
+                heuristic_guidance_enabled=True,
+                dataname="8i",
+                sparsepcgc_scale_m=8,
+                _current_subtree_id="",
+                heuristic_guidance_tensor_cache_entries=2,
+            ),
+        )
+        actuator = StructureRepairActuator.__new__(StructureRepairActuator)
+        actuator.args = SimpleNamespace(
+            _global_train_step=0,
+            heuristic_guidance_anchor_steps=200,
+            heuristic_guidance_network_residual_weight=0.5,
+        )
+        result = actuator._build_exact_den6_residual_plan(
+            guidance,
+            coords,
+            torch.tensor([[[0.0010]]]),
+            torch.tensor([[[0.0010]]]),
+            torch.tensor([[[0.0005]]]),
+            torch.zeros((1, 1, coords.shape[-1])),
+            torch.zeros((1, 1, coords.shape[-1])),
+            torch.zeros((1, 26, coords.shape[-1])),
+            torch.zeros((1, coords.shape[-1], 26)),
+        )
+        self.assertIsNotNone(result)
+        final_coords, debug = result
+        self.assertEqual(debug["selected_counts"], {"Add": 1, "Prune": 1, "Adjust": 1})
+        self.assertEqual(_coord_hash(final_coords), _coord_hash(expected))
+
     def test_den6_anchor_amounts_are_operation_specific_at_step_zero(self):
         """8i m=8の0.25%を旧5% Prune候補で上書きしない。"""
         actuator = StructureRepairActuator.__new__(StructureRepairActuator)

@@ -2108,5 +2108,25 @@ class OctreeStructureAnalysis(nn.Module):
         }
         # ana_den6の式を既存proxyへ写像したpriorである。
         # 追加のactual codec呼出やKNNは行わないため、Step時間への影響を小さく保つ。
+        # ana_den6_residualでは、den5/den6が生成した順位付き候補poolを
+        # proxyへ置換せず、そのままHeuristic guidanceへ渡す。
+        exact_den6_guidance = (
+            source_tree_for_key.get("ana_den6_ranked_candidate_guidance")
+            if isinstance(source_tree_for_key, dict)
+            else None
+        )
+        if not isinstance(exact_den6_guidance, dict) and isinstance(full_octree_context, dict):
+            exact_den6_guidance = full_octree_context.get("ana_den6_ranked_candidate_guidance")
+        if isinstance(exact_den6_guidance, dict):
+            result["ana_den6_ranked_candidate_guidance"] = exact_den6_guidance
+
+        current_global_voxel_coords = (
+            source_tree_for_key.get("global_voxel_coords")
+            if isinstance(source_tree_for_key, dict)
+            else None
+        )
+        if torch.is_tensor(current_global_voxel_coords):
+            result["global_voxel_coords"] = current_global_voxel_coords
+
         result["heuristic_guidance"] = build_heuristic_guidance(result, self.args)
         return result
