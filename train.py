@@ -1551,6 +1551,11 @@ def _build_sparsepcgc_full_cloud_amount_candidate_teacher_loss(
         "actual_objective_bit_source": "",
     }
     rows = []
+    if str(getattr(args, "heuristic_guidance_mode", "")).strip().lower() == "ana_den6_online":
+        # ana_den6_onlineはActuatorが1つのAmount/Action/Where planを直接決める。
+        # 旧full-cloud amount teacherのbest-of-N actual探索は主経路へ混入させない。
+        debug["full_cloud_amount_teacher_source"] = "disabled_for_ana_den6_online_one_plan"
+        return None, debug, rows
     if not isinstance(amount_terms, dict):
         return None, debug, rows
 
@@ -3746,6 +3751,31 @@ def _resolve_full_cloud_anchor_no_grad(args, full_cloud_canonical_context):
 
     allow_grad = bool(getattr(args, "full_cloud_anchor_allow_grad", False))
     node_limit = int(getattr(args, "full_cloud_anchor_grad_node_limit", 50000))
+    online_mode = (
+        str(getattr(args, "heuristic_guidance_mode", "")).strip().lower()
+        == "ana_den6_online"
+    )
+    if online_mode:
+        # onlineはfull-cloud方策log-probへ勾配を流すことが要件である。
+        # 条件不足時にno-gradへ黙って落とすと、訓練は進んでもWhere/Amount/Actionが学習されない。
+        if not allow_grad:
+            raise RuntimeError(
+                "ana_den6_onlineではfull_cloud_anchor_allow_grad=Trueが必要である"
+            )
+        if node_limit <= 0:
+            raise RuntimeError(
+                "ana_den6_onlineではfull_cloud_anchor_grad_node_limitを正値にする必要がある"
+            )
+        if node_count <= 0:
+            raise RuntimeError(
+                "ana_den6_onlineでfull-cloud Voxel数を特定できない"
+            )
+        if node_count > node_limit:
+            raise RuntimeError(
+                "ana_den6_onlineのfull-cloud Voxel数が勾配上限を超えた: "
+                f"{node_count}>{node_limit}。上限を明示的に増やすか入力設定を確認すること"
+            )
+        return False, f"ana_den6_online_grad_required:{node_count}<={node_limit}", node_count, count_source
 
     if not allow_grad:
         return True, "full_cloud_anchor_grad_disabled", node_count, count_source
@@ -12238,8 +12268,15 @@ def train(model, args, loss, writer, plot, notifier=None):
                 sparsepcgc_training_mode = str(
                     getattr(args, "sparsepcgc_training_mode", "subtree_selector")
                 ).strip().lower()
+                heuristic_mode = str(getattr(args, "heuristic_guidance_mode", "")).strip().lower()
+                den6_online_full_cloud = heuristic_mode == "ana_den6_online"
                 full_cloud_amount_mode = bool(sparsepcgc_training_mode == "full_cloud_amount")
-                if full_cloud_amount_mode:
+                if den6_online_full_cloud:
+                    # ana_den6 onlineではLocalPrune/Subtree学習を完全に通さず、3操作とも全点群で決める。
+                    subtree_mode = False
+                    full_cloud_amount_mode = False
+                    args._current_teacher_scope = "full_cloud"
+                elif full_cloud_amount_mode:
                     subtree_mode = True
 
                 """ログ判定"""
@@ -12265,8 +12302,21 @@ def train(model, args, loss, writer, plot, notifier=None):
                 args._log_this_step = False
                 sparsepcgc_csv_debug = ( str(getattr(args, "compress", "")).strip().lower().replace("-", "").replace("_", "") == "sparsepcgc" and bool(getattr(args, "save_compression_metric_csv", True))) # Sparse PCGC専用ログ
                 operation_csv_debug = bool( getattr(args, "save_operation_metric_csv", getattr(args, "save_operation_metrics_csv", True))) # 点操作メトリクスCSVを保存するか判定し、点移動量や追加/削除などのDebug収集条件に使用
-                args._collect_sparsepcgc_debug = bool(sparsepcgc_csv_debug and should_collect_sparsepcgc_hard_debug(args, log_this_step=log_this_step, profile_this_step=profile_this_step, global_step=global_train_step)) # SparsePCGCの重いhard統計は毎Stepではなく診断間隔だけ収集する
-                args._collect_structure_debug = bool( log_this_step or profile_this_step or operation_csv_debug or sparsepcgc_add_experiment_active(args))
+                args._collect_sparsepcgc_debug = bool(
+                    (not den6_online_full_cloud)
+                    and sparsepcgc_csv_debug
+                    and should_collect_sparsepcgc_hard_debug(
+                        args,
+                        log_this_step=log_this_step,
+                        profile_this_step=profile_this_step,
+                        global_step=global_train_step,
+                    )
+                )
+                # ana_den6 onlineの通常学習では未使用の巨大debug Tensor/辞書を作らない。
+                args._collect_structure_debug = bool(
+                    (not den6_online_full_cloud)
+                    and (log_this_step or profile_this_step or operation_csv_debug or sparsepcgc_add_experiment_active(args))
+                )
                 detail_log_this_step = False
                 step_timing_breakdown = {}
                 step_actual_oracle_metric_debug = {}
@@ -13332,6 +13382,11 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 time.time() - full_cloud_anchor_block_start
                             )
                         if (not is_anchor_step) or full_cloud_anchor_shadow_train_active:
+                            if den6_online_full_cloud:
+                                raise RuntimeError(
+                                    "ana_den6_online主経路へLocalPrune/Subtree処理が侵入した。"
+                                    "Add/Prune/Adjustは全点群だけで実行する必要がある"
+                                )
                             """Subtreeの場合"""
                             subtree_edit_sums = new_point_edit_sums()
                             subtree_noise_debug_values = []
@@ -15002,6 +15057,31 @@ def train(model, args, loss, writer, plot, notifier=None):
                     if callable(policy_loss_fn):
                         L_discrete_policy = policy_loss_fn(L_downstream.detach())
                         L = L + L_discrete_policy
+
+                # ana_den6 onlineではcompression_primaryでもPolicy Gradientを必ず加える。
+                # actual codecの結果は微分不能なので、Where/Amount/Actionのsample log-probへ
+                # advantageを掛けて、1Stepで試した1planの成否を次Stepへ学習させる。
+                heuristic_mode = str(
+                    getattr(args, "heuristic_guidance_mode", "")
+                ).strip().lower()
+                if heuristic_mode == "ana_den6_online":
+                    base_model_for_policy = model.module if hasattr(model, "module") else model
+                    policy_loss_fn = getattr(base_model_for_policy, "discrete_policy_loss", None)
+                    if not callable(policy_loss_fn):
+                        raise RuntimeError(
+                            "ana_den6_onlineにはNetwork.discrete_policy_lossが必要である"
+                        )
+                    online_policy_loss = policy_loss_fn(L_downstream.detach())
+                    if not torch.is_tensor(online_policy_loss):
+                        raise RuntimeError(
+                            "ana_den6_onlineのdiscrete_policy_lossがTensorを返していない"
+                        )
+                    # hard分岐で既に足している場合の二重加算を避ける。
+                    if _discrete_loss_mode_value(args) == "hard" and not compression_primary_mode:
+                        L = L - L_discrete_policy
+                    L_discrete_policy = online_policy_loss
+                    L = L + L_discrete_policy
+
                 base_model_for_correction = model.module if hasattr(model, "module") else model
                 full_cloud_correction_loss, full_cloud_correction_debug = build_full_cloud_actual_correction_loss(
                     args=args,
@@ -16637,16 +16717,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                     0.0,
                 )
                 plot.record_point_edits("step", global_train_step + 1, plot_edit_stats) # 点操作統計をCSVに記録
-                plot.record_occupancy_metrics("step", global_train_step + 1, compression_metric_row) # 占有pattern/probability proxyと実hard octree統計をCSVに記録
-                plot.record_voxel_collision_metrics("step", global_train_step + 1, compression_metric_row) # SparsePCGC量子化後の点潰れ率をCSV/plotへ記録
                 plot_step_info = plot.record_metrics("step", global_train_step + 1, step_metric_values) # Step単位の損失値をCSVに保存
-                if plot_step_info.get("skipped", False) and not compact_step_text_log:
-                    threshold_text = f"{plot_step_info.get('threshold', float('nan')):.6g}"
-                    baseline = plot_step_info.get("baseline", None)
-                    baseline_text = ""
-                    if baseline is not None:
-                        baseline_text = f", baseline={float(baseline):.6g}"
-                    writer.write( "PlotSkipStep: " f"global_step={global_train_step + 1}, " f"episode={episode + 1}, " f"epoch={epoch + 1}, " f"metric={plot_step_info.get('metric_key', 'unknown')}, " f"value={float(plot_step_info.get('value', float('nan'))):.6g}, " f"rule={plot_step_info.get('reason', 'unknown')}, " f"threshold={threshold_text}" f"{baseline_text}")
                 if timing_enabled:
                     sync_for_timing(use_cuda)
                     en_step = time.time()
@@ -16693,19 +16764,8 @@ def train(model, args, loss, writer, plot, notifier=None):
                 log_plot_skip_epoch( writer, plot_epoch_info, global_epoch) # Epoch単位の平均損失をCSVに記録
                 writer.write(format_metric_summary("EpochAvg", plot.metric_keys, epoch_avgs))
             epoch_edit_info = plot.record_point_edits("epo", global_epoch + 1) # Epoch内で記録されたStep単位の点編集統計を集計
-            plot.record_occupancy_metrics("epo", global_epoch + 1) # Epoch内で記録された占有pattern/probability統計を集計
-            plot.record_voxel_collision_metrics("epo", global_epoch + 1) # Epoch内のSparsePCGC量子化点潰れ率を集計
             log_epoch_point_edit_average( writer, epoch_edit_info, global_epoch) # Epoch単位の点ん操作統計をログに記録
             global_epoch += 1
-            plot.plot_loss_curve("step")
-            plot.plot_loss_curve("epo")
-            plot.plot_point_edit_curve("step")
-            plot.plot_point_edit_curve("epo")
-            plot.plot_occupancy_curve("step")
-            plot.plot_occupancy_curve("epo")
-            plot.plot_voxel_collision_curve("step")
-            plot.plot_voxel_collision_curve("epo")
-            writer.write(f"Saved step/epoch plots/csv: {plot.save_dir}")
             writer.flush()
         if episode_metric_sums is not None:
             plot.epi_avg = metric_avgs_to_floats(episode_metric_sums)
@@ -16715,14 +16775,9 @@ def train(model, args, loss, writer, plot, notifier=None):
             plot.epi_avg = [None for _ in range(plot.num_loss)]
         writer.write(format_metric_summary("EpisodeAvg", plot.metric_keys, plot.epi_avg))
         episode_edit_info = plot.record_point_edits("epi", episode + 1)
-        plot.record_occupancy_metrics("epi", episode + 1)
-        plot.record_voxel_collision_metrics("epi", episode + 1)
         log_episode_point_edit_average( writer, episode_edit_info, episode)
-        plot.plot_loss_curve("epi")
-        plot.plot_point_edit_curve("epi")
-        plot.plot_occupancy_curve("epi")
-        plot.plot_voxel_collision_curve("epi")
-        writer.write(f"Saved episode plots/csv: {plot.save_dir}")
+        plot.plot_point_edit_curve("step")
+        writer.write(f"Saved 3 point-edit plots (Add/Prune/Adjust): {plot.save_dir}")
         if _episode_input_common_cache_enabled(args):
             cache_summary = _episode_input_common_cache_summary(args)
             writer.write(

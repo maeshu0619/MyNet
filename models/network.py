@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import time
+from collections import OrderedDict
 
 from .encoder.point_trans import PointTransformer
 from .utils.pointcloud import utils_repkpu
@@ -13,6 +14,8 @@ from .utils.pointcloud.sparsepcgc_voxel import (
     restore_points_from_voxel_coords,
 )
 from .utils.pointcloud.ana_den6_reference import attach_ana_den6_reference_anchor
+from .utils.pointcloud.ana_den6_online import attach_ana_den6_online_guidance
+from .modules.heuristic_guidance import build_heuristic_guidance
 from .modules.cause_aggregation import CauseDiagnosisAggregation
 from .modules.cost_attribution import CAUSE_NAMES, CostAttributionModule
 from .modules.octree_structure import OctreeStructureAnalysis
@@ -47,6 +50,8 @@ class Network(nn.Module):
         self.last_encoder_debug = {} # 直近Forward時のEncoder関連デバッグ情報を保存する辞書を初期化
         self.last_actuator_soft_terms = {} # 直近Forward時の微分可能な点操作proxyを保存する辞書
         self.last_runtime_timing = {} # 直近Forward時の実行時間計測結果を保存する辞書を初期化
+        self._den6_online_objective_baseline = OrderedDict()
+        self.last_discrete_policy_debug = {}
 
         """モジュールセットアップ"""
         self.encoder = PointTransformer(self.args) # 特徴抽出器
@@ -125,8 +130,52 @@ class Network(nn.Module):
     #     return None
 
     """補助関数"""
-    def discrete_policy_loss(self, reward): # 離散方策に対する方策勾配風の損失を返すための関数
-        return reward.new_zeros(())
+    def discrete_policy_loss(self, reward):
+        """actual圧縮結果からden6 onlineのWhere/Amount/Actionを更新する。"""
+        if not torch.is_tensor(reward):
+            raise TypeError("discrete_policy_lossのrewardはTensorである必要がある")
+        mode = str(getattr(self.args, "heuristic_guidance_mode", "proxy_prior")).strip().lower()
+        if mode != "ana_den6_online":
+            return reward.new_zeros(())
+        state = self.last_actuator_voxel_state
+        if not isinstance(state, dict):
+            return reward.new_zeros(())
+        log_prob = state.get("den6_online_policy_log_prob", None)
+        entropy = state.get("den6_online_policy_entropy", None)
+        if not torch.is_tensor(log_prob) or not log_prob.requires_grad:
+            return reward.new_zeros(())
+        objective = torch.nan_to_num(reward.float().mean(), nan=0.0, posinf=1e3, neginf=-1e3)
+        cache_key = "|".join((
+            str(getattr(self.args, "_current_input_file", "")),
+            str(getattr(self.args, "sparsepcgc_scale_ae", 0)),
+            str(getattr(self.args, "sparsepcgc_scale_sr", 0)),
+            str(getattr(self.args, "sparsepcgc_scale_m", 8)),
+        ))
+        previous = self._den6_online_objective_baseline.get(cache_key, 0.0)
+        previous_t = objective.new_tensor(float(previous))
+        # objectiveは小さいほど良い。baselineより小さい時に選択確率を増やす。
+        advantage = previous_t - objective.detach()
+        ema = min(max(float(getattr(self.args, "heuristic_guidance_online_reward_ema", 0.10)), 1e-4), 1.0)
+        updated = (1.0 - ema) * float(previous) + ema * float(objective.detach().cpu())
+        self._den6_online_objective_baseline[cache_key] = float(updated)
+        self._den6_online_objective_baseline.move_to_end(cache_key)
+        while len(self._den6_online_objective_baseline) > 4096:
+            self._den6_online_objective_baseline.popitem(last=False)
+
+        weight = max(float(getattr(self.args, "heuristic_guidance_online_policy_weight", 1.0)), 0.0)
+        entropy_weight = max(float(getattr(self.args, "heuristic_guidance_online_entropy_weight", 0.001)), 0.0)
+        policy_loss = -weight * advantage * log_prob.float().mean()
+        if torch.is_tensor(entropy):
+            policy_loss = policy_loss - entropy_weight * entropy.float().mean()
+        self.last_discrete_policy_debug = {
+            "objective": float(objective.detach().cpu()),
+            "objective_baseline": float(previous),
+            "advantage": float(advantage.detach().cpu()),
+            "log_prob": float(log_prob.detach().float().mean().cpu()),
+            "entropy": float(entropy.detach().float().mean().cpu()) if torch.is_tensor(entropy) else 0.0,
+            "policy_loss": float(policy_loss.detach().cpu()),
+        }
+        return policy_loss.to(dtype=reward.dtype)
 
     def score_algorithmic_proposal_subtrees(self, subtree_features):
         """Score candidate subtrees for the algorithmic proposal selector path."""
@@ -1327,21 +1376,27 @@ class Network(nn.Module):
         guidance_mode = str(
             getattr(self.args, "heuristic_guidance_mode", "proxy_prior")
         ).strip().lower()
-        if (
-            bool(getattr(self.args, "heuristic_guidance_enabled", True))
-            and guidance_mode in {
-                "ana_den6_residual", "ana_den6_reproduce", "ana_den6_reference_ply"
-            }
-        ):
-            if not isinstance(full_octree_context, dict):
-                raise RuntimeError(
-                    f"{guidance_mode}にはfull-cloud canonical contextが必要である"
+        if bool(getattr(self.args, "heuristic_guidance_enabled", True)):
+            if guidance_mode == "ana_den6_online":
+                if not isinstance(full_octree_context, dict):
+                    raise RuntimeError("ana_den6_onlineにはfull-cloud canonical contextが必要である")
+                full_octree_context = attach_ana_den6_online_guidance(
+                    full_octree_context,
+                    self.args,
+                    device=pts_xyz.device,
                 )
-            full_octree_context = attach_ana_den6_reference_anchor(
-                full_octree_context,
-                self.args,
-                device=pts_xyz.device,
-            )
+            elif guidance_mode in {
+                "ana_den6_residual", "ana_den6_reproduce", "ana_den6_reference_ply"
+            }:
+                if not isinstance(full_octree_context, dict):
+                    raise RuntimeError(
+                        f"{guidance_mode}にはfull-cloud canonical contextが必要である"
+                    )
+                full_octree_context = attach_ana_den6_reference_anchor(
+                    full_octree_context,
+                    self.args,
+                    device=pts_xyz.device,
+                )
 
         fast_oracle_result = self._maybe_fast_full_cloud_oracle_forward(
             pts_xyz,
@@ -2135,6 +2190,27 @@ class Network(nn.Module):
             actuator_octree_context_source = "canonical_subtree_tree"
 
         if (
+            isinstance(structure, dict)
+            and guidance_mode in {"ana_den6_online", "ana_den6_residual"}
+        ):
+            if not is_full_cloud_forward or not isinstance(actuator_octree_context, dict):
+                raise RuntimeError(
+                    "ana_den6 online/residualは全点群canonical forwardだけを受け付ける"
+                )
+            exact_payload = actuator_octree_context.get(
+                "ana_den6_ranked_candidate_guidance", None
+            )
+            global_coords = actuator_octree_context.get("global_voxel_coords", None)
+            if not isinstance(exact_payload, dict) or not torch.is_tensor(global_coords):
+                raise RuntimeError(
+                    "ana_den6 exact candidate payloadまたはglobal_voxel_coordsがActuator直前で欠落した"
+                )
+            # OctreeStructureAnalysis内部のproxy guidanceをexact den6 guidanceで上書きする。
+            structure["global_voxel_coords"] = global_coords
+            structure["ana_den6_ranked_candidate_guidance"] = exact_payload
+            structure["heuristic_guidance"] = build_heuristic_guidance(structure, self.args)
+
+        if (
             is_full_cloud_forward
             and bool(getattr(self.args, "full_cloud_require_actuator_octree_context", True))
             and not isinstance(actuator_octree_context, dict)
@@ -2230,6 +2306,11 @@ class Network(nn.Module):
                 "raw_learned_drop_ratio",
                 "raw_learned_add_ratio",
                 "raw_learned_move_ratio",
+                "den6_online_policy_log_prob",
+                "den6_online_policy_entropy",
+                "den6_online_where_log_prob",
+                "den6_online_amount_log_prob",
+                "den6_online_action_log_prob",
             )
             if actuator_stats.get(key, None) is not None
         }

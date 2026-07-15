@@ -2739,16 +2739,17 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--heuristic_guidance_enabled', default=True, type=str2bool, help='ana_den6由来HeuristicをWhere/Amount/Actionのpriorとして使う')
     parser.add_argument(
         '--heuristic_guidance_mode',
-        default='ana_den6_residual',
+        default='ana_den6_online',
         choices=[
             'proxy_prior',
+            'ana_den6_online',
             'ana_den6_residual',
             'ana_den6_reproduce',
             'ana_den6_reference_ply',
         ],
         help=(
-            'Heuristic guidanceの実行形態。ana_den6_residualはden6の全順位付きcandidate poolを'
-            '探索空間にし、NetworkがWhere/Amount/Action residualだけを学習する'
+            'Heuristic guidanceの実行形態。ana_den6_onlineはtrain中に各frameのden6候補を'
+            'lazy生成・cacheし、1Stepで1planだけを実圧縮して学習する'
         ),
     )
     parser.add_argument(
@@ -2762,6 +2763,91 @@ def parse_pugan_args(parser, file_day, file_time):
         default='/data/maejima/log/mynet_den6_manifests',
         type=str,
         help='複数frame学習時に入力SHA256とAE/SR/mからv2 manifestを自動選択するディレクトリ',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_cache_dir',
+        default='/data/maejima/log/mynet_den6_online_cache',
+        type=str,
+        help='train中にlazy生成するana_den6順位付き候補poolのcache先',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_conda_env',
+        default='sparsepcgc',
+        type=str,
+        help='ana_den6 online workerを起動するconda環境。空なら現在Pythonを使う',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_python',
+        default='',
+        type=str,
+        help='online worker用Pythonの絶対path。指定時はconda envより優先する',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_worker_device',
+        default='cpu',
+        choices=['cpu', 'auto', 'cuda'],
+        type=str,
+        help='初回候補cache生成workerのdevice。train GPUとの同時確保を避けるため既定CPU',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_pool_limit',
+        default=512,
+        type=int,
+        help='Add/Prune/Adjustごとのcompact shortlist上限。初期count×reserveより大きい全件poolは保持しない',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_compact_reserve_factor',
+        default=8,
+        type=int,
+        help='den6初期Action countに対して保持する候補余裕倍率',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_memory_entries',
+        default=4,
+        type=int,
+        help='process内に保持するframe別den6候補payload数',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_max_total_ratio',
+        default=0.0099,
+        type=float,
+        help='Add+Prune+Adjust操作数の全Voxel比上限。1.0未満を保証するため既定0.0099',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_max_changed_ratio',
+        default=0.0099,
+        type=float,
+        help='Add+Prune+2*Adjustで数える変更Voxel cell比率上限',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_where_temperature',
+        default=0.75,
+        type=float,
+        help='den6候補pool内Gumbel-TopK探索の温度',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_amount_log_sigma',
+        default=0.08,
+        type=float,
+        help='Amountをden6中心から微小探索するlog-normal標準偏差',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_policy_weight',
+        default=1.0,
+        type=float,
+        help='actual結果からWhere/Amount/Actionへ返すpolicy-gradient損失重み',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_entropy_weight',
+        default=0.001,
+        type=float,
+        help='候補探索の早期固定化を防ぐentropy bonus重み',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_reward_ema',
+        default=0.10,
+        type=float,
+        help='frame別actual objective baselineのEMA更新率',
     )
     parser.add_argument(
         '--heuristic_guidance_den6_codec_strict',
@@ -3756,10 +3842,11 @@ def parse_pugan_args(parser, file_day, file_time):
         args.sparsepcgc_dense_scale_sr_list = str(args.sparsepcgc_scale_sr)
     args.heuristic_guidance_enabled = bool(getattr(args, "heuristic_guidance_enabled", True))
     args.heuristic_guidance_mode = str(
-        getattr(args, "heuristic_guidance_mode", "ana_den6_residual")
+        getattr(args, "heuristic_guidance_mode", "ana_den6_online")
     ).strip().lower()
     valid_guidance_modes = {
         "proxy_prior",
+        "ana_den6_online",
         "ana_den6_residual",
         "ana_den6_reproduce",
         "ana_den6_reference_ply",
@@ -3819,8 +3906,79 @@ def parse_pugan_args(parser, file_day, file_time):
     args.heuristic_guidance_amount_residual_fraction = max(float(getattr(args, "heuristic_guidance_amount_residual_fraction", 0.50)), 0.0)
     args.heuristic_guidance_amount_min_residual = max(float(getattr(args, "heuristic_guidance_amount_min_residual", 0.0001)), 0.0)
     args.heuristic_guidance_amount_grad_scale = max(float(getattr(args, "heuristic_guidance_amount_grad_scale", 1.0)), 0.0)
+    args.heuristic_guidance_online_pool_limit = min(max(
+        int(getattr(args, "heuristic_guidance_online_pool_limit", 512)), 3
+    ), 512)
+    args.heuristic_guidance_online_compact_reserve_factor = min(max(
+        int(getattr(args, "heuristic_guidance_online_compact_reserve_factor", 8)), 1
+    ), 32)
+    args.heuristic_guidance_online_memory_entries = max(
+        int(getattr(args, "heuristic_guidance_online_memory_entries", 4)), 1
+    )
+    args.heuristic_guidance_online_max_total_ratio = min(max(
+        float(getattr(args, "heuristic_guidance_online_max_total_ratio", 0.0099)), 3e-6
+    ), 0.0099)
+    args.heuristic_guidance_online_max_changed_ratio = min(max(
+        float(getattr(args, "heuristic_guidance_online_max_changed_ratio", 0.0099)), 3e-6
+    ), 0.0099)
+    args.heuristic_guidance_online_where_temperature = max(
+        float(getattr(args, "heuristic_guidance_online_where_temperature", 0.75)), 0.05
+    )
+    args.heuristic_guidance_online_amount_log_sigma = min(max(
+        float(getattr(args, "heuristic_guidance_online_amount_log_sigma", 0.08)), 0.0
+    ), 0.50)
+    args.heuristic_guidance_online_policy_weight = max(
+        float(getattr(args, "heuristic_guidance_online_policy_weight", 1.0)), 0.0
+    )
+    args.heuristic_guidance_online_entropy_weight = max(
+        float(getattr(args, "heuristic_guidance_online_entropy_weight", 0.001)), 0.0
+    )
+    args.heuristic_guidance_online_reward_ema = min(max(
+        float(getattr(args, "heuristic_guidance_online_reward_ema", 0.10)), 1e-4
+    ), 1.0)
+    if args.heuristic_guidance_enabled and args.heuristic_guidance_mode == "ana_den6_online":
+        # online方式は全点群から1%未満の微小Voxelを1planだけ選ぶ。
+        # 旧subtree oracleやfull-cloud Amount多候補評価を併走させない。
+        args.train_patch_subset_enable = False
+        args.sparsepcgc_training_mode = "legacy"
+        args.sparsepcgc_legacy_direct_actuator_train = True
+        args.sparsepcgc_algorithmic_proposal_selector = False
+        args.sparsepcgc_actual_oracle_edit = False
+        args.sparsepcgc_actual_oracle_apply_teacher_actions = False
+        args.sparsepcgc_actual_oracle_apply_full_override = False
+        args.sparsepcgc_full_cloud_actual_primary = False
+        args.sparsepcgc_require_full_cloud_actual_teacher = False
+        args.train_full_cloud_actual_interval = 0
+        args.train_full_cloud_anchor_every_step = False
+        # ana_den6 online主経路では未使用のLocalPrune/Subtree/大量debugログを停止する。
+        args.phase7_debug = False
+        args.phase7_grad_debug = False
+        args.network_voxel_node_debug = False
+        args.leaf_pattern_diagnosis_debug = False
+        args.print_actuator_hard_soft_compare = False
+        args.save_operation_metric_csv = False
+        args.save_operation_metrics_csv = False
+        args.save_compression_metric_csv = False
+        # online Policy Gradientにはfull-cloud Actuator headのgraphが必要である。
+        # no-grad anchorへ落ちるとlog-probがdetachされ学習不能になる。
+        args.full_cloud_anchor_allow_grad = True
+        if not _cli_option_was_provided("--full_cloud_anchor_grad_node_limit"):
+            args.full_cloud_anchor_grad_node_limit = max(
+                int(getattr(args, "full_cloud_anchor_grad_node_limit", 50000)),
+                2000000,
+            )
+        args.full_cloud_anchor_train_shadow_subtree = False
+        args.train_full_cloud_anchor_every_step_shadow = False
+        args.sparsepcgc_actual_every_step = True
+        args.actual_eval_interval = 1
+        args.disable_actual_codec_during_train = False
+        args.batch_size = 1
+        # 旧5% Prune等で学習したheadを自動読込するとonline residual初期値を汚す。
+        # 明示指定時だけ再開を許可し、既定は新しい方策headから開始する。
+        if not _cli_option_was_provided("--more_training"):
+            args.more_training = False
     if args.heuristic_guidance_enabled and compress_key == "sparsepcgc":
-        if args.heuristic_guidance_mode == "ana_den6_residual":
+        if args.heuristic_guidance_mode in {"ana_den6_online", "ana_den6_residual"}:
             # den6 Amountは全点群比0.05%～0.25%級である。旧3%/5%初期値を混入させない。
             profile_amounts = {
                 ("8i", 8): (0.0010, 0.0010, 0.0005),
@@ -3845,13 +4003,21 @@ def parse_pugan_args(parser, file_day, file_time):
                 args.repair_init_move_ratio = float(move_init)
             if not _cli_option_was_provided("--repair_amount_target_mode"):
                 args.repair_amount_target_mode = "none"
-            # actual Rateはden6と同じfull-cloud基準で毎Step確認し、勾配は既存shadow subtreeへ流す。
+            # actual Rateはden6と同じfull-cloud基準で毎Step確認する。
             if not _cli_option_was_provided("--train_full_cloud_anchor_every_step"):
                 args.train_full_cloud_anchor_every_step = True
-            if not _cli_option_was_provided("--train_full_cloud_anchor_every_step_shadow"):
-                args.train_full_cloud_anchor_every_step_shadow = True
-            if not _cli_option_was_provided("--full_cloud_anchor_train_shadow_subtree"):
-                args.full_cloud_anchor_train_shadow_subtree = True
+            if args.heuristic_guidance_mode == "ana_den6_residual":
+                # 旧manifest residualだけは既存shadow subtree経路を維持する。
+                if not _cli_option_was_provided("--train_full_cloud_anchor_every_step_shadow"):
+                    args.train_full_cloud_anchor_every_step_shadow = True
+                if not _cli_option_was_provided("--full_cloud_anchor_train_shadow_subtree"):
+                    args.full_cloud_anchor_train_shadow_subtree = True
+            else:
+                # onlineはfull-cloud Actuator自身へPolicy Gradientを流すためshadowを併走しない。
+                if not _cli_option_was_provided("--train_full_cloud_anchor_every_step_shadow"):
+                    args.train_full_cloud_anchor_every_step_shadow = False
+                if not _cli_option_was_provided("--full_cloud_anchor_train_shadow_subtree"):
+                    args.full_cloud_anchor_train_shadow_subtree = False
         # Add/Prune/Adjustを同時候補として残す。各操作量はHeuristic prior周辺でNetworkが微調整する。
         if not _cli_option_was_provided("--sparsepcgc_disable_add"):
             args.sparsepcgc_disable_add = False
@@ -3983,7 +4149,7 @@ def parse_pugan_args(parser, file_day, file_time):
         and compress_key == "sparsepcgc"
         and args.heuristic_guidance_den6_codec_strict
         and args.heuristic_guidance_mode in {
-            "ana_den6_residual", "ana_den6_reproduce", "ana_den6_reference_ply"
+            "ana_den6_online", "ana_den6_residual", "ana_den6_reproduce", "ana_den6_reference_ply"
         }
     ):
         # den6の比較対象は native_vs1_pq1_ae0_sr{native-m}_m{m} であり、
@@ -6969,7 +7135,7 @@ def parse_pugan_args(parser, file_day, file_time):
     if (
         bool(getattr(args, "heuristic_guidance_enabled", True))
         and str(getattr(args, "heuristic_guidance_mode", "")).strip().lower()
-        == "ana_den6_residual"
+        in {"ana_den6_online", "ana_den6_residual"}
     ):
         # 最後の汎用SparsePCGC後処理が旧3～5%探索値を再導入しないよう固定する。
         profile_amounts = {

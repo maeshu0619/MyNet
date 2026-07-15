@@ -2873,14 +2873,18 @@ class StructureRepairActuator(nn.Module):
         if not bool(getattr(self.args, "heuristic_guidance_enabled", True)):
             return None
         mode = str(getattr(self.args, "heuristic_guidance_mode", "proxy_prior")).strip().lower()
-        if mode == "ana_den6_residual":
-            if str(guidance.get("formula_basis", "")) != "ana_den6_exact_ranked_editcandidate_pool_v2":
+        if mode in {"ana_den6_online", "ana_den6_residual"}:
+            if str(guidance.get("formula_basis", "")) not in {
+                "ana_den6_exact_ranked_editcandidate_pool_v2",
+                "ana_den6_exact_ranked_editcandidate_pool_online_v1",
+                "ana_den6_exact_one_pattern_anchor_online_v4",
+            }:
                 raise RuntimeError(
-                    "ana_den6_residualでproxy近似guidanceがActuatorへ入った。"
+                    "ana_den6 online/residualでproxy近似guidanceがActuatorへ入った。"
                     "exact ranked candidate pool以外は使用できない"
                 )
             if not isinstance(guidance.get("exact_candidate_guidance"), dict):
-                raise RuntimeError("ana_den6_residualでexact_candidate_guidanceが欠落した")
+                raise RuntimeError("ana_den6 online/residualでexact_candidate_guidanceが欠落した")
         return guidance
 
     def _heuristic_anchor_phase(self):
@@ -2981,7 +2985,7 @@ class StructureRepairActuator(nn.Module):
             return drop_gate, add_gate, move_gate
         strength = min(max(float(getattr(self.args, "heuristic_guidance_action_strength", 0.50)), 0.0), 1.0)
         mode = str(getattr(self.args, "heuristic_guidance_mode", "proxy_prior")).strip().lower()
-        if mode == "ana_den6_residual":
+        if mode in {"ana_den6_online", "ana_den6_residual"}:
             final_strength = min(max(float(
                 getattr(self.args, "heuristic_guidance_final_prior_strength", 0.10)
             ), 0.0), 1.0)
@@ -3039,7 +3043,7 @@ class StructureRepairActuator(nn.Module):
         prior = self._fit_heuristic_where_prior(guidance, operation, like_tensor)
         weight = max(float(getattr(self.args, "heuristic_guidance_where_weight", 1.0)), 0.0)
         mode = str(getattr(self.args, "heuristic_guidance_mode", "proxy_prior")).strip().lower()
-        if mode == "ana_den6_residual":
+        if mode in {"ana_den6_online", "ana_den6_residual"}:
             final_weight = max(float(getattr(self.args, "heuristic_guidance_final_where_weight", 0.25)), 0.0)
             anchor_phase = self._heuristic_anchor_phase()
             weight = final_weight + (weight - final_weight) * anchor_phase
@@ -3117,11 +3121,14 @@ class StructureRepairActuator(nn.Module):
     def _normalize_candidate_network_score(value):
         value = torch.nan_to_num(value.float(), nan=0.0, posinf=0.0, neginf=0.0)
         if value.numel() <= 1:
-            return torch.zeros_like(value)
+            return value - value.detach()
         lower = value.amin()
         upper = value.amax()
         if float((upper - lower).detach().cpu()) <= 1e-12:
-            return torch.zeros_like(value)
+            # 初期化直後は全候補scoreが同値になりやすい。
+            # forwardを0のまま保ちながら、selected log-probから各候補headへ
+            # 勾配が流れる中心化STEとして返す。
+            return value - value.mean()
         return (value - lower) / (upper - lower).clamp_min(1e-12) - 0.5
 
     def _exact_den6_candidate_scores(
@@ -3215,13 +3222,13 @@ class StructureRepairActuator(nn.Module):
         move_logits,
         add_pair_logits,
     ):
-        """den6のcandidate pool・variant・conflict ruleを保ったhard planを構築する。"""
+        """den6順位を基盤に、1Stepで1つだけonline planをsampleする。"""
         if not isinstance(guidance, dict):
             return None
         exact = guidance.get("exact_candidate_guidance")
         if not isinstance(exact, dict) or voxel_coords.shape[0] != 1:
             return None
-        pools = exact.get("ranked_candidate_pools")
+        pools = exact.get("operation_candidate_shortlists")
         if not isinstance(pools, dict):
             return None
         operations = ("Add", "Prune", "Adjust")
@@ -3229,35 +3236,132 @@ class StructureRepairActuator(nn.Module):
             return None
 
         point_count = int(voxel_coords.shape[-1])
-        ratio_values = {
-            "Add": max(float(learned_add_ratio.detach().mean().cpu()), 0.0),
-            "Prune": max(float(learned_drop_ratio.detach().mean().cpu()), 0.0),
-            "Adjust": max(float(learned_move_ratio.detach().mean().cpu()), 0.0),
-        }
-        total_ratio = sum(ratio_values.values())
-        if total_ratio <= 0.0:
-            ratio_values = dict(guidance.get("amount_prior") or {})
-            total_ratio = sum(max(float(value), 0.0) for value in ratio_values.values())
-        shares = {
-            name: max(float(ratio_values.get(name, 0.0)), 0.0) / max(total_ratio, 1e-12)
-            for name in operations
-        }
-        learned_budget = max(3, int(math.ceil(float(point_count) * float(total_ratio))))
-        learned_counts = self._den6_allocate_counts(learned_budget, shares)
-        anchor_counts = {
-            name: int((exact.get("anchor_operation_counts") or exact.get("selected_operation_counts") or {}).get(name, 0))
-            for name in operations
-        }
-        anchor_phase = self._heuristic_anchor_phase()
-        requested_counts = {
-            name: max(
-                1,
-                int(round(anchor_phase * anchor_counts[name] + (1.0 - anchor_phase) * learned_counts[name])),
+        if point_count <= 0:
+            raise RuntimeError("ana_den6 online planの入力Voxel数が0である")
+        max_total_ratio = min(max(float(
+            getattr(self.args, "heuristic_guidance_online_max_total_ratio", 0.0099)
+        ), 0.0), 0.0099)
+        max_changed_ratio = min(max(float(
+            getattr(self.args, "heuristic_guidance_online_max_changed_ratio", 0.0099)
+        ), 0.0), 0.0099)
+        # Add/Prune/Adjustを最低1件ずつ含めるには3操作・4変更cellが必要である。
+        # 小点群で1%未満を破る暗黙fallbackは行わず、条件矛盾として停止する。
+        if int(math.floor(point_count * max_total_ratio)) < 3:
+            raise RuntimeError(
+                "ana_den6 onlineで3操作を維持しつつ総操作率1%未満にできない: "
+                f"voxel_count={point_count}, max_total_ratio={max_total_ratio}"
             )
+        if int(math.floor(point_count * max_changed_ratio)) < 4:
+            raise RuntimeError(
+                "ana_den6 onlineでAdd/Prune/Adjustを維持しつつ変更Voxel率1%未満にできない: "
+                f"voxel_count={point_count}, max_changed_ratio={max_changed_ratio}"
+            )
+
+        anchor_phase = self._heuristic_anchor_phase()
+        residual_alpha = 1.0 - anchor_phase
+
+        # Amount/Actionは毎Step den6 priorを基礎にし、Networkは有界な乗法residualだけを与える。
+        # Step 0ではresidual_alpha=0となるためworkerのden6初期planと完全一致する。
+        prior_total_ratio = max(float(exact.get("total_ratio", 0.0)), 1e-9)
+        prior_shares_raw = exact.get("operation_shares", {})
+        prior_shares = {
+            name: max(float(prior_shares_raw.get(name, 1.0 / 3.0)), 1e-9)
             for name in operations
         }
+        prior_share_sum = max(sum(prior_shares.values()), 1e-9)
+        prior_ratios = {
+            name: prior_total_ratio * prior_shares[name] / prior_share_sum
+            for name in operations
+        }
+        learned_raw = {
+            "Add": learned_add_ratio.float().mean().clamp_min(1e-9),
+            "Prune": learned_drop_ratio.float().mean().clamp_min(1e-9),
+            "Adjust": learned_move_ratio.float().mean().clamp_min(1e-9),
+        }
+        amount_beta = min(max(float(
+            getattr(self.args, "heuristic_guidance_online_amount_residual_scale", 0.35)
+        ), 0.0), 1.0)
+        ratio_tensors = {}
         for name in operations:
-            requested_counts[name] = min(requested_counts[name], len(pools[name]))
+            prior_t = learned_raw[name].new_tensor(prior_ratios[name])
+            log_residual = torch.log(learned_raw[name] / prior_t.clamp_min(1e-9))
+            bounded = torch.tanh(log_residual) * float(amount_beta) * float(residual_alpha)
+            ratio_tensors[name] = prior_t * torch.exp(bounded)
+        current_step = max(int(getattr(self.args, "_global_train_step", 0)), 0)
+        exact_anchor_steps = max(
+            int(getattr(self.args, "heuristic_guidance_exact_anchor_steps", 1)), 0
+        )
+        online_mode = (
+            str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower()
+            == "ana_den6_online"
+        )
+        exploration_active = bool(
+            online_mode
+            and self.training
+            and current_step >= exact_anchor_steps
+        )
+
+        # Amountはden6初期値の近傍だけをlog-normalで探索する。
+        amount_sigma = max(
+            float(getattr(self.args, "heuristic_guidance_online_amount_log_sigma", 0.08)),
+            0.0,
+        )
+        sampled_ratio_tensors = {}
+        amount_log_prob_terms = []
+        for operation in operations:
+            mean_ratio = ratio_tensors[operation]
+            if exploration_active and amount_sigma > 0.0:
+                epsilon = torch.randn_like(mean_ratio).detach()
+                sampled_log = mean_ratio.log() + amount_sigma * epsilon
+                sampled_ratio = sampled_log.exp().detach()
+                normal = torch.distributions.Normal(
+                    mean_ratio.log(),
+                    mean_ratio.new_tensor(amount_sigma),
+                )
+                amount_log_prob_terms.append(normal.log_prob(sampled_log.detach()))
+            else:
+                sampled_ratio = mean_ratio.detach()
+                amount_log_prob_terms.append(mean_ratio.new_zeros(()))
+            sampled_ratio_tensors[operation] = sampled_ratio
+
+        sampled_total_ratio = sum(sampled_ratio_tensors.values())
+        sampled_total_value = float(sampled_total_ratio.detach().cpu())
+        if sampled_total_value > max_total_ratio:
+            scale = max_total_ratio / max(sampled_total_value, 1e-12)
+            sampled_ratio_tensors = {
+                name: value * float(scale) for name, value in sampled_ratio_tensors.items()
+            }
+            sampled_total_ratio = sum(sampled_ratio_tensors.values())
+        sampled_total_value = max(float(sampled_total_ratio.detach().cpu()), 3.0 / float(point_count))
+        sampled_total_value = min(sampled_total_value, max_total_ratio)
+
+        shares_value = {
+            name: max(float(sampled_ratio_tensors[name].detach().cpu()), 0.0)
+            / max(sampled_total_value, 1e-12)
+            for name in operations
+        }
+        total_budget = max(3, int(math.ceil(float(point_count) * sampled_total_value)))
+        total_budget = min(total_budget, max(int(math.floor(point_count * max_total_ratio)), 3))
+        requested_counts = self._den6_allocate_counts(total_budget, shares_value)
+        for name in operations:
+            requested_counts[name] = min(max(int(requested_counts[name]), 1), len(pools[name]))
+
+        # Adjustはremove+addの2 cellを変えるため、変更Voxel cell比も1%未満に制限する。
+        max_changed_cells = max(int(math.floor(point_count * max_changed_ratio)), 3)
+        def changed_cells(counts):
+            return int(counts["Add"] + counts["Prune"] + 2 * counts["Adjust"])
+        while changed_cells(requested_counts) > max_changed_cells:
+            reducible = [name for name in operations if requested_counts[name] > 1]
+            if not reducible:
+                break
+            operation = max(
+                reducible,
+                key=lambda name: (
+                    2 if name == "Adjust" else 1,
+                    requested_counts[name],
+                ),
+            )
+            requested_counts[operation] -= 1
 
         network_scores = self._exact_den6_candidate_scores(
             guidance,
@@ -3267,88 +3371,96 @@ class StructureRepairActuator(nn.Module):
             add_pair_logits,
         )
         residual_weight = max(
-            float(getattr(self.args, "heuristic_guidance_network_residual_weight", 0.50)), 0.0
+            float(getattr(self.args, "heuristic_guidance_network_residual_weight", 0.50)),
+            0.0,
         )
-        residual_alpha = 1.0 - anchor_phase
+        temperature = max(float(
+            getattr(self.args, "heuristic_guidance_online_where_temperature", 0.75)
+        ), 0.05)
         ordered_indices = {}
-        combined_scores = {}
+        candidate_log_probs = {}
+        candidate_entropies = []
+        combined_logits = {}
         for operation in operations:
             mapping = guidance.get("candidate_tensor_map", {}).get(operation, {})
             rank_score = mapping.get("rank_score")
             if not torch.is_tensor(rank_score):
                 return None
-            combined = rank_score.float() + residual_alpha * residual_weight * network_scores[operation]
-            combined_detached = combined.detach()
-            combined_scores[operation] = combined_detached.cpu().tolist()
+            logits = rank_score.float() + residual_alpha * residual_weight * network_scores[operation]
+            combined_logits[operation] = logits
+            scaled_logits = logits / float(temperature)
+            log_probs = torch.log_softmax(scaled_logits, dim=0)
+            probs = torch.softmax(scaled_logits, dim=0)
+            candidate_log_probs[operation] = log_probs
+            candidate_entropies.append(-(probs * log_probs).sum())
+            if exploration_active:
+                uniform = torch.rand_like(scaled_logits).clamp_(1e-8, 1.0 - 1e-8)
+                gumbel = -torch.log(-torch.log(uniform))
+                order_score = (scaled_logits + gumbel).detach()
+            else:
+                order_score = scaled_logits.detach()
             try:
-                order_tensor = torch.argsort(combined_detached, descending=True, stable=True)
+                order_tensor = torch.argsort(order_score, descending=True, stable=True)
             except TypeError:
-                # 古いPyTorchではstable引数が無いため、candidate rankを微小tie-breakとして使う。
                 tie_break = torch.arange(
-                    combined_detached.numel(),
-                    device=combined_detached.device,
-                    dtype=combined_detached.dtype,
+                    order_score.numel(), device=order_score.device, dtype=order_score.dtype
                 )
-                order_tensor = torch.argsort(
-                    combined_detached - tie_break * 1e-12, descending=True
-                )
+                order_tensor = torch.argsort(order_score - tie_break * 1e-12, descending=True)
             ordered_indices[operation] = order_tensor.cpu().tolist()
 
+        # Action順序はStep 0ではden6 priority、以降はNetwork Amount/Action確率から1回sampleする。
         priority = tuple(exact.get("operation_priority") or operations)
-        orders = list(itertools.permutations(operations))
-        if priority in orders:
-            orders.remove(priority)
-            orders.insert(0, priority)
-        variants = max(int(exact.get("plan_variants", 6) or 6), len(orders))
+        if set(priority) != set(operations):
+            priority = operations
+        action_ratio_stack = torch.stack([ratio_tensors[name] for name in operations])
+        action_probs = action_ratio_stack / action_ratio_stack.sum().clamp_min(1e-12)
+        action_log_probs = torch.log(action_probs.clamp_min(1e-12))
+        if exploration_active:
+            uniform = torch.rand_like(action_log_probs).clamp_(1e-8, 1.0 - 1e-8)
+            gumbel = -torch.log(-torch.log(uniform))
+            action_order_idx = torch.argsort((action_log_probs + gumbel).detach(), descending=True)
+            operation_order = tuple(operations[int(index)] for index in action_order_idx.cpu().tolist())
+        else:
+            operation_order = priority
+
+        # 1Stepにつき、この1回の順序・1回の候補sampleから1planだけを構築する。
         occupied = {
             tuple(int(value) for value in row)
             for row in voxel_coords[0].transpose(0, 1).detach().cpu().tolist()
         }
-        best = None
-        for variant in range(variants):
-            operation_order = orders[variant % len(orders)]
-            pool_variant = variant // len(orders)
-            selected = []
-            removes = set()
-            adds = set()
-            counts = {name: 0 for name in operations}
-            score_sum = 0.0
-            for operation in operation_order:
-                permutation = self._den6_pool_permutation_indices(
-                    ordered_indices[operation], pool_variant + variant
-                )
-                for candidate_index in permutation:
-                    if counts[operation] >= requested_counts[operation]:
-                        break
-                    candidate = pools[operation][candidate_index]
-                    if not self._den6_candidate_compatible(candidate, occupied, removes, adds):
-                        continue
-                    candidate_removes, candidate_adds = self._den6_candidate_coord_sets(candidate)
-                    removes.update(candidate_removes)
-                    adds.update(candidate_adds)
-                    selected.append((operation, candidate_index, candidate))
-                    counts[operation] += 1
-                    score_sum += float(combined_scores[operation][candidate_index])
-            if any(counts[name] < requested_counts[name] for name in operations):
-                continue
-            normalized = score_sum / max(len(selected), 1)
-            if best is None or normalized > best[0]:
-                best = (normalized, selected, removes, adds, counts, operation_order, variant)
-        if best is None:
+        selected = []
+        removes = set()
+        adds = set()
+        selected_counts = {name: 0 for name in operations}
+        for operation in operation_order:
+            for candidate_index in ordered_indices[operation]:
+                if selected_counts[operation] >= requested_counts[operation]:
+                    break
+                candidate = pools[operation][candidate_index]
+                if not self._den6_candidate_compatible(candidate, occupied, removes, adds):
+                    continue
+                candidate_removes, candidate_adds = self._den6_candidate_coord_sets(candidate)
+                removes.update(candidate_removes)
+                adds.update(candidate_adds)
+                selected.append((operation, candidate_index, candidate))
+                selected_counts[operation] += 1
+
+        # 衝突で要求数に届かなくても別pattern探索は行わず、同じsample内の到達planを使う。
+        if any(selected_counts[name] <= 0 for name in operations):
             raise RuntimeError(
-                "ana_den6 exact candidate poolから要求Amountを満たすconflict-free planを構築できない"
+                "ana_den6 onlineの1sample planでAdd/Prune/Adjustのいずれかを1件も選べない: "
+                f"requested={requested_counts}, selected={selected_counts}"
             )
 
-        _, selected, removes, adds, selected_counts, operation_order, variant = best
         source_rows = voxel_coords[0].transpose(0, 1).contiguous().to(dtype=torch.long)
         remove_rows = (
             torch.as_tensor(sorted(removes), device=source_rows.device, dtype=torch.long)
             if removes else source_rows.new_empty((0, 3))
         )
         if remove_rows.numel() > 0:
-            combined = torch.cat([source_rows, remove_rows], dim=0)
-            mins = combined.amin(dim=0)
-            spans = (combined.amax(dim=0) - mins + 1).clamp_min(1)
+            combined_rows = torch.cat([source_rows, remove_rows], dim=0)
+            mins = combined_rows.amin(dim=0)
+            spans = (combined_rows.amax(dim=0) - mins + 1).clamp_min(1)
             def keys(rows):
                 shifted = rows - mins
                 return shifted[:, 0] * spans[1] * spans[2] + shifted[:, 1] * spans[2] + shifted[:, 2]
@@ -3366,33 +3478,69 @@ class StructureRepairActuator(nn.Module):
         final_rows = torch.unique(torch.cat([source_rows, add_rows], dim=0), dim=0, sorted=True)
         final_coords = final_rows.transpose(0, 1).contiguous().unsqueeze(0)
 
+        selected_where_log_probs = []
+        for operation, candidate_index, _ in selected:
+            selected_where_log_probs.append(candidate_log_probs[operation][candidate_index])
+        where_log_prob = (
+            torch.stack(selected_where_log_probs).mean()
+            if selected_where_log_probs
+            else action_ratio_stack.new_zeros(())
+        )
+        amount_log_prob = torch.stack(amount_log_prob_terms).mean()
+        count_tensor = action_ratio_stack.new_tensor(
+            [float(selected_counts[name]) for name in operations]
+        )
+        count_fraction = count_tensor / count_tensor.sum().clamp_min(1.0)
+        action_log_prob = (count_fraction.detach() * action_log_probs).sum()
+        policy_log_prob = where_log_prob + amount_log_prob + action_log_prob
+        policy_entropy = (
+            torch.stack(candidate_entropies).mean()
+            + (-(action_probs * action_log_probs).sum())
+        )
+
         selected_ids = [str(candidate.get("candidate_id", "")) for _, _, candidate in selected]
+        selected_total_ratio = sum(selected_counts.values()) / max(float(point_count), 1.0)
+        selected_changed_ratio = (
+            selected_counts["Add"] + selected_counts["Prune"] + 2 * selected_counts["Adjust"]
+        ) / max(float(point_count), 1.0)
         debug = {
             "selected_counts": selected_counts,
             "operation_order": ">".join(operation_order),
-            "variant_index": int(variant),
+            "variant_index": 0,
             "selected_candidate_ids": selected_ids,
             "residual_alpha": float(residual_alpha),
             "anchor_phase": float(anchor_phase),
             "requested_counts": requested_counts,
             "removed_voxel_count": len(removes),
             "added_voxel_count": len(adds),
+            "ratio_fallback_applied": selected_counts != requested_counts,
+            "selected_total_ratio": float(selected_total_ratio),
+            "selected_changed_voxel_ratio": float(selected_changed_ratio),
+            "one_pattern_only": True,
+            "exploration_active": bool(exploration_active),
+            "policy_log_prob": policy_log_prob,
+            "policy_entropy": policy_entropy,
+            "where_log_prob": where_log_prob,
+            "amount_log_prob": amount_log_prob,
+            "action_log_prob": action_log_prob,
         }
-        if anchor_phase >= 1.0 - 1e-12:
-            expected_hash = str(exact.get("final_voxel_hash", ""))
+
+        # Step 0はden6 Heuristicだけで作ったinitial planと一致することを検査する。
+        if current_step < exact_anchor_steps:
+            initial_plan = exact.get("initial_heuristic_plan", {})
+            expected_hash = ""
+            if isinstance(initial_plan, dict) and bool(initial_plan.get("available", False)):
+                expected_hash = str(initial_plan.get("final_voxel_hash", ""))
+            if not expected_hash:
+                expected_hash = str(exact.get("final_voxel_hash", ""))
             if expected_hash:
                 values = final_rows.detach().cpu().numpy()
-                if values.shape[0] > 1:
-                    order = values[:, 2].argsort(kind="stable")
-                    values = values[order]
-                    order = values[:, 1].argsort(kind="stable")
-                    values = values[order]
-                    order = values[:, 0].argsort(kind="stable")
-                    values = values[order]
-                actual_hash = hashlib.sha256(values.astype("int64", copy=False).tobytes(order="C")).hexdigest()
+                actual_hash = hashlib.sha256(
+                    values.astype("int64", copy=False).tobytes(order="C")
+                ).hexdigest()
                 if actual_hash != expected_hash:
                     raise RuntimeError(
-                        "Network residual=0のden6 planがmanifest final voxel hashと一致しない: "
+                        "Step 0のonline den6 Heuristic planがworker結果と一致しない: "
                         f"actual={actual_hash}, expected={expected_hash}"
                     )
         return final_coords, debug
@@ -3945,12 +4093,16 @@ class StructureRepairActuator(nn.Module):
         leaf_add_target_bias = leaf_target_direction_prior["add_target_bias"]
         leaf_move_target_bias = leaf_target_direction_prior["move_target_bias"]
 
-        # ana_den6_residualでは、proxy特徴ではなくden6の全順位付き候補poolを使う。
+        # ana_den6_residualでは、proxy特徴ではなくden6 anchor近傍の局所候補shortlistを使う。
         heuristic_guidance = self._heuristic_guidance_state(structure)
         exact_den6_candidate_mode = bool(
             isinstance(heuristic_guidance, dict)
             and str(heuristic_guidance.get("formula_basis", ""))
-            == "ana_den6_exact_ranked_editcandidate_pool_v2"
+            in {
+                "ana_den6_exact_ranked_editcandidate_pool_v2",
+                "ana_den6_exact_ranked_editcandidate_pool_online_v1",
+                "ana_den6_exact_one_pattern_anchor_online_v4",
+            }
         )
         exact_add_source_mask = self._fit_heuristic_candidate_mask(
             heuristic_guidance, "Add", preserve
@@ -9405,7 +9557,12 @@ class StructureRepairActuator(nn.Module):
             "actuator_target_mode": actuator_target_mode, 
             "voxel_edit_state_enabled": pts_xyz.new_tensor(float(voxel_edit_state_enabled)).detach(),
             "voxel_edit_mode": (
-                "ana_den6_exact_residual_plan"
+                (
+                    "ana_den6_online_one_pattern_plan"
+                    if str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower()
+                    == "ana_den6_online"
+                    else "ana_den6_exact_residual_plan"
+                )
                 if exact_residual_plan_applied
                 else "ana_den6_exact_anchor_with_network_soft_backward"
                 if exact_anchor_applied else voxel_edit_mode
@@ -10139,6 +10296,21 @@ class StructureRepairActuator(nn.Module):
             "ana_den6_exact_anchor_applied": bool(exact_anchor_applied),
             "ana_den6_exact_residual_plan_applied": bool(exact_residual_plan_applied),
             "ana_den6_exact_residual_plan_debug": exact_residual_plan_debug,
+            "den6_online_policy_log_prob": exact_residual_plan_debug.get(
+                "policy_log_prob", pts_xyz.new_zeros(())
+            ),
+            "den6_online_policy_entropy": exact_residual_plan_debug.get(
+                "policy_entropy", pts_xyz.new_zeros(())
+            ),
+            "den6_online_where_log_prob": exact_residual_plan_debug.get(
+                "where_log_prob", pts_xyz.new_zeros(())
+            ),
+            "den6_online_amount_log_prob": exact_residual_plan_debug.get(
+                "amount_log_prob", pts_xyz.new_zeros(())
+            ),
+            "den6_online_action_log_prob": exact_residual_plan_debug.get(
+                "action_log_prob", pts_xyz.new_zeros(())
+            ),
             "ana_den6_candidate_formula_basis": (
                 str(heuristic_guidance.get("formula_basis", ""))
                 if isinstance(heuristic_guidance, dict) else ""

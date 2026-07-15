@@ -15,6 +15,9 @@ from typing import Any, Dict, Mapping
 import torch
 
 
+_EXACT_GUIDANCE_CACHE: "OrderedDict[tuple[str, str, str, int], Dict[str, Any]]" = OrderedDict()
+
+
 @dataclass(frozen=True)
 class HeuristicProfile:
     dataset: str
@@ -176,17 +179,31 @@ def _exact_den6_guidance(
     exact: Mapping[str, Any],
 ) -> Dict[str, Any]:
     """den6 pool rankを現在のcanonical voxel行へ厳密に対応付ける。"""
-    if str(exact.get("source", "")) != "ana_den6_exact_ranked_candidate_pool_v2":
-        raise RuntimeError("ana_den6_residualのcandidate guidance sourceが不正である")
+    if str(exact.get("source", "")) not in {
+        "ana_den6_exact_ranked_candidate_pool_v2",
+        "ana_den6_exact_ranked_candidate_pool_online_v1",
+        "ana_den6_exact_compact_candidate_shortlist_online_v3",
+        "ana_den6_exact_one_pattern_anchor_online_v4",
+    }:
+        raise RuntimeError("ana_den6 exact candidate guidance sourceが不正である")
     coords = _normalize_coords_b3n(structure.get("global_voxel_coords"), like)
     if coords is None:
         raise RuntimeError(
-            "ana_den6_residualにはOctreeStructureAnalysisと同じglobal_voxel_coordsが必要である"
+            "ana_den6 exact guidanceにはActuatorと同じglobal_voxel_coordsが必要である"
         )
 
-    pools = exact.get("ranked_candidate_pools")
+    # den6 Heuristicはframe固定であり学習graphを持たない。
+    # 同一frame・同一deviceでは座標辞書作成と候補写像を再実行せず、そのまま再利用する。
+    cache_signature = str(exact.get("cache_signature", exact.get("input_voxel_hash", "")))
+    cache_key = (cache_signature, str(like.device), str(like.dtype), int(coords.shape[-1]))
+    cached_guidance = _EXACT_GUIDANCE_CACHE.get(cache_key)
+    if isinstance(cached_guidance, dict):
+        _EXACT_GUIDANCE_CACHE.move_to_end(cache_key)
+        return cached_guidance
+
+    pools = exact.get("operation_candidate_shortlists")
     if not isinstance(pools, Mapping):
-        raise RuntimeError("ana_den6_residualにranked_candidate_poolsが無い")
+        raise RuntimeError("ana_den6 exact guidanceに局所候補shortlistが無い")
     B, _, N = coords.shape
     where_prior = {name: like.new_zeros((B, 1, N)) for name in ("Add", "Prune", "Adjust")}
     candidate_mask = {name: torch.zeros((B, 1, N), device=like.device, dtype=torch.bool) for name in where_prior}
@@ -220,7 +237,7 @@ def _exact_den6_guidance(
         for operation in ("Add", "Prune", "Adjust"):
             pool = pools.get(operation)
             if not isinstance(pool, list):
-                raise RuntimeError(f"ana_den6_residualの{operation} poolが不正である")
+                raise RuntimeError(f"ana_den6 exact guidanceの{operation} poolが不正である")
             pool_size = len(pool)
             for fallback_rank, candidate in enumerate(pool):
                 if not isinstance(candidate, Mapping):
@@ -326,7 +343,7 @@ def _exact_den6_guidance(
     shares = {name: max(float(shares_raw.get(name, 0.0)), 0.0) for name in where_prior}
     share_sum = sum(shares.values())
     if share_sum <= 0.0:
-        raise RuntimeError("ana_den6_residualのoperation share合計が0である")
+        raise RuntimeError("ana_den6 exact guidanceのoperation share合計が0である")
     shares = {name: value / share_sum for name, value in shares.items()}
     total_ratio = max(float(exact.get("total_ratio", 0.0)), 0.0)
     amount_prior = {name: total_ratio * shares[name] for name in shares}
@@ -335,7 +352,7 @@ def _exact_den6_guidance(
         name: float(0.50 + 0.50 * shares[name] / max(max_share, 1e-9))
         for name in shares
     }
-    return {
+    guidance = {
         "enabled": True,
         "profile_source": str(exact.get("source", "")),
         "dataset": _dataset_key(exact.get("dataset", getattr(args, "dataname", "8i"))),
@@ -356,12 +373,22 @@ def _exact_den6_guidance(
             for name, values in candidate_tensor_map.items()
         },
         "where_prior_mean": {},
-        "formula_basis": "ana_den6_exact_ranked_editcandidate_pool_v2",
+        "formula_basis": (
+            "ana_den6_exact_one_pattern_anchor_online_v4"
+            if str(exact.get("source", "")) == "ana_den6_exact_one_pattern_anchor_online_v4"
+            else "ana_den6_exact_ranked_editcandidate_pool_online_v1"
+            if str(exact.get("source", "")) == "ana_den6_exact_ranked_candidate_pool_online_v1"
+            else "ana_den6_exact_ranked_editcandidate_pool_v2"
+        ),
         "exact_candidate_guidance": exact,
         "exact_candidate_mapped_count": mapped,
         "exact_candidate_unmapped_count": unmapped,
     }
-
+    _EXACT_GUIDANCE_CACHE[cache_key] = guidance
+    _EXACT_GUIDANCE_CACHE.move_to_end(cache_key)
+    while len(_EXACT_GUIDANCE_CACHE) > 8:
+        _EXACT_GUIDANCE_CACHE.popitem(last=False)
+    return guidance
 
 
 def _leaf_gain(structure: Mapping[str, Any], operation: str, like: torch.Tensor) -> torch.Tensor:
@@ -466,13 +493,15 @@ def build_heuristic_guidance(structure: Mapping[str, Any], args: Any) -> Dict[st
 
     mode = str(getattr(args, "heuristic_guidance_mode", "proxy_prior")).strip().lower()
     exact = structure.get("ana_den6_ranked_candidate_guidance") if isinstance(structure, Mapping) else None
-    if mode == "ana_den6_residual":
+    if mode in {"ana_den6_online", "ana_den6_residual"}:
         if not isinstance(exact, Mapping):
             raise RuntimeError(
-                "ana_den6_residualでexact candidate guidanceがOctree構造へ伝播していない。"
+                "ana_den6 online/residualでexact candidate guidanceがNetworkへ伝播していない。"
                 "proxy_priorへ代替してはならない"
             )
-        manifest_key = str(exact.get("manifest_sha256", exact.get("manifest_path", "")))
+        manifest_key = str(
+            exact.get("cache_signature", exact.get("manifest_sha256", exact.get("manifest_path", "")))
+        )
         subtree_key = str(getattr(args, "_current_subtree_id", ""))
         cache_key = (
             manifest_key,

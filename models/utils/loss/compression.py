@@ -12,6 +12,27 @@ from models.utils.compression.octree_stats import hard_octree_occupancy_stats
 
 
 class CompressionLossMixin:
+    def _guard_den6_online_edited_actual_encode(self, args):
+        """ana_den6 onlineで同一Stepの編集後actual encodeを1回へ制限する。"""
+        online_mode = (
+            str(getattr(args, "heuristic_guidance_mode", "")).strip().lower()
+            == "ana_den6_online"
+        )
+        if not bool(online_mode and getattr(self, "training", False)):
+            return False
+        global_step = int(getattr(args, "_global_train_step", 0))
+        guard = getattr(self, "_den6_online_actual_step_guard", None)
+        if not isinstance(guard, dict) or int(guard.get("step", -1)) != global_step:
+            guard = {"step": global_step, "edited_encode_count": 0}
+        if int(guard.get("edited_encode_count", 0)) >= 1:
+            raise RuntimeError(
+                "ana_den6_onlineで同一Stepに編集後actual encodeが複数回要求された: "
+                f"step={global_step}"
+            )
+        guard["edited_encode_count"] = int(guard.get("edited_encode_count", 0)) + 1
+        self._den6_online_actual_step_guard = guard
+        return True
+
     def _store_compression_terms(self, **terms):
         self.last_compression_terms = dict(terms)
 
@@ -913,6 +934,15 @@ class CompressionLossMixin:
         return result
 
     def _encode_actual_many(self, args, xyz_list):
+        if (
+            str(getattr(args, "heuristic_guidance_mode", "")).strip().lower()
+            == "ana_den6_online"
+            and bool(getattr(self, "training", False))
+        ):
+            raise RuntimeError(
+                "ana_den6_onlineでは複数候補actual encodeを禁止する。"
+                "1Step 1planの編集後encodeだけを使用すること"
+            )
         encoder = self._get_actual_encoder(args)
         candidate_payload = []
         point_tensors = []
@@ -1417,6 +1447,10 @@ class CompressionLossMixin:
         if actual_gen_cache_hit:
             stats_gen = dict(cached_oracle_stats)
         else:
+            # ana_den6 onlineは1Stepにつき編集後actual encodeを厳密に1回だけ許可する。
+            # baselineはframe単位cacheであり、この回数には含めない。
+            self._guard_den6_online_edited_actual_encode(args)
+
             # actual codec評価は評価指標なので、train用の量子化ノイズを入れないclean編集点群を使う。
             stats_gen = self._encode_actual_batch(args, actual_xyz, final_w=actual_final_w)
         codec_name = str(stats_gen.get("codec", cached_gt.get("codec", "octattention"))).strip().lower()
