@@ -36,6 +36,10 @@ from models.utils.pointcloud.sparsepcgc_voxel import (
     restore_points_from_voxel_coords,
 )
 from models.utils.pointcloud.quant_noise import add_uniform_quantization_noise, resolve_uniform_noise_delta
+from models.utils.pointcloud.ana_den6_online import (
+    prefetch_ana_den6_online_guidance,
+    shutdown_ana_den6_online_prefetch,
+)
 from models.utils.pointcloud.voxel_collision import (
     compute_voxel_collision_stats_batch,
     flatten_voxel_collision_stats,
@@ -6733,6 +6737,11 @@ def _attach_sparsepcgc_actual_oracle_drop(
     cache_key,
     global_step,
 ):
+    if str(getattr(args, "heuristic_guidance_mode", "")).strip().lower() == "ana_den6_online":
+        raise RuntimeError(
+            "ana_den6_online主経路にlegacy actual oracleは入れない。"
+            "1 Stepにつきnetworkが決めた1 planだけをactual encodeすること。"
+        )
     debug = {
         "enabled": False,
         "used": False,
@@ -10723,6 +10732,57 @@ def _phase7_named_grad_norms(model):
 
     return out
 
+
+def _den6_online_grad_audit_enabled(args, global_step):
+    if not bool(getattr(args, "heuristic_guidance_online_grad_audit", False)):
+        return False
+    interval = int(getattr(args, "heuristic_guidance_online_grad_audit_interval", 1))
+    return interval > 0 and int(global_step) % interval == 0
+
+
+def _den6_online_grad_norms(model):
+    """Return the three learned decision gradients with one device sync.
+
+    This deliberately inspects only the heads used for online Where, Amount,
+    and Action decisions.  Unlike the legacy GradFlow debug path it does not
+    walk every child module or construct per-parameter text statistics.
+    """
+    base_model = _unwrap_train_model(model)
+    actuator = getattr(base_model, "actuator", None)
+    groups = {
+        "den6_online_where_grad_norm": (
+            getattr(actuator, "drop_head", None),
+            getattr(actuator, "add_head", None),
+            getattr(actuator, "add_voxel_head", None),
+            getattr(actuator, "move_voxel_head", None),
+        ),
+        "den6_online_amount_grad_norm": (
+            getattr(actuator, "drop_amount_head", None),
+            getattr(actuator, "add_amount_head", None),
+            getattr(actuator, "move_amount_head", None),
+        ),
+        "den6_online_action_grad_norm": (
+            getattr(actuator, "operation_gate_head", None),
+            getattr(base_model, "policy_module", None),
+        ),
+    }
+    norm_squares = []
+    for modules in groups.values():
+        terms = []
+        for module in modules:
+            if module is None:
+                continue
+            for parameter in module.parameters():
+                if parameter.grad is not None:
+                    grad = torch.nan_to_num(parameter.grad.detach().float())
+                    terms.append(torch.sum(grad * grad))
+        if terms:
+            norm_squares.append(torch.stack(terms).sum())
+        else:
+            norm_squares.append(torch.zeros((), device=next(base_model.parameters()).device))
+    values = torch.sqrt(torch.stack(norm_squares)).detach().cpu().tolist()
+    return {name: float(value) for name, value in zip(groups.keys(), values)}
+
 def _format_nonfinite_grad_summary(summary):
     if not summary or not summary.get("has_nonfinite", False):
         return "none"
@@ -10833,9 +10893,19 @@ def _balance_actual_operation_head_gradients(args, model, structure_debug=None):
     #   drop_head        -> grad norm 約200
     #   drop_amount_head -> grad norm 約200
     # ============================================================
-    prune_target = max(
-        float(getattr(args, "grad_scale_operation_amount", default_target)),
-        0.0,
+    online_one_plan = (
+        str(getattr(args, "heuristic_guidance_mode", "")).strip().lower()
+        == "ana_den6_online"
+    )
+    # The legacy path used a 200x Prune-only target.  In the online hybrid
+    # path that makes the learned Amount/Where policy dominate Add/Adjust and
+    # defeats the single-plan policy-gradient update.  Keep all decision heads
+    # on the same configured target; this changes gradients only after
+    # backward and never changes the den6 prior or the hard plan itself.
+    prune_target = (
+        default_target
+        if online_one_plan
+        else max(float(getattr(args, "grad_scale_operation_amount", default_target)), 0.0)
     )
 
     if default_target <= 0.0 and prune_target <= 0.0:
@@ -10879,6 +10949,11 @@ def _balance_actual_operation_head_gradients(args, model, structure_debug=None):
     force_prune_balance = bool(getattr(args, "minimal_loss_objective", False))
     if force_prune_balance:
         teacher_active["prune"] = True
+    if online_one_plan:
+        # den6 online has no multi-plan oracle labels.  All three operation
+        # heads are trained from the selected plan's policy gradient, so none
+        # may be excluded merely because an oracle-specific counter is zero.
+        teacher_active = {"prune": True, "add": True, "move": True}
 
     base_model = model.module if hasattr(model, "module") else model
     actuator = getattr(base_model, "actuator", None)
@@ -10965,6 +11040,54 @@ def _balance_actual_operation_head_gradients(args, model, structure_debug=None):
         debug[f"{label}_grad_balance_scale"] = float(scale)
         debug[f"{label}_grad_norm_after_balance"] = float(norm_before * scale)
         debug[f"{label}_grad_balance_status"] = "scaled"
+
+    if online_one_plan and default_target > 0.0:
+        # The per-head pass above keeps legacy head groups healthy.  The
+        # online policy, however, learns three *decisions* (Where, Amount,
+        # Action).  Normalize their combined norms once more so one decision
+        # cannot dominate solely because it owns more small MLP heads.
+        decision_groups = {
+            "where": [
+                getattr(actuator, "drop_head", None),
+                getattr(actuator, "add_head", None),
+                getattr(actuator, "add_voxel_head", None),
+                getattr(actuator, "move_voxel_head", None),
+            ],
+            "amount": [
+                getattr(actuator, "drop_amount_head", None),
+                getattr(actuator, "add_amount_head", None),
+                getattr(actuator, "move_amount_head", None),
+            ],
+            "action": [
+                getattr(actuator, "operation_gate_head", None),
+                getattr(base_model, "policy_module", None),
+            ],
+        }
+        for decision, modules in decision_groups.items():
+            params = [
+                param
+                for module in modules
+                if module is not None
+                for param in module.parameters()
+                if param.grad is not None
+            ]
+            if not params:
+                debug[f"den6_online_{decision}_grad_balance_status"] = "no_grad"
+                continue
+            norm_sq = sum(
+                torch.sum(torch.nan_to_num(param.grad.detach().float()) ** 2)
+                for param in params
+            )
+            norm_before = float(torch.sqrt(norm_sq).detach().cpu())
+            if not math.isfinite(norm_before) or norm_before <= 1e-12:
+                debug[f"den6_online_{decision}_grad_balance_status"] = "zero_or_nonfinite"
+                continue
+            scale = min(max(default_target / norm_before, min_scale), max_scale)
+            for param in params:
+                param.grad.mul_(float(scale))
+            debug[f"den6_online_{decision}_grad_norm_before_balance"] = norm_before
+            debug[f"den6_online_{decision}_grad_norm_after_balance"] = norm_before * scale
+            debug[f"den6_online_{decision}_grad_balance_status"] = "scaled"
 
     return debug
 
@@ -11778,6 +11901,7 @@ def run_episode_full_cloud_validation(
             "_log_this_step",
             "_collect_structure_debug",
             "_collect_sparsepcgc_debug",
+            "_den6_online_training_step_active",
         )
     }
     model.eval()
@@ -11806,6 +11930,7 @@ def run_episode_full_cloud_validation(
                 args._log_this_step = False
                 args._collect_structure_debug = False
                 args._collect_sparsepcgc_debug = False
+                args._den6_online_training_step_active = False
                 try:
                     input_pcd = prepare_subtree_input_pcd(pts, use_cuda)
                     input_xyz = input_pcd[:, :3, :]
@@ -12092,6 +12217,18 @@ def train(model, args, loss, writer, plot, notifier=None):
         writer.write(f"8i kept sequence dirs: {kept_names}")
     seq_datasets = [(seq_dir, PlyDirDataset(args, seq_dir)) for seq_dir in seq_dirs] # 各シーケンス内のPLY点群ファイルを読み込むデータセットを作る
     total_train_files = sum(len(dataset) for _, dataset in seq_datasets) # 全シーケンスに含まれる点群ファイル数を合計し、総Step数の見積もりなどに使用
+    den6_prefetch_lookahead = max(
+        int(getattr(args, "heuristic_guidance_online_prefetch_lookahead", 0)), 0
+    )
+    if seq_datasets and den6_prefetch_lookahead > 0:
+        first_files = list(getattr(seq_datasets[0][1], "files", ()))[:den6_prefetch_lookahead]
+        prefetch_state = prefetch_ana_den6_online_guidance(args, first_files)
+        if int(prefetch_state.get("submitted", 0)) > 0:
+            writer.write(
+                "Den6OnlinePrefetch: "
+                f"workers={int(getattr(args, 'heuristic_guidance_online_prefetch_workers', 0))}, "
+                f"lookahead={den6_prefetch_lookahead}, submitted={int(prefetch_state['submitted'])}"
+            )
     args._total_train_steps_estimate = max(int(getattr(args, "episodes", 1)), 1) * max(int(total_train_files), 1) # Episode数と点群ファイル数からそう学修Step数を概算
     if _episode_input_common_cache_enabled(args):
         setattr(args, "_episode_input_common_cache", OrderedDict())
@@ -12251,12 +12388,21 @@ def train(model, args, loss, writer, plot, notifier=None):
             active_dataset = apply_epoch_file_window(dataset, args, global_epoch) # Epochごとにmax_files件の窓を順番に進め、同じ先頭30件の反復を避ける
             loader = torch.utils.data.DataLoader(active_dataset, **loader_kwargs) # 現在Epochの窓Datasetから点群ファイルを順に読み出す
             num_steps = len(active_dataset)
+            active_files = list(getattr(active_dataset, "files", ()))
+            if den6_prefetch_lookahead > 0:
+                prefetch_ana_den6_online_guidance(args, active_files[:den6_prefetch_lookahead])
             epoch_has_optimizer_step = False
             epoch_metric_sums = None
 
             for step, pts in enumerate(loader): # Step開始
                 """基本情報のセットアップ"""
                 st_step = time.time()
+                if den6_prefetch_lookahead > 0:
+                    next_prefetch_index = step + den6_prefetch_lookahead
+                    if next_prefetch_index < len(active_files):
+                        prefetch_ana_den6_online_guidance(
+                            args, (active_files[next_prefetch_index],)
+                        )
                 optimizer.zero_grad(set_to_none=True) # 前Stepの勾配を必ず消し、条件分岐による勾配蓄積を防ぐ
                 file_path = active_dataset.files[step]
                 # den6 v2 manifestは入力PLYのSHA256とcodec設定で厳密照合する。
@@ -12294,9 +12440,16 @@ def train(model, args, loss, writer, plot, notifier=None):
                         and profile_this_step
                     )
                 )
+                # Network/Actuator側も同じprofile Stepだけ詳細計測する。
+                # debug_timingを常時Trueにせず、通常Stepへ同期コストを持ち込まない。
+                args._profile_runtime_this_step = bool(timing_enabled)
 
                 """ログ用の変数セット"""
                 args._global_train_step = int(global_train_step) # 現在の累積Step番号を保存
+                # Loss is a mixin object rather than nn.Module.  Mark this
+                # exact train step explicitly so ana_den6_online can enforce
+                # one fresh edited actual encode and report its counters.
+                args._den6_online_training_step_active = bool(den6_online_full_cloud)
                 args._current_sample_name = os.path.basename(str(file_path)) # teacher/debugログに点群ファイル名を残す
                 args._current_teacher_scope = "full_cloud" # このStepのteacherが全点群か局所subtreeかをLoss側へ伝える初期値
                 args._sparsepcgc_full_cloud_actual_primary_active = False
@@ -16170,6 +16323,11 @@ def train(model, args, loss, writer, plot, notifier=None):
                 last_nonfinite_grad_summary = None
                 if total_loss_finite: # 総損失がInfでないとき、更新前パラメータを記録
                     param_update_snapshots = capture_param_update_snapshots( args, model, step + 1, num_steps)
+                # cuDNN backward用workspaceが、連続full-cloud Stepで断片化した
+                # allocator cacheに阻まれないよう未使用blockだけを返却する。
+                # 生きているFP32 Tensorとautograd graphには触れない。
+                if den6_online_full_cloud and use_cuda and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 if skip_optimizer_reason is not None: # Optimizer更新を止める必要があるか否かの判定
                     writer.write(
                         f"Skip Optimizing!!! reason={skip_optimizer_reason}; "
@@ -16209,6 +16367,8 @@ def train(model, args, loss, writer, plot, notifier=None):
                         structure_debug,
                     )
                     comp_debug.update(operation_grad_balance_debug)
+                    if den6_online_full_cloud and _den6_online_grad_audit_enabled(args, global_train_step):
+                        comp_debug.update(_den6_online_grad_norms(model))
                     # Phase7-4:
                     # unscale後の実gradを対象にsanity checkする。
                     _phase7_log_grad_sanity(
@@ -16252,7 +16412,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                             f"gap={float(comp_debug.get('phase7_full_vs_subtree_gap', 0.0) or 0.0):.6g}"
                         )
 
-                    if bool(getattr(args, "debug_grad_flow", False)) or compact_step_text_log:
+                    if bool(getattr(args, "debug_grad_flow", False)):
                         log_grad_flow(args, writer, model, step + 1, num_steps, global_step=global_train_step) # 各層・各モジュールに勾配が届いているか否かの判定ログ
                     nonfinite_grad_summary = _summarize_nonfinite_grads(
                         model,
@@ -16347,6 +16507,8 @@ def train(model, args, loss, writer, plot, notifier=None):
                         structure_debug,
                     )
                     comp_debug.update(operation_grad_balance_debug)
+                    if den6_online_full_cloud and _den6_online_grad_audit_enabled(args, global_train_step):
+                        comp_debug.update(_den6_online_grad_norms(model))
                     # Phase7-4:
                     # backward直後の実gradを対象にsanity checkする。
                     _phase7_log_grad_sanity(
@@ -16371,7 +16533,8 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 f"cost_attr={phase7_grad_debug.get('cost_attr_grad_norm', 0.0):.6g}, "
                                 f"cause_agg={phase7_grad_debug.get('cause_agg_grad_norm', 0.0):.6g}"
                             )
-                    log_grad_flow(args, writer, model, step + 1, num_steps, global_step=global_train_step) # 各モジュールの勾配状態をログに出す
+                    if bool(getattr(args, "debug_grad_flow", False)):
+                        log_grad_flow(args, writer, model, step + 1, num_steps, global_step=global_train_step) # 各モジュールの勾配状態をログに出す
                     nonfinite_grad_summary = _summarize_nonfinite_grads(
                         model,
                         limit=int(getattr(args, "nonfinite_grad_log_param_limit", 8)),
@@ -16725,12 +16888,82 @@ def train(model, args, loss, writer, plot, notifier=None):
                 if train_edit_stats is None:
                     train_edit_stats = summarize_point_edits( input_xyz=input_xyz[:, :3, :], gen_pts=gen_pts, final_w=final_w, args=args) # 点操作情報を計算
                 plot_edit_stats = dict(train_edit_stats or {})
-                plot_edit_stats["oracle_full_cloud_prune_ratio_percent"] = operation_metric_row.get(
-                    "oracle_full_cloud_prune_ratio_percent",
-                    0.0,
-                )
+                if den6_online_full_cloud:
+                    # online主経路のpoint-edit CSV/図は3操作だけに固定する。
+                    plot_edit_stats = {
+                        key: value
+                        for key, value in plot_edit_stats.items()
+                        if key in {"added_ratio_percent", "deleted_ratio_percent", "adjusted_ratio_percent"}
+                    }
+                else:
+                    plot_edit_stats["oracle_full_cloud_prune_ratio_percent"] = operation_metric_row.get(
+                        "oracle_full_cloud_prune_ratio_percent",
+                        0.0,
+                    )
                 plot.record_point_edits("step", global_train_step + 1, plot_edit_stats) # 点操作統計をCSVに記録
+                plot.record_occupancy_metrics("step", global_train_step + 1, compression_metric_row) # 図用の占有統計を保持する（詳細テキストログとは独立）
+                plot.record_voxel_collision_metrics("step", global_train_step + 1, compression_metric_row) # 図用のVoxel衝突統計を保持する
                 plot_step_info = plot.record_metrics("step", global_train_step + 1, step_metric_values) # Step単位の損失値をCSVに保存
+                if den6_online_full_cloud:
+                    base_model_for_audit = model.module if hasattr(model, "module") else model
+                    audit_voxel_state = getattr(base_model_for_audit, "last_actuator_voxel_state", {})
+                    audit_plan = (
+                        audit_voxel_state.get("ana_den6_exact_residual_plan_debug", {})
+                        if isinstance(audit_voxel_state, dict) else {}
+                    )
+                    audit_compression = dict(getattr(loss, "last_compression_debug", {}) or {})
+                    actual_audit = getattr(loss, "_den6_online_actual_audit", {})
+                    if not isinstance(actual_audit, dict):
+                        actual_audit = {}
+                    cache_stats = getattr(args, "_ana_den6_online_cache_stats", {})
+                    static_node_cache = {}
+                    static_cache_stats_fn = getattr(base_model_for_audit, "input_cache_stats", None)
+                    if callable(static_cache_stats_fn):
+                        static_node_cache = static_cache_stats_fn()
+                    audit_runtime = dict(
+                        getattr(base_model_for_audit, "last_runtime_timing", {}) or {}
+                    )
+                    audit_phase_timing = {}
+                    if timing_enabled:
+                        audit_phase_timing = {
+                            "data": float(timing_data_end - timing_data_start),
+                            "model": float(timing_model_end - timing_model_start),
+                            "loss": float(timing_loss_end - timing_loss_start),
+                            "backward_opt": float(timing_step_end - timing_loss_end),
+                        }
+                    writer.write(
+                        "Den6OnlineAudit: "
+                        f"cache={dict(cache_stats) if isinstance(cache_stats, dict) else {}}, "
+                        f"prior_plan_hash={str(audit_plan.get('plan_hash', ''))}, "
+                        f"final_voxel_hash={str(audit_plan.get('final_voxel_hash', ''))}, "
+                        f"expected_final_voxel_hash={str(audit_plan.get('expected_final_voxel_hash', ''))}, "
+                        f"selected_counts={dict(audit_plan.get('selected_counts') or {})}, "
+                        f"operation_order={str(audit_plan.get('operation_order', ''))}, "
+                        f"residual_alpha={float(audit_plan.get('residual_alpha', 0.0)):.6f}, "
+                        f"actual_encodes=(baseline={int(actual_audit.get('baseline', audit_compression.get('den6_online_baseline_actual_encode_count', 0)))}, "
+                        f"edited={int(actual_audit.get('edited', audit_compression.get('den6_online_edited_actual_encode_count', 0)))}, "
+                        f"candidate={int(actual_audit.get('candidate', audit_compression.get('den6_online_candidate_actual_encode_count', 0)))}, "
+                        f"worker_requests={int(actual_audit.get('worker_request_count', 0))}, "
+                        f"edited_cache_hit={bool(actual_audit.get('edited_result_cache_hit', False))})"
+                        f", codec_bits=(baseline={float(audit_compression.get('gt_actual_bit', 0.0)):.1f}, "
+                        f"edited={float(audit_compression.get('gen_actual_bit', 0.0)):.1f})"
+                        f", static_node_cache=(entries={int(static_node_cache.get('entries', 0) or 0)}, "
+                        f"bytes={int(static_node_cache.get('bytes', 0) or 0)}, "
+                        f"working_set_bypassed={int(static_node_cache.get('working_set_bypassed', 0) or 0)})"
+                        f", cuda_cache_released_before_actual="
+                        f"{int(getattr(args, '_den6_online_cuda_cache_released_bytes', 0) or 0) / (1024 ** 2):.1f}MiB"
+                        f", grad_norms=(where={float(audit_compression.get('den6_online_where_grad_norm', 0.0) or 0.0):.6g}, "
+                        f"amount={float(audit_compression.get('den6_online_amount_grad_norm', 0.0) or 0.0):.6g}, "
+                        f"action={float(audit_compression.get('den6_online_action_grad_norm', 0.0) or 0.0):.6g})"
+                        f", timing=(step_before_audit={float(time.time() - st_step):.3f}s, "
+                        f"actual_total={float(audit_compression.get('actual_encode_time_total', 0.0) or 0.0):.3f}s, "
+                        f"actual_gt={float(audit_compression.get('gt_actual_encode_time', 0.0) or 0.0):.3f}s, "
+                        f"actual_edited={float(audit_compression.get('gen_actual_encode_time', 0.0) or 0.0):.3f}s, "
+                        f"actual_worker={float(audit_compression.get('actual_worker_roundtrip_time', 0.0) or 0.0):.3f}s, "
+                        f"actual_transfer={float(audit_compression.get('actual_input_prepare_time', 0.0) or 0.0):.3f}s, "
+                        f"actual_ply={float(audit_compression.get('actual_ply_write_time', 0.0) or 0.0):.3f}s), "
+                        f"phase={audit_phase_timing}, network={audit_runtime}"
+                    )
                 if timing_enabled:
                     sync_for_timing(use_cuda)
                     en_step = time.time()
@@ -16749,6 +16982,116 @@ def train(model, args, loss, writer, plot, notifier=None):
                 point_count_mean = ( sum(subtree_point_counts) / float(len(subtree_point_counts)) if subtree_point_counts else None)
                 subtree_meta_for_better = { "enabled": bool(subtree_mode), "depth": subtree_depth_meta.get("depth"), "base_depth": subtree_depth_meta.get("base_depth"), "min_depth": subtree_depth_meta.get("min_depth"), "max_depth": subtree_depth_meta.get("max_depth"), "uncapped_min_depth": subtree_depth_meta.get("uncapped_min_depth"), "uncapped_max_depth": subtree_depth_meta.get("uncapped_max_depth"), "data_max_depth": subtree_depth_meta.get("data_max_depth"), "curriculum_phase": subtree_depth_meta.get("curriculum_phase"), "percent_mode": subtree_depth_meta.get("depth_percent_curriculum"), "percent_range": subtree_depth_meta.get("depth_percent_range"), "point_count_min": point_count_min, "point_count_mean": point_count_mean, "point_count_max": point_count_max, "selected_subtree_count": selected_subtree_count, "eligible_subtree_count": eligible_subtree_count, "actual_eligible_subtree_count": actual_eligible_subtree_count, "total_subtree_count": total_subtree_count, "min_subtree_points": min_subtree_points, "is_anchor_step": bool(is_anchor_step), "anchor_reason": anchor_reason, "loss_scope": subtree_loss_scope, "subset_step": bool(subset_step), "subset_enabled": bool(subset_enabled)}
                 log_for_better_step( for_better_path, args=args, model=model, loss_obj=loss, optimizer=optimizer, global_step=global_train_step, episode=episode, epoch=epoch, step=step, stage=current_stage, stage_factors=stage_factors, compression_row=compression_metric_row, operation_row=operation_metric_row, comp_debug=comp_debug, structure_debug=structure_debug, edit_stats=train_edit_stats, subtree_meta=subtree_meta_for_better, loss_values={ "L": L, "L_geom": L_geom, "L_com": L_com, "L_com_objective": L_com_objective, "L_attr": L_attr, "L_policy": L_policy, "L_actuator": L_actuator, "loss_bit": loss_bit, "loss_single": loss_single, "loss_nodes": loss_nodes}, step_completed=step_completed, total_loss_finite=total_loss_finite, amp_info=amp_info, timing={"step_seconds": en_step - st_step})
+                # このStepのbackward・計測・記録がすべて終わった後だけ参照を切る。
+                # 計算内容は変えず、前Stepのfull-cloud Tensorと次Stepのforwardが
+                # 同時にGPU上へ存在することを防ぐ。
+                if den6_online_full_cloud:
+                    base_model_for_release = _unwrap_train_model(model)
+                    release_step_state = getattr(base_model_for_release, "release_step_transient_state", None)
+                    if callable(release_step_state):
+                        release_step_state()
+                    gen_pts = None
+                    gen_xyz = None
+                    compression_gen_xyz = None
+                    final_w = None
+                    out_label = None
+                    structure_debug = None
+                    comp_debug = None
+                    L = None
+                    L_geom = None
+                    L_com = None
+                    L_com_objective = None
+                    L_attr = None
+                    L_policy = None
+                    L_actuator = None
+                    Lp_out = None
+                    La_fit = None
+                    La_rep = None
+                    loss_bit = None
+                    loss_single = None
+                    loss_nodes = None
+                    final_w_for_loss = None
+                    gen_xyz_for_actual = None
+                    voxel_restored_actual_debug = None
+                    # full-cloud canonical/context Tensorは次Stepで再生成する。
+                    # 旧contextを保持したまま次frameを構築すると、点数が異なる
+                    # frameごとに数GiBの一時重複が発生する。
+                    input_xyz = None
+                    input_pcd = None
+                    input_attr_full = None
+                    compression_gt_pts = None
+                    voxel_collision_input_gt = None
+                    full_cloud_canonical_context = None
+                    full_octree_context = None
+                    full_octree_contexts = {}
+                    subtree_trees = {}
+                    group_meta = {}
+                    # scalar Tensorでもgrad_fnからfull graphを参照するため、
+                    # backward・全ログ完了後に内訳の別名もまとめて切る。
+                    terms = {}
+                    compression_debug_terms = {}
+                    compression_grad_terms = {}
+                    compression_tensor_debug = {}
+                    phase3_terms = {}
+                    cp_debug = {}
+                    actuator_terms = {}
+                    actuator_soft_terms = {}
+                    model_soft_terms = {}
+                    args_soft_terms = {}
+                    full_cloud_amount_terms = None
+                    param_update_snapshots = None
+                    compression_metric_row = None
+                    operation_metric_row = None
+                    train_edit_stats = None
+                    # train() is one large Python function, so loop-local
+                    # autograd scalars otherwise survive into the next step.
+                    # Even a scalar grad_fn retains the complete full-cloud
+                    # forward graph (several GiB).  Backward, optimizer update,
+                    # metrics and logging are complete here, so only references
+                    # are released; no arithmetic or gradient is changed.
+                    value = None
+                    term = None
+                    legacy_L_downstream = None
+                    legacy_L_total = None
+                    L_downstream = None
+                    L_discrete_policy = None
+                    fallback_proxy = None
+                    fallback_anchor = None
+                    prune_where_proxy_for_grad = None
+                    prune_bit_term = None
+                    prune_node_term = None
+                    prune_single_term = None
+                    prune_rate_term = None
+                    prune_geom_term = None
+                    amount_proxy = None
+                    amount_value = None
+                    amount_ratio = None
+                    amount_anchor_loss = None
+                    prune_amount_grad_delta = None
+                    tail_attr_block = None
+                    tail_policy_block = None
+                    tail_actuator_block = None
+                    tail_support_raw = None
+                    tail_support_scaled = None
+                    online_policy_loss = None
+                    prune_where_grad_terms = []
+                    step_grad_loss_items = []
+                    audit_voxel_state = {}
+                    audit_plan_debug = {}
+                    audit_plan = {}
+                    metric_values = []
+                    step_metric_values = []
+                    surrogate_metrics = []
+                    # saved-tensor offloadのbackward復元blockと前Stepのloss
+                    # bridgeを次のfull-cloud forwardへ持ち越さない。
+                    loss.last_geometry_debug = {}
+                    loss.last_compression_terms = {}
+                    loss.last_compression_debug = {}
+                    setattr(args, "_current_sparsepcgc_proposal_terms_by_key", {})
+                    setattr(args, "_current_sparsepcgc_proposal_selection_meta", {"enabled": False})
+                    setattr(args, "_last_voxel_restored_actual_debug", {})
+                    if use_cuda and torch.cuda.is_available():
+                        torch.cuda.empty_cache()
                 global_train_step += 1
                 max_train_steps = int(getattr(args, "max_train_steps", 0))
                 if max_train_steps > 0 and global_train_step >= max_train_steps:
@@ -16777,8 +17120,20 @@ def train(model, args, loss, writer, plot, notifier=None):
                 log_plot_skip_epoch( writer, plot_epoch_info, global_epoch) # Epoch単位の平均損失をCSVに記録
                 writer.write(format_metric_summary("EpochAvg", plot.metric_keys, epoch_avgs))
             epoch_edit_info = plot.record_point_edits("epo", global_epoch + 1) # Epoch内で記録されたStep単位の点編集統計を集計
+            plot.record_occupancy_metrics("epo", global_epoch + 1) # Epoch内の占有統計を図用に集計
+            plot.record_voxel_collision_metrics("epo", global_epoch + 1) # Epoch内のVoxel衝突統計を図用に集計
             log_epoch_point_edit_average( writer, epoch_edit_info, global_epoch) # Epoch単位の点ん操作統計をログに記録
             global_epoch += 1
+            # Epochごとの図生成は通常の詳細Stepログ削減とは独立して残す。
+            plot.plot_loss_curve("step")
+            plot.plot_loss_curve("epo")
+            plot.plot_point_edit_curve("step")
+            plot.plot_point_edit_curve("epo")
+            plot.plot_occupancy_curve("step")
+            plot.plot_occupancy_curve("epo")
+            plot.plot_voxel_collision_curve("step")
+            plot.plot_voxel_collision_curve("epo")
+            writer.write(f"Saved step/epoch plots/csv: {plot.save_dir}")
             writer.flush()
         if episode_metric_sums is not None:
             plot.epi_avg = metric_avgs_to_floats(episode_metric_sums)
@@ -16788,9 +17143,14 @@ def train(model, args, loss, writer, plot, notifier=None):
             plot.epi_avg = [None for _ in range(plot.num_loss)]
         writer.write(format_metric_summary("EpisodeAvg", plot.metric_keys, plot.epi_avg))
         episode_edit_info = plot.record_point_edits("epi", episode + 1)
+        plot.record_occupancy_metrics("epi", episode + 1)
+        plot.record_voxel_collision_metrics("epi", episode + 1)
         log_episode_point_edit_average( writer, episode_edit_info, episode)
-        plot.plot_point_edit_curve("step")
-        writer.write(f"Saved 3 point-edit plots (Add/Prune/Adjust): {plot.save_dir}")
+        plot.plot_loss_curve("epi")
+        plot.plot_point_edit_curve("epi")
+        plot.plot_occupancy_curve("epi")
+        plot.plot_voxel_collision_curve("epi")
+        writer.write(f"Saved episode plots/csv: {plot.save_dir}")
         if _episode_input_common_cache_enabled(args):
             cache_summary = _episode_input_common_cache_summary(args)
             writer.write(
@@ -17099,7 +17459,17 @@ if __name__ == '__main__':
     if torch.cuda.is_available() and not args.cpu and args.use_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-        torch.backends.cudnn.benchmark = not bool(getattr(args, "deterministic", False))
+        variable_length_full_cloud = (
+            str(getattr(args, "heuristic_guidance_mode", "")).strip().lower()
+            == "ana_den6_online"
+        )
+        # 8iの点数はframeごとに変わる。benchmark=Trueだと巨大Conv1dの
+        # algorithm/workspace探索が形状ごとに増え続けるため、この経路では
+        # 固定algorithmを使う。dtype・入力・学習計算は変更しない。
+        torch.backends.cudnn.benchmark = bool(
+            not getattr(args, "deterministic", False)
+            and not variable_length_full_cloud
+        )
         try:
             torch.set_float32_matmul_precision("high")
         except AttributeError:
@@ -17186,4 +17556,5 @@ if __name__ == '__main__':
             notifier.training_error(exc, log_path=getattr(writer, "file_path", None))
         raise
     finally:
+        shutdown_ana_den6_online_prefetch(wait=False)
         writer.close()

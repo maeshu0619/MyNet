@@ -21,7 +21,7 @@ from types import ModuleType
 from typing import Any, Mapping, Sequence
 
 
-SCHEMA_VERSION = "ana_den6_online_candidate_cache_v1"
+SCHEMA_VERSION = "ana_den6_online_candidate_cache_v2"
 OPERATIONS = ("Add", "Prune", "Adjust")
 DEFAULT_PROFILES: dict[tuple[str, int], tuple[float, tuple[float, float, float]]] = {
     ("8I", 8): (0.0025, (0.40, 0.40, 0.20)),
@@ -195,6 +195,23 @@ def _initial_plan_payload(
     }
 
 
+def _compact_online_shortlist(
+    pool: Sequence[Mapping[str, Any]],
+    selected_ids: set[str],
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Step 0の選択候補を必ず残し、rank近傍だけをonline residual用に保持する。"""
+    selected = [item for item in pool if str(item.get("candidate_id", "")) in selected_ids]
+    if len(selected) != len(selected_ids) or len(selected) > int(limit):
+        raise RuntimeError("online shortlistが初期den6 planを完全に保持できない")
+    keep_ids = {str(item.get("candidate_id", "")) for item in selected}
+    for item in pool:
+        if len(keep_ids) >= int(limit):
+            break
+        keep_ids.add(str(item.get("candidate_id", "")))
+    return [dict(item) for item in pool if str(item.get("candidate_id", "")) in keep_ids]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="ana_den6 online candidate cache worker")
     parser.add_argument("--sparsepcgc-root", required=True)
@@ -206,7 +223,8 @@ def main() -> int:
     parser.add_argument("--total-ratio", default=-1.0, type=float, help="0-1表記")
     parser.add_argument("--operation-shares", default="")
     parser.add_argument("--max-total-ratio", default=0.0099, type=float, help="候補poolを用意する最大総操作率")
-    parser.add_argument("--pool-limit-per-operation", default=8192, type=int)
+    parser.add_argument("--full-pool-limit-per-operation", default=0, type=int)
+    parser.add_argument("--compact-reserve-factor", default=1.0, type=float)
     parser.add_argument("--output-json", required=True)
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--cpu", action="store_true")
@@ -329,13 +347,29 @@ def main() -> int:
         shares_tuple = _parse_shares(cli.operation_shares, dataset, int(cli.scale_m))
         shares = dict(zip(OPERATIONS, shares_tuple))
 
+        initial_total_count = max(3, int(math.ceil(unique_count * total_ratio)))
+        initial_counts = den6._allocate_counts(initial_total_count, shares)
         max_total_ratio = min(max(float(cli.max_total_ratio), total_ratio), 0.0099)
         maximum_total_count = max(3, int(math.ceil(unique_count * max_total_ratio)))
-        per_operation_limit = max(int(cli.pool_limit_per_operation), 3)
-        maximum_counts = {
-            name: min(maximum_total_count, per_operation_limit)
-            for name in OPERATIONS
-        }
+        # 1つのplanを作るために必要な候補だけを生成する。旧既定8192件×3操作は、
+        # 約1900 actionの一意planに対して過剰だった。衝突回避用に25%だけ内部余裕を持つ。
+        configured_limit = max(int(cli.full_pool_limit_per_operation), 0)
+        build_reserve = max(float(cli.compact_reserve_factor), 1.25)
+        # 先行操作との衝突により、件数の少ないAdjustでも元順位を深く読む。
+        # そのため操作別countではなく3操作中の最大countを共通基準にする。
+        common_required = max(
+            int(math.ceil(float(max(initial_counts.values())) * build_reserve)),
+            max(initial_counts.values()),
+            3,
+        )
+        per_operation_limits = {}
+        for name in OPERATIONS:
+            required = int(common_required)
+            if configured_limit > 0:
+                required = min(required, configured_limit)
+                required = max(required, int(initial_counts[name]))
+            per_operation_limits[name] = min(required, maximum_total_count)
+        maximum_counts = dict(per_operation_limits)
         priors = den6._deep_copy_priors()
         pools, heuristics, diagnostics = den6._prepare_operation_pools(
             den5,
@@ -349,10 +383,10 @@ def main() -> int:
             maximum_counts,
         )
         # 順位はden6._prepare_operation_poolsが返した順序をそのまま保持する。
-        serialized_pools: dict[str, list[dict[str, Any]]] = {}
+        full_serialized_pools: dict[str, list[dict[str, Any]]] = {}
         for operation in OPERATIONS:
-            pool = list(pools.get(operation, ()))[:per_operation_limit]
-            serialized_pools[operation] = [
+            pool = list(pools.get(operation, ()))[:per_operation_limits[operation]]
+            full_serialized_pools[operation] = [
                 _candidate_payload(
                     den5,
                     candidate,
@@ -367,8 +401,6 @@ def main() -> int:
             if not pool:
                 raise RuntimeError(f"ana_den6 online候補poolが空である: {operation}")
 
-        initial_total_count = max(3, int(math.ceil(unique_count * total_ratio)))
-        initial_counts = den6._allocate_counts(initial_total_count, shares)
         for name in OPERATIONS:
             initial_counts[name] = min(int(initial_counts[name]), len(pools[name]))
         priority = den6._operation_priority(
@@ -388,10 +420,34 @@ def main() -> int:
             priority,
             baseline_probe.original_coords,
         )
+        if not bool(initial_plan.get("available", False)):
+            raise RuntimeError(f"den6 initial planを構築できない: {initial_plan.get('reason', '')}")
+        selected_ids = set(str(value) for value in initial_plan.get("candidate_ids", ()))
+        reserve_factor = max(float(cli.compact_reserve_factor), 1.0)
+        shortlist_limits = {
+            operation: int(initial_counts[operation]) + int(
+                math.ceil(float(initial_counts[operation]) * (reserve_factor - 1.0))
+            )
+            for operation in OPERATIONS
+        }
+        serialized_pools = {
+            operation: _compact_online_shortlist(
+                full_serialized_pools[operation],
+                {
+                    candidate_id
+                    for candidate_id in selected_ids
+                    if candidate_id in {
+                        str(item.get("candidate_id", "")) for item in full_serialized_pools[operation]
+                    }
+                },
+                shortlist_limits[operation],
+            )
+            for operation in OPERATIONS
+        }
 
         payload = {
             "schema_version": SCHEMA_VERSION,
-            "source": "ana_den6_exact_ranked_candidate_pool_online_v1",
+            "source": "ana_den6_exact_unique_plan_online_v6",
             "created_at_unix": time.time(),
             "elapsed_sec": float(time.time() - started),
             "dataset": dataset,
@@ -410,7 +466,9 @@ def main() -> int:
             "operation_priority": list(priority),
             "plan_variants": int(args.plan_variants),
             "anchor_operation_counts": dict(initial_counts),
-            "ranked_candidate_pools": serialized_pools,
+            "operation_candidate_shortlists": serialized_pools,
+            "shortlist_limits": shortlist_limits,
+            "full_pool_counts": {name: len(full_serialized_pools[name]) for name in OPERATIONS},
             "pool_diagnostics": diagnostics,
             "initial_heuristic_plan": initial_plan,
             "baseline_decoder_complete_bits": float(

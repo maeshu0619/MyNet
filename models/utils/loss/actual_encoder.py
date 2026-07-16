@@ -51,8 +51,9 @@ class _OctAttentionActualEncoder:
         return repo_root, oa_dir, ckpt_path
 
     def _lazy_init(self):
-        if self._loaded:
+        if self._loaded and self._proc is not None and self._proc.poll() is None:
             return
+        self._loaded = False
 
         repo_root, oa_dir, ckpt_path = self._resolve_ckpt_path()
         teacher_mode = str(getattr(self.args, "octattention_teacher_device", "balanced")).strip().lower()
@@ -364,6 +365,12 @@ class _SparsePCGCActualEncoder:
         self._workspace_lock = threading.Lock()
         self._result_cache = OrderedDict()
         self._codec_fingerprint = None
+        # Audit counters distinguish an actual worker request from an in-process
+        # result-cache hit.  ana_den6_online requires the edited cloud to issue
+        # one worker request on every training step.
+        self._worker_launch_count = 0
+        self._worker_request_count = 0
+        self._result_cache_hit_count = 0
 
     def _repo_root(self):
         return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
@@ -506,6 +513,7 @@ class _SparsePCGCActualEncoder:
             cwd=sparse_root,
             env=env,
         )
+        self._worker_launch_count += 1
         self._stdout_queue = queue.Queue()
         self._stdout_thread = threading.Thread(target=self._pump_stdout, daemon=True)
         self._stdout_thread.start()
@@ -565,6 +573,7 @@ class _SparsePCGCActualEncoder:
         if self._proc is None or self._proc.stdin is None:
             raise RuntimeError("SparsePCGC worker stdin is not available.")
         self._request_id += 1
+        self._worker_request_count += 1
         request = dict(request)
         request["request_id"] = self._request_id
         start = time.time()
@@ -573,6 +582,19 @@ class _SparsePCGCActualEncoder:
         response = self._read_worker_json(self.timeout)
         while response.get("request_id") not in {None, self._request_id}:
             response = self._read_worker_json(self.timeout)
+        if bool(request.get("exit_after_response", False)) and response.get("status") == "ok":
+            proc = self._proc
+            if proc is not None:
+                proc.wait(timeout=min(float(self.timeout), 30.0))
+            self._proc = None
+            self._loaded = False
+            if self._stdout_thread is not None:
+                self._stdout_thread.join(timeout=1.0)
+            self._stdout_thread = None
+            self._stdout_queue = None
+            if self._stderr_file is not None:
+                self._stderr_file.close()
+                self._stderr_file = None
         return response, float(time.time() - start)
 
     def _write_ply(self, path, pts_3n):
@@ -667,6 +689,9 @@ class _SparsePCGCActualEncoder:
             except OSError:
                 checkpoints[field] = {"path": path, "missing": True}
         payload = {
+            # Bump whenever worker-side accounting changes so stale in-memory
+            # and disk GT entries cannot silently mix bit definitions.
+            "rate_semantics": "den6_decoder_complete_logical_bits_v2",
             "root": os.path.abspath(os.path.expanduser(str(getattr(self.args, "sparsepcgc_root", "")))),
             "mode": str(getattr(self.args, "sparsepcgc_mode", "dense_lossy")),
             "m": int(getattr(self.args, "sparsepcgc_scale_m", 8)),
@@ -732,17 +757,25 @@ class _SparsePCGCActualEncoder:
         return any(marker in message for marker in markers)
 
     def _get_cached_result(self, key):
+        if bool(getattr(self.args, "_sparsepcgc_force_fresh_actual_encode", False)):
+            return None
         if not bool(getattr(self.args, "sparsepcgc_actual_result_cache", True)):
             return None
         item = self._result_cache.get(key)
         if item is None:
             return None
         self._result_cache.move_to_end(key)
+        self._result_cache_hit_count += 1
         out = dict(item)
         out["sparsepcgc_actual_result_cache_hit"] = True
+        out["sparsepcgc_worker_launch_count"] = int(self._worker_launch_count)
+        out["sparsepcgc_worker_request_count"] = int(self._worker_request_count)
+        out["sparsepcgc_actual_result_cache_hit_count"] = int(self._result_cache_hit_count)
         return out
 
     def _store_cached_result(self, key, value):
+        if bool(getattr(self.args, "_sparsepcgc_force_fresh_actual_encode", False)):
+            return
         if not bool(getattr(self.args, "sparsepcgc_actual_result_cache", True)):
             return
         clean = dict(value)
@@ -828,6 +861,14 @@ class _SparsePCGCActualEncoder:
                 "exact_teacher_mode": exact_teacher_mode,
                 "exact_teacher_uses_full_context": exact_teacher_uses_full_context,
                 "exact_teacher_fallback_reason": exact_teacher_fallback_reason,
+                "exit_after_response": bool(
+                    getattr(
+                        self.args,
+                        "sparsepcgc_release_worker_after_request",
+                        str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower()
+                        == "ana_den6_online",
+                    )
+                ),
             }
             response, worker_roundtrip_time = self._send_worker_request(request)
             ascii_fallback_used = False
@@ -935,6 +976,9 @@ class _SparsePCGCActualEncoder:
                 "sparsepcgc_binary_ply_used": bool(used_binary_ply and not ascii_fallback_used),
                 "sparsepcgc_ascii_ply_fallback_used": bool(ascii_fallback_used),
                 "sparsepcgc_actual_result_cache_hit": False,
+                "sparsepcgc_worker_launch_count": int(self._worker_launch_count),
+                "sparsepcgc_worker_request_count": int(self._worker_request_count),
+                "sparsepcgc_actual_result_cache_hit_count": int(self._result_cache_hit_count),
                 "sparsepcgc_point_sha256": str(point_hash),
                 "sparsepcgc_codec_fingerprint": self._codec_cache_fingerprint(),
             }
@@ -962,6 +1006,12 @@ class _SparsePCGCActualEncoder:
 
                 if keep_key:
                     stats[str(key)] = value
+            # Worker payloads may contain similarly named diagnostic fields.
+            # These three counters are process-local audit facts, so never let
+            # a worker-side default overwrite them.
+            stats["sparsepcgc_worker_launch_count"] = int(self._worker_launch_count)
+            stats["sparsepcgc_worker_request_count"] = int(self._worker_request_count)
+            stats["sparsepcgc_actual_result_cache_hit_count"] = int(self._result_cache_hit_count)
             # train.py側で扱いやすい短縮aliasも用意する。
             if "sparsepcgc_worker_cuda_allocated_mb" in stats:
                 stats["actual_sparsepcgc_worker_cuda_allocated_mb"] = stats["sparsepcgc_worker_cuda_allocated_mb"]

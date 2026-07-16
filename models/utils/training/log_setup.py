@@ -41,7 +41,10 @@ def log_basic_setup(writer, args, file_day, file_time):
         )
     elif guidance_mode == "ana_den6_reference_ply":
         writer.write("Heuristic Guidance Warning: ana_den6_reference_ply applies only a saved final PLY and is not candidate-plan reproduction.")
-    elif bool(getattr(args, "heuristic_guidance_enabled", False)):
+    elif (
+        bool(getattr(args, "heuristic_guidance_enabled", False))
+        and guidance_mode == "proxy_prior"
+    ):
         writer.write(
             "Heuristic Guidance Warning: proxy_prior is not ana_den6 EditCandidate ranking and "
             "must not be compared as an exact den6 reproduction."

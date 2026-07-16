@@ -1,10 +1,12 @@
 import hashlib
 import itertools
+import json
 import math
 import time
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 from models.utils.pointcloud.sparsepcgc_voxel import (
     canonical_sparsepcgc_voxel_coords,
     restore_points_from_voxel_coords,
@@ -36,6 +38,7 @@ class StructureRepairActuator(nn.Module):
             torch.tensor(neighbor_offsets, dtype=torch.float32),
             persistent=False,
         )
+
         self.move_voxel_head = nn.Sequential(
             nn.Conv1d(in_channels, hidden_dim, 1),
             nn.ReLU(inplace=True),
@@ -156,6 +159,44 @@ class StructureRepairActuator(nn.Module):
         nn.init.constant_(self.move_amount_head.bias, 0.0)
         self.debug_tensors = {}
 
+    def _should_collect_runtime_debug(self):
+        """Return whether scalar diagnostics may synchronize the GPU this step."""
+        return bool(
+            getattr(self.args, "_collect_structure_debug", False)
+            or (
+                getattr(self.args, "verbose_step_logs", False)
+                and getattr(self.args, "_log_this_step", True)
+            )
+            or (
+                getattr(self.args, "sparsepcgc_hard_debug_on_log", False)
+                and getattr(self.args, "_log_this_step", True)
+            )
+            or getattr(self.args, "print_actuator_hard_soft_compare", False)
+        )
+
+    def _run_large_head(self, head, features):
+        """Run a point-wise head without retaining its hidden FP32 maps.
+
+        Non-reentrant checkpointing preserves the exact forward arithmetic and
+        recomputes only the head during backward.  Hard plans, candidate pools,
+        losses, and dtypes are unchanged.
+        """
+        enabled = bool(
+            self.training
+            and getattr(self.args, "full_cloud_activation_checkpoint", True)
+            and str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower()
+            == "ana_den6_online"
+        )
+        if enabled:
+            dummy = features.new_zeros((), requires_grad=True)
+            return checkpoint(
+                lambda value, _dummy: head(value),
+                features,
+                dummy,
+                use_reentrant=True,
+            )
+        return head(features)
+
     def _child_slot_target_mask(self, voxel_coords, octree_context):
         # 1. octree_cubtree.pyで作った厳密maskがあればそれを使う
         if isinstance(octree_context, dict):
@@ -179,11 +220,18 @@ class StructureRepairActuator(nn.Module):
         K = int(offsets.shape[0])
 
         current = voxel_coords.transpose(1, 2).contiguous()
-        targets = current[:, :, None, :] + offsets.view(1, 1, K, 3)
-
         current_parent = torch.div(current, 2, rounding_mode="floor")
-        target_parent = torch.div(targets, 2, rounding_mode="floor")
-        same_parent_mask = (target_parent == current_parent[:, :, None, :]).all(dim=-1)
+        # Avoid materialising [B,N,26,3] target coordinates (~0.48 GB for an
+        # 8i frame).  Parent equality is separable by axis and integer-exact.
+        same_parent_mask = torch.ones(
+            (B, current.shape[1], K), device=voxel_coords.device, dtype=torch.bool
+        )
+        for axis in range(3):
+            target_axis = current[:, :, axis : axis + 1] + offsets[:, axis].view(1, 1, K)
+            same_parent_mask &= (
+                torch.div(target_axis, 2, rounding_mode="floor")
+                == current_parent[:, :, axis : axis + 1]
+            )
 
         return same_parent_mask
 
@@ -282,6 +330,15 @@ class StructureRepairActuator(nn.Module):
             ).clamp_min(0.0).detach()
             move_prior = zero
             best_prior = torch.maximum(delete_prior, add_prior)
+            debug_scalars = {}
+            if self._should_collect_runtime_debug():
+                debug_scalars = {
+                    "delete_prior_mean": float(delete_prior.detach().float().mean().cpu()),
+                    "add_prior_mean": float(add_prior.detach().float().mean().cpu()),
+                    "move_prior_mean": 0.0,
+                    "best_prior_mean": float(best_prior.detach().float().mean().cpu()),
+                    "best_prior_max": float(best_prior.detach().float().max().cpu()),
+                }
             out.update(
                 {
                     "enabled": True,
@@ -289,11 +346,7 @@ class StructureRepairActuator(nn.Module):
                     "add_prior": add_prior,
                     "move_prior": move_prior,
                     "best_prior": best_prior,
-                    "delete_prior_mean": float(delete_prior.detach().float().mean().cpu()),
-                    "add_prior_mean": float(add_prior.detach().float().mean().cpu()),
-                    "move_prior_mean": 0.0,
-                    "best_prior_mean": float(best_prior.detach().float().mean().cpu()),
-                    "best_prior_max": float(best_prior.detach().float().max().cpu()),
+                    **debug_scalars,
                 }
             )
             return out
@@ -315,6 +368,15 @@ class StructureRepairActuator(nn.Module):
         add_prior = torch.tanh(add_gain * scale).clamp(0.0, 1.0).detach()
         move_prior = torch.tanh(move_gain * scale).clamp(0.0, 1.0).detach()
         best_prior = torch.maximum(torch.maximum(delete_prior, add_prior), move_prior)
+        debug_scalars = {}
+        if self._should_collect_runtime_debug():
+            debug_scalars = {
+                "delete_prior_mean": float(delete_prior.detach().float().mean().cpu()),
+                "add_prior_mean": float(add_prior.detach().float().mean().cpu()),
+                "move_prior_mean": float(move_prior.detach().float().mean().cpu()),
+                "best_prior_mean": float(best_prior.detach().float().mean().cpu()),
+                "best_prior_max": float(best_prior.detach().float().max().cpu()),
+            }
 
         out.update(
             {
@@ -323,11 +385,7 @@ class StructureRepairActuator(nn.Module):
                 "add_prior": add_prior,
                 "move_prior": move_prior,
                 "best_prior": best_prior,
-                "delete_prior_mean": float(delete_prior.detach().float().mean().cpu()),
-                "add_prior_mean": float(add_prior.detach().float().mean().cpu()),
-                "move_prior_mean": float(move_prior.detach().float().mean().cpu()),
-                "best_prior_mean": float(best_prior.detach().float().mean().cpu()),
-                "best_prior_max": float(best_prior.detach().float().max().cpu()),
+                **debug_scalars,
             }
         )
         return out
@@ -484,16 +542,21 @@ class StructureRepairActuator(nn.Module):
 
         add_target_bias = add_match.to(dtype=dtype) * add_source_prior.unsqueeze(2)
         move_target_bias = move_match.to(dtype=dtype) * move_source_prior.unsqueeze(2)
+        debug_scalars = {}
+        if self._should_collect_runtime_debug():
+            debug_scalars = {
+                "add_target_match_ratio": float(add_match.to(torch.float32).mean().detach().cpu()),
+                "move_target_match_ratio": float(move_match.to(torch.float32).mean().detach().cpu()),
+                "add_target_bias_mean": float(add_target_bias.detach().float().mean().cpu()),
+                "move_target_bias_mean": float(move_target_bias.detach().float().mean().cpu()),
+            }
 
         out.update(
             {
                 "enabled": True,
                 "add_target_bias": add_target_bias.detach(),
                 "move_target_bias": move_target_bias.detach(),
-                "add_target_match_ratio": float(add_match.to(torch.float32).mean().detach().cpu()),
-                "move_target_match_ratio": float(move_match.to(torch.float32).mean().detach().cpu()),
-                "add_target_bias_mean": float(add_target_bias.detach().float().mean().cpu()),
-                "move_target_bias_mean": float(move_target_bias.detach().float().mean().cpu()),
+                **debug_scalars,
             }
         )
         return out
@@ -1237,13 +1300,16 @@ class StructureRepairActuator(nn.Module):
             slots = self._child_slot_from_coords_lastdim(coords)
             child_slots[b] = slots
             unique_parents, inverse = torch.unique(parents, dim=0, sorted=True, return_inverse=True)
-            codes = torch.zeros((unique_parents.shape[0],), device=voxel_coords.device, dtype=torch.long)
-            for slot in range(8):
-                mask = slots == slot
-                if bool(mask.any().item()):
-                    parent_ids = torch.unique(inverse[mask], sorted=False)
-                    bit = codes.new_full((parent_ids.numel(),), 1 << slot)
-                    codes[parent_ids] = torch.bitwise_or(codes[parent_ids], bit)
+            occupancy = torch.zeros(
+                (unique_parents.shape[0], 8),
+                device=voxel_coords.device,
+                dtype=torch.bool,
+            )
+            occupancy[inverse, slots.clamp(0, 7)] = True
+            pattern_weights = (
+                2 ** torch.arange(8, device=voxel_coords.device, dtype=torch.long)
+            ).view(1, 8)
+            codes = (occupancy.to(dtype=torch.long) * pattern_weights).sum(dim=1)
             parent_codes[b] = codes.index_select(0, inverse)
         return parent_codes, child_slots
 
@@ -1339,12 +1405,23 @@ class StructureRepairActuator(nn.Module):
         for b in range(B):
             item = voxel_cache[b]
             current = item["coords"]
-            targets = current[:, None, :] + offsets.view(1, -1, 3)
-            occupied = self._coords_membership_cached(
-                targets.reshape(-1, 3),
-                item["occupied_keys"],
-                item["key_mins"],
-                item["key_spans"],
+            # _coord_keys is affine in x/y/z.  Build the [N,26] integer keys
+            # directly instead of allocating [N,26,3] target coordinates.
+            mins = item["key_mins"]
+            spans = item["key_spans"].clamp_min(1)
+            shifted = current - mins.view(1, 3)
+            query_keys = (
+                (shifted[:, 0:1] + offsets[:, 0].view(1, -1)) * spans[1] * spans[2]
+                + (shifted[:, 1:2] + offsets[:, 1].view(1, -1)) * spans[2]
+                + shifted[:, 2:3]
+                + offsets[:, 2].view(1, -1)
+            )
+            occupied_keys = item["occupied_keys"]
+            pos = torch.searchsorted(occupied_keys, query_keys.reshape(-1))
+            in_bounds = pos < occupied_keys.numel()
+            safe_pos = pos.clamp(max=max(int(occupied_keys.numel()) - 1, 0))
+            occupied = (
+                in_bounds & (occupied_keys[safe_pos] == query_keys.reshape(-1))
             ).view(N, -1)
             masks.append(~occupied)
         return torch.stack(masks, dim=0)
@@ -1403,8 +1480,6 @@ class StructureRepairActuator(nn.Module):
                 total += voxel_count
                 continue
             mask_b = point_mask[b].to(device=item["inverse"].device, dtype=torch.bool)
-            if not bool(mask_b.any().item()):
-                continue
             selected_inverse = item["inverse"][mask_b]
             total += int(torch.unique(selected_inverse, sorted=False).numel())
         return total
@@ -1505,7 +1580,7 @@ class StructureRepairActuator(nn.Module):
         # ------------------------------------------------------------
         if hard_drop_mask_b is not None:
             drop_mask = hard_drop_mask_b.to(device=coords_n3.device, dtype=torch.bool).reshape(-1)
-            if drop_mask.numel() == coords_n3.shape[0] and bool(drop_mask.any().item()):
+            if drop_mask.numel() == coords_n3.shape[0]:
                 drop_coords = torch.unique(coords_n3[drop_mask], dim=0, sorted=True)
                 current = self._remove_voxel_coords(current, drop_coords)
                 debug["drop_count"] = int(drop_coords.shape[0])
@@ -1516,7 +1591,7 @@ class StructureRepairActuator(nn.Module):
         if add_target_coords_b is not None and add_target_mask_b is not None:
             add_coords_n3 = add_target_coords_b.transpose(0, 1).contiguous().to(device=coords_n3.device, dtype=torch.long)
             add_mask = add_target_mask_b.to(device=coords_n3.device, dtype=torch.bool).reshape(-1)
-            if add_mask.numel() == add_coords_n3.shape[0] and bool(add_mask.any().item()):
+            if add_mask.numel() == add_coords_n3.shape[0]:
                 selected_add = add_coords_n3[add_mask]
                 unique_add_mask = self._first_unique_rows_mask(selected_add)
                 debug["duplicate_target_rejected"] += int((~unique_add_mask).sum().item())
@@ -1541,7 +1616,7 @@ class StructureRepairActuator(nn.Module):
 
             move_targets_n3 = move_target_coords_b.transpose(0, 1).contiguous().to(device=coords_n3.device, dtype=torch.long)
 
-            if move_mask.numel() == coords_n3.shape[0] and move_targets_n3.shape[0] == coords_n3.shape[0] and bool(move_mask.any().item()):
+            if move_mask.numel() == coords_n3.shape[0] and move_targets_n3.shape[0] == coords_n3.shape[0]:
                 source_coords = coords_n3[move_mask]
                 target_coords = move_targets_n3[move_mask]
 
@@ -2828,7 +2903,7 @@ class StructureRepairActuator(nn.Module):
         )
         logit_scale = max(float(getattr(self.args, "repair_operation_gate_logit_scale", 6.0)), 1e-6)
         raw_logit = torch.nan_to_num(
-            self.operation_gate_head(pooled),
+            self._run_large_head(self.operation_gate_head, pooled),
             nan=0.0,
             posinf=logit_scale,
             neginf=-logit_scale,
@@ -2878,6 +2953,10 @@ class StructureRepairActuator(nn.Module):
                 "ana_den6_exact_ranked_editcandidate_pool_v2",
                 "ana_den6_exact_ranked_editcandidate_pool_online_v1",
                 "ana_den6_exact_one_pattern_anchor_online_v4",
+                "ana_den6_exact_one_pattern_anchor_online_v5",
+                "ana_den6_exact_compact_candidate_shortlist_online_v5",
+                "ana_den6_exact_unique_plan_online_v6",
+                "ana_den6_exact_one_pattern_anchor_online_v6",
             }:
                 raise RuntimeError(
                     "ana_den6 online/residualでproxy近似guidanceがActuatorへ入った。"
@@ -3298,10 +3377,15 @@ class StructureRepairActuator(nn.Module):
         exact_anchor_steps = max(
             int(getattr(self.args, "heuristic_guidance_exact_anchor_steps", 1)), 0
         )
+        unique_plan_mode = str(exact.get("source", "")) in {
+            "ana_den6_exact_unique_plan_online_v6",
+            "ana_den6_exact_one_pattern_anchor_online_v6",
+        }
         exploration_active = bool(
             online_mode
             and self.training
             and current_step >= exact_anchor_steps
+            and not unique_plan_mode
         )
 
         # Amountはden6初期値の近傍だけをlog-normalで探索する。
@@ -3527,6 +3611,14 @@ class StructureRepairActuator(nn.Module):
             "amount_log_prob": amount_log_prob,
             "action_log_prob": action_log_prob,
         }
+        plan_hash_payload = {
+            "candidate_ids": selected_ids,
+            "operation_counts": selected_counts,
+            "operation_order": debug["operation_order"],
+        }
+        debug["plan_hash"] = hashlib.sha256(
+            json.dumps(plan_hash_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
 
         # Step 0はden6 Heuristicだけで作ったinitial planと一致することを検査する。
         if current_step < exact_anchor_steps:
@@ -3541,10 +3633,25 @@ class StructureRepairActuator(nn.Module):
                 actual_hash = hashlib.sha256(
                     values.astype("int64", copy=False).tobytes(order="C")
                 ).hexdigest()
+                debug["final_voxel_hash"] = actual_hash
+                debug["expected_final_voxel_hash"] = expected_hash
                 if actual_hash != expected_hash:
                     raise RuntimeError(
                         "Step 0のonline den6 Heuristic planがworker結果と一致しない: "
                         f"actual={actual_hash}, expected={expected_hash}"
+                    )
+            if isinstance(initial_plan, dict) and bool(initial_plan.get("available", False)):
+                expected_ids = [str(value) for value in initial_plan.get("candidate_ids", ())]
+                expected_counts = {
+                    name: int(dict(initial_plan.get("operation_counts") or {}).get(name, 0))
+                    for name in operations
+                }
+                expected_order = str(dict(initial_plan.get("metadata") or {}).get("operation_order", ""))
+                if selected_ids != expected_ids or selected_counts != expected_counts or debug["operation_order"] != expected_order:
+                    raise RuntimeError(
+                        "Step 0のonline den6 Heuristic candidate planがworker結果と一致しない: "
+                        f"ids_match={selected_ids == expected_ids}, counts={selected_counts}/{expected_counts}, "
+                        f"order={debug['operation_order']}/{expected_order}"
                     )
         return final_coords, debug
 
@@ -3796,7 +3903,10 @@ class StructureRepairActuator(nn.Module):
         full_octree_context=None,
         full_cloud_amount_terms=None,
     ):
-        timing_enabled = bool(getattr(self.args, "debug_timing", False))
+        timing_enabled = bool(
+            getattr(self.args, "debug_timing", False)
+            or getattr(self.args, "_profile_runtime_this_step", False)
+        )
         runtime_timing = {}
         if timing_enabled:
             if pts_xyz.is_cuda:
@@ -4057,11 +4167,13 @@ class StructureRepairActuator(nn.Module):
         ).view(B, N) - base_pattern_popularity
 
         current_voxels_n3 = voxel_coords.transpose(1, 2).contiguous()
-        candidate_neighbor_voxels = (
-            current_voxels_n3[:, :, None, :]
-            + neighbor_offsets_long.view(1, 1, -1, 3)
-        )
-        target_child_slots = self._child_slot_from_coords_lastdim(candidate_neighbor_voxels)
+        # Child slot depends only on coordinate parity.  Compute it directly
+        # as [B,N,26], avoiding another [B,N,26,3] integer tensor.
+        target_child_slots = (
+            (current_voxels_n3[:, :, 0:1] + neighbor_offsets_long[:, 0].view(1, 1, -1)).remainder(2)
+            + 2 * (current_voxels_n3[:, :, 1:2] + neighbor_offsets_long[:, 1].view(1, 1, -1)).remainder(2)
+            + 4 * (current_voxels_n3[:, :, 2:3] + neighbor_offsets_long[:, 2].view(1, 1, -1)).remainder(2)
+        ).to(dtype=torch.long)
         target_child_bits = torch.bitwise_left_shift(
             torch.ones_like(target_child_slots, dtype=torch.long),
             target_child_slots,
@@ -4105,6 +4217,10 @@ class StructureRepairActuator(nn.Module):
                 "ana_den6_exact_ranked_editcandidate_pool_v2",
                 "ana_den6_exact_ranked_editcandidate_pool_online_v1",
                 "ana_den6_exact_one_pattern_anchor_online_v4",
+                "ana_den6_exact_one_pattern_anchor_online_v5",
+                "ana_den6_exact_compact_candidate_shortlist_online_v5",
+                "ana_den6_exact_unique_plan_online_v6",
+                "ana_den6_exact_one_pattern_anchor_online_v6",
             }
         )
         exact_add_source_mask = self._fit_heuristic_candidate_mask(
@@ -5349,7 +5465,7 @@ class StructureRepairActuator(nn.Module):
         # _scale_where_downstream_grad はその後に適用し、forward値は有界のまま、
         # backwardだけ操作別倍率で調整する。
         # ============================================================
-        raw_drop_logit = self.drop_head(actuator_features)
+        raw_drop_logit = self._run_large_head(self.drop_head, actuator_features)
         raw_drop_logit_for_forward = torch.nan_to_num(
             raw_drop_logit,
             nan=0.0,
@@ -6026,7 +6142,7 @@ class StructureRepairActuator(nn.Module):
             _mark_runtime("delete")
 
         move_score = (repair_gate * (1.0 - hard_drop)).clamp(0.0, 1.0)
-        subtree_move_source_logit = self.subtree_move_source_head(actuator_features)
+        subtree_move_source_logit = self._run_large_head(self.subtree_move_source_head, actuator_features)
         subtree_move_source_logit = self._scale_where_downstream_grad(
             subtree_move_source_logit,
             op_name="move",
@@ -6339,7 +6455,7 @@ class StructureRepairActuator(nn.Module):
         move_mask = hard_move
         move_mask_for_guard = move_mask
 
-        move_logits = self.move_voxel_head(actuator_features)
+        move_logits = self._run_large_head(self.move_voxel_head, actuator_features)
         move_logits = self._scale_where_downstream_grad(
             move_logits,
             op_name="move",
@@ -6833,7 +6949,7 @@ class StructureRepairActuator(nn.Module):
             1.0,
         )
         if add_k > 0:
-            learned_add_logit = self.add_head(actuator_features)
+            learned_add_logit = self._run_large_head(self.add_head, actuator_features)
             learned_add_logit = self._scale_where_downstream_grad(
                 learned_add_logit,
                 op_name="add",
@@ -6875,7 +6991,7 @@ class StructureRepairActuator(nn.Module):
             ) if exact_den6_candidate_mode else preserve.new_zeros(
                 (B, int(self.neighbor_offsets.shape[0]), N)
             )
-            add_voxel_logits = self.add_voxel_head(actuator_features)
+            add_voxel_logits = self._run_large_head(self.add_voxel_head, actuator_features)
             add_voxel_logits = self._scale_where_downstream_grad(
                 add_voxel_logits,
                 op_name="add",
@@ -6931,55 +7047,48 @@ class StructureRepairActuator(nn.Module):
                 add_target_allowed = leaf_add_target_bias > 0
                 valid_pair = valid_pair & add_target_allowed
 
-            candidate_base_voxels_long = voxel_coords.transpose(1, 2).contiguous().unsqueeze(2)  # [B, N, 1, 3]
-            candidate_offsets_long = neighbor_offsets_long.view(1, 1, -1, 3)                    # [1, 1, K, 3]
-            candidate_target_voxels_long = candidate_base_voxels_long + candidate_offsets_long  # [B, N, K, 3]
+            # exact den6 onlineでは、このgeneric Add状態は後段の唯一の
+            # exact planで必ず上書きされる。Networkのpair_logitsは残すが、
+            # 使用されない全N×26 target座標・重複排除・occupancy照合は作らない。
+            if not exact_den6_candidate_mode:
+                candidate_base_voxels_long = voxel_coords.transpose(1, 2).contiguous().unsqueeze(2)
+                candidate_offsets_long = neighbor_offsets_long.view(1, 1, -1, 3)
+                candidate_target_voxels_long = candidate_base_voxels_long + candidate_offsets_long
 
-            candidate_target_voxels_flat = (
-                candidate_target_voxels_long
-                .reshape(B, -1, 3)
-                .transpose(1, 2)
-                .contiguous()
-            )  # [B, 3, N*K]
-
-            unique_target_pair_mask = (
-                self._first_unique_coord_mask(candidate_target_voxels_flat)
-                .view(B, N, -1)
-            )
-
-            valid_pair = valid_pair & unique_target_pair_mask
-
-            # ============================================================
-            # Addは必ず「現在のHard状態で空のtarget voxel」だけを候補にする。
-            # empty_target_maskは初期voxel_coords基準なので、
-            # Prune/Adjust後のfinal_voxel_coords_stateに対しても空であるか確認する。
-            # ============================================================
-            add_hardening_threshold = float(
-                getattr(
-                    self.args,
-                    "operation_count_drop_threshold",
-                    getattr(self.args, "test_drop_threshold", 0.5),
+                candidate_target_voxels_flat = (
+                    candidate_target_voxels_long
+                    .reshape(B, -1, 3)
+                    .transpose(1, 2)
+                    .contiguous()
                 )
-            )
-            current_keep_for_add = final_w.detach().squeeze(1) >= add_hardening_threshold
+                unique_target_pair_mask = (
+                    self._first_unique_coord_mask(candidate_target_voxels_flat)
+                    .view(B, N, -1)
+                )
+                valid_pair = valid_pair & unique_target_pair_mask
 
-            current_empty_target_pair_mask = torch.zeros_like(valid_pair, dtype=torch.bool)
-            for b in range(B):
-                current_occ_coords = final_voxel_coords_state[b].transpose(0, 1).contiguous()
-                current_occ_coords = current_occ_coords[current_keep_for_add[b]]
-
-                candidate_targets_b = candidate_target_voxels_long[b].reshape(-1, 3).contiguous()
-
-                if current_occ_coords.numel() == 0:
-                    current_empty_target_pair_mask[b] = True
-                else:
-                    occupied_now = self._coords_membership(
-                        candidate_targets_b,
-                        current_occ_coords,
-                    ).view(N, K_add)
-                    current_empty_target_pair_mask[b] = ~occupied_now
-
-            valid_pair = valid_pair & current_empty_target_pair_mask
+                add_hardening_threshold = float(
+                    getattr(
+                        self.args,
+                        "operation_count_drop_threshold",
+                        getattr(self.args, "test_drop_threshold", 0.5),
+                    )
+                )
+                current_keep_for_add = final_w.detach().squeeze(1) >= add_hardening_threshold
+                current_empty_target_pair_mask = torch.zeros_like(valid_pair, dtype=torch.bool)
+                for b in range(B):
+                    current_occ_coords = final_voxel_coords_state[b].transpose(0, 1).contiguous()
+                    current_occ_coords = current_occ_coords[current_keep_for_add[b]]
+                    candidate_targets_b = candidate_target_voxels_long[b].reshape(-1, 3).contiguous()
+                    if current_occ_coords.numel() == 0:
+                        current_empty_target_pair_mask[b] = True
+                    else:
+                        occupied_now = self._coords_membership(
+                            candidate_targets_b,
+                            current_occ_coords,
+                        ).view(N, K_add)
+                        current_empty_target_pair_mask[b] = ~occupied_now
+                valid_pair = valid_pair & current_empty_target_pair_mask
 
             # AMP/float16環境では、float32の最小値(-3e38)をhalf Tensorへ入れるとoverflowする。
             # そのため、masked_fillに使う負値は、必ず対象Tensor自身のdtypeから作る。
@@ -7003,7 +7112,11 @@ class StructureRepairActuator(nn.Module):
                 add_direction_ce_per_point * add_valid_point
             ).sum() / add_valid_point.sum().clamp_min(1.0)
             valid_counts = valid_pair.reshape(B, -1).sum(dim=1)
-            effective_add_k = min(int(add_k), int(valid_counts.min().detach().cpu().item()))
+            effective_add_k = (
+                0
+                if exact_den6_candidate_mode
+                else min(int(add_k), int(valid_counts.min().detach().cpu().item()))
+            )
             if effective_add_k > 0:
                 pair_mask_value = torch.finfo(pair_logits.dtype).min
                 pair_scores = pair_logits.masked_fill(~valid_pair, pair_mask_value).reshape(B, -1)
@@ -7358,18 +7471,74 @@ class StructureRepairActuator(nn.Module):
         if timing_enabled:
             _mark_runtime("add")
 
+        # exact den6 onlineの唯一planをgeneric voxel-edit stateより先に確定する。
+        # 旧経路は全点のPrune/Add/Move状態を構築した後でこのplanに上書きしていた。
+        exact_residual_plan_applied = False
+        exact_residual_plan_debug = {}
+        exact_den6_online = (
+            str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower()
+            == "ana_den6_online"
+        )
+        if (
+            exact_den6_candidate_mode
+            and (
+                exact_den6_online
+                or str(structure.get("octree_input_mode", "")).strip().lower() == "full_cloud"
+            )
+        ):
+            exact_plan_result = self._build_exact_den6_residual_plan(
+                heuristic_guidance,
+                voxel_coords,
+                learned_add_ratio,
+                learned_drop_ratio,
+                learned_move_ratio,
+                drop_prob,
+                move_score,
+                move_logits,
+                exact_add_pair_logits,
+            )
+            if exact_plan_result is not None:
+                exact_plan_coords, exact_residual_plan_debug = exact_plan_result
+                exact_counts = exact_residual_plan_debug.get("selected_counts", {})
+                voxel_edit_final_coords = exact_plan_coords
+                voxel_edit_final_weights = pts_xyz.new_ones((B, 1, int(exact_plan_coords.shape[-1])))
+                voxel_edit_valid_mask = torch.ones(
+                    (B, int(exact_plan_coords.shape[-1])),
+                    device=pts_xyz.device,
+                    dtype=torch.bool,
+                )
+                voxel_edit_debug_list = [{
+                    "initial_count": int(voxel_coords.shape[-1]),
+                    "drop_count": int(exact_counts.get("Prune", 0)),
+                    "add_count": int(exact_counts.get("Add", 0)),
+                    "move_count": int(exact_counts.get("Adjust", 0)),
+                    "same_voxel_move_rejected": 0,
+                    "existing_target_rejected": 0,
+                    "duplicate_target_rejected": 0,
+                    "final_count": int(exact_plan_coords.shape[-1]),
+                    "subtree_prune_count": 0,
+                }]
+                exact_residual_plan_applied = True
+
         hardening_threshold = float(
             getattr(self.args, "operation_count_drop_threshold", getattr(self.args, "test_drop_threshold", 0.5))
         )
         hard_keep_mask = final_w.detach() >= hardening_threshold
-        point_aligned_after_occupied_voxels = self._unique_voxel_count(final_voxel_coords, hard_keep_mask)
+        point_aligned_after_occupied_voxels = (
+            int(exact_plan_coords.shape[-1])
+            if exact_residual_plan_applied
+            else self._unique_voxel_count(final_voxel_coords, hard_keep_mask)
+        )
         # Phase3: Prune/Add/Moveをoccupied voxel集合へ反映した最終Voxel状態を作る。
         # 既存のpts_out/final_wは変更しない。
-        voxel_edit_debug_list = []
+        if not exact_residual_plan_applied:
+            voxel_edit_debug_list = []
         voxel_edit_coords_list = []
         voxel_edit_weights_list = []
 
-        if voxel_edit_state_enabled:
+        if exact_residual_plan_applied:
+            pass
+        elif voxel_edit_state_enabled:
             for b in range(B):
                 coords_b, weights_b, debug_b = self._build_voxel_edit_state_single(
                     voxel_coords_b=voxel_coords[b],
@@ -7427,11 +7596,14 @@ class StructureRepairActuator(nn.Module):
             actual_oracle_raw_percent_value = float(
                 leaf_diag_for_override.get("actual_oracle_raw_percent", 0.0) or 0.0
             )
-        exact_residual_plan_applied = False
-        exact_residual_plan_debug = {}
         if (
+            not exact_residual_plan_applied
+            and
             exact_den6_candidate_mode
-            and str(structure.get("octree_input_mode", "")).strip().lower() == "full_cloud"
+            and (
+                exact_den6_online
+                or str(structure.get("octree_input_mode", "")).strip().lower() == "full_cloud"
+            )
         ):
             exact_plan_result = self._build_exact_den6_residual_plan(
                 heuristic_guidance,
@@ -7710,7 +7882,9 @@ class StructureRepairActuator(nn.Module):
         phase0_noop_only_collapse_detected = bool(
             phase0_network_mode_but_hard_drop_zero or (phase0_network_prune_mode and learned_drop_ratio_value <= 0.0)
         )
-        hard_drop_count_trace = (
+        hard_drop_count_trace = ""
+        if self._should_collect_runtime_debug():
+            hard_drop_count_trace = (
             "codec_prune_prior_phase="
             f"{float(codec_prune_prior_phase):.6g}, "
             f"codec_prune_prior_base_ratio={float(codec_prune_prior_ratio):.6g}, "
@@ -7748,7 +7922,7 @@ class StructureRepairActuator(nn.Module):
             f"final_hard_drop_count={float(last_hard_drop_trace.get('final_hard_drop_count', float(hard_drop_count_value))):.6g}, "
             f"selected_drop_count_hard={float(hard_drop_count_value):.6g}, "
             f"drop_ratio_hard={float(drop_ratio_hard.detach().mean().item()):.6g}"
-        )
+            )
         hard_move_count_value = int(hard_move.detach().sum().item())
         raw_hard_move_count_value = int(raw_hard_move_bool.detach().sum().item())
         adjusted_point_rate_value = float(hard_move_count_value) / max(float(B * N), 1.0)
@@ -8260,7 +8434,7 @@ class StructureRepairActuator(nn.Module):
                 actual_oracle_candidate_where_loss = actual_oracle_candidate_where_loss + drop_oracle_loss
 
             if add_enabled and (actual_oracle_has_add or actual_oracle_has_bad_add):
-                oracle_add_logit = self.add_head(actuator_features)
+                oracle_add_logit = self._run_large_head(self.add_head, actuator_features)
                 oracle_add_logit = self._scale_where_downstream_grad(
                     oracle_add_logit,
                     op_name="add",
@@ -8278,7 +8452,7 @@ class StructureRepairActuator(nn.Module):
                 )
                 add_where_actuator_loss = add_where_actuator_loss + oracle_candidate_weight * add_oracle_loss
                 actual_oracle_candidate_where_loss = actual_oracle_candidate_where_loss + add_oracle_loss
-                oracle_add_direction_logits = self.add_voxel_head(actuator_features)
+                oracle_add_direction_logits = self._run_large_head(self.add_voxel_head, actuator_features)
                 oracle_add_direction_logits = self._scale_where_downstream_grad(
                     oracle_add_direction_logits,
                     op_name="add",
@@ -8333,7 +8507,7 @@ class StructureRepairActuator(nn.Module):
                 move_where_actuator_loss = (
                     move_where_actuator_loss + oracle_candidate_weight * subtree_move_oracle_loss
                 )
-                oracle_move_direction_logits = self.move_voxel_head(actuator_features)
+                oracle_move_direction_logits = self._run_large_head(self.move_voxel_head, actuator_features)
                 oracle_move_direction_logits = self._scale_where_downstream_grad(
                     oracle_move_direction_logits,
                     op_name="move",

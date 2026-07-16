@@ -14,6 +14,9 @@ import shutil
 import subprocess
 import sys
 import time
+import copy
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from collections import OrderedDict
 from pathlib import Path
@@ -22,12 +25,21 @@ from typing import Any, Mapping
 import torch
 
 
-SCHEMA_VERSION = "ana_den6_online_one_pattern_cache_v4"
-SOURCE_NAME = "ana_den6_exact_one_pattern_anchor_online_v4"
+SCHEMA_VERSION = "ana_den6_online_one_pattern_cache_v6"
+SOURCE_NAME = "ana_den6_exact_one_pattern_anchor_online_v6"
 OPERATIONS = ("Add", "Prune", "Adjust")
 _FILE_HASH_CACHE: dict[tuple[str, int, int], str] = {}
 _GLOBAL_PAYLOAD_CACHE: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
-_CACHE_STATS = {"build": 0, "memory_hit": 0, "disk_hit": 0, "invalid": 0}
+_CACHE_STATS = {
+    "build": 0,
+    "memory_hit": 0,
+    "disk_hit": 0,
+    "worker_launch": 0,
+    "validation_failure": 0,
+}
+_PREFETCH_EXECUTOR = None
+_PREFETCH_FUTURES: dict[str, Any] = {}
+_PREFETCH_LOCK = threading.Lock()
 
 
 def _sha256_file(path: Path) -> str:
@@ -201,7 +213,9 @@ def _worker_command(
         "--scale-ae", str(int(getattr(args, "sparsepcgc_scale_ae", 0))),
         "--scale-sr", str(int(getattr(args, "sparsepcgc_scale_sr", 0))),
         "--max-total-ratio", str(float(getattr(args, "heuristic_guidance_online_max_total_ratio", 0.0099))),
-        "--pool-limit-per-operation", str(int(getattr(args, "heuristic_guidance_online_pool_limit", 512))),
+        # den6と同じ全候補順位はworker内だけで作り、永続cacheにはshortlistだけを残す。
+        "--full-pool-limit-per-operation", str(int(getattr(args, "heuristic_guidance_online_full_pool_limit", 0))),
+        "--compact-reserve-factor", str(float(getattr(args, "heuristic_guidance_online_compact_reserve_factor", 1.0))),
         "--output-json", str(output_json),
         "--output-root", str(build_root),
     ]
@@ -229,7 +243,7 @@ def _normalize_worker_payload(
     input_sha256: str,
 ) -> dict[str, Any]:
     """既存workerのJSONをonline Actuator用compact cache形式へ写像する。"""
-    pools = worker_payload.get("ranked_candidate_pools")
+    pools = worker_payload.get("operation_candidate_shortlists")
     initial_plan = worker_payload.get("initial_heuristic_plan")
     if not isinstance(pools, Mapping) or not isinstance(initial_plan, Mapping):
         raise RuntimeError("ana_den6 online workerの候補poolまたはinitial planが不正である")
@@ -259,11 +273,11 @@ def _normalize_worker_payload(
         "operation_shares": dict(worker_payload.get("operation_shares") or {}),
         "operation_heuristics": dict(worker_payload.get("operation_heuristics") or {}),
         "operation_priority": list(worker_payload.get("operation_priority") or ()),
-        "operation_candidate_shortlists": {
-            operation: list(pools[operation]) for operation in OPERATIONS
-        },
+        "operation_candidate_shortlists": {operation: list(pools[operation]) for operation in OPERATIONS},
         "initial_heuristic_plan": dict(initial_plan),
         "anchor_operation_counts": dict(worker_payload.get("anchor_operation_counts") or {}),
+        "shortlist_limits": dict(worker_payload.get("shortlist_limits") or {}),
+        "full_pool_counts": dict(worker_payload.get("full_pool_counts") or {}),
         "baseline_decoder_complete_bits": float(
             worker_payload.get("baseline_decoder_complete_bits", 0.0)
         ),
@@ -273,45 +287,6 @@ def _normalize_worker_payload(
             "worker": float(worker_payload.get("elapsed_sec", 0.0)),
         },
     }
-
-
-def _load_compatible_worker_json(
-    args: Any,
-    *,
-    input_file: Path,
-    input_sha256: str,
-    cache_dir: Path,
-) -> tuple[dict[str, Any], Path] | None:
-    """既存worker JSONのうち、入力とcodec scaleが一致するものだけ再利用する。"""
-    dataset = _dataset_cli_name(getattr(args, "dataname", "8i"))
-    expected_scales = (
-        int(getattr(args, "sparsepcgc_scale_m", 8)),
-        int(getattr(args, "sparsepcgc_scale_ae", 0)),
-        int(getattr(args, "sparsepcgc_scale_sr", 0)),
-    )
-    for path in sorted(cache_dir.glob(f"{dataset}_{input_file.stem}_*.json")):
-        try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
-            if Path(str(raw.get("input_file", ""))).expanduser().resolve() != input_file:
-                continue
-            if str(raw.get("input_sha256", "")) != input_sha256:
-                continue
-            scales = (
-                int(raw.get("scale_m", -1)),
-                int(raw.get("scale_ae", -1)),
-                int(raw.get("scale_sr", -1)),
-            )
-            if scales != expected_scales:
-                continue
-            return _normalize_worker_payload(
-                raw,
-                args=args,
-                input_file=input_file,
-                input_sha256=input_sha256,
-            ), path
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            continue
-    return None
 
 
 def _validate_payload(
@@ -354,6 +329,10 @@ def _validate_payload(
         candidates = shortlists.get(operation)
         if not isinstance(candidates, list) or not candidates:
             raise RuntimeError(f"ana_den6 online cacheの{operation}局所候補が空である")
+        anchor_count = max(int(dict(payload.get("anchor_operation_counts") or {}).get(operation, 0)), 1)
+        limit = int(dict(payload.get("shortlist_limits") or {}).get(operation, 0))
+        if limit <= 0 or len(candidates) > limit or limit < anchor_count:
+            raise RuntimeError(f"ana_den6 online cacheの{operation} shortlist上限が不正である")
 
 
 
@@ -384,8 +363,13 @@ def _torch_load_cache(cache_path: Path) -> Any:
         return torch.load(cache_path, map_location="cpu")
 
 
-def _load_or_build_payload(args: Any) -> dict[str, Any]:
-    input_file = Path(str(getattr(args, "_current_input_file", ""))).expanduser().resolve()
+def _load_or_build_payload(args: Any, input_file_override: Any = None) -> dict[str, Any]:
+    raw_input_file = (
+        input_file_override
+        if input_file_override is not None
+        else getattr(args, "_current_input_file", "")
+    )
+    input_file = Path(str(raw_input_file)).expanduser().resolve()
     if not input_file.is_file():
         raise RuntimeError("ana_den6 onlineでは各Stepのargs._current_input_fileに実在PLYが必要である")
     input_sha256 = _sha256_file(input_file)
@@ -415,28 +399,11 @@ def _load_or_build_payload(args: Any) -> dict[str, Any]:
                 _CACHE_STATS["disk_hit"] += 1
                 print(f"[ana_den6_online] cache hit: {input_file.name} (disk)", flush=True)
             except Exception as exc:
-                _CACHE_STATS["invalid"] += 1
-                invalid = output_cache.with_suffix(output_cache.suffix + f".invalid.{int(time.time())}")
-                output_cache.replace(invalid)
-                print(f"[ana_den6_online] cache invalid: {input_file.name}: {type(exc).__name__}: {exc}; moved={invalid.name}", flush=True)
-
-        if payload is None:
-            legacy = _load_compatible_worker_json(
-                args,
-                input_file=input_file,
-                input_sha256=input_sha256,
-                cache_dir=output_cache.parent,
-            )
-            if legacy is not None:
-                payload, legacy_path = legacy
-                temporary = output_cache.with_suffix(output_cache.suffix + ".tmp")
-                torch.save(payload, temporary)
-                temporary.replace(output_cache)
-                _CACHE_STATS["disk_hit"] += 1
-                print(
-                    f"[ana_den6_online] cache hit: {input_file.name} (worker json: {legacy_path.name})",
-                    flush=True,
-                )
+                _CACHE_STATS["validation_failure"] += 1
+                raise RuntimeError(
+                    "ana_den6 online cache validation failed; 壊れたcacheを黙って削除・再生成しない。"
+                    f" 明示的に確認して削除すること: {output_cache} ({type(exc).__name__}: {exc})"
+                ) from exc
 
         if payload is None:
             worker_json = output_cache.with_suffix(".worker.json")
@@ -448,6 +415,7 @@ def _load_or_build_payload(args: Any) -> dict[str, Any]:
                 worker=worker,
             )
             print(f"[ana_den6_online] 初回frameのden6候補cacheを生成する: {input_file.name}", flush=True)
+            _CACHE_STATS["worker_launch"] += 1
             completed = subprocess.run(command, cwd=str(worker.parent.parent), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False, env=dict(os.environ))
             if completed.returncode != 0:
                 detail = (completed.stderr or completed.stdout or "").strip()[-8000:]
@@ -483,6 +451,70 @@ def _load_or_build_payload(args: Any) -> dict[str, Any]:
         _GLOBAL_PAYLOAD_CACHE.popitem(last=False)
     setattr(args, "_ana_den6_online_cache_stats", dict(_CACHE_STATS))
     return payload
+
+
+def _prefetch_one(args: Any, input_file: str) -> str:
+    worker_args = copy.copy(args)
+    worker_args._current_input_file = str(input_file)
+    input_path = Path(str(input_file)).expanduser().resolve()
+    input_sha256 = _sha256_file(input_path)
+    cache_path = _cache_file(worker_args, input_path, input_sha256)
+    # A cache miss used to launch a full ana_den6 GPU process from every
+    # prefetch thread.  Two such workers could overlap the training model and
+    # the actual-codec worker, causing the delayed ~40 GB spike.  Existing
+    # caches are still loaded ahead on CPU; a missing cache is built once,
+    # synchronously when that frame is consumed, unless explicitly requested.
+    if (
+        not cache_path.is_file()
+        and not bool(getattr(worker_args, "heuristic_guidance_online_prefetch_build_missing", False))
+    ):
+        return ""
+    payload = _load_or_build_payload(worker_args, input_file_override=input_file)
+    return str(payload.get("cache_path", ""))
+
+
+def prefetch_ana_den6_online_guidance(args: Any, input_files: Any) -> dict[str, int]:
+    """Build the exact per-frame cache ahead of its synchronous train step."""
+    global _PREFETCH_EXECUTOR
+    mode = str(getattr(args, "heuristic_guidance_mode", "")).strip().lower()
+    workers = max(int(getattr(args, "heuristic_guidance_online_prefetch_workers", 0)), 0)
+    if mode != "ana_den6_online" or workers <= 0 or int(getattr(args, "max_train_steps", 0)) > 0:
+        return {"submitted": 0, "pending": 0, "done": 0}
+
+    submitted = 0
+    with _PREFETCH_LOCK:
+        if _PREFETCH_EXECUTOR is None:
+            _PREFETCH_EXECUTOR = ThreadPoolExecutor(
+                max_workers=workers,
+                thread_name_prefix="ana_den6_prefetch",
+            )
+        for raw_path in input_files:
+            path = str(Path(str(raw_path)).expanduser().resolve())
+            if path in _PREFETCH_FUTURES:
+                continue
+            _PREFETCH_FUTURES[path] = _PREFETCH_EXECUTOR.submit(_prefetch_one, args, path)
+            submitted += 1
+        done = sum(int(future.done()) for future in _PREFETCH_FUTURES.values())
+        pending = len(_PREFETCH_FUTURES) - done
+    return {"submitted": submitted, "pending": pending, "done": done}
+
+
+def shutdown_ana_den6_online_prefetch(*, wait: bool = True) -> None:
+    global _PREFETCH_EXECUTOR
+    with _PREFETCH_LOCK:
+        executor = _PREFETCH_EXECUTOR
+        _PREFETCH_EXECUTOR = None
+        futures = list(_PREFETCH_FUTURES.values())
+        _PREFETCH_FUTURES.clear()
+    for future in futures:
+        if not future.running():
+            future.cancel()
+    if executor is not None:
+        try:
+            executor.shutdown(wait=bool(wait), cancel_futures=True)
+        except TypeError:
+            # Python 3.8's ThreadPoolExecutor has no cancel_futures keyword.
+            executor.shutdown(wait=bool(wait))
 
 
 def attach_ana_den6_online_guidance(

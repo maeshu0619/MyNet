@@ -10,12 +10,22 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass
+import math
 from typing import Any, Dict, Mapping
 
 import torch
 
 
 _EXACT_GUIDANCE_CACHE: "OrderedDict[tuple[str, str, str, int], Dict[str, Any]]" = OrderedDict()
+
+
+def release_exact_guidance_cache(args: Any = None) -> None:
+    """Release mapped per-step guidance without changing its CPU manifest."""
+    _EXACT_GUIDANCE_CACHE.clear()
+    if args is not None:
+        cache = getattr(args, "_ana_den6_exact_tensor_guidance_cache", None)
+        if isinstance(cache, dict):
+            cache.clear()
 
 
 @dataclass(frozen=True)
@@ -183,7 +193,11 @@ def _exact_den6_guidance(
         "ana_den6_exact_ranked_candidate_pool_v2",
         "ana_den6_exact_ranked_candidate_pool_online_v1",
         "ana_den6_exact_compact_candidate_shortlist_online_v3",
+        "ana_den6_exact_compact_candidate_shortlist_online_v5",
         "ana_den6_exact_one_pattern_anchor_online_v4",
+        "ana_den6_exact_one_pattern_anchor_online_v5",
+        "ana_den6_exact_unique_plan_online_v6",
+        "ana_den6_exact_one_pattern_anchor_online_v6",
     }:
         raise RuntimeError("ana_den6 exact candidate guidance sourceが不正である")
     coords = _normalize_coords_b3n(structure.get("global_voxel_coords"), like)
@@ -194,12 +208,36 @@ def _exact_den6_guidance(
 
     # den6 Heuristicはframe固定であり学習graphを持たない。
     # 同一frame・同一deviceでは座標辞書作成と候補写像を再実行せず、そのまま再利用する。
-    cache_signature = str(exact.get("cache_signature", exact.get("input_voxel_hash", "")))
+    # Different manifests for the same voxel count must never share a mapped
+    # candidate tensor.  The prior key used only input_voxel_hash and could
+    # return a stale v2/v4 payload after a v5 cache refresh.
+    cache_signature = str(exact.get("cache_signature", "")).strip()
+    if not cache_signature:
+        cache_signature = "|".join(
+            str(exact.get(name, ""))
+            for name in (
+                "source",
+                "schema_version",
+                "input_sha256",
+                "input_voxel_hash",
+                "manifest_sha256",
+                "den5_sha256",
+                "den6_sha256",
+            )
+        )
     cache_key = (cache_signature, str(like.device), str(like.dtype), int(coords.shape[-1]))
     cached_guidance = _EXACT_GUIDANCE_CACHE.get(cache_key)
     if isinstance(cached_guidance, dict):
         _EXACT_GUIDANCE_CACHE.move_to_end(cache_key)
         return cached_guidance
+
+    # online/residual training visits a different full-cloud frame every step.
+    # Keeping mapped CUDA tensors for old frames cannot produce a cache hit in
+    # the current step and used several GiB per frame.  Drop the previous frame
+    # *before* allocating the next one, while retaining same-frame reuse above.
+    mode = str(getattr(args, "heuristic_guidance_mode", "proxy_prior")).strip().lower()
+    if mode in {"ana_den6_online", "ana_den6_residual"}:
+        _EXACT_GUIDANCE_CACHE.clear()
 
     pools = exact.get("operation_candidate_shortlists")
     if not isinstance(pools, Mapping):
@@ -246,7 +284,15 @@ def _exact_den6_guidance(
                 if not isinstance(candidate, Mapping):
                     continue
                 rank = int(candidate.get("pool_rank", fallback_rank))
-                rank_score = _rank_value(rank, pool_size)
+                # compact cacheでは元のden6 pool順位を保持したscoreを使う。
+                # shortlist長で再正規化するとStep 0の順位が変わってしまう。
+                raw_rank_score = candidate.get("rank_score", None)
+                try:
+                    rank_score = float(raw_rank_score)
+                except (TypeError, ValueError):
+                    rank_score = _rank_value(rank, pool_size)
+                if not math.isfinite(rank_score):
+                    rank_score = _rank_value(rank, pool_size)
                 remove_coords = [tuple(int(v) for v in coord) for coord in candidate.get("remove_coords", ())]
                 add_coords = [tuple(int(v) for v in coord) for coord in candidate.get("add_coords", ())]
                 mapped_this = False
@@ -377,8 +423,15 @@ def _exact_den6_guidance(
         },
         "where_prior_mean": {},
         "formula_basis": (
-            "ana_den6_exact_one_pattern_anchor_online_v4"
-            if str(exact.get("source", "")) == "ana_den6_exact_one_pattern_anchor_online_v4"
+            str(exact.get("source", ""))
+            if str(exact.get("source", ""))
+            in {
+                "ana_den6_exact_one_pattern_anchor_online_v4",
+                "ana_den6_exact_one_pattern_anchor_online_v5",
+                "ana_den6_exact_compact_candidate_shortlist_online_v5",
+                "ana_den6_exact_unique_plan_online_v6",
+                "ana_den6_exact_one_pattern_anchor_online_v6",
+            }
             else "ana_den6_exact_ranked_editcandidate_pool_online_v1"
             if str(exact.get("source", "")) == "ana_den6_exact_ranked_candidate_pool_online_v1"
             else "ana_den6_exact_ranked_editcandidate_pool_v2"
@@ -522,6 +575,10 @@ def build_heuristic_guidance(structure: Mapping[str, Any], args: Any) -> Dict[st
         if isinstance(cached, dict):
             cache.move_to_end(cache_key)
             return cached
+        # The next sequential frame cannot reuse the previous frame's mapped
+        # CUDA guidance.  Clear it before constructing the replacement so peak
+        # memory never contains both full-cloud mappings at once.
+        cache.clear()
         guidance = _exact_den6_guidance(structure, args, like, exact)
         cache[cache_key] = guidance
         cache.move_to_end(cache_key)

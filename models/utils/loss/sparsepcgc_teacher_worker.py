@@ -142,11 +142,38 @@ def _build_encoder(args: argparse.Namespace):
         # サイズへ上書きするため、worker境界でlogical値を復元して両者を分離する。
         original_normalize = encoder_multiple._normalize_result
 
-        def normalize_with_den6_logical_rate(result, input_file, output_dir, bin_paths, dec_paths, normalize_args):
-            normalized = original_normalize(result, input_file, output_dir, bin_paths, dec_paths, normalize_args)
-            logical_bits = float(result.get("file_size", normalized.get("file_size", 0.0)))
+        def normalize_with_den6_logical_rate(
+            result,
+            input_file,
+            output_dir,
+            bin_paths,
+            dec_paths,
+            normalize_args,
+            input_stats=None,
+        ):
+            normalized = original_normalize(
+                result,
+                input_file,
+                output_dir,
+                bin_paths,
+                dec_paths,
+                normalize_args,
+                input_stats=input_stats,
+            )
             main_bits = float(normalized.get("file_size", 0.0))
+            # LossyCoderDense.test adds four decoder-side bits per downscale
+            # stage.  Some encoder_multiple revisions expose only the packed
+            # main-bin count in result["file_size"], so retain the den6 lower
+            # bound even in that revision.
+            decoder_side_bits = 4.0 * float(
+                max(int(args.scale_sr), 0) + max(int(args.scale_ae), 0)
+            )
+            logical_bits = max(
+                float(result.get("file_size", normalized.get("file_size", 0.0))),
+                main_bits + decoder_side_bits,
+            )
             normalized["main_bin_bits"] = main_bits
+            normalized["decoder_side_stage_bits"] = decoder_side_bits
             normalized["logical_file_size"] = logical_bits
             normalized["side_information_bits"] = max(logical_bits - main_bits, 0.0)
             normalized["file_size"] = logical_bits
@@ -266,6 +293,17 @@ def main() -> int:
                     exact_teacher_fallback_reason=str(request.get("exact_teacher_fallback_reason", "")),
                 )
 
+            # The encoder model remains resident for the next request, but its
+            # convolution workspaces do not.  Return only those unused blocks
+            # before the main process starts backward; values and model state
+            # are unchanged and worker startup is still paid only once.
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+
             gpu_after = {}
             if bool(args.gpu_stats):
                 gpu_after = _collect_cuda_stats("sparsepcgc_worker_after")
@@ -325,6 +363,8 @@ def main() -> int:
                     )
 
             _emit({"status": "ok", "request_id": request_id, "result": result})
+            if bool(request.get("exit_after_response", False)):
+                return 0
         except Exception as exc:
             _emit(
                 {

@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 
 CAUSE_NAMES = (
@@ -39,7 +40,21 @@ class CostAttributionModule(nn.Module):
 
         input_mode = "node_voxel" if bool(getattr(self, "node_voxel_mode", False)) else "point"
 
-        logits = self.net(features)
+        if self.training and bool(getattr(self, "activation_checkpointing", False)):
+            # PyTorch 1.11's experimental non-reentrant implementation keeps
+            # the recomputed full-cloud graph alive after backward.  The
+            # established reentrant path releases it correctly.  The scalar
+            # dummy keeps parameter gradients enabled when features are an
+            # intentionally detached input; it is not used in the arithmetic.
+            dummy = features.new_zeros((), requires_grad=True)
+            logits = checkpoint(
+                lambda value, _dummy: self.net(value),
+                features,
+                dummy,
+                use_reentrant=True,
+            )
+        else:
+            logits = self.net(features)
 
         # ============================================================
         # Phase4:
@@ -55,7 +70,11 @@ class CostAttributionModule(nn.Module):
 
         scores = torch.softmax(logits, dim=1)
 
-        if torch.is_grad_enabled():
+        # These reductions are diagnostics only.  On a full 8i frame they
+        # launch several extra kernels over ~0.8M nodes and force the results
+        # to stay alive until the end of the step.  Network.forward toggles
+        # this flag only for an explicitly requested debug/profile step.
+        if torch.is_grad_enabled() and bool(getattr(self, "collect_runtime_debug", False)):
             score_entropy = -(
                 scores.clamp_min(1e-8).log()
                 * scores
@@ -67,6 +86,13 @@ class CostAttributionModule(nn.Module):
                 "cause_entropy": score_entropy.detach(),
                 "logits_abs_mean": logits.detach().abs().mean(),
                 "logits_abs_max": logits.detach().abs().max(),
+                "scores_requires_grad": bool(scores.requires_grad),
+                "logits_requires_grad": bool(logits.requires_grad),
+                "input_mode": input_mode,
+                "input_shape": tuple(features.shape),
+            }
+        elif not bool(getattr(self, "collect_runtime_debug", False)):
+            self.debug_tensors = {
                 "scores_requires_grad": bool(scores.requires_grad),
                 "logits_requires_grad": bool(logits.requires_grad),
                 "input_mode": input_mode,

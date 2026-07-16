@@ -202,13 +202,58 @@ class OctreeStructureAnalysis(nn.Module):
         safe_pos = pos.clamp(max=max(int(reference_keys.numel()) - 1, 0))
         return in_bounds & (reference_keys[safe_pos] == query_keys)
 
+    def _neighbor_occupancy_chunked(self, coords, unique_coords=None):
+        """Compute the exact 26-neighbour occupancy with bounded workspace.
+
+        The previous implementation materialised all ``N * 26 * 3`` int64
+        coordinates and then copied them again while building membership keys.
+        Chunking changes only evaluation order: every queried coordinate and
+        the float32 mean over the same 26 booleans remain identical.
+        """
+        if coords.numel() == 0:
+            return coords.new_zeros((0,), dtype=torch.float32)
+        coords = coords.to(dtype=torch.long)
+        if unique_coords is None:
+            unique_coords = torch.unique(coords, dim=0, sorted=True)
+        else:
+            unique_coords = unique_coords.to(device=coords.device, dtype=torch.long)
+
+        offsets = self.neighbor_offsets.to(device=coords.device, dtype=torch.long)
+        key_mins = unique_coords.amin(dim=0) - 1
+        key_spans = (
+            unique_coords.amax(dim=0) - unique_coords.amin(dim=0) + 3
+        ).to(torch.long).clamp_min(1)
+        occupied_keys = torch.sort(
+            self._coord_keys(unique_coords, key_mins, key_spans)
+        ).values
+        chunk_size = max(
+            int(getattr(self.args, "structure_neighbor_query_chunk", 32768)),
+            1,
+        )
+        result = torch.empty(
+            (coords.shape[0],), device=coords.device, dtype=torch.float32
+        )
+        for start in range(0, int(coords.shape[0]), chunk_size):
+            end = min(start + chunk_size, int(coords.shape[0]))
+            targets = coords[start:end, None, :] + offsets.view(1, -1, 3)
+            query_keys = self._coord_keys(
+                targets.reshape(-1, 3), key_mins, key_spans
+            )
+            pos = torch.searchsorted(occupied_keys, query_keys)
+            in_bounds = pos < occupied_keys.numel()
+            safe_pos = pos.clamp(max=max(int(occupied_keys.numel()) - 1, 0))
+            occupied = (
+                in_bounds & (occupied_keys[safe_pos] == query_keys)
+            ).view(end - start, -1)
+            result[start:end] = occupied.to(torch.float32).mean(dim=1)
+        return result
+
     def _quantized_voxel_stats(self, pts_xyz, qs_override, snap_delta_norm):
         B, _, N = pts_xyz.shape
         if N <= 0:
             return pts_xyz.new_zeros((B, 4, N))
         qs = qs_override.to(device=pts_xyz.device, dtype=pts_xyz.dtype).view(B, 1, 1).clamp_min(1e-9)
         coords = torch.round(pts_xyz / qs).to(torch.long)
-        offsets = self.neighbor_offsets.to(device=pts_xyz.device, dtype=torch.long)
         stats = []
         for b in range(B):
             coord_b = coords[b].transpose(0, 1).contiguous()
@@ -221,16 +266,10 @@ class OctreeStructureAnalysis(nn.Module):
             point_counts = counts.index_select(0, inverse).clamp_min(1.0)
             merge_pressure = ((point_counts - 1.0) / point_counts).view(1, N)
             density = self._normalize_pointwise(point_counts.view(1, 1, N)).view(1, N).clamp(0.0, 4.0) / 4.0
-            targets = coord_b[:, None, :] + offsets.view(1, -1, 3)
-            key_mins = unique_coords.amin(dim=0) - 1
-            key_spans = (unique_coords.amax(dim=0) - unique_coords.amin(dim=0) + 3).to(torch.long).clamp_min(1)
-            occupied_keys = torch.sort(self._coord_keys(unique_coords.to(torch.long), key_mins, key_spans)).values
-            query_keys = self._coord_keys(targets.reshape(-1, 3).to(torch.long), key_mins, key_spans)
-            pos = torch.searchsorted(occupied_keys, query_keys)
-            in_bounds = pos < occupied_keys.numel()
-            safe_pos = pos.clamp(max=max(int(occupied_keys.numel()) - 1, 0))
-            occupied = (in_bounds & (occupied_keys[safe_pos] == query_keys)).view(N, -1)
-            neighbor_empty = (1.0 - occupied.to(dtype=pts_xyz.dtype).mean(dim=1)).view(1, N)
+            neighbor_occ = self._neighbor_occupancy_chunked(
+                coord_b, unique_coords=unique_coords
+            ).to(dtype=pts_xyz.dtype)
+            neighbor_empty = (1.0 - neighbor_occ).view(1, N)
             quant_residual = (
                 torch.linalg.norm(snap_delta_norm[b], dim=0, keepdim=True) / (3.0 ** 0.5)
             ).clamp(0.0, 1.0)
@@ -709,12 +748,29 @@ class OctreeStructureAnalysis(nn.Module):
                 continue
 
             parent_coords = torch.div(coords_n3, 2, rounding_mode="floor")
-            unique_parents, inverse = torch.unique(
-                parent_coords,
-                dim=0,
-                sorted=True,
-                return_inverse=True,
+            parent_cache = getattr(self, "_active_canonical_parent_cache", None)
+            can_reuse_parent_partition = bool(
+                b == 0
+                and B == 1
+                and isinstance(parent_cache, dict)
+                and torch.is_tensor(parent_cache.get("unique_parents"))
+                and torch.is_tensor(parent_cache.get("inverse"))
+                and int(parent_cache["inverse"].numel()) == int(coords_n3.shape[0])
             )
+            if can_reuse_parent_partition:
+                # The cache was produced earlier in this same forward from the
+                # same canonical global_voxel_coords.  Only the partition is
+                # shared; child-slot convention and all following arithmetic
+                # remain exactly as before.
+                unique_parents = parent_cache["unique_parents"]
+                inverse = parent_cache["inverse"]
+            else:
+                unique_parents, inverse = torch.unique(
+                    parent_coords,
+                    dim=0,
+                    sorted=True,
+                    return_inverse=True,
+                )
 
             child_slot = (
                 (coords_n3[:, 0] & 1)
@@ -1436,11 +1492,27 @@ class OctreeStructureAnalysis(nn.Module):
                 f"but got {tuple(coords.shape)}. "
                 "Normalize global_voxel_coords with _normalize_global_coords_n3() before calling this function."
             )
+        # During a canonical full-cloud forward this exact 26-neighbour map is
+        # consumed by both _prebuilt_octree_context and
+        # _quantized_voxel_stats_from_tree.  Reuse the first result inside the
+        # same forward; it is a deterministic, detached integer-coordinate
+        # calculation and has no autograd graph.
+        active = getattr(self, "_active_canonical_neighbor_cache", None)
+        if isinstance(active, dict) and active.get("allow_read", False):
+            cached = active.get("value")
+            if torch.is_tensor(cached) and int(cached.numel()) == int(coords.shape[0]):
+                return cached
+
         unique_coords = torch.unique(coords, dim=0, sorted=True)
-        offsets = self.neighbor_offsets.to(device=coords.device, dtype=torch.long)
-        targets = coords[:, None, :] + offsets.view(1, -1, 3)
-        occupied = self._coords_membership(targets.reshape(-1, 3), unique_coords).view(coords.shape[0], -1)
-        return occupied.to(dtype=torch.float32).mean(dim=1)
+        result = self._neighbor_occupancy_chunked(
+            coords, unique_coords=unique_coords
+        )
+        active = getattr(self, "_active_canonical_neighbor_cache", None)
+        if isinstance(active, dict) and active.get("allow_write", False):
+            active["value"] = result
+            active["allow_write"] = False
+            active["allow_read"] = True
+        return result
 
     def _quantized_voxel_stats_from_tree(self, pts_xyz, global_coords, qs_override, snap_delta_norm):
         B, _, N = pts_xyz.shape
@@ -1513,6 +1585,14 @@ class OctreeStructureAnalysis(nn.Module):
         
         parent_coords = torch.div(coords, 2, rounding_mode="floor")
         unique_parents, inverse = torch.unique(parent_coords, dim=0, sorted=True, return_inverse=True)
+        # _leaf_pattern_diagnosis_from_coords receives these same canonical
+        # coordinates later in this forward.  Sharing the parent partition
+        # removes a second large torch.unique without changing child slots,
+        # occupancy codes, targets, or gradients.
+        self._active_canonical_parent_cache = {
+            "unique_parents": unique_parents,
+            "inverse": inverse,
+        }
         child_index = ((coords[:, 0] & 1) * 4 + (coords[:, 1] & 1) * 2 + (coords[:, 2] & 1)).to(torch.long)
         occupancy = torch.zeros((unique_parents.shape[0], 8), device=device, dtype=torch.bool)
         occupancy[inverse, child_index] = True
@@ -1609,6 +1689,14 @@ class OctreeStructureAnalysis(nn.Module):
     ):
         if pts_xyz.ndim != 3 or pts_xyz.shape[1] != 3:
             raise ValueError("pts_xyz must have shape [B, 3, N]")
+
+        # Per-forward only.  Never reuse a neighbour map across frames.
+        self._active_canonical_neighbor_cache = {
+            "allow_write": True,
+            "allow_read": False,
+            "value": None,
+        }
+        self._active_canonical_parent_cache = None
 
         input_dtype = pts_xyz.dtype
         work_xyz = pts_xyz.float() if pts_xyz.dtype in (torch.float16, torch.bfloat16) else pts_xyz

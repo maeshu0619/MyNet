@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import time
 from collections import OrderedDict
+from contextlib import nullcontext
 
 from .encoder.point_trans import PointTransformer
 from .utils.pointcloud import utils_repkpu
@@ -15,7 +16,7 @@ from .utils.pointcloud.sparsepcgc_voxel import (
 )
 from .utils.pointcloud.ana_den6_reference import attach_ana_den6_reference_anchor
 from .utils.pointcloud.ana_den6_online import attach_ana_den6_online_guidance
-from .modules.heuristic_guidance import build_heuristic_guidance
+from .modules.heuristic_guidance import build_heuristic_guidance, release_exact_guidance_cache
 from .modules.cause_aggregation import CauseDiagnosisAggregation
 from .modules.cost_attribution import CAUSE_NAMES, CostAttributionModule
 from .modules.octree_structure import OctreeStructureAnalysis
@@ -42,8 +43,13 @@ class Network(nn.Module):
         self.args = args
         self.writer = writer
         self.args.encoder_input_dim = 1 if bool(getattr(self.args, "encoder_sparse_tensor", True)) else 3 # Encoderに入力する特徴次元を決めている。encoder_sparse_tensor=TrueならSparse Tensor用に1次元特徴
-        self.cache_enabled = False # 入力キャッシュの初期化
-        self.input_cache = {} # 入力キャッシュ用の辞書
+        # Full-cloud Node/Voxel input is a deterministic function of the GT
+        # voxel context.  Keep this separate from trainable features so it is
+        # safe to reuse across episodes without retaining an autograd graph.
+        self.cache_enabled = bool(getattr(self.args, "cache_frozen_inputs", True))
+        self.input_cache = OrderedDict()
+        self._input_cache_bytes = 0
+        self._input_cache_working_set_bypassed = 0
         self.expected_input_cache_entries = 0 # 想定されるキャッシュ数を初期化
         self.debug_tensors = {} # デバッグ用のテンソルを保存
         self.last_structure_debug = {} # 直近Forward時の構造診断デバッグ情報を保存する辞書の初期化
@@ -108,20 +114,153 @@ class Network(nn.Module):
 
     """キャッシュ関係の互換関数"""
     def input_cache_stats(self): # 入力キャッシュの状態を返す関数
-        return {"entries": 0, "bytes": 0, "max_entries": 0, "max_bytes": 0}
+        max_entries, max_bytes = self._input_cache_limits()
+        return {
+            "entries": len(self.input_cache),
+            "bytes": int(self._input_cache_bytes),
+            "max_entries": int(max_entries),
+            "max_bytes": int(max_bytes),
+            "working_set_bypassed": int(getattr(self, "_input_cache_working_set_bypassed", 0)),
+        }
 
     def set_expected_input_cache_entries(self, total_entries): # 想定されるキャッシュ件数を設定する関数
         self.expected_input_cache_entries = max(int(total_entries), 0)
 
     def estimate_input_cache_capacity_entries(self): # 入力キャッシュに何件保存できるか見積もる関数
-        return 0
+        max_entries, max_bytes = self._input_cache_limits()
+        if max_entries <= 0:
+            return 0
+        if not self.input_cache or max_bytes <= 0:
+            return int(max_entries)
+        average_bytes = max(int(self._input_cache_bytes) // len(self.input_cache), 1)
+        return max(0, min(int(max_entries), int(max_bytes) // average_bytes))
 
     def clear_input_cache(self): # 入力キャッシュを空にする関数
         self.input_cache.clear()
+        self._input_cache_bytes = 0
+
+    def release_step_transient_state(self):
+        """Release tensors that are only needed until the current optimizer step.
+
+        These fields are diagnostic/bridge references, not model parameters or
+        reusable input caches.  Keeping them on the module makes the previous
+        full-cloud output survive while Python evaluates the next forward,
+        unnecessarily increasing the CUDA peak without affecting learning.
+        """
+        self.debug_tensors = {}
+        self.last_actuator_voxel_state = None
+        self.last_actuator_soft_terms = {}
+        release_exact_guidance_cache(self.args)
+        for module in (self.actuator, self.cost_attributor, self.policy_module):
+            if hasattr(module, "debug_tensors"):
+                module.debug_tensors = {}
+        try:
+            setattr(self.args, "_last_actuator_voxel_state", None)
+            setattr(self.args, "_last_actuator_soft_terms", {})
+            setattr(self.args, "_full_cloud_canonical_context", None)
+        except Exception:
+            pass
 
     def disable_input_cache(self): # 入力キャッシュを無効化する関数
         self.cache_enabled = False
         self.clear_input_cache()
+
+    def _input_cache_limits(self):
+        max_entries = max(int(getattr(self.args, "cache_max_entries", 0)), 0)
+        max_memory_mb = max(int(getattr(self.args, "cache_max_memory_mb", 0)), 0)
+        return max_entries, max_memory_mb * 1024 * 1024
+
+    @staticmethod
+    def _input_cache_value_bytes(value):
+        if torch.is_tensor(value):
+            return int(value.numel()) * int(value.element_size())
+        if isinstance(value, dict):
+            return sum(Network._input_cache_value_bytes(item) for item in value.values())
+        if isinstance(value, (list, tuple)):
+            return sum(Network._input_cache_value_bytes(item) for item in value)
+        return 0
+
+    def _static_node_cache_key(self, cache_key, source):
+        if not cache_key:
+            return ""
+        # Include every coordinate convention that can change a voxel-derived
+        # input.  The file cache key already identifies the source PLY.
+        return "|".join((
+            "static_node_input_v1",
+            str(cache_key),
+            str(source),
+            str(getattr(self.args, "qs", 2)),
+            str(getattr(self.args, "sparsepcgc_voxel_size", 1.0)),
+            str(getattr(self.args, "sparsepcgc_pos_quantscale", 1)),
+            str(getattr(self.args, "sparsepcgc_quant_mode", "round_voxel_then_pos")),
+            str(getattr(self.args, "sparsepcgc_dequantize_center", False)),
+            str(getattr(self.args, "fused_feat_dim", getattr(self.args, "out_dim", 64))),
+        ))
+
+    def _get_static_node_cache(self, cache_key, source, device):
+        if not self.cache_enabled:
+            return None
+        key = self._static_node_cache_key(cache_key, source)
+        if not key:
+            return None
+        entry = self.input_cache.get(key)
+        if not isinstance(entry, dict):
+            return None
+        state = entry.get("state")
+        if not isinstance(state, dict):
+            return None
+        # Cached states are immutable detached tensors.  The normal forward
+        # path never writes them in-place, so returning the GPU tensors avoids
+        # a second full-cloud device copy on every episode.
+        for value in state.values():
+            if torch.is_tensor(value) and value.device != device:
+                return None
+        self.input_cache.move_to_end(key)
+        return state
+
+    def _put_static_node_cache(self, cache_key, source, state):
+        if not self.cache_enabled or not isinstance(state, dict):
+            return
+        key = self._static_node_cache_key(cache_key, source)
+        max_entries, max_bytes = self._input_cache_limits()
+        if not key or max_entries <= 0 or max_bytes <= 0:
+            return
+        cached_state = {
+            name: value.detach() if torch.is_tensor(value) else value
+            for name, value in state.items()
+        }
+        entry_bytes = self._input_cache_value_bytes(cached_state)
+        # Do not evict the whole useful cache for a frame that cannot fit.
+        if entry_bytes > max_bytes:
+            return
+        # Training scans every frame sequentially and revisits it only in the
+        # next episode.  If the complete working set cannot fit, an LRU of
+        # these large GPU tensors has zero reuse: the early frames evict the
+        # late frames before either can be hit.  Bypass that provably
+        # thrashing cache.  This changes neither inputs nor arithmetic; it
+        # only avoids retaining several GB of unreachable tensors.
+        expected_entries = max(int(getattr(self, "expected_input_cache_entries", 0)), 0)
+        capacity_by_bytes = int(max_bytes // max(entry_bytes, 1))
+        effective_capacity = min(int(max_entries), int(capacity_by_bytes))
+        if expected_entries > 0 and effective_capacity < expected_entries:
+            self._input_cache_working_set_bypassed = int(
+                getattr(self, "_input_cache_working_set_bypassed", 0)
+            ) + 1
+            if self.input_cache:
+                self.clear_input_cache()
+            return
+        old = self.input_cache.pop(key, None)
+        if isinstance(old, dict):
+            self._input_cache_bytes -= int(old.get("bytes", 0) or 0)
+        self.input_cache[key] = {"state": cached_state, "bytes": int(entry_bytes)}
+        self._input_cache_bytes += int(entry_bytes)
+        while self.input_cache and (
+            len(self.input_cache) > max_entries or self._input_cache_bytes > max_bytes
+        ):
+            _, removed = self.input_cache.popitem(last=False)
+            if isinstance(removed, dict):
+                self._input_cache_bytes -= int(removed.get("bytes", 0) or 0)
+        self._input_cache_bytes = max(int(self._input_cache_bytes), 0)
 
     # def warmup_frozen_input(self, pts_xyz, cache_key=None, coord_scale=None): # 旧実装で、固定入力特徴を事前計算してキャッシュするための関数
     #     return None
@@ -198,7 +337,10 @@ class Network(nn.Module):
         )
 
     def _timing_enabled(self): # Forward内で処理時間を測定するか否かの判定
-        return bool(getattr(self.args, "debug_timing", False))
+        return bool(
+            getattr(self.args, "debug_timing", False)
+            or getattr(self.args, "_profile_runtime_this_step", False)
+        )
 
     @staticmethod
     def _sync_if_cuda_tensor(tensor): # 入力テンソルがCUDA上にある場合だけ、GPU処理を同期する関数
@@ -533,6 +675,7 @@ class Network(nn.Module):
     def _build_node_voxel_input(
         self,
         pts_xyz,
+        cache_key=None,
         coord_scale=None,
         subtree_tree=None,
         full_octree_context=None,
@@ -550,6 +693,7 @@ class Network(nn.Module):
             "network_voxel_node_count": 0,
             "network_voxel_node_source": "none",
             "network_voxel_node_feature_shape": "",
+            "network_voxel_node_cache_hit": False,
         }
 
         if not bool(getattr(self.args, "network_voxel_node_input", False)):
@@ -588,6 +732,30 @@ class Network(nn.Module):
             )
             if coords_raw is not None:
                 source = "full_octree_context"
+
+        # Only full-cloud canonical inputs are invariant across train steps.
+        # Subtree contexts deliberately remain uncached because their selected
+        # membership can change between steps.
+        if source == "full_octree_context" and subtree_tree is None:
+            cached_state = self._get_static_node_cache(
+                cache_key,
+                source,
+                pts_xyz.device,
+            )
+            if cached_state is not None:
+                cached_debug = dict(debug)
+                cached_debug.update(
+                    {
+                        "network_voxel_node_input_used": True,
+                        "network_voxel_node_fallback": False,
+                        "network_voxel_node_fallback_reason": "",
+                        "network_voxel_node_count": int(cached_state["node_xyz"].shape[-1]),
+                        "network_voxel_node_source": "full_octree_context_cache",
+                        "network_voxel_node_feature_shape": str(tuple(cached_state["node_features"].shape)),
+                        "network_voxel_node_cache_hit": True,
+                    }
+                )
+                return cached_state, cached_debug
 
         meta = None
         if coords_raw is None:
@@ -686,7 +854,7 @@ class Network(nn.Module):
             }
         )
 
-        return {
+        state = {
             "voxel_coords": voxel_coords,
             "node_xyz": node_xyz,
             "node_features": node_features,
@@ -697,7 +865,11 @@ class Network(nn.Module):
             "restore_meta": restore_meta,
             "restore_info": restore_info,
             "source": str(source),
-        }, debug
+        }
+        if source == "full_octree_context" and subtree_tree is None:
+            self._put_static_node_cache(cache_key, source, state)
+            debug["network_voxel_node_cache_hit"] = False
+        return state, debug
 
     """Encoder用関数"""
     def _voxel_downsample_single(self, pts_xyz, coord_scale): # 1つの点群サンプルに対して、Voxel DownSamplingを行う関数
@@ -1241,6 +1413,18 @@ class Network(nn.Module):
         巨大なNetwork/Actuator forwardを実測済みvoxel stateのセットだけに短絡する。
         actual候補encodeとshadow subtreeの学習経路はそのまま残す。
         """
+        guidance_mode = str(
+            getattr(self.args, "heuristic_guidance_mode", "")
+        ).strip().lower()
+        if guidance_mode == "ana_den6_online":
+            if isinstance(full_octree_context, dict) and any(
+                key.startswith("actual_oracle_")
+                for key in full_octree_context
+            ):
+                raise RuntimeError(
+                    "ana_den6_onlineにlegacy actual-oracle contextが混入した。"
+                )
+            return None
         if not bool(getattr(self.args, "fast_full_cloud_oracle_anchor", True)):
             return None
         if compute_internal_losses is not False:
@@ -1355,6 +1539,21 @@ class Network(nn.Module):
             raise ValueError("pts_xyz must have shape [B, 3, N]")
 
         self.last_actuator_voxel_state = None
+        collect_runtime_debug = self._should_collect_runtime_debug()
+        # CostAttribution/Policy used to calculate several full-cloud
+        # reductions unconditionally merely to populate debug dictionaries.
+        # Keep those diagnostics available when requested without charging
+        # every training step for them.
+        self.cost_attributor.collect_runtime_debug = bool(collect_runtime_debug)
+        self.policy_module.collect_runtime_debug = bool(collect_runtime_debug)
+        checkpoint_full_cloud_heads = bool(
+            self.training
+            and getattr(self.args, "full_cloud_activation_checkpoint", True)
+            and str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower()
+            == "ana_den6_online"
+        )
+        self.cost_attributor.activation_checkpointing = checkpoint_full_cloud_heads
+        self.policy_module.activation_checkpointing = checkpoint_full_cloud_heads
         original_pts_xyz = pts_xyz
         original_pts_attr = pts_attr
         node_voxel_input_state = None
@@ -1366,6 +1565,7 @@ class Network(nn.Module):
             "network_voxel_node_count": 0,
             "network_voxel_node_source": "none",
             "network_voxel_node_feature_shape": "",
+            "network_voxel_node_cache_hit": False,
         }
 
         try:
@@ -1559,6 +1759,7 @@ class Network(nn.Module):
         if bool(getattr(self.args, "network_voxel_node_input", False)):
             node_voxel_input_state, node_voxel_debug = self._build_node_voxel_input(
                 pts_xyz,
+                cache_key=cache_key,
                 coord_scale=coord_scale,
                 subtree_tree=canonical_subtree_tree,
                 full_octree_context=full_octree_context,
@@ -2231,19 +2432,54 @@ class Network(nn.Module):
                 "for Actuator canonical voxel path."
             )
 
-        pts_out, final_w, edit_loss, actuator_stats = self.actuator( # 実際に点操作を行う
-            pts_xyz=pts_xyz,
-            structure=structure,
-            cause_scores=subtree_scores_full,
-            policy_probs=policy_probs_full,
-            actuator_features=actuator_input,
-            repair_priority=repair_priority_full,
-            coord_scale=coord_scale,
-            selection_mask=selection_mask,
-            octree_context=actuator_octree_context,
-            full_octree_context=full_octree_context,
-            full_cloud_amount_terms=full_cloud_amount_terms,
+        # Structure diagnosis creates sizeable exact integer-search workspaces.
+        # They are dead here, while the live FP32 structure/policy tensors are
+        # still referenced.  Returning only those unused allocator blocks keeps
+        # the persistent SparsePCGC CUDA worker from overlapping with stale
+        # workspace reservations.
+        if (
+            is_full_cloud_forward
+            and guidance_mode == "ana_den6_online"
+            and bool(getattr(self.args, "den6_online_release_cuda_cache_before_actuator", True))
+            and pts_xyz.is_cuda
+        ):
+            torch.cuda.empty_cache()
+
+        offload_threshold_mb = float(
+            getattr(self.args, "full_cloud_saved_tensor_cpu_offload_mb", 1.0)
         )
+        offload_saved_tensors = bool(
+            self.training
+            and is_full_cloud_forward
+            and guidance_mode == "ana_den6_online"
+            and offload_threshold_mb > 0.0
+            and pts_xyz.is_cuda
+        )
+        if offload_saved_tensors:
+            # Use PyTorch's lifecycle-aware implementation.  The former
+            # selective hook returned small CUDA tensors inside its packed
+            # object, so Torch 1.11 kept them alive with graph references and
+            # GPU usage grew by several GiB per Step.
+            saved_tensor_context = torch.autograd.graph.save_on_cpu(
+                pin_memory=True
+            )
+        else:
+            saved_tensor_context = nullcontext()
+
+        with saved_tensor_context:
+            pts_out, final_w, edit_loss, actuator_stats = self.actuator( # 実際に点操作を行う
+                pts_xyz=pts_xyz,
+                structure=structure,
+                cause_scores=subtree_scores_full,
+                policy_probs=policy_probs_full,
+                actuator_features=actuator_input,
+                repair_priority=repair_priority_full,
+                coord_scale=coord_scale,
+                selection_mask=selection_mask,
+                octree_context=actuator_octree_context,
+                full_octree_context=full_octree_context,
+                full_cloud_amount_terms=full_cloud_amount_terms,
+            )
         if isinstance(actuator_stats, dict):
             actuator_stats["actuator_octree_context_source"] = str(actuator_octree_context_source)
             actuator_stats["actuator_octree_context_is_full_cloud"] = bool(is_full_cloud_forward)
@@ -2306,6 +2542,7 @@ class Network(nn.Module):
                 "raw_learned_drop_ratio",
                 "raw_learned_add_ratio",
                 "raw_learned_move_ratio",
+                "ana_den6_exact_residual_plan_debug",
                 "den6_online_policy_log_prob",
                 "den6_online_policy_entropy",
                 "den6_online_where_log_prob",

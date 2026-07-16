@@ -61,29 +61,34 @@ class PlotMaker():
         self.step_x_his = []
         self.epo_x_his = []
         self.epi_x_his = []
-        self.edit_keys = [
-            "added_ratio_percent",
-            "deleted_ratio_percent",
-            "full_cloud_voxel_drop_ratio_percent",
-            "adjusted_ratio_percent",
-            "oracle_full_cloud_prune_ratio_percent",
-            "full_cloud_amount_final_ratio",
-            "full_cloud_amount_selected_residual",
-            "full_cloud_amount_teacher_residual",
-            "full_cloud_amount_pred_residual",
-            "full_cloud_amount_drop_count",
-            "full_cloud_amount_actual_delta",
-            "full_cloud_amount_surrogate_delta",
-            "full_cloud_amount_geom_loss",
-            "full_cloud_amount_residual_loss",
-            "full_cloud_amount_total_loss",
-            "full_cloud_amount_noop_selected",
-            "full_cloud_amount_actual_eval_count",
-            "full_cloud_amount_teacher_ratio",
-            "full_cloud_amount_oracle_best_ratio",
-            "full_cloud_amount_oracle_gap",
-            "full_cloud_amount_actual_finished_count",
-        ]
+        online_den6 = str(getattr(args, "heuristic_guidance_mode", "")).strip().lower() == "ana_den6_online"
+        self.edit_keys = (
+            ["added_ratio_percent", "deleted_ratio_percent", "adjusted_ratio_percent"]
+            if online_den6
+            else [
+                "added_ratio_percent",
+                "deleted_ratio_percent",
+                "full_cloud_voxel_drop_ratio_percent",
+                "adjusted_ratio_percent",
+                "oracle_full_cloud_prune_ratio_percent",
+                "full_cloud_amount_final_ratio",
+                "full_cloud_amount_selected_residual",
+                "full_cloud_amount_teacher_residual",
+                "full_cloud_amount_pred_residual",
+                "full_cloud_amount_drop_count",
+                "full_cloud_amount_actual_delta",
+                "full_cloud_amount_surrogate_delta",
+                "full_cloud_amount_geom_loss",
+                "full_cloud_amount_residual_loss",
+                "full_cloud_amount_total_loss",
+                "full_cloud_amount_noop_selected",
+                "full_cloud_amount_actual_eval_count",
+                "full_cloud_amount_teacher_ratio",
+                "full_cloud_amount_oracle_best_ratio",
+                "full_cloud_amount_oracle_gap",
+                "full_cloud_amount_actual_finished_count",
+            ]
+        )
         self.step_edit_his = [[] for _ in self.edit_keys]
         self.epo_edit_his = [[] for _ in self.edit_keys]
         self.epi_edit_his = [[] for _ in self.edit_keys]
@@ -229,7 +234,7 @@ class PlotMaker():
         self.title = [
             "Loss", 
             "Loss of Geometry", 
-            "Surrogate Predicted Delta (100*(Mine-GT)/GT)",
+            "Backward Surrogate / Proxy Delta (100*(Mine-GT)/GT)",
             "Training Actual Objective Delta",
             "Policy Actual Delta",
             "Oracle Teacher Actual Delta",

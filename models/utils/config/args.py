@@ -2668,6 +2668,12 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--sparsepcgc_skip_decode', default=True, type=str2bool, help='SparsePCGC teacherで復号を省略してbitだけ計測するか')
     parser.add_argument('--sparsepcgc_inner_psnr', default=False, type=str2bool, help='SparsePCGC内部の復号・PSNR計算を有効化するか。圧縮lossのbit教師には不要なので既定False')
     parser.add_argument('--sparsepcgc_fast_binary_ply', default=True, type=str2bool, help='worker入力PLYを同じfloat32座標のbinary little-endianで保存しI/Oを高速化するか')
+    parser.add_argument(
+        '--sparsepcgc_release_worker_after_request',
+        default=None,
+        type=str2bool,
+        help='各actual encode後にworkerのCUDA contextを解放するか（未指定時はana_den6_onlineのみ有効）',
+    )
     parser.add_argument('--sparsepcgc_binary_ply_fallback_ascii', default=True, type=str2bool, help='環境側readerがbinary PLYを読めない場合にASCIIへ一度だけ自動fallbackするか')
     parser.add_argument('--sparsepcgc_reuse_workspace', default=True, type=str2bool, help='actual worker用一時directoryをrequest間で再利用するか')
     parser.add_argument('--sparsepcgc_actual_result_cache', default=True, type=str2bool, help='同一Voxel集合・同一codec設定のactual結果をprocess内LRU cacheで再利用するか')
@@ -2791,21 +2797,45 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--heuristic_guidance_online_pool_limit',
-        default=512,
+        default=0,
         type=int,
-        help='Add/Prune/Adjustごとのcompact shortlist上限。初期count×reserveより大きい全件poolは保持しない',
+        help='旧互換用。ana_den6_onlineでは初期den6 count×reserveでshortlist長を決めるため通常0のまま使う',
     )
     parser.add_argument(
         '--heuristic_guidance_online_compact_reserve_factor',
-        default=8,
+        default=1.0,
+        type=float,
+        help='一意なden6 plan以外もonline候補として保持する倍率。既定1.0は確定planだけを保持する',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_full_pool_limit',
+        default=0,
         type=int,
-        help='den6初期Action countに対して保持する候補余裕倍率',
+        help='worker内部候補数の明示上限。0なら一意planに必要な件数から自動決定する',
     )
     parser.add_argument(
         '--heuristic_guidance_online_memory_entries',
         default=4,
         type=int,
         help='process内に保持するframe別den6候補payload数',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_prefetch_workers',
+        default=2,
+        type=int,
+        help='次frameの既存den6候補cacheをCPUで先読みする並列数。0で無効',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_prefetch_build_missing',
+        default=False,
+        type=str2bool,
+        help='先読みthreadから未生成den6 cacheのGPU worker生成も許可するか。通常Falseで学習GPUとの重複を防ぐ',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_prefetch_lookahead',
+        default=4,
+        type=int,
+        help='現在stepより先にden6候補cache生成を予約するframe数',
     )
     parser.add_argument(
         '--heuristic_guidance_online_max_total_ratio',
@@ -2848,6 +2878,18 @@ def parse_pugan_args(parser, file_day, file_time):
         default=0.10,
         type=float,
         help='frame別actual objective baselineのEMA更新率',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_grad_audit',
+        default=False,
+        type=str2bool,
+        help='ana_den6_onlineでWhere/Amount/Actionのhead grad normだけを記録する。通常は同期削減のためFalse',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_grad_audit_interval',
+        default=1,
+        type=int,
+        help='ana_den6_online grad auditの間隔。1なら毎Step、0以下は無効',
     )
     parser.add_argument(
         '--heuristic_guidance_den6_codec_strict',
@@ -3367,6 +3409,11 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--use_tf32', default=True, type=str2bool, help='TF32を使用するか')
     parser.add_argument('--use_amp', default=True, type=str2bool, help='混合精度学習を使うか')
     parser.add_argument('--amp_dtype', default='auto', type=str, help='AMPのデータ型')
+    parser.add_argument('--full_cloud_activation_checkpoint', default=True, type=str2bool, help='FP32精度を維持したままfull-cloud headの中間activationをbackward時に再計算してGPUメモリを削減する')
+    parser.add_argument('--full_cloud_saved_tensor_cpu_offload_mb', default=1.0, type=float, help='full-cloud Actuatorのbackward用FP32 Tensorを公式save_on_cpuで可逆退避するか（0で無効、正数で有効）')
+    parser.add_argument('--structure_neighbor_query_chunk', default=32768, type=int, help='26近傍occupancyを完全一致のまま分割検索する点数（小さいほど一時GPUメモリを削減）')
+    parser.add_argument('--den6_online_release_cuda_cache_before_actuator', default=True, type=str2bool, help='構造解析終了後に不要となったCUDA検索workspace cacheをActuator前に返却する')
+    parser.add_argument('--den6_online_release_cuda_cache_before_actual', default=True, type=str2bool, help='ana_den6_onlineの実圧縮worker起動直前に未使用CUDA allocator cacheだけを返却し、2プロセス重複時のGPU使用量を抑える')
     parser.add_argument('--amp_init_scale', default=1.0, type=float, help='GradScaler初期値')
     parser.add_argument('--amp_overflow_patience', default=2, type=int, help='オーバーフロー許容回数')
     parser.add_argument('--cache_frozen_inputs', default=True, type=str2bool, help='Encoder出力をキャッシュするか')
@@ -3906,14 +3953,26 @@ def parse_pugan_args(parser, file_day, file_time):
     args.heuristic_guidance_amount_residual_fraction = max(float(getattr(args, "heuristic_guidance_amount_residual_fraction", 0.50)), 0.0)
     args.heuristic_guidance_amount_min_residual = max(float(getattr(args, "heuristic_guidance_amount_min_residual", 0.0001)), 0.0)
     args.heuristic_guidance_amount_grad_scale = max(float(getattr(args, "heuristic_guidance_amount_grad_scale", 1.0)), 0.0)
-    args.heuristic_guidance_online_pool_limit = min(max(
-        int(getattr(args, "heuristic_guidance_online_pool_limit", 512)), 3
-    ), 512)
+    args.heuristic_guidance_online_pool_limit = max(
+        int(getattr(args, "heuristic_guidance_online_pool_limit", 0)), 0
+    )
     args.heuristic_guidance_online_compact_reserve_factor = min(max(
-        int(getattr(args, "heuristic_guidance_online_compact_reserve_factor", 8)), 1
-    ), 32)
+        float(getattr(args, "heuristic_guidance_online_compact_reserve_factor", 1.0)), 1.0
+    ), 4.0)
+    args.heuristic_guidance_online_full_pool_limit = max(
+        int(getattr(args, "heuristic_guidance_online_full_pool_limit", 0)), 0
+    )
     args.heuristic_guidance_online_memory_entries = max(
         int(getattr(args, "heuristic_guidance_online_memory_entries", 4)), 1
+    )
+    args.heuristic_guidance_online_prefetch_workers = max(
+        int(getattr(args, "heuristic_guidance_online_prefetch_workers", 2)), 0
+    )
+    args.heuristic_guidance_online_prefetch_build_missing = bool(
+        getattr(args, "heuristic_guidance_online_prefetch_build_missing", False)
+    )
+    args.heuristic_guidance_online_prefetch_lookahead = max(
+        int(getattr(args, "heuristic_guidance_online_prefetch_lookahead", 4)), 0
     )
     args.heuristic_guidance_online_max_total_ratio = min(max(
         float(getattr(args, "heuristic_guidance_online_max_total_ratio", 0.0099)), 3e-6
@@ -3936,6 +3995,12 @@ def parse_pugan_args(parser, file_day, file_time):
     args.heuristic_guidance_online_reward_ema = min(max(
         float(getattr(args, "heuristic_guidance_online_reward_ema", 0.10)), 1e-4
     ), 1.0)
+    args.heuristic_guidance_online_grad_audit = bool(
+        getattr(args, "heuristic_guidance_online_grad_audit", False)
+    )
+    args.heuristic_guidance_online_grad_audit_interval = max(
+        int(getattr(args, "heuristic_guidance_online_grad_audit_interval", 1)), 0
+    )
     if args.heuristic_guidance_enabled and args.heuristic_guidance_mode == "ana_den6_online":
         # online方式は全点群から1%未満の微小Voxelを1planだけ選ぶ。
         # 旧subtree oracleやfull-cloud Amount多候補評価を併走させない。
@@ -3959,6 +4024,20 @@ def parse_pugan_args(parser, file_day, file_time):
         args.save_operation_metric_csv = False
         args.save_operation_metrics_csv = False
         args.save_compression_metric_csv = False
+        # 通常online学習のhot pathから、方策とcodec結果に関係しない
+        # CSV/診断同期を除外する。必要な1-plan auditは専用の短いtext行で残す。
+        args.save_good_bad_cases = False
+        args.save_proxy_actual_bad_cases = False
+        args.phase7_eval_summary = False
+        args.phase7_metric_columns = False
+        args.loss_grad_probe_enabled = False
+        args.step_grad_log = False
+        args.compression_grad_probe = False
+        args.debug_grad_flow = False
+        args.for_better_log = False
+        args.enable_voxel_collision_log = False
+        args.sparsepcgc_hard_debug_interval = 0
+        args.sparsepcgc_hard_debug_on_log = False
         # online Policy Gradientにはfull-cloud Actuator headのgraphが必要である。
         # no-grad anchorへ落ちるとlog-probがdetachされ学習不能になる。
         args.full_cloud_anchor_allow_grad = True
@@ -4556,6 +4635,13 @@ def parse_pugan_args(parser, file_day, file_time):
     args.actual_eval_interval = max(int(getattr(args, "actual_eval_interval", 1000)), 0)
     args.sparsepcgc_inner_psnr = bool(getattr(args, "sparsepcgc_inner_psnr", False))
     args.sparsepcgc_fast_binary_ply = bool(getattr(args, "sparsepcgc_fast_binary_ply", True))
+    release_worker = getattr(args, "sparsepcgc_release_worker_after_request", None)
+    if release_worker is None:
+        release_worker = (
+            str(getattr(args, "heuristic_guidance_mode", "")).strip().lower()
+            == "ana_den6_online"
+        )
+    args.sparsepcgc_release_worker_after_request = bool(release_worker)
     args.sparsepcgc_binary_ply_fallback_ascii = bool(getattr(args, "sparsepcgc_binary_ply_fallback_ascii", True))
     args.sparsepcgc_reuse_workspace = bool(getattr(args, "sparsepcgc_reuse_workspace", True))
     args.sparsepcgc_actual_result_cache = bool(getattr(args, "sparsepcgc_actual_result_cache", True))
@@ -7174,6 +7260,21 @@ def parse_pugan_args(parser, file_day, file_time):
             args.repair_operation_gate_random_mix_start = 0.0
         if not _cli_option_was_provided("--repair_operation_gate_random_mix_end"):
             args.repair_operation_gate_random_mix_end = 0.0
+        if args.heuristic_guidance_mode == "ana_den6_online":
+            # 汎用SparsePCGC後処理が有効化する診断を、online one-plan経路では
+            # 再び止める。専用audit textだけはtrain.pyが常時出力する。
+            args.save_good_bad_cases = False
+            args.save_proxy_actual_bad_cases = False
+            args.phase7_eval_summary = False
+            args.phase7_metric_columns = False
+            args.loss_grad_probe_enabled = False
+            args.step_grad_log = False
+            args.compression_grad_probe = False
+            args.debug_grad_flow = False
+            args.for_better_log = False
+            args.enable_voxel_collision_log = False
+            args.sparsepcgc_hard_debug_interval = 0
+            args.sparsepcgc_hard_debug_on_log = False
         if not _cli_option_was_provided("--repair_move_score_noise_start"):
             args.repair_move_score_noise_start = 0.0
         if not _cli_option_was_provided("--repair_move_score_noise_end"):

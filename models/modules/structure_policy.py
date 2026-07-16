@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 
 POLICY_NAMES = (
@@ -82,12 +83,28 @@ class StructureRepairPolicy(nn.Module):
             raise ValueError(f"features must have shape [B, C, N], got {tuple(features.shape)}")
 
         input_mode = "node_voxel" if bool(getattr(self, "node_voxel_mode", False)) else "point"
-        logits = self.net(features)
+        if self.training and bool(getattr(self, "activation_checkpointing", False)):
+            dummy = features.new_zeros((), requires_grad=True)
+            logits = checkpoint(
+                lambda value, _dummy: self.net(value),
+                features,
+                dummy,
+                use_reentrant=True,
+            )
+        else:
+            logits = self.net(features)
         probs = F.softmax(logits / self.temperature, dim=1)
-        if torch.is_grad_enabled():
+        # Debug-only full-cloud reductions are intentionally disabled on the
+        # normal hot path.  They do not contribute to any training loss.
+        if torch.is_grad_enabled() and bool(getattr(self, "collect_runtime_debug", False)):
             self.debug_tensors = {
                 "repair_ratio": (1.0 - probs[:, 0:1, :]).mean().detach(),
                 "policy_entropy": (-(probs.clamp_min(1e-6).log() * probs).sum(dim=1)).mean().detach(),
+                "input_mode": input_mode,
+                "input_shape": tuple(features.shape),
+            }
+        elif not bool(getattr(self, "collect_runtime_debug", False)):
+            self.debug_tensors = {
                 "input_mode": input_mode,
                 "input_shape": tuple(features.shape),
             }

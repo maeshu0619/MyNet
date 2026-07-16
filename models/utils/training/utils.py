@@ -293,9 +293,17 @@ def actual_compression_ratio_plot_metric(loss_obj, device):
 
 def surrogate_compression_plot_metric(loss_obj, fallback_value, device):
     comp_debug = getattr(loss_obj, "last_compression_debug", {}) or {} # 直近Stepの圧縮debug辞書を取り出す
-    surrogate_value = comp_debug.get("surrogate_pred_bit", comp_debug.get("rate_proxy_delta", None)) # Surrogateが予測した(Mine-GT)*100/GTを取り出す
+    # learned surrogate backendはsurrogate_pred_bit、actual_ste backendは
+    # proxy_surrogate.loss_bitが実際のbackward勾配源である。
+    surrogate_value = comp_debug.get("surrogate_pred_bit", None)
     if surrogate_value is None:
-        surrogate_value = fallback_value # Surrogate値が無いbackendでは従来のL_com表示へ戻す
+        proxy_debug = comp_debug.get("proxy_surrogate", None)
+        if isinstance(proxy_debug, dict):
+            surrogate_value = proxy_debug.get("loss_bit", None)
+    # rate_proxy_delta/fallback_valueはactual codecのforward値になり得るため
+    # Surrogate図へ複製しない。勾配側値が無いbackendでは欠測にする。
+    if surrogate_value is None:
+        return None
     return metric_tensor(surrogate_value, device) # plot/CSVに渡せるscalar tensorへ正規化する
 
 

@@ -12,13 +12,18 @@ from models.utils.compression.octree_stats import hard_octree_occupancy_stats
 
 
 class CompressionLossMixin:
-    def _guard_den6_online_edited_actual_encode(self, args):
-        """ana_den6 onlineで同一Stepの編集後actual encodeを1回へ制限する。"""
-        online_mode = (
+    @staticmethod
+    def _is_den6_online_training_step(args):
+        """Loss is not an nn.Module, so training state must come from train.py."""
+        return bool(
             str(getattr(args, "heuristic_guidance_mode", "")).strip().lower()
             == "ana_den6_online"
+            and getattr(args, "_den6_online_training_step_active", False)
         )
-        if not bool(online_mode and getattr(self, "training", False)):
+
+    def _guard_den6_online_edited_actual_encode(self, args):
+        """ana_den6 onlineで同一Stepの編集後actual encodeを1回へ制限する。"""
+        if not self._is_den6_online_training_step(args):
             return False
         global_step = int(getattr(args, "_global_train_step", 0))
         guard = getattr(self, "_den6_online_actual_step_guard", None)
@@ -638,6 +643,7 @@ class CompressionLossMixin:
             source_identity = "missing"
         return "|".join(
             [
+                "den6_decoder_complete_logical_bits_v2",
                 str(cache_key),
                 source_identity,
                 str(getattr(args, "sparsepcgc_mode", "dense_lossy")),
@@ -894,6 +900,25 @@ class CompressionLossMixin:
             "sparsepcgc_low_prob_threshold": float(sparse_threshold_values[-1]) if sparse_threshold_values else float(getattr(args, "sparsepcgc_occupancy_low_prob_threshold", 0.1)),
             "point_count": int(total_points),
             "codec": str(getattr(encoder, "codec_name", "octattention")),
+            # The SparsePCGC encoder owns these counters.  Preserve its
+            # process-level values through batch aggregation for one-plan
+            # audit telemetry (online mode enforces batch_size=1).
+            "sparsepcgc_worker_launch_count": max(
+                (int(s.get("sparsepcgc_worker_launch_count", 0)) for s in stats_list),
+                default=0,
+            ),
+            "sparsepcgc_worker_request_count": max(
+                (int(s.get("sparsepcgc_worker_request_count", 0)) for s in stats_list),
+                default=0,
+            ),
+            "sparsepcgc_actual_result_cache_hit": any(
+                bool(s.get("sparsepcgc_actual_result_cache_hit", False))
+                for s in stats_list
+            ),
+            "sparsepcgc_actual_result_cache_hit_count": max(
+                (int(s.get("sparsepcgc_actual_result_cache_hit_count", 0)) for s in stats_list),
+                default=0,
+            ),
             "per_batch": stats_list,
         }
         if exact_enabled:
@@ -934,11 +959,7 @@ class CompressionLossMixin:
         return result
 
     def _encode_actual_many(self, args, xyz_list):
-        if (
-            str(getattr(args, "heuristic_guidance_mode", "")).strip().lower()
-            == "ana_den6_online"
-            and bool(getattr(self, "training", False))
-        ):
+        if self._is_den6_online_training_step(args):
             raise RuntimeError(
                 "ana_den6_onlineでは複数候補actual encodeを禁止する。"
                 "1Step 1planの編集後encodeだけを使用すること"
@@ -1424,7 +1445,10 @@ class CompressionLossMixin:
             except Exception:
                 pass
         cached_gt = self._get_cached_actual_gt(cache_key)
+        den6_online_train = self._is_den6_online_training_step(args)
+        baseline_actual_encode_count = 0
         if cached_gt is None:
+            baseline_actual_encode_count = 1
             cached_gt = self._encode_actual_batch(args, gt_xyz)
             self._store_cached_actual_gt(cache_key, cached_gt)
 
@@ -1438,6 +1462,15 @@ class CompressionLossMixin:
             and str(full_octree_context.get("actual_oracle_override_scope", "")) == "full_cloud"
             else None
         )
+        if den6_online_train and cached_oracle_stats is not None:
+            raise RuntimeError(
+                "ana_den6_onlineではoracle既計測値をedited actual encodeへ流用できない。"
+            )
+        if den6_online_train and int(actual_xyz.shape[0]) != 1:
+            raise RuntimeError(
+                "ana_den6_onlineは1 Step = 1 hard plan = 1 edited actual encodeのためbatch_size=1が必要。"
+            )
+
         expected_actual_points = int(actual_xyz.shape[-1]) if torch.is_tensor(actual_xyz) else -1
         actual_gen_cache_hit = bool(
             isinstance(cached_oracle_stats, dict)
@@ -1446,13 +1479,45 @@ class CompressionLossMixin:
         )
         if actual_gen_cache_hit:
             stats_gen = dict(cached_oracle_stats)
+            edited_actual_encode_count = 0
         else:
             # ana_den6 onlineは1Stepにつき編集後actual encodeを厳密に1回だけ許可する。
             # baselineはframe単位cacheであり、この回数には含めない。
             self._guard_den6_online_edited_actual_encode(args)
+            edited_actual_encode_count = 1
 
             # actual codec評価は評価指標なので、train用の量子化ノイズを入れないclean編集点群を使う。
-            stats_gen = self._encode_actual_batch(args, actual_xyz, final_w=actual_final_w)
+            # ana_den6_onlineだけは、同一編集結果でもin-process LRUを使わず
+            # 毎Step workerへ1 requestを発行する。GT baselineのframe cacheは維持する。
+            previous_force_fresh = bool(
+                getattr(args, "_sparsepcgc_force_fresh_actual_encode", False)
+            )
+            if den6_online_train:
+                setattr(args, "_sparsepcgc_force_fresh_actual_encode", True)
+                # The external SparsePCGC worker temporarily owns its own CUDA
+                # context.  Return only unused PyTorch allocator blocks before
+                # that overlap; live autograd tensors and all FP32 values stay
+                # untouched and are still available for backward.
+                if (
+                    bool(getattr(args, "den6_online_release_cuda_cache_before_actual", True))
+                    and torch.cuda.is_available()
+                ):
+                    reserved_before = int(torch.cuda.memory_reserved())
+                    torch.cuda.empty_cache()
+                    reserved_after = int(torch.cuda.memory_reserved())
+                    setattr(
+                        args,
+                        "_den6_online_cuda_cache_released_bytes",
+                        max(reserved_before - reserved_after, 0),
+                    )
+            try:
+                stats_gen = self._encode_actual_batch(args, actual_xyz, final_w=actual_final_w)
+            finally:
+                setattr(args, "_sparsepcgc_force_fresh_actual_encode", previous_force_fresh)
+            if den6_online_train and bool(stats_gen.get("sparsepcgc_actual_result_cache_hit", False)):
+                raise RuntimeError(
+                    "ana_den6_onlineのedited actual encodeがresult cacheから返された。"
+                )
         codec_name = str(stats_gen.get("codec", cached_gt.get("codec", "octattention"))).strip().lower()
         backend_label = f"{codec_name}_actual_ste" if use_proxy_surrogate else f"{codec_name}_actual"
         gt_bit = float(cached_gt["bit"])
@@ -1700,6 +1765,34 @@ class CompressionLossMixin:
             "actual_used_voxel_restored_points": bool(getattr(args, "_current_actual_uses_voxel_restored", False)),
             "actual_input_points": int(stats_gen.get("point_count", 0)),
             "actual_gen_oracle_cache_hit": bool(actual_gen_cache_hit),
+            "den6_online_baseline_actual_encode_count": int(
+                baseline_actual_encode_count if den6_online_train else 0
+            ),
+            "den6_online_edited_actual_encode_count": int(
+                edited_actual_encode_count if den6_online_train else 0
+            ),
+            "den6_online_candidate_actual_encode_count": 0,
+            # Wall-clock attribution for the exact codec path.  These values
+            # do not participate in any loss; they make the online one-plan
+            # hot path measurable without enabling the much heavier generic
+            # debug collectors.
+            "gt_actual_encode_time": float(cached_gt.get("encode_time", 0.0))
+            if baseline_actual_encode_count > 0
+            else 0.0,
+            "gen_actual_encode_time": float(stats_gen.get("encode_time", 0.0)),
+            "actual_encode_time_total": (
+                (float(cached_gt.get("encode_time", 0.0)) if baseline_actual_encode_count > 0 else 0.0)
+                + float(stats_gen.get("encode_time", 0.0))
+            ),
+            "actual_input_prepare_time": float(
+                stats_gen.get("sparsepcgc_input_prepare_time", 0.0)
+            ),
+            "actual_ply_write_time": float(
+                stats_gen.get("sparsepcgc_ply_write_time", 0.0)
+            ),
+            "actual_worker_roundtrip_time": float(
+                stats_gen.get("sparsepcgc_worker_roundtrip_time", 0.0)
+            ),
             "actual_total_bits": gen_total_bit,
             "actual_raw_bits": gen_bit,
             "actual_objective_bits": objective_bit,
@@ -1768,6 +1861,19 @@ class CompressionLossMixin:
             "sparsepcgc_scale_sr": int(stats_gen.get("sparsepcgc_scale_sr", getattr(args, "sparsepcgc_scale_sr", 2))),
             "sparsepcgc_mode_effective": str(stats_gen.get("sparsepcgc_mode_effective", getattr(args, "sparsepcgc_mode", "dense_lossy"))),
         }
+        if den6_online_train:
+            # train.py may merge later diagnostic dictionaries.  Preserve the
+            # one-plan codec accounting independently of those merges.
+            self._den6_online_actual_audit = {
+                "baseline": int(baseline_actual_encode_count),
+                "edited": int(edited_actual_encode_count),
+                "candidate": 0,
+                "edited_result_cache_hit": bool(
+                    stats_gen.get("sparsepcgc_actual_result_cache_hit", False)
+                ),
+                "worker_launch_count": int(stats_gen.get("sparsepcgc_worker_launch_count", 0)),
+                "worker_request_count": int(stats_gen.get("sparsepcgc_worker_request_count", 0)),
+            }
         self.last_compression_debug.update(exact_fallback_debug)
 
         if codec_name == "sparsepcgc":
