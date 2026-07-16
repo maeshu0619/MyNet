@@ -3229,6 +3229,16 @@ class Network(nn.Module):
                     if isinstance(structure, dict)
                     else 0
                 ),
+                "phase4_aggregation_min_unit_size": int(
+                    structure.get("phase4_aggregation_min_unit_size", 0)
+                    if isinstance(structure, dict)
+                    else 0
+                ),
+                "phase4_aggregation_max_unit_size": int(
+                    structure.get("phase4_aggregation_max_unit_size", 0)
+                    if isinstance(structure, dict)
+                    else 0
+                ),
                 "phase4_structural_key_source": str(
                     structure.get("phase4_structural_key_source", "unknown")
                     if isinstance(structure, dict)

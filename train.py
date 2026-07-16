@@ -12272,8 +12272,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                 den6_online_full_cloud = heuristic_mode == "ana_den6_online"
                 full_cloud_amount_mode = bool(sparsepcgc_training_mode == "full_cloud_amount")
                 if den6_online_full_cloud:
-                    # ana_den6 onlineではLocalPrune/Subtree学習を完全に通さず、3操作とも全点群で決める。
-                    subtree_mode = False
+                    # 既存のanchor実行枠だけを使い、局所Subtreeの操作・損失経路には入らない。
+                    # subtree_mode=Falseでは共通forwardまで飛ばしてしまうため、anchor専用に維持する。
+                    subtree_mode = True
                     full_cloud_amount_mode = False
                     args._current_teacher_scope = "full_cloud"
                 elif full_cloud_amount_mode:
@@ -12456,11 +12457,15 @@ def train(model, args, loss, writer, plot, notifier=None):
                 """Subtree分割学習"""
                 if subtree_mode:                    
                     full_cloud_anchor_every_step = bool(
-                        getattr(args, "train_full_cloud_anchor_every_step", False)
+                        den6_online_full_cloud
+                        or getattr(args, "train_full_cloud_anchor_every_step", False)
                     )
                     full_cloud_anchor_every_step_shadow = bool(
                         getattr(args, "train_full_cloud_anchor_every_step_shadow", False)
                     )
+                    if den6_online_full_cloud:
+                        # den6 onlineの正式経路へshadow subtree勾配経路を混入させない。
+                        full_cloud_anchor_every_step_shadow = False
                     if full_cloud_amount_mode:
                         full_cloud_anchor_every_step = True
                         full_cloud_anchor_every_step_shadow = False
@@ -12594,6 +12599,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                     if full_cloud_amount_mode:
                         is_anchor_step = True
                         anchor_reason = "full_cloud_amount_training_mode"
+                    elif den6_online_full_cloud:
+                        is_anchor_step = True
+                        anchor_reason = "ana_den6_online_full_cloud"
                     if ( min_points_miss and eligible_subtree_count <= 0 and bool(getattr(args, "train_subtree_anchor_on_min_points_miss", False))): # 最小点群数を満たすSubtreeがない
                         is_anchor_step = True
                         anchor_reason = "min_points_miss_full_anchor"
@@ -12993,9 +13001,13 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 args,
                                 full_cloud_canonical_context,
                             )
-                            if full_cloud_amount_mode:
+                            if full_cloud_amount_mode or den6_online_full_cloud:
                                 full_cloud_anchor_no_grad = False
-                                full_cloud_anchor_no_grad_reason = "full_cloud_amount_train_branch_requires_grad"
+                                full_cloud_anchor_no_grad_reason = (
+                                    "ana_den6_online_full_cloud_requires_grad"
+                                    if den6_online_full_cloud
+                                    else "full_cloud_amount_train_branch_requires_grad"
+                                )
 
                             if not compact_step_text_log:
                                 writer.write(
@@ -14077,7 +14089,8 @@ def train(model, args, loss, writer, plot, notifier=None):
                 with autocast_ctx:
                     final_w_for_loss = None # Lossに渡す点操作重みの初期化
                     if _discrete_loss_mode_value(args) != "hard": # 離散損失モードがHard以外か判定する
-                        final_w_for_loss = final_w
+                        final_w_for_loss = locals().get("final_w", None)
+                        # final_w_for_loss = final_w
                     if timing_enabled:
                         sync_for_timing(use_cuda)
                         timing_noise_start = time.time()

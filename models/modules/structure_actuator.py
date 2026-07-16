@@ -3230,6 +3230,9 @@ class StructureRepairActuator(nn.Module):
             return None
         pools = exact.get("operation_candidate_shortlists")
         if not isinstance(pools, dict):
+            # 既存manifestは同じden6順位をranked_candidate_pools名で保持している。
+            pools = exact.get("ranked_candidate_pools")
+        if not isinstance(pools, dict):
             return None
         operations = ("Add", "Prune", "Adjust")
         if any(not isinstance(pools.get(name), list) or not pools.get(name) for name in operations):
@@ -3238,6 +3241,10 @@ class StructureRepairActuator(nn.Module):
         point_count = int(voxel_coords.shape[-1])
         if point_count <= 0:
             raise RuntimeError("ana_den6 online planの入力Voxel数が0である")
+        online_mode = (
+            str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower()
+            == "ana_den6_online"
+        )
         max_total_ratio = min(max(float(
             getattr(self.args, "heuristic_guidance_online_max_total_ratio", 0.0099)
         ), 0.0), 0.0099)
@@ -3246,12 +3253,12 @@ class StructureRepairActuator(nn.Module):
         ), 0.0), 0.0099)
         # Add/Prune/Adjustを最低1件ずつ含めるには3操作・4変更cellが必要である。
         # 小点群で1%未満を破る暗黙fallbackは行わず、条件矛盾として停止する。
-        if int(math.floor(point_count * max_total_ratio)) < 3:
+        if online_mode and int(math.floor(point_count * max_total_ratio)) < 3:
             raise RuntimeError(
                 "ana_den6 onlineで3操作を維持しつつ総操作率1%未満にできない: "
                 f"voxel_count={point_count}, max_total_ratio={max_total_ratio}"
             )
-        if int(math.floor(point_count * max_changed_ratio)) < 4:
+        if online_mode and int(math.floor(point_count * max_changed_ratio)) < 4:
             raise RuntimeError(
                 "ana_den6 onlineでAdd/Prune/Adjustを維持しつつ変更Voxel率1%未満にできない: "
                 f"voxel_count={point_count}, max_changed_ratio={max_changed_ratio}"
@@ -3290,10 +3297,6 @@ class StructureRepairActuator(nn.Module):
         current_step = max(int(getattr(self.args, "_global_train_step", 0)), 0)
         exact_anchor_steps = max(
             int(getattr(self.args, "heuristic_guidance_exact_anchor_steps", 1)), 0
-        )
-        online_mode = (
-            str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower()
-            == "ana_den6_online"
         )
         exploration_active = bool(
             online_mode

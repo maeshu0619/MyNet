@@ -203,6 +203,9 @@ def _exact_den6_guidance(
 
     pools = exact.get("operation_candidate_shortlists")
     if not isinstance(pools, Mapping):
+        # 既存manifestは同じden6順位をranked_candidate_pools名で保持している。
+        pools = exact.get("ranked_candidate_pools")
+    if not isinstance(pools, Mapping):
         raise RuntimeError("ana_den6 exact guidanceに局所候補shortlistが無い")
     B, _, N = coords.shape
     where_prior = {name: like.new_zeros((B, 1, N)) for name in ("Add", "Prune", "Adjust")}
