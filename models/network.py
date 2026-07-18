@@ -292,8 +292,18 @@ class Network(nn.Module):
         ))
         previous = self._den6_online_objective_baseline.get(cache_key, 0.0)
         previous_t = objective.new_tensor(float(previous))
-        # objectiveは小さいほど良い。baselineより小さい時に選択確率を増やす。
-        advantage = previous_t - objective.detach()
+        # objectiveはActual圧縮率[%]で、小さいほど良い。baselineより小さい時に
+        # 今回の唯一のplanの選択確率を増やす。±1%未満の信号が他損失に埋もれない
+        # よう倍率を掛けるが、forwardのActual値や候補数は変更しない。
+        reward_scale = max(
+            float(getattr(self.args, "heuristic_guidance_online_reward_scale", 10.0)), 0.0
+        )
+        advantage_clip = max(
+            float(getattr(self.args, "heuristic_guidance_online_advantage_clip", 5.0)), 0.0
+        )
+        advantage = (previous_t - objective.detach()) * float(reward_scale)
+        if advantage_clip > 0.0:
+            advantage = advantage.clamp(-advantage_clip, advantage_clip)
         ema = min(max(float(getattr(self.args, "heuristic_guidance_online_reward_ema", 0.10)), 1e-4), 1.0)
         updated = (1.0 - ema) * float(previous) + ema * float(objective.detach().cpu())
         self._den6_online_objective_baseline[cache_key] = float(updated)
@@ -2461,7 +2471,9 @@ class Network(nn.Module):
             # object, so Torch 1.11 kept them alive with graph references and
             # GPU usage grew by several GiB per Step.
             saved_tensor_context = torch.autograd.graph.save_on_cpu(
-                pin_memory=True
+                pin_memory=bool(
+                    getattr(self.args, "full_cloud_saved_tensor_pin_memory", False)
+                )
             )
         else:
             saved_tensor_context = nullcontext()

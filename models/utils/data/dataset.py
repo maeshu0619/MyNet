@@ -1,10 +1,12 @@
 # dataset.py
 import os
+from collections import OrderedDict
 from pathlib import Path
 import numpy as np
 import torch
 
-_PLY_CACHE = {}
+_PLY_CACHE = OrderedDict()
+_PLY_CACHE_BYTES = 0
 _MASTER_ROOT = Path(__file__).resolve().parents[4]
 _DATA_ROOT = (_MASTER_ROOT / "../../../data/maejima/data").resolve()
 
@@ -164,7 +166,9 @@ def load_ply(path, return_color=True, loader="numpy"):
 
 
 def clear_ply_cache():
+    global _PLY_CACHE_BYTES
     _PLY_CACHE.clear()
+    _PLY_CACHE_BYTES = 0
 
 
 class PlyDirDataset(torch.utils.data.Dataset):
@@ -177,6 +181,8 @@ class PlyDirDataset(torch.utils.data.Dataset):
     def __init__(self, args, path):
         path = _resolve_data_path(path)
         self.use_cache = bool(getattr(args, "dataset_cache", True))
+        self.cache_max_entries = max(int(getattr(args, "dataset_cache_max_entries", 64)), 0)
+        self.cache_max_bytes = max(int(getattr(args, "dataset_cache_max_memory_mb", 1024)), 0) * 1024 * 1024
         self.ply_loader = str(getattr(args, "ply_loader", "numpy")).strip().lower()
         if args.trainORtest == "train":
             max_files = args.max_files
@@ -208,16 +214,32 @@ class PlyDirDataset(torch.utils.data.Dataset):
         return len(self.files)
 
     def __getitem__(self, idx):
+        global _PLY_CACHE_BYTES
         path = self.files[idx]
         if self.use_cache:
             cached = _PLY_CACHE.get(path)
             if cached is not None:
+                _PLY_CACHE.move_to_end(path)
                 return cached
 
         points = load_ply(path, loader=self.ply_loader)
         points = torch.from_numpy(points)
-        if self.use_cache:
+        point_bytes = int(points.numel()) * int(points.element_size())
+        if (
+            self.use_cache
+            and self.cache_max_entries > 0
+            and self.cache_max_bytes > 0
+            and point_bytes <= self.cache_max_bytes
+        ):
             _PLY_CACHE[path] = points
+            _PLY_CACHE.move_to_end(path)
+            _PLY_CACHE_BYTES += point_bytes
+            while (
+                len(_PLY_CACHE) > self.cache_max_entries
+                or _PLY_CACHE_BYTES > self.cache_max_bytes
+            ):
+                _, evicted = _PLY_CACHE.popitem(last=False)
+                _PLY_CACHE_BYTES -= int(evicted.numel()) * int(evicted.element_size())
         return points
 
 def collect_seq_dirs(root):

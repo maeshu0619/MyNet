@@ -3099,8 +3099,8 @@ class StructureRepairActuator(nn.Module):
         residual_fraction = max(float(getattr(self.args, "heuristic_guidance_amount_residual_fraction", 0.50)), 0.0)
         min_residual = max(float(getattr(self.args, "heuristic_guidance_amount_min_residual", 0.0001)), 0.0)
         residual_limit = min(max(prior_value * residual_fraction, min_residual), float(max_ratio))
-        lower = max(prior_value - residual_limit, 0.0)
-        upper = min(prior_value + residual_limit, float(max_ratio))
+        anchor_lower = max(prior_value - residual_limit, 0.0)
+        anchor_upper = min(prior_value + residual_limit, float(max_ratio))
         current_step = max(int(getattr(self.args, "_global_train_step", 0)), 0)
         anchor_steps = max(int(getattr(self.args, "heuristic_guidance_anchor_steps", 0)), 0)
         anchor_phase = (
@@ -3108,8 +3108,12 @@ class StructureRepairActuator(nn.Module):
             if anchor_steps > 0
             else 0.0
         )
-        # warmupでは操作別ana_den6比率をhard countの中心にし、
-        # 以降はclamp済みNetwork出力へ不連続なく移行する。
+        # warmup中だけana_den6近傍へ制限する。従来はanchor終了後も
+        # [prior-residual, prior+residual]へ永久にclampしていたため、Networkが
+        # Amountを学習しても実操作量が変化せず、Actual改善が0へ停滞していた。
+        # 候補数は増やさず、同じ1proposalの許容範囲だけを連続的に広げる。
+        lower = anchor_lower * anchor_phase
+        upper = anchor_upper * anchor_phase + float(max_ratio) * (1.0 - anchor_phase)
         network_forward = ratio.detach().clamp(lower, upper)
         guided_forward = (
             ratio.new_full(ratio.shape, prior_value) * anchor_phase
@@ -9776,6 +9780,98 @@ class StructureRepairActuator(nn.Module):
                 key: (value.detach() if torch.is_tensor(value) else value)
                 for key, value in self.debug_tensors.items()
             }
+        # v7 single-proposal経路用のActual policy term。
+        # 旧candidate-pool planだけがpolicy_log_probを生成していたため、v7では
+        # 毎Step Actualを測っていてもWhere/Amount/Actionの方策損失が常に0だった。
+        # ここでは実際に実行した唯一のplanの尤度だけを作り、別候補の生成・評価はしない。
+        guidance_formula = (
+            str(heuristic_guidance.get("formula_basis", ""))
+            if isinstance(heuristic_guidance, dict) else ""
+        )
+        single_proposal_policy = (
+            str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower()
+            == "ana_den6_online"
+            and guidance_formula == "ana_den6_single_proposal_network_residual_online_v7"
+        )
+        single_policy_zero = pts_xyz.new_zeros(())
+        single_where_log_prob = single_policy_zero
+        single_amount_log_prob = single_policy_zero
+        single_action_log_prob = single_policy_zero
+        single_policy_entropy = single_policy_zero
+        if single_proposal_policy:
+            policy_eps = max(float(torch.finfo(pts_xyz.dtype).eps), 1e-6)
+
+            def _executed_where_log_prob(probability, executed):
+                probability = torch.nan_to_num(
+                    probability.float(), nan=0.5, posinf=1.0, neginf=0.0
+                ).clamp(policy_eps, 1.0 - policy_eps)
+                executed = executed.detach().to(device=probability.device, dtype=torch.bool)
+                if executed.shape != probability.shape:
+                    executed = executed.reshape(probability.shape)
+                if not bool(executed.any().item()):
+                    return probability.new_zeros(())
+                # 非選択の数十万Voxelを足すとno-opへ収束するため、今回実行した
+                # Whereだけをcredit assignment対象にする。
+                return probability[executed].log().mean()
+
+            where_terms = []
+            if prune_enabled:
+                where_terms.append(_executed_where_log_prob(drop_prob_proxy, hard_drop_mask))
+            if add_enabled and hard_add_pair.numel() > 0:
+                add_where_probability = (
+                    torch.sigmoid(exact_add_pair_logits.float()).reshape_as(hard_add_pair)
+                    if torch.is_tensor(exact_add_pair_logits)
+                    else soft_add_pair
+                )
+                where_terms.append(
+                    _executed_where_log_prob(add_where_probability, hard_add_pair > 0.0)
+                )
+            if disp_enabled:
+                where_terms.append(_executed_where_log_prob(move_score, hard_move_mask))
+            if where_terms:
+                single_where_log_prob = torch.stack(where_terms).mean()
+
+            gate_prob = operation_gate_prob.float().mean(dim=(0, 2)).clamp(
+                policy_eps, 1.0 - policy_eps
+            )
+            active = gate_prob.new_tensor([
+                float(bool(hard_drop_mask.detach().any().item())) if prune_enabled else 0.0,
+                float(bool((hard_add_pair.detach() > 0.0).any().item())) if add_enabled else 0.0,
+                float(bool(hard_move_mask.detach().any().item())) if disp_enabled else 0.0,
+            ])
+            enabled = gate_prob.new_tensor([
+                float(prune_enabled), float(add_enabled), float(disp_enabled)
+            ])
+            action_terms = active * gate_prob.log() + (1.0 - active) * (1.0 - gate_prob).log()
+            single_action_log_prob = (action_terms * enabled).sum() / enabled.sum().clamp_min(1.0)
+
+            # 実行したAmountの尤度。改善したplanでは同じ方向の操作量を強め、
+            # 悪化したplanでは弱める。全操作の変更Voxel上限はargs側で1%未満に保つ。
+            amount_prob = torch.stack([
+                (learned_drop_ratio.float().mean() / max(float(max_drop_ratio), policy_eps)),
+                (learned_add_ratio.float().mean() / max(float(max_add_ratio_value), policy_eps)),
+                (learned_move_ratio.float().mean() / max(float(max_move_ratio), policy_eps)),
+            ]).clamp(policy_eps, 1.0 - policy_eps)
+            amount_terms = active * amount_prob.log()
+            active_enabled = active * enabled
+            single_amount_log_prob = (
+                (amount_terms * enabled).sum() / active_enabled.sum().clamp_min(1.0)
+            )
+            action_entropy = -(
+                gate_prob * gate_prob.log() + (1.0 - gate_prob) * (1.0 - gate_prob).log()
+            )
+            amount_entropy = -(
+                amount_prob * amount_prob.log()
+                + (1.0 - amount_prob) * (1.0 - amount_prob).log()
+            )
+            single_policy_entropy = (
+                (action_entropy * enabled).sum() + (amount_entropy * enabled).sum()
+            ) / (2.0 * enabled.sum().clamp_min(1.0))
+
+        single_policy_log_prob = (
+            single_where_log_prob + single_amount_log_prob + single_action_log_prob
+        )
+
         return pts_out, final_w, loss, {
             # Adjust Soft状態
             "learned_drop_ratio_requires_grad": pts_xyz.new_tensor(float(learned_drop_ratio.requires_grad)),
@@ -10475,19 +10571,19 @@ class StructureRepairActuator(nn.Module):
             "ana_den6_exact_residual_plan_applied": bool(exact_residual_plan_applied),
             "ana_den6_exact_residual_plan_debug": exact_residual_plan_debug,
             "den6_online_policy_log_prob": exact_residual_plan_debug.get(
-                "policy_log_prob", pts_xyz.new_zeros(())
+                "policy_log_prob", single_policy_log_prob
             ),
             "den6_online_policy_entropy": exact_residual_plan_debug.get(
-                "policy_entropy", pts_xyz.new_zeros(())
+                "policy_entropy", single_policy_entropy
             ),
             "den6_online_where_log_prob": exact_residual_plan_debug.get(
-                "where_log_prob", pts_xyz.new_zeros(())
+                "where_log_prob", single_where_log_prob
             ),
             "den6_online_amount_log_prob": exact_residual_plan_debug.get(
-                "amount_log_prob", pts_xyz.new_zeros(())
+                "amount_log_prob", single_amount_log_prob
             ),
             "den6_online_action_log_prob": exact_residual_plan_debug.get(
-                "action_log_prob", pts_xyz.new_zeros(())
+                "action_log_prob", single_action_log_prob
             ),
             "ana_den6_candidate_formula_basis": (
                 str(heuristic_guidance.get("formula_basis", ""))

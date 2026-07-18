@@ -2881,6 +2881,18 @@ def parse_pugan_args(parser, file_day, file_time):
         help='frame別actual objective baselineのEMA更新率',
     )
     parser.add_argument(
+        '--heuristic_guidance_online_reward_scale',
+        default=10.0,
+        type=float,
+        help='1候補のActual圧縮率[%]をWhere/Amount/Action方策勾配へ変換する倍率',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_advantage_clip',
+        default=5.0,
+        type=float,
+        help='single-proposal Actual policy advantageの絶対値上限',
+    )
+    parser.add_argument(
         '--heuristic_guidance_online_grad_audit',
         default=False,
         type=str2bool,
@@ -3392,6 +3404,8 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--pin_memory', default=True, type=str2bool, help='CPU→GPU転送高速化のためメモリ固定するか')
     parser.add_argument('--persistent_workers', default=True, type=str2bool, help='ワーカーを維持するか')
     parser.add_argument('--dataset_cache', default=False, type=str2bool, help='データセットをメモリにキャッシュするか')
+    parser.add_argument('--dataset_cache_max_entries', default=64, type=int, help='PLY生点群LRUキャッシュの最大件数')
+    parser.add_argument('--dataset_cache_max_memory_mb', default=1024, type=int, help='PLY生点群LRUキャッシュのCPUメモリ上限(MB)')
     parser.add_argument('--episode_input_common_cache', default=True, type=str2bool, help='同じ入力データをEpisodeごとに繰り返すとき、入力依存の共通前処理をCPUキャッシュして再利用するか')
     parser.add_argument('--episode_input_common_cache_enable_dataset_cache', default=True, type=str2bool, help='episode_input_common_cache=True時にPLY dataset_cacheも自動で有効化するか')
     parser.add_argument('--episode_input_common_cache_max_entries', default=0, type=int, help='Episode共通前処理キャッシュの最大件数(0なら学習ファイル数まで自動設定)')
@@ -3412,6 +3426,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--amp_dtype', default='auto', type=str, help='AMPのデータ型')
     parser.add_argument('--full_cloud_activation_checkpoint', default=True, type=str2bool, help='FP32精度を維持したままfull-cloud headの中間activationをbackward時に再計算してGPUメモリを削減する')
     parser.add_argument('--full_cloud_saved_tensor_cpu_offload_mb', default=1.0, type=float, help='full-cloud Actuatorのbackward用FP32 Tensorを公式save_on_cpuで可逆退避するか（0で無効、正数で有効）')
+    parser.add_argument('--full_cloud_saved_tensor_pin_memory', default=False, type=str2bool, help='save_on_cpu退避をpinned memoryに置くか。長時間学習では共有メモリ増加を避けるため既定False')
     parser.add_argument('--structure_neighbor_query_chunk', default=32768, type=int, help='26近傍occupancyを完全一致のまま分割検索する点数（小さいほど一時GPUメモリを削減）')
     parser.add_argument('--den6_online_release_cuda_cache_before_actuator', default=True, type=str2bool, help='構造解析終了後に不要となったCUDA検索workspace cacheをActuator前に返却する')
     parser.add_argument('--den6_online_release_cuda_cache_before_actual', default=True, type=str2bool, help='ana_den6_onlineの実圧縮worker起動直前に未使用CUDA allocator cacheだけを返却し、2プロセス重複時のGPU使用量を抑える')
@@ -3996,6 +4011,12 @@ def parse_pugan_args(parser, file_day, file_time):
     args.heuristic_guidance_online_reward_ema = min(max(
         float(getattr(args, "heuristic_guidance_online_reward_ema", 0.10)), 1e-4
     ), 1.0)
+    args.heuristic_guidance_online_reward_scale = max(
+        float(getattr(args, "heuristic_guidance_online_reward_scale", 10.0)), 0.0
+    )
+    args.heuristic_guidance_online_advantage_clip = max(
+        float(getattr(args, "heuristic_guidance_online_advantage_clip", 5.0)), 0.0
+    )
     args.heuristic_guidance_online_grad_audit = bool(
         getattr(args, "heuristic_guidance_online_grad_audit", False)
     )
@@ -7250,10 +7271,15 @@ def parse_pugan_args(parser, file_day, file_time):
         add_anchor, prune_anchor, move_anchor = profile_amounts.get(
             key, (0.0010, 0.0010, 0.0005)
         )
-        residual_fraction = max(
-            float(getattr(args, "heuristic_guidance_amount_residual_fraction", 0.50)), 0.0
+        # profile値は初期anchorであり、学習後の永久上限ではない。
+        # Add+Prune+2*Adjust（変更Voxel cell数）がonline上限未満となる比率で
+        # 各Amount headの探索幅を配分する。1Stepの候補は引き続き1つだけである。
+        changed_anchor = max(add_anchor + prune_anchor + 2.0 * move_anchor, 1e-12)
+        changed_budget = min(
+            float(getattr(args, "heuristic_guidance_online_max_changed_ratio", 0.0099)),
+            0.0099,
         )
-        bound_scale = 1.0 + residual_fraction
+        bound_scale = max(changed_budget / changed_anchor, 1.0)
         if not _cli_option_was_provided("--max_add_ratio"):
             args.max_add_ratio = min(max(add_anchor * bound_scale, add_anchor + 0.0001), 0.01)
         if not _cli_option_was_provided("--max_drop_ratio"):

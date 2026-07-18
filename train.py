@@ -11,6 +11,8 @@ except OSError:
 import torch
 import torch.optim as optim
 import argparse
+import ctypes
+import gc
 import hashlib
 import math
 import csv
@@ -21,6 +23,20 @@ from collections import OrderedDict
 import time
 import datetime
 from contextlib import nullcontext
+
+try:
+    _LIBC_MALLOC_TRIM = ctypes.CDLL("libc.so.6").malloc_trim
+    _LIBC_MALLOC_TRIM.argtypes = [ctypes.c_size_t]
+    _LIBC_MALLOC_TRIM.restype = ctypes.c_int
+except (OSError, AttributeError):
+    _LIBC_MALLOC_TRIM = None
+
+
+def _release_cpu_step_memory():
+    """解放済みfull-cloud CPU offload領域をOSへ返す。"""
+    gc.collect()
+    if _LIBC_MALLOC_TRIM is not None:
+        _LIBC_MALLOC_TRIM(0)
 
 from models.network import Network
 import models.network as network_module
@@ -13955,11 +13971,46 @@ def train(model, args, loss, writer, plot, notifier=None):
                         raise RuntimeError(
                             "ana_den6_onlineにはNetwork.discrete_policy_lossが必要である"
                         )
-                    online_policy_loss = policy_loss_fn(L_downstream.detach())
+                    # 方策の成否は幾何等を含むL_downstreamではなく、このStepで
+                    # 唯一実行したfull-cloud Actual圧縮率だけで判定する。
+                    # Surrogateは従来どおり微分可能な主損失として別経路で逆伝播する。
+                    actual_policy_value = finite_float_or_none(
+                        compression_debug_terms.get(
+                            "actual_total_bit_percent_fresh",
+                            compression_debug_terms.get("actual_total_bit_percent", None),
+                        )
+                    )
+                    if actual_policy_value is None:
+                        raise RuntimeError(
+                            "ana_den6_onlineの毎Step policy更新にfull-cloud Actual圧縮率がない"
+                        )
+                    online_policy_objective = L_downstream.new_tensor(
+                        float(actual_policy_value)
+                    )
+                    online_policy_loss = policy_loss_fn(online_policy_objective)
                     if not torch.is_tensor(online_policy_loss):
                         raise RuntimeError(
                             "ana_den6_onlineのdiscrete_policy_lossがTensorを返していない"
                         )
+                    policy_debug = dict(
+                        getattr(base_model_for_policy, "last_discrete_policy_debug", {}) or {}
+                    )
+                    if not policy_debug:
+                        raise RuntimeError(
+                            "ana_den6_onlineのsingle-proposal policy項が生成されていない"
+                        )
+                    compression_debug_terms.update({
+                        f"den6_online_policy_{key}": value
+                        for key, value in policy_debug.items()
+                    })
+                    latest_compression_debug = dict(
+                        getattr(loss, "last_compression_debug", {}) or {}
+                    )
+                    latest_compression_debug.update({
+                        f"den6_online_policy_{key}": value
+                        for key, value in policy_debug.items()
+                    })
+                    loss.last_compression_debug = latest_compression_debug
                     # hard分岐で既に足している場合の二重加算を避ける。
                     if _discrete_loss_mode_value(args) == "hard" and not compression_primary_mode:
                         L = L - L_discrete_policy
@@ -15382,6 +15433,11 @@ def train(model, args, loss, writer, plot, notifier=None):
                         f", grad_norms=(where={float(audit_compression.get('den6_online_where_grad_norm', 0.0) or 0.0):.6g}, "
                         f"amount={float(audit_compression.get('den6_online_amount_grad_norm', 0.0) or 0.0):.6g}, "
                         f"action={float(audit_compression.get('den6_online_action_grad_norm', 0.0) or 0.0):.6g})"
+                        f", policy=(objective={float(audit_compression.get('den6_online_policy_objective', 0.0) or 0.0):.6g}, "
+                        f"baseline={float(audit_compression.get('den6_online_policy_objective_baseline', 0.0) or 0.0):.6g}, "
+                        f"advantage={float(audit_compression.get('den6_online_policy_advantage', 0.0) or 0.0):.6g}, "
+                        f"log_prob={float(audit_compression.get('den6_online_policy_log_prob', 0.0) or 0.0):.6g}, "
+                        f"loss={float(audit_compression.get('den6_online_policy_policy_loss', 0.0) or 0.0):.6g})"
                         f", timing=(step_before_audit={float(time.time() - st_step):.3f}s, "
                         f"actual_total={float(audit_compression.get('actual_encode_time_total', 0.0) or 0.0):.3f}s, "
                         f"actual_gt={float(audit_compression.get('gt_actual_encode_time', 0.0) or 0.0):.3f}s, "
@@ -15448,6 +15504,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                     # 旧contextを保持したまま次frameを構築すると、点数が異なる
                     # frameごとに数GiBの一時重複が発生する。
                     input_xyz = None
+                    pts = None
                     input_pcd = None
                     input_attr_full = None
                     compression_gt_pts = None
@@ -15501,6 +15558,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                     tail_actuator_block = None
                     tail_support_raw = None
                     tail_support_scaled = None
+                    compression_support_anchor = None
                     online_policy_loss = None
                     prune_where_grad_terms = []
                     step_grad_loss_items = []
@@ -15520,6 +15578,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                     setattr(args, "_last_voxel_restored_actual_debug", {})
                     if use_cuda and torch.cuda.is_available():
                         torch.cuda.empty_cache()
+                    _release_cpu_step_memory()
                 global_train_step += 1
                 max_train_steps = int(getattr(args, "max_train_steps", 0))
                 if max_train_steps > 0 and global_train_step >= max_train_steps:
