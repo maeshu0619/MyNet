@@ -88,7 +88,7 @@ from models.utils.training.episode_metrics import *
 from models.utils.training.checkpoint_metrics import *
 from models.utils.training.actual_compression_guard import apply_actual_compression_guard
 from models.utils.training.for_better_logging import *
-from models.utils.training.train_flow import * # train loopのStage固定、Subtree入力、1Subtree選択、圧縮目的合成、Epoch窓選択を使う
+from models.utils.training.train_flow import * # train loopのStage固定、全点群入力、圧縮目的合成、Epoch窓選択を使う
 from models.utils.training.loss_grad_probe import build_loss_grad_probe_rows, summarize_loss_grad_probe_rows
 
 from models.utils.surrogate.pretrain import *
@@ -11932,7 +11932,7 @@ def run_episode_full_cloud_validation(
                 args._collect_sparsepcgc_debug = False
                 args._den6_online_training_step_active = False
                 try:
-                    input_pcd = prepare_subtree_input_pcd(pts, use_cuda)
+                    input_pcd = prepare_full_cloud_input_pcd(pts, use_cuda)
                     input_xyz = input_pcd[:, :3, :]
                     input_attr = input_pcd[:, 3:, :].contiguous() if input_pcd.shape[1] > 3 else None
                     autocast_ctx = torch.cuda.amp.autocast(dtype=amp_dtype, enabled=use_amp) if use_cuda else nullcontext()
@@ -12298,10 +12298,6 @@ def train(model, args, loss, writer, plot, notifier=None):
     checkpoint_gate_refs = {} # ChackPoint保存判定で使う基準値や過去値を保持
     best_trackers = None # 複数指標でBest CheckPointを追跡するための状態を初期化
     actual_guard_state = {"best_delta": float("inf"), "best_path": None, "bad_count": 0} # 実Codex評価が悪化したときに、巻き戻す
-    full_cloud_correction_state = {}
-    last_subtree_actual_debug_for_correction = {}
-    last_full_context_debug_for_correction = {}
-    last_full_cloud_correction_update_debug = {}
 
     """モデル保存先ファイルのセットアップ"""
     output_dir = os.path.join(args.out_path)
@@ -12410,7 +12406,6 @@ def train(model, args, loss, writer, plot, notifier=None):
                 args._current_input_file = str(Path(file_path).expanduser().resolve())
                 cache_key = make_step_cache_key(file_path, args) # ファイルパスと設定から一意なキーを作り、前処理結果、Codec結果、Patch情報などのキャッシュ参照に使う
                 raw_pts_num = int(pts.shape[1] if pts.dim() == 3 else pts.shape[0]) # 受け取ったデータの元点数を数え、点数比較やログに使用
-                subtree_mode = bool(getattr(args, "train_patch_subset_enable", False)) # Octree Subtreeの部分学修を行うか否かの判定
                 sparsepcgc_training_mode = str(
                     getattr(args, "sparsepcgc_training_mode", "subtree_selector")
                 ).strip().lower()
@@ -12418,13 +12413,8 @@ def train(model, args, loss, writer, plot, notifier=None):
                 den6_online_full_cloud = heuristic_mode == "ana_den6_online"
                 full_cloud_amount_mode = bool(sparsepcgc_training_mode == "full_cloud_amount")
                 if den6_online_full_cloud:
-                    # 既存のanchor実行枠だけを使い、局所Subtreeの操作・損失経路には入らない。
-                    # subtree_mode=Falseでは共通forwardまで飛ばしてしまうため、anchor専用に維持する。
-                    subtree_mode = True
                     full_cloud_amount_mode = False
                     args._current_teacher_scope = "full_cloud"
-                elif full_cloud_amount_mode:
-                    subtree_mode = True
 
                 """ログ判定"""
                 log_this_step = should_log_step(step + 1, num_steps, args.print_rate) # このStepで通常ログを出すか判定
@@ -12451,7 +12441,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                 # one fresh edited actual encode and report its counters.
                 args._den6_online_training_step_active = bool(den6_online_full_cloud)
                 args._current_sample_name = os.path.basename(str(file_path)) # teacher/debugログに点群ファイル名を残す
-                args._current_teacher_scope = "full_cloud" # このStepのteacherが全点群か局所subtreeかをLoss側へ伝える初期値
+                args._current_teacher_scope = "full_cloud"
                 args._sparsepcgc_full_cloud_actual_primary_active = False
                 args._log_this_step = False
                 sparsepcgc_csv_debug = ( str(getattr(args, "compress", "")).strip().lower().replace("-", "").replace("_", "") == "sparsepcgc" and bool(getattr(args, "save_compression_metric_csv", True))) # Sparse PCGC専用ログ
@@ -12482,24 +12472,14 @@ def train(model, args, loss, writer, plot, notifier=None):
                 if timing_enabled: # 時間計測が有効なら入力整形処理の開始時刻を記録
                     sync_for_timing(use_cuda) # GPUを使用している場合は、正確な時間計測のためにGPUの処理が完了するのを待つ
                     timing_data_start = time.time() # 時間計測開始
-                if subtree_mode: # Subtree部分学習モード
-                    input_pcd = prepare_subtree_input_pcd(pts, use_cuda) # 入力点群を間引かず全点のままSubtree分割用形式へ変換する
-                    input_xyz = input_pcd[:, :3, :] # 座標情報のみ抽出
-                elif args.split2patch: # パッチ分割モード
-                    input_pcd = pts if pts.dim() == 3 else pts.unsqueeze(0) # 形式変換
-                    input_pcd = downsample_input_batch(input_pcd, args, cache_key) # 点数の制限
-                    if use_cuda:
-                        input_pcd = input_pcd.cuda(non_blocking=True)
-                    input_pcd = rearrange(input_pcd, 'b n c -> b c n').contiguous() # 形式変換
-                    input_xyz = input_pcd[:, :3, :] # 座標情報のみ抽出
-                else:
-                    input_xyz, patches, centroid_xyz, fd_xyz = prepare_whole_cloud_inputs(pts, args, cache_key, use_cuda) # 全体点群を入力とする
-                    input_pcd = input_xyz
+                input_pcd = prepare_full_cloud_input_pcd(pts, use_cuda)
+                input_xyz = input_pcd[:, :3, :]
+                input_attr_full = input_pcd[:, 3:, :].contiguous() if input_pcd.shape[1] > 3 else None
 
                 pcd_pts_num = input_xyz.shape[-1]
                 # ============================================================
                 # このStepで使う唯一の voxel 座標系を full cloud から一度だけ作る。
-                # Subtree / full anchor / actual / proxy / debug は必ずこれを基準にする。
+                # Network / actual / surrogate / debug は必ずこれを基準にする。
                 # ============================================================
                 full_cloud_canonical_start = time.time()
                 full_cloud_canonical_context = _episode_input_common_cache_fetch(
@@ -12583,1654 +12563,385 @@ def train(model, args, loss, writer, plot, notifier=None):
                         pass
 
                 """変数の初期化と設定"""
-                subset_step = False # 部分学習か否か
-                subset_enabled = False # 部分集合学習が有効か否か
-                is_anchor_step = True # 初期状態では全体点ん群を使うAnchor Stepとする
+                is_anchor_step = True
+                anchor_reason = "full_cloud_only"
                 compression_cache_key = cache_key # キャッシュキーの初期化
                 compression_gt_pts = input_xyz # 圧縮損失で比較する教師側点群を入力点群にする
                 compression_gen_xyz = None # 圧縮Lossへ渡した出力点群をVoxel衝突ログで参照する
                 train_edit_stats = None # 点操作を見計算状態にする
                 noise_debug = empty_noise_debug() # 圧縮損失用に量子化前の点群に加えるノイズのデバッグ情報を初期化
-                # VoxelCollisionログ用のGT点群である。
-                # full-cloud時は全体点群、Subtree時は後で選択Subtreeに差し替える。
                 voxel_collision_input_gt = input_xyz[:, :3, :]
-                subtree_depth_meta = {} # 深度などの情報保存
-                subtree_trees = {} # 事前構築したSubtree内部OctreeをCPU側で保持する
-                full_octree_contexts = {} # full-cloud Octree内でのSubtree文脈をCPU側で保持する
-                group_meta = {} # 追加Octreeメタ情報を既存group_stateと分離して保持する
-                subtree_ref = None # full-cloud anchor onlyではSubtree参照を作らない
-                total_subtree_count = 0 # Subtree総数を0で初期化
-                eligible_subtree_count = 0 # 学習対象候補として残ったSubtreeの初期化
-                actual_eligible_subtree_count = 0 # 条件を満たしたSubtreeを初期化
-                selected_subtree_count = 0 # このStepで実際にForwardとLoss計算に用いるSubtreeを初期化
-                min_subtree_points = 0 # Subtreeとしてさいようするための最小点数条件を初期化
-                subtree_point_counts = [int(input_xyz.shape[-1])] # Subtree点数分布の初期値として、全体点群の点数をリストで保存
-                anchor_reason = "not_subtree_mode"
-                subtree_loss_scope = "full_cloud"
-                """Subtree分割学習"""
-                if subtree_mode:                    
-                    full_cloud_anchor_every_step = bool(
-                        den6_online_full_cloud
-                        or getattr(args, "train_full_cloud_anchor_every_step", False)
-                    )
-                    full_cloud_anchor_every_step_shadow = bool(
-                        getattr(args, "train_full_cloud_anchor_every_step_shadow", False)
-                    )
-                    if den6_online_full_cloud:
-                        # den6 onlineの正式経路へshadow subtree勾配経路を混入させない。
-                        full_cloud_anchor_every_step_shadow = False
-                    if full_cloud_amount_mode:
-                        full_cloud_anchor_every_step = True
-                        full_cloud_anchor_every_step_shadow = False
-                    full_cloud_anchor_only_step = bool(
-                        full_cloud_anchor_every_step
-                        and not full_cloud_anchor_every_step_shadow
-                    )
-                    """Subtree分割学習のセットアップ"""
-                    optimizer.zero_grad(set_to_none=True) # 残った勾配の削除
-                    subset_enabled = True # 部分集合学習を有効にする
-                    input_attr_full = input_pcd[:, 3:, :].contiguous() if input_pcd.shape[1] > 3 else None # 属性のとりだし
-                    if full_cloud_anchor_only_step:
-                        subtree_depth_meta = {
-                            "depth": 0,
-                            "requested_depth": 0,
-                            "selection_reason": "full_cloud_anchor_every_step_skip_subtree_groups",
-                            "full_cloud_anchor_only_step": True,
-                        }
-                        requested_subtree_depth = 0
-                        min_subtree_points = max(int(getattr(args, "train_subtree_min_points", 1)), 1)
-                        subtree_group_state = {
-                            "subtree_ref": None,
-                            "unique_keys": input_xyz.new_empty((0,), dtype=torch.long),
-                            "index_lists": [],
-                            "all_groups": [],
-                            "eligible_groups": [],
-                            "groups": [],
-                            "depth": 0,
-                            "retry_count": 0,
-                            "selection_reason": "full_cloud_anchor_every_step_skip_subtree_groups",
-                        }
-                        step_timing_breakdown["subtree_group_build_time"] = 0.0
-                    else:
-                        subtree_depth_meta = sample_train_subtree_depth(
-                            input_xyz,
+                encoder_debug_chunks = [] if detail_log_this_step else None
+                """損失項の初期化"""
+                L_geom = input_xyz.new_zeros(())
+                L_com = input_xyz.new_zeros(())
+                L_attr = input_xyz.new_zeros(())
+                L_policy = input_xyz.new_zeros(())
+                L_actuator = input_xyz.new_zeros(())
+                Lp_out = input_xyz.new_zeros(())
+                La_fit = input_xyz.new_zeros(())
+                La_rep = input_xyz.new_zeros(())
+                loss_bit = input_xyz.new_zeros(())
+                loss_single = input_xyz.new_zeros(())
+                loss_nodes = input_xyz.new_zeros(())
+                L_full_cloud_amount = input_xyz.new_zeros(())
+                full_cloud_amount_debug = {}
+                full_cloud_amount_candidate_rows = []
+                gen_xyz = None
+                final_w = None
+                out_label = None
+                full_cloud_anchor_no_grad = False
+                full_cloud_anchor_no_grad_reason = ""
+                full_cloud_primary_override_debug = {}
+                full_cloud_geometry_teacher_debug = {}
+                full_cloud_anchor_runtime_timing = {}
+
+                """モデルの実行"""
+                prev_log_flag = getattr(args, "_log_this_step", False)
+                try:
+                    args._log_this_step = bool(
+                        (not compact_step_text_log)
+                        and getattr(args, "verbose_step_logs", False)
+                        and detail_log_this_step
+                    ) # このfull-cloud処理内で詳細ログを出すか否か決定
+                    if is_anchor_step:
+                        """全点群の場合"""
+                        full_cloud_anchor_block_start = time.time()
+                        args._current_teacher_scope = "full_cloud" # full-cloud anchorでは実圧縮teacherも全点群基準として記録する
+                        args._current_teacher_anchor_reason = str(anchor_reason) # full-cloudになった理由をteacherログへ渡す
+                        args._current_exact_teacher_mode = "full_cloud" # exact occupancy teacherは全点群基準で走らせる
+                        args._current_exact_teacher_uses_full_context = False # 全点群はSubtree文脈を使わない
+                        args._current_exact_teacher_fallback_reason = "" # full-cloudではfallback理由なし
+                        if not compact_step_text_log:
+                            writer.write("Running full cloud Anchor step.") # Anchor Stepであることをログに出す
+
+                        # FullCloud anchorは原則no-gradだが、明示的に許可され、
+                        # かつnode/voxel数が上限以内のときだけ学習graphを作る。
+                        (
+                            full_cloud_anchor_no_grad,
+                            full_cloud_anchor_no_grad_reason,
+                            full_cloud_anchor_node_count,
+                            full_cloud_anchor_node_count_source,
+                        ) = _resolve_full_cloud_anchor_no_grad(
                             args,
-                            global_step=global_train_step,
-                            cache_key=cache_key,
-                        ) # Octree深度の決定
-
-                        subtree_depth_meta, requested_subtree_depth = maybe_raise_subtree_depth_for_large_input(
-                            subtree_depth_meta,
-                            raw_pts_num,
-                            args,
-                        ) # 大点群時のSubtree深度調整
-
-                        # Subtree分割の最小Depthを2に固定する
-                        train_subtree_depth_floor = int(getattr(args, "train_subtree_depth_floor", 4))
-                        requested_subtree_depth = max(int(requested_subtree_depth), train_subtree_depth_floor)
-
-                        # ログ上も、最終的に要求したDepthを分かるように残す
-                        subtree_depth_meta = dict(subtree_depth_meta)
-                        subtree_depth_meta["depth_floor"] = int(train_subtree_depth_floor)
-                        subtree_depth_meta["depth_after_floor"] = int(requested_subtree_depth)
-
-                        min_subtree_points = max(int(getattr(args, "train_subtree_min_points", 1)), 1)
-                        subtree_group_build_start = time.time()
-                        subtree_group_cache_key = _episode_input_common_cache_key(
-                            cache_key,
-                            "subtree_groups",
-                            requested_depth=int(requested_subtree_depth),
-                            min_points=int(min_subtree_points),
-                        )
-                        subtree_group_state = _episode_input_common_cache_fetch(
-                            args,
-                            subtree_group_cache_key,
-                            device=input_xyz.device,
-                            section="subtree_groups",
-                        )
-                        if subtree_group_state is None:
-                            subtree_group_state = build_octree_subtree_groups_with_retry(
-                                input_xyz,
-                                args,
-                                requested_subtree_depth,
-                                min_subtree_points,
-                                allow_largest_fallback=True,
-                            )
-                            _episode_input_common_cache_store(
-                                args,
-                                subtree_group_cache_key,
-                                subtree_group_state,
-                            )
-                        step_timing_breakdown["subtree_group_build_time"] = float(time.time() - subtree_group_build_start)
-                    # subtree_depth_meta = sample_train_subtree_depth( input_xyz, args, global_step=global_train_step, cache_key=cache_key) # Octree深度の決定
-                    # subtree_depth_meta, requested_subtree_depth = maybe_raise_subtree_depth_for_large_input( subtree_depth_meta, raw_pts_num, args) # 大点群時は点を捨てずにSubtree深度だけ1段階浅くする
-                    # requested_subtree_depth = int(requested_subtree_depth) # 調整後のSubtree深度を整数で取り出す
-                    # min_subtree_points = max(int(getattr(args, "train_subtree_min_points", 1)), 1) # Subtreeとして採用する点数の最小点数
-                    # subtree_group_state = build_octree_subtree_groups_with_retry( input_xyz, args, requested_subtree_depth, min_subtree_points, allow_largest_fallback=True) # 入力点群から指定深度のOctree Subtree群を作る
-                    """Subtree情報"""
-                    subtree_ref = subtree_group_state["subtree_ref"] # Subtree参照情報の抽出
-                    if subtree_ref is None and not full_cloud_anchor_only_step:
-                        raise RuntimeError("Subtree mode did not find any valid octree subtree.")
-                    # subtree_trees = dict(subtree_group_state.get("subtree_trees", {}) or {}) # 追加フィールドだけを参照し、既存形式は変えない
-                    # full_octree_contexts = dict(subtree_group_state.get("full_octree_contexts", {}) or {}) # full-cloud上の親・兄弟・祖先文脈
-                    # group_meta = dict(subtree_group_state.get("group_meta", {}) or {}) # ログ用の軽量メタ情報
-                    subtree_trees = {}
-                    full_octree_contexts = {}
-                    group_meta = {}
-                    subtree_depth_meta = dict(subtree_depth_meta) # 深度メタ情報変換
-                    subtree_depth_meta["requested_depth"] = int(requested_subtree_depth) # 要求された深度情報の保存
-                    subtree_depth_meta["depth"] = int(subtree_group_state.get("depth", requested_subtree_depth)) # 実際に採用された深度情報の保存
-                    subtree_depth_meta["retry_count"] = int(subtree_group_state.get("retry_count", 0)) # 深度変更の再試行が何回行われたか
-                    subtree_depth_meta["selection_reason"] = str(subtree_group_state.get("selection_reason", "none")) #  なぜその深度・Subtreeが選ばれたか
-                    all_subtree_keys = subtree_group_state["unique_keys"] # 入力点群内に存在する全Subtreeの識別Keyを取り出す
-                    subtree_index_lists = subtree_group_state["index_lists"] # 各Subtree内の点インデックス
-                    all_groups = subtree_group_state["all_groups"] # 全Subtreeに関して、情報を抜き出す
-
-                    """Subtree決定"""
-                    total_subtree_count = int(all_subtree_keys.numel()) # 入力点群から作られたSubtreeの総数を数える
-                    eligible_groups = list(subtree_group_state.get("eligible_groups", [])) # 最小点数条件などを満たした学習候補Subtreeを取り出す
-                    actual_eligible_subtree_count = int(len(eligible_groups)) # 条件を満たしたSubtreeを数える
-                    min_points_miss = bool(total_subtree_count > 0 and not eligible_groups and min_subtree_points > 1) # Subtree自体はあるが、最小点数条件を満たすSubtreeがないかを判定する
-                    candidate_groups = eligible_groups or list(subtree_group_state.get("groups", [])) or all_groups # 学習に使う候補Subtree集合を決める
-                    max_subtree_points = max(int(getattr(args, "train_subtree_max_points", 0)), 0)
-                    if max_subtree_points > 0:
-                        bounded_candidate_groups = [
-                            (subtree_key, point_idx)
-                            for subtree_key, point_idx in candidate_groups
-                            if int(point_idx.numel()) <= max_subtree_points
-                        ]
-                        if bounded_candidate_groups:
-                            candidate_groups = bounded_candidate_groups
-                    candidate_subtree_keys = all_subtree_keys.new_tensor( # 候補SubtreeのKeyを元のSubtree Keyと同じテンソルとして作る
-                        [subtree_key for subtree_key, _ in candidate_groups],
-                        dtype=all_subtree_keys.dtype,
-                    ) if candidate_groups else all_subtree_keys.new_empty((0,), dtype=all_subtree_keys.dtype)
-                    eligible_subtree_count = int(candidate_subtree_keys.numel()) # FallBack後も含めた学習候補Subtreeを数える
-
-                    """Subtree分割学習の再セットアップ"""
-                    is_anchor_step, anchor_reason = should_use_full_cloud_anchor( args, global_step=global_train_step, cache_key=cache_key) # このStepをSubtree学習が全点群学習にするか判定
-                    if full_cloud_amount_mode:
-                        is_anchor_step = True
-                        anchor_reason = "full_cloud_amount_training_mode"
-                    elif den6_online_full_cloud:
-                        is_anchor_step = True
-                        anchor_reason = "ana_den6_online_full_cloud"
-                    if ( min_points_miss and eligible_subtree_count <= 0 and bool(getattr(args, "train_subtree_anchor_on_min_points_miss", False))): # 最小点群数を満たすSubtreeがない
-                        is_anchor_step = True
-                        anchor_reason = "min_points_miss_full_anchor"
-                        log_for_better_event( for_better_path, "subtree_min_points_miss", global_step=global_train_step + 1, sampled_depth=int(subtree_depth_meta["depth"]), min_subtree_points=min_subtree_points, total_subtree_count=total_subtree_count, action="full_anchor")
-                    elif min_points_miss:
-                        log_for_better_event( for_better_path, "subtree_min_points_miss", global_step=global_train_step + 1, sampled_depth=int(subtree_depth_meta["depth"]), min_subtree_points=min_subtree_points, total_subtree_count=total_subtree_count, action="legacy_all_subtrees_fallback")
-                    full_cloud_anchor_shadow_train_requested = bool(
-                        is_anchor_step
-                        and bool(getattr(args, "full_cloud_anchor_train_shadow_subtree", True))
-                        and eligible_subtree_count > 0
-                    )
-                    selected_subtree_for_grad = bool((not is_anchor_step) or full_cloud_anchor_shadow_train_requested)
-                    selected_subtree_keys = candidate_subtree_keys # 初期状態では候補Subtreeを全て選択対象にする
-                    subtree_potential_select_meta = {"enabled": False, "reason": "not_evaluated"}
-                    if eligible_subtree_count > 0 and selected_subtree_for_grad:
-                        subtree_potential_start = time.time()
-                        potential_selected_keys, subtree_potential_select_meta = _select_sparsepcgc_potential_subtree_key(
-                            candidate_groups,
-                            candidate_subtree_keys,
                             full_cloud_canonical_context,
-                            args,
-                            global_train_step,
-                            cache_key,
-                            model=model,
                         )
-                        step_timing_breakdown["subtree_potential_select_time"] = float(time.time() - subtree_potential_start)
-                        if torch.is_tensor(potential_selected_keys) and int(potential_selected_keys.numel()) > 0:
-                            selected_subtree_keys = potential_selected_keys
-                        else:
-                            selected_subtree_keys = select_octree_subtree_keys(
-                                candidate_subtree_keys,
-                                global_train_step,
+                        if full_cloud_amount_mode or den6_online_full_cloud:
+                            full_cloud_anchor_no_grad = False
+                            full_cloud_anchor_no_grad_reason = (
+                                "ana_den6_online_full_cloud_requires_grad"
+                                if den6_online_full_cloud
+                                else "full_cloud_amount_train_branch_requires_grad"
+                            )
+
+                        if not compact_step_text_log:
+                            writer.write(
+                                "FullCloudAnchorMode: "
+                                f"no_grad={bool(full_cloud_anchor_no_grad)}, "
+                                f"reason={full_cloud_anchor_no_grad_reason}, "
+                                f"node_count={int(full_cloud_anchor_node_count)}, "
+                                f"node_count_source={full_cloud_anchor_node_count_source}, "
+                                f"grad_node_limit={int(getattr(args, 'full_cloud_anchor_grad_node_limit', 50000))}, "
+                                f"allow_grad={bool(getattr(args, 'full_cloud_anchor_allow_grad', False))}"
+                            )
+                        autocast_ctx = torch.cuda.amp.autocast(dtype=amp_dtype, enabled=use_amp) if use_cuda else nullcontext()
+                        grad_ctx = torch.no_grad() if full_cloud_anchor_no_grad else nullcontext()
+
+                        with grad_ctx, autocast_ctx: # 全体点群をno-gradでモデルに入力し、teacher更新用の出力だけ得る
+                            """モデルの実行"""
+                            # Step冒頭で作った full cloud canonical context をそのまま使う。
+                            # ここで再量子化してはいけない。
+                            full_octree_context = dict(full_cloud_canonical_context)
+                            full_octree_context["octree_context_scope"] = "full_cloud"
+                            full_octree_context["octree_input_mode"] = "full_cloud"
+                            full_octree_context["canonical_source"] = "full_cloud_canonical"
+                            full_octree_context["fast_full_cloud_oracle_anchor"] = False
+                            _sparsepcgc_apply_amount_outcome_context(
                                 args,
+                                memory_key=None,
+                                forward_key=cache_key,
                             )
-
-                            if bool(getattr(args, "sparsepcgc_multi_subtree_train", False)):
-                                # potential選択が使えない場合でも、single化せず上位K個だけ使う。
-                                # ここではselect_octree_subtree_keysの順序を尊重する。
-                                multi_k = max(int(getattr(args, "sparsepcgc_multi_subtree_topk", 3)), 1)
-                                selected_subtree_keys = selected_subtree_keys[:multi_k]
-                            else:
-                                selected_subtree_keys = select_single_subtree_key(
-                                    candidate_subtree_keys,
-                                    selected_subtree_keys,
-                                    global_train_step,
-                                    args,
-                                    cache_key,
-                                ) # 1StepでForwardするSubtreeをランダムに1個へ絞る
-                    selected_subtree_count = int(selected_subtree_keys.numel()) # 実際に選択されたSubtree数を数える
-                    subset_step = selected_subtree_for_grad and selected_subtree_count < eligible_subtree_count # 候補の一部だけを使ったStepか否かの判定
-                    encoder_debug_chunks = [] if detail_log_this_step else None # 詳細ログ対象Stepなら、各Subtree Forward時のEncoder Debugを保存するリスト
-
-                    """Selected Groupsの作成"""
-                    selected_groups = None
-                    if selected_subtree_for_grad: # 通常SubtreeまたはFullCloud anchorのshadow学習Subtree
-                        selected_key_set = set(selected_subtree_keys.detach().cpu().tolist()) # 選択されたSubtree Keyの集合
-                        group_source = candidate_groups # 選択元となるSubtreeグループ集合
-                        selected_groups = [ (subtree_key, point_idx) for subtree_key, point_idx in group_source if subtree_key in selected_key_set] # 選択されたSubtree Keyに対応する情報の抽出
-                        if not selected_groups and group_source:
-                            selected_groups = [max(group_source, key=lambda item: int(item[1].numel()))]
-                        if not selected_groups:
-                            raise RuntimeError("Subtree mode did not select any subtree group.")
-                    if is_anchor_step: # Anchorのとき
-                        subtree_point_counts = [int(point_idx.numel()) for _, point_idx in (eligible_groups or [])] # 候補Subtreeの点数分布を記録するための一覧
-                        if not subtree_point_counts:
-                            subtree_point_counts = [int(input_xyz.shape[-1])]
-                        subtree_loss_scope = "full_cloud_output_vs_full_cloud_input"
-                    else:
-                        subtree_point_counts = [int(point_idx.numel()) for _, point_idx in selected_groups]
-                        subtree_loss_scope = "subtree_output_vs_subtree_input"
-                    subtree_inputs_by_key = {}
-
-                    # ============================================================
-                    # Episode共通Subtree runtime cache
-                    # candidateごとの入力点群 / 属性 / canonical metadata を個別Subtree単位で保存する。
-                    # これにより、選択組み合わせが変わっても Episode2以降で再利用できる。
-                    # ============================================================
-                    if selected_subtree_for_grad:
-                        t1 = time.time()
-                        subtree_trees = {}
-                        full_octree_contexts = {}
-                        group_meta = {}
-
-                        subtree_runtime_cache_enabled = bool(
-                            _episode_input_common_cache_enabled(args)
-                            and getattr(args, "episode_input_subtree_runtime_cache", True)
-                        )
-                        subtree_runtime_depth = int(subtree_group_state.get("depth", requested_subtree_depth))
-                        prewarm_groups = list(selected_groups)
-                        if bool(getattr(args, "episode_input_subtree_runtime_prewarm_all", True)):
-                            prewarm_groups = list(candidate_groups)
-                        max_runtime_groups = max(
-                            int(getattr(args, "episode_input_subtree_runtime_max_groups", 0)),
-                            0,
-                        )
-                        if max_runtime_groups > 0 and len(prewarm_groups) > max_runtime_groups:
-                            prewarm_groups = list(prewarm_groups[:max_runtime_groups])
-
-                        runtime_cache_entries = {}
-                        runtime_missing_groups = []
-                        for runtime_key, runtime_point_idx in prewarm_groups:
-                            runtime_key_int = int(runtime_key)
-                            runtime_cache_key = _selected_subtree_runtime_input_common_cache_key(
-                                cache_key,
-                                runtime_key_int,
-                                subtree_runtime_depth,
-                                int(runtime_point_idx.numel()),
+                            gen_pts, L_attr, L_policy, L_actuator, final_w, Lp_out, La_fit, La_rep, out_label = model.forward(
+                                input_xyz,
+                                input_attr_full,
+                                cache_key=cache_key,
+                                return_attr_output=False,
+                                compute_internal_losses=not bool(full_cloud_anchor_no_grad),
+                                full_octree_context=full_octree_context,
+                                octree_input_mode="full_cloud",
                             )
-                            runtime_entry = (
-                                _episode_input_common_cache_fetch(
-                                    args,
-                                    runtime_cache_key,
-                                    device=input_xyz.device,
-                                    section="selected_subtree_runtime",
-                                )
-                                if subtree_runtime_cache_enabled
-                                else None
+                        try:
+                            full_cloud_anchor_runtime_timing = dict(
+                                getattr(model.module if hasattr(model, "module") else model, "last_runtime_timing", {}) or {}
                             )
-                            if isinstance(runtime_entry, dict):
-                                runtime_cache_entries[runtime_key_int] = runtime_entry
-                            else:
-                                runtime_missing_groups.append((runtime_key, runtime_point_idx))
+                        except Exception:
+                            full_cloud_anchor_runtime_timing = {}
+                        if final_w is not None and not torch.isfinite(final_w).all(): # final重みにNanやinfが混ざっていないか確認
+                            writer.write( "Warning: final_w contains NaN/Inf. " "It will be sanitized before point-edit summary and losses.")
+                            final_w = torch.nan_to_num(final_w, nan=0.0, posinf=1.0, neginf=0.0) # 変換
+                            final_w = final_w.clamp(0.0, 1.0) # 変換
+                        if detail_log_this_step:
+                            base_model = model.module if hasattr(model, "module") else model # DataParallelで包まれているばあいは中身のモデルを取り出す
+                            encoder_debug_chunks.append(dict(getattr(base_model, "last_encoder_debug", {}) or {})) # Encoder Debug情報をコピーして保存
+                        gen_xyz = gen_pts[:, :3, :]
+                        _log_sparsepcgc_restore_debug(args, writer, out_label)
+                        train_edit_stats = summarize_point_edits( input_xyz=input_xyz[:, :3, :], gen_pts=gen_pts, final_w=final_w, args=args) # 入力点群と出力点群を比較し、各操作の編集統計を計算
+                        final_w_for_loss = None
+                        if _discrete_loss_mode_value(args) != "hard":
+                            final_w_for_loss = final_w
+                        autocast_ctx = torch.cuda.amp.autocast(dtype=amp_dtype, enabled=use_amp) if use_cuda else nullcontext() # 形状損失と圧縮損失の計算もAMP文脈で行うための設定を作る
+                        loss_grad_ctx = torch.no_grad() if full_cloud_anchor_no_grad else nullcontext()
 
-                        if runtime_missing_groups:
-                            missing_metadata_cache_key = _selected_metadata_input_common_cache_key(
-                                cache_key,
-                                runtime_missing_groups,
-                                subtree_runtime_depth,
-                                args,
-                            )
-                            missing_metadata_cache = _episode_input_common_cache_fetch(
-                                args,
-                                missing_metadata_cache_key,
-                                device=input_xyz.device,
-                                section="selected_metadata",
-                            )
-                            if isinstance(missing_metadata_cache, dict):
-                                missing_subtree_trees = dict(missing_metadata_cache.get("subtree_trees", {}) or {})
-                                missing_full_octree_contexts = dict(missing_metadata_cache.get("full_octree_contexts", {}) or {})
-                                missing_group_meta = dict(missing_metadata_cache.get("group_meta", {}) or {})
-                            else:
-                                missing_subtree_trees, missing_full_octree_contexts, missing_group_meta = build_selected_group_octree_metadata(
-                                    input_xyz,
-                                    subtree_ref,
-                                    runtime_missing_groups,
-                                    args=args,
-                                )
-                                _episode_input_common_cache_store(
-                                    args,
-                                    missing_metadata_cache_key,
-                                    {
-                                        "subtree_trees": missing_subtree_trees,
-                                        "full_octree_contexts": missing_full_octree_contexts,
-                                        "group_meta": missing_group_meta,
-                                    },
-                                )
-
-                            for runtime_key, runtime_point_idx in runtime_missing_groups:
-                                runtime_key_int = int(runtime_key)
-                                runtime_entry = _build_selected_subtree_runtime_cache_entry(
-                                    input_xyz=input_xyz,
-                                    input_attr_full=input_attr_full,
-                                    full_cloud_canonical_context=full_cloud_canonical_context,
-                                    subtree_tree=missing_subtree_trees.get(runtime_key_int, {}),
-                                    full_octree_context=missing_full_octree_contexts.get(runtime_key_int, {}),
-                                    point_idx=runtime_point_idx,
-                                    group_meta=missing_group_meta.get(runtime_key_int, {}),
-                                )
-                                runtime_cache_entries[runtime_key_int] = runtime_entry
-                                if subtree_runtime_cache_enabled:
-                                    runtime_cache_key = _selected_subtree_runtime_input_common_cache_key(
-                                        cache_key,
-                                        runtime_key_int,
-                                        subtree_runtime_depth,
-                                        int(runtime_point_idx.numel()),
+                        with loss_grad_ctx, autocast_ctx:
+                            """形状損失の計算"""
+                            if full_cloud_amount_mode:
+                                geom_mode = str(
+                                    getattr(args, "sparsepcgc_full_cloud_amount_geometry_mode", "sampled")
+                                ).strip().lower()
+                                if geom_mode == "off":
+                                    L_geom = input_xyz.new_zeros(())
+                                    full_cloud_geometry_teacher_debug.update(
+                                        {
+                                            "full_cloud_amount_geometry_mode": "off",
+                                            "full_cloud_amount_geom_sample_points": 0,
+                                        }
                                     )
-                                    _episode_input_common_cache_store(
-                                        args,
-                                        runtime_cache_key,
-                                        runtime_entry,
+                                else:
+                                    run_full_geom = bool(
+                                        geom_mode == "interval_full"
+                                        and (
+                                            int(global_train_step)
+                                            % max(int(getattr(args, "sparsepcgc_full_cloud_amount_geom_interval", 20)), 1)
+                                            == 0
+                                        )
                                     )
-
-                        for selected_key, selected_point_idx in selected_groups:
-                            selected_key_int = int(selected_key)
-                            runtime_entry = runtime_cache_entries.get(selected_key_int, None)
-                            if not isinstance(runtime_entry, dict):
-                                raise RuntimeError(
-                                    "Selected subtree runtime cache entry is missing. "
-                                    f"subtree_key={selected_key_int}, depth={subtree_runtime_depth}"
-                                )
-                            subtree_inputs_by_key[selected_key_int] = runtime_entry
-
-                            patched_subtree_tree = dict(runtime_entry.get("subtree_tree", {}) or {})
-                            patched_full_context = dict(runtime_entry.get("full_octree_context", {}) or {})
-                            selected_group_meta = dict(runtime_entry.get("group_meta", {}) or {})
-                            oracle_subtree_xyz = runtime_entry.get("subtree_xyz", None)
-
-                            oracle_depth = 0
-                            try:
-                                oracle_depth = int(subtree_ref["depth"][0].item())
-                            except Exception:
-                                oracle_depth = int(subtree_depth_meta.get("depth", 0))
-                            oracle_cache_key = (
-                                f"{cache_key}|subtree_depth={oracle_depth}|subtree_key={selected_key_int}"
-                            )
-                            patched_full_context["actual_oracle_full_cloud_cache_key"] = str(cache_key)
-                            patched_subtree_tree, patched_full_context, oracle_debug = _attach_sparsepcgc_actual_oracle_drop(
-                                args=args,
-                                writer=writer,
-                                loss=loss,
-                                subtree_tree=patched_subtree_tree,
-                                full_octree_context=patched_full_context,
-                                subtree_xyz=oracle_subtree_xyz[:, :3, :],
-                                cache_key=oracle_cache_key,
-                                global_step=global_train_step,
-                            )
-                            if str(oracle_debug.get("override_scope", "")) == "full_cloud":
-                                apply_full_override = bool(
-                                    getattr(args, "sparsepcgc_actual_oracle_apply_full_override", False)
-                                )
-                                if apply_full_override:
-                                    full_cloud_canonical_context = dict(full_cloud_canonical_context)
-                                    for oracle_key, oracle_value in patched_full_context.items():
-                                        if oracle_key.startswith("actual_oracle_"):
-                                            full_cloud_canonical_context[oracle_key] = oracle_value
-                                patched_subtree_tree = dict(patched_subtree_tree)
-                                patched_full_context = dict(patched_full_context)
-                                for oracle_key in (
-                                    "actual_oracle_override_final_voxel_coords",
-                                    "actual_oracle_override_move_count",
-                                    "actual_oracle_override_drop_count",
-                                    "actual_oracle_override_subtree_prune_count",
-                                    "actual_oracle_override_scope",
-                                ):
-                                    patched_subtree_tree.pop(oracle_key, None)
-                                    patched_full_context.pop(oracle_key, None)
-                                patched_full_context.pop("actual_oracle_cached_edited_actual_stats", None)
-
-                            subtree_trees[selected_key_int] = patched_subtree_tree
-                            full_octree_contexts[selected_key_int] = patched_full_context
-                            if isinstance(oracle_debug, dict) and oracle_debug:
-                                step_actual_oracle_metric_debug = dict(oracle_debug)
-
-                            selected_group_meta["canonical_source"] = "full_cloud_canonical"
-                            selected_group_meta["canonical_subtree_points"] = int(
-                                patched_subtree_tree["global_voxel_coords"].shape[-1]
-                            )
-                            selected_group_meta["canonical_full_points"] = int(
-                                patched_full_context["full_global_voxel_coords"].shape[-1]
-                            )
-                            if isinstance(oracle_debug, dict):
-                                selected_group_meta["actual_oracle_enabled"] = bool(
-                                    oracle_debug.get("enabled", False)
-                                )
-                                selected_group_meta["actual_oracle_used"] = bool(
-                                    oracle_debug.get("used", False)
-                                )
-                                selected_group_meta["actual_oracle_best_percent"] = float(
-                                    oracle_debug.get("best_percent", 0.0)
-                                )
-                                selected_group_meta["actual_oracle_reason"] = str(
-                                    oracle_debug.get("reason", "")
-                                )
-                            group_meta[selected_key_int] = selected_group_meta
-                        t2 = time.time()
-                        step_timing_breakdown["selected_metadata_oracle_time"] = float(t2 - t1)
-                    else:
-                        subtree_trees = {}
-                        full_octree_contexts = {}
-                        group_meta = {}
-                        subtree_inputs_by_key = {}
-
-                    """ログ"""
-                    if (
-                        log_this_step
-                        and bool(getattr(args, "train_patch_subset_log", True))
-                        and not compact_step_text_log
-                    ):
-                        if is_anchor_step:
-                            point_counts = list(subtree_point_counts)
-                            stat_groups = eligible_groups or [(0, torch.arange(input_xyz.shape[-1], device=input_xyz.device))]
-                            loss_scope = subtree_loss_scope
-                        else:
-                            point_counts = list(subtree_point_counts)
-                            stat_groups = selected_groups
-                            loss_scope = subtree_loss_scope
-                        mean_points = sum(point_counts) / float(max(len(point_counts), 1))
-                        octree_stat = summarize_subtree_octree_stats(input_xyz, stat_groups, args)
-                        octree_stat_text = ""
-                        if octree_stat is not None:
-                            octree_stat_text = (
-                                f", octree_node[min/mean/max]={octree_stat['node']}, "
-                                f"octree_single[min/mean/max]={octree_stat['single']}, "
-                                f"octree_depth[min/mean/max]={octree_stat['depth']}, "
-                                f"octree_stat_count={int(octree_stat['count'])}"
-                            )
-                        potential_text = ""
-                        if isinstance(subtree_potential_select_meta, dict) and bool(
-                            subtree_potential_select_meta.get("enabled", False)
-                        ):
-                            potential_text = (
-                                f", potential_priority=True"
-                                f"(reason={subtree_potential_select_meta.get('reason', 'n/a')}, "
-                                f"pool={int(subtree_potential_select_meta.get('pool', 0))}, "
-                                f"scored={int(subtree_potential_select_meta.get('scored', 0))}, "
-                                f"rank={int(subtree_potential_select_meta.get('rank', -1))}, "
-                                f"score={float(subtree_potential_select_meta.get('score', 0.0)):.4f}, "
-                                f"best={float(subtree_potential_select_meta.get('best_score', 0.0)):.4f}, "
-                                f"drop={float(subtree_potential_select_meta.get('drop_score', 0.0)):.4f}, "
-                                f"add={float(subtree_potential_select_meta.get('add_score', 0.0)):.4f}, "
-                                f"macro={float(subtree_potential_select_meta.get('macro_density_score', 0.0)):.4f}, "
-                                f"proxy_rate={float(subtree_potential_select_meta.get('proxy_rate_score', 0.0)):.4f}, "
-                                f"fast_diag_local={int(subtree_potential_select_meta.get('fast_diag_local_count', 0))}, "
-                                f"fast_diag_global={int(subtree_potential_select_meta.get('fast_diag_global_drop_count', 0))}, "
-                                f"random={bool(subtree_potential_select_meta.get('random', False))})"
-                            )
-                        writer.write(
-                            "SubtreeSelection: "
-                            f"depth={int(subtree_depth_meta['depth'])} "
-                            f"(base={int(subtree_depth_meta['base_depth'])}, "
-                            f"range={int(subtree_depth_meta['min_depth'])}-{int(subtree_depth_meta['max_depth'])}, "
-                            f"uncapped_range={int(subtree_depth_meta.get('uncapped_min_depth', subtree_depth_meta['min_depth']))}-"
-                            f"{int(subtree_depth_meta.get('uncapped_max_depth', subtree_depth_meta['max_depth']))}, "
-                            f"requested={int(subtree_depth_meta.get('requested_depth', subtree_depth_meta['depth']))}, "
-                            f"retry={int(subtree_depth_meta.get('retry_count', 0))}, "
-                            f"retry_reason={subtree_depth_meta.get('selection_reason', 'none')}, "
-                            f"curriculum_phase={float(subtree_depth_meta.get('curriculum_phase', 1.0)):.3f}, "
-                            f"data_max={int(subtree_depth_meta['data_max_depth'])}, "
-                            f"percent_mode={bool(subtree_depth_meta.get('depth_percent_curriculum', False))}, "
-                            f"percent_range={subtree_depth_meta.get('depth_percent_range', 'n/a')}), "
-                            f"selected={selected_subtree_count}/{eligible_subtree_count} eligible "
-                            f"(total={total_subtree_count}, min_points={min_subtree_points}), "
-                            f"points[min/mean/max]={min(point_counts)}/{mean_points:.1f}/{max(point_counts)}, "
-                            f"anchor_refresh={bool(is_anchor_step)}({anchor_reason}), "
-                            f"loss_scope={loss_scope}"
-                            f"{octree_stat_text}"
-                            f"{potential_text}"
-                        )
-
-                    """損失項の初期化"""
-                    L_geom = input_xyz.new_zeros(())
-                    L_com = input_xyz.new_zeros(())
-                    L_attr = input_xyz.new_zeros(())
-                    L_policy = input_xyz.new_zeros(())
-                    L_actuator = input_xyz.new_zeros(())
-                    Lp_out = input_xyz.new_zeros(())
-                    La_fit = input_xyz.new_zeros(())
-                    La_rep = input_xyz.new_zeros(())
-                    loss_bit = input_xyz.new_zeros(())
-                    loss_single = input_xyz.new_zeros(())
-                    loss_nodes = input_xyz.new_zeros(())
-                    L_full_context_subtree_delta = input_xyz.new_zeros(())
-                    L_full_cloud_amount = input_xyz.new_zeros(())
-                    full_cloud_amount_debug = {}
-                    full_cloud_amount_candidate_rows = []
-                    full_context_subtree_delta_debug = {}
-                    full_cloud_correction_loss = input_xyz.new_zeros(())
-                    full_cloud_correction_debug = {}
-                    gen_xyz = None
-                    final_w = None
-                    out_label = None
-                    full_cloud_anchor_no_grad = False
-                    full_cloud_anchor_no_grad_reason = ""
-                    full_cloud_anchor_shadow_train_active = False
-                    full_cloud_anchor_debug_snapshot = {}
-                    full_cloud_primary_override_debug = {}
-                    full_cloud_geometry_teacher_debug = {}
-                    full_cloud_anchor_runtime_timing = {}
-
-                    """モデルの実行"""
-                    prev_log_flag = getattr(args, "_log_this_step", False)
-                    try:
-                        args._log_this_step = bool(
-                            (not compact_step_text_log)
-                            and getattr(args, "verbose_step_logs", False)
-                            and detail_log_this_step
-                        ) # このSubtree処理内で詳細ログを出すか否か決定
-                        if is_anchor_step:
-                            """全点群の場合"""
-                            full_cloud_anchor_block_start = time.time()
-                            args._current_teacher_scope = "full_cloud" # full-cloud anchorでは実圧縮teacherも全点群基準として記録する
-                            args._current_teacher_anchor_reason = str(anchor_reason) # full-cloudになった理由をteacherログへ渡す
-                            args._current_exact_teacher_mode = "full_cloud" # exact occupancy teacherは全点群基準で走らせる
-                            args._current_exact_teacher_uses_full_context = False # 全点群はSubtree文脈を使わない
-                            args._current_exact_teacher_fallback_reason = "" # full-cloudではfallback理由なし
-                            if not compact_step_text_log:
-                                writer.write("Running full cloud Anchor step.") # Anchor Stepであることをログに出す
-
-                            # FullCloud anchorは原則no-gradだが、明示的に許可され、
-                            # かつnode/voxel数が上限以内のときだけ学習graphを作る。
-                            (
-                                full_cloud_anchor_no_grad,
-                                full_cloud_anchor_no_grad_reason,
-                                full_cloud_anchor_node_count,
-                                full_cloud_anchor_node_count_source,
-                            ) = _resolve_full_cloud_anchor_no_grad(
-                                args,
-                                full_cloud_canonical_context,
-                            )
-                            if full_cloud_amount_mode or den6_online_full_cloud:
-                                full_cloud_anchor_no_grad = False
-                                full_cloud_anchor_no_grad_reason = (
-                                    "ana_den6_online_full_cloud_requires_grad"
-                                    if den6_online_full_cloud
-                                    else "full_cloud_amount_train_branch_requires_grad"
-                                )
-
-                            if not compact_step_text_log:
-                                writer.write(
-                                    "FullCloudAnchorMode: "
-                                    f"no_grad={bool(full_cloud_anchor_no_grad)}, "
-                                    f"reason={full_cloud_anchor_no_grad_reason}, "
-                                    f"node_count={int(full_cloud_anchor_node_count)}, "
-                                    f"node_count_source={full_cloud_anchor_node_count_source}, "
-                                    f"grad_node_limit={int(getattr(args, 'full_cloud_anchor_grad_node_limit', 50000))}, "
-                                    f"allow_grad={bool(getattr(args, 'full_cloud_anchor_allow_grad', False))}"
-                                )
-                            full_cloud_anchor_shadow_train_active = bool(
-                                full_cloud_anchor_shadow_train_requested
-                                and full_cloud_anchor_no_grad
-                                and selected_groups
-                            )
-                            if full_cloud_anchor_shadow_train_requested and not compact_step_text_log:
-                                writer.write(
-                                    "FullCloudAnchorShadowTrain: "
-                                    f"requested={bool(full_cloud_anchor_shadow_train_requested)}, "
-                                    f"active={bool(full_cloud_anchor_shadow_train_active)}, "
-                                    f"selected_subtrees={int(len(selected_groups or []))}, "
-                                    f"reason={'active_shadow_subtree_grad' if full_cloud_anchor_shadow_train_active else 'full_cloud_grad_allowed_or_no_subtree'}"
-                                )
-
-                            autocast_ctx = torch.cuda.amp.autocast(dtype=amp_dtype, enabled=use_amp) if use_cuda else nullcontext()
-                            grad_ctx = torch.no_grad() if full_cloud_anchor_no_grad else nullcontext()
-
-                            with grad_ctx, autocast_ctx: # 全体点群をno-gradでモデルに入力し、teacher更新用の出力だけ得る
-                                """モデルの実行"""
-                                # Step冒頭で作った full cloud canonical context をそのまま使う。
-                                # ここで再量子化してはいけない。
-                                full_octree_context = dict(full_cloud_canonical_context)
-                                full_octree_context["octree_context_scope"] = "full_cloud"
-                                full_octree_context["octree_input_mode"] = "full_cloud"
-                                full_octree_context["canonical_source"] = "full_cloud_canonical"
-                                full_octree_context["fast_full_cloud_oracle_anchor"] = bool(
-                                    full_cloud_anchor_shadow_train_active
-                                    and bool(getattr(args, "sparsepcgc_actual_oracle_apply_full_override", False))
-                                    and isinstance(step_actual_oracle_metric_debug, dict)
-                                    and bool(step_actual_oracle_metric_debug.get("used", False))
-                                    and str(step_actual_oracle_metric_debug.get("override_scope", "")) == "full_cloud"
-                                )
-                                _sparsepcgc_apply_amount_outcome_context(
+                                    if geom_mode == "sampled" or not run_full_geom:
+                                        geom_sample_points = max(
+                                            int(getattr(args, "sparsepcgc_full_cloud_amount_geom_sample_points", 20000)),
+                                            1,
+                                        )
+                                        geom_gen = _sample_full_cloud_amount_geom_points(gen_xyz, geom_sample_points)
+                                        geom_gt = _sample_full_cloud_amount_geom_points(input_xyz[:, :3, :], geom_sample_points)
+                                        geom_final_w = None
+                                        L_geom = loss.get_geometry_loss(
+                                            args,
+                                            gen_pts=geom_gen,
+                                            gt_pts=geom_gt,
+                                            final_w=geom_final_w,
+                                            out_label=out_label,
+                                        )
+                                        full_cloud_geometry_teacher_debug.update(
+                                            {
+                                                "full_cloud_amount_geometry_mode": "sampled",
+                                                "full_cloud_amount_geom_sample_points": int(geom_sample_points),
+                                            }
+                                        )
+                                    else:
+                                        L_geom = loss.get_geometry_loss(
+                                            args,
+                                            gen_pts=gen_xyz,
+                                            gt_pts=input_xyz[:, :3, :],
+                                            final_w=final_w_for_loss,
+                                            out_label=out_label,
+                                        )
+                                        full_cloud_geometry_teacher_debug.update(
+                                            {
+                                                "full_cloud_amount_geometry_mode": "interval_full",
+                                                "full_cloud_amount_geom_sample_points": int(input_xyz.shape[-1]),
+                                            }
+                                        )
+                            else:
+                                L_geom = loss.get_geometry_loss(
                                     args,
-                                    memory_key=None,
-                                    forward_key=cache_key,
+                                    gen_pts=gen_xyz,
+                                    gt_pts=input_xyz[:, :3, :],
+                                    final_w=final_w_for_loss,
+                                    out_label=out_label,
                                 )
-                                gen_pts, L_attr, L_policy, L_actuator, final_w, Lp_out, La_fit, La_rep, out_label = model.forward(
-                                    input_xyz,
-                                    input_attr_full,
+
+                            """圧縮損失の計算"""
+                            if stage_factors["com"] != 0.0:
+                                gen_xyz_for_actual, voxel_restored_actual_debug = _select_actual_gen_xyz_from_voxel_state(
+                                    args,
+                                    writer,
+                                    model,
+                                    gen_xyz,
+                                    prefix="VoxelRestoredActual[full_cloud_anchor]",
+                                    canonical_context=full_cloud_canonical_context,
+                                )
+
+                                full_cloud_voxel_state_used = bool(
+                                    isinstance(voxel_restored_actual_debug, dict)
+                                    and voxel_restored_actual_debug.get("used", False)
+                                    and not voxel_restored_actual_debug.get("fallback", False)
+                                )
+
+                                # voxel state 復元に成功した場合は、proxy側もactual側も同じ点群を使う。
+                                # 復元に失敗した場合だけ従来のgen_xyzへfallbackする。
+                                full_cloud_compression_source_xyz = gen_xyz_for_actual if full_cloud_voxel_state_used else gen_xyz
+
+                                compression_gen_xyz, noise_debug = prepare_compression_points(
+                                    full_cloud_compression_source_xyz,
+                                    args,
+                                    model,
+                                    collect_stats=bool(log_this_step or profile_this_step),
+                                ) # 圧縮損失用の入力点群を作る
+
+                                args._current_exact_teacher_mode = "full_cloud"
+                                args._current_exact_teacher_uses_full_context = False
+                                args._current_exact_teacher_fallback_reason = ""
+
+                                L_com, loss_bit, loss_single, loss_nodes, _, _ = loss.get_compression_loss(
+                                    args,
+                                    gen_xyz=compression_gen_xyz,
+                                    gt_xyz=input_xyz[:, :3, :],
+                                    final_w=final_w_for_loss,
                                     cache_key=cache_key,
-                                    return_attr_output=False,
-                                    compute_internal_losses=not bool(full_cloud_anchor_no_grad),
-                                    subtree_ref=subtree_ref,
-                                    selected_subtree_keys=None,
-                                    subtree_tree=None,
+                                    refresh_actual_gen=refresh_actual_gen,
+                                    actual_gen_xyz=gen_xyz_for_actual,
                                     full_octree_context=full_octree_context,
                                     octree_input_mode="full_cloud",
                                 )
-                            try:
-                                full_cloud_anchor_runtime_timing = dict(
-                                    getattr(model.module if hasattr(model, "module") else model, "last_runtime_timing", {}) or {}
-                                )
-                            except Exception:
-                                full_cloud_anchor_runtime_timing = {}
-                            if final_w is not None and not torch.isfinite(final_w).all(): # final重みにNanやinfが混ざっていないか確認
-                                writer.write( "Warning: final_w contains NaN/Inf. " "It will be sanitized before point-edit summary and losses.")
-                                final_w = torch.nan_to_num(final_w, nan=0.0, posinf=1.0, neginf=0.0) # 変換
-                                final_w = final_w.clamp(0.0, 1.0) # 変換
-                            if detail_log_this_step:
-                                base_model = model.module if hasattr(model, "module") else model # DataParallelで包まれているばあいは中身のモデルを取り出す
-                                encoder_debug_chunks.append(dict(getattr(base_model, "last_encoder_debug", {}) or {})) # Encoder Debug情報をコピーして保存
-                            gen_xyz = gen_pts[:, :3, :]
-                            _log_sparsepcgc_restore_debug(args, writer, out_label)
-                            if full_cloud_anchor_shadow_train_active:
-                                train_edit_stats = None
-                            else:
-                                train_edit_stats = summarize_point_edits( input_xyz=input_xyz[:, :3, :], gen_pts=gen_pts, final_w=final_w, args=args) # 入力点群と出力点群を比較し、各操作の編集統計を計算
-                            final_w_for_loss = None
-                            if _discrete_loss_mode_value(args) != "hard":
-                                final_w_for_loss = final_w
-                            autocast_ctx = torch.cuda.amp.autocast(dtype=amp_dtype, enabled=use_amp) if use_cuda else nullcontext() # 形状損失と圧縮損失の計算もAMP文脈で行うための設定を作る
-                            loss_grad_ctx = torch.no_grad() if full_cloud_anchor_no_grad else nullcontext()
-
-                            with loss_grad_ctx, autocast_ctx:
-                                """形状損失の計算"""
-                                full_cloud_oracle_fast_path = bool(
-                                    full_cloud_anchor_shadow_train_active
-                                    and isinstance(out_label, dict)
-                                    and bool(out_label.get("full_cloud_oracle_fast_path", False))
-                                )
-                                if full_cloud_oracle_fast_path:
-                                    L_geom = input_xyz.new_zeros(())
-                                elif full_cloud_amount_mode:
-                                    geom_mode = str(
-                                        getattr(args, "sparsepcgc_full_cloud_amount_geometry_mode", "sampled")
-                                    ).strip().lower()
-                                    if geom_mode == "off":
-                                        L_geom = input_xyz.new_zeros(())
-                                        full_cloud_geometry_teacher_debug.update(
-                                            {
-                                                "full_cloud_amount_geometry_mode": "off",
-                                                "full_cloud_amount_geom_sample_points": 0,
-                                            }
-                                        )
-                                    else:
-                                        run_full_geom = bool(
-                                            geom_mode == "interval_full"
-                                            and (
-                                                int(global_train_step)
-                                                % max(int(getattr(args, "sparsepcgc_full_cloud_amount_geom_interval", 20)), 1)
-                                                == 0
+                                if (
+                                    bool(getattr(args, "sparsepcgc_actual_oracle_apply_full_override", False))
+                                    and
+                                    isinstance(step_actual_oracle_metric_debug, dict)
+                                    and bool(step_actual_oracle_metric_debug.get("used", False))
+                                    and str(step_actual_oracle_metric_debug.get("override_scope", "")) == "full_cloud"
+                                ):
+                                    oracle_billed_percent = finite_float_or_none(
+                                        step_actual_oracle_metric_debug.get("delta_actual_percent", None)
+                                    )
+                                    edit_record_bits = max(
+                                        float(step_actual_oracle_metric_debug.get("selected_edit_record_bits", 0.0) or 0.0),
+                                        0.0,
+                                    )
+                                    if oracle_billed_percent is not None:
+                                        billed_debug = dict(getattr(loss, "last_compression_debug", {}) or {})
+                                        gt_actual_bit_for_override = finite_float_or_none(
+                                            billed_debug.get(
+                                                "gt_actual_bit",
+                                                billed_debug.get("gt_bit_abs", None),
                                             )
                                         )
-                                        if geom_mode == "sampled" or not run_full_geom:
-                                            geom_sample_points = max(
-                                                int(getattr(args, "sparsepcgc_full_cloud_amount_geom_sample_points", 20000)),
-                                                1,
+                                        final_encoded_bit = finite_float_or_none(
+                                            billed_debug.get(
+                                                "gen_actual_bit",
+                                                billed_debug.get("gen_bit_abs", None),
                                             )
-                                            geom_gen = _sample_full_cloud_amount_geom_points(gen_xyz, geom_sample_points)
-                                            geom_gt = _sample_full_cloud_amount_geom_points(input_xyz[:, :3, :], geom_sample_points)
-                                            geom_final_w = None
-                                            L_geom = loss.get_geometry_loss(
-                                                args,
-                                                gen_pts=geom_gen,
-                                                gt_pts=geom_gt,
-                                                final_w=geom_final_w,
-                                                out_label=out_label,
+                                        )
+                                        oracle_edited_bit = finite_float_or_none(
+                                            step_actual_oracle_metric_debug.get("edited_actual_bits", None)
+                                        )
+                                        policy_final_raw_percent = None
+                                        policy_final_billed_percent = None
+                                        policy_final_total_bit_with_edit_record = None
+                                        if (
+                                            gt_actual_bit_for_override is not None
+                                            and gt_actual_bit_for_override > 0.0
+                                            and final_encoded_bit is not None
+                                        ):
+                                            policy_final_total_bit_with_edit_record = (
+                                                float(final_encoded_bit) + float(edit_record_bits)
                                             )
-                                            full_cloud_geometry_teacher_debug.update(
-                                                {
-                                                    "full_cloud_amount_geometry_mode": "sampled",
-                                                    "full_cloud_amount_geom_sample_points": int(geom_sample_points),
-                                                }
-                                            )
+                                            policy_final_raw_percent = 100.0 * (
+                                                float(final_encoded_bit) - float(gt_actual_bit_for_override)
+                                            ) / float(gt_actual_bit_for_override)
+                                            policy_final_billed_percent = 100.0 * (
+                                                float(final_encoded_bit)
+                                                + float(edit_record_bits)
+                                                - float(gt_actual_bit_for_override)
+                                            ) / float(gt_actual_bit_for_override)
+                                        if (
+                                            gt_actual_bit_for_override is not None
+                                            and gt_actual_bit_for_override > 0.0
+                                            and oracle_edited_bit is not None
+                                            and oracle_edited_bit > 0.0
+                                        ):
+                                            raw_percent = 100.0 * (
+                                                float(oracle_edited_bit) - float(gt_actual_bit_for_override)
+                                            ) / float(gt_actual_bit_for_override)
+                                            billed_percent = float(oracle_billed_percent)
+                                            edited_actual_bit_for_log = float(oracle_edited_bit)
+                                            override_bit_source = "oracle_cached_candidate_encode"
                                         else:
-                                            L_geom = loss.get_geometry_loss(
-                                                args,
-                                                gen_pts=gen_xyz,
-                                                gt_pts=input_xyz[:, :3, :],
-                                                final_w=final_w_for_loss,
-                                                out_label=out_label,
+                                            raw_percent = finite_float_or_none(
+                                                step_actual_oracle_metric_debug.get("selected_raw_percent", None)
                                             )
-                                            full_cloud_geometry_teacher_debug.update(
-                                                {
-                                                    "full_cloud_amount_geometry_mode": "interval_full",
-                                                    "full_cloud_amount_geom_sample_points": int(input_xyz.shape[-1]),
-                                                }
-                                            )
-                                else:
-                                    L_geom = loss.get_geometry_loss(
-                                        args,
-                                        gen_pts=gen_xyz,
-                                        gt_pts=input_xyz[:, :3, :],
-                                        final_w=final_w_for_loss,
-                                        out_label=out_label,
-                                    )
-
-                                """圧縮損失の計算"""
-                                if stage_factors["com"] != 0.0:
-                                    gen_xyz_for_actual, voxel_restored_actual_debug = _select_actual_gen_xyz_from_voxel_state(
-                                        args,
-                                        writer,
-                                        model,
-                                        gen_xyz,
-                                        prefix="VoxelRestoredActual[full_cloud_anchor]",
-                                        canonical_context=full_cloud_canonical_context,
-                                    )
-
-                                    full_cloud_voxel_state_used = bool(
-                                        isinstance(voxel_restored_actual_debug, dict)
-                                        and voxel_restored_actual_debug.get("used", False)
-                                        and not voxel_restored_actual_debug.get("fallback", False)
-                                    )
-
-                                    # voxel state 復元に成功した場合は、proxy側もactual側も同じ点群を使う。
-                                    # 復元に失敗した場合だけ従来のgen_xyzへfallbackする。
-                                    full_cloud_compression_source_xyz = gen_xyz_for_actual if full_cloud_voxel_state_used else gen_xyz
-
-                                    compression_gen_xyz, noise_debug = prepare_compression_points(
-                                        full_cloud_compression_source_xyz,
-                                        args,
-                                        model,
-                                        collect_stats=bool(log_this_step or profile_this_step),
-                                    ) # 圧縮損失用の入力点群を作る
-
-                                    args._current_exact_teacher_mode = "full_cloud"
-                                    args._current_exact_teacher_uses_full_context = False
-                                    args._current_exact_teacher_fallback_reason = ""
-
-                                    L_com, loss_bit, loss_single, loss_nodes, _, _ = loss.get_compression_loss(
-                                        args,
-                                        gen_xyz=compression_gen_xyz,
-                                        gt_xyz=input_xyz[:, :3, :],
-                                        final_w=final_w_for_loss,
-                                        cache_key=cache_key,
-                                        refresh_actual_gen=refresh_actual_gen,
-                                        actual_gen_xyz=gen_xyz_for_actual,
-                                        subtree_tree=None,
-                                        full_octree_context=full_octree_context,
-                                        octree_input_mode="full_cloud",
-                                    )
-                                    if (
-                                        bool(getattr(args, "sparsepcgc_actual_oracle_apply_full_override", False))
-                                        and
-                                        isinstance(step_actual_oracle_metric_debug, dict)
-                                        and bool(step_actual_oracle_metric_debug.get("used", False))
-                                        and str(step_actual_oracle_metric_debug.get("override_scope", "")) == "full_cloud"
-                                    ):
-                                        oracle_billed_percent = finite_float_or_none(
-                                            step_actual_oracle_metric_debug.get("delta_actual_percent", None)
-                                        )
-                                        edit_record_bits = max(
-                                            float(step_actual_oracle_metric_debug.get("selected_edit_record_bits", 0.0) or 0.0),
-                                            0.0,
-                                        )
-                                        if oracle_billed_percent is not None:
-                                            billed_debug = dict(getattr(loss, "last_compression_debug", {}) or {})
-                                            gt_actual_bit_for_override = finite_float_or_none(
-                                                billed_debug.get(
-                                                    "gt_actual_bit",
-                                                    billed_debug.get("gt_bit_abs", None),
-                                                )
-                                            )
-                                            final_encoded_bit = finite_float_or_none(
-                                                billed_debug.get(
-                                                    "gen_actual_bit",
-                                                    billed_debug.get("gen_bit_abs", None),
-                                                )
-                                            )
-                                            oracle_edited_bit = finite_float_or_none(
-                                                step_actual_oracle_metric_debug.get("edited_actual_bits", None)
-                                            )
-                                            policy_final_raw_percent = None
-                                            policy_final_billed_percent = None
-                                            policy_final_total_bit_with_edit_record = None
-                                            if (
-                                                gt_actual_bit_for_override is not None
-                                                and gt_actual_bit_for_override > 0.0
-                                                and final_encoded_bit is not None
-                                            ):
-                                                policy_final_total_bit_with_edit_record = (
-                                                    float(final_encoded_bit) + float(edit_record_bits)
-                                                )
-                                                policy_final_raw_percent = 100.0 * (
-                                                    float(final_encoded_bit) - float(gt_actual_bit_for_override)
-                                                ) / float(gt_actual_bit_for_override)
-                                                policy_final_billed_percent = 100.0 * (
-                                                    float(final_encoded_bit)
-                                                    + float(edit_record_bits)
-                                                    - float(gt_actual_bit_for_override)
-                                                ) / float(gt_actual_bit_for_override)
-                                            if (
-                                                gt_actual_bit_for_override is not None
-                                                and gt_actual_bit_for_override > 0.0
-                                                and oracle_edited_bit is not None
-                                                and oracle_edited_bit > 0.0
-                                            ):
-                                                raw_percent = 100.0 * (
-                                                    float(oracle_edited_bit) - float(gt_actual_bit_for_override)
-                                                ) / float(gt_actual_bit_for_override)
-                                                billed_percent = float(oracle_billed_percent)
+                                            billed_percent = float(oracle_billed_percent)
+                                            if oracle_edited_bit is not None and oracle_edited_bit > 0.0:
                                                 edited_actual_bit_for_log = float(oracle_edited_bit)
                                                 override_bit_source = "oracle_cached_candidate_encode"
                                             else:
-                                                raw_percent = finite_float_or_none(
+                                                edited_actual_bit_for_log = float(final_encoded_bit or 0.0)
+                                                override_bit_source = "fresh_final_full_cloud_encode_fallback"
+                                        objective_percent, objective_bit_source = _sparsepcgc_pick_objective_percent(
+                                            args,
+                                            raw_percent,
+                                            billed_percent,
+                                        )
+                                        if objective_percent is None:
+                                            objective_percent = float(billed_percent)
+                                            objective_bit_source = "billed_fallback_missing"
+                                        objective_tensor = L_com.new_tensor(float(objective_percent))
+                                        L_com = objective_tensor + (L_com - L_com.detach())
+                                        loss_bit = objective_tensor + (loss_bit - loss_bit.detach())
+                                        billed_debug.update(
+                                            {
+                                                "total_bit": float(billed_percent),
+                                                "actual_total_bit_percent": float(billed_percent),
+                                                "actual_train_objective_percent": float(objective_percent),
+                                                "actual_objective_percent": float(objective_percent),
+                                                "actual_bit_objective": str(_sparsepcgc_actual_bit_objective_mode(args)),
+                                                "actual_objective_bit_source": str(objective_bit_source),
+                                                "actual_bit_percent": float(billed_percent),
+                                                "actual_delta_percent": float(billed_percent),
+                                                "actual_raw_percent": float(raw_percent)
+                                                if raw_percent is not None
+                                                else float(billed_percent),
+                                                "actual_edit_record_bits": float(edit_record_bits),
+                                                "actual_total_bits": float(edited_actual_bit_for_log) + float(edit_record_bits),
+                                                "gen_actual_bit": float(edited_actual_bit_for_log),
+                                                "gen_total_bit_with_edit_record": float(edited_actual_bit_for_log)
+                                                + float(edit_record_bits),
+                                                "actual_target": float(objective_percent),
+                                                "actual_forward_value": float(objective_percent),
+                                                "actual_bit_percent_used_for_loss": float(objective_percent),
+                                                "compression_loss_used": float(objective_percent),
+                                                "compression_forward_teacher_percent": float(objective_percent),
+                                                "forward_display_value": float(objective_percent),
+                                                "policy_actual_percent": policy_final_billed_percent,
+                                                "oracle_teacher_actual_percent": float(oracle_billed_percent),
+                                                "policy_full_cloud_actual_bit_percent": policy_final_billed_percent,
+                                                "policy_action_source": "actual_oracle_full_cloud_override",
+                                                "oracle_full_cloud_raw_bit_percent": finite_float_or_none(
                                                     step_actual_oracle_metric_debug.get("selected_raw_percent", None)
-                                                )
-                                                billed_percent = float(oracle_billed_percent)
-                                                if oracle_edited_bit is not None and oracle_edited_bit > 0.0:
-                                                    edited_actual_bit_for_log = float(oracle_edited_bit)
-                                                    override_bit_source = "oracle_cached_candidate_encode"
-                                                else:
-                                                    edited_actual_bit_for_log = float(final_encoded_bit or 0.0)
-                                                    override_bit_source = "fresh_final_full_cloud_encode_fallback"
-                                            objective_percent, objective_bit_source = _sparsepcgc_pick_objective_percent(
-                                                args,
-                                                raw_percent,
-                                                billed_percent,
-                                            )
-                                            if objective_percent is None:
-                                                objective_percent = float(billed_percent)
-                                                objective_bit_source = "billed_fallback_missing"
-                                            objective_tensor = L_com.new_tensor(float(objective_percent))
-                                            L_com = objective_tensor + (L_com - L_com.detach())
-                                            loss_bit = objective_tensor + (loss_bit - loss_bit.detach())
-                                            billed_debug.update(
-                                                {
-                                                    "total_bit": float(billed_percent),
-                                                    "actual_total_bit_percent": float(billed_percent),
-                                                    "actual_train_objective_percent": float(objective_percent),
-                                                    "actual_objective_percent": float(objective_percent),
-                                                    "actual_bit_objective": str(_sparsepcgc_actual_bit_objective_mode(args)),
-                                                    "actual_objective_bit_source": str(objective_bit_source),
-                                                    "actual_bit_percent": float(billed_percent),
-                                                    "actual_delta_percent": float(billed_percent),
-                                                    "actual_raw_percent": float(raw_percent)
-                                                    if raw_percent is not None
-                                                    else float(billed_percent),
-                                                    "actual_edit_record_bits": float(edit_record_bits),
-                                                    "actual_total_bits": float(edited_actual_bit_for_log) + float(edit_record_bits),
-                                                    "gen_actual_bit": float(edited_actual_bit_for_log),
-                                                    "gen_total_bit_with_edit_record": float(edited_actual_bit_for_log)
-                                                    + float(edit_record_bits),
-                                                    "actual_target": float(objective_percent),
-                                                    "actual_forward_value": float(objective_percent),
-                                                    "actual_bit_percent_used_for_loss": float(objective_percent),
-                                                    "compression_loss_used": float(objective_percent),
-                                                    "compression_forward_teacher_percent": float(objective_percent),
-                                                    "forward_display_value": float(objective_percent),
-                                                    "policy_actual_percent": policy_final_billed_percent,
-                                                    "oracle_teacher_actual_percent": float(oracle_billed_percent),
-                                                    "policy_full_cloud_actual_bit_percent": policy_final_billed_percent,
-                                                    "policy_action_source": "actual_oracle_full_cloud_override",
-                                                    "oracle_full_cloud_raw_bit_percent": finite_float_or_none(
-                                                        step_actual_oracle_metric_debug.get("selected_raw_percent", None)
-                                                    ),
-                                                    "oracle_full_cloud_actual_bit_percent": float(oracle_billed_percent),
-                                                    "oracle_full_cloud_override_used": True,
-                                                    "oracle_full_cloud_override_bit_source": str(override_bit_source),
-                                                    "policy_final_full_cloud_raw_bit_percent": policy_final_raw_percent,
-                                                    "policy_final_full_cloud_actual_bit_percent": policy_final_billed_percent,
-                                                    "policy_final_full_cloud_gt_bit": gt_actual_bit_for_override,
-                                                    "policy_final_full_cloud_gen_bit": final_encoded_bit,
-                                                    "policy_final_full_cloud_total_bit_with_edit_record": (
-                                                        policy_final_total_bit_with_edit_record
-                                                    ),
-                                                }
-                                            )
-                                            loss.last_compression_debug = billed_debug
-                                    base_model_for_correction = model.module if hasattr(model, "module") else model
-                                    full_cloud_debug_for_correction = dict(getattr(loss, "last_compression_debug", {}) or {})
-                                    full_cloud_correction_state, last_full_cloud_correction_update_debug = update_full_cloud_actual_correction_state(
-                                        args=args,
-                                        state=full_cloud_correction_state,
-                                        full_cloud_debug=full_cloud_debug_for_correction,
-                                        subtree_debug=last_subtree_actual_debug_for_correction,
-                                        full_context_debug=last_full_context_debug_for_correction,
-                                        actuator_voxel_state=getattr(base_model_for_correction, "last_actuator_voxel_state", None),
-                                        reference=gen_xyz_for_actual,
-                                        global_step=global_train_step,
-                                    )
-                                    try:
-                                        setattr(args, "_full_cloud_actual_correction_state", full_cloud_correction_state)
-                                    except Exception:
-                                        pass
-                                else:
-                                    writer.write("!!! Skipping compression loss calculation due to stage factor setting. !!!")
-                                    zero = input_xyz.new_zeros(())
-                                    L_com = zero
-                                    loss_bit = zero
-                                    loss_single = zero
-                                    loss_nodes = zero
-                            if full_cloud_anchor_shadow_train_active:
-                                full_cloud_anchor_debug_snapshot = dict(getattr(loss, "last_compression_debug", {}) or {})
+                                                ),
+                                                "oracle_full_cloud_actual_bit_percent": float(oracle_billed_percent),
+                                                "oracle_full_cloud_override_used": True,
+                                                "oracle_full_cloud_override_bit_source": str(override_bit_source),
+                                                "policy_final_full_cloud_raw_bit_percent": policy_final_raw_percent,
+                                                "policy_final_full_cloud_actual_bit_percent": policy_final_billed_percent,
+                                                "policy_final_full_cloud_gt_bit": gt_actual_bit_for_override,
+                                                "policy_final_full_cloud_gen_bit": final_encoded_bit,
+                                                "policy_final_full_cloud_total_bit_with_edit_record": (
+                                                    policy_final_total_bit_with_edit_record
+                                                ),
+                                            }
+                                        )
+                                        loss.last_compression_debug = billed_debug
+                            else:
+                                writer.write("!!! Skipping compression loss calculation due to stage factor setting. !!!")
                                 zero = input_xyz.new_zeros(())
-                                L_geom = zero
                                 L_com = zero
-                                L_attr = zero
-                                L_policy = zero
-                                L_actuator = zero
-                                Lp_out = zero
-                                La_fit = zero
-                                La_rep = zero
                                 loss_bit = zero
                                 loss_single = zero
                                 loss_nodes = zero
-                                L_full_context_subtree_delta = zero
-                                full_context_subtree_delta_debug = {}
-                                noise_debug = {}
-                                train_edit_stats = None
-                                gen_xyz = None
-                                final_w = None
-                                out_label = None
-                                loss.last_compression_terms = {}
-                                if not compact_step_text_log:
-                                    writer.write(
-                                        "FullCloudAnchorShadowTrain: "
-                                        "full-cloud actual/correction state updated; "
-                                        "resetting differentiable losses and running selected subtree with grad."
-                                    )
-                            step_timing_breakdown["full_cloud_anchor_block_time"] = float(
-                                time.time() - full_cloud_anchor_block_start
-                            )
-                        if (not is_anchor_step) or full_cloud_anchor_shadow_train_active:
-                            if den6_online_full_cloud:
-                                raise RuntimeError(
-                                    "ana_den6_online主経路へLocalPrune/Subtree処理が侵入した。"
-                                    "Add/Prune/Adjustは全点群だけで実行する必要がある"
-                                )
-                            """Subtreeの場合"""
-                            subtree_edit_sums = new_point_edit_sums()
-                            subtree_noise_debug_values = []
-                            subtree_compression_term_sums = {}
-                            subtree_full_context_delta_debug_values = []
-                            subtree_outcome_imitation_debug_values = []
-                            if full_cloud_anchor_shadow_train_active and not compact_step_text_log:
-                                writer.write("Running shadow subtree step for FullCloud anchor gradient.") # FullCloud anchor用の軽量grad経路
-                            elif not compact_step_text_log:
-                                writer.write("Running subtree step with selected Subtree.") # Subtree Stepであることをログに出す
-                            num_selected = float(max(len(selected_groups), 1)) # 選択されたSubtree数をFloatで取得
-                            subtree_edit_sums = new_point_edit_sums() # 複数Subtreeの点編集統計を累積するための変数を初期化
-                            subtree_noise_debug_values = [] # 各Subtreeで圧縮用ノイズを加えたかなどを統合
-                            subtree_compression_term_sums = {} # Subtreeごとの圧縮損失内訳を累積する辞書
-                            subtree_outcome_imitation_debug_values = [] # 各SubtreeのOutcome imitation debugを統合する
-
-                            for subtree_key, point_idx in selected_groups: # 選択されたSubtreeを1つずつ取り出し、それぞれ日いて点群を切り出し、Forward、形状損失、圧縮損失を計算
-                                args._current_teacher_scope = "subtree_local" # Subtree stepではteacherが局所点群基準であることをLoss側へ渡す
-                                args._current_subtree_id = str(subtree_key) # bad caseやteacherログでsubtree識別子を保存する
-                                subtree_key_int = int(subtree_key) # 追加メタ辞書参照用にPython intへ揃える
-                                subtree_tree = subtree_trees.get(subtree_key_int) # 事前構築Subtree Octreeを取得する
-                                full_octree_context = full_octree_contexts.get(subtree_key_int) # full-cloud上のSubtree文脈を取得する
-                                subtree_group_meta = group_meta.get(subtree_key_int, {}) or {} # ログ用メタ
-                                use_subtree_tree = isinstance(subtree_tree, dict) and torch.is_tensor(subtree_tree.get("global_voxel_coords", None))
-                                use_full_octree_context = isinstance(full_octree_context, dict) and torch.is_tensor(
-                                    full_octree_context.get("full_global_voxel_coords", None)
-                                )
-
-                                if not use_subtree_tree or not use_full_octree_context:
-                                    raise RuntimeError(
-                                        "Full-cloud canonical voxel basis is required for subtree training. "
-                                        f"subtree_key={subtree_key_int}, "
-                                        f"use_subtree_tree={use_subtree_tree}, "
-                                        f"use_full_octree_context={use_full_octree_context}"
-                                    )
-
-                                octree_input_mode = "prebuilt_subtree_tree"
-                                args._current_exact_teacher_mode = (
-                                    "subtree_with_global_context"
-                                    if (use_subtree_tree and use_full_octree_context)
-                                    else "local_subtree"
-                                )
-                                # args._current_exact_teacher_mode = "global_subtree" if (use_subtree_tree and use_full_octree_context) else "local_subtree" # teacherの意味を分離する
-                                args._current_exact_teacher_uses_full_context = bool(use_subtree_tree and use_full_octree_context) # full文脈の使用可否
-                                args._current_exact_teacher_fallback_reason = "" if (use_subtree_tree and use_full_octree_context) else "missing_prebuilt_subtree_tree_or_full_octree_context" # fallback理由
-                                runtime_entry = subtree_inputs_by_key.get(subtree_key_int, {})
-                                subtree_xyz = runtime_entry.get("subtree_xyz", None)
-                                if not torch.is_tensor(subtree_xyz):
-                                    subtree_xyz = input_xyz.index_select(2, point_idx).contiguous() # 全体対入力点群から現在Subtreeに属する点だけを取り出す
-                                # VoxelCollisionログでは、Subtree学習中のGTも選択Subtreeに揃える。
-                                # これを入れないと input_gt だけ full cloud 全体になり、診断対象がずれる。
-                                voxel_collision_input_gt = subtree_xyz[:, :3, :]
-                                subtree_attr = runtime_entry.get("subtree_attr", None)
-                                if subtree_attr is None and input_attr_full is not None:
-                                    subtree_attr = input_attr_full.index_select(2, point_idx).contiguous() # 属性を取り出す
-                                subtree_cache_key = ( f"{cache_key}|subtree_depth={int(subtree_ref['depth'][0].item())}|subtree_key={subtree_key}")
-                                amount_outcome_memory_key = _sparsepcgc_amount_outcome_memory_key(
-                                    cache_key,
-                                    subtree_key_int,
-                                )
-                                _sparsepcgc_apply_amount_outcome_context(
-                                    args,
-                                    memory_key=amount_outcome_memory_key,
-                                    forward_key=subtree_cache_key,
-                                )
-                                if log_this_step and not compact_step_text_log:
-                                    selected_path = subtree_group_meta.get("subtree_path", None)
-                                    root_path = full_octree_context.get("root_to_subtree_path", None) if isinstance(full_octree_context, dict) else None
-                                    parent_occ = full_octree_context.get("parent_occupancy_code", None) if isinstance(full_octree_context, dict) else None
-                                    sibling_ids = full_octree_context.get("sibling_node_ids", []) if isinstance(full_octree_context, dict) else []
-                                    global_offset = subtree_group_meta.get("global_offset", None)
-                                    local_offset = subtree_xyz[:, :3, :].detach().amin(dim=2).reshape(-1).tolist()
-                                    global_depth = subtree_group_meta.get("global_depth", None)
-                                    local_depth = int(subtree_group_meta.get("local_depth", subtree_depth_meta.get("depth", 0)))
-                                    writer.write(
-                                        "SubtreeOctreeInput: "
-                                        f"use_subtree_tree={bool(use_subtree_tree)}, "
-                                        f"use_full_octree_context={bool(use_full_octree_context)}, "
-                                        f"octree_input_mode={octree_input_mode}, "
-                                        f"structural_voxel_mode={'global_context' if use_subtree_tree else 'local_recomputed'}, "
-                                        f"point_feature_voxel_mode={'global_context' if use_subtree_tree else 'local_xyz'}, "
-                                        f"local_recomputed={bool(not use_subtree_tree)}, "
-                                        f"selected_subtree_key={subtree_key_int}, "
-                                        f"selected_subtree_path={selected_path}, "
-                                        f"root_to_subtree_path={root_path}, "
-                                        f"global_offset={global_offset}, "
-                                        f"local_offset={local_offset}, "
-                                        f"global_depth={global_depth}, "
-                                        f"local_depth={local_depth}, "
-                                        f"parent_occupancy_code={parent_occ}, "
-                                        f"sibling_count={len(sibling_ids) if hasattr(sibling_ids, '__len__') else 0}, "
-                                        f"enable_sparsepcgc_exact_occupancy_teacher={bool(getattr(args, 'enable_sparsepcgc_exact_occupancy_teacher', False))}, "
-                                        f"sparsepcgc_exact_teacher_mode={args._current_exact_teacher_mode}, "
-                                        f"exact_teacher_uses_full_context={bool(args._current_exact_teacher_uses_full_context)}, "
-                                        f"exact_teacher_fallback_reason={args._current_exact_teacher_fallback_reason}"
-                                    )
-                                    if not use_subtree_tree or not use_full_octree_context:
-                                        writer.write(
-                                            "SubtreeOctreeContextFallback: "
-                                            f"subtree_key={subtree_key_int}, "
-                                            f"octree_input_mode=local_recomputed, "
-                                            f"reason={args._current_exact_teacher_fallback_reason}"
-                                        )
-                                autocast_ctx = torch.cuda.amp.autocast(dtype=amp_dtype, enabled=use_amp) if use_cuda else nullcontext() # Subtree Forward用のAMP文脈を作る
-                                with autocast_ctx:
-                                    """モデルの実行"""
-                                    gen_subtree_pts, L_attr_sub, L_policy_sub, L_actuator_sub, final_w_sub, Lp_out_sub, La_fit_sub, La_rep_sub, out_label_sub = model.forward(
-                                        subtree_xyz,
-                                        subtree_attr,
-                                        cache_key=subtree_cache_key,
-                                        return_attr_output=False,
-                                        subtree_tree=subtree_tree,
-                                        full_octree_context=full_octree_context,
-                                        octree_input_mode=octree_input_mode,
-                                        )
-
-                                """詳細のログ"""
-                                if detail_log_this_step:
-                                    base_model = model.module if hasattr(model, "module") else model
-                                    encoder_debug_chunks.append(dict(getattr(base_model, "last_encoder_debug", {}) or {}))
-
-                                gen_subtree_xyz = gen_subtree_pts[:, :3, :]
-                                base_model_for_full_context = model.module if hasattr(model, "module") else model
-                                actuator_voxel_state_sub = getattr(base_model_for_full_context, "last_actuator_voxel_state", None)
-                                subtree_edit_stats = summarize_point_edits( input_xyz=subtree_xyz[:, :3, :], gen_pts=gen_subtree_pts, final_w=final_w_sub, args=args) # Subtree入力とSubtree出力を比較し、操作などを計算する
-                                add_point_edit_sums(subtree_edit_sums, subtree_edit_stats) # 現在Subtreeの編集統計を、Step全体の編集統計に累積する
-                                final_w_sub_loss = None
-                                if _discrete_loss_mode_value(args) != "hard":
-                                    final_w_sub_loss = final_w_sub
-
-                                """損失計算"""
-                                autocast_ctx = torch.cuda.amp.autocast(dtype=amp_dtype, enabled=use_amp) if use_cuda else nullcontext() # Subtree損失計算用のAMP文脈を作る
-                                with autocast_ctx:
-                                    """形状損失の計算"""
-                                    L_geom_sub = loss.get_geometry_loss( args, gen_pts=gen_subtree_xyz, gt_pts=subtree_xyz[:, :3, :], final_w=final_w_sub_loss, out_label=out_label_sub)
-                                    if stage_factors["com"] != 0.0:
-                                        """圧縮損失の計算"""
-
-                                        # ============================================================
-                                        # Subtree actual/proxy/full-context/debug の基準を、
-                                        # gen_subtree_xyz ではなく Actuator の final voxel edit state に統一する。
-                                        # geometry loss は上で gen_subtree_xyz を使って計算済みなので変更しない。
-                                        # ============================================================
-                                        subtree_voxel_state_xyz, voxel_restored_actual_debug = _select_actual_gen_xyz_from_voxel_state(
-                                            args,
-                                            writer,
-                                            model,
-                                            gen_subtree_xyz,
-                                            prefix="VoxelRestoredActual[subtree]",
-                                            canonical_context=full_octree_context,
-                                        )
-
-                                        subtree_voxel_state_used = bool(
-                                            isinstance(voxel_restored_actual_debug, dict)
-                                            and voxel_restored_actual_debug.get("used", False)
-                                            and not voxel_restored_actual_debug.get("fallback", False)
-                                        )
-
-                                        subtree_compression_source_xyz = subtree_voxel_state_xyz
-
-                                        # ============================================================
-                                        # 空点群ガード:
-                                        # voxel復元失敗後の fallback_xyz まで空の場合、
-                                        # surrogate/proxy 圧縮損失へ N=0 点群を渡すと amax/argmax で落ちる。
-                                        # この場合は圧縮損失用だけ original subtree 入力へ退避する。
-                                        # geometry loss は上で gen_subtree_xyz に対して計算済みなので変更しない。
-                                        # ============================================================
-                                        compression_source_empty = (
-                                            (not torch.is_tensor(subtree_compression_source_xyz))
-                                            or subtree_compression_source_xyz.ndim != 3
-                                            or subtree_compression_source_xyz.shape[1] < 3
-                                            or subtree_compression_source_xyz.shape[-1] <= 0
-                                        )
-
-                                        if compression_source_empty:
-                                            if writer is not None and hasattr(writer, "write") and bool(getattr(args, "_log_this_step", True)):
-                                                writer.write(
-                                                    "SubtreeCompressionInputGuard: "
-                                                    "fallback=True, "
-                                                    "reason=empty_subtree_compression_source, "
-                                                    f"voxel_state_used={bool(subtree_voxel_state_used)}, "
-                                                    f"gen_subtree_shape={tuple(gen_subtree_xyz.shape) if torch.is_tensor(gen_subtree_xyz) else None}, "
-                                                    f"subtree_xyz_shape={tuple(subtree_xyz[:, :3, :].shape) if torch.is_tensor(subtree_xyz) else None}"
-                                                )
-
-                                            # 圧縮損失用だけ安全な非空点群に戻す。
-                                            # detachしておくことで、この退避経路から不自然な勾配を返さない。
-                                            subtree_compression_source_xyz = subtree_xyz[:, :3, :].detach()
-
-                                            # actual_gen_xyz 側も空にしない。
-                                            subtree_voxel_state_xyz = subtree_compression_source_xyz
-
-                                            # このstepは voxel state を使った圧縮評価ではない扱いにする。
-                                            subtree_voxel_state_used = False
-
-                                            # final_w が全0だと、ここでも再び空扱いになる可能性がある。
-                                            # そのため空点群退避時は final_w を圧縮損失へ渡さない。
-                                            final_w_sub_compression = None
-
-                                            if isinstance(voxel_restored_actual_debug, dict):
-                                                voxel_restored_actual_debug["fallback"] = True
-                                                voxel_restored_actual_debug["reason"] = "empty_subtree_compression_source_guard"
-                                                voxel_restored_actual_debug["actual_input_source"] = "original_subtree_xyz_empty_guard"
-                                                voxel_restored_actual_debug["subtree_proxy_uses_voxel_state"] = False
-                                                voxel_restored_actual_debug["subtree_actual_uses_voxel_state"] = False
-                                                voxel_restored_actual_debug["subtree_final_w_disabled_for_voxel_state"] = True
-                                        else:
-                                            # voxel state 復元点群はすでに Prune/Add/Move 反映後の occupied voxel 集合である。
-                                            # ここへ final_w_sub_loss をさらに渡すと、Prune が二重反映される危険がある。
-                                            # fallback時だけ従来の final_w_sub_loss を使う。
-                                            final_w_sub_compression = None if subtree_voxel_state_used else final_w_sub_loss
-
-                                        compression_subtree_xyz, noise_debug_sub = prepare_compression_points(
-                                            subtree_compression_source_xyz,
-                                            args,
-                                            model,
-                                            collect_stats=bool(log_this_step or profile_this_step),
-                                        )
-                                        subtree_noise_debug_values.append(noise_debug_sub)
-
-                                        # Phase7/debug/CSV用に、Subtree actual が何を見たかを保存する。
-                                        if isinstance(voxel_restored_actual_debug, dict):
-                                            voxel_restored_actual_debug = dict(voxel_restored_actual_debug)
-                                        else:
-                                            voxel_restored_actual_debug = {}
-
-                                        voxel_restored_actual_debug.update(
-                                            {
-                                                "actual_scope": "subtree",
-                                                "actual_input_source": "voxel_edit_state" if subtree_voxel_state_used else "gen_subtree_xyz_fallback",
-                                                "voxel_restored_actual_used": bool(subtree_voxel_state_used),
-                                                "voxel_restored_actual_fallback": bool(voxel_restored_actual_debug.get("fallback", False)),
-                                                "voxel_restored_actual_fallback_reason": str(voxel_restored_actual_debug.get("reason", "")),
-                                                "subtree_proxy_uses_voxel_state": bool(subtree_voxel_state_used),
-                                                "subtree_actual_uses_voxel_state": bool(subtree_voxel_state_used),
-                                                "subtree_final_w_disabled_for_voxel_state": bool(subtree_voxel_state_used),
-                                            }
-                                        )
-
-                                        try:
-                                            setattr(args, "_last_voxel_restored_actual_debug", dict(voxel_restored_actual_debug))
-                                        except Exception:
-                                            pass
-                                        args._current_exact_teacher_mode = "local_subtree"
-                                        args._current_exact_teacher_uses_full_context = False
-                                        args._current_exact_teacher_fallback_reason = "subtree_training_step"
-                                        L_com_sub, loss_bit_sub, loss_single_sub, loss_nodes_sub, _, _ = loss.get_compression_loss(
-                                            args,
-                                            gen_xyz=compression_subtree_xyz,
-                                            gt_xyz=subtree_xyz[:, :3, :],
-                                            final_w=final_w_sub_compression,
-                                            cache_key=subtree_cache_key,
-                                            refresh_actual_gen=refresh_actual_gen,
-                                            actual_gen_xyz=subtree_voxel_state_xyz,
-                                            subtree_tree=subtree_tree,
-                                            full_octree_context=full_octree_context,
-                                            octree_input_mode=octree_input_mode,
-                                        )
-
-                                        subtree_comp_debug = dict(getattr(loss, "last_compression_debug", {}) or {})
-                                        subtree_comp_debug.update(voxel_restored_actual_debug)
-
-                                        # ============================================================
-                                        # Outcome Weighted Imitation
-                                        # ============================================================
-                                        # 圧縮損失が下がった実行済みhard actionをNetworkへ覚えさせる。
-                                        # 圧縮損失が悪化した場合は、その削除maskだけを避けるように学習する。
-                                        # ここで使うactual_percentはloss計算後にしか分からないため、
-                                        # Actuator内ではなくtrain.py側で追加lossを作る。
-                                        # ============================================================
-                                        outcome_actual_percent = _sparsepcgc_outcome_actual_percent(subtree_comp_debug)
-
-                                        base_model_for_outcome = _unwrap_train_model(model)
-                                        outcome_terms = dict(
-                                            getattr(base_model_for_outcome, "last_actuator_soft_terms", {}) or {}
-                                        )
-
-                                        outcome_memory_key = _sparsepcgc_success_amount_memory_key(
-                                            cache_key,
-                                            subtree_key_int,
-                                        )
-
-                                        L_outcome_imitation_sub, outcome_imitation_debug_sub = (
-                                            _build_sparsepcgc_outcome_weighted_imitation_loss(
-                                                args,
-                                                actual_percent=outcome_actual_percent,
-                                                actuator_terms=outcome_terms,
-                                                reference=subtree_xyz,
-                                                memory_key=outcome_memory_key,
-                                            )
-                                        )
-
-                                        # Actuatorの行動選択に対する補助lossとして加える。
-                                        L_actuator_sub = L_actuator_sub + L_outcome_imitation_sub
-
-                                        if isinstance(outcome_imitation_debug_sub, dict):
-                                            subtree_outcome_imitation_debug_values.append(outcome_imitation_debug_sub)
-                                            subtree_comp_debug.update(outcome_imitation_debug_sub)
-
-                                        subtree_used_amount_ratio = finite_float_or_none(
-                                            subtree_comp_debug.get(
-                                                "drop_ratio_hard",
-                                                outcome_terms.get(
-                                                    "drop_ratio_hard_for_outcome",
-                                                    outcome_terms.get(
-                                                        "drop_ratio_hard",
-                                                        subtree_comp_debug.get("hard_drop_target_ratio_value", None),
-                                                    ),
-                                                ),
-                                            )
-                                        )
-                                        amount_outcome_memory_debug = _sparsepcgc_update_amount_outcome_memory(
-                                            args,
-                                            amount_outcome_memory_key,
-                                            outcome_actual_percent,
-                                            subtree_used_amount_ratio,
-                                        )
-                                        subtree_comp_debug.update(amount_outcome_memory_debug)
-                                        subtree_outcome_memory_debug = _sparsepcgc_update_subtree_outcome_memory(
-                                            args,
-                                            cache_key,
-                                            subtree_key_int,
-                                            outcome_actual_percent,
-                                        )
-                                        subtree_comp_debug.update(subtree_outcome_memory_debug)
-                                        proposal_terms_sub = _sparsepcgc_proposal_terms_for_subtree(
-                                            args,
-                                            subtree_key_int,
-                                        )
-                                        L_proposal_sub, proposal_debug_sub, proposal_candidate_rows = (
-                                            _build_sparsepcgc_proposal_candidate_teacher_loss(
-                                                args,
-                                                proposal_terms_sub,
-                                                actual_percent=outcome_actual_percent,
-                                                subtree_key=subtree_key_int,
-                                                cache_key=cache_key,
-                                                global_step=global_train_step,
-                                                episode=episode,
-                                                epoch=epoch,
-                                                step=step,
-                                                geom_loss=L_geom_sub,
-                                            )
-                                        )
-                                        if torch.is_tensor(L_proposal_sub):
-                                            L_actuator_sub = L_actuator_sub + L_proposal_sub
-                                        if isinstance(proposal_debug_sub, dict):
-                                            subtree_comp_debug.update(proposal_debug_sub)
-                                        if proposal_candidate_rows:
-                                            candidate_path = metric_csv_paths.get("proposal_candidate_step")
-                                            for proposal_candidate_row in proposal_candidate_rows:
-                                                append_csv_row(
-                                                    candidate_path,
-                                                    PROPOSAL_CANDIDATE_COLUMNS,
-                                                    proposal_candidate_row,
-                                                )
-
-                                        subtree_filter_weight, subtree_filter_label_id, subtree_filter_label, subtree_filter_debug = (
-                                            _resolve_subtree_actual_filter(args, subtree_comp_debug)
-                                        )
-                                        subtree_comp_debug.update(subtree_filter_debug)
-                                        subtree_comp_debug["subtree_good_count"] = 1 if subtree_filter_label_id == 1 else 0
-                                        subtree_comp_debug["subtree_neutral_count"] = 1 if subtree_filter_label_id == 2 else 0
-                                        subtree_comp_debug["subtree_bad_count"] = 1 if subtree_filter_label_id == 3 else 0
-
-                                        anchor_success_debug = {
-                                            "anchor_success_teacher_used": False,
-                                            "anchor_success_teacher_percent": float("nan"),
-                                            "anchor_success_teacher_amount": float("nan"),
-                                            "anchor_success_teacher_loss": 0.0,
-                                            "anchor_success_memory_count": int(
-                                                len(_sparsepcgc_anchor_success_memory(args))
-                                            ),
-                                            "bad_amount_loss_disabled_no_success_memory": bool(
-                                                outcome_imitation_debug_sub.get(
-                                                    "bad_amount_loss_disabled_no_success_memory",
-                                                    False,
-                                                )
-                                            ) if isinstance(outcome_imitation_debug_sub, dict) else False,
-                                        }
-                                        anchor_teacher_entry = _sparsepcgc_anchor_success_teacher(args, cache_key)
-                                        if (
-                                            isinstance(anchor_teacher_entry, dict)
-                                            and bool(getattr(args, "sparsepcgc_anchor_success_teacher", True))
-                                        ):
-                                            anchor_amount = finite_float_or_none(anchor_teacher_entry.get("amount", None))
-                                            raw_drop_ratio = outcome_terms.get(
-                                                "raw_learned_drop_ratio_for_outcome",
-                                                outcome_terms.get("raw_learned_drop_ratio", None),
-                                            )
-                                            if anchor_amount is not None and torch.is_tensor(raw_drop_ratio):
-                                                raw_drop_ratio_t = _sparsepcgc_scalar_tensor(raw_drop_ratio, subtree_xyz)
-                                                anchor_amount_t = raw_drop_ratio_t.new_tensor(float(anchor_amount))
-                                                L_anchor_success_teacher_sub = (
-                                                    torch.relu(anchor_amount_t - raw_drop_ratio_t).pow(2)
-                                                    * float(getattr(args, "sparsepcgc_anchor_success_amount_weight", 0.05))
-                                                )
-                                                L_actuator_sub = L_actuator_sub + L_anchor_success_teacher_sub
-                                                anchor_success_debug.update(
-                                                    {
-                                                        "anchor_success_teacher_used": True,
-                                                        "anchor_success_teacher_percent": finite_float_or_none(
-                                                            anchor_teacher_entry.get("anchor_actual_raw_percent", None)
-                                                        ),
-                                                        "anchor_success_teacher_amount": float(anchor_amount),
-                                                        "anchor_success_teacher_loss": float(
-                                                            L_anchor_success_teacher_sub.detach().float().cpu()
-                                                        ),
-                                                        "anchor_success_memory_count": int(
-                                                            len(_sparsepcgc_anchor_success_memory(args))
-                                                        ),
-                                                    }
-                                                )
-                                        subtree_comp_debug.update(anchor_success_debug)
-
-                                        if subtree_filter_weight != 1.0:
-                                            L_com_sub = L_com_sub * float(subtree_filter_weight)
-                                            loss_bit_sub = loss_bit_sub * float(subtree_filter_weight)
-                                            loss_single_sub = loss_single_sub * float(subtree_filter_weight)
-                                            loss_nodes_sub = loss_nodes_sub * float(subtree_filter_weight)
-
-                                        loss.last_compression_debug = subtree_comp_debug
-
-                                        L_full_context_subtree_delta_sub, full_context_subtree_delta_debug_sub = build_full_context_subtree_delta_loss(
-                                            args,
-                                            full_octree_context=full_octree_context,
-                                            subtree_tree=subtree_tree,
-                                            actuator_voxel_state=actuator_voxel_state_sub,
-                                            reference=subtree_voxel_state_xyz,
-                                        )
-                                        L_full_context_subtree_delta = L_full_context_subtree_delta + (
-                                            L_full_context_subtree_delta_sub / num_selected
-                                        )
-                                        if isinstance(full_context_subtree_delta_debug_sub, dict):
-                                            subtree_full_context_delta_debug_values.append(full_context_subtree_delta_debug_sub)
-                                        accumulate_compression_terms( subtree_compression_term_sums, getattr(loss, "last_compression_terms", {}) or {}, 1.0 / num_selected) # 現在Subtreeで計算された圧縮損失内訳を1/Subtree数の重みをつけて、Step全体の圧縮損失内訳に累積する
-                                    else:
-                                        zero = subtree_xyz.new_zeros(())
-                                        L_com_sub = zero
-                                        loss_bit_sub = zero
-                                        loss_single_sub = zero
-                                        loss_nodes_sub = zero
-                                        full_context_subtree_delta_debug_sub = {
-                                            "full_context_subtree_delta_used": False,
-                                            "full_context_subtree_delta_reason": "compression_stage_disabled",
-                                            "full_context_subtree_delta_value": 0.0,
-                                        }
-                                        subtree_full_context_delta_debug_values.append(full_context_subtree_delta_debug_sub)
-                                
-
-                                """損失項の計算"""
-                                L_geom = L_geom + (L_geom_sub / num_selected)
-                                L_com = L_com + (L_com_sub / num_selected)
-                                L_attr = L_attr + (L_attr_sub / num_selected)
-                                L_policy = L_policy + (L_policy_sub / num_selected)
-                                L_actuator = L_actuator + (L_actuator_sub / num_selected)
-                                Lp_out = Lp_out + (Lp_out_sub / num_selected)
-                                La_fit = La_fit + (La_fit_sub / num_selected)
-                                La_rep = La_rep + (La_rep_sub / num_selected)
-                                loss_bit = loss_bit + (loss_bit_sub / num_selected)
-                                loss_single = loss_single + (loss_single_sub / num_selected)
-                                loss_nodes = loss_nodes + (loss_nodes_sub / num_selected)
-                                gen_xyz = gen_subtree_xyz
-                                final_w = final_w_sub
-                                out_label = out_label_sub
-                            train_edit_stats = finalize_point_edit_sums(subtree_edit_sums)
-                            noise_debug = merge_noise_debug_values(subtree_noise_debug_values)
-                            if subtree_compression_term_sums:
-                                loss.last_compression_terms = subtree_compression_term_sums
-                            last_subtree_actual_debug_for_correction = dict(getattr(loss, "last_compression_debug", {}) or {})
-                            # ============================================================
-                            # Outcome imitation debug merge
-                            # ============================================================
-                            if subtree_outcome_imitation_debug_values:
-                                merged_outcome_debug = {}
-                                numeric_keys = set()
-                                for item in subtree_outcome_imitation_debug_values:
-                                    if isinstance(item, dict):
-                                        for key, value in item.items():
-                                            if isinstance(value, (int, float)):
-                                                numeric_keys.add(key)
-
-                                for key in sorted(numeric_keys):
-                                    vals = []
-                                    for item in subtree_outcome_imitation_debug_values:
-                                        try:
-                                            val = float(item.get(key, float("nan")))
-                                        except Exception:
-                                            continue
-                                        if math.isfinite(val):
-                                            vals.append(val)
-                                    if vals:
-                                        merged_outcome_debug[key] = float(sum(vals) / max(len(vals), 1))
-
-                                merged_outcome_debug["outcome_imitation_subtree_count"] = int(
-                                    len(subtree_outcome_imitation_debug_values)
-                                )
-
-                                try:
-                                    last_subtree_actual_debug_for_correction.update(merged_outcome_debug)
-                                    loss.last_compression_debug.update(merged_outcome_debug)
-                                except Exception:
-                                    pass
-                                merged_full_context_debug = {}
-                                all_keys = set()
-                                for item in subtree_full_context_delta_debug_values:
-                                    if isinstance(item, dict):
-                                        all_keys.update(item.keys())
-
-                                for key in sorted(all_keys):
-                                    values = [
-                                        item.get(key)
-                                        for item in subtree_full_context_delta_debug_values
-                                        if isinstance(item, dict) and key in item
-                                    ]
-                                    numeric_values = []
-                                    bool_values = []
-                                    text_values = []
-                                    for value in values:
-                                        if isinstance(value, bool):
-                                            bool_values.append(value)
-                                        elif isinstance(value, (int, float)):
-                                            numeric_values.append(float(value))
-                                        elif torch.is_tensor(value) and value.numel() == 1:
-                                            numeric_values.append(float(value.detach().float().cpu()))
-                                        elif value is not None:
-                                            text_values.append(str(value))
-
-                                    if numeric_values:
-                                        merged_full_context_debug[key] = sum(numeric_values) / float(max(len(numeric_values), 1))
-                                    elif bool_values:
-                                        merged_full_context_debug[key] = any(bool_values)
-                                    elif text_values:
-                                        merged_full_context_debug[key] = "|".join(sorted(set(text_values)))
-
-                                full_context_subtree_delta_debug = merged_full_context_debug
-                                if isinstance(full_context_subtree_delta_debug, dict):
-                                    last_full_context_debug_for_correction = dict(full_context_subtree_delta_debug)
-                            if full_cloud_anchor_shadow_train_active and full_cloud_anchor_debug_snapshot:
-                                base_model_for_shadow_correction = model.module if hasattr(model, "module") else model
-                                (
-                                    full_cloud_correction_state,
-                                    last_full_cloud_correction_update_debug,
-                                ) = update_full_cloud_actual_correction_state(
-                                    args=args,
-                                    state=full_cloud_correction_state,
-                                    full_cloud_debug=full_cloud_anchor_debug_snapshot,
-                                    subtree_debug=last_subtree_actual_debug_for_correction,
-                                    full_context_debug=last_full_context_debug_for_correction,
-                                    actuator_voxel_state=getattr(base_model_for_shadow_correction, "last_actuator_voxel_state", None),
-                                    reference=gen_xyz if torch.is_tensor(gen_xyz) else input_xyz,
-                                    global_step=global_train_step,
-                                )
-                                if isinstance(last_full_cloud_correction_update_debug, dict):
-                                    last_full_cloud_correction_update_debug = dict(last_full_cloud_correction_update_debug)
-                                    last_full_cloud_correction_update_debug["full_cloud_corr_update_source"] = "full_cloud_anchor_shadow_subtree"
-                                try:
-                                    setattr(args, "_full_cloud_actual_correction_state", full_cloud_correction_state)
-                                except Exception:
-                                    pass
-                                if (
-                                    bool(getattr(args, "sparsepcgc_full_cloud_actual_primary", True))
-                                    and not bool(getattr(args, "direct_network_prune", False))
-                                ):
-                                    merged_full_context_debug = {}
-                                    full_cloud_primary_value = finite_float_or_none(
-                                        full_cloud_anchor_debug_snapshot.get(
-                                            "actual_total_bit_percent",
-                                            full_cloud_anchor_debug_snapshot.get("actual_bit_percent", None),
-                                        )
-                                    )
-                                    subtree_primary_value = finite_float_or_none(
-                                        last_subtree_actual_debug_for_correction.get(
-                                            "actual_total_bit_percent",
-                                            last_subtree_actual_debug_for_correction.get("total_bit", None),
-                                        )
-                                    )
-                                    if (
-                                        full_cloud_primary_value is not None
-                                        and torch.is_tensor(L_com)
-                                    ):
-                                        full_cloud_primary_raw_policy_value = finite_float_or_none(
-                                            full_cloud_anchor_debug_snapshot.get(
-                                                "policy_actual_noop_guard_raw_percent",
-                                                full_cloud_anchor_debug_snapshot.get("actual_raw_percent", None),
-                                            )
-                                        )
-                                        full_cloud_primary_oracle_source = (
-                                            bool(full_cloud_anchor_debug_snapshot.get("oracle_full_cloud_override_used", False))
-                                            or str(full_cloud_anchor_debug_snapshot.get("policy_action_source", "")) == "actual_oracle_full_cloud_override"
-                                        )
-                                        full_cloud_primary_noop_guard = bool(
-                                            full_cloud_anchor_debug_snapshot.get("policy_actual_noop_guard_used", False)
-                                        )
-                                        full_cloud_primary_is_zero = abs(float(full_cloud_primary_value)) <= 1e-9
-                                        subtree_primary_has_signal = (
-                                            subtree_primary_value is not None
-                                            and abs(float(subtree_primary_value)) > 1e-9
-                                        )
-                                        raw_policy_has_signal = (
-                                            full_cloud_primary_raw_policy_value is not None
-                                            and abs(float(full_cloud_primary_raw_policy_value)) > 1e-9
-                                        )
-                                        suppress_zero_full_cloud_primary = (
-                                            full_cloud_primary_is_zero
-                                            and not full_cloud_primary_oracle_source
-                                            and (
-                                                subtree_primary_has_signal
-                                                or (full_cloud_primary_noop_guard and raw_policy_has_signal)
-                                            )
-                                        )
-                                        if suppress_zero_full_cloud_primary:
-                                            full_cloud_primary_override_debug = {
-                                                "full_cloud_actual_primary_used": False,
-                                                "full_cloud_actual_primary_reason": "zero_full_cloud_primary_preserved_subtree_actual",
-                                                "full_cloud_actual_primary_forward_value": float(full_cloud_primary_value),
-                                                "full_cloud_actual_primary_subtree_forward_before": (
-                                                    float(subtree_primary_value) if subtree_primary_value is not None else None
-                                                ),
-                                                "full_cloud_actual_primary_raw_policy_value": (
-                                                    float(full_cloud_primary_raw_policy_value)
-                                                    if full_cloud_primary_raw_policy_value is not None
-                                                    else None
-                                                ),
-                                                "full_cloud_actual_primary_noop_guard_used": bool(full_cloud_primary_noop_guard),
-                                                "full_cloud_actual_primary_oracle_source": bool(full_cloud_primary_oracle_source),
-                                                "full_cloud_actual_primary_suppressed_zero": True,
-                                                "full_cloud_actual_primary_grad_source": "shadow_subtree_ste",
-                                                "full_cloud_actual_primary_requires_grad": bool(L_com.requires_grad),
-                                                "full_cloud_actual_primary_grad_fn": (
-                                                    type(L_com.grad_fn).__name__ if getattr(L_com, "grad_fn", None) is not None else ""
-                                                ),
-                                            }
-                                            try:
-                                                args._sparsepcgc_full_cloud_actual_primary_active = False
-                                            except Exception:
-                                                pass
-                                        else:
-                                            full_cloud_primary_tensor = L_com.new_tensor(float(full_cloud_primary_value))
-                                            L_com = full_cloud_primary_tensor + (L_com - L_com.detach())
-                                            if torch.is_tensor(loss_bit):
-                                                loss_bit = full_cloud_primary_tensor + (loss_bit - loss_bit.detach())
-                                            full_cloud_primary_override_debug = {
-                                                "full_cloud_actual_primary_used": True,
-                                                "full_cloud_actual_primary_reason": "active",
-                                                "full_cloud_actual_primary_forward_value": float(full_cloud_primary_value),
-                                                "full_cloud_actual_primary_subtree_forward_before": (
-                                                    float(subtree_primary_value) if subtree_primary_value is not None else None
-                                                ),
-                                                "full_cloud_actual_primary_raw_policy_value": (
-                                                    float(full_cloud_primary_raw_policy_value)
-                                                    if full_cloud_primary_raw_policy_value is not None
-                                                    else None
-                                                ),
-                                                "full_cloud_actual_primary_noop_guard_used": bool(full_cloud_primary_noop_guard),
-                                                "full_cloud_actual_primary_oracle_source": bool(full_cloud_primary_oracle_source),
-                                                "full_cloud_actual_primary_suppressed_zero": False,
-                                                "full_cloud_actual_primary_grad_source": "shadow_subtree_ste",
-                                                "full_cloud_actual_primary_requires_grad": bool(L_com.requires_grad),
-                                                "full_cloud_actual_primary_grad_fn": (
-                                                    type(L_com.grad_fn).__name__ if getattr(L_com, "grad_fn", None) is not None else ""
-                                                ),
-                                            }
-                                            try:
-                                                args._sparsepcgc_full_cloud_actual_primary_active = True
-                                            except Exception:
-                                                pass
-                                    else:
-                                        full_cloud_primary_override_debug = {
-                                            "full_cloud_actual_primary_used": False,
-                                            "full_cloud_actual_primary_reason": "missing_full_cloud_value_or_lcom_tensor",
-                                        }
-                                        try:
-                                            args._sparsepcgc_full_cloud_actual_primary_active = False
-                                        except Exception:
-                                            pass
-
-                    finally:
-                        args._log_this_step = prev_log_flag
-
+                        step_timing_breakdown["full_cloud_anchor_block_time"] = float(
+                            time.time() - full_cloud_anchor_block_start
+                        )
+                finally:
+                    args._log_this_step = prev_log_flag
                 if timing_enabled:
                     sync_for_timing(use_cuda)
                     timing_model_end = time.time()
@@ -14247,10 +12958,6 @@ def train(model, args, loss, writer, plot, notifier=None):
                     if timing_enabled:
                         sync_for_timing(use_cuda)
                         timing_noise_start = time.time()
-                    if subtree_mode:
-                        compression_gen_xyz = gen_xyz
-                    else: # 入力や診断前ではなく、編集後・量子化前にだけ一様ノイズを加える
-                        compression_gen_xyz, noise_debug = prepare_compression_points( gen_xyz, args, model, collect_stats=bool(log_this_step or profile_this_step)) # 出力点群から圧縮損失用点群を作る
                     if timing_enabled:
                         sync_for_timing(use_cuda)
                         timing_noise_end = time.time()
@@ -14290,8 +12997,6 @@ def train(model, args, loss, writer, plot, notifier=None):
                         }
 
                 # compression loss側で作られた微分可能な内訳を取得する。
-                # Phase7-2のfull-context subtree deltaをここへ追加するため、
-                # termsを使う前に必ず初期化する。
                 terms = dict(getattr(loss, "last_compression_terms", {}) or {})
                 compression_debug_terms = dict(getattr(loss, "last_compression_debug", {}) or {})
                 actual_total_bit_percent_term = compression_debug_terms.get(
@@ -14310,14 +13015,6 @@ def train(model, args, loss, writer, plot, notifier=None):
                 if torch.is_tensor(loss_bit):
                     terms = dict(terms)
                     terms["proxy_bit"] = loss_bit
-                if torch.is_tensor(L_full_context_subtree_delta):
-                    terms = dict(terms)
-                    terms["full_context_subtree_delta"] = L_full_context_subtree_delta
-                    if isinstance(full_context_subtree_delta_debug, dict):
-                        full_context_subtree_delta_debug["full_context_subtree_delta_added_to_terms"] = True
-                        full_context_subtree_delta_debug["full_context_subtree_delta_requires_grad"] = bool(
-                            L_full_context_subtree_delta.requires_grad
-                        )
                     
                 L_com_objective = compose_train_compression_objective(args, terms, L_com, La_fit) # actual/surrogateではL_com直結と内訳合成を半々で混ぜる
                 surrogate_trust_value, surrogate_trust_debug = _sparsepcgc_surrogate_trust(
@@ -14403,7 +13100,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                 }
                 compression_tensor_debug.update(full_cloud_geometry_teacher_debug)
                 compression_tensor_debug.update(surrogate_trust_debug)
-                if full_cloud_amount_mode and bool(is_anchor_step) and not bool(full_cloud_anchor_shadow_train_active):
+                if full_cloud_amount_mode:
                     base_model_for_full_cloud_amount = _unwrap_train_model(model)
                     full_cloud_amount_terms = dict(
                         getattr(base_model_for_full_cloud_amount, "last_actuator_soft_terms", {}) or {}
@@ -15248,116 +13945,6 @@ def train(model, args, loss, writer, plot, notifier=None):
                     L_discrete_policy = online_policy_loss
                     L = L + L_discrete_policy
 
-                base_model_for_correction = model.module if hasattr(model, "module") else model
-                full_cloud_correction_loss, full_cloud_correction_debug = build_full_cloud_actual_correction_loss(
-                    args=args,
-                    correction_state=full_cloud_correction_state,
-                    actuator_voxel_state=getattr(base_model_for_correction, "last_actuator_voxel_state", None),
-                    reference=gen_xyz if torch.is_tensor(gen_xyz) else input_xyz,
-                    global_step=global_train_step,
-                )
-                # ============================================================
-                # Phase3:
-                # full-cloud actual correction を compression terms にも保存する。
-                # これにより step_grad / debug / compression_primary 側で追跡できる。
-                # ============================================================
-                if torch.is_tensor(full_cloud_correction_loss):
-                    try:
-                        phase3_terms = dict(getattr(loss, "last_compression_terms", {}) or {})
-                        phase3_terms["full_cloud_actual_correction"] = full_cloud_correction_loss
-                        loss.last_compression_terms = phase3_terms
-                    except Exception:
-                        pass
-
-                if bool(getattr(args, "full_cloud_actual_correction_loss_enable", False)):
-                    # ============================================================
-                    # FullCloud anchor shadow training:
-                    # full_cloud_actual_correction_loss は build_compression_primary_loss()
-                    # より後で作られるため、compression_primary_modeでもここでLへ足す。
-                    # forward値はFullCloud悪化時のsoft操作ペナルティであり、
-                    # backwardはshadow SubtreeのActuator soft量へ流れる。
-                    # ============================================================
-                    correction_weight = (
-                        float(getattr(args, "cp_full_cloud_actual_correction_weight", 0.05))
-                        if bool(compression_primary_mode)
-                        else float(getattr(args, "full_cloud_actual_correction_weight", 0.05))
-                    )
-                    add_correction_directly = correction_weight > 0.0
-
-                    correction_block = correction_weight * full_cloud_correction_loss
-                    correction_scale = 1.0
-                    correction_balance = None
-
-                    if add_correction_directly and bool(compression_primary_mode):
-                        correction_balance = _compression_primary_support_balance(
-                            args,
-                            compression_support_anchor if torch.is_tensor(compression_support_anchor) else L,
-                            correction_block,
-                            enabled=uses_actual_total_bit_objective(args),
-                            target_ratio_name="compression_primary_tail_target_ratio",
-                            min_scale_name="compression_primary_tail_balance_min_scale",
-                            max_scale_name="compression_primary_tail_balance_max_scale",
-                            disabled_reason="tail_balance_disabled",
-                        )
-                        correction_scale = float(correction_balance["scale"])
-                        L = L + correction_scale * correction_block
-                    elif add_correction_directly:
-                        L = L + correction_block
-
-                    if isinstance(full_cloud_correction_debug, dict):
-                        full_cloud_correction_debug["full_cloud_corr_loss_added_to_total"] = bool(add_correction_directly)
-                        full_cloud_correction_debug["full_cloud_corr_loss_weight_used"] = float(correction_weight)
-                        full_cloud_correction_debug["full_cloud_corr_loss_scale_to_total"] = float(correction_scale)
-                        full_cloud_correction_debug["full_cloud_corr_loss_added_via_compression_primary"] = bool(
-                            compression_primary_mode and add_correction_directly
-                        )
-                        full_cloud_correction_debug["full_cloud_corr_loss_requires_grad"] = bool(
-                            torch.is_tensor(full_cloud_correction_loss)
-                            and full_cloud_correction_loss.requires_grad
-                        )
-                    if isinstance(cp_debug, dict):
-                        cp_debug["cp_support_correction_raw"] = case_float(correction_block, float("nan"))
-                        cp_debug["cp_support_correction_scaled"] = case_float(
-                            correction_scale * correction_block,
-                            float("nan"),
-                        )
-                        cp_debug["cp_support_correction_scale"] = float(correction_scale)
-                        cp_debug["cp_support_correction_reason"] = str(
-                            (correction_balance or {}).get("reason", "")
-                        )
-                        cp_debug["cp_support_correction_target_ratio"] = (
-                            float(correction_balance["target_ratio"])
-                            if correction_balance is not None
-                            and correction_balance.get("target_ratio", None) is not None
-                            else float("nan")
-                        )
-                        cp_debug["cp_support_correction_dominant"] = str(
-                            (correction_balance or {}).get("dominant", "neutral")
-                        )
-                        aux_scaled = float(cp_debug.get("cp_aux_block_scaled", 0.0))
-                        tail_scaled = float(cp_debug.get("cp_support_tail_scaled", 0.0))
-                        correction_scaled = case_float(correction_scale * correction_block, 0.0)
-                        cp_debug["cp_support_total_scaled"] = float(
-                            aux_scaled + tail_scaled + correction_scaled
-                        )
-                        main_block_value = float(cp_debug.get("cp_main_block", 0.0))
-                        cp_debug["cp_support_total_ratio_to_main"] = (
-                            abs(aux_scaled + tail_scaled + correction_scaled)
-                            / max(abs(main_block_value), 1e-12)
-                        )
-                        cp_debug["cp_support_dominant"] = (
-                            "compression"
-                            if abs(main_block_value) + 1e-12 >= abs(aux_scaled + tail_scaled + correction_scaled)
-                            else "support"
-                        )
-                else:
-                    if isinstance(full_cloud_correction_debug, dict):
-                        full_cloud_correction_debug["full_cloud_corr_loss_added_to_total"] = False
-                        full_cloud_correction_debug["full_cloud_corr_loss_requires_grad"] = bool(
-                            torch.is_tensor(full_cloud_correction_loss)
-                            and full_cloud_correction_loss.requires_grad
-                        )
-
                 if full_cloud_amount_mode and torch.is_tensor(L_full_cloud_amount):
                     L = L + L_full_cloud_amount
                     if isinstance(full_cloud_amount_debug, dict):
@@ -15390,7 +13977,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                 _phase7_update_from_structure(
                     comp_debug,
                     phase7_structure_debug,
-                    is_anchor_step=bool(is_anchor_step and not full_cloud_anchor_shadow_train_active),
+                    is_anchor_step=True,
                 )
                 _phase7_update_from_voxel_state(comp_debug, model)
                 # Phase7-4:
@@ -15400,9 +13987,6 @@ def train(model, args, loss, writer, plot, notifier=None):
                     comp_debug.update(step_timing_breakdown)
                     comp_debug["octree_build_time"] = float(
                         step_timing_breakdown.get("full_cloud_canonical_build_time", 0.0)
-                        + step_timing_breakdown.get("subtree_group_build_time", 0.0)
-                        + step_timing_breakdown.get("subtree_potential_select_time", 0.0)
-                        + step_timing_breakdown.get("selected_metadata_oracle_time", 0.0)
                     )
                     if full_cloud_amount_mode:
                         comp_debug["full_cloud_amount_step_time"] = float(
@@ -15417,125 +14001,6 @@ def train(model, args, loss, writer, plot, notifier=None):
                             pass
                 if isinstance(step_actual_oracle_metric_debug, dict) and step_actual_oracle_metric_debug:
                     _copy_sparsepcgc_actual_oracle_debug_for_metrics(comp_debug, step_actual_oracle_metric_debug)
-                if isinstance(full_cloud_anchor_debug_snapshot, dict) and full_cloud_anchor_debug_snapshot:
-                    comp_debug["full_cloud_anchor_shadow_train_requested"] = bool(full_cloud_anchor_shadow_train_requested)
-                    comp_debug["full_cloud_anchor_shadow_train_used"] = bool(full_cloud_anchor_shadow_train_active)
-                    comp_debug["full_cloud_anchor_optimizer_updates"] = bool(full_cloud_anchor_shadow_train_active)
-                    comp_debug["full_cloud_anchor_actual_total_bit_percent"] = full_cloud_anchor_debug_snapshot.get(
-                        "actual_total_bit_percent",
-                        full_cloud_anchor_debug_snapshot.get("actual_bit_percent", None),
-                    )
-                    comp_debug["full_cloud_anchor_actual_bit_percent"] = full_cloud_anchor_debug_snapshot.get(
-                        "actual_bit_percent",
-                        full_cloud_anchor_debug_snapshot.get("actual_total_bit_percent", None),
-                    )
-                    comp_debug["full_cloud_anchor_teacher_type"] = full_cloud_anchor_debug_snapshot.get("teacher_type", "")
-                    comp_debug["full_cloud_anchor_full_cloud_teacher_used"] = bool(
-                        full_cloud_anchor_debug_snapshot.get("full_cloud_teacher_used", False)
-                    )
-                    comp_debug["full_cloud_anchor_point_count_before"] = full_cloud_anchor_debug_snapshot.get("point_count_before", None)
-                    comp_debug["full_cloud_anchor_point_count_after"] = full_cloud_anchor_debug_snapshot.get("point_count_after", None)
-                    comp_debug["full_cloud_anchor_unique_coord_before"] = full_cloud_anchor_debug_snapshot.get("unique_coord_before", None)
-                    comp_debug["full_cloud_anchor_unique_coord_after"] = full_cloud_anchor_debug_snapshot.get("unique_coord_after", None)
-                    for oracle_metric_key in (
-                        "actual_train_objective_percent",
-                        "policy_actual_percent",
-                        "oracle_teacher_actual_percent",
-                        "policy_full_cloud_actual_bit_percent",
-                        "policy_final_full_cloud_raw_bit_percent",
-                        "policy_final_full_cloud_actual_bit_percent",
-                        "policy_final_full_cloud_gt_bit",
-                        "policy_final_full_cloud_gen_bit",
-                        "policy_final_full_cloud_total_bit_with_edit_record",
-                        "oracle_full_cloud_raw_bit_percent",
-                        "oracle_full_cloud_actual_bit_percent",
-                        "oracle_full_cloud_override_used",
-                    ):
-                        if oracle_metric_key in full_cloud_anchor_debug_snapshot:
-                            comp_debug[oracle_metric_key] = full_cloud_anchor_debug_snapshot.get(oracle_metric_key)
-                    if full_cloud_primary_override_debug:
-                        comp_debug.update(full_cloud_primary_override_debug)
-                    if bool(comp_debug.get("full_cloud_actual_primary_used", False)):
-                        subtree_actual_before = finite_float_or_none(
-                            comp_debug.get("actual_total_bit_percent", comp_debug.get("total_bit", None))
-                        )
-                        full_actual_primary_value = finite_float_or_none(
-                            comp_debug.get("full_cloud_actual_primary_forward_value", None)
-                        )
-                        if full_actual_primary_value is not None:
-                            comp_debug["subtree_actual_bit_percent"] = (
-                                float(subtree_actual_before) if subtree_actual_before is not None else None
-                            )
-                            comp_debug["subtree_teacher_percent"] = (
-                                float(subtree_actual_before) if subtree_actual_before is not None else None
-                            )
-                            for anchor_key, output_key in (
-                                ("gt_actual_bit", "gt_actual_bit"),
-                                ("gen_actual_bit", "gen_actual_bit"),
-                                ("gt_bit_abs", "gt_bit_abs"),
-                                ("gen_bit_abs", "gen_bit_abs"),
-                                ("actual_total_bits", "actual_total_bits"),
-                                ("gen_total_bit_with_edit_record", "gen_total_bit_with_edit_record"),
-                                ("actual_raw_percent", "actual_raw_percent"),
-                                ("actual_edit_record_bits", "actual_edit_record_bits"),
-                                ("gt_actual_encode_time", "gt_actual_encode_time"),
-                                ("gen_actual_encode_time", "gen_actual_encode_time"),
-                                ("actual_encode_time_total", "actual_encode_time_total"),
-                                ("point_count_before", "point_count_before"),
-                                ("point_count_after", "point_count_after"),
-                                ("unique_coord_before", "unique_coord_before"),
-                                ("unique_coord_after", "unique_coord_after"),
-                            ):
-                                if anchor_key in full_cloud_anchor_debug_snapshot:
-                                    comp_debug[output_key] = full_cloud_anchor_debug_snapshot.get(anchor_key)
-                            comp_debug["local_proxy_percent"] = comp_debug.get(
-                                "proxy_total_bit_percent",
-                                comp_debug.get("surrogate_total_bit_percent", None),
-                            )
-                            comp_debug["full_cloud_actual_bit_percent"] = float(full_actual_primary_value)
-                            comp_debug["full_cloud_actual_percent"] = float(full_actual_primary_value)
-                            comp_debug["actual_total_bit_percent"] = float(full_actual_primary_value)
-                            comp_debug["actual_train_objective_percent"] = float(full_actual_primary_value)
-                            comp_debug["actual_bit_percent"] = float(full_actual_primary_value)
-                            comp_debug["actual_bit_percent_raw"] = float(full_actual_primary_value)
-                            comp_debug["actual_bit_percent_used_for_loss"] = float(full_actual_primary_value)
-                            comp_debug["actual_target"] = float(full_actual_primary_value)
-                            comp_debug["actual_forward_value"] = float(full_actual_primary_value)
-                            comp_debug["actual_forward_raw_value"] = float(full_actual_primary_value)
-                            comp_debug["compression_loss_raw"] = float(full_actual_primary_value)
-                            comp_debug["compression_loss_used"] = float(full_actual_primary_value)
-                            comp_debug["compression_forward_teacher_percent"] = float(full_actual_primary_value)
-                            comp_debug["forward_display_value"] = float(full_actual_primary_value)
-                            if bool(comp_debug.get("oracle_full_cloud_override_used", False)):
-                                comp_debug["policy_action_source"] = "actual_oracle_full_cloud_override"
-                                comp_debug["policy_actual_noop_guard_used"] = False
-                                comp_debug["oracle_teacher_actual_percent"] = comp_debug.get(
-                                    "oracle_full_cloud_actual_bit_percent",
-                                    float(full_actual_primary_value),
-                                )
-                            else:
-                                comp_debug["policy_actual_percent"] = float(full_actual_primary_value)
-                            if subtree_actual_before is not None:
-                                comp_debug["full_vs_subtree_actual_gap"] = float(full_actual_primary_value) - float(subtree_actual_before)
-                                comp_debug["sign_match_subtree_full"] = bool(
-                                    (float(full_actual_primary_value) <= 0.0 and float(subtree_actual_before) <= 0.0)
-                                    or (float(full_actual_primary_value) >= 0.0 and float(subtree_actual_before) >= 0.0)
-                                )
-                            proxy_value_for_match = finite_float_or_none(comp_debug.get("local_proxy_percent", None))
-                            if proxy_value_for_match is not None:
-                                comp_debug["proxy_full_actual_gap"] = float(proxy_value_for_match) - float(full_actual_primary_value)
-                                comp_debug["sign_match_proxy_full"] = bool(
-                                    (float(full_actual_primary_value) <= 0.0 and float(proxy_value_for_match) <= 0.0)
-                                    or (float(full_actual_primary_value) >= 0.0 and float(proxy_value_for_match) >= 0.0)
-                                )
-                            comp_debug["actual_value_source"] = "fresh_full_cloud_primary_ste"
-                            comp_debug["actual_value_is_fresh"] = True
-                            comp_debug["actual_scope"] = "full_cloud"
-                            comp_debug["teacher_scope"] = "full_cloud_primary"
-                            comp_debug["full_cloud_teacher_used"] = True
-                    elif full_cloud_primary_override_debug:
-                        comp_debug.update(full_cloud_primary_override_debug)
-
                 oracle_actions_applied = bool(
                     getattr(args, "sparsepcgc_actual_oracle_apply_teacher_actions", False)
                     or getattr(args, "sparsepcgc_actual_oracle_apply_full_override", False)
@@ -15557,11 +14022,8 @@ def train(model, args, loss, writer, plot, notifier=None):
 
                 comp_debug.update(
                     {
-                        "is_anchor_refresh_step": bool(is_anchor_step),
-                        "is_subtree_step": bool(subtree_mode and ((not is_anchor_step) or full_cloud_anchor_shadow_train_active)),
-                        "subtree_good_count": int(comp_debug.get("subtree_good_count", 0) or 0),
-                        "subtree_neutral_count": int(comp_debug.get("subtree_neutral_count", 0) or 0),
-                        "subtree_bad_count": int(comp_debug.get("subtree_bad_count", 0) or 0),
+                        "is_anchor_refresh_step": True,
+                        "is_subtree_step": False,
                         "stage_switch_guard_used": bool(stage_guard_debug.get("stage_switch_guard_used", False)),
                         "stage_original": str(stage_guard_debug.get("stage_original", current_stage)),
                         "stage_effective": str(stage_guard_debug.get("stage_effective", current_stage)),
@@ -15580,11 +14042,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                     }
                 )
 
-                anchor_debug_source = None
-                if isinstance(full_cloud_anchor_debug_snapshot, dict) and full_cloud_anchor_debug_snapshot:
-                    anchor_debug_source = full_cloud_anchor_debug_snapshot
-                elif bool(is_anchor_step) and str(comp_debug.get("actual_scope", "")) == "full_cloud":
-                    anchor_debug_source = comp_debug
+                anchor_debug_source = (
+                    comp_debug if str(comp_debug.get("actual_scope", "")) == "full_cloud" else None
+                )
                 anchor_success_update_debug = {
                     "anchor_success_teacher_saved": False,
                     "anchor_success_teacher_percent": float("nan"),
@@ -15607,28 +14067,6 @@ def train(model, args, loss, writer, plot, notifier=None):
                 if cp_debug: # Compression Primaryモード用のDebug情報が存在するか判定
                     comp_debug.update(cp_debug) # 圧縮目的のDebug情報を追加
                     loss.last_compression_debug = comp_debug # 統合後のcomp_debugをLossに保存
-                if isinstance(full_context_subtree_delta_debug, dict) and full_context_subtree_delta_debug:
-                    comp_debug.update(full_context_subtree_delta_debug)
-                    loss.last_compression_debug = comp_debug
-                if isinstance(last_full_cloud_correction_update_debug, dict) and last_full_cloud_correction_update_debug:
-                    comp_debug.update(last_full_cloud_correction_update_debug)
-                if isinstance(full_cloud_correction_debug, dict) and full_cloud_correction_debug:
-                    comp_debug.update(full_cloud_correction_debug)
-                    comp_debug["phase3_full_context_subtree_delta_in_terms"] = bool(
-                        "full_context_subtree_delta" in terms
-                    )
-                    comp_debug["phase3_full_cloud_correction_in_terms"] = bool(
-                        "full_cloud_actual_correction" in getattr(loss, "last_compression_terms", {})
-                    )
-                    comp_debug["phase3_compression_primary_mode"] = bool(compression_primary_mode)
-                    comp_debug["phase3_full_context_requires_grad"] = bool(
-                        torch.is_tensor(L_full_context_subtree_delta)
-                        and L_full_context_subtree_delta.requires_grad
-                    )
-                    comp_debug["phase3_full_cloud_correction_requires_grad"] = bool(
-                        torch.is_tensor(full_cloud_correction_loss)
-                        and full_cloud_correction_loss.requires_grad
-                    )
 
                 if isinstance(compression_tensor_debug, dict):
                     compression_tensor_debug.update(
@@ -15663,24 +14101,6 @@ def train(model, args, loss, writer, plot, notifier=None):
                         comp_debug["compression_objective"] = compression_tensor_debug.get("compression_objective_tensor_value")
                         comp_debug["lcom_objective"] = compression_tensor_debug.get("compression_objective_tensor_value")
 
-                if isinstance(full_cloud_correction_state, dict):
-                    comp_debug.update(
-                        {
-                            "full_cloud_corr_ema_full_vs_subtree_gap": full_cloud_correction_state.get("ema_full_vs_subtree_gap"),
-                            "full_cloud_corr_ema_full_vs_context_gap": full_cloud_correction_state.get("ema_full_vs_context_gap"),
-                            "full_cloud_corr_ema_full_vs_proxy_gap": full_cloud_correction_state.get("ema_full_vs_proxy_gap"),
-                            "full_cloud_corr_ema_full_actual_delta": full_cloud_correction_state.get("ema_full_actual_delta"),
-                            "full_cloud_corr_last_full_actual_delta": full_cloud_correction_state.get("last_full_actual_delta"),
-                            "full_cloud_corr_last_subtree_actual_delta": full_cloud_correction_state.get("last_subtree_actual_delta"),
-                            "full_cloud_corr_last_full_context_delta": full_cloud_correction_state.get("last_full_context_delta"),
-                            "full_cloud_corr_last_subtree_proxy_delta": full_cloud_correction_state.get("last_subtree_proxy_delta"),
-                            "full_cloud_corr_last_update_step": full_cloud_correction_state.get("last_update_step"),
-                        }
-                    )
-
-                comp_debug["full_cloud_corr_loss_added_to_total"] = bool(
-                    getattr(args, "full_cloud_actual_correction_loss_enable", False)
-                )
                 loss.last_compression_debug = comp_debug
 
                 base_model = model.module if hasattr(model, "module") else model # DataParallelで包まれている場合は中身のモデルを取り出す
@@ -15712,23 +14132,13 @@ def train(model, args, loss, writer, plot, notifier=None):
                     phase5_structure_debug,
                     global_step=global_train_step,
                 )
-                for debug_key in ( # 圧縮CSVからも構造入力モードを追えるように必要項目だけを転記する
-                    "use_subtree_tree",
-                    "use_full_octree_context",
+                for debug_key in ( # 圧縮CSVからもfull-cloud構造入力を追えるように必要項目だけを転記する
                     "octree_input_mode",
                     "structural_voxel_mode",
                     "point_feature_voxel_mode",
                     "structural_voxel_key_available",
                     "point_feature_voxel_key_available",
-                    "selected_subtree_key",
-                    "selected_subtree_path",
-                    "root_to_subtree_path",
-                    "global_offset",
-                    "local_offset",
                     "global_depth",
-                    "local_depth",
-                    "parent_occupancy_code",
-                    "sibling_count",
                     "enable_sparsepcgc_exact_occupancy_teacher",
                     "sparsepcgc_exact_teacher_mode",
                     "exact_teacher_uses_full_context",
@@ -15842,7 +14252,6 @@ def train(model, args, loss, writer, plot, notifier=None):
                     if (
                         bool(is_anchor_step)
                         and bool(full_cloud_anchor_no_grad)
-                        and not bool(full_cloud_anchor_shadow_train_active)
                     ):
                         skip_optimizer_reason = "full_cloud_anchor_no_grad"
                         comp_debug["optimizer_skip_reason"] = skip_optimizer_reason
@@ -15901,9 +14310,6 @@ def train(model, args, loss, writer, plot, notifier=None):
                         "network_voxel_node_count",
                         "network_voxel_node_feature_shape",
                         "full_cloud_anchor_node_voxel_used",
-                        "full_cloud_anchor_shadow_train_requested",
-                        "full_cloud_anchor_shadow_train_used",
-                        "full_cloud_anchor_optimizer_updates",
                         "full_cloud_anchor_actual_total_bit_percent",
                         "full_cloud_anchor_actual_bit_percent",
                         "full_cloud_anchor_teacher_type",
@@ -16260,10 +14666,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                     ("L_geom", L_geom),
                     ("L_com", L_com),
                     ("L_com_objective", L_com_objective),
-                    ("full_context_subtree_delta", L_full_context_subtree_delta),
-                    ("full_context_subtree_delta", L_full_context_subtree_delta),
                     ("full_cloud_amount", L_full_cloud_amount),
-                    ("full_cloud_actual_correction", full_cloud_correction_loss),
                     ("L_attr", L_attr),
                     ("L_policy", L_policy),
                     ("L_actuator", L_actuator),
@@ -16283,7 +14686,6 @@ def train(model, args, loss, writer, plot, notifier=None):
                 if (
                     bool(is_anchor_step)
                     and bool(full_cloud_anchor_no_grad)
-                    and not bool(full_cloud_anchor_shadow_train_active)
                 ):
                     step_grad_rows = []
                     if not compact_step_text_log:
@@ -16977,11 +15379,15 @@ def train(model, args, loss, writer, plot, notifier=None):
                         log_point_edit_stats( writer, train_edit_stats, step, num_steps)
                     print( f"Epi{episode + 1}/Epo{epoch + 1}/Step{step + 1}:" f"{en_step-st_step:.4f}s   |   " f"{datetime.datetime.now().strftime('%Y/%m/%d %H:%M:%S')}")
                 amp_info["consecutive_amp_skips"] = int(consecutive_amp_skips)
-                point_count_min = min(subtree_point_counts) if subtree_point_counts else None
-                point_count_max = max(subtree_point_counts) if subtree_point_counts else None
-                point_count_mean = ( sum(subtree_point_counts) / float(len(subtree_point_counts)) if subtree_point_counts else None)
-                subtree_meta_for_better = { "enabled": bool(subtree_mode), "depth": subtree_depth_meta.get("depth"), "base_depth": subtree_depth_meta.get("base_depth"), "min_depth": subtree_depth_meta.get("min_depth"), "max_depth": subtree_depth_meta.get("max_depth"), "uncapped_min_depth": subtree_depth_meta.get("uncapped_min_depth"), "uncapped_max_depth": subtree_depth_meta.get("uncapped_max_depth"), "data_max_depth": subtree_depth_meta.get("data_max_depth"), "curriculum_phase": subtree_depth_meta.get("curriculum_phase"), "percent_mode": subtree_depth_meta.get("depth_percent_curriculum"), "percent_range": subtree_depth_meta.get("depth_percent_range"), "point_count_min": point_count_min, "point_count_mean": point_count_mean, "point_count_max": point_count_max, "selected_subtree_count": selected_subtree_count, "eligible_subtree_count": eligible_subtree_count, "actual_eligible_subtree_count": actual_eligible_subtree_count, "total_subtree_count": total_subtree_count, "min_subtree_points": min_subtree_points, "is_anchor_step": bool(is_anchor_step), "anchor_reason": anchor_reason, "loss_scope": subtree_loss_scope, "subset_step": bool(subset_step), "subset_enabled": bool(subset_enabled)}
-                log_for_better_step( for_better_path, args=args, model=model, loss_obj=loss, optimizer=optimizer, global_step=global_train_step, episode=episode, epoch=epoch, step=step, stage=current_stage, stage_factors=stage_factors, compression_row=compression_metric_row, operation_row=operation_metric_row, comp_debug=comp_debug, structure_debug=structure_debug, edit_stats=train_edit_stats, subtree_meta=subtree_meta_for_better, loss_values={ "L": L, "L_geom": L_geom, "L_com": L_com, "L_com_objective": L_com_objective, "L_attr": L_attr, "L_policy": L_policy, "L_actuator": L_actuator, "loss_bit": loss_bit, "loss_single": loss_single, "loss_nodes": loss_nodes}, step_completed=step_completed, total_loss_finite=total_loss_finite, amp_info=amp_info, timing={"step_seconds": en_step - st_step})
+                full_cloud_meta_for_better = {
+                    "enabled": True,
+                    "input_scope": "full_cloud",
+                    "point_count": int(raw_pts_num),
+                    "is_anchor_step": True,
+                    "anchor_reason": anchor_reason,
+                    "loss_scope": "full_cloud_output_vs_full_cloud_input",
+                }
+                log_for_better_step( for_better_path, args=args, model=model, loss_obj=loss, optimizer=optimizer, global_step=global_train_step, episode=episode, epoch=epoch, step=step, stage=current_stage, stage_factors=stage_factors, compression_row=compression_metric_row, operation_row=operation_metric_row, comp_debug=comp_debug, structure_debug=structure_debug, edit_stats=train_edit_stats, subtree_meta=full_cloud_meta_for_better, loss_values={ "L": L, "L_geom": L_geom, "L_com": L_com, "L_com_objective": L_com_objective, "L_attr": L_attr, "L_policy": L_policy, "L_actuator": L_actuator, "loss_bit": loss_bit, "loss_single": loss_single, "loss_nodes": loss_nodes}, step_completed=step_completed, total_loss_finite=total_loss_finite, amp_info=amp_info, timing={"step_seconds": en_step - st_step})
                 # このStepのbackward・計測・記録がすべて終わった後だけ参照を切る。
                 # 計算内容は変えず、前Stepのfull-cloud Tensorと次Stepのforwardが
                 # 同時にGPU上へ存在することを防ぐ。
@@ -17023,9 +15429,6 @@ def train(model, args, loss, writer, plot, notifier=None):
                     voxel_collision_input_gt = None
                     full_cloud_canonical_context = None
                     full_octree_context = None
-                    full_octree_contexts = {}
-                    subtree_trees = {}
-                    group_meta = {}
                     # scalar Tensorでもgrad_fnからfull graphを参照するため、
                     # backward・全ログ完了後に内訳の別名もまとめて切る。
                     terms = {}

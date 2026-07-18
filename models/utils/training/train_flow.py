@@ -47,8 +47,8 @@ def sparsepcgc_stage_guard_factors(args, stage, stage_factors):
     return factors, debug
 
 
-def prepare_subtree_input_pcd(pts, use_cuda):
-    # DataLoader出力をSubtree分割用の[B, N, C]形式にそろえる。
+def prepare_full_cloud_input_pcd(pts, use_cuda):
+    # DataLoader出力を全点群の[B, N, C]形式にそろえる。
     input_pcd = pts if pts.dim() == 3 else pts.unsqueeze(0)
     # 想定外の次元は点群として扱えないため、早い段階で明示的に止める。
     if input_pcd.dim() != 3:

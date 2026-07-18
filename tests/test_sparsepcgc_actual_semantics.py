@@ -18,6 +18,7 @@ from models.modules.structure_actuator import StructureRepairActuator
 from models.network import Network
 from models.utils.loss.compression import CompressionLossMixin
 from models.utils.training.utils import surrogate_compression_plot_metric
+from models.utils.training.train_flow import prepare_full_cloud_input_pcd
 from models.utils.pointcloud.ana_den6_reference import (
     _coord_hash,
     _current_den6_sha256,
@@ -103,6 +104,12 @@ class _EveryStepFixture(CompressionLossMixin):
 
 
 class SparsePCGCActualSemanticsTest(unittest.TestCase):
+    def test_full_cloud_input_preserves_every_point(self):
+        points = torch.arange(2 * 17 * 6, dtype=torch.float32).reshape(2, 17, 6)
+        prepared = prepare_full_cloud_input_pcd(points, use_cuda=False)
+        self.assertEqual(tuple(prepared.shape), (2, 6, 17))
+        self.assertTrue(torch.equal(prepared, points.permute(0, 2, 1)))
+
     def test_surrogate_plot_uses_actual_ste_backward_proxy_not_actual_delta(self):
         loss_obj = SimpleNamespace(
             last_compression_debug={
