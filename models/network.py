@@ -290,22 +290,26 @@ class Network(nn.Module):
             str(getattr(self.args, "sparsepcgc_scale_sr", 0)),
             str(getattr(self.args, "sparsepcgc_scale_m", 8)),
         ))
+        baseline_seen = cache_key in self._den6_online_objective_baseline
         previous = self._den6_online_objective_baseline.get(cache_key, 0.0)
         previous_t = objective.new_tensor(float(previous))
         # objectiveはActual圧縮率[%]で、小さいほど良い。baselineより小さい時に
         # 今回の唯一のplanの選択確率を増やす。±1%未満の信号が他損失に埋もれない
         # よう倍率を掛けるが、forwardのActual値や候補数は変更しない。
         reward_scale = max(
-            float(getattr(self.args, "heuristic_guidance_online_reward_scale", 10.0)), 0.0
+            float(getattr(self.args, "heuristic_guidance_online_reward_scale", 1.0)), 0.0
         )
         advantage_clip = max(
-            float(getattr(self.args, "heuristic_guidance_online_advantage_clip", 5.0)), 0.0
+            float(getattr(self.args, "heuristic_guidance_online_advantage_clip", 2.0)), 0.0
         )
         advantage = (previous_t - objective.detach()) * float(reward_scale)
         if advantage_clip > 0.0:
             advantage = advantage.clamp(-advantage_clip, advantage_clip)
-        ema = min(max(float(getattr(self.args, "heuristic_guidance_online_reward_ema", 0.10)), 1e-4), 1.0)
-        updated = (1.0 - ema) * float(previous) + ema * float(objective.detach().cpu())
+        # 各入力のno-op(0%)または過去最良Actualを基準にする。遅いEMAでは、
+        # 前回より悪いplanでも0より良いだけで何Episodeも強化されてしまう。
+        # best-so-farなら改善した1planだけを強化し、悪化は必ず抑制できる。
+        objective_value = float(objective.detach().cpu())
+        updated = min(float(previous) if baseline_seen else 0.0, objective_value)
         self._den6_online_objective_baseline[cache_key] = float(updated)
         self._den6_online_objective_baseline.move_to_end(cache_key)
         while len(self._den6_online_objective_baseline) > 4096:

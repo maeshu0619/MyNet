@@ -2958,6 +2958,7 @@ class StructureRepairActuator(nn.Module):
                 "ana_den6_exact_unique_plan_online_v6",
                 "ana_den6_exact_one_pattern_anchor_online_v6",
                 "ana_den6_single_proposal_network_residual_online_v7",
+                "ana_den6_exact_single_plan_teacher_online_v8",
             }:
                 raise RuntimeError(
                     "ana_den6 online/residualでproxy近似guidanceがActuatorへ入った。"
@@ -3312,7 +3313,9 @@ class StructureRepairActuator(nn.Module):
         exact = guidance.get("exact_candidate_guidance")
         if not isinstance(exact, dict) or voxel_coords.shape[0] != 1:
             return None
-        pools = exact.get("operation_candidate_shortlists")
+        pools = exact.get("operation_edit_units")
+        if not isinstance(pools, dict):
+            pools = exact.get("operation_candidate_shortlists")
         if not isinstance(pools, dict):
             # 既存manifestは同じden6順位をranked_candidate_pools名で保持している。
             pools = exact.get("ranked_candidate_pools")
@@ -3404,11 +3407,12 @@ class StructureRepairActuator(nn.Module):
             mean_ratio = ratio_tensors[operation]
             if exploration_active and amount_sigma > 0.0:
                 epsilon = torch.randn_like(mean_ratio).detach()
-                sampled_log = mean_ratio.log() + amount_sigma * epsilon
+                sigma_effective = max(amount_sigma * float(residual_alpha), 1e-6)
+                sampled_log = mean_ratio.log() + sigma_effective * epsilon
                 sampled_ratio = sampled_log.exp().detach()
                 normal = torch.distributions.Normal(
                     mean_ratio.log(),
-                    mean_ratio.new_tensor(amount_sigma),
+                    mean_ratio.new_tensor(sigma_effective),
                 )
                 amount_log_prob_terms.append(normal.log_prob(sampled_log.detach()))
             else:
@@ -3469,6 +3473,9 @@ class StructureRepairActuator(nn.Module):
         temperature = max(float(
             getattr(self.args, "heuristic_guidance_online_where_temperature", 0.75)
         ), 0.05)
+        gumbel_scale = max(float(
+            getattr(self.args, "heuristic_guidance_online_gumbel_scale", 0.10)
+        ), 0.0)
         ordered_indices = {}
         candidate_log_probs = {}
         candidate_entropies = []
@@ -3488,7 +3495,11 @@ class StructureRepairActuator(nn.Module):
             if exploration_active:
                 uniform = torch.rand_like(scaled_logits).clamp_(1e-8, 1.0 - 1e-8)
                 gumbel = -torch.log(-torch.log(uniform))
-                order_score = (scaled_logits + gumbel).detach()
+                # anchor直後から全順位をGumbelで無作為化するとden6の-4% planを
+                # 即座に破壊する。Network移行率に合わせて小さく探索を広げる。
+                order_score = (
+                    scaled_logits + gumbel * float(gumbel_scale) * float(residual_alpha)
+                ).detach()
             else:
                 order_score = scaled_logits.detach()
             try:
@@ -3510,7 +3521,13 @@ class StructureRepairActuator(nn.Module):
         if exploration_active:
             uniform = torch.rand_like(action_log_probs).clamp_(1e-8, 1.0 - 1e-8)
             gumbel = -torch.log(-torch.log(uniform))
-            action_order_idx = torch.argsort((action_log_probs + gumbel).detach(), descending=True)
+            action_order_idx = torch.argsort(
+                (
+                    action_log_probs
+                    + gumbel * float(gumbel_scale) * float(residual_alpha)
+                ).detach(),
+                descending=True,
+            )
             operation_order = tuple(operations[int(index)] for index in action_order_idx.cpu().tolist())
         else:
             operation_order = priority
@@ -3627,7 +3644,9 @@ class StructureRepairActuator(nn.Module):
 
         # Step 0はden6 Heuristicだけで作ったinitial planと一致することを検査する。
         if current_step < exact_anchor_steps:
-            initial_plan = exact.get("initial_heuristic_plan", {})
+            initial_plan = exact.get(
+                "heuristic_anchor_plan", exact.get("initial_heuristic_plan", {})
+            )
             expected_hash = ""
             if isinstance(initial_plan, dict) and bool(initial_plan.get("available", False)):
                 expected_hash = str(initial_plan.get("final_voxel_hash", ""))
@@ -4226,6 +4245,7 @@ class StructureRepairActuator(nn.Module):
                 "ana_den6_exact_compact_candidate_shortlist_online_v5",
                 "ana_den6_exact_unique_plan_online_v6",
                 "ana_den6_exact_one_pattern_anchor_online_v6",
+                "ana_den6_exact_single_plan_teacher_online_v8",
             }
         )
         exact_add_source_mask = self._fit_heuristic_candidate_mask(

@@ -2775,7 +2775,7 @@ def parse_pugan_args(parser, file_day, file_time):
         '--heuristic_guidance_online_cache_dir',
         default='/data/maejima/log/mynet_den6_online_cache',
         type=str,
-        help='入力GTの識別情報・canonical幾何統計だけを保存する軽量cache先（候補・加工結果は保存しない）',
+        help='GT metadataと、1完成planを構成する静的den6 edit-unit teacherのcache先（Network出力・加工結果は保存しない）',
     )
     parser.add_argument(
         '--heuristic_guidance_online_conda_env',
@@ -2857,6 +2857,12 @@ def parse_pugan_args(parser, file_day, file_time):
         help='den6候補pool内Gumbel-TopK探索の温度',
     )
     parser.add_argument(
+        '--heuristic_guidance_online_gumbel_scale',
+        default=0.10,
+        type=float,
+        help='1plan内edit-unit順位探索のGumbel強度。Network移行率を掛けて徐々に有効化する',
+    )
+    parser.add_argument(
         '--heuristic_guidance_online_amount_log_sigma',
         default=0.08,
         type=float,
@@ -2882,13 +2888,13 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--heuristic_guidance_online_reward_scale',
-        default=10.0,
+        default=1.0,
         type=float,
         help='1候補のActual圧縮率[%]をWhere/Amount/Action方策勾配へ変換する倍率',
     )
     parser.add_argument(
         '--heuristic_guidance_online_advantage_clip',
-        default=5.0,
+        default=2.0,
         type=float,
         help='single-proposal Actual policy advantageの絶対値上限',
     )
@@ -2903,6 +2909,18 @@ def parse_pugan_args(parser, file_day, file_time):
         default=1,
         type=int,
         help='ana_den6_online grad auditの間隔。1なら毎Step、0以下は無効',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_require_exact_single_plan_teacher',
+        default=True,
+        type=str2bool,
+        help='旧den6と同じGT edit-unit順位から1planだけ作ることを必須化し、汎用proxyへの劣化を禁止する',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_auto_build_exact_single_plan_teacher',
+        default=True,
+        type=str2bool,
+        help='exact teacher未生成frameだけden6 workerでGT edit unitsを1回生成する',
     )
     parser.add_argument(
         '--heuristic_guidance_den6_codec_strict',
@@ -3999,6 +4017,9 @@ def parse_pugan_args(parser, file_day, file_time):
     args.heuristic_guidance_online_where_temperature = max(
         float(getattr(args, "heuristic_guidance_online_where_temperature", 0.75)), 0.05
     )
+    args.heuristic_guidance_online_gumbel_scale = max(
+        float(getattr(args, "heuristic_guidance_online_gumbel_scale", 0.10)), 0.0
+    )
     args.heuristic_guidance_online_amount_log_sigma = min(max(
         float(getattr(args, "heuristic_guidance_online_amount_log_sigma", 0.08)), 0.0
     ), 0.50)
@@ -4012,16 +4033,22 @@ def parse_pugan_args(parser, file_day, file_time):
         float(getattr(args, "heuristic_guidance_online_reward_ema", 0.10)), 1e-4
     ), 1.0)
     args.heuristic_guidance_online_reward_scale = max(
-        float(getattr(args, "heuristic_guidance_online_reward_scale", 10.0)), 0.0
+        float(getattr(args, "heuristic_guidance_online_reward_scale", 1.0)), 0.0
     )
     args.heuristic_guidance_online_advantage_clip = max(
-        float(getattr(args, "heuristic_guidance_online_advantage_clip", 5.0)), 0.0
+        float(getattr(args, "heuristic_guidance_online_advantage_clip", 2.0)), 0.0
     )
     args.heuristic_guidance_online_grad_audit = bool(
         getattr(args, "heuristic_guidance_online_grad_audit", False)
     )
     args.heuristic_guidance_online_grad_audit_interval = max(
         int(getattr(args, "heuristic_guidance_online_grad_audit_interval", 1)), 0
+    )
+    args.heuristic_guidance_require_exact_single_plan_teacher = bool(
+        getattr(args, "heuristic_guidance_require_exact_single_plan_teacher", True)
+    )
+    args.heuristic_guidance_auto_build_exact_single_plan_teacher = bool(
+        getattr(args, "heuristic_guidance_auto_build_exact_single_plan_teacher", True)
     )
     if args.heuristic_guidance_enabled and args.heuristic_guidance_mode == "ana_den6_online":
         # online方式は全点群から1%未満の微小Voxelを1planだけ選ぶ。

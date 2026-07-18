@@ -276,6 +276,7 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
                 sparsepcgc_scale_sr=2,
                 sparsepcgc_scale_m=8,
                 sparsepcgc_mode="dense_lossy",
+                heuristic_guidance_require_exact_single_plan_teacher=False,
             )
             context = {
                 "global_voxel_coords": torch.tensor(
@@ -293,6 +294,101 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
                 "selected_candidate_ids", "actual_generated_loss", "surrogate_target",
             ):
                 self.assertNotIn(forbidden, payload)
+
+    def test_den6_online_uses_exact_edit_units_but_only_one_full_plan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            input_file = root / "frame.ply"
+            input_file.write_bytes(b"synthetic-ply-identity")
+            import hashlib
+            input_sha256 = hashlib.sha256(input_file.read_bytes()).hexdigest()
+            setting_id = "vs1_pq1_ae0_sr2_m8"
+            edit = {
+                "candidate_id": "P0",
+                "operation": "Prune",
+                "remove_coords": [[1, 0, 0]],
+                "add_coords": [],
+                "pool_rank": 0,
+                "rank_score": 1.0,
+            }
+            payload = {
+                "schema_version": "ana_den6_online_one_pattern_cache_v6",
+                "source": "ana_den6_exact_one_pattern_anchor_online_v6",
+                "input_file": str(input_file),
+                "input_sha256": input_sha256,
+                "dataset": "8i",
+                "setting_id": setting_id,
+                "scale_m": 8,
+                "scale_ae": 0,
+                "scale_sr": 2,
+                "total_ratio": 0.0025,
+                "operation_shares": {"Add": 0.4, "Prune": 0.4, "Adjust": 0.2},
+                "operation_priority": ["Prune", "Add", "Adjust"],
+                "operation_candidate_shortlists": {
+                    "Add": [{**edit, "candidate_id": "A0", "operation": "Add", "remove_coords": [], "add_coords": [[2, 0, 0]]}],
+                    "Prune": [edit],
+                    "Adjust": [{**edit, "candidate_id": "M0", "operation": "Adjust", "add_coords": [[0, 1, 0]]}],
+                },
+                "initial_heuristic_plan": {
+                    "available": True,
+                    "candidate_ids": ["P0", "A0", "M0"],
+                    "operation_counts": {"Add": 1, "Prune": 1, "Adjust": 1},
+                    "metadata": {"operation_order": "Prune>Add>Adjust"},
+                },
+            }
+            cache = root / "cache"
+            cache.mkdir()
+            torch.save(payload, cache / f"8i_frame_{setting_id}_fixture.pt")
+            args = SimpleNamespace(
+                heuristic_guidance_mode="ana_den6_online",
+                heuristic_guidance_online_cache_dir=str(cache),
+                heuristic_guidance_online_memory_entries=2,
+                heuristic_guidance_require_exact_single_plan_teacher=True,
+                _current_input_file=str(input_file),
+                dataname="8i",
+                sparsepcgc_voxel_size=1.0,
+                sparsepcgc_pos_quantscale=1,
+                sparsepcgc_scale_ae=0,
+                sparsepcgc_scale_sr=2,
+                sparsepcgc_scale_m=8,
+                sparsepcgc_mode="dense_lossy",
+            )
+            context = {
+                "global_voxel_coords": torch.tensor(
+                    [[[1, 0, 2], [0, 0, 1], [0, 0, 0]]], dtype=torch.long
+                )
+            }
+            attached = attach_ana_den6_online_guidance(
+                context, args, device=torch.device("cpu")
+            )
+            teacher = attached["ana_den6_ranked_candidate_guidance"]
+            self.assertEqual(
+                teacher["source"], "ana_den6_exact_single_plan_teacher_online_v8"
+            )
+            self.assertEqual(teacher["full_plan_candidate_count"], 1)
+            self.assertEqual(teacher["actual_candidate_encode_count"], 0)
+            self.assertIn("operation_edit_units", teacher)
+            self.assertNotIn("operation_candidate_shortlists", teacher)
+            guidance = build_heuristic_guidance(
+                {
+                    "occupancy_nll_proxy": torch.zeros((1, 1, 3)),
+                    "global_voxel_coords": context["global_voxel_coords"],
+                    "ana_den6_ranked_candidate_guidance": teacher,
+                },
+                SimpleNamespace(
+                    heuristic_guidance_mode="ana_den6_online",
+                    heuristic_guidance_enabled=True,
+                    dataname="8i",
+                    sparsepcgc_scale_m=8,
+                    _current_subtree_id="",
+                    heuristic_guidance_tensor_cache_entries=2,
+                ),
+            )
+            self.assertEqual(
+                guidance["formula_basis"],
+                "ana_den6_exact_single_plan_teacher_online_v8",
+            )
+            self.assertGreater(int(guidance["candidate_mask"]["Prune"].sum()), 0)
 
     def test_den6_online_v7_builds_single_proposal_prior_without_candidate_pool(self):
         like = torch.tensor([[[0.1, 0.8, 0.3]]], dtype=torch.float32)
@@ -385,6 +481,35 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         # while a worse actual compression result must decrease it.
         self.assertLess(gradient_for_objective(-1.0), 0.0)
         self.assertGreater(gradient_for_objective(1.0), 0.0)
+
+    def test_den6_online_policy_uses_per_input_best_actual_baseline(self):
+        network = Network.__new__(Network)
+        torch.nn.Module.__init__(network)
+        network.args = SimpleNamespace(
+            heuristic_guidance_mode="ana_den6_online",
+            _current_input_file="fixture.ply",
+            sparsepcgc_scale_ae=0,
+            sparsepcgc_scale_sr=2,
+            sparsepcgc_scale_m=8,
+            heuristic_guidance_online_policy_weight=1.0,
+            heuristic_guidance_online_entropy_weight=0.0,
+            heuristic_guidance_online_reward_scale=1.0,
+            heuristic_guidance_online_advantage_clip=10.0,
+        )
+        network._den6_online_objective_baseline = __import__("collections").OrderedDict()
+
+        def gradient(objective):
+            log_prob = torch.tensor(0.0, requires_grad=True)
+            network.last_actuator_voxel_state = {
+                "den6_online_policy_log_prob": log_prob,
+                "den6_online_policy_entropy": log_prob.new_zeros(()),
+            }
+            network.discrete_policy_loss(torch.tensor(float(objective))).backward()
+            return float(log_prob.grad)
+
+        self.assertLess(gradient(-4.0), 0.0)   # no-op 0%より改善
+        self.assertGreater(gradient(-3.0), 0.0)  # 過去最良-4%より悪化
+        self.assertLess(gradient(-4.5), 0.0)   # 過去最良を更新
 
     def test_reproduction_reference_matches_saved_mvub_plan(self):
         path = Path(__file__).resolve().parents[1] / "tools" / "ana_den6_reproduce.py"

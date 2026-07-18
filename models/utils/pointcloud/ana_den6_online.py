@@ -1,9 +1,9 @@
-"""GT固定情報だけを保持する、単一提案方式のonline Heuristic入口。
+"""den6のGT順位計算を使い、完成planを毎Stepちょうど1つ作るonline入口。
 
-旧実装は初見frameごとにana_den6 workerを起動し、Add/Prune/Adjustの候補poolと
-初期planを生成・永続化していた。現在は候補や加工結果をcacheしない。GT由来の
-識別情報と幾何統計だけを軽量cacheへ保存し、Where/Amount/Actionは各Stepで
-Heuristic priorとNetwork residualから一度だけ決定する。
+軽量cacheはGT識別情報と幾何統計だけを保持する。別途読むexact teacherは、
+1つのplanを構成するVoxel単位の静的edit unitsであり、複数の完成plan、Network
+出力、加工後点群、加工後lossは保持しない。Where/Amount/Actionはden6順位と
+Network residualから一度だけ決定し、Actual encodeもそのplanに1回だけ行う。
 
 GTの実圧縮項はLoss.actual_gt_cache、GT点群はdataset._PLY_CACHEがそれぞれ既存の
 責務として保持する。このmoduleへ重複保存せず、加工後点群・加工後loss・Network
@@ -17,6 +17,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 from typing import Any, Mapping
 
 import numpy as np
@@ -27,7 +29,10 @@ SCHEMA_VERSION = "ana_den6_gt_terms_single_proposal_cache_v7"
 SOURCE_NAME = "ana_den6_gt_terms_single_proposal_online_v7"
 _FILE_HASH_CACHE: dict[tuple[str, int, int], str] = {}
 _GLOBAL_PAYLOAD_CACHE: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
-_CACHE_STATS = {"build": 0, "memory_hit": 0, "disk_hit": 0}
+_CACHE_STATS = {
+    "build": 0, "memory_hit": 0, "disk_hit": 0,
+    "exact_teacher_hit": 0, "exact_teacher_missing": 0,
+}
 
 
 def _sha256_file(path: Path) -> str:
@@ -227,8 +232,231 @@ def _load_or_build_payload(context: Mapping[str, Any], args: Any) -> dict[str, A
     return payload
 
 
+def _load_exact_single_plan_teacher(
+    args: Any,
+    identity: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """den6と同じGT由来edit-unit順位を読み、完成planは1つだけに固定する。
+
+    旧cacheの ``operation_candidate_shortlists`` は複数の完成planではなく、
+    1つのplanを構成するVoxel単位のedit候補である。Network出力、加工後点群、
+    加工後loss、複数planのActual結果は含まない。名称をedit_unitsへ変換してから
+    Networkへ渡し、誤ってmulti-plan経路として扱われないようにする。
+    """
+    root = Path(str(getattr(
+        args,
+        "heuristic_guidance_online_cache_dir",
+        "/data/maejima/log/mynet_den6_online_cache",
+    ))).expanduser().resolve()
+    input_file = Path(str(identity["input_file"]))
+    stem = input_file.stem.replace(" ", "_")
+    dataset = str(identity["dataset"])
+    setting_id = str(identity["setting_id"])
+    allowed_sources = {
+        "ana_den6_exact_unique_plan_online_v6",
+        "ana_den6_exact_one_pattern_anchor_online_v6",
+    }
+    exact_cache_paths = list(root.glob(f"{dataset}_{stem}_{setting_id}_*.pt"))
+    exact_cache_paths += list(root.glob(f"exact_single_plan_{dataset}_{stem}_{setting_id}_*.json"))
+    for path in sorted(exact_cache_paths):
+        try:
+            candidate = (
+                json.loads(path.read_text(encoding="utf-8"))
+                if path.suffix.lower() == ".json"
+                else torch.load(str(path), map_location="cpu")
+            )
+        except Exception:
+            continue
+        if not isinstance(candidate, Mapping):
+            continue
+        if str(candidate.get("source", "")) not in allowed_sources:
+            continue
+        if str(candidate.get("input_sha256", "")) != str(identity["input_sha256"]):
+            continue
+        candidate_setting = str(candidate.get("setting_id", ""))
+        if candidate_setting != setting_id and not candidate_setting.endswith("_" + setting_id):
+            continue
+        edit_units = candidate.get("operation_candidate_shortlists")
+        if not isinstance(edit_units, Mapping) or any(
+            not isinstance(edit_units.get(name), list) or not edit_units.get(name)
+            for name in ("Add", "Prune", "Adjust")
+        ):
+            continue
+        anchor_plan = candidate.get("initial_heuristic_plan")
+        if not isinstance(anchor_plan, Mapping) or not bool(anchor_plan.get("available", False)):
+            continue
+
+        teacher = dict(candidate)
+        teacher.pop("operation_candidate_shortlists", None)
+        teacher.pop("ranked_candidate_pools", None)
+        teacher.pop("initial_heuristic_plan", None)
+        teacher["operation_edit_units"] = dict(edit_units)
+        teacher["heuristic_anchor_plan"] = dict(anchor_plan)
+        teacher["legacy_den6_source"] = str(candidate.get("source", ""))
+        teacher["source"] = "ana_den6_exact_single_plan_teacher_online_v8"
+        teacher["proposal_policy"] = "one_where_amount_action_per_step"
+        teacher["full_plan_candidate_count"] = 1
+        teacher["actual_candidate_encode_count"] = 0
+        teacher["cache_path"] = str(path)
+        teacher["cache_signature"] = hashlib.sha256(
+            (str(path.resolve()) + "|" + str(identity["input_sha256"])).encode("utf-8")
+        ).hexdigest()
+        _CACHE_STATS["exact_teacher_hit"] += 1
+        setattr(args, "_ana_den6_online_cache_stats", dict(_CACHE_STATS))
+        return teacher
+
+    # 一部frameは旧v6 compact cacheではなく、同じden6計算のv2 manifestだけを
+    # 持つ。そこから「実際に選ばれた1planのedit units」だけを取り出す。
+    manifest_root = Path(str(getattr(
+        args,
+        "heuristic_guidance_den6_manifest_dir",
+        "/data/maejima/log/mynet_den6_manifests",
+    ))).expanduser().resolve()
+    scale_m = int(identity["scale_m"])
+    for path in sorted(manifest_root.glob(f"{dataset}_{stem}_m{scale_m}_*.json")):
+        try:
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            continue
+        if str(manifest.get("schema_version", "")) != "ana_den6_ranked_candidate_manifest_v2":
+            continue
+        if str(manifest.get("input_sha256", "")) != str(identity["input_sha256"]):
+            continue
+        if any(
+            int(manifest.get(name, -1)) != int(identity[name])
+            for name in ("scale_m", "scale_ae", "scale_sr")
+        ):
+            continue
+        selected = manifest.get("selected_candidates")
+        if not isinstance(selected, list) or not selected:
+            continue
+        edit_units = {name: [] for name in ("Add", "Prune", "Adjust")}
+        for item in selected:
+            if not isinstance(item, Mapping):
+                continue
+            operation = str(item.get("operation", ""))
+            if operation not in edit_units:
+                continue
+            unit = dict(item)
+            unit["pool_rank"] = len(edit_units[operation])
+            edit_units[operation].append(unit)
+        if any(not edit_units[name] for name in edit_units):
+            continue
+        for units in edit_units.values():
+            size = len(units)
+            for rank, unit in enumerate(units):
+                unit["rank_score"] = float(
+                    1.0 if size <= 1 else 1.0 - rank / float(size - 1)
+                )
+        selected_counts = {
+            name: len(edit_units[name]) for name in ("Add", "Prune", "Adjust")
+        }
+        metadata = dict(manifest.get("plan_metadata") or {})
+        operation_order = str(metadata.get("operation_order", ""))
+        priority = [name for name in operation_order.split(">") if name in edit_units]
+        if set(priority) != set(edit_units):
+            priority = list(manifest.get("operation_priority") or ("Prune", "Add", "Adjust"))
+        total_count = max(sum(selected_counts.values()), 1)
+        total_ratio = float(
+            metadata.get(
+                "selected_total_ratio_percent",
+                manifest.get("total_ratio_percent", 0.25),
+            )
+        ) / 100.0
+        teacher = {
+            "schema_version": "ana_den6_exact_single_plan_teacher_cache_v8",
+            "source": "ana_den6_exact_single_plan_teacher_online_v8",
+            "legacy_den6_source": "ana_den6_ranked_candidate_manifest_v2:selected_plan",
+            "input_file": str(identity["input_file"]),
+            "input_sha256": str(identity["input_sha256"]),
+            "input_voxel_hash": str(manifest.get("input_voxel_hash", "")),
+            "dataset": dataset,
+            "setting_id": setting_id,
+            "scale_m": int(identity["scale_m"]),
+            "scale_ae": int(identity["scale_ae"]),
+            "scale_sr": int(identity["scale_sr"]),
+            "total_ratio": total_ratio,
+            "operation_shares": {
+                name: selected_counts[name] / float(total_count) for name in selected_counts
+            },
+            "operation_heuristics": dict(manifest.get("operation_heuristics") or {}),
+            "operation_priority": priority,
+            "operation_edit_units": edit_units,
+            "heuristic_anchor_plan": {
+                "available": True,
+                "candidate_ids": [str(item.get("candidate_id", "")) for item in selected],
+                "operation_counts": selected_counts,
+                "metadata": {**metadata, "operation_order": ">".join(priority)},
+                "final_voxel_hash": str(manifest.get("final_voxel_hash", "")),
+            },
+            "proposal_policy": "one_where_amount_action_per_step",
+            "full_plan_candidate_count": 1,
+            "actual_candidate_encode_count": 0,
+            "cache_path": str(path),
+            "cache_signature": hashlib.sha256(
+                (str(path.resolve()) + "|" + str(identity["input_sha256"])).encode("utf-8")
+            ).hexdigest(),
+        }
+        _CACHE_STATS["exact_teacher_hit"] += 1
+        setattr(args, "_ana_den6_online_cache_stats", dict(_CACHE_STATS))
+        return teacher
+
+    if bool(getattr(args, "heuristic_guidance_auto_build_exact_single_plan_teacher", False)):
+        explicit_python = str(
+            getattr(args, "heuristic_guidance_online_python", "")
+            or getattr(args, "sparsepcgc_python", "")
+        ).strip()
+        if explicit_python:
+            python_executable = Path(explicit_python).expanduser().resolve()
+        else:
+            env_name = str(
+                getattr(args, "heuristic_guidance_online_conda_env", "sparsepcgc")
+            ).strip() or "sparsepcgc"
+            python_executable = (
+                Path(sys.executable).resolve().parents[1].parent / env_name / "bin" / "python"
+            )
+        tool = Path(__file__).resolve().parents[3] / "tools" / "ana_den6_online_worker.py"
+        sparsepcgc_root = Path(str(getattr(
+            args, "sparsepcgc_root", Path(__file__).resolve().parents[4] / "compress/octree/SparsePCGC"
+        ))).expanduser().resolve()
+        signature = str(identity["input_sha256"])[:16]
+        output_json = root / (
+            f"exact_single_plan_{dataset}_{stem}_{setting_id}_{signature}.json"
+        )
+        output_root = root / "build" / f"{dataset}_{stem}_{setting_id}_{signature}"
+        command = [
+            str(python_executable), str(tool),
+            "--sparsepcgc-root", str(sparsepcgc_root),
+            "--data", dataset,
+            "--input-file", str(identity["input_file"]),
+            "--scale-m", str(int(identity["scale_m"])),
+            "--scale-ae", str(int(identity["scale_ae"])),
+            "--scale-sr", str(int(identity["scale_sr"])),
+            "--max-total-ratio", str(float(getattr(
+                args, "heuristic_guidance_online_max_total_ratio", 0.0099
+            ))),
+            "--compact-reserve-factor", str(float(getattr(
+                args, "heuristic_guidance_online_compact_reserve_factor", 1.0
+            ))),
+            "--output-json", str(output_json),
+            "--output-root", str(output_root),
+        ]
+        completed = subprocess.run(command, check=False)
+        if completed.returncode == 0 and output_json.is_file():
+            # 同じ関数を1回だけ再試行する。再帰先ではbuildを無効にして、
+            # worker異常時の無限再起動を防ぐ。
+            setattr(args, "heuristic_guidance_auto_build_exact_single_plan_teacher", False)
+            try:
+                return _load_exact_single_plan_teacher(args, identity)
+            finally:
+                setattr(args, "heuristic_guidance_auto_build_exact_single_plan_teacher", True)
+    _CACHE_STATS["exact_teacher_missing"] += 1
+    setattr(args, "_ana_den6_online_cache_stats", dict(_CACHE_STATS))
+    return None
+
+
 def prefetch_ana_den6_online_guidance(args: Any, input_files: Any) -> dict[str, int]:
-    """候補workerは廃止済み。軽量metadataは使用時に同期なしで生成する。"""
+    """既存exact teacherは直接再利用し、欠落分だけ使用時に1回生成する。"""
     del args, input_files
     return {"submitted": 0, "pending": 0, "done": 0}
 
@@ -249,9 +477,21 @@ def attach_ana_den6_online_guidance(
         return dict(context)
     if not isinstance(context, Mapping):
         raise RuntimeError("ana_den6 onlineにはfull-cloud canonical contextが必要である")
-    payload = _load_or_build_payload(context, args)
+    metadata = _load_or_build_payload(context, args)
+    payload = _load_exact_single_plan_teacher(args, metadata)
+    require_exact = bool(
+        getattr(args, "heuristic_guidance_require_exact_single_plan_teacher", True)
+    )
+    if payload is None:
+        if require_exact:
+            raise RuntimeError(
+                "ana_den6 onlineのexact single-plan teacher cacheが無い。"
+                "汎用proxyへ黙って置換すると旧den6のWhere精度を失うため学習を停止した"
+            )
+        payload = metadata
     out = dict(context)
-    # 互換key名は維持するが、中身は候補poolではなくGT固定metadataだけである。
+    # key名は互換維持。中身は1つの完成planを作るGT由来edit-unit teacherであり、
+    # 複数完成planや加工後結果ではない。
     out["ana_den6_ranked_candidate_guidance"] = payload
     out["ana_den6_online_cache_path"] = str(payload.get("cache_path", ""))
     out["ana_den6_online_cache_used"] = True

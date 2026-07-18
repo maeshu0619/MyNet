@@ -198,6 +198,7 @@ def _exact_den6_guidance(
         "ana_den6_exact_one_pattern_anchor_online_v5",
         "ana_den6_exact_unique_plan_online_v6",
         "ana_den6_exact_one_pattern_anchor_online_v6",
+        "ana_den6_exact_single_plan_teacher_online_v8",
     }:
         raise RuntimeError("ana_den6 exact candidate guidance sourceが不正である")
     coords = _normalize_coords_b3n(structure.get("global_voxel_coords"), like)
@@ -239,7 +240,9 @@ def _exact_den6_guidance(
     if mode in {"ana_den6_online", "ana_den6_residual"}:
         _EXACT_GUIDANCE_CACHE.clear()
 
-    pools = exact.get("operation_candidate_shortlists")
+    pools = exact.get("operation_edit_units")
+    if not isinstance(pools, Mapping):
+        pools = exact.get("operation_candidate_shortlists")
     if not isinstance(pools, Mapping):
         # 既存manifestは同じden6順位をranked_candidate_pools名で保持している。
         pools = exact.get("ranked_candidate_pools")
@@ -431,6 +434,7 @@ def _exact_den6_guidance(
                 "ana_den6_exact_compact_candidate_shortlist_online_v5",
                 "ana_den6_exact_unique_plan_online_v6",
                 "ana_den6_exact_one_pattern_anchor_online_v6",
+                "ana_den6_exact_single_plan_teacher_online_v8",
             }
             else "ana_den6_exact_ranked_editcandidate_pool_online_v1"
             if str(exact.get("source", "")) == "ana_den6_exact_ranked_candidate_pool_online_v1"
