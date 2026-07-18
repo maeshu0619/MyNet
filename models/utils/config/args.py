@@ -2651,8 +2651,8 @@ def parse_pugan_args(parser, file_day, file_time):
     # Octree Compression
     parser.add_argument('--max_gpu_mem_it', type=int, default=2**9, help='GPUメモリ制限に応じた反復回数')
     parser.add_argument('--oa_subprocess', default=False, type=str2bool, help='サブプロセスで圧縮を行うか')
-    parser.add_argument('--surrogate', default=False, type=str2bool, help='TrueならSurrogateを使う。SparsePCGC提案手法の既定はactual STEでありFalse')
-    parser.add_argument('--compression_loss_backend', default='sparsepcgc_actual_ste', type=str, help='圧縮損失の計算方法。既定はSparsePCGC実圧縮値をforward、既存proxyをbackwardへ使うactual STE')
+    parser.add_argument('--surrogate', default=False, type=str2bool, help='Trueなら明示的にcodec別Surrogate backendへ切り替える（SparsePCGCは既定でSurrogate backend）')
+    parser.add_argument('--compression_loss_backend', default='sparsepcgc_surrogate', type=str, help='圧縮損失の計算方法。既定は毎StepのSparsePCGC実圧縮値を教師にSurrogateを更新し、実測値をforward、Surrogate勾配をbackwardへ使う')
     parser.add_argument('--compression_grad_probe', default=False, type=str2bool, help='圧縮損失から出力点群へ勾配が流れるか各stepで表示するか')
     parser.add_argument('--compression_grad_probe_every', default=10, type=int, help='圧縮損失の勾配診断を何回に1回表示するか')
     parser.add_argument('--octattention_actualcode', default=False, type=str2bool, help='OctAttention実圧縮で算術符号化後の実bitを使うか（学習中はFalse推奨）')
