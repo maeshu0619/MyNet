@@ -48,6 +48,149 @@ class GeometryLossMixin:
         _, dist2, _, _ = chamfer_dist(gen, gt)
         return dist2.mean()
 
+    @staticmethod
+    def _sorted_membership(source_keys, target_keys):
+        """sourceの各keyがtargetに存在するかをTorch 1.11互換で返す。"""
+        if target_keys.numel() == 0:
+            return torch.zeros_like(source_keys, dtype=torch.bool)
+        target_sorted = torch.sort(target_keys).values
+        positions = torch.searchsorted(target_sorted, source_keys)
+        in_bounds = positions < target_sorted.numel()
+        safe = positions.clamp(max=max(int(target_sorted.numel()) - 1, 0))
+        return in_bounds & target_sorted.index_select(0, safe).eq(source_keys)
+
+    @staticmethod
+    def _voxel_keys(initial_rows, final_rows):
+        combined = torch.cat([initial_rows, final_rows], dim=0)
+        minimum = combined.amin(dim=0)
+        span = (combined.amax(dim=0) - minimum + 1).to(dtype=torch.int64).clamp_min(1)
+
+        def encode(rows):
+            shifted = rows.to(dtype=torch.int64) - minimum
+            return shifted[:, 0] * span[1] * span[2] + shifted[:, 1] * span[2] + shifted[:, 2]
+
+        return encode(initial_rows), encode(final_rows)
+
+    @staticmethod
+    def _voxel_xyz(rows, step, offset, reference):
+        xyz = rows.to(device=reference.device, dtype=torch.float32).transpose(0, 1).unsqueeze(0)
+        return xyz * step.to(device=reference.device, dtype=torch.float32) + offset.to(
+            device=reference.device, dtype=torch.float32
+        )
+
+    def _exact_sparse_edit_chamfer(self, args, gen_pts_f, gt_pts_f, final_w_f):
+        """不変Voxelの距離0を省略し、通常Chamferと同じ値を差分集合だけで計算する。"""
+        if str(getattr(args, "heuristic_guidance_mode", "")).strip().lower() != "ana_den6_online":
+            return None
+        if gen_pts_f.shape[0] != 1 or gt_pts_f.shape[0] != 1:
+            return None
+        state = getattr(args, "_last_actuator_voxel_state", None)
+        if not isinstance(state, dict) or not bool(state.get("voxel_edit_state_enabled", False)):
+            return None
+        initial = state.get("initial_voxel_coords", state.get("voxel_edit_initial_coords"))
+        final = state.get("final_voxel_coords", state.get("voxel_edit_final_coords"))
+        meta = state.get("voxel_restore_meta", {})
+        if not torch.is_tensor(initial) or not torch.is_tensor(final) or not isinstance(meta, dict):
+            return None
+        if initial.ndim != 3 or final.ndim != 3 or initial.shape[0] != 1 or final.shape[0] != 1:
+            return None
+        valid = state.get("final_voxel_valid_mask", state.get("voxel_edit_valid_mask", None))
+        initial_rows = initial[0].transpose(0, 1).detach().to(device=gen_pts_f.device, dtype=torch.int64)
+        final_rows = final[0].transpose(0, 1).detach().to(device=gen_pts_f.device, dtype=torch.int64)
+        if torch.is_tensor(valid):
+            valid_b = valid[0].to(device=gen_pts_f.device, dtype=torch.bool).reshape(-1)
+            if valid_b.numel() == final_rows.shape[0]:
+                final_rows = final_rows[valid_b]
+        if (
+            int(initial_rows.shape[0]) != int(gt_pts_f.shape[-1])
+            or int(final_rows.shape[0]) != int(gen_pts_f.shape[-1])
+            or initial_rows.numel() == 0
+            or final_rows.numel() == 0
+        ):
+            return None
+
+        step = meta.get(
+            "effective_qs_tensor",
+            meta.get("global_qs", state.get("voxel_step", None)),
+        )
+        offset = meta.get(
+            "global_offset_tensor",
+            meta.get("global_offset", state.get("voxel_offset", None)),
+        )
+        if not torch.is_tensor(step):
+            step = gen_pts_f.new_tensor(float(step if step is not None else 1.0)).reshape(1, 1, 1)
+        else:
+            step = step.reshape(-1, 1, 1)
+        if not torch.is_tensor(offset):
+            offset = gen_pts_f.new_zeros((1, 3, 1)) if offset is None else gen_pts_f.new_tensor(offset).reshape(1, 3, 1)
+        else:
+            offset = offset.reshape(1, 3, 1)
+
+        initial_keys, final_keys = self._voxel_keys(initial_rows, final_rows)
+        removed_mask = ~self._sorted_membership(initial_keys, final_keys)
+        added_mask = ~self._sorted_membership(final_keys, initial_keys)
+        removed_rows = initial_rows[removed_mask]
+        added_rows = final_rows[added_mask]
+        initial_xyz = self._voxel_xyz(initial_rows, step, offset, gt_pts_f)
+        final_xyz = self._voxel_xyz(final_rows, step, offset, gen_pts_f)
+        # Voxel状態とLoss入力の順序・座標が一致するときだけ高速経路を使う。
+        # これにより値だけでなく、変更点とその最近傍に対する位置勾配も
+        # 通常のfull-cloud Chamferと同じ入力Tensorへ流せる。
+        if not torch.allclose(initial_xyz, gt_pts_f, rtol=1e-5, atol=1e-4):
+            return None
+        if not torch.allclose(final_xyz, gen_pts_f, rtol=1e-5, atol=1e-4):
+            return None
+        initial_xyz = gt_pts_f
+        final_xyz = gen_pts_f
+
+        zero = gen_pts_f.new_zeros(())
+        added_dist = gen_pts_f.new_empty((0,))
+        removed_dist = gen_pts_f.new_empty((0,))
+        if added_rows.numel() > 0:
+            added_xyz = gen_pts_f[:, :, added_mask]
+            added_dist, _, _, _ = chamfer_dist(
+                added_xyz.transpose(1, 2).contiguous(),
+                initial_xyz.transpose(1, 2).contiguous(),
+            )
+            added_dist = added_dist.reshape(-1)
+        if removed_rows.numel() > 0:
+            removed_xyz = gt_pts_f[:, :, removed_mask]
+            removed_dist, _, _, _ = chamfer_dist(
+                removed_xyz.transpose(1, 2).contiguous(),
+                final_xyz.transpose(1, 2).contiguous(),
+            )
+            removed_dist = removed_dist.reshape(-1)
+
+        gen_count = max(int(final_rows.shape[0]), 1)
+        gt_count = max(int(initial_rows.shape[0]), 1)
+        added_sum = added_dist.sum() if added_dist.numel() > 0 else zero
+        removed_sum = removed_dist.sum() if removed_dist.numel() > 0 else zero
+        hard = added_sum / float(gen_count) + removed_sum / float(gt_count)
+        fit = removed_sum / float(gt_count)
+
+        if final_w_f is None:
+            surrogate = hard
+            weighted = hard
+        else:
+            weights = final_w_f.reshape(-1).clamp(0.0, 1.0).to(dtype=hard.dtype)
+            if weights.numel() != final_rows.shape[0]:
+                return None
+            added_weighted = (
+                (added_dist.detach() * weights[added_mask]).sum()
+                if added_dist.numel() > 0
+                else zero
+            )
+            surrogate = added_weighted / weights.sum().clamp_min(1e-12) + fit.detach()
+            weighted = surrogate
+        return {
+            "hard": hard,
+            "surrogate": surrogate,
+            "weighted": weighted,
+            "fit": fit,
+            "removed_count": int(removed_rows.shape[0]),
+            "added_count": int(added_rows.shape[0]),
+        }
+
     def _soft_actuator_geometry_proxy(self, args, reference):
         if getattr(args, "trainORtest", "train") != "train":
             return reference.new_zeros(())
@@ -99,6 +242,15 @@ class GeometryLossMixin:
         # geometry lossで使う外れ点ラベルは従来互換の point_label だけである。
         if isinstance(out_label, dict):
             out_label = out_label.get("point_label", None)
+        # Networkの現行full-cloud経路は互換用point_labelを常に全ゼロで返す。
+        # 全ゼロなら外れ点除去の前後は完全に同一なので、label無しとして扱い、
+        # occupied-voxel差分だけを評価する厳密Chamfer高速経路を利用できる。
+        if (
+            str(getattr(args, "heuristic_guidance_mode", "")).strip().lower() == "ana_den6_online"
+            and torch.is_tensor(out_label)
+            and not bool(torch.any(out_label >= 0.5).item())
+        ):
+            out_label = None
         if gen_pts.shape[-1] == 0 or gt_pts.shape[-1] == 0:
             self._set_geometry_debug(
                 mode="empty",
@@ -157,7 +309,24 @@ class GeometryLossMixin:
                 gen_pts_f = gen_pts.to(torch.float32)
                 gt_inlinear_f = gt_inlinear.to(torch.float32)
                 final_w_f = None if final_w is None else final_w.to(torch.float32)
-                if use_ste_hard:
+                sparse_edit = self._exact_sparse_edit_chamfer(
+                    args, gen_pts_f, gt_inlinear_f, final_w_f
+                ) if out_label is None else None
+                if sparse_edit is not None:
+                    L_cd_hard = sparse_edit["hard"]
+                    L_cd_surrogate = sparse_edit["surrogate"]
+                    L_cd = (
+                        self._compose_discrete_loss(L_cd_hard, L_cd_surrogate, args)
+                        if use_ste_hard
+                        else sparse_edit["weighted"] if use_weighted_forward
+                        else L_cd_hard
+                    )
+                    hard_cd = L_cd_hard.detach()
+                    weighted_cd = sparse_edit["weighted"].detach()
+                    surrogate_cd = L_cd_surrogate.detach()
+                    L_fit = sparse_edit["fit"]
+                    mode_name = "exact_sparse_edit"
+                elif use_ste_hard:
                     L_cd_hard, L_cd_surrogate = chamfer_l2_loss_and_weight_surrogate(
                         gen_pts_f,
                         gt_inlinear_f,
@@ -183,7 +352,9 @@ class GeometryLossMixin:
                     )
                     surrogate_cd = weighted_cd
                     mode_name = "weighted_soft" if use_weighted_forward else "hard"
-                L_fit = self._fit_proxy_loss(gen_pts_f, gt_inlinear_f)
+                    L_fit = self._fit_proxy_loss(gen_pts_f, gt_inlinear_f)
+                if sparse_edit is None and use_ste_hard:
+                    L_fit = self._fit_proxy_loss(gen_pts_f, gt_inlinear_f)
             L_geom = L_cd
             fit_weight = max(float(getattr(args, "geometry_fit_weight", 0.05)), 0.0)
             if fit_weight > 0.0:
@@ -198,6 +369,12 @@ class GeometryLossMixin:
                 fit_weight=float(fit_weight),
                 gen_points=int(gen_pts.shape[-1]),
                 gt_points=int(gt_inlinear.shape[-1]),
+                sparse_added_points=(
+                    int(sparse_edit["added_count"]) if sparse_edit is not None else None
+                ),
+                sparse_removed_points=(
+                    int(sparse_edit["removed_count"]) if sparse_edit is not None else None
+                ),
             )
             if self._should_verbose_step(args):
                 self.writer.write(

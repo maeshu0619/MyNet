@@ -12329,6 +12329,19 @@ def train(model, args, loss, writer, plot, notifier=None):
     pretrain_label = ( "start after surrogate pretrain" if int(getattr(args, "surrogate_step", 0)) > 0 else "start") # Surrogate事前学習を実行したか否かでログの表示名を変える
     writer.write( f"[Training] {pretrain_label} " f"surrogate_param_norm={case_float(post_pretrain_norm, float('nan')):.6f} " f"lr={surrogate_lrs[0] if surrogate_lrs else 'NA'}")
     log_for_better_event( for_better_path, "training_start_after_surrogate_pretrain", label=pretrain_label, surrogate_param_norm=post_pretrain_norm, surrogate_lrs=surrogate_lrs) # Surrogate事前学習後の状態を詳細分ん積ログへ保存し、本学修開始時の条件として後から確認できるようにする
+    if (
+        bool(getattr(args, "sparsepcgc_warmup_worker_before_train", True))
+        and not bool(getattr(args, "disable_actual_codec_during_train", False))
+        and str(getattr(args, "compression_loss_backend", "")).strip().lower().startswith("sparsepcgc")
+    ):
+        warmup_actual_encoder = getattr(loss, "warmup_actual_encoder", None)
+        if callable(warmup_actual_encoder):
+            actual_worker_warmup_start = time.time()
+            warmup_actual_encoder(args)
+            writer.write(
+                "SparsePCGCWorkerWarmup: persistent=True, "
+                f"elapsed={time.time() - actual_worker_warmup_start:.3f}s"
+            )
     optimizer.zero_grad(set_to_none=True) # 本学習開始前にOptimizer内の勾配を削除
 
     """==========================================================="""
@@ -12685,7 +12698,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                             encoder_debug_chunks.append(dict(getattr(base_model, "last_encoder_debug", {}) or {})) # Encoder Debug情報をコピーして保存
                         gen_xyz = gen_pts[:, :3, :]
                         _log_sparsepcgc_restore_debug(args, writer, out_label)
+                        edit_summary_t0 = time.time()
                         train_edit_stats = summarize_point_edits( input_xyz=input_xyz[:, :3, :], gen_pts=gen_pts, final_w=final_w, args=args) # 入力点群と出力点群を比較し、各操作の編集統計を計算
+                        step_timing_breakdown["point_edit_summary_time"] = float(time.time() - edit_summary_t0)
                         final_w_for_loss = None
                         if _discrete_loss_mode_value(args) != "hard":
                             final_w_for_loss = final_w
@@ -12694,6 +12709,7 @@ def train(model, args, loss, writer, plot, notifier=None):
 
                         with loss_grad_ctx, autocast_ctx:
                             """形状損失の計算"""
+                            geometry_t0 = time.time()
                             if full_cloud_amount_mode:
                                 geom_mode = str(
                                     getattr(args, "sparsepcgc_full_cloud_amount_geometry_mode", "sampled")
@@ -12758,9 +12774,11 @@ def train(model, args, loss, writer, plot, notifier=None):
                                     final_w=final_w_for_loss,
                                     out_label=out_label,
                                 )
+                            step_timing_breakdown["geometry_loss_time"] = float(time.time() - geometry_t0)
 
                             """圧縮損失の計算"""
                             if stage_factors["com"] != 0.0:
+                                compression_t0 = time.time()
                                 gen_xyz_for_actual, voxel_restored_actual_debug = _select_actual_gen_xyz_from_voxel_state(
                                     args,
                                     writer,
@@ -12801,6 +12819,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                                     actual_gen_xyz=gen_xyz_for_actual,
                                     full_octree_context=full_octree_context,
                                     octree_input_mode="full_cloud",
+                                )
+                                step_timing_breakdown["compression_loss_time"] = float(
+                                    time.time() - compression_t0
                                 )
                                 if (
                                     bool(getattr(args, "sparsepcgc_actual_oracle_apply_full_override", False))
@@ -14049,9 +14070,13 @@ def train(model, args, loss, writer, plot, notifier=None):
                     "anchor_success_teacher_saved": False,
                     "anchor_success_teacher_percent": float("nan"),
                     "anchor_success_teacher_amount": float("nan"),
-                    "anchor_success_memory_count": int(len(_sparsepcgc_anchor_success_memory(args))),
+                    "anchor_success_memory_count": 0,
                 }
-                if isinstance(anchor_debug_source, dict):
+                if (
+                    isinstance(anchor_debug_source, dict)
+                    and str(getattr(args, "heuristic_guidance_mode", "")).strip().lower()
+                    != "ana_den6_online"
+                ):
                     anchor_success_update_debug = _sparsepcgc_update_anchor_success_memory(
                         args,
                         cache_key=cache_key,

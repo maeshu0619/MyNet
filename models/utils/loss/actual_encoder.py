@@ -534,6 +534,10 @@ class _SparsePCGCActualEncoder:
                 f"python={' '.join(self._python_command())}, stderr={self._stderr_path}"
             )
 
+    def warmup(self):
+        """Workerとcodec modelだけを初期化し、Step内の初回ロードをなくす。"""
+        self._lazy_init()
+
     def _pump_stdout(self):
         proc = self._proc
         if proc is None or proc.stdout is None or self._stdout_queue is None:
@@ -585,7 +589,17 @@ class _SparsePCGCActualEncoder:
         if bool(request.get("exit_after_response", False)) and response.get("status") == "ok":
             proc = self._proc
             if proc is not None:
-                proc.wait(timeout=min(float(self.timeout), 30.0))
+                try:
+                    proc.wait(timeout=min(float(self.timeout), 30.0))
+                except subprocess.TimeoutExpired:
+                    # encode結果は既に正常受信済みである。CUDA destructorの遅延で
+                    # 正常なActual教師を失わないよう、終了だけを強制して例外化しない。
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5.0)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=5.0)
             self._proc = None
             self._loaded = False
             if self._stdout_thread is not None:
@@ -865,8 +879,7 @@ class _SparsePCGCActualEncoder:
                     getattr(
                         self.args,
                         "sparsepcgc_release_worker_after_request",
-                        str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower()
-                        == "ana_den6_online",
+                        False,
                     )
                 ),
             }

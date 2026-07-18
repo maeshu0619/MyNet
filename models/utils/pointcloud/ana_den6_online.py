@@ -1,45 +1,33 @@
-"""ana_den6候補をtrain中にlazy生成し、full-cloud contextへ接続する。
+"""GT固定情報だけを保持する、単一提案方式のonline Heuristic入口。
 
-手動manifestは不要である。各frameを初めて見た時だけ別processでana_den6と
-ana_den5_v8を実行し、確定anchorと限定候補をbinary cacheへ保存する。以後のStepは
-cacheを読み、Networkが1つのplanだけを選ぶ。
+旧実装は初見frameごとにana_den6 workerを起動し、Add/Prune/Adjustの候補poolと
+初期planを生成・永続化していた。現在は候補や加工結果をcacheしない。GT由来の
+識別情報と幾何統計だけを軽量cacheへ保存し、Where/Amount/Actionは各Stepで
+Heuristic priorとNetwork residualから一度だけ決定する。
+
+GTの実圧縮項はLoss.actual_gt_cache、GT点群はdataset._PLY_CACHEがそれぞれ既存の
+責務として保持する。このmoduleへ重複保存せず、加工後点群・加工後loss・Network
+の選択結果は一切保存しない。
 """
 
 from __future__ import annotations
 
+from collections import OrderedDict
 import hashlib
 import json
 import os
-import shutil
-import subprocess
-import sys
-import time
-import copy
-import threading
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
-from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Mapping
 
+import numpy as np
 import torch
 
 
-SCHEMA_VERSION = "ana_den6_online_one_pattern_cache_v6"
-SOURCE_NAME = "ana_den6_exact_one_pattern_anchor_online_v6"
-OPERATIONS = ("Add", "Prune", "Adjust")
+SCHEMA_VERSION = "ana_den6_gt_terms_single_proposal_cache_v7"
+SOURCE_NAME = "ana_den6_gt_terms_single_proposal_online_v7"
 _FILE_HASH_CACHE: dict[tuple[str, int, int], str] = {}
 _GLOBAL_PAYLOAD_CACHE: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
-_CACHE_STATS = {
-    "build": 0,
-    "memory_hit": 0,
-    "disk_hit": 0,
-    "worker_launch": 0,
-    "validation_failure": 0,
-}
-_PREFETCH_EXECUTOR = None
-_PREFETCH_FUTURES: dict[str, Any] = {}
-_PREFETCH_LOCK = threading.Lock()
+_CACHE_STATS = {"build": 0, "memory_hit": 0, "disk_hit": 0}
 
 
 def _sha256_file(path: Path) -> str:
@@ -60,7 +48,7 @@ def _sha256_file(path: Path) -> str:
     return value
 
 
-def _dataset_cli_name(value: Any) -> str:
+def _dataset_name(value: Any) -> str:
     text = str(value or "").strip().lower()
     if text in {"8i", "8ivslf"}:
         return "8i"
@@ -69,28 +57,6 @@ def _dataset_cli_name(value: Any) -> str:
     if text == "uvg":
         return "UVG"
     raise RuntimeError(f"ana_den6 onlineが未対応のdatasetである: {value}")
-
-
-def _checkpoint_identifier(args: Any) -> str:
-    candidates = (
-        getattr(args, "sparsepcgc_ckpt_dense", ""),
-        getattr(args, "sparsepcgc_ckptdir", ""),
-        getattr(args, "sparsepcgc_ckpt", ""),
-    )
-    for raw in candidates:
-        text = str(raw or "").strip()
-        if not text:
-            continue
-        path = Path(text).expanduser()
-        if path.is_file():
-            resolved = path.resolve()
-            return f"{resolved}:{_sha256_file(resolved)}"
-        return text
-    return "default_sparsepcgc_dense_checkpoint"
-
-
-def _heuristic_version(args: Any) -> str:
-    return str(getattr(args, "heuristic_guidance_online_heuristic_version", SOURCE_NAME)).strip() or SOURCE_NAME
 
 
 def _setting_id(args: Any) -> str:
@@ -103,348 +69,156 @@ def _setting_id(args: Any) -> str:
     )
 
 
-def _cache_identity(args: Any, input_file: Path, input_sha256: str) -> dict[str, Any]:
-    return {
-        "input_file": str(input_file),
-        "input_sha256": str(input_sha256),
-        "dataset": _dataset_cli_name(getattr(args, "dataname", "8i")),
-        "setting_id": _setting_id(args),
-        "voxel_size": float(getattr(args, "sparsepcgc_voxel_size", 1.0)),
-        "pos_quantscale": int(getattr(args, "sparsepcgc_pos_quantscale", 1)),
-        "heuristic_version": _heuristic_version(args),
-        "checkpoint_identifier": _checkpoint_identifier(args),
-    }
+def _checkpoint_identifier(args: Any) -> str:
+    """巨大checkpoint全体を再hashせず、圧縮設定を識別できるfingerprintを返す。"""
+    for name in (
+        "sparsepcgc_ckpt_dense", "sparsepcgc_ckptdir",
+        "sparsepcgc_ckpt", "sparsepcgc_ckptdir_ae", "sparsepcgc_ckptdir_sr",
+    ):
+        raw = str(getattr(args, name, "") or "").strip()
+        if not raw:
+            continue
+        path = Path(raw).expanduser()
+        if path.is_file():
+            stat = path.stat()
+            return f"{path.resolve()}:{int(stat.st_size)}:{int(stat.st_mtime_ns)}"
+        return raw
+    return "default_sparsepcgc_dense_checkpoint"
 
 
-@contextmanager
-def _cache_lock(path: Path):
-    """process間で同じcacheを同時生成しないための排他lockである。"""
-    lock_path = path.with_suffix(path.suffix + ".lock")
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a+", encoding="utf-8") as stream:
-        try:
-            import fcntl
-            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
-        except ImportError:
-            pass
-        yield
-
-
-def _repo_paths(args: Any) -> tuple[Path, Path, Path]:
-    # .../myNet/models/utils/pointcloud/ana_den6_online.py
-    mynet_root = Path(__file__).resolve().parents[3]
-    configured_root = Path(str(getattr(args, "sparsepcgc_root", ""))).expanduser()
-    candidates = (mynet_root / "reference" / "den6", configured_root)
-    analysis_root = next(
-        (
-            path.resolve()
-            for path in candidates
-            if (path / "ana_den6.py").is_file() and (path / "ana_den5_v8.py").is_file()
-        ),
-        None,
-    )
-    if analysis_root is None:
-        raise RuntimeError(
-            "ana_den6 onlineの参照元が見つからない。"
-            "--sparsepcgc_rootまたはmyNet/reference/den6にana_den6.py/ana_den5_v8.pyが必要である"
-        )
-    worker = mynet_root / "tools" / "ana_den6_online_worker.py"
-    return mynet_root, analysis_root, worker
-
-
-def _cache_file(args: Any, input_file: Path, input_sha256: str) -> Path:
-    root = Path(
-        str(
-            getattr(
-                args,
-                "heuristic_guidance_online_cache_dir",
-                "/data/maejima/log/mynet_den6_online_cache",
-            )
-        )
-    ).expanduser().resolve()
-    dataset = _dataset_cli_name(getattr(args, "dataname", "8i"))
-    stem = input_file.stem.replace(" ", "_")
-    name = (
-        f"{dataset}_{stem}_{_setting_id(args)}_"
-        f"{hashlib.sha256(json.dumps(_cache_identity(args, input_file, input_sha256), sort_keys=True).encode()).hexdigest()[:16]}.pt"
-    )
-    return root / name
-
-
-def _worker_prefix(args: Any) -> list[str]:
-    explicit_python = str(getattr(args, "heuristic_guidance_online_python", "")).strip()
-    if explicit_python:
-        python_path = Path(explicit_python).expanduser().resolve()
-        if not python_path.is_file():
-            raise RuntimeError(
-                "--heuristic_guidance_online_pythonが存在しない: "
-                f"{python_path}"
-            )
-        return [str(python_path)]
-
-    conda_env = str(getattr(args, "heuristic_guidance_online_conda_env", "sparsepcgc")).strip()
-    if conda_env:
-        conda = shutil.which("conda")
-        if conda is None:
-            raise RuntimeError(
-                "ana_den6 online worker用condaが見つからない。"
-                "--heuristic_guidance_online_pythonでMinkowskiEngine環境のPythonを指定すること"
-            )
-        return [conda, "run", "--no-capture-output", "-n", conda_env, "python"]
-    return [sys.executable]
-
-
-def _worker_command(
-    args: Any,
-    *,
-    input_file: Path,
-    output_json: Path,
-    analysis_root: Path,
-    worker: Path,
-) -> list[str]:
-    data = _dataset_cli_name(getattr(args, "dataname", "8i"))
-    build_root = output_json.parent / "build" / output_json.stem
-    command = _worker_prefix(args) + [
-        str(worker),
-        "--sparsepcgc-root", str(analysis_root),
-        "--data", data,
-        "--input-file", str(input_file),
-        "--scale-m", str(int(getattr(args, "sparsepcgc_scale_m", 8))),
-        "--scale-ae", str(int(getattr(args, "sparsepcgc_scale_ae", 0))),
-        "--scale-sr", str(int(getattr(args, "sparsepcgc_scale_sr", 0))),
-        "--max-total-ratio", str(float(getattr(args, "heuristic_guidance_online_max_total_ratio", 0.0099))),
-        # den6と同じ全候補順位はworker内だけで作り、永続cacheにはshortlistだけを残す。
-        "--full-pool-limit-per-operation", str(int(getattr(args, "heuristic_guidance_online_full_pool_limit", 0))),
-        "--compact-reserve-factor", str(float(getattr(args, "heuristic_guidance_online_compact_reserve_factor", 1.0))),
-        "--output-json", str(output_json),
-        "--output-root", str(build_root),
-    ]
-    ratio_percent = float(getattr(args, "heuristic_guidance_total_ratio_percent", -1.0))
-    if ratio_percent >= 0.0:
-        command.extend(("--total-ratio", str(ratio_percent / 100.0)))
-    shares = str(getattr(args, "heuristic_guidance_operation_shares", "")).strip()
-    if shares:
-        command.extend(("--operation-shares", shares))
-    device_mode = str(getattr(args, "heuristic_guidance_online_worker_device", "cpu")).strip().lower()
-    if device_mode == "cpu":
-        command.append("--cpu")
-    elif device_mode not in {"auto", "cuda"}:
-        raise RuntimeError(
-            "heuristic_guidance_online_worker_deviceはcpu/auto/cudaのいずれかである"
-        )
-    return command
-
-
-def _normalize_worker_payload(
-    worker_payload: Mapping[str, Any],
-    *,
-    args: Any,
-    input_file: Path,
-    input_sha256: str,
-) -> dict[str, Any]:
-    """既存workerのJSONをonline Actuator用compact cache形式へ写像する。"""
-    pools = worker_payload.get("operation_candidate_shortlists")
-    initial_plan = worker_payload.get("initial_heuristic_plan")
-    if not isinstance(pools, Mapping) or not isinstance(initial_plan, Mapping):
-        raise RuntimeError("ana_den6 online workerの候補poolまたはinitial planが不正である")
-    for operation in OPERATIONS:
-        if not isinstance(pools.get(operation), list) or not pools[operation]:
-            raise RuntimeError(f"ana_den6 online workerの{operation}候補poolが空である")
-
+def _identity(args: Any, input_file: Path, input_sha256: str) -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
-        "source": SOURCE_NAME,
-        "worker_schema_version": str(worker_payload.get("schema_version", "")),
-        "worker_source": str(worker_payload.get("source", "")),
         "input_file": str(input_file),
         "input_sha256": str(input_sha256),
-        "input_voxel_hash": str(worker_payload.get("input_voxel_hash", "")),
-        "dataset": _dataset_cli_name(getattr(args, "dataname", "8i")),
+        "dataset": _dataset_name(getattr(args, "dataname", "8i")),
         "setting_id": _setting_id(args),
-        "den6_setting_id": str(worker_payload.get("setting_id", "")),
         "voxel_size": float(getattr(args, "sparsepcgc_voxel_size", 1.0)),
         "pos_quantscale": int(getattr(args, "sparsepcgc_pos_quantscale", 1)),
-        "heuristic_version": _heuristic_version(args),
+        "scale_ae": int(getattr(args, "sparsepcgc_scale_ae", 0)),
+        "scale_sr": int(getattr(args, "sparsepcgc_scale_sr", 0)),
+        "scale_m": int(getattr(args, "sparsepcgc_scale_m", 8)),
+        "codec_mode": str(getattr(args, "sparsepcgc_mode", "dense_lossy")),
         "checkpoint_identifier": _checkpoint_identifier(args),
-        "scale_m": int(worker_payload.get("scale_m", getattr(args, "sparsepcgc_scale_m", 8))),
-        "scale_ae": int(worker_payload.get("scale_ae", getattr(args, "sparsepcgc_scale_ae", 0))),
-        "scale_sr": int(worker_payload.get("scale_sr", getattr(args, "sparsepcgc_scale_sr", 0))),
-        "total_ratio": float(worker_payload.get("total_ratio", 0.0)),
-        "operation_shares": dict(worker_payload.get("operation_shares") or {}),
-        "operation_heuristics": dict(worker_payload.get("operation_heuristics") or {}),
-        "operation_priority": list(worker_payload.get("operation_priority") or ()),
-        "operation_candidate_shortlists": {operation: list(pools[operation]) for operation in OPERATIONS},
-        "initial_heuristic_plan": dict(initial_plan),
-        "anchor_operation_counts": dict(worker_payload.get("anchor_operation_counts") or {}),
-        "shortlist_limits": dict(worker_payload.get("shortlist_limits") or {}),
-        "full_pool_counts": dict(worker_payload.get("full_pool_counts") or {}),
-        "baseline_decoder_complete_bits": float(
-            worker_payload.get("baseline_decoder_complete_bits", 0.0)
-        ),
-        "den6_sha256": str(worker_payload.get("den6_sha256", "")),
-        "den5_sha256": str(worker_payload.get("den5_sha256", "")),
-        "runtime_breakdown_sec": {
-            "worker": float(worker_payload.get("elapsed_sec", 0.0)),
-        },
     }
 
 
-def _validate_payload(
-    payload: Mapping[str, Any],
-    *,
-    args: Any,
-    input_file: Path,
-    input_sha256: str,
-    analysis_root: Path,
-) -> None:
-    if str(payload.get("schema_version", "")) != SCHEMA_VERSION:
-        raise RuntimeError("ana_den6 online cache schemaが不正である")
+def _cache_file(args: Any, identity: Mapping[str, Any]) -> Path:
+    root = Path(str(getattr(
+        args,
+        "heuristic_guidance_online_cache_dir",
+        "/data/maejima/log/mynet_den6_online_cache",
+    ))).expanduser().resolve()
+    stem = Path(str(identity["input_file"])).stem.replace(" ", "_")
+    signature = hashlib.sha256(
+        json.dumps(dict(identity), sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:16]
+    return root / f"single_proposal_{identity['dataset']}_{stem}_{identity['setting_id']}_{signature}.json"
+
+
+def _canonical_geometry_terms(coords: torch.Tensor) -> dict[str, Any]:
+    if coords.ndim != 3 or coords.shape[0] != 1 or coords.shape[1] != 3:
+        raise RuntimeError(
+            "ana_den6 onlineはbatch=1のfull-cloud canonical voxelだけを受け付ける: "
+            f"shape={tuple(coords.shape)}"
+        )
+    rows = coords[0].transpose(0, 1).detach().to(device="cpu", dtype=torch.int64).contiguous()
+    if rows.numel() == 0:
+        raise RuntimeError("ana_den6 onlineのGT canonical voxelが空である")
+    # Python tupleの全点sortは大規模点群で遅いため、NumPyのlexsortを1回だけ使う。
+    values = rows.numpy()
+    order = np.lexsort((values[:, 2], values[:, 1], values[:, 0]))
+    packed = np.ascontiguousarray(values[order], dtype=np.int64)
+    voxel_hash = hashlib.sha256(packed.tobytes(order="C")).hexdigest()
+    minimum = packed.min(axis=0)
+    maximum = packed.max(axis=0)
+    centroid = packed.mean(axis=0, dtype=np.float64)
+    return {
+        "input_voxel_hash": voxel_hash,
+        "unique_voxel_count": int(packed.shape[0]),
+        "bbox_min": [int(value) for value in minimum.tolist()],
+        "bbox_max": [int(value) for value in maximum.tolist()],
+        "centroid": [float(value) for value in centroid.tolist()],
+    }
+
+
+def _validate_payload(payload: Mapping[str, Any], identity: Mapping[str, Any]) -> None:
     if str(payload.get("source", "")) != SOURCE_NAME:
-        raise RuntimeError("ana_den6 online cache sourceが不正である")
-    if Path(str(payload.get("input_file", ""))).resolve() != input_file:
-        raise RuntimeError("ana_den6 online cacheと現在の入力PLYが一致しない")
-    if str(payload.get("input_sha256", "")) != input_sha256:
-        raise RuntimeError("ana_den6 online cacheと入力PLYのSHA256が一致しない")
-    if str(payload.get("setting_id", "")) != _setting_id(args):
-        raise RuntimeError("ana_den6 online cacheとAE/SR/m設定が一致しない")
-    identity = _cache_identity(args, input_file, input_sha256)
-    for name in ("dataset", "voxel_size", "pos_quantscale", "heuristic_version", "checkpoint_identifier"):
-        if str(payload.get(name, "")) != str(identity[name]):
-            raise RuntimeError(f"ana_den6 online cache identity不一致: {name}")
-    den6_path = analysis_root / "ana_den6.py"
-    den5_path = analysis_root / "ana_den5_v8.py"
-    if not den6_path.is_file() or not den5_path.is_file():
-        raise RuntimeError("現在のana_den6.py/ana_den5_v8.pyを検証できない")
-    if str(payload.get("den6_sha256", "")) != _sha256_file(den6_path):
-        raise RuntimeError("cache生成時と現在のana_den6.pyが一致しない")
-    if str(payload.get("den5_sha256", "")) != _sha256_file(den5_path):
-        raise RuntimeError("cache生成時と現在のana_den5_v8.pyが一致しない")
-    shortlists = payload.get("operation_candidate_shortlists")
-    if not isinstance(shortlists, Mapping):
-        raise RuntimeError("ana_den6 online cacheに局所候補shortlistが無い")
-    anchor = payload.get("initial_heuristic_plan")
-    if not isinstance(anchor, Mapping) or not bool(anchor.get("available", False)):
-        raise RuntimeError("ana_den6 online cacheに確定anchor planが無い")
-    for operation in OPERATIONS:
-        candidates = shortlists.get(operation)
-        if not isinstance(candidates, list) or not candidates:
-            raise RuntimeError(f"ana_den6 online cacheの{operation}局所候補が空である")
-        anchor_count = max(int(dict(payload.get("anchor_operation_counts") or {}).get(operation, 0)), 1)
-        limit = int(dict(payload.get("shortlist_limits") or {}).get(operation, 0))
-        if limit <= 0 or len(candidates) > limit or limit < anchor_count:
-            raise RuntimeError(f"ana_den6 online cacheの{operation} shortlist上限が不正である")
+        raise RuntimeError("single-proposal online cache sourceが不正である")
+    for name, expected in identity.items():
+        if str(payload.get(name, "")) != str(expected):
+            raise RuntimeError(f"single-proposal online cache identity不一致: {name}")
+    geometry = payload.get("gt_geometry_terms")
+    if not isinstance(geometry, Mapping) or not str(geometry.get("input_voxel_hash", "")):
+        raise RuntimeError("single-proposal online cacheにGT幾何項が無い")
+    forbidden = {
+        "operation_candidate_shortlists", "ranked_candidate_pools", "initial_heuristic_plan",
+        "selected_candidate_ids", "processed_point_cloud", "generated_point_cloud",
+        "actual_generated_loss", "surrogate_target",
+    }
+    present = sorted(name for name in forbidden if name in payload)
+    if present:
+        raise RuntimeError(f"single-proposal online cacheに加工候補/結果が混入した: {present}")
 
 
-
-def _merge_timing_sidecar(payload: dict[str, Any], cache_path: Path) -> dict[str, Any]:
-    """大きなcacheを再保存せず記録した実測保存時間をpayloadへ統合する。"""
-    sidecar = cache_path.with_suffix(cache_path.suffix + ".timing.json")
-    if not sidecar.is_file():
-        return payload
-    try:
-        timing = json.loads(sidecar.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return payload
-    if isinstance(timing, Mapping):
-        payload["runtime_breakdown_sec"] = {
-            **dict(payload.get("runtime_breakdown_sec") or {}),
-            **{str(key): float(value) for key, value in timing.items()},
-        }
-    return payload
-
-
-def _torch_load_cache(cache_path: Path) -> Any:
-    """Torch 1.11とweights_only対応Torchの両方でcandidate cacheを読む。"""
-    try:
-        return torch.load(cache_path, map_location="cpu", weights_only=False)
-    except TypeError as exc:
-        if "weights_only" not in str(exc):
-            raise
-        return torch.load(cache_path, map_location="cpu")
-
-
-def _load_or_build_payload(args: Any, input_file_override: Any = None) -> dict[str, Any]:
-    raw_input_file = (
-        input_file_override
-        if input_file_override is not None
-        else getattr(args, "_current_input_file", "")
-    )
-    input_file = Path(str(raw_input_file)).expanduser().resolve()
+def _load_or_build_payload(context: Mapping[str, Any], args: Any) -> dict[str, Any]:
+    input_file = Path(str(getattr(args, "_current_input_file", ""))).expanduser().resolve()
     if not input_file.is_file():
-        raise RuntimeError("ana_den6 onlineでは各Stepのargs._current_input_fileに実在PLYが必要である")
+        raise RuntimeError("ana_den6 onlineではargs._current_input_fileに実在PLYが必要である")
     input_sha256 = _sha256_file(input_file)
-    _, analysis_root, worker = _repo_paths(args)
-    if not worker.is_file():
-        raise RuntimeError(f"ana_den6 online workerが存在しない: {worker}")
-    output_cache = _cache_file(args, input_file, input_sha256)
-    output_cache.parent.mkdir(parents=True, exist_ok=True)
-    memory_key = str(output_cache)
+    identity = _identity(args, input_file, input_sha256)
+    cache_path = _cache_file(args, identity)
+    memory_key = str(cache_path)
 
     cached = _GLOBAL_PAYLOAD_CACHE.get(memory_key)
     if isinstance(cached, dict):
-        _validate_payload(cached, args=args, input_file=input_file, input_sha256=input_sha256, analysis_root=analysis_root)
+        _validate_payload(cached, identity)
         _GLOBAL_PAYLOAD_CACHE.move_to_end(memory_key)
         _CACHE_STATS["memory_hit"] += 1
         setattr(args, "_ana_den6_online_cache_stats", dict(_CACHE_STATS))
-        print(f"[ana_den6_online] cache hit: {input_file.name} (memory)", flush=True)
-        return cached
+        return dict(cached)
 
-    with _cache_lock(output_cache):
-        payload = None
-        if output_cache.is_file():
-            try:
-                candidate = _torch_load_cache(output_cache)
-                _validate_payload(candidate, args=args, input_file=input_file, input_sha256=input_sha256, analysis_root=analysis_root)
-                payload = _merge_timing_sidecar(dict(candidate), output_cache)
-                _CACHE_STATS["disk_hit"] += 1
-                print(f"[ana_den6_online] cache hit: {input_file.name} (disk)", flush=True)
-            except Exception as exc:
-                _CACHE_STATS["validation_failure"] += 1
-                raise RuntimeError(
-                    "ana_den6 online cache validation failed; 壊れたcacheを黙って削除・再生成しない。"
-                    f" 明示的に確認して削除すること: {output_cache} ({type(exc).__name__}: {exc})"
-                ) from exc
+    payload = None
+    if cache_path.is_file():
+        try:
+            candidate = json.loads(cache_path.read_text(encoding="utf-8"))
+            _validate_payload(candidate, identity)
+            payload = dict(candidate)
+            _CACHE_STATS["disk_hit"] += 1
+        except (OSError, ValueError, TypeError, RuntimeError):
+            # v7はGT固定metadataだけなので、安全かつ即時に再構築できる。
+            payload = None
 
-        if payload is None:
-            worker_json = output_cache.with_suffix(".worker.json")
-            command = _worker_command(
-                args,
-                input_file=input_file,
-                output_json=worker_json,
-                analysis_root=analysis_root,
-                worker=worker,
-            )
-            print(f"[ana_den6_online] 初回frameのden6候補cacheを生成する: {input_file.name}", flush=True)
-            _CACHE_STATS["worker_launch"] += 1
-            completed = subprocess.run(command, cwd=str(worker.parent.parent), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False, env=dict(os.environ))
-            if completed.returncode != 0:
-                detail = (completed.stderr or completed.stdout or "").strip()[-8000:]
-                raise RuntimeError(f"ana_den6 online candidate生成に失敗した。 returncode={completed.returncode}\n{detail}")
-            if not worker_json.is_file():
-                raise RuntimeError("ana_den6 online workerが候補JSONを出力しなかった")
-            try:
-                worker_payload = json.loads(worker_json.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as exc:
-                raise RuntimeError("ana_den6 online workerの候補JSONを読めない") from exc
-            payload = _normalize_worker_payload(
-                worker_payload,
-                args=args,
-                input_file=input_file,
-                input_sha256=input_sha256,
-            )
-            temporary = output_cache.with_suffix(output_cache.suffix + ".tmp")
-            torch.save(payload, temporary)
-            temporary.replace(output_cache)
-            try:
-                worker_json.unlink()
-            except OSError:
-                pass
-            _validate_payload(payload, args=args, input_file=input_file, input_sha256=input_sha256, analysis_root=analysis_root)
-            _CACHE_STATS["build"] += 1
+    if payload is None:
+        coords = context.get("full_global_voxel_coords", context.get("global_voxel_coords"))
+        if not torch.is_tensor(coords):
+            raise RuntimeError("ana_den6 online contextにglobal_voxel_coordsが無い")
+        geometry_terms = _canonical_geometry_terms(coords)
+        payload = {
+            **identity,
+            "source": SOURCE_NAME,
+            "gt_geometry_terms": geometry_terms,
+            # 実圧縮GT値はLoss.actual_gt_cacheへ1回だけ保存し、ここでは責務だけを記録する。
+            "gt_compression_terms": {
+                "owner": "Loss.actual_gt_cache",
+                "scope": "unmodified_full_cloud_gt_only",
+            },
+            "proposal_policy": "one_where_amount_action_per_step",
+        }
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = cache_path.with_suffix(cache_path.suffix + f".{os.getpid()}.tmp")
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, cache_path)
+        _CACHE_STATS["build"] += 1
 
-    payload["cache_path"] = str(output_cache)
-    payload["cache_signature"] = hashlib.sha256(json.dumps(_cache_identity(args, input_file, input_sha256), sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
-    _GLOBAL_PAYLOAD_CACHE[memory_key] = payload
+    payload["cache_path"] = str(cache_path)
+    payload["cache_signature"] = hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    _GLOBAL_PAYLOAD_CACHE[memory_key] = dict(payload)
     _GLOBAL_PAYLOAD_CACHE.move_to_end(memory_key)
     max_entries = max(int(getattr(args, "heuristic_guidance_online_memory_entries", 4)), 1)
     while len(_GLOBAL_PAYLOAD_CACHE) > max_entries:
@@ -453,68 +227,14 @@ def _load_or_build_payload(args: Any, input_file_override: Any = None) -> dict[s
     return payload
 
 
-def _prefetch_one(args: Any, input_file: str) -> str:
-    worker_args = copy.copy(args)
-    worker_args._current_input_file = str(input_file)
-    input_path = Path(str(input_file)).expanduser().resolve()
-    input_sha256 = _sha256_file(input_path)
-    cache_path = _cache_file(worker_args, input_path, input_sha256)
-    # A cache miss used to launch a full ana_den6 GPU process from every
-    # prefetch thread.  Two such workers could overlap the training model and
-    # the actual-codec worker, causing the delayed ~40 GB spike.  Existing
-    # caches are still loaded ahead on CPU; a missing cache is built once,
-    # synchronously when that frame is consumed, unless explicitly requested.
-    if (
-        not cache_path.is_file()
-        and not bool(getattr(worker_args, "heuristic_guidance_online_prefetch_build_missing", False))
-    ):
-        return ""
-    payload = _load_or_build_payload(worker_args, input_file_override=input_file)
-    return str(payload.get("cache_path", ""))
-
-
 def prefetch_ana_den6_online_guidance(args: Any, input_files: Any) -> dict[str, int]:
-    """Build the exact per-frame cache ahead of its synchronous train step."""
-    global _PREFETCH_EXECUTOR
-    mode = str(getattr(args, "heuristic_guidance_mode", "")).strip().lower()
-    workers = max(int(getattr(args, "heuristic_guidance_online_prefetch_workers", 0)), 0)
-    if mode != "ana_den6_online" or workers <= 0 or int(getattr(args, "max_train_steps", 0)) > 0:
-        return {"submitted": 0, "pending": 0, "done": 0}
-
-    submitted = 0
-    with _PREFETCH_LOCK:
-        if _PREFETCH_EXECUTOR is None:
-            _PREFETCH_EXECUTOR = ThreadPoolExecutor(
-                max_workers=workers,
-                thread_name_prefix="ana_den6_prefetch",
-            )
-        for raw_path in input_files:
-            path = str(Path(str(raw_path)).expanduser().resolve())
-            if path in _PREFETCH_FUTURES:
-                continue
-            _PREFETCH_FUTURES[path] = _PREFETCH_EXECUTOR.submit(_prefetch_one, args, path)
-            submitted += 1
-        done = sum(int(future.done()) for future in _PREFETCH_FUTURES.values())
-        pending = len(_PREFETCH_FUTURES) - done
-    return {"submitted": submitted, "pending": pending, "done": done}
+    """候補workerは廃止済み。軽量metadataは使用時に同期なしで生成する。"""
+    del args, input_files
+    return {"submitted": 0, "pending": 0, "done": 0}
 
 
 def shutdown_ana_den6_online_prefetch(*, wait: bool = True) -> None:
-    global _PREFETCH_EXECUTOR
-    with _PREFETCH_LOCK:
-        executor = _PREFETCH_EXECUTOR
-        _PREFETCH_EXECUTOR = None
-        futures = list(_PREFETCH_FUTURES.values())
-        _PREFETCH_FUTURES.clear()
-    for future in futures:
-        if not future.running():
-            future.cancel()
-    if executor is not None:
-        try:
-            executor.shutdown(wait=bool(wait), cancel_futures=True)
-        except TypeError:
-            # Python 3.8's ThreadPoolExecutor has no cancel_futures keyword.
-            executor.shutdown(wait=bool(wait))
+    del wait
 
 
 def attach_ana_den6_online_guidance(
@@ -523,26 +243,18 @@ def attach_ana_den6_online_guidance(
     *,
     device: torch.device,
 ) -> dict[str, Any]:
-    """online候補cacheをfull-cloud contextへ付与する。"""
+    """GT metadataを付け、単一提案priorの識別情報をNetworkへ渡す。"""
     mode = str(getattr(args, "heuristic_guidance_mode", "proxy_prior")).strip().lower()
     if mode != "ana_den6_online":
         return dict(context)
     if not isinstance(context, Mapping):
         raise RuntimeError("ana_den6 onlineにはfull-cloud canonical contextが必要である")
-    coords = context.get("full_global_voxel_coords", context.get("global_voxel_coords"))
-    if not torch.is_tensor(coords):
-        raise RuntimeError("ana_den6 online contextにglobal_voxel_coordsが無い")
-    if coords.ndim != 3 or coords.shape[0] != 1 or coords.shape[1] != 3:
-        raise RuntimeError(
-            "ana_den6 onlineはbatch=1のfull-cloud canonical voxelだけを受け付ける: "
-            f"shape={tuple(coords.shape)}"
-        )
-    payload = _load_or_build_payload(args)
+    payload = _load_or_build_payload(context, args)
     out = dict(context)
+    # 互換key名は維持するが、中身は候補poolではなくGT固定metadataだけである。
     out["ana_den6_ranked_candidate_guidance"] = payload
     out["ana_den6_online_cache_path"] = str(payload.get("cache_path", ""))
     out["ana_den6_online_cache_used"] = True
-    # cacheはCPU objectとして保持し、座標Tensorだけ既存contextのdeviceを維持する。
     if torch.is_tensor(out.get("global_voxel_coords")):
         out["global_voxel_coords"] = out["global_voxel_coords"].to(device=device)
     return out

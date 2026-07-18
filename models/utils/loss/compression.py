@@ -698,6 +698,14 @@ class CompressionLossMixin:
                 self.last_surrogate_target_entry = None
         return self.actual_encoder
 
+    def warmup_actual_encoder(self, args):
+        """外部Actual codecをTraining Step開始前に一度だけ初期化する。"""
+        encoder = self._get_actual_encoder(args)
+        warmup = getattr(encoder, "warmup", None)
+        if callable(warmup):
+            warmup()
+        return encoder
+
     def _reset_actual_encoder_after_error(self):
         old_encoder = getattr(self, "actual_encoder", None)
         if old_encoder is not None and hasattr(old_encoder, "close"):

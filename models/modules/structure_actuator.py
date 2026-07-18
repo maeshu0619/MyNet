@@ -2957,10 +2957,11 @@ class StructureRepairActuator(nn.Module):
                 "ana_den6_exact_compact_candidate_shortlist_online_v5",
                 "ana_den6_exact_unique_plan_online_v6",
                 "ana_den6_exact_one_pattern_anchor_online_v6",
+                "ana_den6_single_proposal_network_residual_online_v7",
             }:
                 raise RuntimeError(
                     "ana_den6 online/residualでproxy近似guidanceがActuatorへ入った。"
-                    "exact ranked candidate pool以外は使用できない"
+                    "許可されたexact候補またはsingle-proposal prior以外は使用できない"
                 )
             if not isinstance(guidance.get("exact_candidate_guidance"), dict):
                 raise RuntimeError("ana_den6 online/residualでexact_candidate_guidanceが欠落した")

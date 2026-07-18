@@ -24,6 +24,7 @@ from models.utils.pointcloud.ana_den6_reference import (
     _current_den6_sha256,
     attach_ana_den6_reference_anchor,
 )
+from models.utils.pointcloud.ana_den6_online import attach_ana_den6_online_guidance
 
 
 class _ActualCodecFixture(CompressionLossMixin):
@@ -257,6 +258,76 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(RuntimeError, "複数候補actual encodeを禁止"):
             fixture._encode_actual_many(args, [torch.zeros((3, 1))])
+
+    def test_den6_online_v7_cache_contains_gt_terms_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            input_file = root / "frame.ply"
+            input_file.write_bytes(b"synthetic-ply-identity")
+            args = SimpleNamespace(
+                heuristic_guidance_mode="ana_den6_online",
+                heuristic_guidance_online_cache_dir=str(root / "cache"),
+                heuristic_guidance_online_memory_entries=2,
+                _current_input_file=str(input_file),
+                dataname="8i",
+                sparsepcgc_voxel_size=1.0,
+                sparsepcgc_pos_quantscale=1,
+                sparsepcgc_scale_ae=0,
+                sparsepcgc_scale_sr=2,
+                sparsepcgc_scale_m=8,
+                sparsepcgc_mode="dense_lossy",
+            )
+            context = {
+                "global_voxel_coords": torch.tensor(
+                    [[[1, 0, 2], [0, 0, 1], [0, 0, 0]]], dtype=torch.long
+                )
+            }
+            attached = attach_ana_den6_online_guidance(
+                context, args, device=torch.device("cpu")
+            )
+            payload = attached["ana_den6_ranked_candidate_guidance"]
+            self.assertEqual(payload["proposal_policy"], "one_where_amount_action_per_step")
+            self.assertEqual(payload["gt_geometry_terms"]["unique_voxel_count"], 3)
+            for forbidden in (
+                "operation_candidate_shortlists", "initial_heuristic_plan",
+                "selected_candidate_ids", "actual_generated_loss", "surrogate_target",
+            ):
+                self.assertNotIn(forbidden, payload)
+
+    def test_den6_online_v7_builds_single_proposal_prior_without_candidate_pool(self):
+        like = torch.tensor([[[0.1, 0.8, 0.3]]], dtype=torch.float32)
+        structure = {
+            name: like.clone()
+            for name in (
+                "occupancy_nll_proxy", "node_proxy", "single_proxy", "lowprob_proxy",
+                "context_proxy", "quant_proxy", "sparse_proxy", "outlier_proxy", "shape_proxy",
+            )
+        }
+        structure["ana_den6_ranked_candidate_guidance"] = {
+            "source": "ana_den6_gt_terms_single_proposal_online_v7",
+            "cache_signature": "fixture-v7",
+            "dataset": "8i",
+            "scale_m": 8,
+        }
+        guidance = build_heuristic_guidance(
+            structure,
+            SimpleNamespace(
+                heuristic_guidance_mode="ana_den6_online",
+                heuristic_guidance_enabled=True,
+                dataname="8i",
+                sparsepcgc_scale_m=8,
+                heuristic_guidance_total_ratio_percent=-1.0,
+                heuristic_guidance_operation_shares="",
+                heuristic_guidance_operation_heuristics="",
+            ),
+        )
+        self.assertEqual(
+            guidance["formula_basis"],
+            "ana_den6_single_proposal_network_residual_online_v7",
+        )
+        self.assertEqual(guidance["proposal_policy"], "one_where_amount_action_per_step")
+        self.assertNotIn("candidate_mask", guidance)
+        self.assertNotIn("candidate_tensor_map", guidance)
 
     def test_den6_online_batch_aggregate_preserves_worker_request_counter(self):
         gt_xyz = torch.zeros((1, 3, 4), dtype=torch.float32)

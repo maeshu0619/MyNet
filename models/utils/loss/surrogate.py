@@ -641,6 +641,11 @@ class SurrogateCompressionLossMixin:
     def _store_cached_surrogate_target(self, args, cache_key, entry):
         stored = dict(entry)
         stored.pop("cache_hit", None)
+        if str(getattr(args, "heuristic_guidance_mode", "")).strip().lower() == "ana_den6_online":
+            # single-proposal onlineは毎Stepの唯一の加工結果をその場で教師にする。
+            # 加工後lossを次Stepへ持ち越すcache/last entryは作らない。
+            self.last_surrogate_target_entry = None
+            return
         self.last_surrogate_target_entry = dict(stored)
         key = self._surrogate_target_cache_key(args, cache_key)
         cache = getattr(self, "surrogate_target_cache", None)

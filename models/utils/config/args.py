@@ -2672,8 +2672,9 @@ def parse_pugan_args(parser, file_day, file_time):
         '--sparsepcgc_release_worker_after_request',
         default=None,
         type=str2bool,
-        help='各actual encode後にworkerのCUDA contextを解放するか（未指定時はana_den6_onlineのみ有効）',
+        help='各actual encode後にworkerを終了するか。再ロードが非常に重いため既定False',
     )
+    parser.add_argument('--sparsepcgc_warmup_worker_before_train', default=True, type=str2bool, help='SparsePCGC worker/model初期化をStep時間計測前に一度だけ行うか')
     parser.add_argument('--sparsepcgc_binary_ply_fallback_ascii', default=True, type=str2bool, help='環境側readerがbinary PLYを読めない場合にASCIIへ一度だけ自動fallbackするか')
     parser.add_argument('--sparsepcgc_reuse_workspace', default=True, type=str2bool, help='actual worker用一時directoryをrequest間で再利用するか')
     parser.add_argument('--sparsepcgc_actual_result_cache', default=True, type=str2bool, help='同一Voxel集合・同一codec設定のactual結果をprocess内LRU cacheで再利用するか')
@@ -2754,8 +2755,8 @@ def parse_pugan_args(parser, file_day, file_time):
             'ana_den6_reference_ply',
         ],
         help=(
-            'Heuristic guidanceの実行形態。ana_den6_onlineはtrain中に各frameのden6候補を'
-            'lazy生成・cacheし、1Stepで1planだけを実圧縮して学習する'
+            'Heuristic guidanceの実行形態。ana_den6_onlineはGT固定proxyを初期priorにし、'
+            'Networkが各StepでWhere/Amount/Actionを1組だけ決めて実圧縮・学習する'
         ),
     )
     parser.add_argument(
@@ -2774,7 +2775,7 @@ def parse_pugan_args(parser, file_day, file_time):
         '--heuristic_guidance_online_cache_dir',
         default='/data/maejima/log/mynet_den6_online_cache',
         type=str,
-        help='train中にlazy生成するana_den6順位付き候補poolのcache先',
+        help='入力GTの識別情報・canonical幾何統計だけを保存する軽量cache先（候補・加工結果は保存しない）',
     )
     parser.add_argument(
         '--heuristic_guidance_online_conda_env',
@@ -2821,9 +2822,9 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--heuristic_guidance_online_prefetch_workers',
-        default=2,
+        default=0,
         type=int,
-        help='次frameの既存den6候補cacheをCPUで先読みする並列数。0で無効',
+        help='旧候補worker互換引数。single-proposal方式では使用せず0固定',
     )
     parser.add_argument(
         '--heuristic_guidance_online_prefetch_build_missing',
@@ -4003,6 +4004,8 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     if args.heuristic_guidance_enabled and args.heuristic_guidance_mode == "ana_den6_online":
         # online方式は全点群から1%未満の微小Voxelを1planだけ選ぶ。
+        # 候補pool・複数Actual比較・加工後結果cacheは使わず、毎StepのNetwork出力を
+        # そのStepの唯一のActual/Surrogate教師対象にする。
         # 旧subtree oracleやfull-cloud Amount多候補評価を併走させない。
         args.train_patch_subset_enable = False
         args.sparsepcgc_training_mode = "legacy"
@@ -4051,6 +4054,14 @@ def parse_pugan_args(parser, file_day, file_time):
         args.sparsepcgc_actual_every_step = True
         args.actual_eval_interval = 1
         args.disable_actual_codec_during_train = False
+        args.sparsepcgc_actual_result_cache = False
+        args.compression_surrogate_target_cache_entries = 0
+        args.compression_surrogate_replay_entries = 0
+        args.compression_surrogate_replay_steps = 0
+        args.compression_surrogate_reuse_last_target = False
+        args.compression_surrogate_refresh_interval = 1
+        args.heuristic_guidance_online_prefetch_workers = 0
+        args.heuristic_guidance_online_prefetch_build_missing = False
         args.batch_size = 1
         # 旧5% Prune等で学習したheadを自動読込するとonline residual初期値を汚す。
         # 明示指定時だけ再開を許可し、既定は新しい方策headから開始する。
@@ -4637,11 +4648,11 @@ def parse_pugan_args(parser, file_day, file_time):
     args.sparsepcgc_fast_binary_ply = bool(getattr(args, "sparsepcgc_fast_binary_ply", True))
     release_worker = getattr(args, "sparsepcgc_release_worker_after_request", None)
     if release_worker is None:
-        release_worker = (
-            str(getattr(args, "heuristic_guidance_mode", "")).strip().lower()
-            == "ana_den6_online"
-        )
+        release_worker = False
     args.sparsepcgc_release_worker_after_request = bool(release_worker)
+    args.sparsepcgc_warmup_worker_before_train = bool(
+        getattr(args, "sparsepcgc_warmup_worker_before_train", True)
+    )
     args.sparsepcgc_binary_ply_fallback_ascii = bool(getattr(args, "sparsepcgc_binary_ply_fallback_ascii", True))
     args.sparsepcgc_reuse_workspace = bool(getattr(args, "sparsepcgc_reuse_workspace", True))
     args.sparsepcgc_actual_result_cache = bool(getattr(args, "sparsepcgc_actual_result_cache", True))
@@ -7255,7 +7266,7 @@ def parse_pugan_args(parser, file_day, file_time):
             args.repair_add_ratio_floor = 0.0
         if not _cli_option_was_provided("--repair_move_ratio_floor"):
             args.repair_move_ratio_floor = 0.0
-        # den6候補pool外のrandom探索は許さず、pool内のNetwork residualだけを学習する。
+        # Heuristic priorを中心にNetwork residualだけを学習し、別候補の反復評価はしない。
         if not _cli_option_was_provided("--repair_operation_gate_random_mix_start"):
             args.repair_operation_gate_random_mix_start = 0.0
         if not _cli_option_was_provided("--repair_operation_gate_random_mix_end"):
@@ -7275,6 +7286,16 @@ def parse_pugan_args(parser, file_day, file_time):
             args.enable_voxel_collision_log = False
             args.sparsepcgc_hard_debug_interval = 0
             args.sparsepcgc_hard_debug_on_log = False
+            # 後段の汎用surrogate既定値による再有効化を防ぐ最終保証。
+            # GT cacheは維持し、加工後点群に依存する結果・教師・replayだけを残さない。
+            args.sparsepcgc_actual_result_cache = False
+            args.compression_surrogate_target_cache_entries = 0
+            args.compression_surrogate_replay_entries = 0
+            args.compression_surrogate_replay_steps = 0
+            args.compression_surrogate_reuse_last_target = False
+            args.compression_surrogate_refresh_interval = 1
+            args.heuristic_guidance_online_prefetch_workers = 0
+            args.heuristic_guidance_online_prefetch_build_missing = False
         if not _cli_option_was_provided("--repair_move_score_noise_start"):
             args.repair_move_score_noise_start = 0.0
         if not _cli_option_was_provided("--repair_move_score_noise_end"):

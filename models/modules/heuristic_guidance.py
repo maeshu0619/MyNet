@@ -549,7 +549,12 @@ def build_heuristic_guidance(structure: Mapping[str, Any], args: Any) -> Dict[st
 
     mode = str(getattr(args, "heuristic_guidance_mode", "proxy_prior")).strip().lower()
     exact = structure.get("ana_den6_ranked_candidate_guidance") if isinstance(structure, Mapping) else None
-    if mode in {"ana_den6_online", "ana_den6_residual"}:
+    single_proposal_online = bool(
+        mode == "ana_den6_online"
+        and isinstance(exact, Mapping)
+        and str(exact.get("source", "")) == "ana_den6_gt_terms_single_proposal_online_v7"
+    )
+    if mode in {"ana_den6_online", "ana_den6_residual"} and not single_proposal_online:
         if not isinstance(exact, Mapping):
             raise RuntimeError(
                 "ana_den6 online/residualでexact candidate guidanceがNetworkへ伝播していない。"
@@ -632,7 +637,8 @@ def build_heuristic_guidance(structure: Mapping[str, Any], args: Any) -> Dict[st
         for name, share in shares.items()
     }
     max_share = max(shares.values()) if shares else 1.0
-    # gateは全操作を候補に残しつつ、den6で有望だった構成比を初期Action priorにする。
+    # gateは全操作を候補に残しつつ、Heuristicで有望な構成比を初期Action priorにする。
+    # hard forwardはActuatorがこのpriorとNetwork出力から一度だけ確定し、候補比較はしない。
     action_gate_prior = {
         name: float(0.50 + 0.50 * share / max(max_share, 1e-9))
         for name, share in shares.items()
@@ -650,7 +656,7 @@ def build_heuristic_guidance(structure: Mapping[str, Any], args: Any) -> Dict[st
             for name, value in where_prior.items()
         }
 
-    return {
+    result = {
         "enabled": True,
         "profile_source": profile.source,
         "dataset": profile.dataset,
@@ -662,5 +668,14 @@ def build_heuristic_guidance(structure: Mapping[str, Any], args: Any) -> Dict[st
         "action_gate_prior": action_gate_prior,
         "where_prior": where_prior,
         "where_prior_mean": where_prior_mean,
-        "formula_basis": "mynet_proxy_approximation_not_den6_editcandidate_ranking",
+        "formula_basis": (
+            "ana_den6_single_proposal_network_residual_online_v7"
+            if single_proposal_online
+            else "mynet_proxy_approximation_not_den6_editcandidate_ranking"
+        ),
     }
+    if single_proposal_online:
+        # 加工候補を含まないGT固定metadataだけを監査用に引き継ぐ。
+        result["exact_candidate_guidance"] = dict(exact)
+        result["proposal_policy"] = "one_where_amount_action_per_step"
+    return result
