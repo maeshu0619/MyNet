@@ -1590,15 +1590,29 @@ class Network(nn.Module):
         guidance_mode = str(
             getattr(self.args, "heuristic_guidance_mode", "proxy_prior")
         ).strip().lower()
+        network_only_guidance_forward = bool(
+            guidance_mode == "ana_den6_online"
+            and not self.training
+            and getattr(self.args, "heuristic_guidance_network_only_inference", True)
+        )
+        # OctreeStructureAnalysis also constructs the guidance object.  Pass
+        # the phase explicitly through args so every nested builder takes the
+        # same cache-free inference path.
+        setattr(
+            self.args,
+            "_heuristic_guidance_network_only_forward",
+            network_only_guidance_forward,
+        )
         if bool(getattr(self.args, "heuristic_guidance_enabled", True)):
             if guidance_mode == "ana_den6_online":
                 if not isinstance(full_octree_context, dict):
                     raise RuntimeError("ana_den6_onlineにはfull-cloud canonical contextが必要である")
-                full_octree_context = attach_ana_den6_online_guidance(
-                    full_octree_context,
-                    self.args,
-                    device=pts_xyz.device,
-                )
+                if not network_only_guidance_forward:
+                    full_octree_context = attach_ana_den6_online_guidance(
+                        full_octree_context,
+                        self.args,
+                        device=pts_xyz.device,
+                    )
             elif guidance_mode in {
                 "ana_den6_residual", "ana_den6_reproduce", "ana_den6_reference_ply"
             }:
@@ -2416,18 +2430,24 @@ class Network(nn.Module):
                 "ana_den6_ranked_candidate_guidance", None
             )
             global_coords = actuator_octree_context.get("global_voxel_coords", None)
-            if not isinstance(exact_payload, dict) or not torch.is_tensor(global_coords):
+            if not torch.is_tensor(global_coords):
                 raise RuntimeError(
-                    "ana_den6 exact candidate payloadまたはglobal_voxel_coordsがActuator直前で欠落した"
+                    "ana_den6 global_voxel_coordsがActuator直前で欠落した"
                 )
-            # OctreeStructureAnalysis内部のproxy guidanceをexact den6 guidanceで上書きする。
             structure["global_voxel_coords"] = global_coords
-            structure["ana_den6_ranked_candidate_guidance"] = exact_payload
-            fixed_feature_payload = actuator_octree_context.get(
-                "ana_den6_fixed_feature_guidance", None
-            )
-            if isinstance(fixed_feature_payload, dict):
-                structure["ana_den6_fixed_feature_guidance"] = fixed_feature_payload
+            if not network_only_guidance_forward:
+                if not isinstance(exact_payload, dict):
+                    raise RuntimeError(
+                        "ana_den6 training guidance payloadがActuator直前で欠落した"
+                    )
+                # Training only: fixed GT features are teacher targets/base
+                # for the single evaluated plan.  They are absent at inference.
+                structure["ana_den6_ranked_candidate_guidance"] = exact_payload
+                fixed_feature_payload = actuator_octree_context.get(
+                    "ana_den6_fixed_feature_guidance", None
+                )
+                if isinstance(fixed_feature_payload, dict):
+                    structure["ana_den6_fixed_feature_guidance"] = fixed_feature_payload
             structure["heuristic_guidance"] = build_heuristic_guidance(structure, self.args)
 
         if (
@@ -2459,6 +2479,7 @@ class Network(nn.Module):
         if (
             is_full_cloud_forward
             and guidance_mode == "ana_den6_online"
+            and not network_only_guidance_forward
             and bool(getattr(self.args, "den6_online_release_cuda_cache_before_actuator", True))
             and pts_xyz.is_cuda
         ):

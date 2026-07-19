@@ -594,6 +594,28 @@ def build_heuristic_guidance(structure: Mapping[str, Any], args: Any) -> Dict[st
         }
 
     mode = str(getattr(args, "heuristic_guidance_mode", "proxy_prior")).strip().lower()
+    network_only_forward = bool(
+        mode == "ana_den6_online"
+        and getattr(args, "_heuristic_guidance_network_only_forward", False)
+    )
+    if network_only_forward:
+        # Inference must not cold-build/read den6 features.  Keep only a mode
+        # marker so the Actuator uses its learned one-plan heads and the
+        # ordinary validity masks.  In particular this object intentionally
+        # contains no Where/Amount/Action prior and no cached plan/pool.
+        return {
+            "enabled": True,
+            "profile_source": "network_checkpoint",
+            "dataset": profile.dataset,
+            "scale_m": int(profile.scale_m),
+            "where_prior": {},
+            "amount_prior": {},
+            "action_gate_prior": {},
+            "fixed_direction_index": {},
+            "fixed_direction_bits": {},
+            "formula_basis": "network_only_where_amount_action_inference_v1",
+            "proposal_policy": "one_network_plan_without_den6_or_cache",
+        }
     exact = structure.get("ana_den6_ranked_candidate_guidance") if isinstance(structure, Mapping) else None
     single_proposal_online = bool(
         mode == "ana_den6_online"

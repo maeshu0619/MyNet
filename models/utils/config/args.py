@@ -2746,6 +2746,12 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--sparsepcgc_native_bit_depth', default=0, type=int, help='m=bit_depth-(AE+SR)を計算するnative bit depth。0は8i/MVUB=10、UVG=9を自動選択')
     parser.add_argument('--heuristic_guidance_enabled', default=True, type=str2bool, help='ana_den6由来HeuristicをWhere/Amount/Actionのpriorとして使う')
     parser.add_argument(
+        '--heuristic_guidance_network_only_inference',
+        default=True,
+        type=str2bool,
+        help='eval/test時はden6・cache・workerを呼ばず、蒸留済みNetwork headだけで1 planを決める',
+    )
+    parser.add_argument(
         '--heuristic_guidance_mode',
         default='ana_den6_online',
         choices=[
@@ -2949,9 +2955,21 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--heuristic_guidance_teacher_distill_weight',
-        default=0.10,
+        default=0.50,
         type=float,
-        help='bootstrap中に確定teacherのWhere/Amount/Action規則をNetwork headへ蒸留する補助損失係数',
+        help='訓練時のGT固定den6判断規則をWhere/Amount/Action headへ蒸留する補助損失係数',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_distill_max_points',
+        default=65536,
+        type=int,
+        help='1 Stepでdense Where規則を蒸留する等間隔sample点数（候補選択ではない）',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_distill_max_direction_sources',
+        default=4096,
+        type=int,
+        help='Add/Adjust方向規則の蒸留に使う有効source上限',
     )
     parser.add_argument(
         '--heuristic_guidance_exact_anchor_steps',
@@ -3941,6 +3959,9 @@ def parse_pugan_args(parser, file_day, file_time):
     if not _cli_option_was_provided("--sparsepcgc_dense_scale_sr_list"):
         args.sparsepcgc_dense_scale_sr_list = str(args.sparsepcgc_scale_sr)
     args.heuristic_guidance_enabled = bool(getattr(args, "heuristic_guidance_enabled", True))
+    args.heuristic_guidance_network_only_inference = bool(
+        getattr(args, "heuristic_guidance_network_only_inference", True)
+    )
     args.heuristic_guidance_mode = str(
         getattr(args, "heuristic_guidance_mode", "ana_den6_online")
     ).strip().lower()
@@ -3978,8 +3999,14 @@ def parse_pugan_args(parser, file_day, file_time):
         0,
     )
     args.heuristic_guidance_teacher_distill_weight = max(
-        float(getattr(args, "heuristic_guidance_teacher_distill_weight", 0.10)),
+        float(getattr(args, "heuristic_guidance_teacher_distill_weight", 0.50)),
         0.0,
+    )
+    args.heuristic_guidance_distill_max_points = max(
+        int(getattr(args, "heuristic_guidance_distill_max_points", 65536)), 1
+    )
+    args.heuristic_guidance_distill_max_direction_sources = max(
+        int(getattr(args, "heuristic_guidance_distill_max_direction_sources", 4096)), 1
     )
     args.heuristic_guidance_exact_anchor_steps = max(
         int(getattr(args, "heuristic_guidance_exact_anchor_steps", 1)),

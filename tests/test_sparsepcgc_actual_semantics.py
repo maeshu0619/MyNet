@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import importlib.util
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -430,6 +431,68 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         self.assertNotIn("candidate_mask", guidance)
         self.assertNotIn("candidate_tensor_map", guidance)
 
+    def test_den6_online_eval_guidance_is_network_only_and_has_no_teacher_data(self):
+        structure = {"occupancy_nll_proxy": torch.zeros((1, 1, 5))}
+        args = SimpleNamespace(
+            heuristic_guidance_mode="ana_den6_online",
+            heuristic_guidance_enabled=True,
+            _heuristic_guidance_network_only_forward=True,
+            dataname="8i",
+            sparsepcgc_scale_m=8,
+        )
+        guidance = build_heuristic_guidance(structure, args)
+        self.assertEqual(
+            guidance["formula_basis"],
+            "network_only_where_amount_action_inference_v1",
+        )
+        self.assertEqual(guidance["proposal_policy"], "one_network_plan_without_den6_or_cache")
+        self.assertEqual(guidance["where_prior"], {})
+        self.assertEqual(guidance["amount_prior"], {})
+        self.assertEqual(guidance["action_gate_prior"], {})
+        self.assertNotIn("exact_candidate_guidance", guidance)
+        self.assertNotIn("candidate_mask", guidance)
+        self.assertNotIn("candidate_tensor_map", guidance)
+
+        actuator = StructureRepairActuator.__new__(StructureRepairActuator)
+        actuator.args = args
+        accepted = actuator._heuristic_guidance_state({"heuristic_guidance": guidance})
+        self.assertIs(accepted, guidance)
+        like = torch.randn((1, 1, 5))
+        self.assertTrue(torch.equal(
+            actuator._heuristic_where_logit_bias(guidance, "Prune", like),
+            torch.zeros_like(like),
+        ))
+
+    def test_network_eval_forward_does_not_attach_den6_guidance(self):
+        network = Network.__new__(Network)
+        torch.nn.Module.__init__(network)
+        network.args = SimpleNamespace(
+            heuristic_guidance_mode="ana_den6_online",
+            heuristic_guidance_enabled=True,
+            heuristic_guidance_network_only_inference=True,
+            full_cloud_activation_checkpoint=True,
+            encoder_0grad=False,
+        )
+        network.cost_attributor = SimpleNamespace()
+        network.policy_module = SimpleNamespace()
+        network.training = False
+        sentinel = ("network-only-early-return",)
+        context = {"global_voxel_coords": torch.zeros((1, 3, 4), dtype=torch.long)}
+        with patch(
+            "models.network.attach_ana_den6_online_guidance",
+            side_effect=AssertionError("eval must not call den6"),
+        ), patch.object(
+            Network, "_maybe_fast_full_cloud_oracle_forward", return_value=sentinel,
+        ):
+            result = network.forward(
+                torch.zeros((1, 3, 4)),
+                None,
+                full_octree_context=context,
+                octree_input_mode="full_cloud",
+            )
+        self.assertIs(result, sentinel)
+        self.assertTrue(network.args._heuristic_guidance_network_only_forward)
+
     def test_den6_online_batch_aggregate_preserves_worker_request_counter(self):
         gt_xyz = torch.zeros((1, 3, 4), dtype=torch.float32)
         fixture = _ActualCodecFixture(gt_xyz)
@@ -823,6 +886,34 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
                 value.backward()
                 self.assertTrue(torch.isfinite(network_ratio.grad).all())
                 self.assertGreater(float(network_ratio.grad.abs().sum()), 0.0)
+
+    def test_amount_logit_bound_keeps_gradient_when_raw_head_is_saturated(self):
+        """bounded forwardを変えず、tanh飽和後もAmount headへ勾配を返す。"""
+        actuator = StructureRepairActuator.__new__(StructureRepairActuator)
+        torch.nn.Module.__init__(actuator)
+        actuator.args = SimpleNamespace(
+            repair_operation_amount_logit_scale=6.0,
+            repair_learn_operation_amounts=True,
+            repair_amount_pool_std_weight=0.5,
+            repair_amount_pool_max_weight=0.25,
+            repair_exploration_fraction=0.0,
+        )
+        head = torch.nn.Conv1d(2, 1, 1)
+        with torch.no_grad():
+            head.weight.fill_(1000.0)
+            head.bias.zero_()
+        features = torch.ones((1, 2, 8), dtype=torch.float32)
+        ratio = actuator._learned_operation_ratio(
+            features,
+            head,
+            0.30,
+            "missing_random_mix_start",
+            "missing_random_mix_end",
+        )
+        ratio.sum().backward()
+        self.assertLessEqual(float(ratio.detach()), 0.30)
+        self.assertIsNotNone(head.weight.grad)
+        self.assertGreater(float(head.weight.grad.abs().sum()), 0.0)
 
     def test_full_cloud_static_node_input_cache_reuses_detached_state(self):
         """Episode cache must reuse only fixed Node/Voxel inputs, never a graph."""
