@@ -12410,7 +12410,7 @@ def train(model, args, loss, writer, plot, notifier=None):
             sequence_name = os.path.basename(os.path.normpath(str(seq_dir)))
 
             """基本情報のセットアップ"""
-            active_dataset = apply_epoch_file_window(dataset, args, global_epoch) # Epochごとにmax_files件の窓を順番に進め、同じ先頭30件の反復を避ける
+            active_dataset = apply_epoch_file_window(dataset, args, episode) # 各系列の訓練用150件内をEpisodeごとにmax_files件ずつ進める
             loader = torch.utils.data.DataLoader(active_dataset, **loader_kwargs) # 現在Epochの窓Datasetから点群ファイルを順に読み出す
             num_steps = len(active_dataset)
             active_files = list(getattr(active_dataset, "files", ()))

@@ -281,18 +281,22 @@ def should_collect_sparsepcgc_hard_debug(args, *, log_this_step, profile_this_st
     return step_idx % interval == 0
 
 
-def apply_epoch_file_window(dataset, args, global_epoch):
+def apply_epoch_file_window(dataset, args, window_index):
     # Dataset生成時に保持した全ファイル一覧を取り出し、なければ現在のfilesを全体として扱う。
     all_files = list(getattr(dataset, "all_files", getattr(dataset, "files", [])))
+    # 推論・評価用フレームを訓練へ混入させず、各系列の先頭150件（既定値）だけを訓練窓の母集団にする。
+    train_limit = int(getattr(args, "train_frames_per_sequence", 150))
+    if train_limit > 0:
+        all_files = all_files[:train_limit]
     # max_filesを「1 epochで読むファイル数」として使う。
     window_size = int(getattr(args, "max_files", 0))
     # window指定が無効、または全件がwindow内に収まるなら全ファイルを使う。
     if window_size <= 0 or len(all_files) <= window_size:
         dataset.files = list(all_files)
         return dataset
-    # global_epochに応じて開始位置を進め、次Epochで次の30件へ移動する。
-    start = (int(global_epoch) * window_size) % len(all_files)
-    # 末尾を超えた分は先頭へ巻き戻して、全データを順番に巡回する。
+    # 同じ系列を次に使うEpisodeでは、訓練領域内を次のwindow_size件へ進める。
+    start = (int(window_index) * window_size) % len(all_files)
+    # 訓練領域の末尾を超えた分だけ、その訓練領域の先頭へ巻き戻す。
     dataset.files = [all_files[(start + offset) % len(all_files)] for offset in range(window_size)]
     # DataLoaderが更新後のfilesだけを読む同じDatasetを返す。
     return dataset

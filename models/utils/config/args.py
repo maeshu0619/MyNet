@@ -13,8 +13,8 @@ pretrained_time = "230148"
 surrogate_date = "20260701"
 surrogate_time = "230148"
 
-model_date = "20260701"
-model_time = "230148"
+model_date = "20260719"
+model_time = "063943"
 
 # method_com = "OctAttention"
 method_com = "SparsePCGC"
@@ -27,9 +27,9 @@ dataname = "8i"
 # dataname = "MVUB"
 # dataname = "UVG"
 
-# dataset_name = "longdress"
+dataset_name = "longdress"
 # dataset_name = "loot"
-dataset_name = "redandblack"
+# dataset_name = "redandblack"
 # dataset_name = "soldier"
 
 # dataset_name = "andrew"
@@ -2515,7 +2515,8 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--lr_scheduler_enabled', default=False, type=str2bool, help='TrueならEpoch単位のStepLRを使う。SparsePCGCではLR崩壊防止のため既定でFalse')
     parser.add_argument('--min_main_lr', default=1e-5, type=float, help='main optimizerの学習率floor')
     parser.add_argument('--min_surrogate_lr', default=1e-6, type=float, help='Surrogate optimizerの学習率floor')
-    parser.add_argument('--max_files', default=30, type=int, help='読み込む最大ファイル数')
+    parser.add_argument('--max_files', default=10, type=int, help='1系列の1Epochで読み込むフレーム数')
+    parser.add_argument('--train_frames_per_sequence', default=150, type=int, help='各系列で訓練に使用する先頭フレーム数。残りは訓練窓から除外する')
     parser.add_argument('--episodes', default=128, type=int, help='学習エピソード数')
     parser.add_argument('--lr', default=1e-3, type=float, help='学習率')
     parser.add_argument('--save_eval', default='loss', type=str, help='評価指標（lossまたはpsnr）')
@@ -2870,9 +2871,9 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--heuristic_guidance_online_policy_weight',
-        default=1.0,
+        default=0.1,
         type=float,
-        help='actual結果からWhere/Amount/Actionへ返すpolicy-gradient損失重み',
+        help='actual結果からWhere/Amount/Actionへ返すpolicy-gradient損失重み。主損失を支配しないよう既定値は0.1',
     )
     parser.add_argument(
         '--heuristic_guidance_online_entropy_weight',
@@ -4024,7 +4025,7 @@ def parse_pugan_args(parser, file_day, file_time):
         float(getattr(args, "heuristic_guidance_online_amount_log_sigma", 0.08)), 0.0
     ), 0.50)
     args.heuristic_guidance_online_policy_weight = max(
-        float(getattr(args, "heuristic_guidance_online_policy_weight", 1.0)), 0.0
+        float(getattr(args, "heuristic_guidance_online_policy_weight", 0.1)), 0.0
     )
     args.heuristic_guidance_online_entropy_weight = max(
         float(getattr(args, "heuristic_guidance_online_entropy_weight", 0.001)), 0.0

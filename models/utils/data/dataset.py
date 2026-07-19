@@ -205,7 +205,14 @@ class PlyDirDataset(torch.utils.data.Dataset):
             if len(self.files) == 0:
                 raise ValueError(f"No .ply files found in directory: {path}")
             self.all_files = list(self.files) # train時に先頭max_files固定ではなく全ファイルを順番に巡回するため元一覧を保持する
-            self.files = self.files[:max_files]
+            if args.trainORtest == "train":
+                self.files = self.files[:max_files]
+            else:
+                # 訓練に使う先頭領域と重複しない後半を推論・評価用にする。
+                train_limit = int(getattr(args, "train_frames_per_sequence", 150))
+                if 0 < train_limit < len(self.files):
+                    self.files = self.files[train_limit:]
+                self.files = self.files[:max_files]
 
         else:
             raise ValueError(f"Invalid path: {path}")

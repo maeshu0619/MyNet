@@ -615,7 +615,7 @@ def run_surrogate_pretrain(
     early_stop_hits = 0
     early_stop_reason = None
     eta_warned = False
-    pretrain_global_epoch = 0 # 本学習と同じmax_files窓を使うための事前学習epoch番号
+    pretrain_window_index = 0 # 本学習と同じく、全系列を一巡するごとにmax_files窓を進める
     log_interval = max(int(getattr(args, "surrogate_pretrain_log_interval", 10)), 1)
     print_interval = max(int(getattr(args, "surrogate_pretrain_print_interval", log_interval)), 1)
     pretrain_start_time = time.perf_counter()
@@ -651,7 +651,7 @@ def run_surrogate_pretrain(
         while completed_steps < steps and early_stop_reason is None:
             progressed = False
             for _seq_dir, dataset in seq_datasets:
-                active_dataset = apply_epoch_file_window(dataset, args, pretrain_global_epoch) # 本学習と同じmax_files窓で事前学習データを選ぶ
+                active_dataset = apply_epoch_file_window(dataset, args, pretrain_window_index) # 各系列の訓練領域から同じ位置のmax_files窓を選ぶ
                 loader = torch.utils.data.DataLoader(active_dataset, **loader_kwargs) # 窓選択後のDatasetをDataLoaderへ渡す
                 data_wait_t0 = time.perf_counter()
                 for local_step, pts in enumerate(loader):
@@ -1056,7 +1056,7 @@ def run_surrogate_pretrain(
                     data_wait_t0 = time.perf_counter()
                 if completed_steps >= steps or early_stop_reason is not None:
                     break
-                pretrain_global_epoch += 1 # 次のseq epochでは本学習と同じようにmax_files窓を進める
+            pretrain_window_index += 1 # 全系列を一巡した次の事前学習周回で窓を進める
             if not progressed:
                 writer.write("SurrogatePretrain stopped early: no training samples were available.")
                 break
