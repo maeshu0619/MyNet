@@ -1,9 +1,8 @@
-"""den6のGT順位計算を使い、完成planを毎Stepちょうど1つ作るonline入口。
+"""GT固定特徴だけを渡し、Networkが毎Stepちょうど1 planを作るonline入口。
 
-軽量cacheはGT識別情報と幾何統計だけを保持する。別途読むexact teacherは、
-1つのplanを構成するVoxel単位の静的edit unitsであり、複数の完成plan、Network
-出力、加工後点群、加工後lossは保持しない。Where/Amount/Actionはden6順位と
-Network residualから一度だけ決定し、Actual encodeもそのplanに1回だけ行う。
+軽量cacheはGT識別情報と幾何統計だけを保持する。訓練・推論のどちらでもHeuristic
+candidate pool、過去plan、加工後点群、加工後loss、保存済み行動教師を読まない。
+Actual encodeもNetworkが生成した1 planに対して1回だけ行う。
 
 GTの実圧縮項はLoss.actual_gt_cache、GT点群はdataset._PLY_CACHEがそれぞれ既存の
 責務として保持する。このmoduleへ重複保存せず、加工後点群・加工後loss・Network
@@ -27,8 +26,10 @@ import torch
 
 SCHEMA_VERSION = "ana_den6_gt_terms_single_proposal_cache_v7"
 SOURCE_NAME = "ana_den6_gt_terms_single_proposal_online_v7"
+FIXED_FEATURE_SCHEMA_VERSION = "ana_den6_gt_fixed_symbol_features_v2"
 _FILE_HASH_CACHE: dict[tuple[str, int, int], str] = {}
 _GLOBAL_PAYLOAD_CACHE: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+_FIXED_FEATURE_CACHE: "OrderedDict[str, dict[str, np.ndarray]]" = OrderedDict()
 _CACHE_STATS = {
     "build": 0, "memory_hit": 0, "disk_hit": 0,
     "exact_teacher_hit": 0, "exact_teacher_missing": 0,
@@ -119,6 +120,167 @@ def _cache_file(args: Any, identity: Mapping[str, Any]) -> Path:
         json.dumps(dict(identity), sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()[:16]
     return root / f"single_proposal_{identity['dataset']}_{stem}_{identity['setting_id']}_{signature}.json"
+
+
+def _fixed_feature_file(args: Any, identity: Mapping[str, Any]) -> Path:
+    root = Path(str(getattr(
+        args,
+        "heuristic_guidance_online_cache_dir",
+        "/data/maejima/log/mynet_den6_online_cache",
+    ))).expanduser().resolve()
+    stem = Path(str(identity["input_file"])).stem.replace(" ", "_")
+    signature = hashlib.sha256(
+        json.dumps(
+            {**dict(identity), "fixed_feature_schema": FIXED_FEATURE_SCHEMA_VERSION},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()[:16]
+    return root / (
+        f"fixed_features_{identity['dataset']}_{stem}_{identity['setting_id']}_{signature}.npz"
+    )
+
+
+def _build_fixed_features(args: Any, identity: Mapping[str, Any], output_path: Path) -> None:
+    explicit_python = str(
+        getattr(args, "heuristic_guidance_online_python", "")
+        or getattr(args, "sparsepcgc_python", "")
+    ).strip()
+    if explicit_python:
+        python_executable = Path(explicit_python).expanduser().resolve()
+    else:
+        env_name = str(
+            getattr(args, "heuristic_guidance_online_conda_env", "sparsepcgc")
+        ).strip() or "sparsepcgc"
+        python_executable = (
+            Path(sys.executable).resolve().parents[1].parent / env_name / "bin" / "python"
+        )
+    tool = Path(__file__).resolve().parents[3] / "tools" / "ana_den6_online_worker.py"
+    sparsepcgc_root = Path(str(getattr(
+        args, "sparsepcgc_root", Path(__file__).resolve().parents[4] / "compress/octree/SparsePCGC"
+    ))).expanduser().resolve()
+    build_root = output_path.parent / "fixed_feature_build" / output_path.stem
+    command = [
+        str(python_executable), str(tool),
+        "--sparsepcgc-root", str(sparsepcgc_root),
+        "--data", str(identity["dataset"]),
+        "--input-file", str(identity["input_file"]),
+        "--scale-m", str(int(identity["scale_m"])),
+        "--scale-ae", str(int(identity["scale_ae"])),
+        "--scale-sr", str(int(identity["scale_sr"])),
+        "--output-json", str(output_path.with_suffix(".unused.json")),
+        "--output-root", str(build_root),
+        "--fixed-features-output", str(output_path),
+    ]
+    # SparsePCGC/torchacのextension初期化ログをtrain.pyのStepログへ混ぜない。
+    # 失敗時だけ末尾を例外へ含め、正常時は固定特徴の生成待ちであることを
+    # 呼び出し側のauditから判別できるようにする。
+    completed = subprocess.run(
+        command,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if completed.returncode != 0 or not output_path.is_file():
+        diagnostic = "\n".join(
+            (completed.stderr or completed.stdout or "").splitlines()[-20:]
+        )
+        raise RuntimeError(
+            "SparsePCGC GT固定symbol feature生成に失敗した: "
+            f"returncode={completed.returncode}, output={output_path}, "
+            f"diagnostic={diagnostic}"
+        )
+
+
+def _load_fixed_features(
+    path: Path,
+    identity: Mapping[str, Any],
+    coords: torch.Tensor,
+    device: torch.device,
+) -> dict[str, Any]:
+    memory_key = str(path.resolve())
+    cached = _FIXED_FEATURE_CACHE.get(memory_key)
+    if cached is None:
+        with np.load(path, allow_pickle=False) as payload:
+            arrays = {name: np.asarray(payload[name]).copy() for name in payload.files}
+        metadata = json.loads(str(arrays.pop("metadata_json").reshape(()).item()))
+        if str(metadata.get("schema_version", "")) != FIXED_FEATURE_SCHEMA_VERSION:
+            raise RuntimeError("GT固定symbol feature cache schemaが不正である")
+        if str(metadata.get("source", "")) != "sparsepcgc_gt_symbol_features_no_plan_no_pool_cache":
+            raise RuntimeError("GT固定symbol feature cache sourceが不正である")
+        if str(metadata.get("input_sha256", "")) != str(identity["input_sha256"]):
+            raise RuntimeError("GT固定symbol feature cacheの入力SHA256が一致しない")
+        if (
+            bool(metadata.get("contains_selected_action", True))
+            or bool(metadata.get("contains_candidate_pool", True))
+            or bool(metadata.get("contains_actual_edited_result", True))
+        ):
+            raise RuntimeError(
+                "GT固定symbol feature cacheへ行動教師・Pool・加工後actualが混入した"
+            )
+        arrays["metadata"] = metadata
+        _FIXED_FEATURE_CACHE[memory_key] = arrays
+        _FIXED_FEATURE_CACHE.move_to_end(memory_key)
+        while len(_FIXED_FEATURE_CACHE) > 2:
+            _FIXED_FEATURE_CACHE.popitem(last=False)
+        cached = arrays
+
+    current = np.rint(
+        coords[0].transpose(0, 1).detach().cpu().numpy()
+    ).astype(np.int64, copy=False)
+    stored = np.asarray(cached["coords"], dtype=np.int64)
+    reorder = cached.get("_network_reorder")
+    if current.shape != stored.shape:
+        raise RuntimeError(
+            "GT固定symbol featureとNetwork canonical voxelのshapeが一致しない: "
+            f"fixed={stored.shape}, network={current.shape}"
+        )
+    if reorder is None:
+        if np.array_equal(current, stored):
+            reorder = np.arange(stored.shape[0], dtype=np.int64)
+        else:
+            # SparsePCGCとNetworkは同じGT集合を異なるcanonical順で保持し得る。
+            # 座標を完全照合してから feature indexだけをNetwork順へ写す。
+            stored_order = np.lexsort((stored[:, 2], stored[:, 1], stored[:, 0]))
+            current_order = np.lexsort((current[:, 2], current[:, 1], current[:, 0]))
+            if not np.array_equal(stored[stored_order], current[current_order]):
+                raise RuntimeError(
+                    "GT固定symbol featureとNetwork canonical voxelの座標集合が一致しない"
+                )
+            reorder = np.empty((stored.shape[0],), dtype=np.int64)
+            reorder[current_order] = stored_order
+        cached["_network_reorder"] = reorder
+    elif not np.array_equal(stored[np.asarray(reorder, dtype=np.int64)], current):
+        raise RuntimeError("GT固定symbol featureのcached座標対応が現在入力と一致しない")
+    result = {
+        "source": "sparsepcgc_gt_symbol_features_no_plan_no_pool_cache",
+        "metadata": dict(cached["metadata"]),
+        "score": {},
+        "valid": {},
+        "direction_index": {},
+    }
+    for operation, prefix in (("Add", "add"), ("Prune", "prune"), ("Adjust", "adjust")):
+        result["score"][operation] = torch.from_numpy(
+            cached[f"{prefix}_score"][reorder]
+        ).to(
+            device=device, dtype=torch.float32
+        ).view(1, 1, -1)
+        result["valid"][operation] = torch.from_numpy(
+            cached[f"{prefix}_valid"][reorder]
+        ).to(
+            device=device, dtype=torch.bool
+        ).view(1, 1, -1)
+    for operation, prefix in (("Add", "add"), ("Adjust", "adjust")):
+        result["direction_index"][operation] = torch.from_numpy(
+            cached[f"{prefix}_direction"][reorder].astype(np.int64, copy=False)
+        ).to(device=device, dtype=torch.long).view(1, -1)
+    result["direction_bits"] = {}
+    for operation, prefix in (("Add", "add"), ("Adjust", "adjust")):
+        result["direction_bits"][operation] = torch.from_numpy(
+            cached[f"{prefix}_direction_bits"][reorder].astype(np.int64, copy=False)
+        ).to(device=device, dtype=torch.long).view(1, -1)
+    return result
 
 
 def _canonical_geometry_terms(coords: torch.Tensor) -> dict[str, Any]:
@@ -223,6 +385,11 @@ def _load_or_build_payload(context: Mapping[str, Any], args: Any) -> dict[str, A
     payload["cache_signature"] = hashlib.sha256(
         json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+    if bool(getattr(args, "heuristic_guidance_fixed_symbol_features", False)):
+        fixed_path = _fixed_feature_file(args, identity)
+        if not fixed_path.is_file():
+            _build_fixed_features(args, identity, fixed_path)
+        payload["gt_fixed_feature_path"] = str(fixed_path)
     _GLOBAL_PAYLOAD_CACHE[memory_key] = dict(payload)
     _GLOBAL_PAYLOAD_CACHE.move_to_end(memory_key)
     max_entries = max(int(getattr(args, "heuristic_guidance_online_memory_entries", 4)), 1)
@@ -477,22 +644,29 @@ def attach_ana_den6_online_guidance(
         return dict(context)
     if not isinstance(context, Mapping):
         raise RuntimeError("ana_den6 onlineにはfull-cloud canonical contextが必要である")
-    metadata = _load_or_build_payload(context, args)
-    payload = _load_exact_single_plan_teacher(args, metadata)
-    require_exact = bool(
-        getattr(args, "heuristic_guidance_require_exact_single_plan_teacher", True)
-    )
-    if payload is None:
-        if require_exact:
-            raise RuntimeError(
-                "ana_den6 onlineのexact single-plan teacher cacheが無い。"
-                "汎用proxyへ黙って置換すると旧den6のWhere精度を失うため学習を停止した"
-            )
-        payload = metadata
+    # 保存済み行動の有無で訓練経路が変わると、同じStepでもframeごとにteacher有無が
+    # 混在する。033500ログで起きた120/200 Step崩壊の直接原因なので、online経路は
+    # 常にGT固定metadataだけを渡す。旧exact loaderは過去cacheの解析互換用に残すが、
+    # 訓練・推論からは呼ばない。
+    payload = _load_or_build_payload(context, args)
+    payload["teacher_bootstrap_active"] = False
+    payload["teacher_bootstrap_steps"] = 0
     out = dict(context)
-    # key名は互換維持。中身は1つの完成planを作るGT由来edit-unit teacherであり、
-    # 複数完成planや加工後結果ではない。
+    # key名は既存Networkとの互換性を保つが、中身はGT固定項だけである。
     out["ana_den6_ranked_candidate_guidance"] = payload
+    fixed_path = str(payload.get("gt_fixed_feature_path", "")).strip()
+    if fixed_path:
+        coords = out.get("global_voxel_coords")
+        if not torch.is_tensor(coords):
+            raise RuntimeError("GT固定symbol featureにはglobal_voxel_coordsが必要である")
+        identity = _identity(
+            args,
+            Path(str(payload["input_file"])),
+            str(payload["input_sha256"]),
+        )
+        out["ana_den6_fixed_feature_guidance"] = _load_fixed_features(
+            Path(fixed_path), identity, coords, device
+        )
     out["ana_den6_online_cache_path"] = str(payload.get("cache_path", ""))
     out["ana_den6_online_cache_used"] = True
     if torch.is_tensor(out.get("global_voxel_coords")):

@@ -38,6 +38,14 @@ class StructureRepairActuator(nn.Module):
             torch.tensor(neighbor_offsets, dtype=torch.float32),
             persistent=False,
         )
+        self._den6_fallback_direction_indices = tuple(
+            neighbor_offsets.index(offset)
+            for offset in (
+                (1, 0, 0), (-1, 0, 0),
+                (0, 1, 0), (0, -1, 0),
+                (0, 0, 1), (0, 0, -1),
+            )
+        )
 
         self.move_voxel_head = nn.Sequential(
             nn.Conv1d(in_channels, hidden_dim, 1),
@@ -120,9 +128,12 @@ class StructureRepairActuator(nn.Module):
             nn.init.constant_(self.algorithmic_amount_selector_head[-1].bias[init_selector_class], 1.0)
         nn.init.zeros_(self.algorithmic_amount_residual_head.weight)
         nn.init.zeros_(self.algorithmic_amount_residual_head.bias)
-        nn.init.normal_(self.drop_amount_head.weight, mean=0.0, std=1e-3)
-        nn.init.normal_(self.add_amount_head.weight, mean=0.0, std=1e-3)
-        nn.init.normal_(self.move_amount_head.weight, mean=0.0, std=1e-3)
+        # onlineのAmountはden6 profileに対するresidualである。初期weightの乱数が
+        # profileの0.10/0.10/0.05%をStep 1から2倍以上へずらさないよう0初期化し、
+        # 以後はActual/Surrogate勾配で入力依存residualを学習する。
+        nn.init.zeros_(self.drop_amount_head.weight)
+        nn.init.zeros_(self.add_amount_head.weight)
+        nn.init.zeros_(self.move_amount_head.weight)
         target_repair_ratio = float(
             getattr(self.args, "target_repair_ratio", getattr(self.args, "target_disp_ratio", 0.20))
         )
@@ -1761,7 +1772,7 @@ class StructureRepairActuator(nn.Module):
         return out
 
     @staticmethod
-    def _first_unique_coord_mask(voxel_coords):
+    def _first_unique_coord_mask(voxel_coords, eligible_mask=None):
         B, _, N = voxel_coords.shape
         unique_mask = torch.zeros((B, N), device=voxel_coords.device, dtype=torch.bool)
         for b in range(B):
@@ -1772,14 +1783,33 @@ class StructureRepairActuator(nn.Module):
             _, inverse = torch.unique(coords, dim=0, sorted=True, return_inverse=True)
 
             idx = torch.arange(inverse.numel(), device=inverse.device, dtype=inverse.dtype)
-            sort_key = inverse * inverse.numel() + idx
+            if torch.is_tensor(eligible_mask):
+                eligible_b = eligible_mask[b].reshape(-1).to(
+                    device=inverse.device, dtype=torch.bool
+                )
+                if eligible_b.numel() != inverse.numel():
+                    raise ValueError("eligible_mask must match flattened voxel coordinates")
+                # 同じtargetでは有効pairを先に並べる。Prune済みsourceの無効pairが
+                # targetを予約し、有効な別sourceまで消す旧挙動を防ぐ。
+                invalid_rank = (~eligible_b).to(dtype=inverse.dtype)
+                sort_key = (
+                    inverse * (2 * inverse.numel())
+                    + invalid_rank * inverse.numel()
+                    + idx
+                )
+            else:
+                eligible_b = None
+                sort_key = inverse * inverse.numel() + idx
             order = torch.argsort(sort_key)
 
             sorted_inverse = inverse.index_select(0, order)
             first = torch.ones_like(sorted_inverse, dtype=torch.bool)
             if sorted_inverse.numel() > 1:
                 first[1:] = sorted_inverse[1:] != sorted_inverse[:-1]
-            unique_mask[b, order[first]] = True
+            selected = order[first]
+            if eligible_b is not None:
+                selected = selected[eligible_b.index_select(0, selected)]
+            unique_mask[b, selected] = True
 
         return unique_mask
 
@@ -3002,6 +3032,35 @@ class StructureRepairActuator(nn.Module):
         if not isinstance(guidance, dict):
             return dense
 
+        bitset_all = guidance.get("fixed_direction_bits", {})
+        bitset = bitset_all.get(operation) if isinstance(bitset_all, dict) else None
+        if torch.is_tensor(bitset):
+            bits = bitset.detach().to(device=like_tensor.device, dtype=torch.long)
+            if bits.ndim == 1:
+                bits = bits.view(1, -1)
+            if bits.shape[0] == 1 and B > 1:
+                bits = bits.expand(B, -1)
+            if bits.shape == (B, N):
+                shifts = torch.arange(K, device=bits.device, dtype=torch.long).view(1, K, 1)
+                return ((bits.unsqueeze(1) >> shifts) & 1).to(dtype=like_tensor.dtype)
+
+        fixed_all = guidance.get("fixed_direction_index", {})
+        fixed = fixed_all.get(operation) if isinstance(fixed_all, dict) else None
+        if torch.is_tensor(fixed):
+            index = fixed.detach().to(device=like_tensor.device, dtype=torch.long)
+            if index.ndim == 1:
+                index = index.view(1, -1)
+            if index.shape[0] == 1 and B > 1:
+                index = index.expand(B, -1)
+            if index.shape == (B, N):
+                valid = index.ge(0) & index.lt(K)
+                dense.scatter_(
+                    1,
+                    index.clamp(0, K - 1).unsqueeze(1),
+                    valid.to(dtype=like_tensor.dtype).unsqueeze(1),
+                )
+                return dense
+
         sparse_all = guidance.get("target_direction_sparse", {})
         sparse = sparse_all.get(operation) if isinstance(sparse_all, dict) else None
         if isinstance(sparse, dict):
@@ -3059,6 +3118,20 @@ class StructureRepairActuator(nn.Module):
             out = torch.cat([out, out.new_zeros((B, K, N - out.shape[2]))], dim=2)
         return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0).clamp(0.0, 1.0)
 
+    def _den6_first_empty_direction_bias(self, valid_target_mask, like_tensor):
+        """den5 fallbackと同じ +x,-x,+y,-y,+z,-z の最初の有効方向。"""
+        B, _, N = like_tensor.shape
+        K = int(self.neighbor_offsets.shape[0])
+        if not torch.is_tensor(valid_target_mask) or valid_target_mask.shape != (B, N, K):
+            return like_tensor.new_zeros((B, K, N))
+        chosen = torch.zeros((B, N), device=like_tensor.device, dtype=torch.bool)
+        bias = like_tensor.new_zeros((B, K, N))
+        for direction_index in self._den6_fallback_direction_indices:
+            selected = valid_target_mask[:, :, direction_index].to(torch.bool) & (~chosen)
+            bias[:, direction_index, :] = selected.to(dtype=like_tensor.dtype)
+            chosen |= selected
+        return bias.detach()
+
     def _apply_heuristic_action_guidance(
         self, guidance, drop_gate, add_gate, move_gate, *, prune_enabled, add_enabled, move_enabled
     ):
@@ -3087,7 +3160,11 @@ class StructureRepairActuator(nn.Module):
                 continue
             prior_value = min(max(float(priors.get(operation, 0.5)), 0.0), 1.0) if isinstance(priors, dict) else 0.5
             prior = gate.new_full(gate.shape, prior_value)
-            outputs.append(((1.0 - strength) * gate + strength * prior).clamp(0.0, 1.0))
+            guided_forward = ((1.0 - strength) * gate + strength * prior).clamp(0.0, 1.0)
+            # forwardはden6規則から開始するが、anchor強度1.0の初期Stepでも
+            # Action headの勾配を消さない。Networkは同じ判断規則を模倣し、
+            # anchor減衰後は自身のgateで同じ複合planを再現する。
+            outputs.append(guided_forward.detach() + gate - gate.detach())
         return tuple(outputs)
 
     def _apply_heuristic_amount_guidance(self, ratio, guidance, operation, max_ratio):
@@ -3097,6 +3174,31 @@ class StructureRepairActuator(nn.Module):
         if not isinstance(priors, dict) or operation not in priors:
             return ratio
         prior_value = min(max(float(priors.get(operation, 0.0)), 0.0), float(max_ratio))
+        mode = str(getattr(self.args, "heuristic_guidance_mode", "proxy_prior")).strip().lower()
+        if mode == "ana_den6_online" and prior_value > 0.0:
+            # den6のActionは3操作を含む複合planであり、Amount=0は有効なActionではない。
+            # floor固定ではなく、Network値をpriorに対する対数residualへ写像する。
+            # 初期値はprior、学習可能範囲は概ねprior/4～prior*4なので、Networkは
+            # 操作量を増減できる一方、sigmoid飽和による厳密な0操作へは崩壊しない。
+            fraction = (ratio / float(max_ratio)).clamp(0.0, 1.0)
+            current_step = max(int(getattr(self.args, "_global_train_step", 0)), 0)
+            total_steps = max(int(getattr(self.args, "_total_train_steps_estimate", 1)), 1)
+            progress = min(float(current_step) / float(total_steps), 1.0)
+            # 1更新でprior/4～prior*4へ飽和すると微小操作設計が壊れる。
+            # 初期は±約5%だけを許し、訓練全体で連続的に4倍幅まで開く。
+            expansion = 1.05 + (4.0 - 1.05) * progress
+            multiplier = torch.exp(math.log(expansion) * (2.0 * fraction - 1.0))
+            learned_value = (ratio.new_full(ratio.shape, prior_value) * multiplier).clamp(
+                max=float(max_ratio)
+            )
+            if current_step == 0:
+                # 最初の1 planだけはden6 profileの0.10/0.10/0.05%へ厳密に
+                # 合わせる。forward固定のみで、backwardはlearned_valueへ流すSTE。
+                # 旧cache行動や教師Amountは参照せず、Step 1以降は直ちにNetwork値。
+                prior = ratio.new_full(ratio.shape, prior_value)
+                return prior.detach() + learned_value - learned_value.detach()
+            return learned_value
+
         residual_fraction = max(float(getattr(self.args, "heuristic_guidance_amount_residual_fraction", 0.50)), 0.0)
         min_residual = max(float(getattr(self.args, "heuristic_guidance_amount_min_residual", 0.0001)), 0.0)
         residual_limit = min(max(prior_value * residual_fraction, min_residual), float(max_ratio))
@@ -3106,13 +3208,8 @@ class StructureRepairActuator(nn.Module):
         anchor_steps = max(int(getattr(self.args, "heuristic_guidance_anchor_steps", 0)), 0)
         anchor_phase = (
             max(1.0 - float(current_step) / float(anchor_steps), 0.0)
-            if anchor_steps > 0
-            else 0.0
+            if anchor_steps > 0 else 0.0
         )
-        # warmup中だけana_den6近傍へ制限する。従来はanchor終了後も
-        # [prior-residual, prior+residual]へ永久にclampしていたため、Networkが
-        # Amountを学習しても実操作量が変化せず、Actual改善が0へ停滞していた。
-        # 候補数は増やさず、同じ1proposalの許容範囲だけを連続的に広げる。
         lower = anchor_lower * anchor_phase
         upper = anchor_upper * anchor_phase + float(max_ratio) * (1.0 - anchor_phase)
         network_forward = ratio.detach().clamp(lower, upper)
@@ -3121,7 +3218,6 @@ class StructureRepairActuator(nn.Module):
             + network_forward * (1.0 - anchor_phase)
         )
         grad_scale = max(float(getattr(self.args, "heuristic_guidance_amount_grad_scale", 1.0)), 0.0)
-        # forwardだけをHeuristic中心へ制限し、backwardはAmount headへ残すSTEである。
         return guided_forward + grad_scale * (ratio - ratio.detach())
 
     def _heuristic_where_logit_bias(self, guidance, operation, like_tensor):
@@ -3129,9 +3225,17 @@ class StructureRepairActuator(nn.Module):
         weight = max(float(getattr(self.args, "heuristic_guidance_where_weight", 1.0)), 0.0)
         mode = str(getattr(self.args, "heuristic_guidance_mode", "proxy_prior")).strip().lower()
         if mode in {"ana_den6_online", "ana_den6_residual"}:
-            final_weight = max(float(getattr(self.args, "heuristic_guidance_final_where_weight", 0.25)), 0.0)
-            anchor_phase = self._heuristic_anchor_phase()
-            weight = final_weight + (weight - final_weight) * anchor_phase
+            if mode == "ana_den6_online":
+                # GT固定Octree特徴はteacher行動ではなくNetwork入力の一部である。
+                # Step 200でこの特徴だけを1/4へ落とすと、学習対象そのものが不連続に
+                # 変わるため、onlineでは全Stepで同じ尺度を保つ。
+                weight = max(float(
+                    getattr(self.args, "heuristic_guidance_where_weight", 1.0)
+                ), 0.0)
+            else:
+                final_weight = max(float(getattr(self.args, "heuristic_guidance_final_where_weight", 0.25)), 0.0)
+                anchor_phase = self._heuristic_anchor_phase()
+                weight = final_weight + (weight - final_weight) * anchor_phase
             mask = self._fit_heuristic_candidate_mask(guidance, operation, like_tensor)
             outside_penalty = max(float(
                 getattr(self.args, "heuristic_guidance_outside_pool_logit_penalty", 20.0)
@@ -3613,6 +3717,14 @@ class StructureRepairActuator(nn.Module):
             selected_counts["Add"] + selected_counts["Prune"] + 2 * selected_counts["Adjust"]
         ) / max(float(point_count), 1.0)
         debug = {
+            "plan_count": 1,
+            "pool_reference_count": 1,
+            "candidate_actual_encode_count": 0,
+            "proposal_source": "network_residual_behavior_cloning_teacher",
+            "teacher_bootstrap_active": bool(exact.get("teacher_bootstrap_active", False)),
+            "selected_action_index": -1,
+            "selected_action_mask": [1, 1, 1],
+            "selected_action_count": 3,
             "selected_counts": selected_counts,
             "operation_order": ">".join(operation_order),
             "variant_index": 0,
@@ -4157,15 +4269,25 @@ class StructureRepairActuator(nn.Module):
         neighbor_offsets_long = self.neighbor_offsets.to(device=pts_xyz.device, dtype=torch.long)
 
         empty_target_mask = self._empty_neighbor_target_mask(voxel_coords, voxel_cache=voxel_cache)
+        online_den6_single_proposal = (
+            str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower()
+            == "ana_den6_online"
+        )
 
         B, _, N = pts_xyz.shape
 
         child_slot_mask = self._child_slot_target_mask(voxel_coords, octree_context)
-        if child_slot_mask is not None:
+        if child_slot_mask is not None and not online_den6_single_proposal:
             empty_target_mask = empty_target_mask & child_slot_mask
             actuator_target_mode = "octree_child_slot_masked"
         else:
-            actuator_target_mode = "neighbor_empty_voxel"
+            # ana_den6のAdd/Adjust valid条件は26近傍のempty voxelである。
+            # Network側だけchild-slot maskを追加すると、本物のSparsePCGC固定
+            # symbol pairが全消失するため、online単一planは同じ条件を使う。
+            actuator_target_mode = (
+                "den6_neighbor_empty_voxel"
+                if online_den6_single_proposal else "neighbor_empty_voxel"
+            )
 
         parent_occupancy_codes, source_child_slots = self._point_parent_codes_and_child_slots(voxel_coords)
         occupancy_code_popularity = self._occupancy_code_popularity(
@@ -4372,6 +4494,16 @@ class StructureRepairActuator(nn.Module):
             add_enabled=add_enabled,
             move_enabled=disp_enabled,
         )
+        # den6の「1候補」はAdd/Prune/Adjustのいずれか1操作ではなく、3操作を
+        # まとめた1つの複合planである。ここではPoolを参照せず、入力特徴から
+        # 計算したden6判断規則を初期prior、Networkを学習可能なresidualとする。
+        network_single_proposal = bool(
+            str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower()
+            == "ana_den6_online"
+            and isinstance(heuristic_guidance, dict)
+            and str(heuristic_guidance.get("formula_basis", ""))
+            == "ana_den6_single_proposal_network_residual_online_v7"
+        )
         drop_operation_gate, add_operation_gate, move_operation_gate = self._apply_heuristic_action_guidance(
             heuristic_guidance,
             drop_operation_gate,
@@ -4382,9 +4514,26 @@ class StructureRepairActuator(nn.Module):
             move_enabled=disp_enabled,
         )
         operation_gate_prob = torch.cat([drop_operation_gate, add_operation_gate, move_operation_gate], dim=1)
-        operation_gate_hard = (
-            operation_gate_prob >= min(max(float(getattr(self.args, "repair_operation_gate_hard_threshold", 0.5)), 0.0), 1.0)
-        ).to(dtype=operation_gate_prob.dtype)
+        if network_single_proposal:
+            # den6の1候補は「3操作から1つを選ぶ」のではなく、Add/Prune/Adjustを
+            # 同時に含む1つの複合planである。Action headは各操作の確率・優先度を
+            # 学習するが、hard forwardで操作自体を消してno-opへ逃げることは許さない。
+            enabled_operation_mask = operation_gate_prob.new_tensor([
+                float(prune_enabled), float(add_enabled), float(disp_enabled)
+            ]).view(1, 3, 1).expand_as(operation_gate_prob)
+            operation_gate_hard = enabled_operation_mask
+            operation_gate_st = (
+                operation_gate_hard.detach()
+                + operation_gate_prob
+                - operation_gate_prob.detach()
+            )
+            drop_operation_gate = operation_gate_st[:, 0:1]
+            add_operation_gate = operation_gate_st[:, 1:2]
+            move_operation_gate = operation_gate_st[:, 2:3]
+        else:
+            operation_gate_hard = (
+                operation_gate_prob >= min(max(float(getattr(self.args, "repair_operation_gate_hard_threshold", 0.5)), 0.0), 1.0)
+            ).to(dtype=operation_gate_prob.dtype)
         if actual_oracle_enabled and actual_oracle_apply_teacher_actions:
             if prune_after_prior_mode != "network":
                 if actual_oracle_has_drop and prune_enabled:
@@ -4435,6 +4584,9 @@ class StructureRepairActuator(nn.Module):
                 0.0,
             )
         phase0_network_prune_mode = self._network_phase0_prune_mode(codec_prune_prior_phase)
+        # single-actionではPruneだけがAction gateを迂回すると複数操作になる。
+        if network_single_proposal:
+            phase0_network_prune_mode = False
         # ============================================================
         # Hybrid Prune Prior
         # ============================================================
@@ -5620,6 +5772,16 @@ class StructureRepairActuator(nn.Module):
 
             drop_prob = torch.sigmoid(self._safe_logit(drop_prob) + prune_ratio_bias)
 
+        if network_single_proposal:
+            # den6固定Where式をbase logit、drop_headをNetwork residualとする。
+            # repair/delete等の旧汎用priorをforward順位へ混ぜない。
+            den6_drop_bias = self._heuristic_where_logit_bias(
+                heuristic_guidance, "Prune", learned_drop_logit
+            )
+            drop_prob = torch.sigmoid(den6_drop_bias + learned_drop_logit)
+            drop_prob = drop_prob * drop_operation_gate
+            drop_prob_direct = drop_prob
+
         drop_prob_direct = drop_prob
         drop_random_mix = min(
             max(self._annealed_value("repair_drop_random_mix_start", "repair_drop_random_mix_end"), 0.0),
@@ -6070,6 +6232,10 @@ class StructureRepairActuator(nn.Module):
                 ),
                 allow_single_candidate=bool(direct_network_prune_mode),
             )
+        if network_single_proposal:
+            hard_drop_mask = hard_drop_mask & operation_gate_hard[:, 0:1].to(
+                device=hard_drop_mask.device, dtype=torch.bool
+            )
         hard_drop_trace_debug = dict(getattr(self, "_last_hard_drop_count_trace", {}) or {})
         hard_drop = hard_drop_mask.to(dtype=pts_xyz.dtype)
         # Phase3: Pruneは点削除ではなく、対象点が属するoccupied voxelの削除候補として記録する。
@@ -6279,6 +6445,13 @@ class StructureRepairActuator(nn.Module):
                 self._safe_logit(move_score.clamp(1e-6, 1.0 - 1e-6))
                 + self._heuristic_where_logit_bias(heuristic_guidance, "Adjust", move_score)
             )
+        if network_single_proposal:
+            # subtree_move_source_headは0-weight初期化済みのNetwork residual。
+            den6_move_bias = self._heuristic_where_logit_bias(
+                heuristic_guidance, "Adjust", subtree_move_source_logit
+            )
+            move_score = torch.sigmoid(den6_move_bias + subtree_move_source_logit)
+            move_score = move_score * move_operation_gate * (1.0 - hard_drop)
         learned_move_ratio_for_ops = self._scale_amount_downstream_grad(
             learned_move_ratio,
             op_name="move",
@@ -6357,6 +6530,14 @@ class StructureRepairActuator(nn.Module):
             valid_move_points = (~empty_target_mask) & (~dropped_target_mask)
         else:
             valid_move_points = torch.ones_like(empty_target_mask, dtype=torch.bool) & (~dropped_target_mask)
+
+        if network_single_proposal:
+            fixed_move_target_bias = self._fit_heuristic_target_direction_prior(
+                heuristic_guidance, "Adjust", preserve
+            )
+            exact_move_target_bias = self._den6_first_empty_direction_bias(
+                valid_move_points, preserve
+            ) + 2.0 * fixed_move_target_bias
 
         if exact_den6_candidate_mode:
             # Adjust targetはden6 candidateが指定したsource→targetだけを許す。
@@ -6498,6 +6679,13 @@ class StructureRepairActuator(nn.Module):
                 dtype=move_logits.dtype,
             )
         if exact_den6_candidate_mode:
+            move_logits = move_logits + float(
+                getattr(self.args, "heuristic_guidance_target_direction_weight", 12.0)
+            ) * exact_move_target_bias.to(
+                device=move_logits.device,
+                dtype=move_logits.dtype,
+            )
+        elif network_single_proposal:
             move_logits = move_logits + float(
                 getattr(self.args, "heuristic_guidance_target_direction_weight", 12.0)
             ) * exact_move_target_bias.to(
@@ -6725,6 +6913,10 @@ class StructureRepairActuator(nn.Module):
             force_min_count=bool(getattr(self.args, "repair_force_min_move_voxels", False)),
             max_hard_count=int(getattr(self.args, "repair_max_hard_move_voxels", 0)),
         )
+        if network_single_proposal:
+            hard_move_mask = hard_move_mask & operation_gate_hard[:, 2:3].to(
+                device=hard_move_mask.device, dtype=torch.bool
+            )
         hard_move = hard_move_mask.to(dtype=pts_xyz.dtype)
         # Phase3: guard後に確定したHard Move sourceをVoxel編集状態用に保存する。
         voxel_edit_move_source_mask = hard_move_mask.detach().squeeze(1).to(dtype=torch.bool)
@@ -6823,7 +7015,7 @@ class StructureRepairActuator(nn.Module):
             move_idx_flat.unsqueeze(-1),
         ).squeeze(-1)
 
-        if child_slot_mask is not None:
+        if child_slot_mask is not None and not online_den6_single_proposal:
             voxel_edit_move_child_slot_mask = torch.gather(
                 child_slot_mask,
                 2,
@@ -6960,6 +7152,10 @@ class StructureRepairActuator(nn.Module):
         add_target_hard_add = pts_xyz.new_zeros((B, 1, 0))
         add_target_add_st = pts_xyz.new_zeros((B, 1, 0))
         add_target_voxel_coords = voxel_coords.new_empty((B, 3, 0))
+        fixed_add_direction_pair_count = 0
+        fixed_add_valid_before_unique_count = 0
+        fixed_add_valid_after_unique_count = 0
+        selected_fixed_add_pair_count = 0
         exact_add_pair_logits = None
         # Phase3: Addが実行されない場合でも、Voxel編集状態構築で参照できる空のAdd候補を用意する。
         voxel_edit_add_target_coords = add_target_voxel_coords.detach()
@@ -7001,6 +7197,10 @@ class StructureRepairActuator(nn.Module):
             add_prior = add_prior + float(
                 getattr(self.args, "repair_add_pattern_prior_weight", 1.25)
             ) * add_pattern_prior.clamp_min(0.0).amax(dim=2, keepdim=True).transpose(1, 2)
+            if network_single_proposal:
+                # add_head/add_voxel_headをNetwork residualとし、固定den6式以外の
+                # hand-crafted priorがfallback順位を上書きしないようにする。
+                add_prior = torch.zeros_like(add_prior)
             if sparsepcgc_add_experiment_active and not bool(getattr(self.args, "sparsepcgc_add_use_candidate_score", True)):
                 add_prior = torch.zeros_like(add_prior)
             # Add量の学習結果を位置logitに足し、どのVoxelへ追加するかの勾配も残す。
@@ -7016,6 +7216,16 @@ class StructureRepairActuator(nn.Module):
             ) if exact_den6_candidate_mode else preserve.new_zeros(
                 (B, int(self.neighbor_offsets.shape[0]), N)
             )
+            if network_single_proposal:
+                fixed_add_target_bias = self._fit_heuristic_target_direction_prior(
+                    heuristic_guidance, "Add", preserve
+                )
+                fixed_add_direction_pair_count = int(
+                    (fixed_add_target_bias.detach() > 0.0).sum().item()
+                )
+                exact_add_target_bias = self._den6_first_empty_direction_bias(
+                    empty_target_mask, preserve
+                ) + 2.0 * fixed_add_target_bias
             add_voxel_logits = self._run_large_head(self.add_voxel_head, actuator_features)
             add_voxel_logits = self._scale_where_downstream_grad(
                 add_voxel_logits,
@@ -7038,12 +7248,20 @@ class StructureRepairActuator(nn.Module):
                     device=add_voxel_logits.device,
                     dtype=add_voxel_logits.dtype,
                 )
+            elif network_single_proposal:
+                add_voxel_logits = add_voxel_logits + float(
+                    getattr(self.args, "heuristic_guidance_target_direction_weight", 12.0)
+                ) * exact_add_target_bias.to(
+                    device=add_voxel_logits.device,
+                    dtype=add_voxel_logits.dtype,
+                )
 
             pair_logits = (add_voxel_logits + add_logit).permute(0, 2, 1).contiguous()
 
-            pair_logits = pair_logits + float(
-                getattr(self.args, "repair_add_pair_pattern_prior_weight", 2.0)
-            ) * add_pattern_prior
+            if not network_single_proposal:
+                pair_logits = pair_logits + float(
+                    getattr(self.args, "repair_add_pair_pattern_prior_weight", 2.0)
+                ) * add_pattern_prior
             exact_add_pair_logits = pair_logits
             if selection_mask is None:
                 base_valid = torch.ones((B, N), device=pts_xyz.device, dtype=torch.bool)
@@ -7061,6 +7279,11 @@ class StructureRepairActuator(nn.Module):
             if hard_leaf_operation_mask_enabled and not exact_den6_candidate_mode:
                 base_valid = base_valid & leaf_add_op_mask.squeeze(1)
             valid_pair = empty_target_mask & base_valid.unsqueeze(2)
+            if network_single_proposal:
+                fixed_pair_mask_nk = fixed_add_target_bias.permute(0, 2, 1) > 0.0
+                fixed_add_valid_before_unique_count = int(
+                    (fixed_pair_mask_nk & valid_pair).detach().sum().item()
+                )
             if exact_den6_candidate_mode:
                 valid_pair = valid_pair & (
                     exact_add_target_bias.permute(0, 2, 1) > 0
@@ -7087,10 +7310,17 @@ class StructureRepairActuator(nn.Module):
                     .contiguous()
                 )
                 unique_target_pair_mask = (
-                    self._first_unique_coord_mask(candidate_target_voxels_flat)
+                    self._first_unique_coord_mask(
+                        candidate_target_voxels_flat,
+                        eligible_mask=valid_pair.reshape(B, -1),
+                    )
                     .view(B, N, -1)
                 )
                 valid_pair = valid_pair & unique_target_pair_mask
+                if network_single_proposal:
+                    fixed_add_valid_after_unique_count = int(
+                        (fixed_pair_mask_nk & valid_pair).detach().sum().item()
+                    )
 
                 add_hardening_threshold = float(
                     getattr(
@@ -7152,6 +7382,12 @@ class StructureRepairActuator(nn.Module):
                     largest=True,
                     sorted=False,
                 )
+                if network_single_proposal:
+                    fixed_pair_flat = fixed_add_target_bias.permute(0, 2, 1).reshape(B, -1)
+                    selected_fixed_add_pair_count = int(
+                        (torch.gather(fixed_pair_flat, 1, top_pair_idx).detach() > 0.0)
+                        .sum().item()
+                    )
                 selected_pair_logits = torch.gather(pair_scores, 1, top_pair_idx)
                 add_strength_tau = max(float(getattr(self.args, "repair_add_strength_tau", 1.0)), 1e-6)
                 top_threshold = top_pair_values.min(dim=1, keepdim=True).values.detach()
@@ -7231,6 +7467,10 @@ class StructureRepairActuator(nn.Module):
                 # pair全体のSTEは補助的なsource側可視化にだけ使う。
                 # Addの実操作量は、後でtop-k selected target voxel単位で作る。
                 # ============================================================
+                if network_single_proposal:
+                    hard_add_pair = hard_add_pair * operation_gate_hard[:, 1:2, 0].to(
+                        device=hard_add_pair.device, dtype=hard_add_pair.dtype
+                    )
                 add_pair_st = hard_add_pair - soft_add_pair.detach() + soft_add_pair
                 add_pair_st_view = add_pair_st.view(B, N, -1)
 
@@ -8674,6 +8914,116 @@ class StructureRepairActuator(nn.Module):
             + actual_oracle_move_amount_loss
         )
 
+        # 既存den6の確定済み単一planを使うbootstrapでは、hard forwardを教師へ
+        # 合わせるだけでなく、Poolを外した後もNetwork単独で再現できるよう
+        # Where/Amount/Action/方向headへbehavior-cloning損失を返す。
+        teacher_behavior_clone_loss = pts_xyz.new_zeros(())
+        teacher_behavior_clone_terms = {}
+        if bool(exact_residual_plan_debug.get("teacher_bootstrap_active", False)):
+            def _balanced_where_bce(logits, operation):
+                target = self._fit_heuristic_candidate_mask(
+                    heuristic_guidance, operation, logits
+                ).detach()
+                flat_logits = logits.reshape(-1)
+                mapping = heuristic_guidance.get(
+                    "candidate_tensor_map", {}
+                ).get(operation, {})
+                pos_index = mapping.get("source_index")
+                if not torch.is_tensor(pos_index):
+                    return logits.new_zeros(())
+                pos_index = torch.unique(
+                    pos_index.to(device=logits.device, dtype=torch.long)
+                )
+                pos_index = pos_index[
+                    pos_index.ge(0) & pos_index.lt(int(logits.shape[-1]))
+                ]
+                # full cloud全体をnonzero走査せず、全域を等間隔で覆うnegativeを
+                # 最大4096点だけ使う。candidate maskは既にguidance構築時にある。
+                max_negative = max(min(int(pos_index.numel()) * 4, 4096), 1)
+                point_count = int(logits.shape[-1])
+                stride = max(point_count // max_negative, 1)
+                neg_index = torch.arange(
+                    0, point_count, stride, device=logits.device, dtype=torch.long
+                )[:max_negative]
+                target_flat = target[0, 0]
+                neg_index = neg_index[~target_flat.index_select(0, neg_index)]
+                terms = []
+                if int(pos_index.numel()) > 0:
+                    terms.append(torch.nn.functional.softplus(
+                        -flat_logits.index_select(0, pos_index)
+                    ).mean())
+                if int(neg_index.numel()) > 0:
+                    terms.append(torch.nn.functional.softplus(
+                        flat_logits.index_select(0, neg_index)
+                    ).mean())
+                return torch.stack(terms).mean() if terms else logits.new_zeros(())
+
+            teacher_where_prune = _balanced_where_bce(raw_drop_logit, "Prune")
+            teacher_where_add = _balanced_where_bce(learned_add_logit, "Add")
+            teacher_where_adjust = _balanced_where_bce(
+                subtree_move_source_logit, "Adjust"
+            )
+
+            direction_terms = []
+            direction_sparse_all = heuristic_guidance.get("target_direction_sparse", {})
+            for operation, logits in (("Add", add_voxel_logits), ("Adjust", move_logits)):
+                sparse = direction_sparse_all.get(operation, {})
+                batch_index = sparse.get("batch_index")
+                source_index = sparse.get("source_index")
+                direction_index = sparse.get("direction_index")
+                if all(torch.is_tensor(value) for value in (
+                    batch_index, source_index, direction_index
+                )) and int(source_index.numel()) > 0:
+                    batch_index = batch_index.to(device=logits.device, dtype=torch.long)
+                    source_index = source_index.to(device=logits.device, dtype=torch.long)
+                    direction_index = direction_index.to(device=logits.device, dtype=torch.long)
+                    selected_logits = logits[batch_index, :, source_index]
+                    direction_terms.append(torch.nn.functional.cross_entropy(
+                        selected_logits, direction_index, reduction="mean"
+                    ))
+            teacher_direction = (
+                torch.stack(direction_terms).mean()
+                if direction_terms else pts_xyz.new_zeros(())
+            )
+
+            action_target = torch.ones_like(operation_gate_logit)
+            teacher_action = torch.nn.functional.binary_cross_entropy_with_logits(
+                operation_gate_logit, action_target
+            )
+            amount_priors = heuristic_guidance.get("amount_prior", {})
+            teacher_amount_terms = []
+            for operation, learned, maximum in (
+                ("Prune", raw_learned_drop_ratio, max_drop_ratio),
+                ("Add", raw_learned_add_ratio, max_add_ratio_value),
+                ("Adjust", raw_learned_move_ratio, max_move_ratio),
+            ):
+                if float(maximum) <= 0.0:
+                    continue
+                target = learned.new_tensor(
+                    min(max(float(amount_priors.get(operation, 0.0)), 0.0), float(maximum))
+                    / float(maximum)
+                )
+                prediction = (learned / float(maximum)).clamp(0.0, 1.0)
+                teacher_amount_terms.append((prediction - target).pow(2).mean())
+            teacher_amount = (
+                torch.stack(teacher_amount_terms).mean()
+                if teacher_amount_terms else pts_xyz.new_zeros(())
+            )
+            teacher_behavior_clone_terms = {
+                "where_prune": teacher_where_prune,
+                "where_add": teacher_where_add,
+                "where_adjust": teacher_where_adjust,
+                "direction": teacher_direction,
+                "amount": teacher_amount,
+                "action": teacher_action,
+            }
+            teacher_behavior_clone_loss = torch.stack(
+                list(teacher_behavior_clone_terms.values())
+            ).mean()
+            exact_residual_plan_debug["teacher_behavior_clone_loss"] = (
+                teacher_behavior_clone_loss.detach()
+            )
+
         loss = (
             edit_reg
             + float(getattr(self.args, "repair_ratio_weight", 0.1)) * ratio_loss
@@ -8723,6 +9073,8 @@ class StructureRepairActuator(nn.Module):
             * actual_oracle_amount_supervision_loss
             + float(getattr(self.args, "sparsepcgc_actual_oracle_direction_loss_weight", 0.01))
             * actual_oracle_direction_supervision_loss
+            + float(getattr(self.args, "heuristic_guidance_teacher_distill_weight", 0.10))
+            * teacher_behavior_clone_loss
         )
         loss = torch.nan_to_num(
             loss,
@@ -9835,9 +10187,10 @@ class StructureRepairActuator(nn.Module):
                 return probability[executed].log().mean()
 
             where_terms = []
-            if prune_enabled:
+            selected_gate = operation_gate_hard.detach().float().mean(dim=(0, 2))
+            if prune_enabled and bool(selected_gate[0].item() > 0.5):
                 where_terms.append(_executed_where_log_prob(drop_prob_proxy, hard_drop_mask))
-            if add_enabled and hard_add_pair.numel() > 0:
+            if add_enabled and bool(selected_gate[1].item() > 0.5) and hard_add_pair.numel() > 0:
                 add_where_probability = (
                     torch.sigmoid(exact_add_pair_logits.float()).reshape_as(hard_add_pair)
                     if torch.is_tensor(exact_add_pair_logits)
@@ -9846,7 +10199,7 @@ class StructureRepairActuator(nn.Module):
                 where_terms.append(
                     _executed_where_log_prob(add_where_probability, hard_add_pair > 0.0)
                 )
-            if disp_enabled:
+            if disp_enabled and bool(selected_gate[2].item() > 0.5):
                 where_terms.append(_executed_where_log_prob(move_score, hard_move_mask))
             if where_terms:
                 single_where_log_prob = torch.stack(where_terms).mean()
@@ -9854,16 +10207,15 @@ class StructureRepairActuator(nn.Module):
             gate_prob = operation_gate_prob.float().mean(dim=(0, 2)).clamp(
                 policy_eps, 1.0 - policy_eps
             )
-            active = gate_prob.new_tensor([
-                float(bool(hard_drop_mask.detach().any().item())) if prune_enabled else 0.0,
-                float(bool((hard_add_pair.detach() > 0.0).any().item())) if add_enabled else 0.0,
-                float(bool(hard_move_mask.detach().any().item())) if disp_enabled else 0.0,
-            ])
+            active = selected_gate.to(device=gate_prob.device, dtype=gate_prob.dtype)
             enabled = gate_prob.new_tensor([
                 float(prune_enabled), float(add_enabled), float(disp_enabled)
             ])
-            action_terms = active * gate_prob.log() + (1.0 - active) * (1.0 - gate_prob).log()
-            single_action_log_prob = (action_terms * enabled).sum() / enabled.sum().clamp_min(1.0)
+            action_terms = (
+                active * gate_prob.log()
+                + (1.0 - active) * (1.0 - gate_prob).log()
+            )
+            single_action_log_prob = (action_terms * enabled).sum()
 
             # 実行したAmountの尤度。改善したplanでは同じ方向の操作量を強め、
             # 悪化したplanでは弱める。全操作の変更Voxel上限はargs側で1%未満に保つ。
@@ -9877,20 +10229,84 @@ class StructureRepairActuator(nn.Module):
             single_amount_log_prob = (
                 (amount_terms * enabled).sum() / active_enabled.sum().clamp_min(1.0)
             )
-            action_entropy = -(
-                gate_prob * gate_prob.log() + (1.0 - gate_prob) * (1.0 - gate_prob).log()
-            )
+            action_entropy = -(gate_prob * gate_prob.log())
             amount_entropy = -(
                 amount_prob * amount_prob.log()
                 + (1.0 - amount_prob) * (1.0 - amount_prob).log()
             )
             single_policy_entropy = (
-                (action_entropy * enabled).sum() + (amount_entropy * enabled).sum()
-            ) / (2.0 * enabled.sum().clamp_min(1.0))
+                action_entropy.sum() + (amount_entropy * active).sum()
+            ) / 2.0
 
         single_policy_log_prob = (
             single_where_log_prob + single_amount_log_prob + single_action_log_prob
         )
+        if single_proposal_policy:
+            selected_action_mask = operation_gate_hard.detach()[0, :, 0].to(
+                dtype=torch.int64
+            ).cpu().tolist()
+            selected_action_count = int(sum(selected_action_mask))
+
+            def _coord_rows_hash(rows):
+                if not torch.is_tensor(rows) or rows.numel() == 0:
+                    return hashlib.sha256(b"").hexdigest()
+                values = rows.detach().to(device="cpu", dtype=torch.int64).tolist()
+                canonical = sorted(set(tuple(int(item) for item in row) for row in values))
+                return hashlib.sha256(
+                    json.dumps(canonical, separators=(",", ":")).encode("utf-8")
+                ).hexdigest()
+
+            prune_selected = voxel_coords[0].transpose(0, 1)[
+                hard_drop_mask.detach()[0, 0].to(dtype=torch.bool)
+            ]
+            add_selected = add_target_voxel_coords[0].transpose(0, 1)[
+                add_target_hard_add.detach()[0, 0].to(dtype=torch.bool)
+            ] if add_target_voxel_coords.shape[-1] > 0 else voxel_coords.new_empty((0, 3))
+            move_selected_mask = hard_move_mask.detach()[0, 0].to(dtype=torch.bool)
+            move_sources = voxel_coords[0].transpose(0, 1)[move_selected_mask]
+            move_targets = move_target_voxel_coords[0].transpose(0, 1)[move_selected_mask]
+            exact_residual_plan_debug.update({
+                "plan_count": 1,
+                "pool_reference_count": 0,
+                "candidate_actual_encode_count": 0,
+                "selected_counts": {
+                    "Prune": int(hard_drop_mask.detach().sum().item()),
+                    "Add": int((hard_add_pair.detach() > 0.0).sum().item()),
+                    "Adjust": int(hard_move_mask.detach().sum().item()),
+                },
+                "selected_amount_ratios": {
+                    "Prune": float(learned_drop_ratio.detach().mean().item()),
+                    "Add": float(learned_add_ratio.detach().mean().item()),
+                    "Adjust": float(learned_move_ratio.detach().mean().item()),
+                },
+                "add_selection_diagnostics": {
+                    "requested_k": int(add_k),
+                    "effective_count": int(add_effective_count_value),
+                    "target_voxel_count": int(add_target_voxel_count_value),
+                    "fixed_direction_pairs": int(fixed_add_direction_pair_count),
+                    "fixed_valid_before_unique": int(fixed_add_valid_before_unique_count),
+                    "fixed_valid_after_unique": int(fixed_add_valid_after_unique_count),
+                    "selected_fixed_pairs": int(selected_fixed_add_pair_count),
+                },
+                "selected_coord_hashes": {
+                    "Prune": _coord_rows_hash(prune_selected),
+                    "Add": _coord_rows_hash(add_selected),
+                    "AdjustSource": _coord_rows_hash(move_sources),
+                    "AdjustTarget": _coord_rows_hash(move_targets),
+                },
+                "selected_action_index": (
+                    int(selected_action_mask.index(1))
+                    if selected_action_count == 1 else -1
+                ),
+                "selected_action_mask": selected_action_mask,
+                "selected_action_count": selected_action_count,
+                "policy_log_prob": single_policy_log_prob,
+                "policy_entropy": single_policy_entropy,
+                "where_log_prob": single_where_log_prob,
+                "amount_log_prob": single_amount_log_prob,
+                "action_log_prob": single_action_log_prob,
+                "proposal_source": "network_plus_gt_fixed_den6_features",
+            })
 
         return pts_out, final_w, loss, {
             # Adjust Soft状態

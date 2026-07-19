@@ -530,6 +530,16 @@ def test(model, args, writer):
             sample_start = time.perf_counter()
             data_loading_time = sample_start - fetch_start
             input_path = str(dataset.files[step])
+            # ana_den6_online の固定特徴は元の GT PLY から構築するため、
+            # train.py と同じ入力コンテキストを forward 前に渡す。
+            args._current_input_file = str(Path(input_path).expanduser().resolve())
+            # 推論はbootstrap teacherを使わず、学習後のNetwork residual主体で動かす。
+            # 未設定のまま0扱いにすると初期den6 anchorへ誤って巻き戻る。
+            args._den6_online_training_step_active = False
+            args._global_train_step = max(
+                int(getattr(args, "heuristic_guidance_anchor_steps", 0)),
+                int(getattr(args, "heuristic_guidance_teacher_bootstrap_steps", 0)),
+            )
             preprocess_start = time.perf_counter()
             input_pcd = pts if pts.dim() == 3 else pts.unsqueeze(0)
             raw_points = int(input_pcd.shape[1])

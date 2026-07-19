@@ -147,6 +147,11 @@ _NEIGHBOR_OFFSETS_26 = tuple(
     if not (dx == 0 and dy == 0 and dz == 0)
 )
 _OFFSET_TO_INDEX = {offset: index for index, offset in enumerate(_NEIGHBOR_OFFSETS_26)}
+_DEN6_FALLBACK_OFFSETS = (
+    (1, 0, 0), (-1, 0, 0),
+    (0, 1, 0), (0, -1, 0),
+    (0, 0, 1), (0, 0, -1),
+)
 
 
 def _normalize_coords_b3n(value: Any, like: torch.Tensor) -> torch.Tensor | None:
@@ -174,6 +179,43 @@ def _normalize_coords_b3n(value: Any, like: torch.Tensor) -> torch.Tensor | None
     if coords.shape[0] != like.shape[0] or coords.shape[2] != like.shape[2]:
         return None
     return coords
+
+
+def _den6_fallback_fixed_features(
+    structure: Mapping[str, Any], args: Any, like: torch.Tensor
+) -> tuple[torch.Tensor, Dict[str, Dict[str, torch.Tensor]]]:
+    """den5 fallbackと同じ座標順・6近傍順をGT固定特徴として計算する。
+
+    これは候補Pool・rank・選択済みWhereを読み込まない。全入力Voxelへ同じ式を
+    一度だけ適用し、Networkがscoreを付けるための位置特徴と有効方向特徴を返す。
+    """
+    coords = _normalize_coords_b3n(structure.get("global_voxel_coords"), like)
+    if coords is None:
+        return like.new_zeros(like.shape), {}
+    B, _, N = coords.shape
+    resolution = max(int(getattr(args, "sparsepcgc_native_resolution", 1023)), 1)
+    base = int(resolution + 3)
+    base2 = int(base * base)
+    lex_rows = []
+    for batch in range(B):
+        rows = coords[batch].transpose(0, 1).contiguous()
+        keys = (
+            (rows[:, 0] + 1) * base2
+            + (rows[:, 1] + 1) * base
+            + (rows[:, 2] + 1)
+        )
+        key_min = keys.amin()
+        key_span = (keys.amax() - key_min).clamp_min(1)
+        lex_rows.append(
+            (1.0 - (keys - key_min).to(torch.float32) / key_span.to(torch.float32))
+            .to(dtype=like.dtype)
+        )
+
+    lex_score = torch.stack(lex_rows, dim=0).unsqueeze(1).detach()
+    # 方向はActuatorが既に作ったempty_target_maskへ6個の優先indexを直接適用する。
+    # ここで全点のsparse indexを作って再びdense化するとPyTorch 1.11ではPython
+    # loopへfallbackし85秒掛かったため、同値な既存mask再利用に限定する。
+    return lex_score, {}
 
 
 def _rank_value(rank: int, pool_size: int) -> float:
@@ -558,10 +600,15 @@ def build_heuristic_guidance(structure: Mapping[str, Any], args: Any) -> Dict[st
         and isinstance(exact, Mapping)
         and str(exact.get("source", "")) == "ana_den6_gt_terms_single_proposal_online_v7"
     )
-    if mode in {"ana_den6_online", "ana_den6_residual"} and not single_proposal_online:
+    if mode == "ana_den6_online" and not single_proposal_online:
+        raise RuntimeError(
+            "ana_den6_onlineはGT固定特徴だけを受け付ける。"
+            "candidate Pool/shortlist/teacher planの注入は禁止されている"
+        )
+    if mode == "ana_den6_residual":
         if not isinstance(exact, Mapping):
             raise RuntimeError(
-                "ana_den6 online/residualでexact candidate guidanceがNetworkへ伝播していない。"
+                "ana_den6_residualでexact candidate guidanceがNetworkへ伝播していない。"
                 "proxy_priorへ代替してはならない"
             )
         manifest_key = str(
@@ -610,6 +657,14 @@ def build_heuristic_guidance(structure: Mapping[str, Any], args: Any) -> Dict[st
     context_risk = 0.55 * context + 0.25 * shape + 0.20 * sparse
     hotspot = direct * (0.50 + lowprob) * (0.50 + context) * (0.75 + single)
     geometry = 0.35 * shape + 0.25 * quant + 0.20 * outlier + 0.20 * sparse
+    fallback_order, fallback_directions = _den6_fallback_fixed_features(
+        structure, args, like
+    )
+    fixed_symbol_features = structure.get("ana_den6_fixed_feature_guidance")
+    if not isinstance(fixed_symbol_features, Mapping):
+        fixed_symbol_features = {}
+    fixed_score_all = fixed_symbol_features.get("score", {})
+    fixed_valid_all = fixed_symbol_features.get("valid", {})
 
     where_prior: Dict[str, torch.Tensor] = {}
     selected_names = {
@@ -618,18 +673,51 @@ def build_heuristic_guidance(structure: Mapping[str, Any], args: Any) -> Dict[st
         "Adjust": profile.adjust_heuristic,
     }
     for operation, heuristic_name in selected_names.items():
-        leaf = _normalize_score(_leaf_gain(structure, operation, like))
+        raw_leaf = _leaf_gain(structure, operation, like)
+        leaf = _normalize_score(raw_leaf)
+        # ana_den5のdirect_gain_bitsは「そのActionでoccupancy symbolを反転した時の
+        # coding cost差」であり、全操作共通のoccupancy NLLではない。旧v7は
+        # operation別leaf gainをmask_gainにだけ置き、8i/m8で実際に使う
+        # geometry_safe/subtree/hotspot式のdirect項から落としていた。
+        # GTのparent occupancy patternを同じActionで反転して得たleaf NLL gainを
+        # direct項へ戻し、Networkへ渡す固定Where特徴を操作別にする。
+        operation_direct = _normalize_score(0.35 * direct + 0.65 * leaf)
         expected_new = geometry if operation in {"Add", "Adjust"} else 0.20 * shape
-        where_prior[operation] = _score_formula(
+        den6_equation_score = _score_formula(
             heuristic_name,
-            direct=direct,
+            direct=operation_direct,
             descendant=descendant,
             expected_new=expected_new,
             mask_gain=leaf + 0.25 * lowprob,
             context_risk=context_risk,
             hotspot=hotspot,
             geometry=geometry,
-        ).to(dtype=like.dtype).detach()
+        )
+        # fixed flip gainは全den6式の第一項なので、正規化後にも消えないよう残す。
+        fixed_score = _fit_b1n(
+            fixed_score_all.get(operation) if isinstance(fixed_score_all, Mapping) else None,
+            like,
+        ).clamp_min(0.0)
+        fixed_valid = _fit_b1n(
+            fixed_valid_all.get(operation) if isinstance(fixed_valid_all, Mapping) else None,
+            like,
+        ).gt(0.0).to(dtype=like.dtype)
+        if bool(fixed_valid.any().item()):
+            # 本物のSparsePCGC symbol式がある位置と、den5のdeterministic
+            # fallback位置を非重複のscore帯へ置く。全体min-max正規化すると
+            # fallbackのlexicographic差が約1/30へ潰れ、汎用priorが順序を
+            # 上書きしていた。これは選択済みWhereではなく、各位置へ同じ式を
+            # 適用した固定特徴である。
+            fixed_band = 0.75 + 0.25 * _normalize_score(fixed_score)
+            fallback_band = 0.25 + 0.25 * fallback_order
+            combined = torch.where(
+                fixed_valid > 0.0,
+                fixed_band,
+                fallback_band,
+            )
+        else:
+            combined = 0.25 + 0.50 * fallback_order + 0.05 * den6_equation_score
+        where_prior[operation] = combined.clamp(0.0, 1.0).to(dtype=like.dtype).detach()
 
     shares = {
         "Add": profile.add_share,
@@ -671,6 +759,15 @@ def build_heuristic_guidance(structure: Mapping[str, Any], args: Any) -> Dict[st
         "amount_prior": amount_prior,
         "action_gate_prior": action_gate_prior,
         "where_prior": where_prior,
+        "target_direction_sparse": fallback_directions,
+        "fixed_direction_index": (
+            fixed_symbol_features.get("direction_index", {})
+            if isinstance(fixed_symbol_features, Mapping) else {}
+        ),
+        "fixed_direction_bits": (
+            fixed_symbol_features.get("direction_bits", {})
+            if isinstance(fixed_symbol_features, Mapping) else {}
+        ),
         "where_prior_mean": where_prior_mean,
         "formula_basis": (
             "ana_den6_single_proposal_network_residual_online_v7"
@@ -682,4 +779,7 @@ def build_heuristic_guidance(structure: Mapping[str, Any], args: Any) -> Dict[st
         # 加工候補を含まないGT固定metadataだけを監査用に引き継ぐ。
         result["exact_candidate_guidance"] = dict(exact)
         result["proposal_policy"] = "one_where_amount_action_per_step"
+        result["fixed_feature_basis"] = (
+            "sparsepcgc_gt_symbol_score_plus_den5_lexicographic_and_first_empty_6n"
+        )
     return result

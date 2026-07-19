@@ -779,6 +779,7 @@ class SurrogateCompressionLossMixin:
         )
 
     def _train_compression_surrogate(self, args, x_soft, target, train_steps=None):
+        self._last_surrogate_grad_norm = 0.0
         if train_steps is None:
             train_steps = max(int(getattr(args, "compression_surrogate_train_steps", 2)), 0)
         else:
@@ -828,9 +829,12 @@ class SurrogateCompressionLossMixin:
                     self.surrogate_optimizer.zero_grad(set_to_none=True)
                     self._reset_compression_surrogate("non-finite gradient during train")
                     return x_soft.new_zeros(())
-                torch.nn.utils.clip_grad_norm_(
+                surrogate_grad_norm = torch.nn.utils.clip_grad_norm_(
                     self.compression_surrogate.parameters(),
                     float(getattr(args, "compression_surrogate_grad_clip", 10.0)),
+                )
+                self._last_surrogate_grad_norm = float(
+                    torch.nan_to_num(surrogate_grad_norm.detach().float()).cpu()
                 )
                 self.surrogate_optimizer.step()
                 if not self._surrogate_state_is_finite():
@@ -1019,9 +1023,11 @@ class SurrogateCompressionLossMixin:
         if teacher_refreshed:
             actual_t0 = time.time() if timing_enabled else 0.0
             cached_gt = self._get_cached_actual_gt(cache_key)
+            baseline_actual_encode_count = 0
             if cached_gt is None:
                 cached_gt = self._encode_actual_batch(args, gt_xyz)
                 self._store_cached_actual_gt(cache_key, cached_gt)
+                baseline_actual_encode_count = 1
             # actual codec教師は評価指標なので、train用ノイズなしの編集点群で測る。
             actual_xyz = gen_xyz if actual_gen_xyz is None else actual_gen_xyz
             cached_oracle_stats = (
@@ -1040,7 +1046,27 @@ class SurrogateCompressionLossMixin:
             if actual_gen_cache_hit:
                 stats_gen = dict(cached_oracle_stats)
             else:
+                den6_online_train = bool(
+                    str(getattr(args, "heuristic_guidance_mode", "")).strip().lower()
+                    == "ana_den6_online"
+                    and bool(getattr(args, "_den6_online_training_step_active", False))
+                )
+                if den6_online_train:
+                    if int(actual_xyz.shape[0]) != 1:
+                        raise RuntimeError("ana_den6_onlineは1 Step = 1 edited actual encodeのためbatch_size=1が必要")
+                    self._guard_den6_online_edited_actual_encode(args)
                 stats_gen = self._encode_actual_batch(args, actual_xyz, final_w=final_w)
+                if den6_online_train:
+                    self._den6_online_actual_audit = {
+                        "baseline": int(baseline_actual_encode_count),
+                        "edited": 1,
+                        "candidate": 0,
+                        "edited_result_cache_hit": bool(
+                            stats_gen.get("sparsepcgc_actual_result_cache_hit", False)
+                        ),
+                        "worker_launch_count": int(stats_gen.get("sparsepcgc_worker_launch_count", 0)),
+                        "worker_request_count": int(stats_gen.get("sparsepcgc_worker_request_count", 0)),
+                    }
             if timing_enabled:
                 timing["actual_encode"] = time.time() - actual_t0
                 timing_cursor = time.time()
@@ -1995,6 +2021,7 @@ class SurrogateCompressionLossMixin:
             "pred_clip_min": float(pred_clip_min_value),
             "pred_clip_max": float(pred_clip_max_value),
             "surrogate_loss_for_grad": self._scalar(surrogate_loss_for_grad_weighted.detach()),
+            "surrogate_grad_norm": float(getattr(self, "_last_surrogate_grad_norm", 0.0)),
             "proxy_aux_for_grad": self._scalar(proxy_aux_for_grad.detach()),
             "grad_source": grad_source,
             "detach_surrogate_from_network": bool(detach_surrogate_from_network),

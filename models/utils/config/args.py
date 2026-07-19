@@ -2936,6 +2936,24 @@ def parse_pugan_args(parser, file_day, file_time):
         help='den6 Where/Amount/Action priorをNetwork主体へ連続移行するstep数。0で即時residual主体',
     )
     parser.add_argument(
+        '--heuristic_guidance_teacher_bootstrap_steps',
+        default=0,
+        type=int,
+        help='旧互換用。ana_den6_onlineでは保存済み行動教師を禁止するため常に0',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_fixed_symbol_features',
+        default=True,
+        type=str2bool,
+        help='SparsePCGCのGT固定symbol scoreを候補/planなしのNetwork入力cacheとして使う',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_teacher_distill_weight',
+        default=0.10,
+        type=float,
+        help='bootstrap中に確定teacherのWhere/Amount/Action規則をNetwork headへ蒸留する補助損失係数',
+    )
+    parser.add_argument(
         '--heuristic_guidance_exact_anchor_steps',
         default=1,
         type=int,
@@ -3954,6 +3972,14 @@ def parse_pugan_args(parser, file_day, file_time):
     args.heuristic_guidance_anchor_steps = max(
         int(getattr(args, "heuristic_guidance_anchor_steps", 200)),
         0,
+    )
+    args.heuristic_guidance_teacher_bootstrap_steps = max(
+        int(getattr(args, "heuristic_guidance_teacher_bootstrap_steps", 0)),
+        0,
+    )
+    args.heuristic_guidance_teacher_distill_weight = max(
+        float(getattr(args, "heuristic_guidance_teacher_distill_weight", 0.10)),
+        0.0,
     )
     args.heuristic_guidance_exact_anchor_steps = max(
         int(getattr(args, "heuristic_guidance_exact_anchor_steps", 1)),
@@ -7326,6 +7352,39 @@ def parse_pugan_args(parser, file_day, file_time):
         if not _cli_option_was_provided("--repair_operation_gate_random_mix_end"):
             args.repair_operation_gate_random_mix_end = 0.0
         if args.heuristic_guidance_mode == "ana_den6_online":
+            # 行動選択はNetwork単独に限定する。codec prior/oracleは特徴ではなく
+            # hard選択を上書きするため、この経路では使用しない。
+            args.sparsepcgc_codec_prune_prior = False
+            args.sparsepcgc_enable_add_experiment = False
+            args.sparsepcgc_actual_oracle_edit = False
+            args.sparsepcgc_actual_oracle_apply_teacher_actions = False
+            args.sparsepcgc_actual_oracle_apply_full_override = False
+            args.sparsepcgc_actual_gate_prune = False
+            args.sparsepcgc_actual_gate_non_prune = False
+            args.heuristic_guidance_require_exact_single_plan_teacher = False
+            args.heuristic_guidance_auto_build_exact_single_plan_teacher = False
+            args.heuristic_guidance_teacher_bootstrap_steps = 0
+            # 旧設定の3000/150/25倍は1更新でAmount headを飽和させ、Step 2で
+            # 3操作すべてが上限へ飛ぶ。one-plan policyでは実Actualを毎Step得るため、
+            # 人工的な下流勾配増幅は不要である。
+            if not _cli_option_was_provided("--repair_amount_downstream_grad_max_scale"):
+                args.repair_amount_downstream_grad_max_scale = 1.0
+            if not _cli_option_was_provided("--repair_amount_downstream_grad_scale"):
+                args.repair_amount_downstream_grad_scale = 1.0
+            if not _cli_option_was_provided("--repair_drop_amount_downstream_grad_scale"):
+                args.repair_drop_amount_downstream_grad_scale = 1.0
+            if not _cli_option_was_provided("--repair_add_amount_downstream_grad_scale"):
+                args.repair_add_amount_downstream_grad_scale = 1.0
+            if not _cli_option_was_provided("--repair_move_amount_downstream_grad_scale"):
+                args.repair_move_amount_downstream_grad_scale = 1.0
+            # WhereのGT固定特徴とtarget方向priorは学習途中で消さない。どちらも
+            # cache行動ではなく、現在の入力点群から毎forward計算する特徴である。
+            if not _cli_option_was_provided("--heuristic_guidance_where_weight"):
+                args.heuristic_guidance_where_weight = 12.0
+            if not _cli_option_was_provided("--leaf_pattern_add_target_direction_weight"):
+                args.leaf_pattern_add_target_direction_weight = 4.0
+            if not _cli_option_was_provided("--leaf_pattern_move_target_direction_weight"):
+                args.leaf_pattern_move_target_direction_weight = 4.0
             # 汎用SparsePCGC後処理が有効化する診断を、online one-plan経路では
             # 再び止める。専用audit textだけはtrain.pyが常時出力する。
             args.save_good_bad_cases = False

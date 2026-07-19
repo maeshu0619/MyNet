@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""ana_den6と同一の候補生成・Heuristic順位をonline学習用cacheへ保存するworker。
+"""ana_den6と同じSparsePCGC固定特徴をonline学習用cacheへ保存するworker。
 
 このworkerはmyNet本体とは別Python processで動かす。SparsePCGCとmyNetが同じ
 ``models`` package名を持つため、同一processへimportするとmodule衝突が起きるからである。
-actualで多数planを探索せず、baseline probeと順位付き候補poolだけを一度生成する。
+固定特徴modeではactualで編集候補を評価せず、baseline probeから各GT位置の
+coding-cost特徴だけを一度生成する。選択済みplanや候補Poolは保存しない。
 """
 
 from __future__ import annotations
@@ -226,6 +227,11 @@ def main() -> int:
     parser.add_argument("--full-pool-limit-per-operation", default=0, type=int)
     parser.add_argument("--compact-reserve-factor", default=1.0, type=float)
     parser.add_argument("--output-json", required=True)
+    parser.add_argument(
+        "--fixed-features-output",
+        default="",
+        help="候補/planを保存せず、全GT Voxel整列のSparsePCGC固定scoreだけをNPZへ保存する",
+    )
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--cpu", action="store_true")
     cli = parser.parse_args()
@@ -338,6 +344,165 @@ def main() -> int:
         )
 
         dataset = _dataset_key(cli.data)
+        if str(cli.fixed_features_output).strip():
+            # Network入力に許可するのは、GTから一度だけ計算できる固定coding-cost
+            # featureだけである。選択済みID、Pool順位列、完成plan、加工後点群、
+            # actual改善値は一切保存しない。
+            import numpy as np
+
+            priors = den6._deep_copy_priors()
+            raw_by_operation, _ = den5._generate_candidates_extended(
+                engine, baseline_probe, args, requested_operation=None
+            )
+            coords = np.ascontiguousarray(
+                np.asarray(baseline_probe.original_coords, dtype=np.int64)[:, :3]
+            )
+            lookup = {
+                tuple(int(value) for value in row): index
+                for index, row in enumerate(coords.tolist())
+            }
+            occupied = set(lookup)
+            feature_score = {
+                name: np.zeros((coords.shape[0],), dtype=np.float32)
+                for name in OPERATIONS
+            }
+            feature_valid = {
+                name: np.zeros((coords.shape[0],), dtype=np.uint8)
+                for name in OPERATIONS
+            }
+            direction_index = {
+                "Add": np.full((coords.shape[0],), -1, dtype=np.int8),
+                "Adjust": np.full((coords.shape[0],), -1, dtype=np.int8),
+            }
+            direction_bits = {
+                "Add": np.zeros((coords.shape[0],), dtype=np.uint32),
+                "Adjust": np.zeros((coords.shape[0],), dtype=np.uint32),
+            }
+            offset_to_index = {
+                offset: index
+                for index, offset in enumerate(
+                    (dx, dy, dz)
+                    for dx in (-1, 0, 1)
+                    for dy in (-1, 0, 1)
+                    for dz in (-1, 0, 1)
+                    if not (dx == 0 and dy == 0 and dz == 0)
+                )
+            }
+            heuristics = {}
+            feature_counts = {}
+            for operation in OPERATIONS:
+                curve = den6._curve_for(priors, dataset, int(setting.scale_m), operation)
+                heuristic = str(curve.get("heuristic") or "geometry_safe_rate")
+                heuristics[operation] = heuristic
+                den5._set_state_model_context(
+                    baseline_probe, setting, baseline_codec, operation, args
+                )
+                single_voxel_items = [
+                    item for item in raw_by_operation.get(operation, ())
+                    if den5._is_single_voxel_operation(item, operation)
+                ]
+                # Pool順位ではなく、ana_den5が各symbolへ適用する同一の
+                # deterministic計算式の生スコアを固定Network特徴として保存する。
+                scored_items = [
+                    (
+                        float(den5._candidate_score(
+                            item,
+                            heuristic,
+                            baseline_probe,
+                            {"status": "actual_only_no_surrogate"},
+                        )),
+                        item,
+                    )
+                    for item in single_voxel_items
+                ]
+                finite_scores = [score for score, _ in scored_items if math.isfinite(score)]
+                score_min = min(finite_scores) if finite_scores else 0.0
+                score_max = max(finite_scores) if finite_scores else 0.0
+                score_scale = max(float(score_max - score_min), 1e-12)
+                mapped = 0
+                for raw_score, candidate in scored_items:
+                    if not math.isfinite(raw_score):
+                        continue
+                    normalized_score = float((raw_score - score_min) / score_scale)
+                    removes = [tuple(map(int, row)) for row in getattr(candidate, "remove_coords", ())]
+                    adds = [tuple(map(int, row)) for row in getattr(candidate, "add_coords", ())]
+                    if operation == "Prune":
+                        pairs = [(lookup.get(source), -1) for source in removes]
+                    elif operation == "Adjust" and len(removes) == len(adds) == 1:
+                        source = removes[0]
+                        target = adds[0]
+                        offset = tuple(target[i] - source[i] for i in range(3))
+                        pairs = [(lookup.get(source), offset_to_index.get(offset, -1))]
+                    else:
+                        pairs = []
+                        for target in adds:
+                            for offset, direction in offset_to_index.items():
+                                source = tuple(target[i] - offset[i] for i in range(3))
+                                source_index = lookup.get(source)
+                                if source_index is not None:
+                                    pairs.append((source_index, direction))
+                    for source_index, direction in pairs:
+                        if source_index is None:
+                            continue
+                        if normalized_score >= float(feature_score[operation][source_index]):
+                            feature_score[operation][source_index] = normalized_score
+                            feature_valid[operation][source_index] = 1
+                            if operation in direction_index and int(direction) >= 0:
+                                direction_index[operation][source_index] = int(direction)
+                        if operation in direction_bits and int(direction) >= 0:
+                            direction_bits[operation][source_index] |= np.uint32(1 << int(direction))
+                        mapped += 1
+                feature_counts[operation] = {
+                    "raw": int(len(raw_by_operation.get(operation, ()))),
+                    "single_voxel": int(len(single_voxel_items)),
+                    "mapped_pairs": int(mapped),
+                    "valid_source_count": int(feature_valid[operation].sum()),
+                }
+
+            fixed_path = Path(cli.fixed_features_output).expanduser().resolve()
+            fixed_path.parent.mkdir(parents=True, exist_ok=True)
+            metadata = {
+                "schema_version": "ana_den6_gt_fixed_symbol_features_v2",
+                "source": "sparsepcgc_gt_symbol_features_no_plan_no_pool_cache",
+                "input_file": str(input_file),
+                "input_sha256": _sha256_file(input_file),
+                "input_voxel_hash": _coord_hash(coords),
+                "setting_id": str(setting.setting_id),
+                "scale_m": int(setting.scale_m),
+                "scale_ae": int(setting.scale_ae),
+                "scale_sr": int(setting.scale_sr),
+                "operation_heuristics": heuristics,
+                "feature_counts": feature_counts,
+                "contains_selected_action": False,
+                "contains_candidate_pool": False,
+                "contains_actual_edited_result": False,
+                "contains_candidate_objects": False,
+            }
+            temporary = fixed_path.with_suffix(fixed_path.suffix + ".tmp.npz")
+            np.savez_compressed(
+                temporary,
+                coords=coords.astype(np.int16, copy=False),
+                add_score=feature_score["Add"],
+                prune_score=feature_score["Prune"],
+                adjust_score=feature_score["Adjust"],
+                add_valid=feature_valid["Add"],
+                prune_valid=feature_valid["Prune"],
+                adjust_valid=feature_valid["Adjust"],
+                add_direction=direction_index["Add"],
+                adjust_direction=direction_index["Adjust"],
+                add_direction_bits=direction_bits["Add"],
+                adjust_direction_bits=direction_bits["Adjust"],
+                metadata_json=np.asarray(json.dumps(metadata, sort_keys=True)),
+            )
+            temporary.replace(fixed_path)
+            print(json.dumps({
+                "status": "ok",
+                "fixed_features_output": str(fixed_path),
+                "feature_counts": feature_counts,
+                "elapsed_sec": float(time.time() - started),
+            }, sort_keys=True), flush=True)
+            return 0
+
         total_ratio = (
             float(cli.total_ratio)
             if float(cli.total_ratio) > 0.0

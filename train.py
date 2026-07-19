@@ -15401,6 +15401,46 @@ def train(model, args, loss, writer, plot, notifier=None):
                     audit_runtime = dict(
                         getattr(base_model_for_audit, "last_runtime_timing", {}) or {}
                     )
+                    # one-plan online方式の設計条件を単なるログではなく実行時契約にする。
+                    # 旧実装のようにAction/Amountが徐々に0へ落ちても学習を継続する
+                    # silent failureを禁止し、最初に壊れたStepで原因を残す。
+                    online_invariant_failures = []
+                    if int(audit_plan.get("plan_count", 0) or 0) != 1:
+                        online_invariant_failures.append("plan_count!=1")
+                    if int(audit_plan.get("pool_reference_count", 0) or 0) != 0:
+                        online_invariant_failures.append("pool_reference_count!=0")
+                    if int(actual_audit.get(
+                        "candidate",
+                        audit_compression.get("den6_online_candidate_actual_encode_count", 0),
+                    ) or 0) != 0:
+                        online_invariant_failures.append("candidate_actual_encode_count!=0")
+                    if int(actual_audit.get(
+                        "edited",
+                        audit_compression.get("den6_online_edited_actual_encode_count", 0),
+                    ) or 0) != 1:
+                        online_invariant_failures.append("edited_actual_encode_count!=1")
+                    if list(audit_plan.get("selected_action_mask", [])) != [1, 1, 1]:
+                        online_invariant_failures.append("selected_action_mask!=[1,1,1]")
+                    selected_counts = dict(audit_plan.get("selected_counts") or {})
+                    selected_amounts = dict(audit_plan.get("selected_amount_ratios") or {})
+                    for operation in ("Prune", "Add", "Adjust"):
+                        if int(selected_counts.get(operation, 0) or 0) <= 0:
+                            online_invariant_failures.append(f"{operation}_count<=0")
+                        if float(selected_amounts.get(operation, 0.0) or 0.0) <= 0.0:
+                            online_invariant_failures.append(f"{operation}_amount<=0")
+                    for head_name, debug_name in (
+                        ("Where", "den6_online_where_grad_norm_before_balance"),
+                        ("Amount", "den6_online_amount_grad_norm_before_balance"),
+                        ("Action", "den6_online_action_grad_norm_before_balance"),
+                        ("Surrogate", "surrogate_grad_norm"),
+                    ):
+                        if float(audit_compression.get(debug_name, 0.0) or 0.0) <= 0.0:
+                            online_invariant_failures.append(f"{head_name}_grad<=0")
+                    if online_invariant_failures:
+                        raise RuntimeError(
+                            "ana_den6 one-plan invariant violation: "
+                            + ", ".join(online_invariant_failures)
+                        )
                     audit_phase_timing = {}
                     if timing_enabled:
                         audit_phase_timing = {
@@ -15412,10 +15452,21 @@ def train(model, args, loss, writer, plot, notifier=None):
                     writer.write(
                         "Den6OnlineAudit: "
                         f"cache={dict(cache_stats) if isinstance(cache_stats, dict) else {}}, "
+                        f"plan_count={int(audit_plan.get('plan_count', 0) or 0)}, "
+                        f"pool_reference_count={int(audit_plan.get('pool_reference_count', 0) or 0)}, "
+                        f"proposal_source={str(audit_plan.get('proposal_source', ''))}, "
+                        f"selected_action_index={int(audit_plan.get('selected_action_index', -1))}, "
+                        f"selected_action_mask={list(audit_plan.get('selected_action_mask', []))}, "
+                        f"selected_action_count={int(audit_plan.get('selected_action_count', 0) or 0)}, "
+                        f"teacher_bootstrap={bool(audit_plan.get('teacher_bootstrap_active', False))}, "
+                        f"teacher_bc_loss={case_float(audit_plan.get('teacher_behavior_clone_loss', 0.0), 0.0):.6g}, "
                         f"prior_plan_hash={str(audit_plan.get('plan_hash', ''))}, "
                         f"final_voxel_hash={str(audit_plan.get('final_voxel_hash', ''))}, "
                         f"expected_final_voxel_hash={str(audit_plan.get('expected_final_voxel_hash', ''))}, "
                         f"selected_counts={dict(audit_plan.get('selected_counts') or {})}, "
+                        f"selected_amount_ratios={dict(audit_plan.get('selected_amount_ratios') or {})}, "
+                        f"add_selection={dict(audit_plan.get('add_selection_diagnostics') or {})}, "
+                        f"selected_coord_hashes={dict(audit_plan.get('selected_coord_hashes') or {})}, "
                         f"operation_order={str(audit_plan.get('operation_order', ''))}, "
                         f"residual_alpha={float(audit_plan.get('residual_alpha', 0.0)):.6f}, "
                         f"actual_encodes=(baseline={int(actual_audit.get('baseline', audit_compression.get('den6_online_baseline_actual_encode_count', 0)))}, "
@@ -15432,7 +15483,11 @@ def train(model, args, loss, writer, plot, notifier=None):
                         f"{int(getattr(args, '_den6_online_cuda_cache_released_bytes', 0) or 0) / (1024 ** 2):.1f}MiB"
                         f", grad_norms=(where={float(audit_compression.get('den6_online_where_grad_norm', 0.0) or 0.0):.6g}, "
                         f"amount={float(audit_compression.get('den6_online_amount_grad_norm', 0.0) or 0.0):.6g}, "
-                        f"action={float(audit_compression.get('den6_online_action_grad_norm', 0.0) or 0.0):.6g})"
+                        f"action={float(audit_compression.get('den6_online_action_grad_norm', 0.0) or 0.0):.6g}, "
+                        f"surrogate={float(audit_compression.get('surrogate_grad_norm', 0.0) or 0.0):.6g})"
+                        f", grad_norms_pre_decision_balance=(where={float(audit_compression.get('den6_online_where_grad_norm_before_balance', 0.0) or 0.0):.6g}, "
+                        f"amount={float(audit_compression.get('den6_online_amount_grad_norm_before_balance', 0.0) or 0.0):.6g}, "
+                        f"action={float(audit_compression.get('den6_online_action_grad_norm_before_balance', 0.0) or 0.0):.6g})"
                         f", policy=(objective={float(audit_compression.get('den6_online_policy_objective', 0.0) or 0.0):.6g}, "
                         f"baseline={float(audit_compression.get('den6_online_policy_objective_baseline', 0.0) or 0.0):.6g}, "
                         f"advantage={float(audit_compression.get('den6_online_policy_advantage', 0.0) or 0.0):.6g}, "

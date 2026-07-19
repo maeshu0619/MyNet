@@ -2423,6 +2423,11 @@ class Network(nn.Module):
             # OctreeStructureAnalysis内部のproxy guidanceをexact den6 guidanceで上書きする。
             structure["global_voxel_coords"] = global_coords
             structure["ana_den6_ranked_candidate_guidance"] = exact_payload
+            fixed_feature_payload = actuator_octree_context.get(
+                "ana_den6_fixed_feature_guidance", None
+            )
+            if isinstance(fixed_feature_payload, dict):
+                structure["ana_den6_fixed_feature_guidance"] = fixed_feature_payload
             structure["heuristic_guidance"] = build_heuristic_guidance(structure, self.args)
 
         if (

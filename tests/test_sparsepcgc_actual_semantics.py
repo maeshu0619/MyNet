@@ -295,7 +295,7 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
             ):
                 self.assertNotIn(forbidden, payload)
 
-    def test_den6_online_uses_exact_edit_units_but_only_one_full_plan(self):
+    def test_den6_online_ignores_legacy_exact_edit_unit_pool(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             input_file = root / "frame.ply"
@@ -344,6 +344,9 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
                 heuristic_guidance_online_cache_dir=str(cache),
                 heuristic_guidance_online_memory_entries=2,
                 heuristic_guidance_require_exact_single_plan_teacher=True,
+                heuristic_guidance_teacher_bootstrap_steps=200,
+                _den6_online_training_step_active=True,
+                _global_train_step=0,
                 _current_input_file=str(input_file),
                 dataname="8i",
                 sparsepcgc_voxel_size=1.0,
@@ -363,11 +366,12 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
             )
             teacher = attached["ana_den6_ranked_candidate_guidance"]
             self.assertEqual(
-                teacher["source"], "ana_den6_exact_single_plan_teacher_online_v8"
+                teacher["source"], "ana_den6_gt_terms_single_proposal_online_v7"
             )
-            self.assertEqual(teacher["full_plan_candidate_count"], 1)
-            self.assertEqual(teacher["actual_candidate_encode_count"], 0)
-            self.assertIn("operation_edit_units", teacher)
+            self.assertEqual(teacher["proposal_policy"], "one_where_amount_action_per_step")
+            self.assertFalse(teacher["teacher_bootstrap_active"])
+            self.assertEqual(teacher["teacher_bootstrap_steps"], 0)
+            self.assertNotIn("operation_edit_units", teacher)
             self.assertNotIn("operation_candidate_shortlists", teacher)
             guidance = build_heuristic_guidance(
                 {
@@ -386,9 +390,10 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
             )
             self.assertEqual(
                 guidance["formula_basis"],
-                "ana_den6_exact_single_plan_teacher_online_v8",
+                "ana_den6_single_proposal_network_residual_online_v7",
             )
-            self.assertGreater(int(guidance["candidate_mask"]["Prune"].sum()), 0)
+            self.assertNotIn("candidate_mask", guidance)
+            self.assertNotIn("candidate_tensor_map", guidance)
 
     def test_den6_online_v7_builds_single_proposal_prior_without_candidate_pool(self):
         like = torch.tensor([[[0.1, 0.8, 0.3]]], dtype=torch.float32)
@@ -665,8 +670,8 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "exact candidate guidance"):
             build_heuristic_guidance(structure, args)
 
-    def test_den6_online_v5_compact_shortlist_stays_on_exact_path(self):
-        """v5 compact payload must not silently fall back to the proxy/local path."""
+    def test_den6_online_rejects_legacy_v5_candidate_shortlist(self):
+        """online modeへ旧Poolを直接注入する抜け道も拒否する。"""
         coords = torch.tensor(
             [[[0, 1, 0], [0, 0, 1], [0, 0, 0]]], dtype=torch.long
         )
@@ -683,26 +688,22 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
                 "Adjust": [{"operation": "Adjust", "pool_rank": 0, "remove_coords": [[0, 1, 0]], "add_coords": [[0, 1, 1]]}],
             },
         }
-        guidance = build_heuristic_guidance(
-            {
-                "occupancy_nll_proxy": torch.zeros((1, 1, 3), dtype=torch.float32),
-                "global_voxel_coords": coords,
-                "ana_den6_ranked_candidate_guidance": exact,
-            },
-            SimpleNamespace(
-                heuristic_guidance_mode="ana_den6_online",
-                heuristic_guidance_enabled=True,
-                dataname="8i",
-                sparsepcgc_scale_m=8,
-                _current_subtree_id="",
-                heuristic_guidance_tensor_cache_entries=2,
-            ),
-        )
-        self.assertEqual(
-            guidance["formula_basis"],
-            "ana_den6_exact_compact_candidate_shortlist_online_v5",
-        )
-        self.assertIsInstance(guidance["exact_candidate_guidance"], dict)
+        with self.assertRaisesRegex(RuntimeError, "candidate Pool"):
+            build_heuristic_guidance(
+                {
+                    "occupancy_nll_proxy": torch.zeros((1, 1, 3), dtype=torch.float32),
+                    "global_voxel_coords": coords,
+                    "ana_den6_ranked_candidate_guidance": exact,
+                },
+                SimpleNamespace(
+                    heuristic_guidance_mode="ana_den6_online",
+                    heuristic_guidance_enabled=True,
+                    dataname="8i",
+                    sparsepcgc_scale_m=8,
+                    _current_subtree_id="",
+                    heuristic_guidance_tensor_cache_entries=2,
+                ),
+            )
 
     def test_den6_exact_residual_hard_plan_matches_anchor_when_residual_is_zero(self):
         """Network残差0ではden6のpool順・衝突回避・最終Voxel集合を再現する。"""
@@ -797,6 +798,31 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         values["Prune"].backward()
         self.assertTrue(torch.isfinite(network_ratio.grad).all())
         self.assertGreater(float(network_ratio.grad.abs().sum()), 0.0)
+
+    def test_den6_online_amounts_remain_nonzero_after_old_200_step_boundary(self):
+        """旧bootstrap境界を越えても3操作のAmount priorと勾配を消さない。"""
+        guidance = {
+            "amount_prior": {"Add": 0.0010, "Prune": 0.0010, "Adjust": 0.0005},
+        }
+        for step in (120, 200, 201, 600, 1000):
+            actuator = StructureRepairActuator.__new__(StructureRepairActuator)
+            actuator.args = SimpleNamespace(
+                heuristic_guidance_mode="ana_den6_online",
+                _global_train_step=step,
+                _total_train_steps_estimate=1000,
+            )
+            for operation in ("Add", "Prune", "Adjust"):
+                network_ratio = torch.tensor(
+                    [[[0.15]]], dtype=torch.float32, requires_grad=True
+                )
+                value = actuator._apply_heuristic_amount_guidance(
+                    network_ratio, guidance, operation, 0.30
+                )
+                self.assertGreater(float(value.detach()), 0.0)
+                self.assertLessEqual(float(value.detach()), 0.00401)
+                value.backward()
+                self.assertTrue(torch.isfinite(network_ratio.grad).all())
+                self.assertGreater(float(network_ratio.grad.abs().sum()), 0.0)
 
     def test_full_cloud_static_node_input_cache_reuses_detached_state(self):
         """Episode cache must reuse only fixed Node/Voxel inputs, never a graph."""
