@@ -1213,7 +1213,7 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--sparsepcgc_hybrid_amount_min_network_keep',
-        default=0.15,
+        default=0.50,
         type=float,
         help='Amount blend時に最低限残すNetwork比率。0.15ならpriorが強くてもNetworkを15%%残す',
     )
@@ -1635,6 +1635,24 @@ def parse_pugan_args(parser, file_day, file_time):
         default=0.0,
         type=float,
         help='surrogate trust gateの最小信頼度',
+    )
+    parser.add_argument(
+        '--network_only_surrogate_trust_error',
+        default=0.05,
+        type=float,
+        help='Network-only planでSurrogate勾配を全面的に信頼するActual差[%%]の誤差上限',
+    )
+    parser.add_argument(
+        '--network_only_surrogate_disable_error',
+        default=0.50,
+        type=float,
+        help='Network-only planでSurrogateのpolicy向け勾配を0にするActual差[%%]の誤差',
+    )
+    parser.add_argument(
+        '--network_only_adaptive_entropy_weight',
+        default=0.15,
+        type=float,
+        help='raw総量またはshareが境界へ近づいた時だけ有効になるNetwork-only entropy係数',
     )
     parser.add_argument(
         '--prune_amount_soft_anchor_enable',
@@ -2753,8 +2771,10 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--heuristic_guidance_mode',
-        default='ana_den6_online',
+        default='network_k_proposal_policy',
         choices=[
+            'network_k_proposal_policy',
+            'network_only_codec_policy',
             'proxy_prior',
             'ana_den6_online',
             'ana_den6_residual',
@@ -2762,9 +2782,41 @@ def parse_pugan_args(parser, file_day, file_time):
             'ana_den6_reference_ply',
         ],
         help=(
-            'Heuristic guidanceの実行形態。ana_den6_onlineはGT固定proxyを初期priorにし、'
-            'Networkが各StepでWhere/Amount/Actionを1組だけ決めて実圧縮・学習する'
+            'SparsePCGC行動経路。既定network_k_proposal_policyはden/Pool/teacherを使わず、'
+            '1 shared forwardでK専門planを生成しCriticが1つを選ぶ。'
+            'network_only_codec_policyは旧単一候補の比較用legacy mode'
         ),
+    )
+    parser.add_argument('--network_k_proposal_count', default=8, type=int)
+    parser.add_argument('--network_k_proposal_hidden_dim', default=48, type=int)
+    parser.add_argument('--network_k_proposal_shortlist_size', default=32768, type=int)
+    parser.add_argument(
+        '--network_k_offline_dataset', default='', type=str,
+        help='K専門slotのtraining-only offline Actual mode dataset。空ならonline scalar学習のみ',
+    )
+    parser.add_argument(
+        '--network_k_offline_split', default='train', choices=['train', 'validation', 'test'],
+        help='frameとcodec設定を分離したoffline split',
+    )
+    parser.add_argument('--network_k_offline_loss_weight', default=0.1, type=float)
+    parser.add_argument('--network_only_policy_hidden_dim', default=48, type=int)
+    parser.add_argument('--network_only_max_total_ratio', default=0.0099, type=float)
+    parser.add_argument('--network_only_action_exploration_floor', default=0.05, type=float)
+    parser.add_argument('--network_only_where_gumbel_scale', default=1.0, type=float)
+    parser.add_argument('--network_only_exploration_steps', default=100, type=int)
+    parser.add_argument('--network_only_exploration_min_total_ratio', default=0.0020, type=float)
+    parser.add_argument('--network_only_exploration_share_floor', default=0.10, type=float)
+    parser.add_argument(
+        '--network_only_exploration_anneal_steps', default=200, type=int,
+        help='Network-only再パラメータ化探索を最低25%%まで緩やかにannealするStep数',
+    )
+    parser.add_argument('--network_only_plan_gain_loss_weight', default=0.25, type=float)
+    parser.add_argument('--network_only_actual_surrogate_loss_weight', default=1.0, type=float)
+    parser.add_argument(
+        '--network_only_diagnostic_repeat_single_frame',
+        default=0,
+        type=int,
+        help='診断専用。同じ1 PLYを指定回数繰り返す（0で通常Dataset）',
     )
     parser.add_argument(
         '--heuristic_guidance_den6_plan_manifest',
@@ -2897,7 +2949,7 @@ def parse_pugan_args(parser, file_day, file_time):
         '--heuristic_guidance_online_reward_scale',
         default=1.0,
         type=float,
-        help='1候補のActual圧縮率[%]をWhere/Amount/Action方策勾配へ変換する倍率',
+        help='1候補のActual圧縮率[%%]をWhere/Amount/Action方策勾配へ変換する倍率',
     )
     parser.add_argument(
         '--heuristic_guidance_online_advantage_clip',
@@ -3963,9 +4015,11 @@ def parse_pugan_args(parser, file_day, file_time):
         getattr(args, "heuristic_guidance_network_only_inference", True)
     )
     args.heuristic_guidance_mode = str(
-        getattr(args, "heuristic_guidance_mode", "ana_den6_online")
+        getattr(args, "heuristic_guidance_mode", "network_k_proposal_policy")
     ).strip().lower()
     valid_guidance_modes = {
+        "network_k_proposal_policy",
+        "network_only_codec_policy",
         "proxy_prior",
         "ana_den6_online",
         "ana_den6_residual",
@@ -3974,6 +4028,59 @@ def parse_pugan_args(parser, file_day, file_time):
     }
     if args.heuristic_guidance_mode not in valid_guidance_modes:
         raise ValueError(f"未知のheuristic_guidance_mode: {args.heuristic_guidance_mode}")
+    args.network_only_policy_hidden_dim = max(
+        int(getattr(args, "network_only_policy_hidden_dim", 48)), 16
+    )
+    args.network_k_proposal_count = min(max(
+        int(getattr(args, "network_k_proposal_count", 8)), 2
+    ), 16)
+    args.network_k_proposal_hidden_dim = max(
+        int(getattr(args, "network_k_proposal_hidden_dim", 48)), 16
+    )
+    args.network_k_proposal_shortlist_size = max(
+        int(getattr(args, "network_k_proposal_shortlist_size", 32768)), 256
+    )
+    args.network_k_offline_dataset = str(
+        getattr(args, "network_k_offline_dataset", "") or ""
+    ).strip()
+    args.network_k_offline_split = str(
+        getattr(args, "network_k_offline_split", "train") or "train"
+    ).strip().lower()
+    if args.network_k_offline_split not in {"train", "validation", "test"}:
+        raise ValueError("network_k_offline_split must be train/validation/test")
+    args.network_k_offline_loss_weight = max(
+        float(getattr(args, "network_k_offline_loss_weight", 0.1)), 0.0
+    )
+    args.network_only_max_total_ratio = min(max(
+        float(getattr(args, "network_only_max_total_ratio", 0.0099)), 1e-5
+    ), 0.0099)
+    args.network_only_action_exploration_floor = min(max(
+        float(getattr(args, "network_only_action_exploration_floor", 0.05)), 0.0
+    ), 0.25)
+    args.network_only_where_gumbel_scale = max(
+        float(getattr(args, "network_only_where_gumbel_scale", 1.0)), 0.0
+    )
+    args.network_only_exploration_steps = max(
+        int(getattr(args, "network_only_exploration_steps", 100)), 0
+    )
+    args.network_only_exploration_anneal_steps = max(
+        int(getattr(args, "network_only_exploration_anneal_steps", 200)), 1
+    )
+    args.network_only_exploration_min_total_ratio = min(max(
+        float(getattr(args, "network_only_exploration_min_total_ratio", 0.0020)), 0.0
+    ), args.network_only_max_total_ratio)
+    args.network_only_exploration_share_floor = min(max(
+        float(getattr(args, "network_only_exploration_share_floor", 0.10)), 0.0
+    ), 0.30)
+    args.network_only_plan_gain_loss_weight = max(
+        float(getattr(args, "network_only_plan_gain_loss_weight", 0.25)), 0.0
+    )
+    args.network_only_actual_surrogate_loss_weight = max(
+        float(getattr(args, "network_only_actual_surrogate_loss_weight", 1.0)), 0.0
+    )
+    args.network_only_diagnostic_repeat_single_frame = max(
+        int(getattr(args, "network_only_diagnostic_repeat_single_frame", 0)), 0
+    )
     manifest_file = str(getattr(args, "heuristic_guidance_den6_plan_manifest", "")).strip()
     manifest_dir = str(getattr(args, "heuristic_guidance_den6_manifest_dir", "")).strip()
     if (
@@ -4104,6 +4211,66 @@ def parse_pugan_args(parser, file_day, file_time):
     args.heuristic_guidance_auto_build_exact_single_plan_teacher = bool(
         getattr(args, "heuristic_guidance_auto_build_exact_single_plan_teacher", True)
     )
+    if args.heuristic_guidance_mode in {"network_only_codec_policy", "network_k_proposal_policy"}:
+        # Explicit Network-only full-cloud path.  No legacy selector/oracle or
+        # den6 prefetch is allowed to participate in action selection.
+        args.heuristic_guidance_enabled = False
+        args.train_patch_subset_enable = False
+        args.sparsepcgc_training_mode = "legacy"
+        args.sparsepcgc_legacy_direct_actuator_train = True
+        args.sparsepcgc_algorithmic_proposal_selector = False
+        args.sparsepcgc_actual_oracle_edit = False
+        args.sparsepcgc_actual_oracle_apply_teacher_actions = False
+        args.sparsepcgc_actual_oracle_apply_full_override = False
+        args.sparsepcgc_full_cloud_actual_primary = False
+        args.sparsepcgc_require_full_cloud_actual_teacher = False
+        args.train_full_cloud_actual_interval = 0
+        args.train_full_cloud_anchor_every_step = False
+        args.full_cloud_anchor_allow_grad = True
+        args.full_cloud_anchor_grad_node_limit = max(
+            int(getattr(args, "full_cloud_anchor_grad_node_limit", 50000)), 2000000
+        )
+        args.full_cloud_anchor_train_shadow_subtree = False
+        args.train_full_cloud_anchor_every_step_shadow = False
+        args.sparsepcgc_actual_every_step = True
+        args.actual_eval_interval = 1
+        args.disable_actual_codec_during_train = False
+        args.sparsepcgc_actual_result_cache = False
+        args.compression_surrogate_target_cache_entries = 0
+        args.compression_surrogate_replay_entries = 0
+        args.compression_surrogate_replay_steps = 0
+        args.compression_surrogate_reuse_last_target = False
+        args.compression_surrogate_refresh_interval = 1
+        args.heuristic_guidance_online_prefetch_workers = 0
+        args.heuristic_guidance_online_prefetch_build_missing = False
+        args.batch_size = 1
+        args.sparsepcgc_actual_gate_prune = False
+        args.sparsepcgc_actual_gate_non_prune = False
+        args.sparsepcgc_disable_add = False
+        args.sparsepcgc_enable_add_experiment = True
+        args.sparsepcgc_add_only_when_compression_primary = False
+        args.sparsepcgc_codec_prune_prior = False
+        args.repair_amount_target_mode = "none"
+        args.repair_operation_gate_hard_forward = True
+        args.repair_operation_gate_random_mix_start = 0.0
+        args.repair_operation_gate_random_mix_end = 0.0
+        args.repair_add_amount_random_mix_start = 0.0
+        args.repair_add_amount_random_mix_end = 0.0
+        args.repair_move_amount_random_mix_start = 0.0
+        args.repair_move_amount_random_mix_end = 0.0
+        args.repair_drop_amount_random_mix_start = 0.0
+        args.repair_drop_amount_random_mix_end = 0.0
+        args.repair_add_ratio_floor = 0.0
+        args.repair_drop_ratio_floor = 0.0
+        args.repair_move_ratio_floor = 0.0
+        args.repair_force_min_add_voxels = False
+        args.repair_force_min_move_voxels = False
+        args.repair_force_min_drop_voxels = False
+        args.heuristic_guidance_teacher_bootstrap_steps = 0
+        args.heuristic_guidance_teacher_distill_weight = 0.0
+        args.heuristic_guidance_exact_anchor_steps = 0
+        if not _cli_option_was_provided("--more_training"):
+            args.more_training = False
     if args.heuristic_guidance_enabled and args.heuristic_guidance_mode == "ana_den6_online":
         # online方式は全点群から1%未満の微小Voxelを1planだけ選ぶ。
         # 候補pool・複数Actual比較・加工後結果cacheは使わず、毎StepのNetwork出力を
@@ -7275,6 +7442,19 @@ def parse_pugan_args(parser, file_day, file_time):
             args.repair_move_score_noise_start = max(float(getattr(args, "repair_move_score_noise_start", 0.0)), 0.05)
         if not _cli_option_was_provided("--repair_move_score_noise_end"):
             args.repair_move_score_noise_end = max(float(getattr(args, "repair_move_score_noise_end", 0.0)), 0.01)
+    if str(getattr(args, "heuristic_guidance_mode", "")).strip().lower() in {"network_only_codec_policy", "network_k_proposal_policy"}:
+        # Exploration is sampled inside NetworkOnlyCodecPolicy so the sampled
+        # action and the recorded log-probability refer to the same policy.
+        args.repair_drop_score_noise_start = 0.0
+        args.repair_drop_score_noise_end = 0.0
+        args.repair_add_score_noise_start = 0.0
+        args.repair_add_score_noise_end = 0.0
+        args.repair_move_score_noise_start = 0.0
+        args.repair_move_score_noise_end = 0.0
+        args.repair_add_weight_random_mix_start = 0.0
+        args.repair_add_weight_random_mix_end = 0.0
+        args.repair_operation_gate_random_mix_start = 0.0
+        args.repair_operation_gate_random_mix_end = 0.0
     args.sparsepcgc_ckptdir = _resolve_from_base_path(args.sparsepcgc_ckptdir, args.sparsepcgc_root)
     args.sparsepcgc_ckptdir_sr = _resolve_from_base_path(args.sparsepcgc_ckptdir_sr, args.sparsepcgc_root)
     args.sparsepcgc_ckptdir_ae = _resolve_from_base_path(args.sparsepcgc_ckptdir_ae, args.sparsepcgc_root)
@@ -7440,4 +7620,73 @@ def parse_pugan_args(parser, file_day, file_time):
             args.repair_move_score_noise_start = 0.0
         if not _cli_option_was_provided("--repair_move_score_noise_end"):
             args.repair_move_score_noise_end = 0.0
+    if str(getattr(args, "heuristic_guidance_mode", "")).strip().lower() in {"network_only_codec_policy", "network_k_proposal_policy"}:
+        # Final isolation guard: generic SparsePCGC defaults are normalized
+        # above and historically re-enabled priors/bandit Amount after the
+        # mode-specific block.  Reassert the Network-only contract last.
+        args.heuristic_guidance_enabled = False
+        args.sparsepcgc_codec_prune_prior = False
+        args.sparsepcgc_hybrid_prune_prior = False
+        args.sparsepcgc_hybrid_hard_action = False
+        args.sparsepcgc_hybrid_prior_amount_blend = False
+        args.sparsepcgc_warmup_force_codec_prior_amount = False
+        args.sparsepcgc_post_warmup_amount_strategy = "network"
+        args.sparsepcgc_hybrid_amount_mode = "network"
+        args.sparsepcgc_network_prune_ratio_floor = 0.0
+        args.sparsepcgc_network_prune_min_hard_count = 0
+        args.sparsepcgc_codec_prior_warmup_min_hard_count = 0
+        args.sparsepcgc_algorithmic_proposal_selector = False
+        args.sparsepcgc_actual_oracle_edit = False
+        args.sparsepcgc_actual_oracle_apply_teacher_actions = False
+        args.sparsepcgc_actual_oracle_apply_full_override = False
+        args.sparsepcgc_actual_gate_prune = False
+        args.sparsepcgc_actual_gate_non_prune = False
+        args.sparsepcgc_amount_success_teacher_weight = 0.0
+        args.sparsepcgc_post_warmup_amount_teacher_weight = 0.0
+        args.sparsepcgc_algorithmic_amount_selector_teacher_weight = 0.0
+        args.sparsepcgc_multi_subtree_train = False
+        args.sparsepcgc_outcome_imitation = False
+        args.sparsepcgc_subtree_actual_filter = False
+        args.sparsepcgc_anchor_success_teacher = False
+        args.leaf_pattern_actuator_prior = False
+        args.leaf_pattern_operation_mask = False
+        args.leaf_pattern_target_direction_prior = False
+        args.leaf_pattern_target_direction_mask = False
+        # A generic legacy default caps Adjust to one voxel whenever
+        # heuristic guidance is disabled. Network-only Amount owns this count.
+        args.repair_max_hard_move_voxels = 0
+        args.repair_move_min_hard_expected_voxels = 0.0
+        # Actual scalar policy credit must not be drowned by the initially
+        # inaccurate Surrogate gradient.  Entropy is a distributional safety
+        # term, not a fixed Amount/share target.
+        if not _cli_option_was_provided("--heuristic_guidance_online_policy_weight"):
+            # Actual percent is scaled before REINFORCE; averaging the four
+            # action-family log-probs and this coefficient keep its weighted
+            # magnitude comparable to Actual/Surrogate and entropy losses.
+            args.heuristic_guidance_online_policy_weight = 0.20
+        if not _cli_option_was_provided("--network_only_plan_gain_loss_weight"):
+            args.network_only_plan_gain_loss_weight = 1.0
+        if not _cli_option_was_provided("--heuristic_guidance_online_entropy_weight"):
+            args.heuristic_guidance_online_entropy_weight = 0.005
+        args.repair_drop_ratio_floor = 0.0
+        args.repair_add_ratio_floor = 0.0
+        args.repair_move_ratio_floor = 0.0
+        # Exploration comes from the Actor distributions themselves.  These
+        # legacy forward floors would make the raw policy and executed plan
+        # disagree and only hide Amount/share collapse.
+        args.network_only_exploration_min_total_ratio = 0.0
+        args.network_only_exploration_share_floor = 0.0
+        args.save_good_bad_cases = False
+        args.save_proxy_actual_bad_cases = False
+        args.phase7_eval_summary = False
+        args.loss_grad_probe_enabled = False
+        args.step_grad_log = False
+        args.compression_grad_probe = False
+        args.debug_grad_flow = False
+        args.heuristic_guidance_online_prefetch_workers = 0
+        args.heuristic_guidance_online_prefetch_build_missing = False
+        args.compression_surrogate_replay_entries = 0
+        args.compression_surrogate_replay_steps = 0
+        args.compression_surrogate_reuse_last_target = False
+        args.compression_surrogate_refresh_interval = 1
     return args

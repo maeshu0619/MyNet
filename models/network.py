@@ -23,6 +23,9 @@ from .modules.octree_structure import OctreeStructureAnalysis
 from .modules.proposal_selector import AlgorithmicProposalSelector, FullCloudAmountSelector
 from .modules.structure_actuator import StructureRepairActuator
 from .modules.structure_policy import POLICY_NAMES, StructureRepairPolicy
+from .modules.network_only_codec_policy import NetworkOnlyCodecPolicy
+from .modules.network_k_proposal_policy import NetworkKProposalPolicy
+from .utils.loss.k_proposal_distillation import KProposalSetLoss
 
 
 class Network(nn.Module):
@@ -58,6 +61,7 @@ class Network(nn.Module):
         self.last_runtime_timing = {} # 直近Forward時の実行時間計測結果を保存する辞書を初期化
         self._den6_online_objective_baseline = OrderedDict()
         self.last_discrete_policy_debug = {}
+        self.last_k_proposal_terms = None
 
         """モジュールセットアップ"""
         self.encoder = PointTransformer(self.args) # 特徴抽出器
@@ -81,6 +85,29 @@ class Network(nn.Module):
             hidden_dim=int(getattr(self.args, "repair_actuator_hidden_dim", 64)),
             args=self.args,
         )
+        actuator_feature_dim = (
+            structure_dim + len(CAUSE_NAMES) + len(POLICY_NAMES)
+            + self.cause_aggregator.priority_dim
+        )
+        self.network_only_codec_policy = NetworkOnlyCodecPolicy(
+            in_channels=actuator_feature_dim,
+            hidden_dim=int(getattr(self.args, "network_only_policy_hidden_dim", 48)),
+            max_total_ratio=float(
+                getattr(self.args, "network_only_max_total_ratio", 0.0099)
+            ),
+        )
+        self.network_k_proposal_policy = NetworkKProposalPolicy(
+            in_channels=actuator_feature_dim,
+            hidden_dim=int(getattr(self.args, "network_k_proposal_hidden_dim", 48)),
+            proposal_count=int(getattr(self.args, "network_k_proposal_count", 8)),
+            max_total_ratio=float(
+                getattr(self.args, "network_only_max_total_ratio", 0.0099)
+            ),
+            shortlist_size=int(
+                getattr(self.args, "network_k_proposal_shortlist_size", 32768)
+            ),
+        )
+        self.k_proposal_set_loss = KProposalSetLoss()
         proposal_amount_bins = getattr(self.args, "sparsepcgc_proposal_amount_bin_values", None)
         if not isinstance(proposal_amount_bins, (list, tuple)) or not proposal_amount_bins:
             proposal_amount_bins = (0.0, 0.015, 0.021, 0.026, 0.031, 0.038, 0.044, 0.05)
@@ -270,11 +297,11 @@ class Network(nn.Module):
 
     """補助関数"""
     def discrete_policy_loss(self, reward):
-        """actual圧縮結果からden6 onlineのWhere/Amount/Actionを更新する。"""
+        """Update the executed one-plan policy from the actual codec scalar."""
         if not torch.is_tensor(reward):
             raise TypeError("discrete_policy_lossのrewardはTensorである必要がある")
         mode = str(getattr(self.args, "heuristic_guidance_mode", "proxy_prior")).strip().lower()
-        if mode != "ana_den6_online":
+        if mode not in {"ana_den6_online", "network_only_codec_policy", "network_k_proposal_policy"}:
             return reward.new_zeros(())
         state = self.last_actuator_voxel_state
         if not isinstance(state, dict):
@@ -302,14 +329,28 @@ class Network(nn.Module):
         advantage_clip = max(
             float(getattr(self.args, "heuristic_guidance_online_advantage_clip", 2.0)), 0.0
         )
-        advantage = (previous_t - objective.detach()) * float(reward_scale)
+        # Compression objective convention: negative is improvement.  A
+        # positive (worsening) EMA must never make a zero-bit-change plan look
+        # successful, otherwise the Actor is explicitly trained toward the
+        # observed 0% collapse.  Use the EMA only after it is on the improving
+        # side; zero remains neutral while any worsening plan is penalized.
+        effective_baseline_t = torch.minimum(previous_t, previous_t.new_zeros(()))
+        advantage = (effective_baseline_t - objective.detach()) * float(reward_scale)
         if advantage_clip > 0.0:
             advantage = advantage.clamp(-advantage_clip, advantage_clip)
-        # 各入力のno-op(0%)または過去最良Actualを基準にする。遅いEMAでは、
-        # 前回より悪いplanでも0より良いだけで何Episodeも強化されてしまう。
-        # best-so-farなら改善した1planだけを強化し、悪化は必ず抑制できる。
+        # Use an EMA state baseline, not best-so-far.  A single lucky codec
+        # quantisation event must not make every subsequent exploratory plan
+        # negative-advantage forever; that failure mode collapsed Amount to
+        # zero after the first -1 byte event.
         objective_value = float(objective.detach().cpu())
-        updated = min(float(previous) if baseline_seen else 0.0, objective_value)
+        baseline_alpha = min(max(
+            float(getattr(self.args, "heuristic_guidance_online_reward_ema", 0.10)),
+            1e-4,
+        ), 1.0)
+        updated = (
+            (1.0 - baseline_alpha) * float(previous) + baseline_alpha * objective_value
+            if baseline_seen else objective_value
+        )
         self._den6_online_objective_baseline[cache_key] = float(updated)
         self._den6_online_objective_baseline.move_to_end(cache_key)
         while len(self._den6_online_objective_baseline) > 4096:
@@ -317,22 +358,105 @@ class Network(nn.Module):
 
         weight = max(float(getattr(self.args, "heuristic_guidance_online_policy_weight", 1.0)), 0.0)
         entropy_weight = max(float(getattr(self.args, "heuristic_guidance_online_entropy_weight", 0.001)), 0.0)
-        policy_loss = -weight * advantage * log_prob.float().mean()
+        policy_core_raw = -advantage * log_prob.float().mean()
+        policy_core_weighted = weight * policy_core_raw
+        policy_loss = policy_core_weighted
+        entropy_raw = entropy.float().mean() if torch.is_tensor(entropy) else objective.new_zeros(())
+        entropy_weighted = -entropy_weight * entropy_raw
         if torch.is_tensor(entropy):
-            policy_loss = policy_loss - entropy_weight * entropy.float().mean()
+            policy_loss = policy_loss + entropy_weighted
+        adaptive_amount_entropy = objective.new_zeros(())
+        adaptive_amount_entropy_weighted = objective.new_zeros(())
+        if mode in {"network_only_codec_policy", "network_k_proposal_policy"}:
+            amount_entropy = state.get("network_only_amount_entropy", None)
+            ratio_mean = state.get("network_only_total_ratio_mean", None)
+            shares_mean = state.get("network_only_shares_mean", None)
+            if (
+                torch.is_tensor(amount_entropy)
+                and torch.is_tensor(ratio_mean)
+                and torch.is_tensor(shares_mean)
+            ):
+                ratio_boundary = max(
+                    1.0 - float(ratio_mean.detach().float().mean().cpu()) / 0.0015,
+                    0.0,
+                )
+                share_boundary = max(
+                    1.0 - float(shares_mean.detach().float().min().cpu()) / 0.15,
+                    0.0,
+                )
+                collapse_severity = min(max(ratio_boundary, share_boundary), 1.0)
+                adaptive_weight = max(
+                    float(getattr(self.args, "network_only_adaptive_entropy_weight", 0.50)),
+                    0.0,
+                ) * collapse_severity
+                adaptive_amount_entropy = amount_entropy.float().mean()
+                adaptive_amount_entropy_weighted = -adaptive_weight * adaptive_amount_entropy
+                policy_loss = policy_loss + adaptive_amount_entropy_weighted
         self.last_discrete_policy_debug = {
             "objective": float(objective.detach().cpu()),
             "objective_baseline": float(previous),
+            "objective_effective_baseline": float(effective_baseline_t.detach().cpu()),
             "advantage": float(advantage.detach().cpu()),
             "log_prob": float(log_prob.detach().float().mean().cpu()),
             "entropy": float(entropy.detach().float().mean().cpu()) if torch.is_tensor(entropy) else 0.0,
+            "policy_core_raw": float(policy_core_raw.detach().cpu()),
+            "policy_core_weighted": float(policy_core_weighted.detach().cpu()),
+            "entropy_raw": float(entropy_raw.detach().cpu()),
+            "entropy_weighted": float(entropy_weighted.detach().cpu()),
+            "adaptive_amount_entropy_raw": float(adaptive_amount_entropy.detach().cpu()),
+            "adaptive_amount_entropy_weighted": float(adaptive_amount_entropy_weighted.detach().cpu()),
+            "baseline_ema_alpha": float(baseline_alpha),
             "policy_loss": float(policy_loss.detach().cpu()),
         }
         return policy_loss.to(dtype=reward.dtype)
 
+    def network_only_plan_gain_loss(self, actual_bit_percent):
+        """Fit the plan-level local-sum + interaction predictor to actual bits."""
+        if not torch.is_tensor(actual_bit_percent):
+            raise TypeError("actual_bit_percent must be a Tensor")
+        if str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower() not in {
+            "network_only_codec_policy", "network_k_proposal_policy"
+        }:
+            return actual_bit_percent.new_zeros(())
+        state = self.last_actuator_voxel_state
+        prediction = state.get("network_only_predicted_plan_gain") if isinstance(state, dict) else None
+        if not torch.is_tensor(prediction) or not prediction.requires_grad:
+            raise RuntimeError("network-only plan gain predictor is detached or missing")
+        # ``prediction`` is a gain: larger values are ranked ahead by the
+        # policy.  Actual compression is an objective delta where negative is
+        # better, so its regression target must have the opposite sign.
+        # Using the raw objective here reinforced codec-worsening locations.
+        target = (-actual_bit_percent.detach().float().mean()).expand_as(prediction.float())
+        loss = torch.nn.functional.smooth_l1_loss(
+            prediction.float(), target, beta=0.25
+        )
+        weight = max(float(getattr(self.args, "network_only_plan_gain_loss_weight", 0.25)), 0.0)
+        weighted = loss * weight
+        self.last_discrete_policy_debug.update({
+            "predicted_plan_gain": float(prediction.detach().float().mean().cpu()),
+            "plan_gain_target": float(target.detach().float().mean().cpu()),
+            "plan_gain_huber": float(loss.detach().cpu()),
+            "plan_gain_huber_weighted": float(weighted.detach().cpu()),
+        })
+        return weighted.to(dtype=actual_bit_percent.dtype)
+
     def score_algorithmic_proposal_subtrees(self, subtree_features):
         """Score candidate subtrees for the algorithmic proposal selector path."""
         return self.algorithmic_proposal_selector(subtree_features)
+
+    def k_proposal_offline_distillation_loss(self, teacher):
+        """Fit K specialists from an explicitly supplied offline Actual set.
+
+        No dataset/cache is loaded here.  Training orchestration must supply a
+        current-state teacher tensor; inference never calls this method.
+        """
+        if str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower() != "network_k_proposal_policy":
+            raise RuntimeError("K proposal distillation requires network_k_proposal_policy mode")
+        if not self.training:
+            raise RuntimeError("offline K proposal distillation is training-only")
+        if not isinstance(self.last_k_proposal_terms, dict):
+            raise RuntimeError("K proposal forward must run before distillation loss")
+        return self.k_proposal_set_loss(self.last_k_proposal_terms, teacher)
 
     def _normalize_coord_scale(self, pts_xyz, coord_scale): # 座標スケールと点群テンソルに合わせた形に整える補助関数
         if coord_scale is None:
@@ -1430,7 +1554,7 @@ class Network(nn.Module):
         guidance_mode = str(
             getattr(self.args, "heuristic_guidance_mode", "")
         ).strip().lower()
-        if guidance_mode == "ana_den6_online":
+        if guidance_mode in {"ana_den6_online", "network_only_codec_policy", "network_k_proposal_policy"}:
             if isinstance(full_octree_context, dict) and any(
                 key.startswith("actual_oracle_")
                 for key in full_octree_context
@@ -1553,6 +1677,7 @@ class Network(nn.Module):
             raise ValueError("pts_xyz must have shape [B, 3, N]")
 
         self.last_actuator_voxel_state = None
+        self.last_k_proposal_terms = None
         collect_runtime_debug = self._should_collect_runtime_debug()
         # CostAttribution/Policy used to calculate several full-cloud
         # reductions unconditionally merely to populate debug dictionaries.
@@ -1564,7 +1689,7 @@ class Network(nn.Module):
             self.training
             and getattr(self.args, "full_cloud_activation_checkpoint", True)
             and str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower()
-            == "ana_den6_online"
+            in {"ana_den6_online", "network_only_codec_policy", "network_k_proposal_policy"}
         )
         self.cost_attributor.activation_checkpointing = checkpoint_full_cloud_heads
         self.policy_module.activation_checkpointing = checkpoint_full_cloud_heads
@@ -1590,6 +1715,9 @@ class Network(nn.Module):
         guidance_mode = str(
             getattr(self.args, "heuristic_guidance_mode", "proxy_prior")
         ).strip().lower()
+        network_only_codec_mode = guidance_mode in {
+            "network_only_codec_policy", "network_k_proposal_policy"
+        }
         network_only_guidance_forward = bool(
             guidance_mode == "ana_den6_online"
             and not self.training
@@ -1603,6 +1731,16 @@ class Network(nn.Module):
             "_heuristic_guidance_network_only_forward",
             network_only_guidance_forward,
         )
+        if network_only_codec_mode and isinstance(full_octree_context, dict) and any(
+            str(key).startswith(("ana_den", "teacher", "actual_oracle"))
+            for key in full_octree_context
+        ):
+            # Never ignore an injected cached action payload.  A Network-only
+            # run fails closed instead of silently consulting or falling back
+            # to a legacy plan.
+            raise RuntimeError(
+                "network_only_codec_policy received forbidden den/teacher/oracle payload"
+            )
         if bool(getattr(self.args, "heuristic_guidance_enabled", True)):
             if guidance_mode == "ana_den6_online":
                 if not isinstance(full_octree_context, dict):
@@ -2401,6 +2539,34 @@ class Network(nn.Module):
             [structure_feat_full, subtree_scores_full, policy_probs_full, repair_priority_full],
             dim=1,
         ) # 構造特徴、原因スコアなどをチャネル方向に結合
+        network_only_policy_terms = None
+        k_proposal_terms = None
+        if guidance_mode == "network_only_codec_policy":
+            # Legacy diagnosis/policy tensors are fixed observations for the
+            # new codec policy.  Detaching here prevents the one-plan Actual
+            # loss from retaining/updating the old heuristic-oriented graph;
+            # gradients still flow through every NetworkOnlyCodecPolicy head.
+            actuator_input = actuator_input.detach()
+            network_only_policy_terms = self.network_only_codec_policy(
+                actuator_input,
+                self.args,
+                training=self.training,
+                fixed_features=structure.get("network_only_fixed_features"),
+            )
+        elif guidance_mode == "network_k_proposal_policy":
+            # One shared encoder/basis creates K deterministic specialized
+            # plans.  Only the Critic-selected compact plan is expanded into
+            # the existing Actuator's one-plan interface.
+            actuator_input = actuator_input.detach()
+            k_proposal_terms = self.network_k_proposal_policy(
+                actuator_input,
+                self.args,
+                training=self.training,
+                fixed_features=structure.get("network_only_fixed_features"),
+                voxel_coords=structure.get("global_voxel_coords"),
+            )
+            self.last_k_proposal_terms = k_proposal_terms
+            network_only_policy_terms = k_proposal_terms["selected_policy_terms"]
         full_cloud_amount_terms = None
         if (
             is_full_cloud_forward
@@ -2478,7 +2644,7 @@ class Network(nn.Module):
         # workspace reservations.
         if (
             is_full_cloud_forward
-            and guidance_mode == "ana_den6_online"
+            and guidance_mode in {"ana_den6_online", "network_only_codec_policy", "network_k_proposal_policy"}
             and not network_only_guidance_forward
             and bool(getattr(self.args, "den6_online_release_cuda_cache_before_actuator", True))
             and pts_xyz.is_cuda
@@ -2491,15 +2657,15 @@ class Network(nn.Module):
         offload_saved_tensors = bool(
             self.training
             and is_full_cloud_forward
-            and guidance_mode == "ana_den6_online"
+            and guidance_mode in {"ana_den6_online", "network_only_codec_policy", "network_k_proposal_policy"}
             and offload_threshold_mb > 0.0
             and pts_xyz.is_cuda
         )
         if offload_saved_tensors:
-            # Use PyTorch's lifecycle-aware implementation.  The former
-            # selective hook returned small CUDA tensors inside its packed
-            # object, so Torch 1.11 kept them alive with graph references and
-            # GPU usage grew by several GiB per Step.
+            # Full graph offload is intentional here. Selective offload was
+            # faster, but retained many individually-small masks and reached
+            # 12 GiB in the main process (plus the codec worker) after only a
+            # few same-frame steps.
             saved_tensor_context = torch.autograd.graph.save_on_cpu(
                 pin_memory=bool(
                     getattr(self.args, "full_cloud_saved_tensor_pin_memory", False)
@@ -2521,6 +2687,7 @@ class Network(nn.Module):
                 octree_context=actuator_octree_context,
                 full_octree_context=full_octree_context,
                 full_cloud_amount_terms=full_cloud_amount_terms,
+                network_only_policy_terms=network_only_policy_terms,
             )
         if isinstance(actuator_stats, dict):
             actuator_stats["actuator_octree_context_source"] = str(actuator_octree_context_source)
@@ -2530,6 +2697,45 @@ class Network(nn.Module):
                 isinstance(actuator_octree_context, dict)
                 and actuator_octree_context.get("global_voxel_coords", None) is not None
             )
+            if isinstance(k_proposal_terms, dict):
+                # Tensor-valued diagnostics remain attached for offline
+                # proposal/Critic losses; integer counters are inference
+                # contract evidence and contain no cache/teacher state.
+                actuator_stats.update({
+                    "k_proposal_selected_slot": k_proposal_terms["selected_slot"],
+                    "k_proposal_predicted_gain": k_proposal_terms["predicted_gain"],
+                    "k_proposal_predicted_geometry": k_proposal_terms["predicted_geometry"],
+                    "k_proposal_predicted_interaction": k_proposal_terms["predicted_interaction"],
+                    "k_proposal_uncertainty": k_proposal_terms["uncertainty"],
+                    "k_proposal_compact_descriptor": k_proposal_terms["compact_plans"]["descriptor"],
+                    "k_proposal_accepted_count": k_proposal_terms["compact_plans"]["accepted_count"],
+                    "k_proposal_collision_count": k_proposal_terms["compact_plans"]["collision_count"],
+                    "shared_encoder_forward_count": 1,
+                    "shared_basis_forward_count": 1,
+                    "proposal_count": int(k_proposal_terms["proposal_count"]),
+                    "critic_batch_count": 1,
+                    "selected_plan_count": 1,
+                    "den6_call_count": 0,
+                    "cache_reference_count": 0,
+                    "teacher_reference_count": 0,
+                    "sparsepcgc_probe_count": 0,
+                    "candidate_actual_encode_count": 0,
+                })
+                selected_expected = self.network_k_proposal_policy._select_slot_tensor(
+                    k_proposal_terms["compact_plans"]["accepted_count"],
+                    k_proposal_terms["selected_slot"],
+                )
+                # Network order is Prune/Add/Adjust and matches Actuator stats.
+                executed_counts = selected_expected.new_tensor((
+                    float(actuator_stats.get("voxel_edit_drop_count", 0) or 0),
+                    float(actuator_stats.get("voxel_edit_add_count", 0) or 0),
+                    float(actuator_stats.get("voxel_edit_move_count", 0) or 0),
+                )).view(1, 3).expand_as(selected_expected)
+                actuator_stats["k_proposal_expected_count"] = selected_expected
+                actuator_stats["k_proposal_executed_count"] = executed_counts
+                actuator_stats["k_proposal_execution_count_mismatch"] = (
+                    executed_counts - selected_expected
+                ).abs().sum(dim=1)
             
         # Actuatorが内部で更新したVoxel状態をLoss / compression.py 側から読めるように保存する。
         actuator_voxel_state = {
@@ -2590,6 +2796,48 @@ class Network(nn.Module):
                 "den6_online_where_log_prob",
                 "den6_online_amount_log_prob",
                 "den6_online_action_log_prob",
+                "network_only_direction_log_prob",
+                "network_only_direction_entropy",
+                "network_only_total_ratio_raw",
+                "network_only_total_ratio",
+                "network_only_total_ratio_unconstrained",
+                "k_proposal_selected_slot",
+                "k_proposal_predicted_gain",
+                "k_proposal_predicted_geometry",
+                "k_proposal_predicted_interaction",
+                "k_proposal_uncertainty",
+                "k_proposal_compact_descriptor",
+                "k_proposal_accepted_count",
+                "k_proposal_collision_count",
+                "k_proposal_expected_count",
+                "k_proposal_executed_count",
+                "k_proposal_execution_count_mismatch",
+                "shared_encoder_forward_count",
+                "shared_basis_forward_count",
+                "proposal_count",
+                "critic_batch_count",
+                "selected_plan_count",
+                "den6_call_count",
+                "cache_reference_count",
+                "teacher_reference_count",
+                "sparsepcgc_probe_count",
+                "candidate_actual_encode_count",
+                "network_only_total_ratio_mean",
+                "network_only_shares",
+                "network_only_shares_raw",
+                "network_only_shares_mean",
+                "network_only_priorities",
+                "network_only_temperature",
+                "network_only_where_threshold",
+                "network_only_where_sampling_temperature",
+                "network_only_exploration_fraction",
+                "network_only_predicted_local_gain_sum",
+                "network_only_interaction_correction",
+                "network_only_predicted_plan_gain",
+                "network_only_where_entropy",
+                "network_only_amount_entropy",
+                "network_only_action_entropy",
+                "network_only_direction_sampling_temperature",
             )
             if actuator_stats.get(key, None) is not None
         }
@@ -2852,6 +3100,20 @@ class Network(nn.Module):
             "codec_block_budget_zero",
             "codec_block_target_drop_ratio",
             "codec_block_under_selected",
+            "network_only_direction_log_prob",
+            "network_only_total_ratio_raw",
+            "network_only_total_ratio",
+            "network_only_total_ratio_unconstrained",
+            "network_only_shares",
+            "network_only_shares_raw",
+            "network_only_priorities",
+            "network_only_temperature",
+            "network_only_predicted_local_gain_sum",
+            "network_only_interaction_correction",
+            "network_only_predicted_plan_gain",
+            "network_only_where_entropy",
+            "network_only_amount_entropy",
+            "network_only_action_entropy",
         )
         self.last_actuator_soft_terms = {
             key: value

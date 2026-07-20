@@ -202,7 +202,7 @@ class OctreeStructureAnalysis(nn.Module):
         safe_pos = pos.clamp(max=max(int(reference_keys.numel()) - 1, 0))
         return in_bounds & (reference_keys[safe_pos] == query_keys)
 
-    def _neighbor_occupancy_chunked(self, coords, unique_coords=None):
+    def _neighbor_occupancy_chunked(self, coords, unique_coords=None, return_details=False):
         """Compute the exact 26-neighbour occupancy with bounded workspace.
 
         The previous implementation materialised all ``N * 26 * 3`` int64
@@ -233,6 +233,14 @@ class OctreeStructureAnalysis(nn.Module):
         result = torch.empty(
             (coords.shape[0],), device=coords.device, dtype=torch.float32
         )
+        details = (
+            torch.empty((6, coords.shape[0]), device=coords.device, dtype=torch.float32)
+            if return_details else None
+        )
+        offset_l1 = offsets.abs().sum(dim=1)
+        offset_norm = torch.linalg.vector_norm(offsets.float(), dim=1)
+        mask_6 = offset_l1 == 1
+        mask_18 = offset_l1 <= 2
         for start in range(0, int(coords.shape[0]), chunk_size):
             end = min(start + chunk_size, int(coords.shape[0]))
             targets = coords[start:end, None, :] + offsets.view(1, -1, 3)
@@ -245,7 +253,33 @@ class OctreeStructureAnalysis(nn.Module):
             occupied = (
                 in_bounds & (occupied_keys[safe_pos] == query_keys)
             ).view(end - start, -1)
-            result[start:end] = occupied.to(torch.float32).mean(dim=1)
+            occupied_f = occupied.to(torch.float32)
+            result[start:end] = occupied_f.mean(dim=1)
+            if details is not None:
+                support = occupied_f.sum(dim=1)
+                occ6 = occupied_f[:, mask_6].mean(dim=1)
+                occ18 = occupied_f[:, mask_18].mean(dim=1)
+                occ26 = occupied_f.mean(dim=1)
+                isolation = (support <= 0.0).to(torch.float32)
+                nearest = torch.where(
+                    occupied,
+                    offset_norm.view(1, -1),
+                    offset_norm.new_full((1, offsets.shape[0]), 4.0),
+                ).amin(dim=1).clamp_max(3.0) / (3.0 ** 0.5)
+                # Axis-aligned local-plane residual proxy.  It is computed
+                # from the same 26-neighbour occupancy query, without KNN or
+                # an O(N^2) covariance/eigendecomposition.
+                support_safe = support.clamp_min(1.0).view(-1, 1)
+                neighbor_xyz = occupied_f @ offsets.float()
+                neighbor_mean = neighbor_xyz / support_safe
+                second = occupied_f @ offsets.float().square()
+                axis_variance = (second / support_safe - neighbor_mean.square()).clamp_min(0.0)
+                plane_distance = axis_variance.amin(dim=1).sqrt().clamp_max(1.0)
+                details[:, start:end] = torch.stack(
+                    (occ6, occ18, occ26, isolation, nearest, plane_distance), dim=0
+                )
+        if details is not None:
+            return result, details
         return result
 
     def _quantized_voxel_stats(self, pts_xyz, qs_override, snap_delta_norm):
@@ -1504,12 +1538,13 @@ class OctreeStructureAnalysis(nn.Module):
                 return cached
 
         unique_coords = torch.unique(coords, dim=0, sorted=True)
-        result = self._neighbor_occupancy_chunked(
-            coords, unique_coords=unique_coords
+        result, details = self._neighbor_occupancy_chunked(
+            coords, unique_coords=unique_coords, return_details=True
         )
         active = getattr(self, "_active_canonical_neighbor_cache", None)
         if isinstance(active, dict) and active.get("allow_write", False):
             active["value"] = result
+            active["details"] = details
             active["allow_write"] = False
             active["allow_read"] = True
         return result
@@ -1695,6 +1730,7 @@ class OctreeStructureAnalysis(nn.Module):
             "allow_write": True,
             "allow_read": False,
             "value": None,
+            "details": None,
         }
         self._active_canonical_parent_cache = None
 
@@ -2198,15 +2234,20 @@ class OctreeStructureAnalysis(nn.Module):
         # 追加のactual codec呼出やKNNは行わないため、Step時間への影響を小さく保つ。
         # ana_den6_residualでは、den5/den6が生成した順位付き候補poolを
         # proxyへ置換せず、そのままHeuristic guidanceへ渡す。
-        exact_den6_guidance = (
-            source_tree_for_key.get("ana_den6_ranked_candidate_guidance")
-            if isinstance(source_tree_for_key, dict)
-            else None
+        network_only_mode = (
+            str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower()
+            in {"network_only_codec_policy", "network_k_proposal_policy"}
         )
-        if not isinstance(exact_den6_guidance, dict) and isinstance(full_octree_context, dict):
-            exact_den6_guidance = full_octree_context.get("ana_den6_ranked_candidate_guidance")
-        if isinstance(exact_den6_guidance, dict):
-            result["ana_den6_ranked_candidate_guidance"] = exact_den6_guidance
+        if not network_only_mode:
+            exact_den6_guidance = (
+                source_tree_for_key.get("ana_den6_ranked_candidate_guidance")
+                if isinstance(source_tree_for_key, dict)
+                else None
+            )
+            if not isinstance(exact_den6_guidance, dict) and isinstance(full_octree_context, dict):
+                exact_den6_guidance = full_octree_context.get("ana_den6_ranked_candidate_guidance")
+            if isinstance(exact_den6_guidance, dict):
+                result["ana_den6_ranked_candidate_guidance"] = exact_den6_guidance
 
         current_global_voxel_coords = (
             source_tree_for_key.get("global_voxel_coords")
@@ -2216,5 +2257,25 @@ class OctreeStructureAnalysis(nn.Module):
         if torch.is_tensor(current_global_voxel_coords):
             result["global_voxel_coords"] = current_global_voxel_coords
 
-        result["heuristic_guidance"] = build_heuristic_guidance(result, self.args)
+        neighbor_cache = getattr(self, "_active_canonical_neighbor_cache", None)
+        neighbor_details = (
+            neighbor_cache.get("details") if isinstance(neighbor_cache, dict) else None
+        )
+        if torch.is_tensor(neighbor_details) and int(neighbor_details.shape[-1]) == int(pts_xyz.shape[-1]):
+            # 6/18/26 occupancy, isolation, nearest occupied surface distance,
+            # and local plane-distance proxy.  These are current-input fixed
+            # features; no dataset ID, codec probe, plan, or teacher is used.
+            result["network_only_fixed_features"] = neighbor_details.unsqueeze(0).to(
+                device=pts_xyz.device, dtype=input_dtype
+            )
+
+        if (
+            str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower()
+            in {"network_only_codec_policy", "network_k_proposal_policy"}
+        ):
+            # The fixed Octree/local features above remain available, but no
+            # heuristic score, cached action, rank, or teacher payload is built.
+            result["heuristic_guidance"] = None
+        else:
+            result["heuristic_guidance"] = build_heuristic_guidance(result, self.args)
         return result

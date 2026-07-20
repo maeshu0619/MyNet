@@ -41,6 +41,7 @@ def _release_cpu_step_memory():
 from models.network import Network
 import models.network as network_module
 from models.utils.loss.loss import Loss
+from models.utils.loss.k_proposal_distillation import OfflineKProposalTeacherStore
 from models.utils.notify.mail_notify import TrainingMailNotifier
 from record.write import Writing
 from record.plot import PlotMaker
@@ -12232,6 +12233,21 @@ def train(model, args, loss, writer, plot, notifier=None):
         )
         writer.write(f"8i kept sequence dirs: {kept_names}")
     seq_datasets = [(seq_dir, PlyDirDataset(args, seq_dir)) for seq_dir in seq_dirs] # 各シーケンス内のPLY点群ファイルを読み込むデータセットを作る
+    k_proposal_teacher_store = None
+    k_offline_path = str(getattr(args, "network_k_offline_dataset", "") or "").strip()
+    if (
+        str(getattr(args, "heuristic_guidance_mode", "")).strip().lower()
+        == "network_k_proposal_policy"
+        and k_offline_path
+    ):
+        if not os.path.isfile(k_offline_path):
+            raise FileNotFoundError(f"network_k_offline_dataset not found: {k_offline_path}")
+        k_proposal_teacher_store = OfflineKProposalTeacherStore(k_offline_path)
+        writer.write(
+            "KProposalOfflineTeacher: "
+            f"path={k_offline_path}, split={args.network_k_offline_split}, "
+            f"states={len(k_proposal_teacher_store.states)}, runtime_den6=0, candidate_actual=0"
+        )
     total_train_files = sum(len(dataset) for _, dataset in seq_datasets) # 全シーケンスに含まれる点群ファイル数を合計し、総Step数の見積もりなどに使用
     den6_prefetch_lookahead = max(
         int(getattr(args, "heuristic_guidance_online_prefetch_lookahead", 0)), 0
@@ -12440,8 +12456,12 @@ def train(model, args, loss, writer, plot, notifier=None):
                 ).strip().lower()
                 heuristic_mode = str(getattr(args, "heuristic_guidance_mode", "")).strip().lower()
                 den6_online_full_cloud = heuristic_mode == "ana_den6_online"
+                network_only_full_cloud = heuristic_mode in {
+                    "network_only_codec_policy", "network_k_proposal_policy"
+                }
+                one_plan_full_cloud = den6_online_full_cloud or network_only_full_cloud
                 full_cloud_amount_mode = bool(sparsepcgc_training_mode == "full_cloud_amount")
-                if den6_online_full_cloud:
+                if one_plan_full_cloud:
                     full_cloud_amount_mode = False
                     args._current_teacher_scope = "full_cloud"
 
@@ -12468,7 +12488,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                 # Loss is a mixin object rather than nn.Module.  Mark this
                 # exact train step explicitly so ana_den6_online can enforce
                 # one fresh edited actual encode and report its counters.
-                args._den6_online_training_step_active = bool(den6_online_full_cloud)
+                args._den6_online_training_step_active = bool(one_plan_full_cloud)
                 args._current_sample_name = os.path.basename(str(file_path)) # teacher/debugログに点群ファイル名を残す
                 args._current_teacher_scope = "full_cloud"
                 args._sparsepcgc_full_cloud_actual_primary_active = False
@@ -12476,7 +12496,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                 sparsepcgc_csv_debug = ( str(getattr(args, "compress", "")).strip().lower().replace("-", "").replace("_", "") == "sparsepcgc" and bool(getattr(args, "save_compression_metric_csv", True))) # Sparse PCGC専用ログ
                 operation_csv_debug = bool( getattr(args, "save_operation_metric_csv", getattr(args, "save_operation_metrics_csv", True))) # 点操作メトリクスCSVを保存するか判定し、点移動量や追加/削除などのDebug収集条件に使用
                 args._collect_sparsepcgc_debug = bool(
-                    (not den6_online_full_cloud)
+                    (not one_plan_full_cloud)
                     and sparsepcgc_csv_debug
                     and should_collect_sparsepcgc_hard_debug(
                         args,
@@ -12675,8 +12695,17 @@ def train(model, args, loss, writer, plot, notifier=None):
                             )
                         autocast_ctx = torch.cuda.amp.autocast(dtype=amp_dtype, enabled=use_amp) if use_cuda else nullcontext()
                         grad_ctx = torch.no_grad() if full_cloud_anchor_no_grad else nullcontext()
+                        model_saved_tensor_ctx = (
+                            torch.autograd.graph.save_on_cpu(
+                                pin_memory=bool(
+                                    getattr(args, "full_cloud_saved_tensor_pin_memory", False)
+                                )
+                            )
+                            if network_only_full_cloud and use_cuda and not full_cloud_anchor_no_grad
+                            else nullcontext()
+                        )
 
-                        with grad_ctx, autocast_ctx: # 全体点群をno-gradでモデルに入力し、teacher更新用の出力だけ得る
+                        with grad_ctx, autocast_ctx, model_saved_tensor_ctx: # 全体点群をno-gradでモデルに入力し、teacher更新用の出力だけ得る
                             """モデルの実行"""
                             # Step冒頭で作った full cloud canonical context をそのまま使う。
                             # ここで再量子化してはいけない。
@@ -12699,6 +12728,12 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 full_octree_context=full_octree_context,
                                 octree_input_mode="full_cloud",
                             )
+                        if network_only_full_cloud and use_cuda:
+                            # Saved autograd tensors are already on CPU after
+                            # leaving save_on_cpu. Return now-unused forward
+                            # workspaces before the persistent codec worker
+                            # allocates its encode buffers.
+                            torch.cuda.empty_cache()
                         try:
                             full_cloud_anchor_runtime_timing = dict(
                                 getattr(model.module if hasattr(model, "module") else model, "last_runtime_timing", {}) or {}
@@ -12722,8 +12757,17 @@ def train(model, args, loss, writer, plot, notifier=None):
                             final_w_for_loss = final_w
                         autocast_ctx = torch.cuda.amp.autocast(dtype=amp_dtype, enabled=use_amp) if use_cuda else nullcontext() # 形状損失と圧縮損失の計算もAMP文脈で行うための設定を作る
                         loss_grad_ctx = torch.no_grad() if full_cloud_anchor_no_grad else nullcontext()
+                        loss_saved_tensor_ctx = (
+                            torch.autograd.graph.save_on_cpu(
+                                pin_memory=bool(
+                                    getattr(args, "full_cloud_saved_tensor_pin_memory", False)
+                                )
+                            )
+                            if network_only_full_cloud and use_cuda and not full_cloud_anchor_no_grad
+                            else nullcontext()
+                        )
 
-                        with loss_grad_ctx, autocast_ctx:
+                        with loss_grad_ctx, autocast_ctx, loss_saved_tensor_ctx:
                             """形状損失の計算"""
                             geometry_t0 = time.time()
                             if full_cloud_amount_mode:
@@ -13058,12 +13102,63 @@ def train(model, args, loss, writer, plot, notifier=None):
                     args,
                     compression_debug_terms,
                 )
+                network_only_trust_gate = (
+                    str(getattr(args, "heuristic_guidance_mode", "")).strip().lower()
+                    in {"network_only_codec_policy", "network_k_proposal_policy"}
+                )
+                if network_only_trust_gate:
+                    # A pretrained Surrogate from the legacy action
+                    # distribution can initially be several percentage points
+                    # wrong on Network-only plans.  Train that Surrogate on the
+                    # fresh scalar as usual, but do not let its uncalibrated
+                    # gradient steer the action policy.  The forward value is
+                    # still the one edited-cloud Actual value.
+                    surrogate_error = finite_float_or_none(
+                        compression_debug_terms.get(
+                            "surrogate_abs_bit_error",
+                            compression_debug_terms.get("surrogate_bit_error", None),
+                        )
+                    )
+                    trust_low = max(
+                        float(getattr(args, "network_only_surrogate_trust_error", 0.05)),
+                        0.0,
+                    )
+                    trust_high = max(
+                        float(getattr(args, "network_only_surrogate_disable_error", 0.50)),
+                        trust_low,
+                    )
+                    if surrogate_error is None:
+                        surrogate_trust_value = 0.0
+                    elif surrogate_error <= trust_low:
+                        surrogate_trust_value = 1.0
+                    elif surrogate_error >= trust_high:
+                        surrogate_trust_value = 0.0
+                    else:
+                        surrogate_trust_value = 1.0 - (
+                            (surrogate_error - trust_low)
+                            / max(trust_high - trust_low, 1e-12)
+                        )
+                    surrogate_trust_debug.update({
+                        "network_only_surrogate_trust_gate": True,
+                        "surrogate_trust_value": float(surrogate_trust_value),
+                        "network_only_surrogate_trust_error": float(trust_low),
+                        "network_only_surrogate_disable_error": float(trust_high),
+                    })
                 surrogate_loss_before_trust = finite_float_or_none(L_com_objective)
                 if float(surrogate_trust_value) < 1.0 and torch.is_tensor(L_com_objective):
-                    L_com_objective = (
-                        float(surrogate_trust_value) * L_com_objective
-                        + (1.0 - float(surrogate_trust_value)) * (float(getattr(args, "w_com", 1.0)) * L_com)
-                    )
+                    if network_only_trust_gate:
+                        # Teacher-STE: preserve the Actual forward scalar and
+                        # scale only the Surrogate backward contribution.
+                        L_com_objective = (
+                            L_com_objective.detach()
+                            + float(surrogate_trust_value)
+                            * (L_com_objective - L_com_objective.detach())
+                        )
+                    else:
+                        L_com_objective = (
+                            float(surrogate_trust_value) * L_com_objective
+                            + (1.0 - float(surrogate_trust_value)) * (float(getattr(args, "w_com", 1.0)) * L_com)
+                        )
                 surrogate_trust_debug["surrogate_loss_before_trust"] = (
                     float(surrogate_loss_before_trust)
                     if surrogate_loss_before_trust is not None
@@ -13242,7 +13337,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                 L_downstream = legacy_L_downstream
                 L_discrete_policy = L.new_zeros(())
                 cp_debug = {} # compression primaryモード用のdebug情報を空辞書で初期化
-                if compression_primary_mode: # 圧縮優先の場合、圧縮損失を重視した損失を再計算
+                if compression_primary_mode and not network_only_full_cloud: # legacy圧縮優先経路
                     L, L_com_objective, cp_debug = build_compression_primary_loss(
                         args,
                         terms=terms,
@@ -13952,6 +14047,43 @@ def train(model, args, loss, writer, plot, notifier=None):
                             else "support"
                         )
                     L_discrete_policy = L.new_zeros(())
+                elif compression_primary_mode and network_only_full_cloud:
+                    # The Network-only objective is deliberately compact:
+                    # Actual-forward/Surrogate-backward compression + geometry.
+                    # Old Prune-only proxy anchors, attribution/policy teachers,
+                    # and actuator imitation losses would reintroduce a legacy
+                    # heuristic preference and retain their full-cloud graphs.
+                    if not (torch.is_tensor(L_com_objective) and L_com_objective.requires_grad):
+                        raise RuntimeError(
+                            "network-only compression objective lost its Surrogate gradient"
+                        )
+                    geometry_weight = max(float(getattr(args, "cp_lambda_geom", 1.0)), 0.0)
+                    compression_weight = max(
+                        float(
+                            getattr(
+                                args,
+                                "network_only_actual_surrogate_loss_weight",
+                                1.0,
+                            )
+                        ),
+                        0.0,
+                    )
+                    L = (
+                        geometry_weight * L_geom
+                        + stage_factors["com"] * compression_weight * L_com_objective
+                    )
+                    L_downstream = L_com_objective
+                    L_discrete_policy = L.new_zeros(())
+                    L_attr = L_attr.detach()
+                    L_policy = L_policy.detach()
+                    L_actuator = L_actuator.detach()
+                    cp_debug = {
+                        "network_only_objective": True,
+                        "network_only_actual_surrogate_weight": float(compression_weight),
+                        "network_only_geometry_weight": float(geometry_weight),
+                        "network_only_legacy_proxy_loss": 0.0,
+                        "network_only_behavior_cloning_loss": 0.0,
+                    }
                 elif _discrete_loss_mode_value(args) == "hard":
                     policy_loss_fn = getattr(model, "discrete_policy_loss", None) # モデルが保持しているHard離散方策用の損失関数を取得する
                     if callable(policy_loss_fn):
@@ -13964,12 +14096,12 @@ def train(model, args, loss, writer, plot, notifier=None):
                 heuristic_mode = str(
                     getattr(args, "heuristic_guidance_mode", "")
                 ).strip().lower()
-                if heuristic_mode == "ana_den6_online":
+                if heuristic_mode in {"ana_den6_online", "network_only_codec_policy", "network_k_proposal_policy"}:
                     base_model_for_policy = model.module if hasattr(model, "module") else model
                     policy_loss_fn = getattr(base_model_for_policy, "discrete_policy_loss", None)
                     if not callable(policy_loss_fn):
                         raise RuntimeError(
-                            "ana_den6_onlineにはNetwork.discrete_policy_lossが必要である"
+                            f"{heuristic_mode}にはNetwork.discrete_policy_lossが必要である"
                         )
                     # 方策の成否は幾何等を含むL_downstreamではなく、このStepで
                     # 唯一実行したfull-cloud Actual圧縮率だけで判定する。
@@ -13982,7 +14114,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                     )
                     if actual_policy_value is None:
                         raise RuntimeError(
-                            "ana_den6_onlineの毎Step policy更新にfull-cloud Actual圧縮率がない"
+                            f"{heuristic_mode}の毎Step policy更新にfull-cloud Actual圧縮率がない"
                         )
                     online_policy_objective = L_downstream.new_tensor(
                         float(actual_policy_value)
@@ -13990,14 +14122,14 @@ def train(model, args, loss, writer, plot, notifier=None):
                     online_policy_loss = policy_loss_fn(online_policy_objective)
                     if not torch.is_tensor(online_policy_loss):
                         raise RuntimeError(
-                            "ana_den6_onlineのdiscrete_policy_lossがTensorを返していない"
+                            f"{heuristic_mode}のdiscrete_policy_lossがTensorを返していない"
                         )
                     policy_debug = dict(
                         getattr(base_model_for_policy, "last_discrete_policy_debug", {}) or {}
                     )
                     if not policy_debug:
                         raise RuntimeError(
-                            "ana_den6_onlineのsingle-proposal policy項が生成されていない"
+                            f"{heuristic_mode}のsingle-proposal policy項が生成されていない"
                         )
                     compression_debug_terms.update({
                         f"den6_online_policy_{key}": value
@@ -14016,6 +14148,102 @@ def train(model, args, loss, writer, plot, notifier=None):
                         L = L - L_discrete_policy
                     L_discrete_policy = online_policy_loss
                     L = L + L_discrete_policy
+                    if heuristic_mode in {"network_only_codec_policy", "network_k_proposal_policy"}:
+                        plan_gain_loss_fn = getattr(
+                            base_model_for_policy, "network_only_plan_gain_loss", None
+                        )
+                        if not callable(plan_gain_loss_fn):
+                            raise RuntimeError("network-only plan gain predictor loss is missing")
+                        L_plan_gain = plan_gain_loss_fn(online_policy_objective)
+                        if not torch.is_tensor(L_plan_gain) or not L_plan_gain.requires_grad:
+                            raise RuntimeError("network-only plan gain loss has no gradient")
+                        L = L + L_plan_gain
+                        compression_debug_terms["network_only_plan_gain_loss"] = float(
+                            L_plan_gain.detach().cpu()
+                        )
+                        plan_gain_debug = dict(
+                            getattr(base_model_for_policy, "last_discrete_policy_debug", {}) or {}
+                        )
+                        compression_debug_terms.update({
+                            f"den6_online_policy_{key}": value
+                            for key, value in plan_gain_debug.items()
+                        })
+                        latest_compression_debug = dict(
+                            getattr(loss, "last_compression_debug", {}) or {}
+                        )
+                        latest_compression_debug.update({
+                            f"den6_online_policy_{key}": value
+                            for key, value in plan_gain_debug.items()
+                        })
+                        loss.last_compression_debug = latest_compression_debug
+
+                    if (
+                        heuristic_mode == "network_k_proposal_policy"
+                        and isinstance(k_proposal_teacher_store, OfflineKProposalTeacherStore)
+                    ):
+                        offline_state_id = k_proposal_teacher_store.find_state_for_input(
+                            file_path,
+                            args,
+                            split=str(getattr(args, "network_k_offline_split", "train")),
+                        )
+                        if offline_state_id is not None:
+                            proposal_output = getattr(
+                                base_model_for_policy, "last_k_proposal_terms", None
+                            )
+                            actuator_state = getattr(
+                                base_model_for_policy, "last_actuator_voxel_state", None
+                            )
+                            initial_voxel_coords = (
+                                actuator_state.get("initial_voxel_coords")
+                                if isinstance(actuator_state, dict) else None
+                            )
+                            if not isinstance(proposal_output, dict) or not torch.is_tensor(initial_voxel_coords):
+                                raise RuntimeError(
+                                    "offline K proposal loss requires current proposal and canonical voxels"
+                                )
+                            offline_teacher = k_proposal_teacher_store.teacher_for_output(
+                                offline_state_id,
+                                proposal_output,
+                                initial_voxel_coords,
+                                split=str(getattr(args, "network_k_offline_split", "train")),
+                            )
+                            offline_loss_fn = getattr(
+                                base_model_for_policy,
+                                "k_proposal_offline_distillation_loss",
+                                None,
+                            )
+                            if not callable(offline_loss_fn):
+                                raise RuntimeError("K proposal offline set loss is missing")
+                            offline_losses = offline_loss_fn(offline_teacher)
+                            offline_weight = max(
+                                float(getattr(args, "network_k_offline_loss_weight", 1.0)),
+                                0.0,
+                            )
+                            weighted_offline_total = offline_losses["total"] * offline_weight
+                            if not weighted_offline_total.requires_grad:
+                                raise RuntimeError("K proposal offline set loss has no gradient")
+                            L = L + weighted_offline_total
+                            compression_debug_terms.update({
+                                "k_proposal_offline_state_id": offline_state_id,
+                                "k_proposal_offline_loss": float(weighted_offline_total.detach().cpu()),
+                                "k_proposal_offline_loss_weight": offline_weight,
+                                "k_proposal_offline_dominance_ratio": float(offline_losses["dominance_ratio"]),
+                                "k_proposal_offline_dominance_warning": bool(offline_losses["dominance_warning"]),
+                                "k_proposal_offline_add_where_teacher_available": False,
+                            })
+                            for loss_name, raw_value in offline_losses["raw"].items():
+                                compression_debug_terms[
+                                    f"k_proposal_offline_{loss_name}_raw"
+                                ] = float(raw_value.detach().cpu())
+                            for loss_name, weighted_value in offline_losses["weighted"].items():
+                                compression_debug_terms[
+                                    f"k_proposal_offline_{loss_name}_weighted"
+                                ] = float(weighted_value.detach().cpu()) * offline_weight
+                            latest_compression_debug = dict(
+                                getattr(loss, "last_compression_debug", {}) or {}
+                            )
+                            latest_compression_debug.update(compression_debug_terms)
+                            loss.last_compression_debug = latest_compression_debug
 
                 if full_cloud_amount_mode and torch.is_tensor(L_full_cloud_amount):
                     L = L + L_full_cloud_amount
@@ -14797,6 +15025,19 @@ def train(model, args, loss, writer, plot, notifier=None):
                 step_completed = False # Optimizer更新が成功したかのフラグ
                 total_loss_finite = bool(torch.isfinite(L.detach()).all().item()) and skip_optimizer_reason is None # LがNanなどでないか否かの判定
                 param_update_snapshots = None # 更新前パラメータの記録を見作成で初期化
+                network_only_param_before = None
+                if network_only_full_cloud and total_loss_finite:
+                    audit_model = _unwrap_train_model(model)
+                    policy_module_for_audit = (
+                        audit_model.network_k_proposal_policy
+                        if heuristic_mode == "network_k_proposal_policy"
+                        else audit_model.network_only_codec_policy
+                    )
+                    network_only_param_before = {
+                        name: parameter.detach().clone()
+                        for name, parameter in policy_module_for_audit.named_parameters()
+                        if parameter.requires_grad
+                    }
                 amp_info = { "enabled": bool(amp_scaler_enabled), "found_inf": None, "scale_before": None, "scale_after": None, "consecutive_amp_skips": int(consecutive_amp_skips)} # AMPの状態を記録する辞書を作る
                 last_nonfinite_grad_summary = None
                 if total_loss_finite: # 総損失がInfでないとき、更新前パラメータを記録
@@ -14804,7 +15045,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                 # cuDNN backward用workspaceが、連続full-cloud Stepで断片化した
                 # allocator cacheに阻まれないよう未使用blockだけを返却する。
                 # 生きているFP32 Tensorとautograd graphには触れない。
-                if den6_online_full_cloud and use_cuda and torch.cuda.is_available():
+                if one_plan_full_cloud and use_cuda and torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 if skip_optimizer_reason is not None: # Optimizer更新を止める必要があるか否かの判定
                     writer.write(
@@ -15092,6 +15333,47 @@ def train(model, args, loss, writer, plot, notifier=None):
                 )
                 if step_completed: # Optimizer更新が成功したら差分ログを出す
                     log_param_updates( args, writer, model, param_update_snapshots, step + 1, num_steps)
+                network_only_head_audit = {}
+                if network_only_full_cloud and isinstance(network_only_param_before, dict):
+                    audit_model = _unwrap_train_model(model)
+                    grouped = {
+                        "where": (
+                            "local_trunk", "local_cost_head", "shared_local_trunk",
+                            "shared_basis_head", "plan_tokens", "token_mixer", "coefficient_head",
+                            "coefficient_scale_head", "priority_head", "threshold_head",
+                        ),
+                        "amount": ("amount_head", "amount_scale_head", "share_head", "share_scale_head", "plan_tokens"),
+                        "action": ("gate_head", "enable_head", "plan_tokens"),
+                        "direction": ("direction_field_head", "shared_direction_head", "direction_delta_head", "plan_tokens"),
+                        "interaction": ("interaction_head", "critic", "critic_interaction_head", "critic_gain_head"),
+                    }
+                    policy_module_for_audit = (
+                        audit_model.network_k_proposal_policy
+                        if heuristic_mode == "network_k_proposal_policy"
+                        else audit_model.network_only_codec_policy
+                    )
+                    named_now = dict(policy_module_for_audit.named_parameters())
+                    for group_name, prefixes in grouped.items():
+                        grad_sq = 0.0
+                        update_sq = 0.0
+                        for name, parameter in named_now.items():
+                            if not name.startswith(prefixes):
+                                continue
+                            if parameter.grad is not None:
+                                grad_sq += float(parameter.grad.detach().float().pow(2).sum().cpu())
+                            before = network_only_param_before.get(name)
+                            if torch.is_tensor(before):
+                                update_sq += float(
+                                    (parameter.detach() - before).float().pow(2).sum().cpu()
+                                )
+                        network_only_head_audit[f"{group_name}_grad_norm"] = grad_sq ** 0.5
+                        network_only_head_audit[f"{group_name}_update_norm"] = update_sq ** 0.5
+                    comp_debug.update({
+                        f"network_only_{key}": value
+                        for key, value in network_only_head_audit.items()
+                    })
+                    loss.last_compression_debug = comp_debug
+                network_only_param_before = None
                 if timing_enabled:
                     sync_for_timing(use_cuda)
                     timing_step_end = time.time()
@@ -15366,7 +15648,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                 if train_edit_stats is None:
                     train_edit_stats = summarize_point_edits( input_xyz=input_xyz[:, :3, :], gen_pts=gen_pts, final_w=final_w, args=args) # 点操作情報を計算
                 plot_edit_stats = dict(train_edit_stats or {})
-                if den6_online_full_cloud:
+                if one_plan_full_cloud:
                     # online主経路のpoint-edit CSV/図は3操作だけに固定する。
                     plot_edit_stats = {
                         key: value
@@ -15502,6 +15784,258 @@ def train(model, args, loss, writer, plot, notifier=None):
                         f"actual_ply={float(audit_compression.get('actual_ply_write_time', 0.0) or 0.0):.3f}s), "
                         f"phase={audit_phase_timing}, network={audit_runtime}"
                     )
+                if network_only_full_cloud:
+                    audit_model = _unwrap_train_model(model)
+                    audit_state = getattr(audit_model, "last_actuator_voxel_state", {})
+                    audit_plan = (
+                        audit_state.get("ana_den6_exact_residual_plan_debug", {})
+                        if isinstance(audit_state, dict) else {}
+                    )
+                    audit_compression = dict(getattr(loss, "last_compression_debug", {}) or {})
+                    actual_audit = getattr(loss, "_den6_online_actual_audit", {})
+                    if not isinstance(actual_audit, dict):
+                        actual_audit = {}
+                    baseline_encodes = int(
+                        actual_audit.get(
+                            "baseline",
+                            audit_compression.get("den6_online_baseline_actual_encode_count", 0),
+                        ) or 0
+                    )
+                    edited_encodes = int(
+                        actual_audit.get(
+                            "edited",
+                            audit_compression.get("den6_online_edited_actual_encode_count", 0),
+                        ) or 0
+                    )
+                    candidate_encodes = int(
+                        actual_audit.get(
+                            "candidate",
+                            audit_compression.get("den6_online_candidate_actual_encode_count", 0),
+                        ) or 0
+                    )
+                    contract = {
+                        "network_forward_count": int(audit_plan.get("network_forward_count", 0) or 0),
+                        "plan_count": int(audit_plan.get("plan_count", 0) or 0),
+                        "den6_call_count": int(audit_plan.get("den6_call_count", 0) or 0),
+                        "candidate_object_count": int(audit_plan.get("candidate_object_count", 0) or 0),
+                        "pool_reference_count": int(audit_plan.get("pool_reference_count", 0) or 0),
+                        "behavior_cloning_loss": float(audit_plan.get("behavior_cloning_loss", 0.0) or 0.0),
+                        "teacher_plan_reference_count": int(audit_plan.get("teacher_plan_reference_count", 0) or 0),
+                        "baseline_actual_encode_count": baseline_encodes,
+                        "edited_actual_encode_count": edited_encodes,
+                        "candidate_actual_encode_count": candidate_encodes,
+                        "total_actual_encode_count": baseline_encodes + edited_encodes + candidate_encodes,
+                    }
+                    failures = []
+                    for key, expected in (
+                        ("network_forward_count", 1),
+                        ("plan_count", 1),
+                        ("den6_call_count", 0),
+                        ("candidate_object_count", 0),
+                        ("pool_reference_count", 0),
+                        ("teacher_plan_reference_count", 0),
+                        ("edited_actual_encode_count", 1),
+                        ("candidate_actual_encode_count", 0),
+                    ):
+                        if int(contract[key]) != int(expected):
+                            failures.append(f"{key}!={expected}")
+                    if float(contract["behavior_cloning_loss"]) != 0.0:
+                        failures.append("behavior_cloning_loss!=0")
+                    if failures:
+                        raise RuntimeError(
+                            "network-only one-plan invariant violation: " + ", ".join(failures)
+                        )
+
+                    def _audit_scalar(key, default=0.0):
+                        value = audit_state.get(key, default) if isinstance(audit_state, dict) else default
+                        if torch.is_tensor(value):
+                            return float(value.detach().float().mean().cpu())
+                        return float(value or default)
+
+                    def _audit_list(key):
+                        value = audit_state.get(key, []) if isinstance(audit_state, dict) else []
+                        if torch.is_tensor(value):
+                            return value.detach().float().reshape(-1).cpu().tolist()
+                        return list(value) if isinstance(value, (list, tuple)) else []
+
+                    diversity = getattr(args, "_network_only_diversity", None)
+                    if not isinstance(diversity, dict):
+                        diversity = {
+                            "plan_hashes": [], "ratios": [], "shares": [],
+                            "priorities": [], "last_coords": None,
+                        }
+                        args._network_only_diversity = diversity
+                    plan_hash = str(audit_plan.get("plan_hash", ""))
+                    current_coords = audit_plan.get("selected_coord_key_set", set())
+                    if not isinstance(current_coords, set):
+                        current_coords = set(current_coords or [])
+                    previous_coords = diversity.get("last_coords")
+                    if isinstance(previous_coords, set):
+                        union_count = len(previous_coords | current_coords)
+                        where_jaccard_distance = (
+                            1.0 - len(previous_coords & current_coords) / float(union_count)
+                            if union_count > 0 else 0.0
+                        )
+                    else:
+                        where_jaccard_distance = float("nan")
+                    diversity["last_coords"] = current_coords
+                    diversity["plan_hashes"].append(plan_hash)
+                    diversity["ratios"].append(_audit_scalar("network_only_total_ratio_unconstrained"))
+                    diversity["shares"].append(_audit_list("network_only_shares_raw"))
+                    diversity["priorities"].append(tuple(audit_plan.get("priority_order", [])))
+                    history_limit = 1000
+                    for history_key in ("plan_hashes", "ratios", "shares", "priorities"):
+                        diversity[history_key] = diversity[history_key][-history_limit:]
+                    valid_hashes = [value for value in diversity["plan_hashes"] if value]
+                    unique_plan_rate = (
+                        len(set(valid_hashes)) / float(len(valid_hashes))
+                        if valid_hashes else 0.0
+                    )
+                    same_plan_repeat_rate = 1.0 - unique_plan_rate
+                    ratio_std = float(np.std(diversity["ratios"])) if diversity["ratios"] else 0.0
+                    shares_array = np.asarray(diversity["shares"], dtype=np.float64)
+                    share_std = (
+                        np.std(shares_array, axis=0).tolist()
+                        if shares_array.ndim == 2 and shares_array.shape[0] > 0 else []
+                    )
+                    add_direction_hist = np.bincount(
+                        np.asarray(audit_plan.get("add_direction_indices", []), dtype=np.int64),
+                        minlength=26,
+                    ).tolist()
+                    adjust_direction_hist = np.bincount(
+                        np.asarray(audit_plan.get("adjust_direction_indices", []), dtype=np.int64),
+                        minlength=26,
+                    ).tolist()
+                    compression_weight_for_audit = max(
+                        float(getattr(args, "network_only_actual_surrogate_loss_weight", 1.0)),
+                        0.0,
+                    )
+                    geometry_weight_for_audit = max(float(getattr(args, "cp_lambda_geom", 1.0)), 0.0)
+                    raw_loss_magnitudes = {
+                        "geometry": abs(float(finite_float_or_none(L_geom) or 0.0)),
+                        "actual_surrogate_ste": abs(float(finite_float_or_none(L_com_objective) or 0.0)),
+                        "surrogate_prediction": abs(float(finite_float_or_none(loss_bit) or 0.0)),
+                        "policy_gradient": abs(float(audit_compression.get("den6_online_policy_policy_core_raw", 0.0) or 0.0)),
+                        "entropy": abs(float(audit_compression.get("den6_online_policy_entropy_raw", 0.0) or 0.0)),
+                        "adaptive_amount_entropy": abs(float(audit_compression.get("den6_online_policy_adaptive_amount_entropy_raw", 0.0) or 0.0)),
+                        "interaction_huber": abs(float(audit_compression.get("den6_online_policy_plan_gain_huber", 0.0) or 0.0)),
+                    }
+                    weighted_loss_magnitudes = {
+                        "geometry": geometry_weight_for_audit * raw_loss_magnitudes["geometry"],
+                        "actual_surrogate_ste": compression_weight_for_audit * raw_loss_magnitudes["actual_surrogate_ste"],
+                        "policy_gradient": abs(float(audit_compression.get("den6_online_policy_policy_core_weighted", 0.0) or 0.0)),
+                        "entropy": abs(float(audit_compression.get("den6_online_policy_entropy_weighted", 0.0) or 0.0)),
+                        "adaptive_amount_entropy": abs(float(audit_compression.get("den6_online_policy_adaptive_amount_entropy_weighted", 0.0) or 0.0)),
+                        "interaction_huber": abs(float(audit_compression.get("den6_online_policy_plan_gain_huber_weighted", 0.0) or 0.0)),
+                    }
+                    nonzero_weighted = {
+                        key: value for key, value in weighted_loss_magnitudes.items()
+                        if math.isfinite(value) and value > 1e-12
+                    }
+                    loss_dominance_ratio = (
+                        max(nonzero_weighted.values()) / max(min(nonzero_weighted.values()), 1e-12)
+                        if len(nonzero_weighted) >= 2 else 1.0
+                    )
+                    loss_dominance_warning = loss_dominance_ratio > 100.0
+
+                    writer.write(
+                        "NetworkOnlyAudit: "
+                        f"counters={contract}, "
+                        f"counts={dict(audit_plan.get('selected_counts') or {})}, "
+                        f"ratios={dict(audit_plan.get('selected_amount_ratios') or {})}, "
+                        f"shares_raw={_audit_list('network_only_shares_raw')}, "
+                        f"shares_hard={_audit_list('network_only_shares')}, "
+                        f"shares_mean={_audit_list('network_only_shares_mean')}, "
+                        f"total_ratio_raw={_audit_scalar('network_only_total_ratio_raw'):.8f}, "
+                        f"total_ratio_unconstrained={_audit_scalar('network_only_total_ratio_unconstrained'):.8f}, "
+                        f"total_ratio_hard={_audit_scalar('network_only_total_ratio'):.8f}, "
+                        f"total_ratio_mean={_audit_scalar('network_only_total_ratio_mean'):.8f}, "
+                        f"gates={_audit_list('operation_gate_hard')}, "
+                        f"priorities={_audit_list('network_only_priorities')}, "
+                        f"temperature={_audit_scalar('network_only_temperature'):.6f}, "
+                        f"threshold={_audit_list('network_only_where_threshold')}, "
+                        f"exploration_fraction={_audit_scalar('network_only_exploration_fraction'):.6f}, "
+                        f"diversity=(plan_hash={plan_hash}, unique_rate={unique_plan_rate:.6f}, "
+                        f"repeat_rate={same_plan_repeat_rate:.6f}, jaccard_distance={where_jaccard_distance:.6f}, "
+                        f"ratio_std={ratio_std:.8f}, share_std={share_std}, "
+                        f"priority_order={list(audit_plan.get('priority_order', []))}, "
+                        f"add_direction_hist={add_direction_hist}, adjust_direction_hist={adjust_direction_hist}), "
+                        f"entropy=(where={_audit_scalar('network_only_where_entropy'):.6g}, "
+                        f"amount={_audit_scalar('network_only_amount_entropy'):.6g}, "
+                        f"action={_audit_scalar('network_only_action_entropy'):.6g}, "
+                        f"direction={_audit_scalar('network_only_direction_entropy'):.6g}), "
+                        f"gain=(local={_audit_scalar('network_only_predicted_local_gain_sum'):.6g}, "
+                        f"interaction={_audit_scalar('network_only_interaction_correction'):.6g}, "
+                        f"plan={_audit_scalar('network_only_predicted_plan_gain'):.6g}, "
+                        f"actual={float(audit_compression.get('actual_total_bit_percent_fresh', audit_compression.get('actual_total_bit_percent', 0.0)) or 0.0):.6g}), "
+                        f"surrogate=(mae={float(audit_compression.get('surrogate_abs_bit_error', 0.0) or 0.0):.6g}, "
+                        f"sign_match={audit_compression.get('sign_match_surrogate_actual', '')}), "
+                        f"loss_scale=(raw={raw_loss_magnitudes}, weighted={weighted_loss_magnitudes}, "
+                        f"dominance_ratio={loss_dominance_ratio:.6g}, warning={loss_dominance_warning}), "
+                        f"grad_update={network_only_head_audit}, "
+                        f"timing=(step={float(time.time() - st_step):.3f}, "
+                        f"actual={float(audit_compression.get('actual_encode_time_total', 0.0) or 0.0):.3f}, "
+                        f"network={dict(getattr(audit_model, 'last_runtime_timing', {}) or {})})"
+                    )
+                    if heuristic_mode == "network_k_proposal_policy":
+                        selected_slot_value = int(round(_audit_scalar("k_proposal_selected_slot")))
+                        writer.write(
+                            "KProposalAudit: "
+                            f"shared_encoder_forward_count={int(audit_state.get('shared_encoder_forward_count', 0) or 0)}, "
+                            f"shared_basis_forward_count={int(audit_state.get('shared_basis_forward_count', 0) or 0)}, "
+                            f"proposal_count={int(audit_state.get('proposal_count', 0) or 0)}, "
+                            f"critic_batch_count={int(audit_state.get('critic_batch_count', 0) or 0)}, "
+                            f"selected_plan_count={int(audit_state.get('selected_plan_count', 0) or 0)}, "
+                            f"selected_slot={selected_slot_value}, "
+                            f"den6={int(audit_state.get('den6_call_count', 0) or 0)}, "
+                            f"cache={int(audit_state.get('cache_reference_count', 0) or 0)}, "
+                            f"teacher={int(audit_state.get('teacher_reference_count', 0) or 0)}, "
+                            f"probe={int(audit_state.get('sparsepcgc_probe_count', 0) or 0)}, "
+                            f"candidate_actual={int(audit_state.get('candidate_actual_encode_count', 0) or 0)}, "
+                            f"expected_counts={_audit_list('k_proposal_expected_count')}, "
+                            f"executed_counts={_audit_list('k_proposal_executed_count')}, "
+                            f"execution_count_mismatch={_audit_list('k_proposal_execution_count_mismatch')}, "
+                            f"critic_gain={_audit_list('k_proposal_predicted_gain')}, "
+                            f"critic_geometry={_audit_list('k_proposal_predicted_geometry')}, "
+                            f"critic_interaction={_audit_list('k_proposal_predicted_interaction')}, "
+                            f"critic_uncertainty={_audit_list('k_proposal_uncertainty')}"
+                        )
+                        offline_state = audit_compression.get(
+                            "k_proposal_offline_state_id", ""
+                        )
+                        if offline_state:
+                            offline_raw = {
+                                name: float(audit_compression.get(
+                                    f"k_proposal_offline_{name}_raw", 0.0
+                                ) or 0.0)
+                                for name in (
+                                    "mode_matching", "coverage", "oracle_best",
+                                    "voxel_relative_value", "candidate_value",
+                                    "ranking", "hard_negative", "critic_selection",
+                                    "high_value_diversity", "geometry",
+                                )
+                            }
+                            offline_weighted = {
+                                name: float(audit_compression.get(
+                                    f"k_proposal_offline_{name}_weighted", 0.0
+                                ) or 0.0)
+                                for name in offline_raw
+                            }
+                            writer.write(
+                                "KProposalOfflineLoss: "
+                                f"state={offline_state}, "
+                                f"total={float(audit_compression.get('k_proposal_offline_loss', 0.0) or 0.0):.6g}, "
+                                f"weight={float(audit_compression.get('k_proposal_offline_loss_weight', 0.0) or 0.0):.6g}, "
+                                f"raw={offline_raw}, weighted={offline_weighted}, "
+                                f"dominance_ratio={float(audit_compression.get('k_proposal_offline_dominance_ratio', 0.0) or 0.0):.6g}, "
+                                f"warning={bool(audit_compression.get('k_proposal_offline_dominance_warning', False))}, "
+                                "add_where_teacher_available=False"
+                            )
+                    if loss_dominance_warning:
+                        writer.write(
+                            "NetworkOnlyLossScaleWarning: a weighted loss term exceeds another "
+                            f"nonzero term by {loss_dominance_ratio:.3f}x; terms={weighted_loss_magnitudes}"
+                        )
                 if timing_enabled:
                     sync_for_timing(use_cuda)
                     en_step = time.time()
@@ -16003,7 +16537,7 @@ if __name__ == '__main__':
         torch.backends.cudnn.allow_tf32 = True
         variable_length_full_cloud = (
             str(getattr(args, "heuristic_guidance_mode", "")).strip().lower()
-            == "ana_den6_online"
+            in {"ana_den6_online", "network_only_codec_policy", "network_k_proposal_policy"}
         )
         # 8iの点数はframeごとに変わる。benchmark=Trueだと巨大Conv1dの
         # algorithm/workspace探索が形状ごとに増え続けるため、この経路では

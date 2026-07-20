@@ -641,7 +641,9 @@ class SurrogateCompressionLossMixin:
     def _store_cached_surrogate_target(self, args, cache_key, entry):
         stored = dict(entry)
         stored.pop("cache_hit", None)
-        if str(getattr(args, "heuristic_guidance_mode", "")).strip().lower() == "ana_den6_online":
+        if str(getattr(args, "heuristic_guidance_mode", "")).strip().lower() in {
+            "ana_den6_online", "network_only_codec_policy"
+        }:
             # single-proposal onlineは毎Stepの唯一の加工結果をその場で教師にする。
             # 加工後lossを次Stepへ持ち越すcache/last entryは作らない。
             self.last_surrogate_target_entry = None
@@ -1030,6 +1032,28 @@ class SurrogateCompressionLossMixin:
                 baseline_actual_encode_count = 1
             # actual codec教師は評価指標なので、train用ノイズなしの編集点群で測る。
             actual_xyz = gen_xyz if actual_gen_xyz is None else actual_gen_xyz
+            actual_final_w = final_w
+            voxel_actual_debug = {}
+            voxel_state = getattr(args, "_last_actuator_voxel_state", None)
+            if (
+                self._is_sparsepcgc_context(args)
+                and isinstance(voxel_state, dict)
+                and bool(getattr(args, "sparsepcgc_actual_use_actuator_voxel_state", True))
+            ):
+                restored_xyz, voxel_actual_debug = self._voxel_state_to_codec_xyz(
+                    args,
+                    voxel_state=voxel_state,
+                    like_xyz=actual_xyz,
+                )
+                if restored_xyz is not None:
+                    # final_voxel_coords is already the complete occupied set:
+                    # applying point-aligned final_w again would discard Add and
+                    # double-apply Prune.
+                    actual_xyz = restored_xyz
+                    actual_final_w = None
+                    setattr(args, "_current_actual_uses_voxel_restored", True)
+                else:
+                    setattr(args, "_current_actual_uses_voxel_restored", False)
             cached_oracle_stats = (
                 full_octree_context.get("actual_oracle_cached_edited_actual_stats", None)
                 if isinstance(full_octree_context, dict)
@@ -1048,14 +1072,14 @@ class SurrogateCompressionLossMixin:
             else:
                 den6_online_train = bool(
                     str(getattr(args, "heuristic_guidance_mode", "")).strip().lower()
-                    == "ana_den6_online"
+                    in {"ana_den6_online", "network_only_codec_policy", "network_k_proposal_policy"}
                     and bool(getattr(args, "_den6_online_training_step_active", False))
                 )
                 if den6_online_train:
                     if int(actual_xyz.shape[0]) != 1:
                         raise RuntimeError("ana_den6_onlineは1 Step = 1 edited actual encodeのためbatch_size=1が必要")
                     self._guard_den6_online_edited_actual_encode(args)
-                stats_gen = self._encode_actual_batch(args, actual_xyz, final_w=final_w)
+                stats_gen = self._encode_actual_batch(args, actual_xyz, final_w=actual_final_w)
                 if den6_online_train:
                     self._den6_online_actual_audit = {
                         "baseline": int(baseline_actual_encode_count),

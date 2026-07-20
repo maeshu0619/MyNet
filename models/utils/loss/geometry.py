@@ -80,7 +80,9 @@ class GeometryLossMixin:
 
     def _exact_sparse_edit_chamfer(self, args, gen_pts_f, gt_pts_f, final_w_f):
         """不変Voxelの距離0を省略し、通常Chamferと同じ値を差分集合だけで計算する。"""
-        if str(getattr(args, "heuristic_guidance_mode", "")).strip().lower() != "ana_den6_online":
+        if str(getattr(args, "heuristic_guidance_mode", "")).strip().lower() not in {
+            "ana_den6_online", "network_only_codec_policy", "network_k_proposal_policy"
+        }:
             return None
         if gen_pts_f.shape[0] != 1 or gt_pts_f.shape[0] != 1:
             return None
@@ -246,7 +248,8 @@ class GeometryLossMixin:
         # 全ゼロなら外れ点除去の前後は完全に同一なので、label無しとして扱い、
         # occupied-voxel差分だけを評価する厳密Chamfer高速経路を利用できる。
         if (
-            str(getattr(args, "heuristic_guidance_mode", "")).strip().lower() == "ana_den6_online"
+            str(getattr(args, "heuristic_guidance_mode", "")).strip().lower()
+            in {"ana_den6_online", "network_only_codec_policy", "network_k_proposal_policy"}
             and torch.is_tensor(out_label)
             and not bool(torch.any(out_label >= 0.5).item())
         ):

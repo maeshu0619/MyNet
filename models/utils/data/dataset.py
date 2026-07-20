@@ -217,6 +217,22 @@ class PlyDirDataset(torch.utils.data.Dataset):
         else:
             raise ValueError(f"Invalid path: {path}")
 
+        repeat_single = max(
+            int(getattr(args, "network_only_diagnostic_repeat_single_frame", 0)), 0
+        )
+        if args.trainORtest == "train" and repeat_single > 0:
+            if (
+                str(getattr(args, "heuristic_guidance_mode", "")).strip().lower()
+                not in {"network_only_codec_policy", "network_k_proposal_policy"}
+            ):
+                raise ValueError(
+                    "network_only_diagnostic_repeat_single_frame is restricted to Network-only mode"
+                )
+            # Repeat the exact same path, rather than aliases/symlinks, so the
+            # baseline scalar cache and policy baseline are tested correctly.
+            self.files = [self.files[0]] * repeat_single
+            self.all_files = list(self.files)
+
     def __len__(self):
         return len(self.files)
 

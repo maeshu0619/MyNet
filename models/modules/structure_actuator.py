@@ -196,7 +196,7 @@ class StructureRepairActuator(nn.Module):
             self.training
             and getattr(self.args, "full_cloud_activation_checkpoint", True)
             and str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower()
-            == "ana_den6_online"
+            in {"ana_den6_online", "network_only_codec_policy", "network_k_proposal_policy"}
         )
         if enabled:
             dummy = features.new_zeros((), requires_grad=True)
@@ -2776,6 +2776,38 @@ class StructureRepairActuator(nn.Module):
         return torch.sigmoid((priority - threshold) / max(float(tau), 1e-6))
 
     @staticmethod
+    def network_only_topk_log_prob(base_logits, executed, temperature):
+        """Relative likelihood of the executed Gumbel-top-k subset.
+
+        This is the mean selected categorical log-probability (a compact
+        Plackett-Luce surrogate).  Unlike independent Bernoulli likelihoods,
+        it is invariant to a common logit shift and therefore trains ranking.
+        """
+        base_logits = torch.nan_to_num(
+            base_logits.float(), nan=0.0, posinf=20.0, neginf=-20.0
+        )
+        executed = executed.detach().to(device=base_logits.device, dtype=torch.bool)
+        if executed.shape != base_logits.shape:
+            executed = executed.reshape(base_logits.shape)
+        if not bool(executed.any().item()):
+            return base_logits.new_zeros(())
+        temperature = torch.as_tensor(
+            temperature, device=base_logits.device, dtype=base_logits.dtype
+        ).clamp_min(0.05)
+        scaled_logits = base_logits / temperature
+        selected_index = torch.nonzero(executed, as_tuple=False)
+        selected_logits = scaled_logits[
+            selected_index[:, 0], selected_index[:, 1], selected_index[:, 2]
+        ]
+        log_normalizer = torch.logsumexp(scaled_logits, dim=2)
+        selected_normalizer = log_normalizer[
+            selected_index[:, 0], selected_index[:, 1]
+        ]
+        # Avoid materialising/saving a full [B,operation,N] log-softmax only
+        # to index a few thousand executed points.
+        return (selected_logits - selected_normalizer).mean()
+
+    @staticmethod
     def _masked_mean(values, point_mask):
         if point_mask is None:
             return values.mean()
@@ -4055,6 +4087,7 @@ class StructureRepairActuator(nn.Module):
         octree_context=None,
         full_octree_context=None,
         full_cloud_amount_terms=None,
+        network_only_policy_terms=None,
     ):
         timing_enabled = bool(
             getattr(self.args, "debug_timing", False)
@@ -4100,6 +4133,14 @@ class StructureRepairActuator(nn.Module):
             .replace(" ", "")
         )
         sparsepcgc_context = compress_key == "sparsepcgc"
+        network_only_codec_mode = (
+            str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower()
+            in {"network_only_codec_policy", "network_k_proposal_policy"}
+        )
+        if network_only_codec_mode and not isinstance(network_only_policy_terms, dict):
+            raise RuntimeError(
+                "Network-only policy output is required; legacy fallback is forbidden"
+            )
         add_enabled = self._add_enabled()
         prune_enabled = self._prune_enabled()
         disp_enabled = self._disp_enabled()
@@ -4511,6 +4552,28 @@ class StructureRepairActuator(nn.Module):
             add_enabled=add_enabled,
             move_enabled=disp_enabled,
         )
+        if network_only_codec_mode:
+            gate_prob_t = network_only_policy_terms["gate_probability"].to(
+                device=pts_xyz.device, dtype=pts_xyz.dtype
+            )
+            gate_hard_t = network_only_policy_terms["gate_hard"].to(
+                device=pts_xyz.device, dtype=pts_xyz.dtype
+            )
+            gate_st_t = network_only_policy_terms["gates"].to(
+                device=pts_xyz.device, dtype=pts_xyz.dtype
+            )
+            enabled_t = gate_prob_t.new_tensor(
+                [float(prune_enabled), float(add_enabled), float(disp_enabled)]
+            ).view(1, 3, 1)
+            operation_gate_prob = gate_prob_t * enabled_t
+            operation_gate_hard = gate_hard_t * enabled_t
+            operation_gate_logit = network_only_policy_terms["gate_logits"].to(
+                device=pts_xyz.device, dtype=pts_xyz.dtype
+            )
+            gate_st_t = gate_st_t * enabled_t
+            drop_operation_gate = gate_st_t[:, 0:1]
+            add_operation_gate = gate_st_t[:, 1:2]
+            move_operation_gate = gate_st_t[:, 2:3]
         # den6の「1候補」はAdd/Prune/Adjustのいずれか1操作ではなく、3操作を
         # まとめた1つの複合planである。ここではPoolを参照せず、入力特徴から
         # 計算したden6判断規則を初期prior、Networkを学習可能なresidualとする。
@@ -4526,6 +4589,7 @@ class StructureRepairActuator(nn.Module):
         )
         network_only_single_proposal = bool(
             single_proposal_formula == "network_only_where_amount_action_inference_v1"
+            or network_only_codec_mode
         )
         network_single_proposal = bool(
             teacher_guided_single_proposal or network_only_single_proposal
@@ -4540,7 +4604,10 @@ class StructureRepairActuator(nn.Module):
                 add_enabled=add_enabled,
                 move_enabled=disp_enabled,
             )
-        operation_gate_prob = torch.cat([drop_operation_gate, add_operation_gate, move_operation_gate], dim=1)
+        if network_only_codec_mode:
+            operation_gate_prob = gate_prob_t * enabled_t
+        else:
+            operation_gate_prob = torch.cat([drop_operation_gate, add_operation_gate, move_operation_gate], dim=1)
         if teacher_guided_single_proposal:
             # den6の1候補は「3操作から1つを選ぶ」のではなく、Add/Prune/Adjustを
             # 同時に含む1つの複合planである。Action headは各操作の確率・優先度を
@@ -4557,6 +4624,8 @@ class StructureRepairActuator(nn.Module):
             drop_operation_gate = operation_gate_st[:, 0:1]
             add_operation_gate = operation_gate_st[:, 1:2]
             move_operation_gate = operation_gate_st[:, 2:3]
+        elif network_only_codec_mode:
+            operation_gate_hard = gate_hard_t * enabled_t
         else:
             operation_gate_hard = (
                 operation_gate_prob >= min(max(float(getattr(self.args, "repair_operation_gate_hard_threshold", 0.5)), 0.0), 1.0)
@@ -4796,6 +4865,13 @@ class StructureRepairActuator(nn.Module):
             "repair_drop_amount_random_mix_start",
             "repair_drop_amount_random_mix_end",
         )
+        if network_only_codec_mode:
+            # Base ratio is total*share; the common gate multiplication below
+            # supplies the Binary-Concrete hard-forward/soft-backward action.
+            learned_drop_ratio = (
+                network_only_policy_terms["total_ratio"]
+                * network_only_policy_terms["shares"][:, 0:1]
+            ).to(device=pts_xyz.device, dtype=pts_xyz.dtype).clamp(0.0, float(max_drop_ratio))
         raw_learned_drop_ratio = learned_drop_ratio
         learned_drop_ratio_before_floor = learned_drop_ratio
         drop_ratio_floor = min(
@@ -5550,6 +5626,14 @@ class StructureRepairActuator(nn.Module):
                 - effective_drop_ratio_for_hard_count.detach()
             )
 
+        if network_only_codec_mode:
+            # No legacy amount bandit/prior/floor may replace the ratio emitted
+            # by the one Network forward.
+            effective_drop_ratio_for_hard_count = learned_drop_ratio_after_gate
+            network_effective_drop_ratio_for_hard_count = learned_drop_ratio_after_gate
+            hard_drop_target_ratio_source = "network_only_total_share_gate"
+            hard_drop_target_ratio_source_id = 20
+
         # network floorは最後の保険だけにする。
         # HybridではPrune量固定を避けたいので、必要ならCLIで小さくする。
         if network_prune_floor_ratio > 0.0 and not algorithmic_proposal_selector_active:
@@ -5576,7 +5660,7 @@ class StructureRepairActuator(nn.Module):
         # Heuristic有効時だけhard countと同じguided Amountをsoft経路へ渡す。
         learned_drop_ratio = (
             effective_drop_ratio_for_hard_count
-            if heuristic_guidance is not None
+            if heuristic_guidance is not None or network_only_codec_mode
             else learned_drop_ratio_before_gate
         )
         learned_drop_ratio_for_ops = self._scale_amount_downstream_grad(
@@ -5687,6 +5771,10 @@ class StructureRepairActuator(nn.Module):
             learned_drop_logit,
             op_name="drop",
         )
+        if network_only_codec_mode:
+            learned_drop_logit = network_only_policy_terms["where_logits"][:, 0:1].to(
+                device=pts_xyz.device, dtype=pts_xyz.dtype
+            )
         # ============================================================
         # Codec prior distillation用のNetwork素のlogit
         # ============================================================
@@ -6370,6 +6458,10 @@ class StructureRepairActuator(nn.Module):
             voxel_coords,
             voxel_cache=voxel_cache,
         )
+        if network_only_codec_mode:
+            subtree_move_source_logit = network_only_policy_terms["where_logits"][:, 2:3].to(
+                device=pts_xyz.device, dtype=pts_xyz.dtype
+            )
         subtree_move_source_prob = torch.sigmoid(subtree_move_source_logit).clamp(0.0, 1.0)
         move_source_prior = torch.sigmoid(
             (
@@ -6444,6 +6536,11 @@ class StructureRepairActuator(nn.Module):
             "repair_move_amount_random_mix_start",
             "repair_move_amount_random_mix_end",
         )
+        if network_only_codec_mode:
+            learned_move_ratio = (
+                network_only_policy_terms["total_ratio"]
+                * network_only_policy_terms["shares"][:, 2:3]
+            ).to(device=pts_xyz.device, dtype=pts_xyz.dtype).clamp(0.0, float(max_move_ratio))
         raw_learned_move_ratio = learned_move_ratio
         # AdjustがHard実行0%に潰れるのを防ぐ。
         # forward値だけ下限を持たせ、backwardは元のlearned_move_ratioへ流す。
@@ -6695,12 +6792,20 @@ class StructureRepairActuator(nn.Module):
             op_name="move",
         )
         move_logits = self._voxel_mean_logits(move_logits, voxel_coords, voxel_cache=voxel_cache)
+        if network_only_codec_mode:
+            move_logits = network_only_policy_terms["direction_logits"][:, 1].to(
+                device=pts_xyz.device, dtype=pts_xyz.dtype
+            )
         learned_move_direction_logits = move_logits
 
         # Section5:
         # best_move_target_child_slotと一致するtarget方向を強める。
         # 方向そのものは上流の valid_move_points でmask済みである。
-        if bool(leaf_target_direction_prior.get("enabled", False)) and not exact_den6_candidate_mode:
+        if (
+            bool(leaf_target_direction_prior.get("enabled", False))
+            and not exact_den6_candidate_mode
+            and not network_only_codec_mode
+        ):
             move_logits = move_logits + float(
                 getattr(self.args, "leaf_pattern_move_target_direction_weight", 1.25)
             ) * leaf_move_target_bias.permute(0, 2, 1).to(
@@ -6901,7 +7006,7 @@ class StructureRepairActuator(nn.Module):
             move_allowed_weight = guarded_move_candidate_mask.unsqueeze(1).to(dtype=move_candidate_voxel_weight.dtype)
 
         move_target_ratio_for_hard = move_target_ratio
-        if heuristic_guidance is not None and move_target_ratio > 0.0:
+        if (heuristic_guidance is not None or network_only_codec_mode) and move_target_ratio > 0.0:
             # den6 profileのAdjust比率は入力全体のoccupied voxel基準である。
             # 既存実装はguard後candidate数を分母にしたため、候補が少ないframeでは
             # 0.05%が過小なhard countへ縮んでいた。hard選択の分母だけを候補数へ
@@ -6926,7 +7031,11 @@ class StructureRepairActuator(nn.Module):
         if min_move_expected_voxels > 0.0 and disp_enabled:
             expected_move_voxels = (
                 learned_move_ratio.detach().reshape(B, 1, 1)
-                * valid_move_source_voxel_count_effective.detach()
+                * (
+                    learned_move_ratio.new_tensor(float(global_voxel_count)).reshape(1, 1, 1)
+                    if network_only_codec_mode
+                    else valid_move_source_voxel_count_effective.detach()
+                )
             ).mean()
             if float(expected_move_voxels.cpu()) < min_move_expected_voxels:
                 move_target_ratio_for_hard = 0.0
@@ -7101,6 +7210,11 @@ class StructureRepairActuator(nn.Module):
             "repair_add_amount_random_mix_start",
             "repair_add_amount_random_mix_end",
         )
+        if network_only_codec_mode:
+            learned_add_ratio = (
+                network_only_policy_terms["total_ratio"]
+                * network_only_policy_terms["shares"][:, 1:2]
+            ).to(device=pts_xyz.device, dtype=pts_xyz.dtype).clamp(0.0, float(max_add_ratio_value))
         raw_learned_add_ratio = learned_add_ratio
         add_ratio_floor_applied = False
         add_ratio_floor = min(max(float(getattr(self.args, "repair_add_ratio_floor", 0.0)), 0.0), max_add_ratio_value)
@@ -7207,6 +7321,10 @@ class StructureRepairActuator(nn.Module):
                 learned_add_logit,
                 op_name="add",
             )
+            if network_only_codec_mode:
+                learned_add_logit = network_only_policy_terms["where_logits"][:, 1:2].to(
+                    device=pts_xyz.device, dtype=pts_xyz.dtype
+                )
             add_prior = (
                 0.25 * p_sibling
                 + 0.20 * p_parent
@@ -7266,9 +7384,17 @@ class StructureRepairActuator(nn.Module):
             )
             add_logit = self._voxel_mean_logits(add_logit, voxel_coords, voxel_cache=voxel_cache)
             add_voxel_logits = self._voxel_mean_logits(add_voxel_logits, voxel_coords, voxel_cache=voxel_cache)
+            if network_only_codec_mode:
+                add_voxel_logits = network_only_policy_terms["direction_logits"][:, 0].to(
+                    device=pts_xyz.device, dtype=pts_xyz.dtype
+                )
             learned_add_direction_logits = add_voxel_logits
 
-            if bool(leaf_target_direction_prior.get("enabled", False)) and not exact_den6_candidate_mode:
+            if (
+                bool(leaf_target_direction_prior.get("enabled", False))
+                and not exact_den6_candidate_mode
+                and not network_only_codec_mode
+            ):
                 add_voxel_logits = add_voxel_logits + float(
                     getattr(self.args, "leaf_pattern_add_target_direction_weight", 1.25)
                 ) * leaf_add_target_bias.permute(0, 2, 1).to(
@@ -7332,7 +7458,7 @@ class StructureRepairActuator(nn.Module):
             # exact den6 onlineでは、このgeneric Add状態は後段の唯一の
             # exact planで必ず上書きされる。Networkのpair_logitsは残すが、
             # 使用されない全N×26 target座標・重複排除・occupancy照合は作らない。
-            if not exact_den6_candidate_mode:
+            if not exact_den6_candidate_mode and not network_only_codec_mode:
                 candidate_base_voxels_long = voxel_coords.transpose(1, 2).contiguous().unsqueeze(2)
                 candidate_offsets_long = neighbor_offsets_long.view(1, 1, -1, 3)
                 candidate_target_voxels_long = candidate_base_voxels_long + candidate_offsets_long
@@ -7401,11 +7527,21 @@ class StructureRepairActuator(nn.Module):
                 add_direction_ce_per_point * add_valid_point
             ).sum() / add_valid_point.sum().clamp_min(1.0)
             valid_counts = valid_pair.reshape(B, -1).sum(dim=1)
-            effective_add_k = (
+            requested_add_k = (
                 0
                 if exact_den6_candidate_mode
                 else min(int(add_k), int(valid_counts.min().detach().cpu().item()))
             )
+            if network_only_codec_mode and requested_add_k > 0:
+                # Keep dense scores/masks, but never materialise N*26*3 target
+                # coordinates.  Only a small score-ordered top window needs
+                # coordinates for duplicate/collision resolution.
+                effective_add_k = min(
+                    int(valid_counts.min().detach().cpu().item()),
+                    max(int(requested_add_k) * 4, int(requested_add_k) + 64),
+                )
+            else:
+                effective_add_k = requested_add_k
             if effective_add_k > 0:
                 pair_mask_value = torch.finfo(pair_logits.dtype).min
                 pair_scores = pair_logits.masked_fill(~valid_pair, pair_mask_value).reshape(B, -1)
@@ -7414,7 +7550,7 @@ class StructureRepairActuator(nn.Module):
                     k=effective_add_k,
                     dim=1,
                     largest=True,
-                    sorted=False,
+                    sorted=bool(network_only_codec_mode),
                 )
                 if network_single_proposal:
                     fixed_pair_flat = fixed_add_target_bias.permute(0, 2, 1).reshape(B, -1)
@@ -7424,7 +7560,11 @@ class StructureRepairActuator(nn.Module):
                     )
                 selected_pair_logits = torch.gather(pair_scores, 1, top_pair_idx)
                 add_strength_tau = max(float(getattr(self.args, "repair_add_strength_tau", 1.0)), 1e-6)
-                top_threshold = top_pair_values.min(dim=1, keepdim=True).values.detach()
+                threshold_index = min(
+                    max(int(requested_add_k) - 1, 0),
+                    int(top_pair_values.shape[1]) - 1,
+                )
+                top_threshold = top_pair_values[:, threshold_index:threshold_index + 1].detach()
                 selected_pair_strength = torch.sigmoid((selected_pair_logits - top_threshold) / add_strength_tau)
                 selected_pair_strength = torch.nan_to_num(
                     selected_pair_strength,
@@ -7442,6 +7582,31 @@ class StructureRepairActuator(nn.Module):
                 unique_add_target_mask = self._first_unique_coord_mask(selected_add_voxels_long).to(
                     dtype=pair_scores.dtype
                 )
+                if network_only_codec_mode:
+                    current_keep_for_add = final_w.detach().squeeze(1) >= float(
+                        getattr(
+                            self.args,
+                            "operation_count_drop_threshold",
+                            getattr(self.args, "test_drop_threshold", 0.5),
+                        )
+                    )
+                    collision_free = torch.zeros_like(
+                        unique_add_target_mask, dtype=torch.bool
+                    )
+                    for b in range(B):
+                        occupied_now = final_voxel_coords_state[b].transpose(0, 1).contiguous()
+                        occupied_now = occupied_now[current_keep_for_add[b]]
+                        selected_targets_b = selected_add_voxels_long[b].transpose(0, 1).contiguous()
+                        collision_free[b] = ~self._coords_membership(
+                            selected_targets_b, occupied_now
+                        )
+                    eligible_selected = (
+                        unique_add_target_mask.to(dtype=torch.bool) & collision_free
+                    )
+                    score_rank = eligible_selected.to(torch.long).cumsum(dim=1)
+                    unique_add_target_mask = (
+                        eligible_selected & (score_rank <= int(requested_add_k))
+                    ).to(dtype=pair_scores.dtype)
                 if threshold_cap_mode:
                     hard_top_add = (
                         selected_pair_strength >= float(getattr(self.args, "repair_add_hard_threshold", 0.5))
@@ -10243,50 +10408,162 @@ class StructureRepairActuator(nn.Module):
             if isinstance(heuristic_guidance, dict) else ""
         )
         single_proposal_policy = (
-            str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower()
-            == "ana_den6_online"
-            and guidance_formula == "ana_den6_single_proposal_network_residual_online_v7"
+            (
+                str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower()
+                == "ana_den6_online"
+                and guidance_formula == "ana_den6_single_proposal_network_residual_online_v7"
+            )
+            or network_only_codec_mode
         )
         single_policy_zero = pts_xyz.new_zeros(())
         single_where_log_prob = single_policy_zero
         single_amount_log_prob = single_policy_zero
         single_action_log_prob = single_policy_zero
+        single_direction_log_prob = single_policy_zero
+        single_direction_entropy = single_policy_zero
         single_policy_entropy = single_policy_zero
         if single_proposal_policy:
             policy_eps = max(float(torch.finfo(pts_xyz.dtype).eps), 1e-6)
 
-            def _executed_where_log_prob(probability, executed):
-                probability = torch.nan_to_num(
-                    probability.float(), nan=0.5, posinf=1.0, neginf=0.0
-                ).clamp(policy_eps, 1.0 - policy_eps)
-                executed = executed.detach().to(device=probability.device, dtype=torch.bool)
-                if executed.shape != probability.shape:
-                    executed = executed.reshape(probability.shape)
-                if not bool(executed.any().item()):
-                    return probability.new_zeros(())
-                # 非選択の数十万Voxelを足すとno-opへ収束するため、今回実行した
-                # Whereだけをcredit assignment対象にする。
-                return probability[executed].log().mean()
+            def _executed_where_log_prob(base_logits, executed):
+                sampling_temperature = network_only_policy_terms.get(
+                    "where_sampling_temperature", base_logits.new_tensor(1.0)
+                )
+                # Hard selection is Gumbel-top-k.  Use the corresponding
+                # relative categorical likelihood, rather than independent
+                # sigmoid probabilities that can be improved by shifting all
+                # voxel logits without changing their ranking.
+                return self.network_only_topk_log_prob(
+                    base_logits, executed, sampling_temperature
+                )
 
             where_terms = []
             selected_gate = operation_gate_hard.detach().float().mean(dim=(0, 2))
+            network_base_where = (
+                network_only_policy_terms.get("base_where_logits")
+                if network_only_codec_mode else None
+            )
             if prune_enabled and bool(selected_gate[0].item() > 0.5):
-                where_terms.append(_executed_where_log_prob(drop_prob_proxy, hard_drop_mask))
-            if add_enabled and bool(selected_gate[1].item() > 0.5) and hard_add_pair.numel() > 0:
-                add_where_probability = (
-                    torch.sigmoid(exact_add_pair_logits.float()).reshape_as(hard_add_pair)
-                    if torch.is_tensor(exact_add_pair_logits)
-                    else soft_add_pair
+                prune_base_logits = (
+                    network_base_where[:, 0:1].float()
+                    if torch.is_tensor(network_base_where)
+                    else torch.logit(drop_prob_proxy.float().clamp(policy_eps, 1.0 - policy_eps))
                 )
+                where_terms.append(_executed_where_log_prob(prune_base_logits, hard_drop_mask))
+            if add_enabled and bool(selected_gate[1].item() > 0.5) and hard_add_pair.numel() > 0:
+                if network_only_codec_mode:
+                    add_selected_nk = hard_add_pair.detach().view(
+                        B, N, int(self.neighbor_offsets.shape[0])
+                    ) > 0.0
+                    add_source_selected = add_selected_nk.any(dim=2).unsqueeze(1)
+                    add_where_logits = network_base_where[:, 1:2].float()
+                else:
+                    add_where_logits = (
+                        exact_add_pair_logits.float().reshape_as(hard_add_pair)
+                        if torch.is_tensor(exact_add_pair_logits)
+                        else torch.logit(soft_add_pair.float().clamp(policy_eps, 1.0 - policy_eps))
+                    )
+                    add_source_selected = hard_add_pair > 0.0
                 where_terms.append(
-                    _executed_where_log_prob(add_where_probability, hard_add_pair > 0.0)
+                    _executed_where_log_prob(add_where_logits, add_source_selected)
                 )
             if disp_enabled and bool(selected_gate[2].item() > 0.5):
-                where_terms.append(_executed_where_log_prob(move_score, hard_move_mask))
+                move_base_logits = (
+                    network_base_where[:, 2:3].float()
+                    if torch.is_tensor(network_base_where)
+                    else torch.logit(move_score.float().clamp(policy_eps, 1.0 - policy_eps))
+                )
+                where_terms.append(_executed_where_log_prob(move_base_logits, hard_move_mask))
             if where_terms:
                 single_where_log_prob = torch.stack(where_terms).mean()
 
-            gate_prob = operation_gate_prob.float().mean(dim=(0, 2)).clamp(
+            direction_terms = []
+            direction_entropies = []
+            def _selected_network_direction_term(operation_index, selected_source, selected_direction):
+                base_vectors = network_only_policy_terms["base_direction_vectors"]
+                concentration = network_only_policy_terms["direction_concentration"]
+                unit_offsets = torch.nn.functional.normalize(
+                    self.neighbor_offsets.to(device=base_vectors.device, dtype=base_vectors.dtype),
+                    dim=1,
+                )
+                log_prob_values = []
+                entropy_values = []
+                for batch_index in range(B):
+                    source_indices = torch.nonzero(
+                        selected_source[batch_index], as_tuple=False
+                    ).reshape(-1)
+                    if source_indices.numel() == 0:
+                        continue
+                    vectors = base_vectors[batch_index, operation_index, :, source_indices].transpose(0, 1)
+                    scales = concentration[batch_index, operation_index, 0, source_indices].unsqueeze(1)
+                    direction_temperature = torch.as_tensor(
+                        network_only_policy_terms.get("direction_sampling_temperature", 1.0),
+                        device=vectors.device,
+                        dtype=vectors.dtype,
+                    ).clamp_min(0.05)
+                    logits = (
+                        torch.matmul(vectors, unit_offsets.transpose(0, 1)) * scales
+                    ) / direction_temperature
+                    probabilities = torch.softmax(logits.float(), dim=1).clamp_min(policy_eps)
+                    directions = selected_direction[batch_index, source_indices].to(dtype=torch.long)
+                    log_prob_values.append(
+                        probabilities.gather(1, directions.unsqueeze(1)).log().mean()
+                    )
+                    entropy_values.append(
+                        -(probabilities * probabilities.log()).sum(dim=1).mean()
+                    )
+                if not log_prob_values:
+                    return None, None
+                return torch.stack(log_prob_values).mean(), torch.stack(entropy_values).mean()
+
+            if add_enabled and hard_add_pair.numel() > 0 and torch.is_tensor(exact_add_pair_logits):
+                if network_only_codec_mode:
+                    add_selected_nk = hard_add_pair.detach().view(
+                        B, N, int(self.neighbor_offsets.shape[0])
+                    ) > 0.0
+                    add_selected_source = add_selected_nk.any(dim=2)
+                    add_selected_direction = add_selected_nk.to(dtype=torch.long).argmax(dim=2)
+                    direction_term, direction_entropy = _selected_network_direction_term(
+                        0, add_selected_source, add_selected_direction
+                    )
+                    if direction_term is not None:
+                        direction_terms.append(direction_term)
+                        direction_entropies.append(direction_entropy)
+                else:
+                    add_dir_prob = torch.softmax(exact_add_pair_logits.float(), dim=2)
+                    add_selected_nk = hard_add_pair.detach().view_as(add_dir_prob) > 0.0
+                    if bool(add_selected_nk.any().item()):
+                        direction_terms.append(add_dir_prob.clamp_min(policy_eps)[add_selected_nk].log().mean())
+                    direction_entropies.append(
+                        -(add_dir_prob.clamp_min(policy_eps) * add_dir_prob.clamp_min(policy_eps).log()).sum(dim=2).mean()
+                    )
+            if disp_enabled and torch.is_tensor(move_probs):
+                selected_move = hard_move_mask.detach().squeeze(1).to(dtype=torch.bool)
+                if network_only_codec_mode:
+                    direction_term, direction_entropy = _selected_network_direction_term(
+                        1, selected_move, move_idx.squeeze(1)
+                    )
+                    if direction_term is not None:
+                        direction_terms.append(direction_term)
+                        direction_entropies.append(direction_entropy)
+                else:
+                    direction_move_probs = move_probs.float()
+                    if bool(selected_move.any().item()):
+                        chosen_move_prob = torch.gather(direction_move_probs, 1, move_idx).squeeze(1)
+                        direction_terms.append(chosen_move_prob.clamp_min(policy_eps)[selected_move].log().mean())
+                    direction_entropies.append(
+                        -(direction_move_probs.clamp_min(policy_eps) * direction_move_probs.clamp_min(policy_eps).log()).sum(dim=1).mean()
+                    )
+            if direction_terms:
+                single_direction_log_prob = torch.stack(direction_terms).mean()
+            if direction_entropies:
+                single_direction_entropy = torch.stack(direction_entropies).mean()
+
+            gate_probability_for_log = (
+                network_only_policy_terms.get("gate_base_probability", operation_gate_prob)
+                if network_only_codec_mode else operation_gate_prob
+            )
+            gate_prob = gate_probability_for_log.float().mean(dim=(0, 2)).clamp(
                 policy_eps, 1.0 - policy_eps
             )
             active = selected_gate.to(device=gate_prob.device, dtype=gate_prob.dtype)
@@ -10306,11 +10583,18 @@ class StructureRepairActuator(nn.Module):
                 (learned_add_ratio.float().mean() / max(float(max_add_ratio_value), policy_eps)),
                 (learned_move_ratio.float().mean() / max(float(max_move_ratio), policy_eps)),
             ]).clamp(policy_eps, 1.0 - policy_eps)
-            amount_terms = active * amount_prob.log()
-            active_enabled = active * enabled
-            single_amount_log_prob = (
-                (amount_terms * enabled).sum() / active_enabled.sum().clamp_min(1.0)
-            )
+            if network_only_codec_mode:
+                single_amount_log_prob = (
+                    network_only_policy_terms["amount_sample_log_prob"]
+                    + network_only_policy_terms["share_sample_log_prob"]
+                    + network_only_policy_terms["priority_sample_log_prob"]
+                )
+            else:
+                amount_terms = active * amount_prob.log()
+                active_enabled = active * enabled
+                single_amount_log_prob = (
+                    (amount_terms * enabled).sum() / active_enabled.sum().clamp_min(1.0)
+                )
             action_entropy = -(gate_prob * gate_prob.log())
             amount_entropy = -(
                 amount_prob * amount_prob.log()
@@ -10318,11 +10602,51 @@ class StructureRepairActuator(nn.Module):
             )
             single_policy_entropy = (
                 action_entropy.sum() + (amount_entropy * active).sum()
-            ) / 2.0
+            ) / 2.0 + single_direction_entropy
+            if network_only_codec_mode:
+                # Keep the learned three-way share exploratory without a
+                # fixed 0.4/0.4/0.2 target.  This acts on raw softmax shares,
+                # so a temporary hard exploration floor cannot hide collapse.
+                share_entropy = network_only_policy_terms.get("amount_entropy")
+                if torch.is_tensor(share_entropy):
+                    single_policy_entropy = single_policy_entropy + share_entropy
+                distribution_entropies = [
+                    network_only_policy_terms.get("amount_distribution_entropy"),
+                    network_only_policy_terms.get("share_distribution_entropy"),
+                    network_only_policy_terms.get("priority_entropy"),
+                ]
+                distribution_entropies = [
+                    value for value in distribution_entropies if torch.is_tensor(value)
+                ]
+                if distribution_entropies:
+                    single_policy_entropy = single_policy_entropy + torch.stack(
+                        [value.float().mean() for value in distribution_entropies]
+                    ).mean().to(dtype=single_policy_entropy.dtype)
 
-        single_policy_log_prob = (
-            single_where_log_prob + single_amount_log_prob + single_action_log_prob
+        # Each family describes one part of the same composite action.  Use
+        # their mean so adding Where/Direction/priority terms cannot multiply
+        # the effective PG coefficient or overwhelm geometry/Surrogate loss.
+        single_policy_log_prob = torch.stack((
+            single_where_log_prob,
+            single_amount_log_prob,
+            single_action_log_prob,
+            single_direction_log_prob,
+        )).mean()
+        external_composite_log_prob = (
+            network_only_policy_terms.get("composite_policy_log_prob")
+            if network_only_codec_mode and isinstance(network_only_policy_terms, dict)
+            else None
         )
+        if torch.is_tensor(external_composite_log_prob):
+            # K specialists are deterministic proposals.  Their stochastic
+            # credit is the batched Critic's selected-slot distribution, not
+            # the legacy single-policy sum over thousands of voxel log-probs.
+            single_policy_log_prob = external_composite_log_prob
+            external_composite_entropy = network_only_policy_terms.get(
+                "composite_policy_entropy"
+            )
+            if torch.is_tensor(external_composite_entropy):
+                single_policy_entropy = external_composite_entropy
         if single_proposal_policy:
             selected_action_mask = operation_gate_hard.detach()[0, :, 0].to(
                 dtype=torch.int64
@@ -10347,6 +10671,55 @@ class StructureRepairActuator(nn.Module):
             move_selected_mask = hard_move_mask.detach()[0, 0].to(dtype=torch.bool)
             move_sources = voxel_coords[0].transpose(0, 1)[move_selected_mask]
             move_targets = move_target_voxel_coords[0].transpose(0, 1)[move_selected_mask]
+            coord_hashes = {
+                "Prune": _coord_rows_hash(prune_selected),
+                "Add": _coord_rows_hash(add_selected),
+                "AdjustSource": _coord_rows_hash(move_sources),
+                "AdjustTarget": _coord_rows_hash(move_targets),
+            }
+
+            def _tagged_coord_keys(tag, rows):
+                if not torch.is_tensor(rows) or rows.numel() == 0:
+                    return set()
+                return {
+                    (str(tag), int(row[0]), int(row[1]), int(row[2]))
+                    for row in rows.detach().to(device="cpu", dtype=torch.int64).tolist()
+                }
+
+            selected_coord_key_set = set()
+            selected_coord_key_set.update(_tagged_coord_keys("P", prune_selected))
+            selected_coord_key_set.update(_tagged_coord_keys("A", add_selected))
+            selected_coord_key_set.update(_tagged_coord_keys("MS", move_sources))
+            selected_coord_key_set.update(_tagged_coord_keys("MT", move_targets))
+            sampled_priority_order = (
+                network_only_policy_terms.get("priority_order")[0].detach().cpu().tolist()
+                if network_only_codec_mode
+                and torch.is_tensor(network_only_policy_terms.get("priority_order"))
+                else [0, 1, 2]
+            )
+            plan_hash_payload = {
+                "coord_hashes": coord_hashes,
+                "action_mask": selected_action_mask,
+                "amounts": [
+                    round(float(learned_drop_ratio.detach().mean()), 9),
+                    round(float(learned_add_ratio.detach().mean()), 9),
+                    round(float(learned_move_ratio.detach().mean()), 9),
+                ],
+                "priority_order": sampled_priority_order,
+            }
+            network_plan_hash = hashlib.sha256(
+                json.dumps(plan_hash_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            add_direction_indices = (
+                torch.nonzero(hard_add_pair.detach()[0].reshape(-1) > 0.0, as_tuple=False)
+                .reshape(-1)
+                .remainder(int(self.neighbor_offsets.shape[0]))
+                .cpu().tolist()
+            )
+            move_direction_indices = (
+                move_idx_flat.detach()[0][move_selected_mask].cpu().tolist()
+                if bool(move_selected_mask.any().item()) else []
+            )
             exact_residual_plan_debug.update({
                 "plan_count": 1,
                 "pool_reference_count": 0,
@@ -10370,12 +10743,12 @@ class StructureRepairActuator(nn.Module):
                     "fixed_valid_after_unique": int(fixed_add_valid_after_unique_count),
                     "selected_fixed_pairs": int(selected_fixed_add_pair_count),
                 },
-                "selected_coord_hashes": {
-                    "Prune": _coord_rows_hash(prune_selected),
-                    "Add": _coord_rows_hash(add_selected),
-                    "AdjustSource": _coord_rows_hash(move_sources),
-                    "AdjustTarget": _coord_rows_hash(move_targets),
-                },
+                "selected_coord_hashes": coord_hashes,
+                "selected_coord_key_set": selected_coord_key_set,
+                "plan_hash": network_plan_hash,
+                "priority_order": sampled_priority_order,
+                "add_direction_indices": add_direction_indices,
+                "adjust_direction_indices": move_direction_indices,
                 "selected_action_index": (
                     int(selected_action_mask.index(1))
                     if selected_action_count == 1 else -1
@@ -10387,7 +10760,18 @@ class StructureRepairActuator(nn.Module):
                 "where_log_prob": single_where_log_prob,
                 "amount_log_prob": single_amount_log_prob,
                 "action_log_prob": single_action_log_prob,
-                "proposal_source": "network_plus_gt_fixed_den6_features",
+                "direction_log_prob": single_direction_log_prob,
+                "direction_entropy": single_direction_entropy,
+                "proposal_source": (
+                    "network_only_codec_cost_policy"
+                    if network_only_codec_mode
+                    else "network_plus_gt_fixed_den6_features"
+                ),
+                "network_forward_count": 1 if network_only_codec_mode else 0,
+                "den6_call_count": 0,
+                "candidate_object_count": 0,
+                "teacher_plan_reference_count": 0,
+                "behavior_cloning_loss": 0.0,
             })
 
         return pts_out, final_w, loss, {
@@ -11102,6 +11486,88 @@ class StructureRepairActuator(nn.Module):
             ),
             "den6_online_action_log_prob": exact_residual_plan_debug.get(
                 "action_log_prob", single_action_log_prob
+            ),
+            "network_only_direction_log_prob": exact_residual_plan_debug.get(
+                "direction_log_prob", single_direction_log_prob
+            ),
+            "network_only_direction_entropy": exact_residual_plan_debug.get(
+                "direction_entropy", single_direction_entropy
+            ),
+            "network_only_total_ratio_raw": (
+                network_only_policy_terms["total_ratio_raw"]
+                if network_only_codec_mode else pts_xyz.new_zeros((B, 1, 1))
+            ),
+            "network_only_total_ratio": (
+                network_only_policy_terms["total_ratio"]
+                if network_only_codec_mode else pts_xyz.new_zeros((B, 1, 1))
+            ),
+            "network_only_total_ratio_unconstrained": (
+                network_only_policy_terms["total_ratio_unconstrained"]
+                if network_only_codec_mode else pts_xyz.new_zeros((B, 1, 1))
+            ),
+            "network_only_total_ratio_mean": (
+                network_only_policy_terms["total_ratio_mean"]
+                if network_only_codec_mode else pts_xyz.new_zeros((B, 1, 1))
+            ),
+            "network_only_shares": (
+                network_only_policy_terms["shares"]
+                if network_only_codec_mode else pts_xyz.new_zeros((B, 3, 1))
+            ),
+            "network_only_shares_raw": (
+                network_only_policy_terms["shares_raw"]
+                if network_only_codec_mode else pts_xyz.new_zeros((B, 3, 1))
+            ),
+            "network_only_shares_mean": (
+                network_only_policy_terms["shares_mean"]
+                if network_only_codec_mode else pts_xyz.new_zeros((B, 3, 1))
+            ),
+            "network_only_priorities": (
+                network_only_policy_terms["priorities"]
+                if network_only_codec_mode else pts_xyz.new_zeros((B, 3, 1))
+            ),
+            "network_only_temperature": (
+                network_only_policy_terms["temperature"]
+                if network_only_codec_mode else pts_xyz.new_ones((B, 1, 1))
+            ),
+            "network_only_where_threshold": (
+                network_only_policy_terms["where_threshold"]
+                if network_only_codec_mode else pts_xyz.new_zeros((B, 3, 1))
+            ),
+            "network_only_where_sampling_temperature": (
+                network_only_policy_terms["where_sampling_temperature"]
+                if network_only_codec_mode else pts_xyz.new_ones((B, 1, 1))
+            ),
+            "network_only_direction_sampling_temperature": (
+                network_only_policy_terms["direction_sampling_temperature"]
+                if network_only_codec_mode else pts_xyz.new_ones(())
+            ),
+            "network_only_exploration_fraction": (
+                network_only_policy_terms["exploration_fraction"]
+                if network_only_codec_mode else pts_xyz.new_zeros(())
+            ),
+            "network_only_predicted_local_gain_sum": (
+                network_only_policy_terms["predicted_local_gain_sum"]
+                if network_only_codec_mode else pts_xyz.new_zeros((B, 1))
+            ),
+            "network_only_interaction_correction": (
+                network_only_policy_terms["interaction_correction"]
+                if network_only_codec_mode else pts_xyz.new_zeros((B, 1))
+            ),
+            "network_only_predicted_plan_gain": (
+                network_only_policy_terms["predicted_plan_gain"]
+                if network_only_codec_mode else pts_xyz.new_zeros((B, 1))
+            ),
+            "network_only_where_entropy": (
+                network_only_policy_terms["where_entropy"]
+                if network_only_codec_mode else pts_xyz.new_zeros(())
+            ),
+            "network_only_amount_entropy": (
+                network_only_policy_terms["amount_entropy"]
+                if network_only_codec_mode else pts_xyz.new_zeros(())
+            ),
+            "network_only_action_entropy": (
+                network_only_policy_terms["action_entropy"]
+                if network_only_codec_mode else pts_xyz.new_zeros(())
             ),
             "ana_den6_candidate_formula_basis": (
                 str(heuristic_guidance.get("formula_basis", ""))
