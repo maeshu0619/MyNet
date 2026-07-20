@@ -2791,7 +2791,47 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--network_k_proposal_hidden_dim', default=48, type=int)
     parser.add_argument('--network_k_proposal_shortlist_size', default=32768, type=int)
     parser.add_argument(
-        '--network_k_offline_dataset', default='', type=str,
+        '--network_k_target_domain', default='neighbor26_empty',
+        choices=['neighbor26_empty', 'child_slot'],
+        help='K経路のAdd/Adjust先。既定はden6と同じ26近傍の空Voxel',
+    )
+    parser.add_argument(
+        '--network_k_ratio_values', default='0.0005,0.0010,0.0025,0.0050,0.0100', type=str,
+        help='K専門slotが第1段階で選ぶ総編集率の離散値',
+    )
+    parser.add_argument('--network_k_share_lattice_step', default=0.05, type=float)
+    parser.add_argument('--network_k_critic_lambda_geometry', default=1.0, type=float)
+    parser.add_argument('--network_k_critic_lambda_uncertainty', default=0.05, type=float)
+    parser.add_argument('--network_k_critic_gain_scale', default=5.0, type=float)
+    parser.add_argument('--network_k_critic_geometry_scale', default=1.0, type=float)
+    parser.add_argument('--network_k_unfreeze_local_trunk', default=False, type=str2bool)
+    parser.add_argument('--network_k_unfreeze_upstream', default=False, type=str2bool)
+    parser.add_argument('--network_k_debug_plan_hash', default=False, type=str2bool)
+    parser.add_argument(
+        '--network_k_diagnostic_sequence_name', default='', type=str,
+        help='K Proposalの少数state診断時だけ使用する系列basename。通常訓練は空文字。',
+    )
+    parser.add_argument(
+        '--network_k_target_set_loss_cadence', default=5, type=int,
+        help='offline Add/Adjust target集合の密教師を計算するStep間隔。',
+    )
+    parser.add_argument('--network_k_elite_enabled', default=False, type=str2bool)
+    parser.add_argument('--network_k_elite_cadence', default=50, type=int)
+    parser.add_argument('--network_k_elite_replay_capacity', default=2048, type=int)
+    parser.add_argument(
+        '--network_k_diagnostic_factorization', default='network_map_network_theta',
+        choices=[
+            'heuristic_map_heuristic_theta',
+            'heuristic_map_network_theta',
+            'network_map_heuristic_theta',
+            'network_map_network_theta',
+        ],
+        help='分解診断用。通常推論ではnetwork_map_network_theta以外を拒否する',
+    )
+    parser.add_argument(
+        '--network_k_offline_dataset',
+        default='/data/maejima/log/mynet_kproposal_offline/kproposal_modes_k8_schema_v2.json.gz',
+        type=str,
         help='K専門slotのtraining-only offline Actual mode dataset。空ならonline scalar学習のみ',
     )
     parser.add_argument(
@@ -4039,6 +4079,42 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     args.network_k_proposal_shortlist_size = max(
         int(getattr(args, "network_k_proposal_shortlist_size", 32768)), 256
+    )
+    args.network_k_target_domain = str(
+        getattr(args, "network_k_target_domain", "neighbor26_empty")
+    ).strip().lower()
+    if args.network_k_target_domain not in {"neighbor26_empty", "child_slot"}:
+        raise ValueError("network_k_target_domain must be neighbor26_empty/child_slot")
+    ratio_text = str(getattr(
+        args, "network_k_ratio_values", "0.0005,0.0010,0.0025,0.0050,0.0100"
+    ))
+    args.network_k_ratio_values = tuple(
+        sorted({float(value.strip()) for value in ratio_text.split(",") if value.strip()})
+    )
+    if not args.network_k_ratio_values or any(
+        value <= 0.0 or value > 0.05 for value in args.network_k_ratio_values
+    ):
+        raise ValueError("network_k_ratio_values must contain positive ratios <= 0.05")
+    args.network_k_share_lattice_step = min(max(
+        float(getattr(args, "network_k_share_lattice_step", 0.05)), 0.0
+    ), 0.5)
+    args.network_k_critic_lambda_geometry = max(
+        float(getattr(args, "network_k_critic_lambda_geometry", 1.0)), 0.0
+    )
+    args.network_k_critic_lambda_uncertainty = max(
+        float(getattr(args, "network_k_critic_lambda_uncertainty", 0.05)), 0.0
+    )
+    args.network_k_critic_gain_scale = max(
+        float(getattr(args, "network_k_critic_gain_scale", 5.0)), 1e-6
+    )
+    args.network_k_critic_geometry_scale = max(
+        float(getattr(args, "network_k_critic_geometry_scale", 1.0)), 1e-6
+    )
+    args.network_k_elite_cadence = max(
+        int(getattr(args, "network_k_elite_cadence", 50)), 1
+    )
+    args.network_k_elite_replay_capacity = max(
+        int(getattr(args, "network_k_elite_replay_capacity", 2048)), 8
     )
     args.network_k_offline_dataset = str(
         getattr(args, "network_k_offline_dataset", "") or ""

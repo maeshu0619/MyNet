@@ -17,6 +17,7 @@ import argparse
 import gzip
 import hashlib
 import importlib.util
+import itertools
 import json
 import math
 import os
@@ -29,6 +30,36 @@ import numpy as np
 
 
 OPERATIONS = ("Add", "Prune", "Adjust")
+POLICY_OPERATIONS = ("Prune", "Add", "Adjust")
+
+
+def _optional_coordinate(candidate, names):
+    """候補に明示保存された座標だけを返し、欠落値は補完しない。"""
+    for name in names:
+        raw = getattr(candidate, name, None)
+        if raw is None:
+            continue
+        array = np.asarray(raw)
+        if array.size == 3:
+            return [list(map(int, array.reshape(1, 3)[0]))]
+        if array.ndim == 2 and array.shape[1] == 3:
+            return [list(map(int, row)) for row in array]
+    return []
+
+
+def _direction_index(delta):
+    """26近傍の辞書順indexを返す。範囲外方向は教師なしとする。"""
+    offsets = [
+        (x, y, z)
+        for x in (-1, 0, 1)
+        for y in (-1, 0, 1)
+        for z in (-1, 0, 1)
+        if (x, y, z) != (0, 0, 0)
+    ]
+    try:
+        return offsets.index(tuple(map(int, delta)))
+    except ValueError:
+        return -1
 
 
 def _sha256_file(path):
@@ -62,11 +93,40 @@ def _candidate_row(candidate):
             raw = raw.item()
         return raw
 
+    operation = str(value("operation", ""))
+    remove_coords = [list(map(int, row)) for row in value("remove_coords", ())]
+    add_coords = [list(map(int, row)) for row in value("add_coords", ())]
+    # Prune/Adjustのremove座標は実行sourceそのもの。Add sourceは履歴に
+    # 明示値がある場合だけ保存し、symbol位置等から推測しない。
+    if operation in ("Prune", "Adjust"):
+        source_coords = list(remove_coords)
+        source_available = bool(source_coords)
+    else:
+        source_coords = _optional_coordinate(
+            candidate, ("source_coords", "source_coord", "add_source_coords", "add_source_coord")
+        )
+        source_available = bool(source_coords)
+    target_coords = list(add_coords) if operation in ("Add", "Adjust") else []
+    direction = []
+    direction_index = -1
+    if len(source_coords) == 1 and len(target_coords) == 1:
+        direction = [
+            int(target_coords[0][axis]) - int(source_coords[0][axis])
+            for axis in range(3)
+        ]
+        direction_index = _direction_index(direction)
     return {
         "candidate_id": str(value("candidate_id", "")),
-        "operation": str(value("operation", "")),
-        "remove_coords": [list(map(int, row)) for row in value("remove_coords", ())],
-        "add_coords": [list(map(int, row)) for row in value("add_coords", ())],
+        "operation": operation,
+        "remove_coords": remove_coords,
+        "add_coords": add_coords,
+        "source_coords": source_coords,
+        "source_available": source_available,
+        "target_coords": target_coords,
+        "target_available": bool(target_coords),
+        "direction": direction,
+        "direction_index": int(direction_index),
+        "direction_available": direction_index >= 0,
         "symbol_index": int(value("symbol_index", -1)),
         "partner_symbol_index": int(value("partner_symbol_index", -1)),
         "depth": int(value("depth", -1)),
@@ -90,6 +150,24 @@ def _coord_hash(coords):
     return hashlib.sha256(
         np.ascontiguousarray(packed[order], dtype=np.int64).tobytes(order="C")
     ).hexdigest()
+
+
+def _local_score_summary(candidates):
+    """実行memberだけのscore統計であり、完全pool統計とは区別する。"""
+    result = {}
+    for operation in OPERATIONS:
+        values = [
+            float(row.get("heuristic_score", 0.0))
+            for row in candidates
+            if row.get("operation") == operation
+        ]
+        result[operation] = {
+            "count": len(values),
+            "mean": float(np.mean(values)) if values else 0.0,
+            "maximum": float(np.max(values)) if values else 0.0,
+            "scope": "executed_members_only",
+        }
+    return result
 
 
 def _actual_lookup(run_rows_path):
@@ -210,6 +288,7 @@ def reconstruct(args):
             "pattern_key": key[2],
             "plan_key": plan_key,
             "operation_order": str(plan_meta.get("operation_order", "")),
+            "plan_variant": int(plan_meta.get("variant_index", -1)),
             "operation_counts": operation_counts,
             "requested_counts": {
                 name: int(measured.get("requested_{}_count".format(name.lower()), 0))
@@ -236,6 +315,51 @@ def reconstruct(args):
             "added_voxel_count": int(len(adds)),
             "final_voxel_hash": _coord_hash(final_coords),
             "candidates": candidates,
+            "local_score_summary": _local_score_summary(candidates),
+            "shortlist_natural_recall": {
+                "available": False,
+                "reason": "network_shortlist_is_not_part_of_historical_den6_plan",
+            },
+        }
+        accepted_counts = dict(operation_counts)
+        rejected_counts = {
+            name: max(int(record["requested_counts"][name]) - int(accepted_counts[name]), 0)
+            for name in OPERATIONS
+        }
+        order_names = [
+            name for name in record["operation_order"].split(">") if name in OPERATIONS
+        ]
+        order_permutations = list(itertools.permutations(POLICY_OPERATIONS))
+        order_class = order_permutations.index(tuple(order_names)) if len(order_names) == 3 else -1
+        ratio_values = (0.05, 0.10, 0.25, 0.50, 1.00)
+        ratio_class = min(
+            range(len(ratio_values)),
+            key=lambda index: abs(ratio_values[index] - record["total_ratio_percent"]),
+        )
+        record["explicit_theta"] = {
+            "ratio_class": int(ratio_class),
+            "total_ratio_fraction": float(record["total_ratio_percent"]) / 100.0,
+            "share": [float(record["shares"][name]) for name in OPERATIONS],
+            "operation_order": order_names,
+            "order_class": int(order_class),
+            "variant": int(record["plan_variant"]),
+            "score_coefficient": None,
+            "score_coefficient_available": False,
+        }
+        record["pre_valid_proposal"] = {
+            "available": False,
+            "reason": "historical_den6_cache_contains_executed_plan_only",
+        }
+        record["post_valid_executable_plan"] = {
+            "operation_order": order_names,
+            "requested_count": dict(record["requested_counts"]),
+            "accepted_count": accepted_counts,
+            "rejected_count": rejected_counts,
+            "reject_reason_available": False,
+            "reject_reason_count": {"unattributed_shortfall": int(sum(rejected_counts.values()))},
+            "members": candidates,
+            "plan_hash": plan_key,
+            "final_voxel_hash": record["final_voxel_hash"],
         }
         reconstructed.append(record)
         seen.add(key)
@@ -293,7 +417,8 @@ def reconstruct(args):
     output = Path(args.output).expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "schema_version": "mynet_kproposal_actual_plan_dataset_v1",
+        "schema_version": "mynet_kproposal_actual_plan_dataset_v2",
+        "compatible_reader_versions": ["mynet_kproposal_actual_plan_dataset_v1"],
         "offline_only": True,
         "contains_virtual_actual_labels": False,
         "den6_sha256": current_den6,

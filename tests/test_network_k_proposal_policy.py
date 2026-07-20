@@ -59,6 +59,52 @@ class NetworkKProposalPolicyTest(unittest.TestCase):
         forbidden = ("den4", "den5", "den6", "teacher", "cache", "actual_encoder")
         self.assertFalse(any(any(term in name for term in forbidden) for name in imports))
 
+    def test_missing_fixed_features_fails_closed(self):
+        with self.assertRaises(RuntimeError):
+            self.policy(
+                self.features, _args(), training=False,
+                fixed_features=None, voxel_coords=self.coords,
+            )
+
+    def test_training_teacher_source_augments_but_preserves_natural_shortlist(self):
+        teacher_coord = self.coords[0, :, 3000].tolist()
+        output = self.policy(
+            self.features,
+            _args(_network_k_training_teacher_coords=[teacher_coord]),
+            training=True,
+            fixed_features=self.fixed,
+            voxel_coords=self.coords,
+        )
+        self.assertEqual(output["natural_shortlist_indices"].shape[1], 256)
+        self.assertTrue(bool((output["shortlist_indices"] == 3000).any()))
+
+    def test_inference_rejects_teacher_shortlist(self):
+        with self.assertRaises(RuntimeError):
+            self.policy(
+                self.features,
+                _args(_network_k_training_teacher_coords=[[0, 0, 0]]),
+                training=False,
+                fixed_features=self.fixed,
+                voxel_coords=self.coords,
+            )
+
+    def test_add_target_set_logits_use_reachable_sources_without_source_label(self):
+        target = (self.coords[0, :, 3000] + torch.tensor([1, 0, 0])).tolist()
+        output = self.policy(
+            self.features,
+            _args(
+                network_k_offline_dataset="offline-only",
+                _network_k_training_teacher_target_coords=[target],
+            ),
+            training=True,
+            fixed_features=self.fixed,
+            voxel_coords=self.coords,
+        )
+        self.assertEqual(tuple(output["slot_target_logits"].shape), (1, 8, 3, 1))
+        self.assertTrue(torch.isfinite(output["slot_target_logits"][:, :, 1]).all())
+        output["slot_target_logits"][:, :, 1].sum().backward()
+        self.assertGreater(float(self.policy.shared_direction_head.weight.grad.abs().sum()), 0.0)
+
     def test_deterministic_specialized_slots_and_counter_contract(self):
         first = self._forward()
         second = self._forward()
@@ -88,12 +134,13 @@ class NetworkKProposalPolicyTest(unittest.TestCase):
         with torch.no_grad():
             self.policy.plan_tokens[3].add_(2.0)
         after = self._forward()
-        unchanged = [
-            torch.equal(before["slot_logits"][:, slot], after["slot_logits"][:, slot])
-            for slot in range(8) if slot != 3
-        ]
-        self.assertTrue(all(unchanged))
-        self.assertFalse(torch.equal(before["slot_logits"][:, 3], after["slot_logits"][:, 3]))
+        for key in ("ratio_logits", "shares", "order_logits", "variant_logits"):
+            unchanged = [
+                torch.equal(before[key][:, slot], after[key][:, slot])
+                for slot in range(8) if slot != 3
+            ]
+            self.assertTrue(all(unchanged), key)
+            self.assertFalse(torch.equal(before[key][:, 3], after[key][:, 3]), key)
 
     def test_codec_conditioning_changes_proposal_set(self):
         first = self._forward()["slot_logits"]
@@ -105,6 +152,38 @@ class NetworkKProposalPolicyTest(unittest.TestCase):
             voxel_coords=self.coords,
         )["slot_logits"]
         self.assertFalse(torch.equal(first, second))
+
+    def test_ratio_and_order_theta_change_executable_plan_hash(self):
+        kwargs = dict(
+            training=False, fixed_features=self.fixed, voxel_coords=self.coords,
+        )
+        before = self.policy(
+            self.features, _args(network_k_debug_plan_hash=True), **kwargs
+        )
+        before_hash = before["executable_plans"]["plan_hash"][0][0]
+        with torch.no_grad():
+            self.policy.slot_ratio_bias[0].fill_(-8.0)
+            self.policy.slot_ratio_bias[0, 4] = 8.0
+            self.policy.slot_order_bias[0].fill_(-8.0)
+            self.policy.slot_order_bias[0, 5] = 8.0
+        after = self.policy(
+            self.features, _args(network_k_debug_plan_hash=True), **kwargs
+        )
+        self.assertNotEqual(before_hash, after["executable_plans"]["plan_hash"][0][0])
+
+    def test_inactive_threshold_temperature_and_enable_heads_are_removed(self):
+        for name in ("threshold_head", "temperature_head", "enable_head", "priority_head"):
+            self.assertFalse(hasattr(self.policy, name), name)
+
+    def test_legacy_k_checkpoint_dead_heads_do_not_break_non_strict_load(self):
+        state = dict(self.policy.state_dict())
+        hidden = self.policy.amount_head.weight.shape[1]
+        state["amount_head.weight"] = torch.zeros(1, hidden)
+        state["amount_head.bias"] = torch.zeros(1)
+        for name in ("enable_head", "priority_head", "threshold_head", "temperature_head"):
+            state[name + ".weight"] = torch.zeros(3, hidden)
+            state[name + ".bias"] = torch.zeros(3)
+        self.policy.load_state_dict(state, strict=False)
 
     def test_selected_amount_matches_collision_resolved_compact_counts(self):
         output = self._forward()
@@ -154,6 +233,14 @@ class NetworkKProposalPolicyTest(unittest.TestCase):
             "geometry": torch.linspace(0.1, 0.8, 8).view(1, 8),
             "mode_mask": torch.ones(1, 8, dtype=torch.bool),
             "voxel_relative_value": torch.rand(1, 3, output["slot_logits"].shape[-1]),
+            "theta": {
+                "ratio_class": output["ratio_class"].detach().roll(1, dims=1),
+                "total_ratio": output["total_ratio"].detach().squeeze(-1).roll(1, dims=1),
+                "share": output["shares"].detach().roll(1, dims=1),
+                "order_class": output["order_class"].detach().roll(1, dims=1),
+                "variant_class": torch.zeros(1, 8, dtype=torch.long),
+                "mask": torch.ones(1, 8, dtype=torch.bool),
+            },
         }
         losses = KProposalSetLoss()(output, teacher)
         self.assertTrue(losses["total"].requires_grad)

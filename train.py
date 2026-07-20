@@ -131,6 +131,19 @@ STEP_GRAD_COLUMNS = [
 ]
 
 def _limit_training_seq_dirs(seq_dirs, args):
+    diagnostic_sequence = str(
+        getattr(args, "network_k_diagnostic_sequence_name", "") or ""
+    ).strip()
+    if diagnostic_sequence:
+        if str(getattr(args, "heuristic_guidance_mode", "")).strip().lower() != "network_k_proposal_policy":
+            raise ValueError("network_k_diagnostic_sequence_nameはK Proposal診断専用である")
+        selected = [
+            path for path in seq_dirs
+            if os.path.basename(os.path.normpath(str(path))) == diagnostic_sequence
+        ]
+        if len(selected) != 1:
+            raise ValueError("K Proposal診断系列を一意に特定できない")
+        return selected
     # 8iは従来既定では先頭3シーケンスのみを使うが、argsで4つ全部へ切替可能にする。
     if str(getattr(args, "dataname", "")).strip().lower() == "8i":
         mode = str(getattr(args, "train_8i_sequence_mode", "first3")).strip().lower()
@@ -12719,6 +12732,34 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 memory_key=None,
                                 forward_key=cache_key,
                             )
+                            # offline教師が存在する訓練frameだけ、実在sourceを勾配候補へ追加する。
+                            # 自然shortlistは別途保持し、推論recallとして過大評価しない。
+                            args._network_k_training_teacher_coords = None
+                            args._network_k_training_teacher_target_coords = None
+                            if (
+                                heuristic_mode == "network_k_proposal_policy"
+                                and isinstance(k_proposal_teacher_store, OfflineKProposalTeacherStore)
+                            ):
+                                training_state_id = k_proposal_teacher_store.find_state_for_input(
+                                    file_path,
+                                    args,
+                                    split=str(getattr(args, "network_k_offline_split", "train")),
+                                )
+                                if training_state_id is not None:
+                                    args._network_k_training_teacher_coords = (
+                                        k_proposal_teacher_store.training_source_coordinates(
+                                            training_state_id
+                                        )
+                                    )
+                                    target_set_cadence = max(int(getattr(
+                                        args, "network_k_target_set_loss_cadence", 5
+                                    )), 1)
+                                    if global_train_step % target_set_cadence == 0:
+                                        args._network_k_training_teacher_target_coords = (
+                                            k_proposal_teacher_store.training_target_coordinates(
+                                                training_state_id
+                                            )
+                                        )
                             gen_pts, L_attr, L_policy, L_actuator, final_w, Lp_out, La_fit, La_rep, out_label = model.forward(
                                 input_xyz,
                                 input_attr_full,
@@ -12728,6 +12769,8 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 full_octree_context=full_octree_context,
                                 octree_input_mode="full_cloud",
                             )
+                            args._network_k_training_teacher_coords = None
+                            args._network_k_training_teacher_target_coords = None
                         if network_only_full_cloud and use_cuda:
                             # Saved autograd tensors are already on CPU after
                             # leaving save_on_cpu. Return now-unused forward
@@ -14229,8 +14272,37 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 "k_proposal_offline_loss_weight": offline_weight,
                                 "k_proposal_offline_dominance_ratio": float(offline_losses["dominance_ratio"]),
                                 "k_proposal_offline_dominance_warning": bool(offline_losses["dominance_warning"]),
-                                "k_proposal_offline_add_where_teacher_available": False,
+                                "k_proposal_offline_add_where_teacher_available": bool(
+                                    offline_teacher.get("add_where_teacher_available", False)
+                                ),
+                                "k_proposal_shortlist_natural_recall": float(
+                                    offline_teacher["shortlist_natural_recall"][
+                                        offline_teacher["shortlist_natural_recall_mask"]
+                                    ].mean().detach().cpu()
+                                ) if bool(offline_teacher[
+                                    "shortlist_natural_recall_mask"
+                                ].any()) else float("nan"),
+                                "k_proposal_shortlist_training_recall": float(
+                                    offline_teacher["shortlist_training_recall"][
+                                        offline_teacher["shortlist_training_recall_mask"]
+                                    ].mean().detach().cpu()
+                                ) if bool(offline_teacher[
+                                    "shortlist_training_recall_mask"
+                                ].any()) else float("nan"),
+                                "k_proposal_target_reachable_recall": float(
+                                    offline_teacher["target_reachable_recall"][
+                                        offline_teacher["target_reachable_recall_mask"]
+                                    ].mean().detach().cpu()
+                                ) if bool(offline_teacher[
+                                    "target_reachable_recall_mask"
+                                ].any()) else float("nan"),
                             })
+                            for metric_name, metric_value in offline_losses.get("metrics", {}).items():
+                                if torch.is_tensor(metric_value):
+                                    metric_value = float(metric_value.detach().cpu())
+                                compression_debug_terms[
+                                    f"k_proposal_offline_metric_{metric_name}"
+                                ] = metric_value
                             for loss_name, raw_value in offline_losses["raw"].items():
                                 compression_debug_terms[
                                     f"k_proposal_offline_{loss_name}_raw"
@@ -15992,6 +16064,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                             f"teacher={int(audit_state.get('teacher_reference_count', 0) or 0)}, "
                             f"probe={int(audit_state.get('sparsepcgc_probe_count', 0) or 0)}, "
                             f"candidate_actual={int(audit_state.get('candidate_actual_encode_count', 0) or 0)}, "
+                            f"unique_executable={int(audit_state.get('k_proposal_unique_executable_plan_count', -1))}, "
                             f"expected_counts={_audit_list('k_proposal_expected_count')}, "
                             f"executed_counts={_audit_list('k_proposal_executed_count')}, "
                             f"execution_count_mismatch={_audit_list('k_proposal_execution_count_mismatch')}, "
@@ -16009,10 +16082,12 @@ def train(model, args, loss, writer, plot, notifier=None):
                                     f"k_proposal_offline_{name}_raw", 0.0
                                 ) or 0.0)
                                 for name in (
-                                    "mode_matching", "coverage", "oracle_best",
-                                    "voxel_relative_value", "candidate_value",
-                                    "ranking", "hard_negative", "critic_selection",
-                                    "high_value_diversity", "geometry",
+                                    "mode_matching", "theta_supervision", "coverage", "teacher_soft_best",
+                                    "voxel_relative_value", "target_set", "direction",
+                                    "candidate_value", "ranking", "hard_negative",
+                                    "critic_selection", "high_value_diversity", "geometry",
+                                    "interaction", "uncertainty_calibration",
+                                    "actual_replay_value", "actual_elite_imitation",
                                 )
                             }
                             offline_weighted = {
@@ -16029,7 +16104,11 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 f"raw={offline_raw}, weighted={offline_weighted}, "
                                 f"dominance_ratio={float(audit_compression.get('k_proposal_offline_dominance_ratio', 0.0) or 0.0):.6g}, "
                                 f"warning={bool(audit_compression.get('k_proposal_offline_dominance_warning', False))}, "
-                                "add_where_teacher_available=False"
+                                f"add_where_teacher_available={bool(audit_compression.get('k_proposal_offline_add_where_teacher_available', False))}, "
+                                f"shortlist_natural_recall={float(audit_compression.get('k_proposal_shortlist_natural_recall', float('nan'))):.6g}, "
+                                f"shortlist_training_recall={float(audit_compression.get('k_proposal_shortlist_training_recall', float('nan'))):.6g}, "
+                                f"target_reachable_recall={float(audit_compression.get('k_proposal_target_reachable_recall', float('nan'))):.6g}, "
+                                f"actual_k_oracle={audit_compression.get('k_proposal_offline_metric_actual_k_oracle', None)}"
                             )
                     if loss_dominance_warning:
                         writer.write(

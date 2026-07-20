@@ -20,6 +20,8 @@ import numpy as np
 
 OPERATIONS = ("Prune", "Add", "Adjust")
 OP_INDEX = {name: index for index, name in enumerate(OPERATIONS)}
+RATIO_VALUES_PERCENT = (0.05, 0.10, 0.25, 0.50, 1.00)
+ORDER_PERMUTATIONS = list(itertools.permutations(OPERATIONS))
 
 
 def _load(paths):
@@ -27,6 +29,12 @@ def _load(paths):
     for path in paths:
         with gzip.open(str(path), "rt", encoding="utf-8") as stream:
             payload = json.load(stream)
+        schema = str(payload.get("schema_version", ""))
+        if schema not in (
+            "mynet_kproposal_actual_plan_dataset_v1",
+            "mynet_kproposal_actual_plan_dataset_v2",
+        ):
+            raise RuntimeError("unsupported Actual plan dataset schema: {}".format(schema))
         if payload.get("contains_virtual_actual_labels", True):
             raise RuntimeError("virtual/estimated labels are forbidden: {}".format(path))
         rows.extend(payload.get("records", ()))
@@ -55,6 +63,103 @@ def _priority_vector(text):
     for rank, operation in enumerate(order):
         ranks[OP_INDEX[operation]] = 1.0 - rank / 2.0
     return ranks
+
+
+def _direction_index(delta):
+    offsets = [
+        (x, y, z)
+        for x in (-1, 0, 1)
+        for y in (-1, 0, 1)
+        for z in (-1, 0, 1)
+        if (x, y, z) != (0, 0, 0)
+    ]
+    try:
+        return offsets.index(tuple(map(int, delta)))
+    except ValueError:
+        return -1
+
+
+def _explicit_theta(row):
+    """v1にも適用できる識別可能なthetaだけを正規化する。"""
+    stored = dict(row.get("explicit_theta") or {})
+    ratio_percent = float(row["total_ratio_percent"])
+    ratio_class = int(stored.get(
+        "ratio_class",
+        min(
+            range(len(RATIO_VALUES_PERCENT)),
+            key=lambda index: abs(RATIO_VALUES_PERCENT[index] - ratio_percent),
+        ),
+    ))
+    share_map = dict(row.get("shares") or {})
+    share = stored.get("share")
+    if not isinstance(share, list) or len(share) != 3:
+        share = [float(share_map.get(name, 0.0)) for name in OPERATIONS]
+    order = stored.get("operation_order")
+    if not isinstance(order, list) or len(order) != 3:
+        order = [name for name in str(row.get("operation_order", "")).split(">") if name in OP_INDEX]
+    order_tuple = tuple(order)
+    order_class = int(stored.get(
+        "order_class",
+        ORDER_PERMUTATIONS.index(order_tuple) if order_tuple in ORDER_PERMUTATIONS else -1,
+    ))
+    variant = int(stored.get("variant", row.get("plan_variant", -1)))
+    coefficient = stored.get("score_coefficient")
+    return {
+        "ratio_class": ratio_class,
+        "total_ratio_fraction": ratio_percent / 100.0,
+        "share": list(map(float, share)),
+        "operation_order": list(order),
+        "order_class": order_class,
+        "variant": variant,
+        "variant_available": variant >= 0,
+        "score_coefficient": coefficient,
+        "score_coefficient_available": coefficient is not None,
+    }
+
+
+def _mode_voxel_targets(row):
+    """実行済みplanからmode別教師を作り、Add source欠落はmaskで表す。"""
+    result = {
+        name: {
+            "source_coords": [],
+            "target_coords": [],
+            "direction_index": [],
+            "source_available": [],
+            "target_available": [],
+            "direction_available": [],
+        }
+        for name in OPERATIONS
+    }
+    for candidate in row.get("candidates", ()):
+        operation = str(candidate.get("operation", ""))
+        if operation not in result:
+            continue
+        removes = [list(map(int, coord)) for coord in candidate.get("remove_coords", ())]
+        adds = [list(map(int, coord)) for coord in candidate.get("add_coords", ())]
+        explicit_source = candidate.get("source_coords", None)
+        if operation in ("Prune", "Adjust"):
+            sources = removes
+        elif explicit_source is not None:
+            sources = [list(map(int, coord)) for coord in explicit_source]
+        else:
+            sources = []
+        targets = adds if operation in ("Add", "Adjust") else []
+        pairs = max(len(sources), len(targets), 1)
+        for pair_index in range(pairs):
+            source = sources[pair_index] if pair_index < len(sources) else None
+            target = targets[pair_index] if pair_index < len(targets) else None
+            direction_index = -1
+            if source is not None and target is not None:
+                direction_index = _direction_index([
+                    int(target[axis]) - int(source[axis]) for axis in range(3)
+                ])
+            result[operation]["source_coords"].append(source)
+            result[operation]["target_coords"].append(target)
+            result[operation]["direction_index"].append(int(direction_index))
+            result[operation]["source_available"].append(source is not None)
+            result[operation]["target_available"].append(target is not None)
+            result[operation]["direction_available"].append(direction_index >= 0)
+    return result
 
 
 def _direction_histogram(row):
@@ -295,7 +400,19 @@ def _strict_split(states):
         settings = [item[1][0]["state_key"]["setting_id"] for item in chosen]
         if len(set(frames)) != 3 or len(set(settings)) != 3:
             continue
-        score = sum(len(item[1]) for item in chosen)
+        train_key = chosen[0][1][0]["state_key"]
+        train_default_match = int(
+            int(train_key.get("scale_m", -1)) == 8
+            and int(train_key.get("scale_ae", -1)) == 0
+            and int(train_key.get("scale_sr", -1)) == 2
+        )
+        train_path = str(train_key.get("input_file", "")).replace("\\", "/")
+        train_primary_frame = int("/8i/" in train_path)
+        score = (
+            train_default_match,
+            train_primary_frame,
+            sum(len(item[1]) for item in chosen),
+        )
         if best is None or score > best[0]:
             best = (score, chosen)
     if best is None:
@@ -317,7 +434,10 @@ def prepare(args):
         medoids, assignment, descriptors, distance = _k_medoids(
             state_rows, args.maximum_k
         )
+        gains = np.asarray([float(row["actual_gain_percent"]) for row in state_rows])
+        gain_order = gains.argsort().argsort()
         prepared[state_id] = {
+            "state_id": state_id,
             "state_key": state_rows[0]["state_key"],
             "candidate_count": len(state_rows),
             "mode_count": len(medoids),
@@ -327,7 +447,40 @@ def prepare(args):
                     "descriptor": descriptors[index].tolist(),
                     "actual_gain_percent": float(state_rows[index]["actual_gain_percent"]),
                     "geometry": state_rows[index]["geometry"],
+                    "interaction_gain_percent": float(
+                        state_rows[index].get("interaction_gain_percent", 0.0)
+                    ),
                     "member_count": int((assignment == mode).sum()),
+                    "actual_rank": int(gain_order[index]),
+                    "high_value": bool(gains[index] >= np.quantile(gains, 0.75)),
+                    "explicit_theta": _explicit_theta(state_rows[index]),
+                    "voxel_targets": _mode_voxel_targets(state_rows[index]),
+                    "post_valid_executable_plan": dict(
+                        state_rows[index].get("post_valid_executable_plan") or {
+                            "available": True,
+                            "operation_order": [
+                                name for name in str(state_rows[index].get("operation_order", "")).split(">")
+                                if name in OP_INDEX
+                            ],
+                            "requested_count": dict(state_rows[index].get("requested_counts") or {}),
+                            "accepted_count": dict(state_rows[index].get("operation_counts") or {}),
+                            "members": list(state_rows[index].get("candidates") or ()),
+                            "plan_hash": str(state_rows[index].get("plan_key", "")),
+                            "final_voxel_hash": str(state_rows[index].get("final_voxel_hash", "")),
+                        }
+                    ),
+                    "local_score_summary": dict(
+                        state_rows[index].get("local_score_summary") or {
+                            "scope": "descriptor_statistics_only"
+                        }
+                    ),
+                    "shortlist_natural_recall": dict(
+                        state_rows[index].get("shortlist_natural_recall") or {
+                            "available": False,
+                            "reason": "computed_against_runtime_network_shortlist",
+                        }
+                    ),
+                    "teacher_actual_label": True,
                 }
                 for mode, index in enumerate(medoids)
             ],
@@ -339,7 +492,8 @@ def prepare(args):
             },
         }
     payload = {
-        "schema_version": "mynet_kproposal_mode_dataset_v1",
+        "schema_version": "mynet_kproposal_mode_dataset_v2",
+        "compatible_reader_versions": ["mynet_kproposal_mode_dataset_v1"],
         "offline_only": True,
         "voxel_target_semantics": "rank_weighted_relative_value_not_causal_gain",
         "add_direction_teacher_available": False,

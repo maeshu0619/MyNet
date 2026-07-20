@@ -707,6 +707,11 @@ def log_compact_step_summary(
         ("move_source_voxel_count", "moved_different_voxel_count", "voxel_edit_move_count"),
         _first_value(comp_debug, ("voxel_edit_move_count", "actual_oracle_accepted_adjust_count"), 0),
     )
+    if bool(structure_debug.get("external_executable_plan_applied", False)):
+        # K経路ではlegacy soft maskではなく、共通builderのhard実行数を表示する。
+        add_count = _first_value(structure_debug, ("voxel_edit_add_count",), add_count)
+        prune_count = _first_value(structure_debug, ("voxel_edit_drop_count",), prune_count)
+        adjust_count = _first_value(structure_debug, ("voxel_edit_move_count",), adjust_count)
     manifest_counts = getattr(args, "_ana_den6_reference_operation_counts", None)
     if (
         str(getattr(args, "_ana_den6_reference_anchor_source", ""))

@@ -2557,7 +2557,15 @@ class Network(nn.Module):
             # One shared encoder/basis creates K deterministic specialized
             # plans.  Only the Critic-selected compact plan is expanded into
             # the existing Actuator's one-plan interface.
-            actuator_input = actuator_input.detach()
+            if not bool(getattr(self.args, "network_k_unfreeze_upstream", False)):
+                actuator_input = actuator_input.detach()
+            factorization_mode = str(getattr(
+                self.args, "network_k_diagnostic_factorization", "network_map_network_theta"
+            )).strip().lower()
+            if not self.training and factorization_mode != "network_map_network_theta":
+                raise RuntimeError(
+                    "推論時はHeuristic分解診断modeを使用できない"
+                )
             k_proposal_terms = self.network_k_proposal_policy(
                 actuator_input,
                 self.args,
@@ -2688,6 +2696,10 @@ class Network(nn.Module):
                 full_octree_context=full_octree_context,
                 full_cloud_amount_terms=full_cloud_amount_terms,
                 network_only_policy_terms=network_only_policy_terms,
+                external_executable_plan=(
+                    k_proposal_terms.get("selected_executable_plan")
+                    if isinstance(k_proposal_terms, dict) else None
+                ),
             )
         if isinstance(actuator_stats, dict):
             actuator_stats["actuator_octree_context_source"] = str(actuator_octree_context_source)
@@ -2720,6 +2732,15 @@ class Network(nn.Module):
                     "teacher_reference_count": 0,
                     "sparsepcgc_probe_count": 0,
                     "candidate_actual_encode_count": 0,
+                    "k_proposal_unique_executable_plan_count": int(
+                        k_proposal_terms.get("unique_executable_plan_count", -1)
+                    ),
+                    "k_proposal_external_plan_applied": bool(
+                        actuator_stats.get("external_executable_plan_applied", False)
+                    ),
+                    "k_proposal_external_plan_hash": str(
+                        actuator_stats.get("external_executable_plan_hash", "")
+                    ),
                 })
                 selected_expected = self.network_k_proposal_policy._select_slot_tensor(
                     k_proposal_terms["compact_plans"]["accepted_count"],
@@ -2822,6 +2843,7 @@ class Network(nn.Module):
                 "teacher_reference_count",
                 "sparsepcgc_probe_count",
                 "candidate_actual_encode_count",
+                "k_proposal_unique_executable_plan_count",
                 "network_only_total_ratio_mean",
                 "network_only_shares",
                 "network_only_shares_raw",
@@ -3677,6 +3699,7 @@ class Network(nn.Module):
                     "algorithmic_proposal_selector_enabled",
                     "algorithmic_proposal_selector_active",
                     "algorithmic_proposal_noop_selected",
+                    "external_executable_plan_applied",
                 ):
                     self.last_structure_debug[key] = bool(_actuator_scalar(key, 0.0) > 0.5)
                 for key in (
@@ -3685,6 +3708,7 @@ class Network(nn.Module):
                     "collapse_reason",
                     "hard_drop_count_trace",
                     "delete_candidate_empty_reason",
+                    "external_executable_plan_hash",
                 ):
                     self.last_structure_debug[key] = str(actuator_stats.get(key, ""))
                 for key in (
@@ -3746,6 +3770,9 @@ class Network(nn.Module):
                     "hard_mask_count",
                     "final_hard_drop_count",
                     "selected_drop_count_hard",
+                    "voxel_edit_drop_count",
+                    "voxel_edit_add_count",
+                    "voxel_edit_move_count",
                 ):
                     self.last_structure_debug[key] = _actuator_scalar(key, 0.0)
         else:

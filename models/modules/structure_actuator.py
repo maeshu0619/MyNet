@@ -13,6 +13,10 @@ from models.utils.pointcloud.sparsepcgc_voxel import (
     sparsepcgc_effective_qs_value,
     sparsepcgc_effective_qs_tensor,
 )
+from .executable_voxel_plan import (
+    apply_selected_executable_plan,
+    executable_plan_hashes,
+)
 
 class StructureRepairActuator(nn.Module):
     """Apply small geometry-preserving movements that realize repair policies.
@@ -1689,6 +1693,18 @@ class StructureRepairActuator(nn.Module):
 
         return padded_coords, padded_weights, valid_mask
 
+    @staticmethod
+    def _apply_external_executable_plan(voxel_coords, executable_plan):
+        """K=1の確定planを再探索せず適用する唯一のActuator入口。"""
+        if executable_plan is None or int(executable_plan.operation_order.shape[1]) != 1:
+            raise ValueError("external executable planはK=1でなければならない")
+        selected_zero = torch.zeros(
+            (voxel_coords.shape[0],), device=voxel_coords.device, dtype=torch.long
+        )
+        return apply_selected_executable_plan(
+            voxel_coords, executable_plan, selected_zero
+        )
+
     @classmethod
     def _selected_voxels_absent_count(cls, before_coords, selected_mask, after_coords, after_mask):
         if selected_mask.ndim == 3:
@@ -1826,6 +1842,7 @@ class StructureRepairActuator(nn.Module):
         max_hard_count=0,
         min_hard_count=0,
         allow_single_candidate=False,
+        skip_hard_selection=False,
     ):
         B, _, N = drop_scores.shape
         hard_drop = torch.zeros_like(drop_scores, dtype=torch.bool)
@@ -1864,7 +1881,7 @@ class StructureRepairActuator(nn.Module):
         threshold_cap_mode = self._threshold_cap_mode()
         network_floor_mode = bool(self.training and self._prune_after_prior_mode() == "network")
         min_hard_count = max(int(min_hard_count), 0)
-        if N <= 0 or float(max_drop_ratio) <= 0.0 or (not threshold_cap_mode and float(target_drop_ratio) <= 0.0):
+        if bool(skip_hard_selection) or N <= 0 or float(max_drop_ratio) <= 0.0 or (not threshold_cap_mode and float(target_drop_ratio) <= 0.0):
             try:
                 setattr(self, "_last_hard_drop_count_trace", hard_drop_trace)
             except Exception:
@@ -4088,7 +4105,9 @@ class StructureRepairActuator(nn.Module):
         full_octree_context=None,
         full_cloud_amount_terms=None,
         network_only_policy_terms=None,
+        external_executable_plan=None,
     ):
+        external_plan_authority = external_executable_plan is not None
         timing_enabled = bool(
             getattr(self.args, "debug_timing", False)
             or getattr(self.args, "_profile_runtime_this_step", False)
@@ -6161,6 +6180,7 @@ class StructureRepairActuator(nn.Module):
                 max_hard_count=int(getattr(self.args, "repair_max_hard_drop_voxels", 0)),
                 min_hard_count=0,
                 allow_single_candidate=False,
+                skip_hard_selection=external_plan_authority,
             )
         elif codec_prune_prior_phase > 0.0 and not direct_network_prune_mode:
             hard_drop_block_reason = "codec_prior_phase_hard_drop"
@@ -6320,6 +6340,7 @@ class StructureRepairActuator(nn.Module):
                     max_hard_count=int(getattr(self.args, "repair_max_hard_drop_voxels", 0)),
                     min_hard_count=network_prune_min_hard_count,
                     allow_single_candidate=False,
+                    skip_hard_selection=external_plan_authority,
                 )
         else:
             hard_drop_block_reason = "network_learned_hard_drop"
@@ -6346,6 +6367,7 @@ class StructureRepairActuator(nn.Module):
                     else network_prune_min_hard_count
                 ),
                 allow_single_candidate=bool(direct_network_prune_mode),
+                skip_hard_selection=external_plan_authority,
             )
         if network_single_proposal:
             hard_drop_mask = hard_drop_mask & operation_gate_hard[:, 0:1].to(
@@ -6895,6 +6917,7 @@ class StructureRepairActuator(nn.Module):
             voxel_cache=voxel_cache,
             force_min_count=bool(getattr(self.args, "repair_force_min_move_voxels", False)),
             max_hard_count=int(getattr(self.args, "repair_max_hard_move_voxels", 0)),
+            skip_hard_selection=external_plan_authority,
         )
         raw_hard_move_bool = raw_hard_move_mask.squeeze(1).detach().to(dtype=torch.bool)
 
@@ -7050,6 +7073,7 @@ class StructureRepairActuator(nn.Module):
             voxel_cache=voxel_cache,
             force_min_count=bool(getattr(self.args, "repair_force_min_move_voxels", False)),
             max_hard_count=int(getattr(self.args, "repair_max_hard_move_voxels", 0)),
+            skip_hard_selection=external_plan_authority,
         )
         if network_single_proposal:
             hard_move_mask = hard_move_mask & operation_gate_hard[:, 2:3].to(
@@ -7263,6 +7287,9 @@ class StructureRepairActuator(nn.Module):
                 )
             ),
         )
+        if external_plan_authority:
+            add_k = 0
+            add_candidate_ratio = 0.0
         add_ratio = pts_xyz.new_zeros(())
         add_ratio_loss = pts_xyz.new_zeros(())
         add_shape_guard = pts_xyz.new_zeros(())
@@ -7939,11 +7966,55 @@ class StructureRepairActuator(nn.Module):
         # 旧経路は全点のPrune/Add/Move状態を構築した後でこのplanに上書きしていた。
         exact_residual_plan_applied = False
         exact_residual_plan_debug = {}
+        external_executable_plan_applied = False
+        external_executable_plan_hash = ""
+        if external_executable_plan is not None:
+            if not network_only_codec_mode:
+                raise RuntimeError("external executable planはNetwork-only K経路専用である")
+            if int(external_executable_plan.operation_order.shape[1]) != 1:
+                raise RuntimeError("Actuatorへ渡すexternal executable planはK=1でなければならない")
+            external_coords, external_valid = self._apply_external_executable_plan(
+                voxel_coords, external_executable_plan
+            )
+            voxel_edit_final_coords = external_coords
+            voxel_edit_valid_mask = external_valid
+            voxel_edit_final_weights = external_valid.unsqueeze(1).to(dtype=pts_xyz.dtype)
+            counts = external_executable_plan.accepted_count[:, 0]
+            voxel_edit_debug_list = []
+            for batch_index in range(B):
+                voxel_edit_debug_list.append({
+                    "initial_count": int(torch.unique(
+                        voxel_coords[batch_index].transpose(0, 1), dim=0
+                    ).shape[0]),
+                    "drop_count": int(counts[batch_index, 0].item()),
+                    "add_count": int(counts[batch_index, 1].item()),
+                    "move_count": int(counts[batch_index, 2].item()),
+                    "same_voxel_move_rejected": 0,
+                    "existing_target_rejected": int(
+                        external_executable_plan.reject_reason_count[
+                            batch_index, 0, :, 2
+                        ].sum().item()
+                    ),
+                    "duplicate_target_rejected": int(
+                        external_executable_plan.reject_reason_count[
+                            batch_index, 0, :, 3
+                        ].sum().item()
+                    ),
+                    "final_count": int(external_valid[batch_index].sum().item()),
+                    "subtree_prune_count": 0,
+                })
+            if bool(getattr(self.args, "network_k_debug_plan_hash", False)):
+                external_executable_plan_hash = executable_plan_hashes(
+                    external_executable_plan
+                )[0][0]
+            external_executable_plan_applied = True
         exact_den6_online = (
             str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower()
             == "ana_den6_online"
         )
         if (
+            not external_executable_plan_applied
+            and
             exact_den6_candidate_mode
             and (
                 exact_den6_online
@@ -7989,18 +8060,22 @@ class StructureRepairActuator(nn.Module):
         )
         hard_keep_mask = final_w.detach() >= hardening_threshold
         point_aligned_after_occupied_voxels = (
-            int(exact_plan_coords.shape[-1])
-            if exact_residual_plan_applied
-            else self._unique_voxel_count(final_voxel_coords, hard_keep_mask)
+            int(voxel_edit_valid_mask.sum().item())
+            if external_executable_plan_applied
+            else (
+                int(exact_plan_coords.shape[-1])
+                if exact_residual_plan_applied
+                else self._unique_voxel_count(final_voxel_coords, hard_keep_mask)
+            )
         )
         # Phase3: Prune/Add/Moveをoccupied voxel集合へ反映した最終Voxel状態を作る。
         # 既存のpts_out/final_wは変更しない。
-        if not exact_residual_plan_applied:
+        if not exact_residual_plan_applied and not external_executable_plan_applied:
             voxel_edit_debug_list = []
         voxel_edit_coords_list = []
         voxel_edit_weights_list = []
 
-        if exact_residual_plan_applied:
+        if exact_residual_plan_applied or external_executable_plan_applied:
             pass
         elif voxel_edit_state_enabled:
             for b in range(B):
@@ -10720,11 +10795,60 @@ class StructureRepairActuator(nn.Module):
                 move_idx_flat.detach()[0][move_selected_mask].cpu().tolist()
                 if bool(move_selected_mask.any().item()) else []
             )
+            external_selected_counts = None
+            if external_executable_plan_applied:
+                external_mask = external_executable_plan.accepted_mask[0, 0]
+                prune_selected = external_executable_plan.source_coord[0, 0, 0][external_mask[0]]
+                add_selected = external_executable_plan.target_coord[0, 0, 1][external_mask[1]]
+                move_sources = external_executable_plan.source_coord[0, 0, 2][external_mask[2]]
+                move_targets = external_executable_plan.target_coord[0, 0, 2][external_mask[2]]
+                external_selected_counts = {
+                    "Prune": int(external_mask[0].sum().item()),
+                    "Add": int(external_mask[1].sum().item()),
+                    "Adjust": int(external_mask[2].sum().item()),
+                }
+                selected_action_mask = [1, 1, 1]
+                selected_action_count = 3
+                sampled_priority_order = external_executable_plan.operation_order[
+                    0, 0
+                ].detach().cpu().tolist()
+                coord_hashes = {
+                    "Prune": _coord_rows_hash(prune_selected),
+                    "Add": _coord_rows_hash(add_selected),
+                    "AdjustSource": _coord_rows_hash(move_sources),
+                    "AdjustTarget": _coord_rows_hash(move_targets),
+                }
+                selected_coord_key_set = set()
+                selected_coord_key_set.update(_tagged_coord_keys("P", prune_selected))
+                selected_coord_key_set.update(_tagged_coord_keys("A", add_selected))
+                selected_coord_key_set.update(_tagged_coord_keys("MS", move_sources))
+                selected_coord_key_set.update(_tagged_coord_keys("MT", move_targets))
+                add_direction_indices = external_executable_plan.direction_index[
+                    0, 0, 1
+                ][external_mask[1]].detach().cpu().tolist()
+                move_direction_indices = external_executable_plan.direction_index[
+                    0, 0, 2
+                ][external_mask[2]].detach().cpu().tolist()
+                plan_hash_payload = {
+                    "coord_hashes": coord_hashes,
+                    "action_mask": selected_action_mask,
+                    "amounts": [
+                        round(float(learned_drop_ratio.detach().mean()), 9),
+                        round(float(learned_add_ratio.detach().mean()), 9),
+                        round(float(learned_move_ratio.detach().mean()), 9),
+                    ],
+                    "priority_order": sampled_priority_order,
+                }
+                network_plan_hash = hashlib.sha256(
+                    json.dumps(
+                        plan_hash_payload, sort_keys=True, separators=(",", ":")
+                    ).encode("utf-8")
+                ).hexdigest()
             exact_residual_plan_debug.update({
                 "plan_count": 1,
                 "pool_reference_count": 0,
                 "candidate_actual_encode_count": 0,
-                "selected_counts": {
+                "selected_counts": external_selected_counts or {
                     "Prune": int(hard_drop_mask.detach().sum().item()),
                     "Add": int((hard_add_pair.detach() > 0.0).sum().item()),
                     "Adjust": int(hard_move_mask.detach().sum().item()),
@@ -11577,6 +11701,8 @@ class StructureRepairActuator(nn.Module):
             "final_voxel_coords": voxel_edit_final_coords,
             "final_voxel_weights": voxel_edit_final_weights,
             "final_voxel_valid_mask": voxel_edit_valid_mask,
+            "external_executable_plan_applied": bool(external_executable_plan_applied),
+            "external_executable_plan_hash": str(external_executable_plan_hash),
             "voxel_step": voxel_step,
             "voxel_offset": voxel_offset,
 

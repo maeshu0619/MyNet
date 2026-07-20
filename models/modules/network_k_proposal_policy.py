@@ -8,10 +8,17 @@ draws from one logit tensor.
 """
 
 import math
+import itertools
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from .executable_voxel_plan import (
+    ExecutableVoxelPlanBuilder,
+    coordinate_indices,
+    select_executable_plan,
+)
 
 
 LOCAL_COST_NAMES = (
@@ -82,14 +89,26 @@ class NetworkKProposalPolicy(nn.Module):
         self.coefficient_head = nn.Linear(
             global_hidden, 3 * len(LOCAL_COST_NAMES)
         )
-        self.amount_head = nn.Linear(global_hidden, 1)
+        self.amount_head = nn.Linear(global_hidden, 5)
         self.share_head = nn.Linear(global_hidden, 3)
-        self.enable_head = nn.Linear(global_hidden, 3)
-        self.priority_head = nn.Linear(global_hidden, 3)
-        self.threshold_head = nn.Linear(global_hidden, 3)
-        self.temperature_head = nn.Linear(global_hidden, 3)
+        self.order_head = nn.Linear(global_hidden, 6)
+        self.variant_head = nn.Linear(global_hidden, 6)
         self.direction_delta_head = nn.Linear(global_hidden, 2 * 3)
         self.confidence_head = nn.Linear(global_hidden, 1)
+        self.slot_ratio_bias = nn.Parameter(torch.zeros(self.proposal_count, 5))
+        self.slot_share_bias = nn.Parameter(torch.zeros(self.proposal_count, 3))
+        self.slot_order_bias = nn.Parameter(torch.zeros(self.proposal_count, 6))
+        self.slot_variant_bias = nn.Parameter(torch.zeros(self.proposal_count, 6))
+        self.register_buffer(
+            "ratio_values",
+            torch.tensor((0.0005, 0.0010, 0.0025, 0.0050, 0.0100)),
+            persistent=False,
+        )
+        self.register_buffer(
+            "order_permutations",
+            torch.tensor(tuple(itertools.permutations(range(3))), dtype=torch.long),
+            persistent=False,
+        )
 
         # The critic sees post-shortlist, post-validity/collision compact plan
         # statistics.  It evaluates all K plans in one tensor batch.
@@ -116,15 +135,31 @@ class NetworkKProposalPolicy(nn.Module):
         self.register_buffer(
             "neighbor_offsets_long", torch.tensor(offsets, dtype=torch.long), persistent=False
         )
+        self.executable_plan_builder = ExecutableVoxelPlanBuilder()
         self._initialize_mode_biases()
+
+    def _load_from_state_dict(
+        self, state_dict, prefix, local_metadata, strict,
+        missing_keys, unexpected_keys, error_msgs,
+    ):
+        # 旧K checkpointの連続Amount/dead headは新しい離散thetaとshapeが異なる。
+        amount_weight = prefix + "amount_head.weight"
+        amount_bias = prefix + "amount_head.bias"
+        if amount_weight in state_dict and tuple(state_dict[amount_weight].shape) != tuple(self.amount_head.weight.shape):
+            state_dict.pop(amount_weight)
+        if amount_bias in state_dict and tuple(state_dict[amount_bias].shape) != tuple(self.amount_head.bias.shape):
+            state_dict.pop(amount_bias)
+        for head_name in ("enable_head", "priority_head", "threshold_head", "temperature_head"):
+            state_dict.pop(prefix + head_name + ".weight", None)
+            state_dict.pop(prefix + head_name + ".bias", None)
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs,
+        )
 
     def _initialize_mode_biases(self):
         # Eight deliberately different initial modes.  They are initialization
         # only and remain fully learnable; they are not teacher labels/floors.
-        ratios = torch.tensor((0.0005, 0.0010, 0.0025, 0.0050, 0.0100))
-        ratios = ratios.clamp_max(self.max_total_ratio * (1.0 - 1e-4))
-        ratio_fraction = (ratios / max(self.max_total_ratio, 1e-8)).clamp(1e-4, 1 - 1e-4)
-        ratio_logits = torch.logit(ratio_fraction)
         share_modes = torch.tensor(
             (
                 (0.40, 0.40, 0.20),
@@ -139,28 +174,40 @@ class NetworkKProposalPolicy(nn.Module):
             dtype=torch.float32,
         )
         with torch.no_grad():
-            self.amount_head.weight.zero_()
-            self.share_head.weight.zero_()
-            self.enable_head.weight.zero_()
-            self.priority_head.weight.zero_()
-            self.threshold_head.weight.zero_()
-            self.temperature_head.weight.zero_()
-            self.amount_head.bias.fill_(float(ratio_logits[2]))
-            self.share_head.bias.copy_(torch.log(share_modes[0]))
-            self.enable_head.bias.fill_(math.log(0.9 / 0.1))
-            self.priority_head.bias.zero_()
-            self.threshold_head.bias.zero_()
-            self.temperature_head.bias.fill_(math.log(math.exp(0.65) - 1.0))
+            # 小さい非零初期値で入力条件付けを初Stepから有効にする。
+            nn.init.xavier_uniform_(self.amount_head.weight, gain=0.01)
+            nn.init.xavier_uniform_(self.share_head.weight, gain=0.01)
+            nn.init.xavier_uniform_(self.order_head.weight, gain=0.01)
+            nn.init.xavier_uniform_(self.variant_head.weight, gain=0.01)
+            self.amount_head.bias.zero_()
+            self.share_head.bias.zero_()
+            self.order_head.bias.zero_()
+            self.variant_head.bias.zero_()
+            self.slot_ratio_bias.fill_(-2.0)
+            self.slot_order_bias.fill_(-2.0)
+            self.slot_variant_bias.fill_(-2.0)
+            for slot in range(self.proposal_count):
+                self.slot_ratio_bias[slot, slot % 5] = 2.0
+                self.slot_share_bias[slot].copy_(
+                    torch.log(share_modes[slot % int(share_modes.shape[0])])
+                )
+                self.slot_order_bias[slot, slot % 6] = 2.0
+                self.slot_variant_bias[slot, (slot * 5) % 6] = 2.0
             self.critic_gain_head.weight.zero_()
             self.critic_gain_head.bias.zero_()
             self.critic_interaction_head.weight.zero_()
             self.critic_interaction_head.bias.zero_()
+            # 未学習時にgeometry/uncertaintyだけでslotが固定されない中立初期値。
+            self.critic_geometry_head.weight.zero_()
+            self.critic_geometry_head.bias.fill_(-6.0)
+            self.critic_uncertainty_head.weight.zero_()
+            self.critic_uncertainty_head.bias.fill_(-6.0)
         # Token-specific biases must be represented by tokens rather than K
         # separate heavy heads.  Seed token coordinates with amount/share modes.
         with torch.no_grad():
             for slot in range(self.proposal_count):
-                ratio_index = slot % int(ratio_logits.numel())
-                self.plan_tokens[slot, 0] = ratio_logits[ratio_index]
+                ratio_index = slot % int(self.ratio_values.numel())
+                self.plan_tokens[slot, 0] = float(ratio_index) / 4.0
                 mode = share_modes[slot % int(share_modes.shape[0])]
                 self.plan_tokens[slot, 1:4] = torch.log(mode)
                 self.plan_tokens[slot, 4:7] = torch.roll(
@@ -200,109 +247,36 @@ class NetworkKProposalPolicy(nn.Module):
         # heuristic/cache.  It is deliberately token-independent: modifying
         # one specialist must not silently change every other specialist's
         # candidate domain through a moving shortlist.
-        union_score = basis.abs().amax(dim=2).amax(dim=1)
+        shared_weight = coefficients.detach().abs().mean(dim=1).unsqueeze(-1)
+        union_score = (basis.abs() * shared_weight).amax(dim=2).amax(dim=1)
         size = min(int(points), int(self.shortlist_size))
         return union_score.topk(size, dim=1, largest=True, sorted=True).indices
 
-    def _compact_plan_statistics(
-        self, slot_logits, shortlist_indices, ratios, shares, enables,
-        enable_probability,
-        priorities, temperatures, shortlist_basis, voxel_coords,
+    def _augment_training_shortlist(
+        self, natural_indices, voxel_coords, teacher_coords, teacher_target_coords
     ):
-        """Build differentiable compact descriptors after shortlist validity.
-
-        The exact Actuator remains the final authority.  This stage removes
-        duplicate source choices across operations in learned priority order
-        and records rejected mass, so Critic input describes the executable
-        shortlist plan rather than the unconstrained dense proposal.
-        """
-        batch, slots, operations, shortlist = slot_logits.shape
-        point_count = int(voxel_coords.shape[-1]) if torch.is_tensor(voxel_coords) else shortlist
-        requested_continuous = ratios * shares * enable_probability * float(point_count)
-        requested = (ratios * shares * enables * float(point_count)).round().long()
-        requested = requested.clamp(min=0, max=shortlist)
-        selected = torch.zeros_like(slot_logits, dtype=torch.bool)
-        accepted_count = torch.zeros(
-            (batch, slots, operations), device=slot_logits.device, dtype=slot_logits.dtype
-        )
-        collision_count = torch.zeros_like(accepted_count)
-        score_mean = torch.zeros_like(accepted_count)
-        score_max = torch.zeros_like(accepted_count)
-
-        # K and three operations are small fixed control dimensions.  There is
-        # no point/candidate Python loop and no candidate object construction.
-        for b in range(batch):
-            for k in range(slots):
-                occupied_source = torch.zeros(shortlist, device=slot_logits.device, dtype=torch.bool)
-                order = priorities[b, k].argsort(descending=True)
-                for rank in range(operations):
-                    operation = int(order[rank].item())
-                    count = int(requested[b, k, operation].item())
-                    if count <= 0:
-                        continue
-                    scores = slot_logits[b, k, operation] / temperatures[b, k, operation].clamp_min(0.05)
-                    scores = scores.masked_fill(occupied_source, -torch.inf)
-                    available = int((~occupied_source).sum().item())
-                    take = min(count, available)
-                    if take <= 0:
-                        collision_count[b, k, operation] = float(count)
-                        continue
-                    chosen = scores.topk(take, largest=True, sorted=False).indices
-                    selected[b, k, operation, chosen] = True
-                    occupied_source[chosen] = True
-                    accepted_count[b, k, operation] = float(take)
-                    collision_count[b, k, operation] = float(count - take)
-                    chosen_scores = slot_logits[b, k, operation, chosen]
-                    score_mean[b, k, operation] = chosen_scores.mean()
-                    score_max[b, k, operation] = chosen_scores.max()
-
-        hard_ratio_forward = accepted_count / max(float(point_count), 1.0)
-        soft_ratio = requested_continuous / max(float(point_count), 1.0)
-        hard_ratio = hard_ratio_forward.detach() + soft_ratio - soft_ratio.detach()
-        total_accepted = accepted_count.sum(dim=2, keepdim=True).clamp_min(1.0)
-        hard_share_forward = accepted_count / total_accepted
-        hard_share = hard_share_forward.detach() + shares - shares.detach()
-        enable_ste = enables.detach() + enable_probability - enable_probability.detach()
-        selected_float = selected.to(slot_logits.dtype)
-        selected_mass = selected_float.sum(dim=3).clamp_min(1.0)
-        selected_basis = torch.einsum(
-            "bkom,bocm->bkoc", selected_float, shortlist_basis
-        ) / selected_mass.unsqueeze(-1)
-        selected_basis = selected_basis.mean(dim=2)
-        overlap = torch.stack(
-            (
-                (selected_float[:, :, 0] * selected_float[:, :, 1]).sum(dim=2),
-                (selected_float[:, :, 0] * selected_float[:, :, 2]).sum(dim=2),
-                (selected_float[:, :, 1] * selected_float[:, :, 2]).sum(dim=2),
-            ),
-            dim=2,
-        ) / float(max(shortlist, 1))
-        rejected_ratio = collision_count / requested.to(slot_logits.dtype).clamp_min(1.0)
-        descriptor = torch.cat(
-            (
-                hard_ratio,
-                hard_share,
-                enable_ste,
-                priorities,
-                score_mean,
-                score_max,
-                selected_basis,
-                overlap,
-                rejected_ratio.mean(dim=2, keepdim=True),
-            ),
-            dim=2,
-        )
-        if descriptor.shape[2] != 29:
-            raise RuntimeError("internal K-plan descriptor size mismatch")
-        return {
-            "selected_shortlist_mask": selected,
-            "requested_count": requested,
-            "accepted_count": accepted_count,
-            "collision_count": collision_count,
-            "hard_ratio": hard_ratio_forward,
-            "hard_share": hard_share_forward,
-            "descriptor": descriptor,
-        }
+        """訓練時だけ既知teacher sourceを追加し、自然recallは別Tensorで保持する。"""
+        if teacher_coords is None and teacher_target_coords is None:
+            return natural_indices
+        if natural_indices.shape[0] != 1:
+            raise RuntimeError("teacher shortlist augmentation currently requires batch=1")
+        coords = voxel_coords[0].transpose(0, 1) if voxel_coords.shape[1] == 3 else voxel_coords[0]
+        query_parts = []
+        if teacher_coords:
+            query_parts.append(torch.as_tensor(
+                teacher_coords, device=coords.device, dtype=torch.long
+            ).reshape(-1, 3))
+        # target集合は実行shortlistを膨らませず、専用loss domainで扱う。
+        if not query_parts:
+            return natural_indices
+        query = torch.cat(query_parts, dim=0)
+        matched = coordinate_indices(query, coords.long())
+        matched = matched[matched >= 0]
+        if not matched.numel():
+            return natural_indices
+        return torch.unique(
+            torch.cat((natural_indices[0], matched), dim=0), sorted=True
+        ).view(1, -1)
 
     @staticmethod
     def _select_slot_tensor(value, selected_slot):
@@ -320,7 +294,9 @@ class NetworkKProposalPolicy(nn.Module):
             training = self.training
         batch, _, points = features.shape
         if fixed_features is None:
-            fixed_features = features.new_zeros((batch, self.fixed_feature_dim, points))
+            raise RuntimeError(
+                "K proposalには入力由来Octree/local fixed featuresが必須である"
+            )
         if tuple(fixed_features.shape) != (batch, self.fixed_feature_dim, points):
             raise ValueError("K-policy fixed feature shape mismatch")
 
@@ -341,32 +317,273 @@ class NetworkKProposalPolicy(nn.Module):
         coefficients = torch.tanh(self.coefficient_head(slot_feature)).view(
             batch, self.proposal_count, 3, len(LOCAL_COST_NAMES)
         )
-        amount_logit = self.amount_head(slot_feature)
-        # Token coordinates seed genuinely distinct modes before offline fit.
-        amount_logit = amount_logit + 0.20 * tokens[:, :, 0:1]
-        total_ratio = torch.sigmoid(amount_logit) * self.max_total_ratio
-        share_logits = self.share_head(slot_feature) + 0.20 * tokens[:, :, 1:4]
-        shares = torch.softmax(share_logits, dim=2)
-        enable_logits = self.enable_head(slot_feature)
-        enable_probability = torch.sigmoid(enable_logits)
-        enables = (enable_probability >= 0.5).to(features.dtype)
-        priorities = self.priority_head(slot_feature) + 0.25 * tokens[:, :, 4:7]
-        thresholds = torch.tanh(self.threshold_head(slot_feature))
-        temperatures = F.softplus(self.temperature_head(slot_feature)) + 0.10
+        ratio_values = tuple(float(value) for value in getattr(
+            args, "network_k_ratio_values", tuple(self.ratio_values.tolist())
+        ))
+        if len(ratio_values) != 5:
+            raise ValueError("network_k_ratio_valuesは5値でなければならない")
+        ratio_values_tensor = features.new_tensor(ratio_values)
+        ratio_logits = self.amount_head(slot_feature) + self.slot_ratio_bias.unsqueeze(0)
+        ratio_probability = torch.softmax(ratio_logits, dim=2)
+        ratio_class = ratio_logits.argmax(dim=2)
+        ratio_hard = F.one_hot(ratio_class, num_classes=5).to(features.dtype)
+        ratio_ste = ratio_hard.detach() + ratio_probability - ratio_probability.detach()
+        total_ratio = (ratio_ste * ratio_values_tensor.view(1, 1, 5)).sum(2, keepdim=True)
+
+        share_logits = self.share_head(slot_feature) + self.slot_share_bias.unsqueeze(0)
+        shares_soft = torch.softmax(share_logits, dim=2)
+        lattice_step = float(getattr(args, "network_k_share_lattice_step", 0.05))
+        if lattice_step > 0.0:
+            shares_hard = torch.round(shares_soft / lattice_step) * lattice_step
+            shares_hard = shares_hard.clamp_min(lattice_step)
+            shares_hard = shares_hard / shares_hard.sum(2, keepdim=True).clamp_min(1e-8)
+            shares = shares_hard.detach() + shares_soft - shares_soft.detach()
+        else:
+            shares_hard = shares_soft.detach()
+            shares = shares_soft
+
+        # v1/v2の既存163 planは3操作すべてONであり、enableは識別不能なので固定する。
+        enable_probability = features.new_ones((batch, self.proposal_count, 3))
+        enables = features.new_ones((batch, self.proposal_count, 3))
+        enable_logits = features.new_full((batch, self.proposal_count, 3), 12.0)
+
+        order_logits = self.order_head(slot_feature) + self.slot_order_bias.unsqueeze(0)
+        order_probability = torch.softmax(order_logits, dim=2)
+        order_class = order_logits.argmax(dim=2)
+        operation_order = self.order_permutations.to(order_class).index_select(
+            0, order_class.reshape(-1)
+        ).view(batch, self.proposal_count, 3)
+        priorities = features.new_zeros((batch, self.proposal_count, 3))
+        rank_values = features.new_tensor((3.0, 2.0, 1.0)).view(1, 1, 3).expand_as(priorities)
+        priorities.scatter_(2, operation_order, rank_values)
+        variant_logits = self.variant_head(slot_feature) + self.slot_variant_bias.unsqueeze(0)
+        variant_class = variant_logits.argmax(dim=2)
         confidence = torch.sigmoid(self.confidence_head(slot_feature))
 
-        shortlist_indices = self._shared_shortlist(basis, coefficients, points)
+        natural_shortlist_indices = self._shared_shortlist(basis, coefficients, points)
+        teacher_coords = getattr(args, "_network_k_training_teacher_coords", None)
+        teacher_target_coords = getattr(
+            args, "_network_k_training_teacher_target_coords", None
+        )
+        if (teacher_coords is not None or teacher_target_coords is not None) and not training:
+            raise RuntimeError("teacher shortlistは訓練時にだけ使用できる")
+        shortlist_indices = self._augment_training_shortlist(
+            natural_shortlist_indices,
+            voxel_coords,
+            teacher_coords if training else None,
+            teacher_target_coords if training else None,
+        )
         shortlist_basis = self._gather_points(basis, shortlist_indices)
         slot_logits = torch.einsum(
             "bocm,bkoc->bkom", shortlist_basis, coefficients
         )
-        slot_logits = slot_logits - thresholds.unsqueeze(-1) + priorities.unsqueeze(-1)
+        slot_logits = slot_logits + priorities.unsqueeze(-1)
+        # den6のpool走査variantを、共有shortlist順位への小さな決定論的傾きで表す。
+        variant_slopes = features.new_tensor((
+            (0.0, 0.0, 0.0),
+            (0.08, 0.0, 0.0),
+            (0.0, 0.08, 0.0),
+            (0.0, 0.0, 0.08),
+            (-0.05, 0.05, 0.0),
+            (0.05, 0.0, -0.05),
+        ))
+        selected_slopes = variant_slopes.index_select(
+            0, variant_class.reshape(-1)
+        ).view(batch, self.proposal_count, 3, 1)
+        shortlist_rank = torch.linspace(
+            1.0, 0.0, shortlist_indices.shape[1],
+            device=features.device, dtype=features.dtype,
+        ).view(1, 1, 1, -1)
+        slot_scale = slot_logits.detach().std(dim=3, keepdim=True).clamp_min(1e-4)
+        slot_logits = slot_logits + selected_slopes * shortlist_rank * slot_scale
 
-        compact = self._compact_plan_statistics(
-            slot_logits, shortlist_indices, total_ratio, shares, enables,
-            enable_probability,
-            priorities, temperatures, shortlist_basis, voxel_coords,
+        if not torch.is_tensor(voxel_coords):
+            raise RuntimeError("K proposalにはglobal voxel座標が必須である")
+        target_domain = str(getattr(
+            args, "network_k_target_domain", "neighbor26_empty"
+        )).strip().lower()
+        if target_domain != "neighbor26_empty":
+            raise RuntimeError(
+                "K policyのchild_slot domainには明示的direction_valid_maskが必要であり未接続である"
+            )
+        requested_continuous = total_ratio * shares * enable_probability * float(points)
+        requested_count = (
+            total_ratio * shares * enables * float(points)
+        ).round().to(dtype=torch.long)
+        requested_count = requested_count.clamp(min=0, max=int(shortlist_indices.shape[1]))
+        # builderへshortlist indexを渡し、K×全点score Tensorも作らない。
+        direction_delta_all = self.direction_delta_head(slot_feature).view(
+            batch, self.proposal_count, 2, 3
         )
+        slot_direction_logits = None
+        if bool(training) and bool(str(getattr(args, "network_k_offline_dataset", "")).strip()):
+            shortlist_direction = self._gather_points(direction_field, shortlist_indices)
+            shortlist_vectors = F.normalize(
+                shortlist_direction[:, None, :, :3]
+                + direction_delta_all.unsqueeze(-1),
+                dim=3,
+                eps=1e-6,
+            )
+            shortlist_concentration = F.softplus(
+                shortlist_direction[:, None, :, 3:4]
+            ) + 0.1
+            slot_direction_logits = torch.einsum(
+                "bkodm,qd->bkoqm",
+                shortlist_vectors,
+                self.unit_neighbor_offsets.to(shortlist_vectors),
+            ) * shortlist_concentration
+
+        slot_target_logits = None
+        target_candidate_coords = None
+        if teacher_target_coords is not None:
+            if batch != 1:
+                raise RuntimeError("target-set教師はbatch=1のoffline訓練専用である")
+            target_rows = torch.as_tensor(
+                teacher_target_coords, device=features.device, dtype=torch.long
+            ).reshape(-1, 3)
+            target_candidate_coords = target_rows.transpose(0, 1).unsqueeze(0)
+            offsets = self.executable_plan_builder.neighbor_offsets.to(features.device)
+            all_coords = (
+                voxel_coords[0].transpose(0, 1)
+                if voxel_coords.shape[1] == 3 else voxel_coords[0]
+            ).long()
+            target_count = int(target_rows.shape[0])
+            target_chunks = []
+            for start in range(0, target_count, 512):
+                chunk = target_rows[start : start + 512]
+                source_rows = (
+                    chunk[:, None, :] - offsets[None, :, :]
+                ).reshape(-1, 3)
+                source_global = coordinate_indices(source_rows, all_coords)
+                reachable = source_global >= 0
+                safe_global = source_global.clamp_min(0)
+                source_basis = self._gather_points(
+                    basis, safe_global.view(1, -1)
+                )
+                source_score = torch.einsum(
+                    "bocp,bkoc->bkop", source_basis, coefficients
+                ) + priorities.unsqueeze(-1)
+                source_direction = self._gather_points(
+                    direction_field, safe_global.view(1, -1)
+                )
+                source_vectors = F.normalize(
+                    source_direction[:, None, :, :3]
+                    + direction_delta_all.unsqueeze(-1),
+                    dim=3, eps=1e-6,
+                )
+                pair_offsets = offsets.repeat(chunk.shape[0], 1).to(
+                    source_vectors.dtype
+                )
+                direction_score = torch.einsum(
+                    "bkodp,pd->bkop", source_vectors, pair_offsets
+                ) * (F.softplus(source_direction[:, None, :, 3]) + 0.1)
+                chunk_values = features.new_full(
+                    (1, self.proposal_count, 3, chunk.shape[0]), -20.0
+                )
+                for operation, direction_operation in ((1, 0), (2, 1)):
+                    pair_score = (
+                        source_score[:, :, operation]
+                        + direction_score[:, :, direction_operation]
+                    ).view(1, self.proposal_count, chunk.shape[0], 26)
+                    pair_score = pair_score.masked_fill(
+                        ~reachable.view(1, 1, chunk.shape[0], 26), -torch.inf
+                    )
+                    value = torch.logsumexp(pair_score, dim=3)
+                    chunk_values[:, :, operation] = torch.where(
+                        torch.isfinite(value), value, value.new_full((), -20.0)
+                    )
+                target_chunks.append(chunk_values)
+            slot_target_logits = torch.cat(target_chunks, dim=3)
+
+        def _direction_provider(batch_index, slot_index, operation, source_indices):
+            direction_operation = 0 if int(operation) == 1 else 1
+            vectors = direction_field[
+                batch_index, direction_operation, :3
+            ].index_select(1, source_indices).transpose(0, 1)
+            vectors = F.normalize(
+                vectors + direction_delta_all[batch_index, slot_index, direction_operation],
+                dim=1,
+                eps=1e-6,
+            )
+            concentration_value = F.softplus(
+                direction_field[batch_index, direction_operation, 3]
+                .index_select(0, source_indices)
+            ).unsqueeze(1) + 0.1
+            return (
+                vectors @ self.unit_neighbor_offsets.to(vectors).transpose(0, 1)
+            ) * concentration_value
+
+        executable_plans = self.executable_plan_builder.build(
+            voxel_coords=voxel_coords,
+            operation_scores=slot_logits,
+            requested_count=requested_count,
+            operation_order=operation_order,
+            direction_logit_provider=_direction_provider,
+            operation_enabled=enables.to(dtype=torch.bool),
+            source_indices=shortlist_indices,
+            target_coord_min=voxel_coords.new_tensor((0, 0, 0)),
+            target_coord_max=voxel_coords.new_tensor((
+                int(getattr(args, "sparsepcgc_psnr_resolution", 1023) or 1023),
+            ) * 3),
+            debug_hash=bool(getattr(args, "network_k_debug_plan_hash", False)),
+        )
+        accepted_count = executable_plans.accepted_count.to(dtype=features.dtype)
+        collision_count = (requested_count - executable_plans.accepted_count).clamp_min(0).to(
+            dtype=features.dtype
+        )
+
+        # hard plan descriptorをforward値に保ちつつ、Amount/shareへSTE勾配を返す。
+        descriptor = executable_plans.plan_descriptor
+        soft_requested_ratio = requested_continuous / max(float(points), 1.0)
+        soft_accepted_ratio = soft_requested_ratio
+        soft_share = shares
+        descriptor = descriptor.clone()
+        descriptor[:, :, 0:3] = (
+            descriptor[:, :, 0:3].detach()
+            + soft_requested_ratio - soft_requested_ratio.detach()
+        )
+        descriptor[:, :, 3:6] = (
+            descriptor[:, :, 3:6].detach()
+            + soft_accepted_ratio - soft_accepted_ratio.detach()
+        )
+        descriptor[:, :, 6:9] = (
+            descriptor[:, :, 6:9].detach() + soft_share - soft_share.detach()
+        )
+
+        # 実行planだけをWhere教師・ログへ公開する。
+        selected_shortlist_mask_all = torch.zeros_like(slot_logits, dtype=torch.bool)
+        shortlist_inverse = torch.full(
+            (batch, points), -1, device=features.device, dtype=torch.long
+        )
+        shortlist_inverse.scatter_(
+            1,
+            shortlist_indices,
+            torch.arange(shortlist_indices.shape[1], device=features.device)
+            .view(1, -1).expand(batch, -1),
+        )
+        for batch_index in range(batch):
+            for slot_index in range(self.proposal_count):
+                for operation in range(3):
+                    mask = executable_plans.accepted_mask[batch_index, slot_index, operation]
+                    source = executable_plans.source_index[
+                        batch_index, slot_index, operation
+                    ][mask]
+                    if source.numel() == 0:
+                        continue
+                    position = shortlist_inverse[batch_index].index_select(0, source)
+                    position = position[position >= 0]
+                    selected_shortlist_mask_all[
+                        batch_index, slot_index, operation, position
+                    ] = True
+        compact = {
+            "selected_shortlist_mask": selected_shortlist_mask_all,
+            "requested_count": requested_count,
+            "accepted_count": accepted_count,
+            "collision_count": collision_count,
+            "hard_ratio": accepted_count / max(float(points), 1.0),
+            "hard_share": accepted_count / accepted_count.sum(2, keepdim=True).clamp_min(1.0),
+            "descriptor": descriptor,
+        }
         critic_input = torch.cat((slot_feature, compact["descriptor"]), dim=2)
         critic_hidden = self.critic(critic_input)
         predicted_gain = self.critic_gain_head(critic_hidden)
@@ -374,11 +591,21 @@ class NetworkKProposalPolicy(nn.Module):
         predicted_interaction = self.critic_interaction_head(critic_hidden)
         uncertainty = F.softplus(self.critic_uncertainty_head(critic_hidden)) + 1e-4
         predicted_plan_gain = predicted_gain + predicted_interaction
+        gain_scale = max(float(getattr(args, "network_k_critic_gain_scale", 5.0)), 1e-6)
+        geometry_scale = max(float(getattr(args, "network_k_critic_geometry_scale", 1.0)), 1e-6)
+        lambda_geometry = max(float(
+            getattr(args, "network_k_critic_lambda_geometry", 1.0)
+        ), 0.0)
+        lambda_uncertainty = max(float(
+            getattr(args, "network_k_critic_lambda_uncertainty", 0.05)
+        ), 0.0)
         critic_score = (
-            predicted_plan_gain - predicted_geometry
-            - uncertainty * (1.0 - confidence)
+            predicted_plan_gain / gain_scale
+            - lambda_geometry * predicted_geometry / geometry_scale
+            - lambda_uncertainty * uncertainty * (1.0 - confidence)
         )
         selected_slot = critic_score.squeeze(-1).argmax(dim=1)
+        selected_executable_plan = select_executable_plan(executable_plans, selected_slot)
         critic_log_probability = torch.log_softmax(
             critic_score.squeeze(-1), dim=1
         )
@@ -411,7 +638,7 @@ class NetworkKProposalPolicy(nn.Module):
         )
         selected_coefficients = self._select_slot_tensor(coefficients, selected_slot)
         selected_direction_delta = self._select_slot_tensor(
-            self.direction_delta_head(slot_feature).view(batch, self.proposal_count, 2, 3),
+            direction_delta_all,
             selected_slot,
         )
         base_vectors = F.normalize(
@@ -431,7 +658,7 @@ class NetworkKProposalPolicy(nn.Module):
         )
         accepted_total = selected_accepted_count.sum(dim=1, keepdim=True)
         accepted_total_ratio = (
-            (accepted_total - 0.125).clamp_min(0.0) / max(float(points), 1.0)
+            accepted_total / max(float(points), 1.0)
         ).unsqueeze(-1)
         accepted_shares = (
             selected_accepted_count / accepted_total.clamp_min(1.0)
@@ -451,17 +678,17 @@ class NetworkKProposalPolicy(nn.Module):
         selected_enable_probability = self._select_slot_tensor(
             enable_probability, selected_slot
         ).unsqueeze(-1)
-        selected_enables_hard = (selected_accepted_count > 0).to(features.dtype).unsqueeze(-1)
+        selected_enables_hard = torch.ones_like(
+            selected_enable_probability, dtype=features.dtype
+        )
         selected_enables = (
             selected_enables_hard.detach()
             + selected_enable_probability
             - selected_enable_probability.detach()
         )
         selected_priorities = self._select_slot_tensor(priorities, selected_slot).unsqueeze(-1)
-        selected_temperature = self._select_slot_tensor(
-            temperatures.mean(dim=2, keepdim=True), selected_slot
-        ).unsqueeze(-1)
-        selected_threshold = self._select_slot_tensor(thresholds, selected_slot).unsqueeze(-1)
+        selected_temperature = features.new_ones((batch, 1, 1))
+        selected_threshold = features.new_zeros((batch, 3, 1))
 
         selected = {
             "local_cost_maps": basis,
@@ -478,12 +705,16 @@ class NetworkKProposalPolicy(nn.Module):
             "direction_concentration": concentration,
             "direction_logits": direction_logits,
             "direction_sampling_temperature": features.new_tensor(1.0),
-            "total_ratio_raw": selected_total_ratio_raw / max(self.max_total_ratio, 1e-8),
+            "total_ratio_raw": selected_total_ratio_raw / max(
+                float(ratio_values_tensor.max().item()), 1e-8
+            ),
             "total_ratio_unconstrained": selected_total_ratio_raw,
             "total_ratio": selected_total_ratio,
             "total_ratio_mean": selected_total_ratio_raw,
             "amount_sample_log_prob": selected_total_ratio.sum() * 0.0,
-            "amount_distribution_entropy": selected_total_ratio.sum() * 0.0,
+            "amount_distribution_entropy": -(
+                ratio_probability.clamp_min(1e-8) * ratio_probability.clamp_min(1e-8).log()
+            ).sum(2).mean(),
             "share_logits": self._select_slot_tensor(share_logits, selected_slot),
             "shares": selected_shares,
             "shares_raw": selected_shares_raw,
@@ -512,7 +743,9 @@ class NetworkKProposalPolicy(nn.Module):
             ),
             "selected_spatial_statistics": self._select_slot_tensor(compact["descriptor"][:, :, 18:28], selected_slot),
             "where_entropy": -(torch.softmax(full_where_logits, 2) * torch.log_softmax(full_where_logits, 2)).sum(2).mean(),
-            "amount_entropy": selected_total_ratio.sum() * 0.0,
+            "amount_entropy": -(
+                ratio_probability.clamp_min(1e-8) * ratio_probability.clamp_min(1e-8).log()
+            ).sum(2).mean(),
             "share_entropy": -(selected_shares.clamp_min(1e-8) * selected_shares.clamp_min(1e-8).log()).sum(1).mean(),
             "ratio_mean_entropy": selected_total_ratio.sum() * 0.0,
             "action_entropy": -(selected_enable_probability.clamp_min(1e-8) * selected_enable_probability.clamp_min(1e-8).log()).mean(),
@@ -523,18 +756,33 @@ class NetworkKProposalPolicy(nn.Module):
         }
         return {
             "selected_policy_terms": selected,
+            "executable_plans": vars(executable_plans),
+            "selected_executable_plan": selected_executable_plan,
             "shared_basis": basis,
             "shared_direction_field": direction_field,
             "shortlist_indices": shortlist_indices,
+            "natural_shortlist_indices": natural_shortlist_indices,
+            "unique_executable_plan_count": (
+                min(len(set(row)) for row in executable_plans.plan_hash)
+                if executable_plans.plan_hash is not None else -1
+            ),
             "slot_logits": slot_logits,
+            "slot_direction_logits": slot_direction_logits,
+            "slot_target_logits": slot_target_logits,
+            "target_candidate_coords": target_candidate_coords,
             "slot_features": slot_feature,
             "total_ratio": total_ratio,
+            "ratio_logits": ratio_logits,
+            "ratio_class": ratio_class,
             "shares": shares,
             "enable_probability": enable_probability,
             "enables": enables,
             "priorities": priorities,
-            "thresholds": thresholds,
-            "temperatures": temperatures,
+            "operation_order": operation_order,
+            "order_logits": order_logits,
+            "order_class": order_class,
+            "variant_logits": variant_logits,
+            "variant_class": variant_class,
             "confidence": confidence,
             "compact_plans": compact,
             "predicted_gain": predicted_gain,
