@@ -8,6 +8,7 @@ import numpy as np
 import torch
 
 from .actual_encoder import build_actual_encoder
+from models.modules.executable_voxel_plan import apply_selected_executable_plan
 from models.utils.compression.octree_stats import hard_octree_occupancy_stats
 
 
@@ -967,7 +968,10 @@ class CompressionLossMixin:
         return result
 
     def _encode_actual_many(self, args, xyz_list):
-        if self._is_den6_online_training_step(args):
+        if (
+            self._is_den6_online_training_step(args)
+            and not bool(getattr(args, "network_k_all_actual_enabled", False))
+        ):
             raise RuntimeError(
                 "ana_den6_onlineでは複数候補actual encodeを禁止する。"
                 "1Step 1planの編集後encodeだけを使用すること"
@@ -1039,6 +1043,108 @@ class CompressionLossMixin:
                 stats = self._attach_octree_aux_stats(args, pts_b, stats)
             stats_list.append(stats)
         return stats_list
+
+    def evaluate_network_k_plans_actual(
+        self,
+        args,
+        proposal_output,
+        voxel_state,
+        gt_xyz,
+        cache_key=None,
+    ):
+        """Network-only K executable planを各1回Actual評価する。"""
+        if not bool(getattr(args, "network_k_all_actual_enabled", False)):
+            raise RuntimeError("network_k_all_actual_enabledが無効である")
+        if str(getattr(args, "heuristic_guidance_mode", "")).strip().lower() != "network_k_proposal_policy":
+            raise RuntimeError("K all-Actualはnetwork_k_proposal_policy専用である")
+        if not isinstance(proposal_output, dict) or not isinstance(voxel_state, dict):
+            raise RuntimeError("K proposalまたはActuator voxel stateが欠落した")
+        plan = proposal_output.get("executable_plan_batch")
+        initial_coords = voxel_state.get("initial_voxel_coords")
+        if plan is None or not torch.is_tensor(initial_coords):
+            raise RuntimeError("K executable planまたは初期Voxel座標が欠落した")
+        if int(plan.operation_order.shape[0]) != 1 or int(initial_coords.shape[0]) != 1:
+            raise RuntimeError("K all-Actualは既知1 state、batch_size=1だけを受け付ける")
+        proposal_count = int(plan.operation_order.shape[1])
+        expected_count = int(getattr(args, "network_k_proposal_count", proposal_count))
+        if proposal_count != expected_count:
+            raise RuntimeError(
+                f"K proposal数不一致: built={proposal_count}, expected={expected_count}"
+            )
+        cached_gt = self._get_cached_actual_gt(cache_key)
+        baseline_scalar_cache_hit = cached_gt is not None
+        baseline_actual_encode_count = 0
+        if cached_gt is None:
+            baseline_actual_encode_count = 1
+            cached_gt = self._encode_actual_batch(args, gt_xyz)
+            self._store_cached_actual_gt(cache_key, cached_gt)
+        candidates = []
+        candidate_point_counts = []
+        for slot in range(proposal_count):
+            final_coords, valid = apply_selected_executable_plan(
+                initial_coords,
+                plan,
+                torch.tensor((slot,), device=initial_coords.device, dtype=torch.long),
+            )
+            candidate_state = dict(voxel_state)
+            candidate_state["final_voxel_coords"] = final_coords
+            candidate_state["final_voxel_valid_mask"] = valid
+            candidate_xyz, candidate_debug = self._voxel_state_to_codec_xyz(
+                args, candidate_state, like_xyz=gt_xyz
+            )
+            if candidate_xyz is None:
+                raise RuntimeError(
+                    "K executable planをcodec座標へ復元できない: "
+                    + str(candidate_debug.get("voxel_state_codec_xyz_reason", "unknown"))
+                )
+            candidate_point_counts.append(int(candidate_xyz.shape[-1]))
+            # worker転送直前までCPUに置き、K個の全点TensorをGPUへ常駐させない。
+            candidates.append(candidate_xyz[0].detach().to(device="cpu", dtype=torch.float32))
+        previous_force_fresh = bool(
+            getattr(args, "_sparsepcgc_force_fresh_actual_encode", False)
+        )
+        setattr(args, "_sparsepcgc_force_fresh_actual_encode", True)
+        try:
+            stats_list = self._encode_actual_many(args, candidates)
+        finally:
+            setattr(args, "_sparsepcgc_force_fresh_actual_encode", previous_force_fresh)
+        if len(stats_list) != proposal_count:
+            raise RuntimeError(
+                f"K Actual結果数不一致: {len(stats_list)} != {proposal_count}"
+            )
+        gt_bits = float(cached_gt["bit"])
+        compression_percent = []
+        for slot, stats in enumerate(stats_list):
+            if not bool(stats.get("actual_finished", True)):
+                raise RuntimeError(
+                    f"K Actual encode未完了: slot={slot}, reason={stats.get('actual_error_reason', '')}"
+                )
+            bits = float(stats["bit"])
+            compression_percent.append(self._relative_percent(bits, gt_bits))
+            stats["point_count"] = int(stats.get("point_count", candidate_point_counts[slot]))
+        selected_slot = int(proposal_output["selected_slot"].reshape(-1)[0].detach().cpu())
+        actual_tensor = proposal_output["predicted_plan_gain"].new_tensor(
+            compression_percent
+        ).view(1, proposal_count)
+        return {
+            "actual_compression_percent": actual_tensor,
+            "actual_gain_percent": -actual_tensor,
+            "stats": stats_list,
+            "selected_slot": selected_slot,
+            "selected_stats": dict(stats_list[selected_slot]),
+            "baseline_bits": gt_bits,
+            "baseline_scalar_cache_hit": bool(baseline_scalar_cache_hit),
+            "baseline_actual_encode_count": baseline_actual_encode_count,
+            "edited_actual_encode_count": proposal_count,
+            # ここで評価するのはHeuristic candidateではなくNetworkが完成させたplanである。
+            "candidate_actual_encode_count": 0,
+            "proposal_actual_encode_count": proposal_count,
+            "total_actual_encode_count": proposal_count + baseline_actual_encode_count,
+            "candidate_point_counts": candidate_point_counts,
+            "den6_call_count": 0,
+            "cache_reference_count": 0,
+            "teacher_reference_count": 0,
+        }
 
     def _actual_octree_stat_qs(self, args, codec_name):
         codec_key = str(codec_name).strip().lower()
@@ -1470,7 +1576,11 @@ class CompressionLossMixin:
             and str(full_octree_context.get("actual_oracle_override_scope", "")) == "full_cloud"
             else None
         )
-        if den6_online_train and cached_oracle_stats is not None:
+        if (
+            den6_online_train
+            and cached_oracle_stats is not None
+            and not bool(getattr(args, "network_k_all_actual_enabled", False))
+        ):
             raise RuntimeError(
                 "ana_den6_onlineではoracle既計測値をedited actual encodeへ流用できない。"
             )

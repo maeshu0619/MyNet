@@ -293,6 +293,35 @@ class NetworkKProposalPolicy(nn.Module):
         if training is None:
             training = self.training
         batch, _, points = features.shape
+        all_actual_exploration = bool(
+            training and getattr(args, "network_k_all_actual_enabled", False)
+        )
+        exploration_temperature_start = max(float(getattr(
+            args, "network_k_all_actual_temperature", 1.0
+        )), 0.05)
+        exploration_temperature_min = min(max(float(getattr(
+            args, "network_k_all_actual_temperature_min", 0.25
+        )), 0.01), exploration_temperature_start)
+        anneal_steps = max(int(getattr(
+            args, "network_k_all_actual_anneal_steps", 500
+        )), 1)
+        anneal_progress = min(max(
+            float(getattr(args, "_global_train_step", 0)) / float(anneal_steps), 0.0
+        ), 1.0)
+        exploration_temperature = (
+            exploration_temperature_start
+            + (exploration_temperature_min - exploration_temperature_start)
+            * anneal_progress
+        )
+
+        def sample_categorical(logits):
+            """探索量を実際のhard標本へ反映するCategorical STE。"""
+            uniform = torch.rand_like(logits).clamp_(1e-6, 1.0 - 1e-6)
+            gumbel = -torch.log(-torch.log(uniform))
+            noisy = logits + exploration_temperature * gumbel
+            hard = F.one_hot(noisy.argmax(dim=2), num_classes=logits.shape[2]).to(logits)
+            soft = torch.softmax(noisy / max(exploration_temperature, 0.05), dim=2)
+            return hard.detach() + soft - soft.detach()
         if fixed_features is None:
             raise RuntimeError(
                 "K proposalには入力由来Octree/local fixed featuresが必須である"
@@ -314,9 +343,22 @@ class NetworkKProposalPolicy(nn.Module):
         state = global_feature.unsqueeze(1).expand(-1, self.proposal_count, -1)
         slot_feature = self.token_mixer(torch.cat((state, tokens), dim=2))
 
-        coefficients = torch.tanh(self.coefficient_head(slot_feature)).view(
+        coefficient_mean_raw = self.coefficient_head(slot_feature).view(
             batch, self.proposal_count, 3, len(LOCAL_COST_NAMES)
         )
+        coefficient_std = max(float(getattr(
+            args, "network_k_all_actual_coefficient_std", 0.15
+        )), 1e-4)
+        if all_actual_exploration:
+            coefficient_sample_raw = coefficient_mean_raw + coefficient_std * torch.randn_like(
+                coefficient_mean_raw
+            )
+        else:
+            coefficient_sample_raw = coefficient_mean_raw
+        coefficients = torch.tanh(coefficient_sample_raw)
+        coefficient_log_prob = -0.5 * (
+            (coefficient_sample_raw.detach() - coefficient_mean_raw) / coefficient_std
+        ).pow(2).mean(dim=(2, 3))
         ratio_values = tuple(float(value) for value in getattr(
             args, "network_k_ratio_values", tuple(self.ratio_values.tolist())
         ))
@@ -325,13 +367,28 @@ class NetworkKProposalPolicy(nn.Module):
         ratio_values_tensor = features.new_tensor(ratio_values)
         ratio_logits = self.amount_head(slot_feature) + self.slot_ratio_bias.unsqueeze(0)
         ratio_probability = torch.softmax(ratio_logits, dim=2)
-        ratio_class = ratio_logits.argmax(dim=2)
-        ratio_hard = F.one_hot(ratio_class, num_classes=5).to(features.dtype)
-        ratio_ste = ratio_hard.detach() + ratio_probability - ratio_probability.detach()
+        if all_actual_exploration:
+            ratio_ste = sample_categorical(ratio_logits)
+            ratio_class = ratio_ste.argmax(dim=2)
+        else:
+            ratio_class = ratio_logits.argmax(dim=2)
+            ratio_hard = F.one_hot(ratio_class, num_classes=5).to(features.dtype)
+            ratio_ste = ratio_hard.detach() + ratio_probability - ratio_probability.detach()
+        ratio_log_prob = (
+            ratio_ste.detach() * torch.log_softmax(ratio_logits, dim=2)
+        ).sum(dim=2)
         total_ratio = (ratio_ste * ratio_values_tensor.view(1, 1, 5)).sum(2, keepdim=True)
 
         share_logits = self.share_head(slot_feature) + self.slot_share_bias.unsqueeze(0)
-        shares_soft = torch.softmax(share_logits, dim=2)
+        if all_actual_exploration:
+            uniform = torch.rand_like(share_logits).clamp_(1e-6, 1.0 - 1e-6)
+            gumbel = -torch.log(-torch.log(uniform))
+            shares_soft = torch.softmax(
+                (share_logits + exploration_temperature * gumbel)
+                / max(exploration_temperature, 0.05), dim=2
+            )
+        else:
+            shares_soft = torch.softmax(share_logits, dim=2)
         lattice_step = float(getattr(args, "network_k_share_lattice_step", 0.05))
         if lattice_step > 0.0:
             shares_hard = torch.round(shares_soft / lattice_step) * lattice_step
@@ -341,6 +398,9 @@ class NetworkKProposalPolicy(nn.Module):
         else:
             shares_hard = shares_soft.detach()
             shares = shares_soft
+        share_log_prob = (
+            shares_hard.detach() * torch.log_softmax(share_logits, dim=2)
+        ).sum(dim=2)
 
         # v1/v2の既存163 planは3操作すべてONであり、enableは識別不能なので固定する。
         enable_probability = features.new_ones((batch, self.proposal_count, 3))
@@ -349,7 +409,15 @@ class NetworkKProposalPolicy(nn.Module):
 
         order_logits = self.order_head(slot_feature) + self.slot_order_bias.unsqueeze(0)
         order_probability = torch.softmax(order_logits, dim=2)
-        order_class = order_logits.argmax(dim=2)
+        if all_actual_exploration:
+            order_sample = sample_categorical(order_logits)
+            order_class = order_sample.argmax(dim=2)
+        else:
+            order_class = order_logits.argmax(dim=2)
+            order_sample = F.one_hot(order_class, num_classes=6).to(features.dtype)
+        order_log_prob = (
+            order_sample.detach() * torch.log_softmax(order_logits, dim=2)
+        ).sum(dim=2)
         operation_order = self.order_permutations.to(order_class).index_select(
             0, order_class.reshape(-1)
         ).view(batch, self.proposal_count, 3)
@@ -357,7 +425,15 @@ class NetworkKProposalPolicy(nn.Module):
         rank_values = features.new_tensor((3.0, 2.0, 1.0)).view(1, 1, 3).expand_as(priorities)
         priorities.scatter_(2, operation_order, rank_values)
         variant_logits = self.variant_head(slot_feature) + self.slot_variant_bias.unsqueeze(0)
-        variant_class = variant_logits.argmax(dim=2)
+        if all_actual_exploration:
+            variant_sample = sample_categorical(variant_logits)
+            variant_class = variant_sample.argmax(dim=2)
+        else:
+            variant_class = variant_logits.argmax(dim=2)
+            variant_sample = F.one_hot(variant_class, num_classes=6).to(features.dtype)
+        variant_log_prob = (
+            variant_sample.detach() * torch.log_softmax(variant_logits, dim=2)
+        ).sum(dim=2)
         confidence = torch.sigmoid(self.confidence_head(slot_feature))
 
         natural_shortlist_indices = self._shared_shortlist(basis, coefficients, points)
@@ -374,10 +450,10 @@ class NetworkKProposalPolicy(nn.Module):
             teacher_target_coords if training else None,
         )
         shortlist_basis = self._gather_points(basis, shortlist_indices)
-        slot_logits = torch.einsum(
+        base_slot_logits = torch.einsum(
             "bocm,bkoc->bkom", shortlist_basis, coefficients
         )
-        slot_logits = slot_logits + priorities.unsqueeze(-1)
+        base_slot_logits = base_slot_logits + priorities.unsqueeze(-1)
         # den6のpool走査variantを、共有shortlist順位への小さな決定論的傾きで表す。
         variant_slopes = features.new_tensor((
             (0.0, 0.0, 0.0),
@@ -394,8 +470,14 @@ class NetworkKProposalPolicy(nn.Module):
             1.0, 0.0, shortlist_indices.shape[1],
             device=features.device, dtype=features.dtype,
         ).view(1, 1, 1, -1)
-        slot_scale = slot_logits.detach().std(dim=3, keepdim=True).clamp_min(1e-4)
-        slot_logits = slot_logits + selected_slopes * shortlist_rank * slot_scale
+        slot_scale = base_slot_logits.detach().std(dim=3, keepdim=True).clamp_min(1e-4)
+        base_slot_logits = base_slot_logits + selected_slopes * shortlist_rank * slot_scale
+        if all_actual_exploration:
+            uniform = torch.rand_like(base_slot_logits).clamp_(1e-6, 1.0 - 1e-6)
+            where_gumbel = -torch.log(-torch.log(uniform))
+            slot_logits = base_slot_logits + where_gumbel * exploration_temperature
+        else:
+            slot_logits = base_slot_logits
 
         if not torch.is_tensor(voxel_coords):
             raise RuntimeError("K proposalにはglobal voxel座標が必須である")
@@ -412,11 +494,27 @@ class NetworkKProposalPolicy(nn.Module):
         ).round().to(dtype=torch.long)
         requested_count = requested_count.clamp(min=0, max=int(shortlist_indices.shape[1]))
         # builderへshortlist indexを渡し、K×全点score Tensorも作らない。
-        direction_delta_all = self.direction_delta_head(slot_feature).view(
+        direction_delta_mean = self.direction_delta_head(slot_feature).view(
             batch, self.proposal_count, 2, 3
         )
+        direction_std = max(float(getattr(
+            args, "network_k_all_actual_direction_std", 0.10
+        )), 1e-4)
+        if all_actual_exploration:
+            direction_delta_all = direction_delta_mean + direction_std * torch.randn_like(
+                direction_delta_mean
+            )
+        else:
+            direction_delta_all = direction_delta_mean
+        direction_log_prob = -0.5 * (
+            (direction_delta_all.detach() - direction_delta_mean) / direction_std
+        ).pow(2).mean(dim=(2, 3))
         slot_direction_logits = None
-        if bool(training) and bool(str(getattr(args, "network_k_offline_dataset", "")).strip()):
+        if (
+            bool(training)
+            and not all_actual_exploration
+            and bool(str(getattr(args, "network_k_offline_dataset", "")).strip())
+        ):
             shortlist_direction = self._gather_points(direction_field, shortlist_indices)
             shortlist_vectors = F.normalize(
                 shortlist_direction[:, None, :, :3]
@@ -525,7 +623,11 @@ class NetworkKProposalPolicy(nn.Module):
             target_coord_max=voxel_coords.new_tensor((
                 int(getattr(args, "sparsepcgc_psnr_resolution", 1023) or 1023),
             ) * 3),
-            debug_hash=bool(getattr(args, "network_k_debug_plan_hash", False)),
+            # 全K Actual診断ではslot collapseをplan単位で必ず検出する。
+            debug_hash=bool(
+                all_actual_exploration
+                or getattr(args, "network_k_debug_plan_hash", False)
+            ),
         )
         accepted_count = executable_plans.accepted_count.to(dtype=features.dtype)
         collision_count = (requested_count - executable_plans.accepted_count).clamp_min(0).to(
@@ -575,6 +677,25 @@ class NetworkKProposalPolicy(nn.Module):
                     selected_shortlist_mask_all[
                         batch_index, slot_index, operation, position
                     ] = True
+        where_log_probability = torch.log_softmax(base_slot_logits, dim=3)
+        selected_where_count = selected_shortlist_mask_all.sum(dim=(2, 3)).clamp_min(1)
+        where_log_prob = (
+            where_log_probability * selected_shortlist_mask_all.to(where_log_probability.dtype)
+        ).sum(dim=(2, 3)) / selected_where_count.to(where_log_probability.dtype)
+        slot_policy_log_prob = (
+            ratio_log_prob + share_log_prob + order_log_prob + variant_log_prob
+            + where_log_prob + coefficient_log_prob + direction_log_prob
+        )
+        slot_policy_entropy = (
+            -(ratio_probability.clamp_min(1e-8) * ratio_probability.clamp_min(1e-8).log()).sum(2)
+            -(order_probability.clamp_min(1e-8) * order_probability.clamp_min(1e-8).log()).sum(2)
+            -(torch.softmax(variant_logits, 2).clamp_min(1e-8)
+              * torch.log_softmax(variant_logits, 2)).sum(2)
+            -(torch.softmax(share_logits, 2).clamp_min(1e-8)
+              * torch.log_softmax(share_logits, 2)).sum(2)
+            -(torch.softmax(base_slot_logits, 3).clamp_min(1e-8)
+              * torch.log_softmax(base_slot_logits, 3)).sum(3).mean(2)
+        )
         compact = {
             "selected_shortlist_mask": selected_shortlist_mask_all,
             "requested_count": requested_count,
@@ -757,6 +878,7 @@ class NetworkKProposalPolicy(nn.Module):
         return {
             "selected_policy_terms": selected,
             "executable_plans": vars(executable_plans),
+            "executable_plan_batch": executable_plans,
             "selected_executable_plan": selected_executable_plan,
             "shared_basis": basis,
             "shared_direction_field": direction_field,
@@ -783,6 +905,11 @@ class NetworkKProposalPolicy(nn.Module):
             "order_class": order_class,
             "variant_logits": variant_logits,
             "variant_class": variant_class,
+            "slot_policy_log_prob": slot_policy_log_prob,
+            "slot_policy_entropy": slot_policy_entropy,
+            "all_actual_exploration": all_actual_exploration,
+            "exploration_temperature": features.new_tensor(exploration_temperature),
+            "exploration_anneal_progress": features.new_tensor(anneal_progress),
             "confidence": confidence,
             "compact_plans": compact,
             "predicted_gain": predicted_gain,

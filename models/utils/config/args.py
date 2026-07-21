@@ -2819,6 +2819,26 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--network_k_elite_cadence', default=50, type=int)
     parser.add_argument('--network_k_elite_replay_capacity', default=2048, type=int)
     parser.add_argument(
+        '--network_k_all_actual_enabled', default=False, type=str2bool,
+        help=(
+            '既知1 state診断専用。NetworkのK executable planを全件Actual評価し、'
+            'state内相対rewardでtheta/Where/Direction/Criticを更新する'
+        ),
+    )
+    parser.add_argument('--network_k_all_actual_temperature', default=1.0, type=float)
+    parser.add_argument('--network_k_all_actual_temperature_min', default=0.25, type=float)
+    parser.add_argument('--network_k_all_actual_anneal_steps', default=500, type=int)
+    parser.add_argument('--network_k_all_actual_coefficient_std', default=0.15, type=float)
+    parser.add_argument('--network_k_all_actual_direction_std', default=0.10, type=float)
+    parser.add_argument('--network_k_all_actual_actor_weight', default=1.0, type=float)
+    parser.add_argument('--network_k_all_actual_critic_weight', default=0.5, type=float)
+    parser.add_argument('--network_k_all_actual_ranking_weight', default=0.25, type=float)
+    parser.add_argument('--network_k_all_actual_entropy_weight', default=0.01, type=float)
+    parser.add_argument(
+        '--network_k_all_actual_selected_surrogate_weight', default=0.1, type=float,
+        help='全K Actual更新と併用する選択plan Surrogate勾配の係数',
+    )
+    parser.add_argument(
         '--network_k_diagnostic_factorization', default='network_map_network_theta',
         choices=[
             'heuristic_map_heuristic_theta',
@@ -4113,6 +4133,39 @@ def parse_pugan_args(parser, file_day, file_time):
     args.network_k_elite_cadence = max(
         int(getattr(args, "network_k_elite_cadence", 50)), 1
     )
+    args.network_k_all_actual_enabled = bool(
+        getattr(args, "network_k_all_actual_enabled", False)
+    )
+    args.network_k_all_actual_temperature = max(
+        float(getattr(args, "network_k_all_actual_temperature", 1.0)), 0.05
+    )
+    args.network_k_all_actual_temperature_min = min(max(
+        float(getattr(args, "network_k_all_actual_temperature_min", 0.25)), 0.01
+    ), args.network_k_all_actual_temperature)
+    args.network_k_all_actual_anneal_steps = max(
+        int(getattr(args, "network_k_all_actual_anneal_steps", 500)), 1
+    )
+    args.network_k_all_actual_coefficient_std = max(
+        float(getattr(args, "network_k_all_actual_coefficient_std", 0.15)), 1e-4
+    )
+    args.network_k_all_actual_direction_std = max(
+        float(getattr(args, "network_k_all_actual_direction_std", 0.10)), 1e-4
+    )
+    for name, default in (
+        ("network_k_all_actual_actor_weight", 1.0),
+        ("network_k_all_actual_critic_weight", 0.5),
+        ("network_k_all_actual_ranking_weight", 0.25),
+        ("network_k_all_actual_entropy_weight", 0.01),
+        ("network_k_all_actual_selected_surrogate_weight", 0.1),
+    ):
+        setattr(args, name, max(float(getattr(args, name, default)), 0.0))
+    if args.network_k_all_actual_enabled:
+        if args.heuristic_guidance_mode != "network_k_proposal_policy":
+            raise ValueError(
+                "network_k_all_actual_enabledはnetwork_k_proposal_policy専用である"
+            )
+        if int(args.network_k_proposal_count) not in {8, 16}:
+            raise ValueError("K all-Actualのproposal数は8または16に限定する")
     args.network_k_elite_replay_capacity = max(
         int(getattr(args, "network_k_elite_replay_capacity", 2048)), 8
     )

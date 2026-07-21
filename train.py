@@ -12248,10 +12248,30 @@ def train(model, args, loss, writer, plot, notifier=None):
     seq_datasets = [(seq_dir, PlyDirDataset(args, seq_dir)) for seq_dir in seq_dirs] # 各シーケンス内のPLY点群ファイルを読み込むデータセットを作る
     k_proposal_teacher_store = None
     k_offline_path = str(getattr(args, "network_k_offline_dataset", "") or "").strip()
+    k_all_actual_enabled = bool(getattr(args, "network_k_all_actual_enabled", False))
+    if k_all_actual_enabled:
+        unique_training_files = sorted({
+            os.path.realpath(path)
+            for _, dataset in seq_datasets
+            for path in getattr(dataset, "files", ())
+        })
+        if len(unique_training_files) != 1:
+            raise RuntimeError(
+                "K all-Actualは既知1 state専用である。"
+                "network_k_diagnostic_sequence_name、max_files=1、"
+                "network_only_diagnostic_repeat_single_frameを設定し、"
+                f"入力PLYを1種類に限定すること（現在{len(unique_training_files)}種類）"
+            )
+        writer.write(
+            "KAllActualMode: "
+            f"input={unique_training_files[0]}, K={int(args.network_k_proposal_count)}, "
+            "teacher=0, cache_plan=0, den5=0, den6=0, actual_per_step=K"
+        )
     if (
         str(getattr(args, "heuristic_guidance_mode", "")).strip().lower()
         == "network_k_proposal_policy"
         and k_offline_path
+        and not k_all_actual_enabled
     ):
         if not os.path.isfile(k_offline_path):
             raise FileNotFoundError(f"network_k_offline_dataset not found: {k_offline_path}")
@@ -12265,7 +12285,7 @@ def train(model, args, loss, writer, plot, notifier=None):
     den6_prefetch_lookahead = max(
         int(getattr(args, "heuristic_guidance_online_prefetch_lookahead", 0)), 0
     )
-    if seq_datasets and den6_prefetch_lookahead > 0:
+    if seq_datasets and den6_prefetch_lookahead > 0 and not k_all_actual_enabled:
         first_files = list(getattr(seq_datasets[0][1], "files", ()))[:den6_prefetch_lookahead]
         prefetch_state = prefetch_ana_den6_online_guidance(args, first_files)
         if int(prefetch_state.get("submitted", 0)) > 0:
@@ -12526,6 +12546,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                 detail_log_this_step = False
                 step_timing_breakdown = {}
                 step_actual_oracle_metric_debug = {}
+                k_all_actual_result = None
 
                 """学習設定"""
                 if timing_enabled and use_cuda and torch.cuda.is_available(): # GPU計測のためのリセット
@@ -12900,6 +12921,42 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 # voxel state 復元に成功した場合は、proxy側もactual側も同じ点群を使う。
                                 # 復元に失敗した場合だけ従来のgen_xyzへfallbackする。
                                 full_cloud_compression_source_xyz = gen_xyz_for_actual if full_cloud_voxel_state_used else gen_xyz
+
+                                if k_all_actual_enabled:
+                                    k_actual_t0 = time.time()
+                                    k_model = _unwrap_train_model(model)
+                                    proposal_output = getattr(
+                                        k_model, "last_k_proposal_terms", None
+                                    )
+                                    actuator_voxel_state = getattr(
+                                        k_model, "last_actuator_voxel_state", None
+                                    )
+                                    evaluator = getattr(
+                                        loss, "evaluate_network_k_plans_actual", None
+                                    )
+                                    if not callable(evaluator):
+                                        raise RuntimeError("K all-Actual evaluatorがLossに存在しない")
+                                    k_all_actual_result = evaluator(
+                                        args,
+                                        proposal_output=proposal_output,
+                                        voxel_state=actuator_voxel_state,
+                                        gt_xyz=input_xyz[:, :3, :],
+                                        cache_key=cache_key,
+                                    )
+                                    # 通常のselected-plan損失ではK評価済みの同一結果を再利用し、
+                                    # 9回目の重複Actual encodeを発生させない。
+                                    full_octree_context[
+                                        "actual_oracle_cached_edited_actual_stats"
+                                    ] = dict(k_all_actual_result["selected_stats"])
+                                    full_octree_context[
+                                        "actual_oracle_override_scope"
+                                    ] = "full_cloud"
+                                    full_octree_context[
+                                        "network_k_all_actual_reuse"
+                                    ] = True
+                                    step_timing_breakdown["k_all_actual_time"] = float(
+                                        time.time() - k_actual_t0
+                                    )
 
                                 compression_gen_xyz, noise_debug = prepare_compression_points(
                                     full_cloud_compression_source_xyz,
@@ -14111,6 +14168,14 @@ def train(model, args, loss, writer, plot, notifier=None):
                         ),
                         0.0,
                     )
+                    if k_all_actual_enabled:
+                        # 全Kの実測相対rewardを主信号にし、選択1案だけのSurrogateが
+                        # 8専門slotを同じ方向へ引く影響は小さく残す。
+                        compression_weight *= max(float(getattr(
+                            args,
+                            "network_k_all_actual_selected_surrogate_weight",
+                            0.1,
+                        )), 0.0)
                     L = (
                         geometry_weight * L_geom
                         + stage_factors["com"] * compression_weight * L_com_objective
@@ -14139,7 +14204,14 @@ def train(model, args, loss, writer, plot, notifier=None):
                 heuristic_mode = str(
                     getattr(args, "heuristic_guidance_mode", "")
                 ).strip().lower()
-                if heuristic_mode in {"ana_den6_online", "network_only_codec_policy", "network_k_proposal_policy"}:
+                if (
+                    heuristic_mode in {
+                        "ana_den6_online",
+                        "network_only_codec_policy",
+                        "network_k_proposal_policy",
+                    }
+                    and not k_all_actual_enabled
+                ):
                     base_model_for_policy = model.module if hasattr(model, "module") else model
                     policy_loss_fn = getattr(base_model_for_policy, "discrete_policy_loss", None)
                     if not callable(policy_loss_fn):
@@ -14316,6 +14388,63 @@ def train(model, args, loss, writer, plot, notifier=None):
                             )
                             latest_compression_debug.update(compression_debug_terms)
                             loss.last_compression_debug = latest_compression_debug
+
+                if k_all_actual_enabled:
+                    if heuristic_mode != "network_k_proposal_policy":
+                        raise RuntimeError("K all-Actual lossはK proposal mode専用である")
+                    if not isinstance(k_all_actual_result, dict):
+                        raise RuntimeError("K all-Actual評価結果が学習損失へ届いていない")
+                    base_model_for_policy = model.module if hasattr(model, "module") else model
+                    all_actual_loss_fn = getattr(
+                        base_model_for_policy, "k_proposal_all_actual_loss", None
+                    )
+                    if not callable(all_actual_loss_fn):
+                        raise RuntimeError("K all-Actual policy lossがNetworkに存在しない")
+                    L_k_all_actual = all_actual_loss_fn(
+                        k_all_actual_result["actual_compression_percent"]
+                    )
+                    if not torch.is_tensor(L_k_all_actual) or not L_k_all_actual.requires_grad:
+                        raise RuntimeError("K all-Actual policy lossの勾配が切れている")
+                    L = L + L_k_all_actual
+                    L_discrete_policy = L_k_all_actual
+                    k_actual_debug = dict(
+                        getattr(base_model_for_policy, "last_k_all_actual_debug", {}) or {}
+                    )
+                    compression_debug_terms.update({
+                        f"k_all_actual_{key}": value
+                        for key, value in k_actual_debug.items()
+                    })
+                    compression_debug_terms.update({
+                        "k_all_actual_proposal_count": int(
+                            k_all_actual_result["proposal_actual_encode_count"]
+                        ),
+                        "k_all_actual_baseline_bits": float(
+                            k_all_actual_result["baseline_bits"]
+                        ),
+                        "k_all_actual_baseline_scalar_cache_hit": bool(
+                            k_all_actual_result["baseline_scalar_cache_hit"]
+                        ),
+                        "den6_online_baseline_actual_encode_count": int(
+                            k_all_actual_result["baseline_actual_encode_count"]
+                        ),
+                        "den6_online_edited_actual_encode_count": int(
+                            k_all_actual_result["edited_actual_encode_count"]
+                        ),
+                        "den6_online_candidate_actual_encode_count": 0,
+                    })
+                    latest_compression_debug = dict(
+                        getattr(loss, "last_compression_debug", {}) or {}
+                    )
+                    latest_compression_debug.update(compression_debug_terms)
+                    loss.last_compression_debug = latest_compression_debug
+                    loss._den6_online_actual_audit = {
+                        "baseline": int(k_all_actual_result["baseline_actual_encode_count"]),
+                        "edited": int(k_all_actual_result["edited_actual_encode_count"]),
+                        "candidate": 0,
+                        "proposal": int(k_all_actual_result["proposal_actual_encode_count"]),
+                        "worker_request_count": int(k_all_actual_result["proposal_actual_encode_count"]),
+                        "edited_result_cache_hit": False,
+                    }
 
                 if full_cloud_amount_mode and torch.is_tensor(L_full_cloud_amount):
                     L = L + L_full_cloud_amount
@@ -15053,6 +15182,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                     ("loss_nodes", loss_nodes),
                     ("loss_single", loss_single),
                     ("surrogate_loss_for_grad", terms.get("surrogate", None)),
+                    ("L_discrete_policy", L_discrete_policy),
                 ]
                 if torch.is_tensor(La_fit) and La_fit.requires_grad:
                     step_grad_loss_items.append(("La_fit", La_fit))
@@ -15413,8 +15543,12 @@ def train(model, args, loss, writer, plot, notifier=None):
                             "local_trunk", "local_cost_head", "shared_local_trunk",
                             "shared_basis_head", "plan_tokens", "token_mixer", "coefficient_head",
                             "coefficient_scale_head", "priority_head", "threshold_head",
+                            "order_head", "variant_head", "slot_order_bias", "slot_variant_bias",
                         ),
-                        "amount": ("amount_head", "amount_scale_head", "share_head", "share_scale_head", "plan_tokens"),
+                        "amount": (
+                            "amount_head", "amount_scale_head", "share_head", "share_scale_head",
+                            "slot_ratio_bias", "slot_share_bias", "plan_tokens",
+                        ),
                         "action": ("gate_head", "enable_head", "plan_tokens"),
                         "direction": ("direction_field_head", "shared_direction_head", "direction_delta_head", "plan_tokens"),
                         "interaction": ("interaction_head", "critic", "critic_interaction_head", "critic_gain_head"),
@@ -15897,7 +16031,14 @@ def train(model, args, loss, writer, plot, notifier=None):
                         "edited_actual_encode_count": edited_encodes,
                         "candidate_actual_encode_count": candidate_encodes,
                         "total_actual_encode_count": baseline_encodes + edited_encodes + candidate_encodes,
+                        "proposal_actual_encode_count": int(
+                            actual_audit.get("proposal", 0) or 0
+                        ),
                     }
+                    expected_edited_actual = (
+                        int(getattr(args, "network_k_proposal_count", 8))
+                        if k_all_actual_enabled else 1
+                    )
                     failures = []
                     for key, expected in (
                         ("network_forward_count", 1),
@@ -15906,13 +16047,21 @@ def train(model, args, loss, writer, plot, notifier=None):
                         ("candidate_object_count", 0),
                         ("pool_reference_count", 0),
                         ("teacher_plan_reference_count", 0),
-                        ("edited_actual_encode_count", 1),
+                        ("edited_actual_encode_count", expected_edited_actual),
                         ("candidate_actual_encode_count", 0),
                     ):
                         if int(contract[key]) != int(expected):
                             failures.append(f"{key}!={expected}")
                     if float(contract["behavior_cloning_loss"]) != 0.0:
                         failures.append("behavior_cloning_loss!=0")
+                    if (
+                        k_all_actual_enabled
+                        and int(contract["proposal_actual_encode_count"])
+                        != expected_edited_actual
+                    ):
+                        failures.append(
+                            f"proposal_actual_encode_count!={expected_edited_actual}"
+                        )
                     if failures:
                         raise RuntimeError(
                             "network-only one-plan invariant violation: " + ", ".join(failures)
@@ -16013,6 +16162,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                     writer.write(
                         "NetworkOnlyAudit: "
                         f"counters={contract}, "
+                        f"k_all_actual={dict(getattr(audit_model, 'last_k_all_actual_debug', {}) or {})}, "
                         f"counts={dict(audit_plan.get('selected_counts') or {})}, "
                         f"ratios={dict(audit_plan.get('selected_amount_ratios') or {})}, "
                         f"shares_raw={_audit_list('network_only_shares_raw')}, "

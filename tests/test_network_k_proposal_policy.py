@@ -11,6 +11,7 @@ import torch
 
 import models.network as network_module
 from models.modules.network_k_proposal_policy import NetworkKProposalPolicy
+from models.utils.loss.compression import CompressionLossMixin
 from models.utils.loss.k_proposal_distillation import (
     KProposalSetLoss,
     OfflineKProposalTeacherStore,
@@ -220,6 +221,75 @@ class NetworkKProposalPolicyTest(unittest.TestCase):
         self.assertGreater(float(improving.abs().sum()), 0.0)
         self.assertTrue(torch.allclose(improving, -worsening, atol=1e-7, rtol=1e-5))
 
+    def test_all_actual_exploration_updates_each_theta_family_without_teacher(self):
+        self.policy.train()
+        output = self.policy(
+            self.features,
+            _args(
+                network_k_all_actual_enabled=True,
+                network_k_all_actual_temperature=1.0,
+                network_k_offline_dataset="参照してはいけない",
+            ),
+            training=True,
+            fixed_features=self.fixed,
+            voxel_coords=self.coords,
+        )
+        self.assertTrue(output["all_actual_exploration"])
+        self.assertIsNone(output["slot_direction_logits"])
+        advantage = torch.linspace(-1.0, 1.0, 8).view(1, 8)
+        loss = -(advantage * output["slot_policy_log_prob"]).mean()
+        loss.backward()
+        groups = {
+            "ratio": self.policy.amount_head.weight.grad,
+            "share": self.policy.share_head.weight.grad,
+            "order": self.policy.order_head.weight.grad,
+            "variant": self.policy.variant_head.weight.grad,
+            "coefficient": self.policy.coefficient_head.weight.grad,
+            "where": self.policy.shared_basis_head.weight.grad,
+            "direction": self.policy.direction_delta_head.weight.grad,
+        }
+        for name, gradient in groups.items():
+            self.assertIsNotNone(gradient, name)
+            self.assertGreater(float(gradient.detach().abs().sum()), 0.0, name)
+
+    def test_all_actual_flag_does_not_make_inference_random(self):
+        args = _args(network_k_all_actual_enabled=True)
+        first = self.policy(
+            self.features, args, training=False,
+            fixed_features=self.fixed, voxel_coords=self.coords,
+        )
+        second = self.policy(
+            self.features, args, training=False,
+            fixed_features=self.fixed, voxel_coords=self.coords,
+        )
+        for key in ("ratio_class", "shares", "order_class", "variant_class", "slot_logits"):
+            self.assertTrue(torch.equal(first[key], second[key]), key)
+
+    def test_all_actual_relative_reward_has_correct_actor_sign(self):
+        log_prob = torch.zeros(1, 8, requires_grad=True)
+        predicted_gain = torch.zeros(1, 8, 1, requires_grad=True)
+        dummy = SimpleNamespace(
+            training=True,
+            args=_args(
+                heuristic_guidance_mode="network_k_proposal_policy",
+                network_k_all_actual_enabled=True,
+            ),
+            last_k_proposal_terms={
+                "slot_policy_log_prob": log_prob,
+                "predicted_plan_gain": predicted_gain,
+                "slot_policy_entropy": torch.ones(1, 8, requires_grad=True),
+                "selected_slot": torch.zeros(1, dtype=torch.long),
+            },
+            last_k_all_actual_debug={},
+        )
+        compression_loss = torch.tensor([[-2.0, -1.0, 0.0, 1.0, 2.0, 1.5, 0.5, -0.5]])
+        total = network_module.Network.k_proposal_all_actual_loss(dummy, compression_loss)
+        actor_grad = torch.autograd.grad(total, log_prob, retain_graph=True)[0]
+        # 最も改善したslotは勾配降下でlog-probが増え、最悪slotは減る。
+        self.assertLess(float(actor_grad[0, 0]), 0.0)
+        self.assertGreater(float(actor_grad[0, 4]), 0.0)
+        self.assertTrue(total.requires_grad)
+
     def test_set_loss_updates_proposal_and_critic_heads(self):
         self.policy.train()
         output = self.policy(
@@ -295,6 +365,65 @@ class NetworkKProposalPolicyTest(unittest.TestCase):
         self.assertFalse(bool(teacher["voxel_value_mask"][0, 1].any()))
         self.assertFalse(teacher["add_where_teacher_available"])
         self.assertEqual(teacher["voxel_target_semantics"], "rank_weighted_relative_value_not_causal_gain")
+
+
+class KAllActualEvaluatorTest(unittest.TestCase):
+    def test_evaluates_exactly_k_completed_network_plans_and_reuses_selected(self):
+        class DummyLoss(CompressionLossMixin):
+            def __init__(self):
+                self.encoded = 0
+
+            def _get_cached_actual_gt(self, cache_key):
+                return {"bit": 1000.0}
+
+            def _encode_actual_many(self, args, xyz_list):
+                self.encoded += len(xyz_list)
+                return [
+                    {"bit": 1000.0 - 10.0 * index, "point_count": int(xyz.shape[-1]),
+                     "actual_finished": True}
+                    for index, xyz in enumerate(xyz_list)
+                ]
+
+            def _voxel_state_to_codec_xyz(self, args, voxel_state, like_xyz):
+                return like_xyz, {"used": True}
+
+        class Plan:
+            operation_order = torch.zeros(1, 8, 3, dtype=torch.long)
+
+        dummy = DummyLoss()
+        args = _args(
+            heuristic_guidance_mode="network_k_proposal_policy",
+            network_k_all_actual_enabled=True,
+            network_k_proposal_count=8,
+        )
+        proposal = {
+            "executable_plan_batch": Plan(),
+            "selected_slot": torch.tensor([3]),
+            "predicted_plan_gain": torch.zeros(1, 8, 1),
+        }
+        voxel_state = {"initial_voxel_coords": torch.zeros(1, 3, 4, dtype=torch.long)}
+        with mock.patch(
+            "models.utils.loss.compression.apply_selected_executable_plan",
+            return_value=(
+                torch.zeros(1, 3, 4, dtype=torch.long),
+                torch.ones(1, 4, dtype=torch.bool),
+            ),
+        ):
+            result = dummy.evaluate_network_k_plans_actual(
+                args,
+                proposal_output=proposal,
+                voxel_state=voxel_state,
+                gt_xyz=torch.zeros(1, 3, 4),
+                cache_key="state",
+            )
+        self.assertEqual(dummy.encoded, 8)
+        self.assertEqual(result["edited_actual_encode_count"], 8)
+        self.assertEqual(result["proposal_actual_encode_count"], 8)
+        self.assertEqual(result["candidate_actual_encode_count"], 0)
+        self.assertEqual(result["baseline_actual_encode_count"], 0)
+        self.assertTrue(result["baseline_scalar_cache_hit"])
+        self.assertEqual(result["selected_stats"]["bit"], 970.0)
+        self.assertEqual(tuple(result["actual_compression_percent"].shape), (1, 8))
 
 
 if __name__ == "__main__":

@@ -62,6 +62,7 @@ class Network(nn.Module):
         self._den6_online_objective_baseline = OrderedDict()
         self.last_discrete_policy_debug = {}
         self.last_k_proposal_terms = None
+        self.last_k_all_actual_debug = {}
 
         """モジュールセットアップ"""
         self.encoder = PointTransformer(self.args) # 特徴抽出器
@@ -457,6 +458,104 @@ class Network(nn.Module):
         if not isinstance(self.last_k_proposal_terms, dict):
             raise RuntimeError("K proposal forward must run before distillation loss")
         return self.k_proposal_set_loss(self.last_k_proposal_terms, teacher)
+
+    def k_proposal_all_actual_loss(self, actual_compression_percent):
+        """8実行planの実測相対rewardを各specialistへ直接返す。"""
+        if not self.training:
+            raise RuntimeError("K all-Actual lossは訓練時だけ使用できる")
+        if not bool(getattr(self.args, "network_k_all_actual_enabled", False)):
+            raise RuntimeError("network_k_all_actual_enabledが無効である")
+        terms = self.last_k_proposal_terms
+        if not isinstance(terms, dict):
+            raise RuntimeError("K proposal forwardがall-Actual lossより前に必要である")
+        log_prob = terms.get("slot_policy_log_prob")
+        predicted_gain = terms.get("predicted_plan_gain")
+        entropy = terms.get("slot_policy_entropy")
+        if not all(torch.is_tensor(value) for value in (log_prob, predicted_gain, entropy)):
+            raise RuntimeError("K proposalのslot policy/Critic Tensorが欠落した")
+        actual_loss = torch.as_tensor(
+            actual_compression_percent,
+            device=log_prob.device,
+            dtype=log_prob.dtype,
+        ).view_as(log_prob)
+        # compression lossは負が改善、gain/rewardは正が改善へ統一する。
+        actual_gain = -actual_loss
+        centered = actual_gain - actual_gain.mean(dim=1, keepdim=True)
+        advantage = centered / actual_gain.std(dim=1, keepdim=True).clamp_min(1e-4)
+        actor_raw = -(advantage.detach() * log_prob).mean()
+        critic_raw = torch.nn.functional.smooth_l1_loss(
+            predicted_gain.squeeze(-1), actual_gain.detach(), beta=0.25
+        )
+        pair_difference = actual_gain[:, :, None] - actual_gain[:, None, :]
+        predicted_difference = (
+            predicted_gain.squeeze(-1)[:, :, None]
+            - predicted_gain.squeeze(-1)[:, None, :]
+        )
+        pair_mask = pair_difference.abs() > 1e-6
+        if bool(pair_mask.any()):
+            ranking_raw = torch.nn.functional.softplus(
+                -pair_difference.sign()[pair_mask] * predicted_difference[pair_mask]
+            ).mean()
+        else:
+            ranking_raw = actor_raw.new_zeros(())
+        entropy_raw = entropy.mean()
+        actor_weight = max(float(getattr(
+            self.args, "network_k_all_actual_actor_weight", 1.0
+        )), 0.0)
+        critic_weight = max(float(getattr(
+            self.args, "network_k_all_actual_critic_weight", 0.5
+        )), 0.0)
+        ranking_weight = max(float(getattr(
+            self.args, "network_k_all_actual_ranking_weight", 0.25
+        )), 0.0)
+        entropy_weight = max(float(getattr(
+            self.args, "network_k_all_actual_entropy_weight", 0.01
+        )), 0.0)
+        total = (
+            actor_raw * actor_weight
+            + critic_raw * critic_weight
+            + ranking_raw * ranking_weight
+            - entropy_raw * entropy_weight
+        )
+        best_slot = actual_gain.argmax(dim=1)
+        selected_slot = terms["selected_slot"].to(best_slot)
+        self.last_k_all_actual_debug = {
+            "actual_compression_percent": actual_loss.detach().cpu().tolist(),
+            "actual_gain_percent": actual_gain.detach().cpu().tolist(),
+            "actual_best_compression_percent": float(actual_loss.min().detach().cpu()),
+            "actual_mean_compression_percent": float(actual_loss.mean().detach().cpu()),
+            "actual_improving_plan_count": int((actual_loss < 0.0).sum().detach().cpu()),
+            "actual_zero_plan_count": int((actual_loss.abs() <= 1e-9).sum().detach().cpu()),
+            "actual_best_slot": best_slot.detach().cpu().tolist(),
+            "critic_selected_slot": selected_slot.detach().cpu().tolist(),
+            "critic_regret_percent": (
+                actual_gain.gather(1, best_slot.view(-1, 1))
+                - actual_gain.gather(1, selected_slot.view(-1, 1))
+            ).detach().cpu().tolist(),
+            "actor_raw": float(actor_raw.detach().cpu()),
+            "critic_raw": float(critic_raw.detach().cpu()),
+            "ranking_raw": float(ranking_raw.detach().cpu()),
+            "entropy_raw": float(entropy_raw.detach().cpu()),
+            "total": float(total.detach().cpu()),
+            "ratio_class": terms["ratio_class"].detach().cpu().tolist()
+            if torch.is_tensor(terms.get("ratio_class")) else [],
+            "shares": terms["shares"].detach().cpu().tolist()
+            if torch.is_tensor(terms.get("shares")) else [],
+            "order_class": terms["order_class"].detach().cpu().tolist()
+            if torch.is_tensor(terms.get("order_class")) else [],
+            "variant_class": terms["variant_class"].detach().cpu().tolist()
+            if torch.is_tensor(terms.get("variant_class")) else [],
+            "unique_executable_plan_count": int(
+                terms.get("unique_executable_plan_count", -1)
+            ),
+            "exploration_temperature": float(
+                terms["exploration_temperature"].detach().cpu()
+            ) if torch.is_tensor(terms.get("exploration_temperature")) else 0.0,
+            "exploration_anneal_progress": float(
+                terms["exploration_anneal_progress"].detach().cpu()
+            ) if torch.is_tensor(terms.get("exploration_anneal_progress")) else 0.0,
+        }
+        return total
 
     def _normalize_coord_scale(self, pts_xyz, coord_scale): # 座標スケールと点群テンソルに合わせた形に整える補助関数
         if coord_scale is None:
