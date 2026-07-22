@@ -42,6 +42,7 @@ from models.network import Network
 import models.network as network_module
 from models.utils.loss.loss import Loss
 from models.utils.loss.k_proposal_distillation import OfflineKProposalTeacherStore
+from models.utils.loss.single_plan_distillation import SinglePlanTeacherStore
 from models.utils.notify.mail_notify import TrainingMailNotifier
 from record.write import Writing
 from record.plot import PlotMaker
@@ -135,8 +136,12 @@ def _limit_training_seq_dirs(seq_dirs, args):
         getattr(args, "network_k_diagnostic_sequence_name", "") or ""
     ).strip()
     if diagnostic_sequence:
-        if str(getattr(args, "heuristic_guidance_mode", "")).strip().lower() != "network_k_proposal_policy":
-            raise ValueError("network_k_diagnostic_sequence_nameはK Proposal診断専用である")
+        if str(getattr(args, "heuristic_guidance_mode", "")).strip().lower() not in {
+            "network_k_proposal_policy", "single_plan_student", "ana_den6_online"
+        }:
+            raise ValueError(
+                "network_k_diagnostic_sequence_nameはK/Single/Exact-den6診断専用である"
+            )
         selected = [
             path for path in seq_dirs
             if os.path.basename(os.path.normpath(str(path))) == diagnostic_sequence
@@ -11903,6 +11908,14 @@ def run_episode_full_cloud_validation(
     use_amp,
     amp_dtype,
 ):
+    if (
+        str(getattr(args, "heuristic_guidance_mode", "")).strip().lower()
+        == "single_plan_student"
+        and str(getattr(
+            args, "single_plan_training_stage", "actual_calibration"
+        )).strip().lower() in {"representation", "fast_distillation"}
+    ):
+        return {"value": None, "count": 0, "sample_names": []}
     max_frames = max(int(getattr(args, "train_full_cloud_val_frames", 5)), 0)
     if max_frames <= 0:
         return {"value": None, "count": 0, "sample_names": []}
@@ -12246,6 +12259,27 @@ def train(model, args, loss, writer, plot, notifier=None):
         )
         writer.write(f"8i kept sequence dirs: {kept_names}")
     seq_datasets = [(seq_dir, PlyDirDataset(args, seq_dir)) for seq_dir in seq_dirs] # 各シーケンス内のPLY点群ファイルを読み込むデータセットを作る
+    single_plan_teacher_store = None
+    if str(getattr(args, "heuristic_guidance_mode", "")).strip().lower() == "single_plan_student":
+        exact_cache_root = str(getattr(args, "exact_teacher_cache_root", "") or "").strip()
+        if exact_cache_root and os.path.isdir(exact_cache_root):
+            single_plan_teacher_store = SinglePlanTeacherStore.from_exact_cache_root(
+                exact_cache_root
+            )
+        if single_plan_teacher_store is not None and single_plan_teacher_store.states:
+            writer.write(
+                "SinglePlanExactTeacher: layer_a_hit=1, states={}, plans={}, "
+                "hard_plan_apply=0, inference_reference=0".format(
+                    len(single_plan_teacher_store.states),
+                    sum(len(rows) for rows in single_plan_teacher_store.states.values()),
+                )
+            )
+        else:
+            raise RuntimeError(
+                "Single-Plan訓練用Layer A Cacheがない。"
+                "tools/build_exact_teacher_cache.pyでfingerprint検証済みcacheを構築すること。"
+                "旧datasetへのsilent fallbackは許可しない"
+            )
     k_proposal_teacher_store = None
     k_offline_path = str(getattr(args, "network_k_offline_dataset", "") or "").strip()
     k_all_actual_enabled = bool(getattr(args, "network_k_all_actual_enabled", False))
@@ -12306,6 +12340,10 @@ def train(model, args, loss, writer, plot, notifier=None):
     den6_prefetch_lookahead = max(
         int(getattr(args, "heuristic_guidance_online_prefetch_lookahead", 0)), 0
     )
+    if str(getattr(args, "heuristic_guidance_mode", "")).strip().lower() not in {
+        "ana_den6_online", "ana_den6_residual"
+    }:
+        den6_prefetch_lookahead = 0
     if seq_datasets and den6_prefetch_lookahead > 0 and not k_all_actual_enabled:
         first_files = list(getattr(seq_datasets[0][1], "files", ()))[:den6_prefetch_lookahead]
         prefetch_state = prefetch_ana_den6_online_guidance(args, first_files)
@@ -12419,6 +12457,13 @@ def train(model, args, loss, writer, plot, notifier=None):
         bool(getattr(args, "sparsepcgc_warmup_worker_before_train", True))
         and not bool(getattr(args, "disable_actual_codec_during_train", False))
         and str(getattr(args, "compression_loss_backend", "")).strip().lower().startswith("sparsepcgc")
+        and not (
+            str(getattr(args, "heuristic_guidance_mode", "")).strip().lower()
+            == "single_plan_student"
+            and str(getattr(
+                args, "single_plan_training_stage", "actual_calibration"
+            )).strip().lower() in {"representation", "fast_distillation"}
+        )
     ):
         warmup_actual_encoder = getattr(loss, "warmup_actual_encoder", None)
         if callable(warmup_actual_encoder):
@@ -12518,8 +12563,14 @@ def train(model, args, loss, writer, plot, notifier=None):
                     network_k_state_visit_counts[cache_key] = state_visit + 1
                 den6_online_full_cloud = heuristic_mode == "ana_den6_online"
                 network_only_full_cloud = heuristic_mode in {
-                    "network_only_codec_policy", "network_k_proposal_policy"
+                    "network_only_codec_policy", "network_k_proposal_policy", "single_plan_student"
                 }
+                single_plan_cache_only_stage = bool(
+                    heuristic_mode == "single_plan_student"
+                    and str(getattr(
+                        args, "single_plan_training_stage", "actual_calibration"
+                    )).strip().lower() in {"representation", "fast_distillation"}
+                )
                 one_plan_full_cloud = den6_online_full_cloud or network_only_full_cloud
                 full_cloud_amount_mode = bool(sparsepcgc_training_mode == "full_cloud_amount")
                 if one_plan_full_cloud:
@@ -12737,12 +12788,16 @@ def train(model, args, loss, writer, plot, notifier=None):
                             args,
                             full_cloud_canonical_context,
                         )
-                        if full_cloud_amount_mode or den6_online_full_cloud:
+                        if full_cloud_amount_mode or den6_online_full_cloud or heuristic_mode == "single_plan_student":
                             full_cloud_anchor_no_grad = False
                             full_cloud_anchor_no_grad_reason = (
                                 "ana_den6_online_full_cloud_requires_grad"
                                 if den6_online_full_cloud
-                                else "full_cloud_amount_train_branch_requires_grad"
+                                else (
+                                    "single_plan_student_distillation_requires_grad"
+                                    if heuristic_mode == "single_plan_student"
+                                    else "full_cloud_amount_train_branch_requires_grad"
+                                )
                             )
 
                         if not compact_step_text_log:
@@ -12863,7 +12918,13 @@ def train(model, args, loss, writer, plot, notifier=None):
                         with loss_grad_ctx, autocast_ctx, loss_saved_tensor_ctx:
                             """形状損失の計算"""
                             geometry_t0 = time.time()
-                            if full_cloud_amount_mode:
+                            if single_plan_cache_only_stage:
+                                # Stage 1/2はCache教師だけで更新し、fresh geometry/Actualを呼ばない。
+                                L_geom = input_xyz.new_zeros(())
+                                full_cloud_geometry_teacher_debug.update({
+                                    "single_plan_cache_only_geometry_skipped": True,
+                                })
+                            elif full_cloud_amount_mode:
                                 geom_mode = str(
                                     getattr(args, "sparsepcgc_full_cloud_amount_geometry_mode", "sampled")
                                 ).strip().lower()
@@ -12930,7 +12991,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                             step_timing_breakdown["geometry_loss_time"] = float(time.time() - geometry_t0)
 
                             """圧縮損失の計算"""
-                            if stage_factors["com"] != 0.0:
+                            if stage_factors["com"] != 0.0 and not single_plan_cache_only_stage:
                                 compression_t0 = time.time()
                                 gen_xyz_for_actual, voxel_restored_actual_debug = _select_actual_gen_xyz_from_voxel_state(
                                     args,
@@ -13141,7 +13202,12 @@ def train(model, args, loss, writer, plot, notifier=None):
                                         )
                                         loss.last_compression_debug = billed_debug
                             else:
-                                writer.write("!!! Skipping compression loss calculation due to stage factor setting. !!!")
+                                if not compact_step_text_log:
+                                    writer.write(
+                                        "Skipping fresh compression: cache-only Single-Plan stage"
+                                        if single_plan_cache_only_stage
+                                        else "Skipping compression loss due to stage factor"
+                                    )
                                 zero = input_xyz.new_zeros(())
                                 L_com = zero
                                 loss_bit = zero
@@ -13233,7 +13299,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                 )
                 network_only_trust_gate = (
                     str(getattr(args, "heuristic_guidance_mode", "")).strip().lower()
-                    in {"network_only_codec_policy", "network_k_proposal_policy"}
+                    in {"network_only_codec_policy", "network_k_proposal_policy", "single_plan_student"}
                 )
                 if network_only_trust_gate:
                     # A pretrained Surrogate from the legacy action
@@ -14176,6 +14242,24 @@ def train(model, args, loss, writer, plot, notifier=None):
                             else "support"
                         )
                     L_discrete_policy = L.new_zeros(())
+                elif (
+                    compression_primary_mode
+                    and heuristic_mode == "single_plan_student"
+                    and single_plan_cache_only_stage
+                ):
+                    # Cache-only StageではActual/Surrogate forward値を要求しない。
+                    # 後段で加えるTeacher蒸留lossだけがStudentを更新する。
+                    L = L_geom.new_zeros(())
+                    L_downstream = L
+                    L_discrete_policy = L
+                    L_attr = L_attr.detach()
+                    L_policy = L_policy.detach()
+                    L_actuator = L_actuator.detach()
+                    cp_debug = {
+                        "single_plan_cache_only_stage": True,
+                        "fresh_actual_encode_count": 0,
+                        "fresh_geometry_count": 0,
+                    }
                 elif compression_primary_mode and network_only_full_cloud:
                     # The Network-only objective is deliberately compact:
                     # Actual-forward/Surrogate-backward compression + geometry.
@@ -14251,8 +14335,10 @@ def train(model, args, loss, writer, plot, notifier=None):
                         "ana_den6_online",
                         "network_only_codec_policy",
                         "network_k_proposal_policy",
+                        "single_plan_student",
                     }
                     and not k_all_actual_enabled
+                    and not single_plan_cache_only_stage
                 ):
                     base_model_for_policy = model.module if hasattr(model, "module") else model
                     policy_loss_fn = getattr(base_model_for_policy, "discrete_policy_loss", None)
@@ -14281,6 +14367,11 @@ def train(model, args, loss, writer, plot, notifier=None):
                         raise RuntimeError(
                             f"{heuristic_mode}のdiscrete_policy_lossがTensorを返していない"
                         )
+                    if heuristic_mode == "single_plan_student":
+                        # 既定0。Actual policy gradientは蒸留Gate通過後の限定ablationだけで使う。
+                        online_policy_loss = online_policy_loss * max(float(getattr(
+                            args, "single_plan_policy_gradient_weight", 0.0
+                        )), 0.0)
                     policy_debug = dict(
                         getattr(base_model_for_policy, "last_discrete_policy_debug", {}) or {}
                     )
@@ -14305,7 +14396,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                         L = L - L_discrete_policy
                     L_discrete_policy = online_policy_loss
                     L = L + L_discrete_policy
-                    if heuristic_mode in {"network_only_codec_policy", "network_k_proposal_policy"}:
+                    if heuristic_mode in {"network_only_codec_policy", "network_k_proposal_policy", "single_plan_student"}:
                         plan_gain_loss_fn = getattr(
                             base_model_for_policy, "network_only_plan_gain_loss", None
                         )
@@ -14436,6 +14527,54 @@ def train(model, args, loss, writer, plot, notifier=None):
                             )
                             latest_compression_debug.update(compression_debug_terms)
                             loss.last_compression_debug = latest_compression_debug
+
+                if (
+                    heuristic_mode == "single_plan_student"
+                    and isinstance(single_plan_teacher_store, SinglePlanTeacherStore)
+                ):
+                    setting_id = (
+                        "native_vs{}_pq{}_ae{}_sr{}_m{}".format(
+                            float(getattr(args, "sparsepcgc_voxel_size", 1.0)),
+                            int(getattr(args, "sparsepcgc_pos_quantscale", 1)),
+                            int(getattr(args, "sparsepcgc_scale_ae", 0)),
+                            int(getattr(args, "sparsepcgc_scale_sr", 2)),
+                            int(getattr(args, "sparsepcgc_scale_m", 8)),
+                        ).replace("vs1.0", "vs1")
+                    )
+                    teacher_state_id = single_plan_teacher_store.find(file_path, setting_id)
+                    if teacher_state_id is not None:
+                        teacher_record = single_plan_teacher_store.supervision_record(
+                            teacher_state_id, global_train_step
+                        )
+                        base_student = model.module if hasattr(model, "module") else model
+                        distill_fn = getattr(
+                            base_student, "single_plan_teacher_distillation_loss", None
+                        )
+                        if not callable(distill_fn):
+                            raise RuntimeError("Single-Plan蒸留lossがない")
+                        single_distill = distill_fn(teacher_record)
+                        if not single_distill.requires_grad:
+                            raise RuntimeError("Single-Plan蒸留lossの勾配が切れている")
+                        L = L + single_distill
+                        compression_debug_terms.update({
+                            "single_plan_teacher_state_id": teacher_state_id,
+                            "single_plan_teacher_plan_key": str(teacher_record["plan_key"]),
+                            "single_plan_teacher_actual_gain": float(
+                                teacher_record["actual_gain_percent"]
+                            ),
+                            "single_plan_distillation_loss": float(single_distill.detach().cpu()),
+                        })
+                        compression_debug_terms.update({
+                            "single_plan_distill_{}".format(key): value
+                            for key, value in dict(getattr(
+                                base_student, "last_single_plan_distillation_debug", {}
+                            )).items()
+                        })
+                        latest_compression_debug = dict(
+                            getattr(loss, "last_compression_debug", {}) or {}
+                        )
+                        latest_compression_debug.update(compression_debug_terms)
+                        loss.last_compression_debug = latest_compression_debug
 
                 if k_all_actual_enabled:
                     if heuristic_mode != "network_k_proposal_policy":
@@ -15407,6 +15546,8 @@ def train(model, args, loss, writer, plot, notifier=None):
                     policy_module_for_audit = (
                         audit_model.network_k_proposal_policy
                         if heuristic_mode == "network_k_proposal_policy"
+                        else audit_model.single_plan_student
+                        if heuristic_mode == "single_plan_student"
                         else audit_model.network_only_codec_policy
                     )
                     network_only_param_before = {
@@ -15720,6 +15861,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                     grouped = {
                         "where": (
                             "local_trunk", "local_cost_head", "shared_local_trunk",
+                            "policy.local_trunk", "policy.local_cost_head",
                             "shared_basis_head", "fixed_codec_basis_head", "plan_tokens",
                             "token_mixer", "coefficient_head",
                             "coefficient_scale_head", "priority_head", "threshold_head",
@@ -15727,15 +15869,26 @@ def train(model, args, loss, writer, plot, notifier=None):
                         ),
                         "amount": (
                             "amount_head", "amount_scale_head", "share_head", "share_scale_head",
+                            "policy.amount_head", "policy.share_head",
                             "slot_ratio_bias", "slot_share_bias", "plan_tokens",
                         ),
-                        "action": ("gate_head", "enable_head", "plan_tokens"),
-                        "direction": ("direction_field_head", "shared_direction_head", "direction_delta_head", "plan_tokens"),
-                        "interaction": ("interaction_head", "critic", "critic_interaction_head", "critic_gain_head"),
+                        "action": (
+                            "gate_head", "enable_head", "plan_tokens", "policy.gate_head",
+                        ),
+                        "direction": (
+                            "direction_field_head", "shared_direction_head", "direction_delta_head",
+                            "plan_tokens", "policy.direction_field_head",
+                        ),
+                        "interaction": (
+                            "interaction_head", "critic", "critic_interaction_head", "critic_gain_head",
+                            "utility_head",
+                        ),
                     }
                     policy_module_for_audit = (
                         audit_model.network_k_proposal_policy
                         if heuristic_mode == "network_k_proposal_policy"
+                        else audit_model.single_plan_student
+                        if heuristic_mode == "single_plan_student"
                         else audit_model.network_only_codec_policy
                     )
                     named_now = dict(policy_module_for_audit.named_parameters())
@@ -16022,6 +16175,20 @@ def train(model, args, loss, writer, plot, notifier=None):
                 actual_compression_metric = actual_compression_plot_metric(loss, L.device) # 実codecで測った(Mine-GT)*100/GTを通常plotへ渡す
                 policy_actual_metric = policy_actual_compression_plot_metric(loss, L.device) # Network自身の最終出力actualを通常plotへ渡す
                 oracle_teacher_metric = oracle_teacher_compression_plot_metric(loss, L.device) # Oracle teacher actualを通常plotへ渡す
+                if den6_online_full_cloud:
+                    source_model = model.module if hasattr(model, "module") else model
+                    source_state = getattr(source_model, "last_actuator_voxel_state", {})
+                    source_plan = (
+                        source_state.get("ana_den6_exact_residual_plan_debug", {})
+                        if isinstance(source_state, dict) else {}
+                    )
+                    performance_source = str(source_plan.get("performance_source", ""))
+                    # Exact anchorのActualをNetwork-only性能として図へ混ぜない。
+                    if performance_source == "exact_teacher_anchor":
+                        oracle_teacher_metric = actual_compression_metric
+                        policy_actual_metric = None
+                    elif not bool(source_plan.get("network_only_performance", False)):
+                        policy_actual_metric = None
                 actual_compression_ratio_metric = actual_compression_ratio_plot_metric(loss, L.device) # 実codecで測った100*Mine/GTを通常plotへ渡す
                 surrogate_metrics = surrogate_plot_metrics(loss) # Surrogate教師学習の誤差系列を通常plotへ渡す
                 metric_values = [ L, L_geom, surrogate_compression_metric, actual_compression_metric, policy_actual_metric, oracle_teacher_metric, L_attr, L_policy, loss_single, loss_nodes, Lp_out, La_fit, La_rep, L_actuator, *surrogate_metrics, actual_compression_ratio_metric] # plot列順にStep損失をまとめる
@@ -16075,8 +16242,8 @@ def train(model, args, loss, writer, plot, notifier=None):
                     online_invariant_failures = []
                     if int(audit_plan.get("plan_count", 0) or 0) != 1:
                         online_invariant_failures.append("plan_count!=1")
-                    if int(audit_plan.get("pool_reference_count", 0) or 0) != 0:
-                        online_invariant_failures.append("pool_reference_count!=0")
+                    if int(audit_plan.get("pool_reference_count", 0) or 0) != 1:
+                        online_invariant_failures.append("pool_reference_count!=1")
                     if int(actual_audit.get(
                         "candidate",
                         audit_compression.get("den6_online_candidate_actual_encode_count", 0),
@@ -16096,14 +16263,19 @@ def train(model, args, loss, writer, plot, notifier=None):
                             online_invariant_failures.append(f"{operation}_count<=0")
                         if float(selected_amounts.get(operation, 0.0) or 0.0) <= 0.0:
                             online_invariant_failures.append(f"{operation}_amount<=0")
-                    for head_name, debug_name in (
-                        ("Where", "den6_online_where_grad_norm_before_balance"),
-                        ("Amount", "den6_online_amount_grad_norm_before_balance"),
-                        ("Action", "den6_online_action_grad_norm_before_balance"),
-                        ("Surrogate", "surrogate_grad_norm"),
-                    ):
-                        if float(audit_compression.get(debug_name, 0.0) or 0.0) <= 0.0:
-                            online_invariant_failures.append(f"{head_name}_grad<=0")
+                    # Exact anchor中はhard forwardがTeacherそのものなので方策grad=0が正しい。
+                    # anchor後も、明示的なgrad auditを有効にしたStepだけ同期して検査する。
+                    anchor_active = str(audit_plan.get("performance_source", "")) == "exact_teacher_anchor"
+                    grad_audit_active = bool(getattr(args, "heuristic_guidance_online_grad_audit", False))
+                    if (not anchor_active) and grad_audit_active:
+                        for head_name, debug_name in (
+                            ("Where", "den6_online_where_grad_norm_before_balance"),
+                            ("Amount", "den6_online_amount_grad_norm_before_balance"),
+                            ("Action", "den6_online_action_grad_norm_before_balance"),
+                            ("Surrogate", "surrogate_grad_norm"),
+                        ):
+                            if float(audit_compression.get(debug_name, 0.0) or 0.0) <= 0.0:
+                                online_invariant_failures.append(f"{head_name}_grad<=0")
                     if online_invariant_failures:
                         raise RuntimeError(
                             "ana_den6 one-plan invariant violation: "
@@ -16123,6 +16295,8 @@ def train(model, args, loss, writer, plot, notifier=None):
                         f"plan_count={int(audit_plan.get('plan_count', 0) or 0)}, "
                         f"pool_reference_count={int(audit_plan.get('pool_reference_count', 0) or 0)}, "
                         f"proposal_source={str(audit_plan.get('proposal_source', ''))}, "
+                        f"performance_source={str(audit_plan.get('performance_source', ''))}, "
+                        f"network_only_performance={bool(audit_plan.get('network_only_performance', False))}, "
                         f"selected_action_index={int(audit_plan.get('selected_action_index', -1))}, "
                         f"selected_action_mask={list(audit_plan.get('selected_action_mask', []))}, "
                         f"selected_action_count={int(audit_plan.get('selected_action_count', 0) or 0)}, "
@@ -16136,6 +16310,10 @@ def train(model, args, loss, writer, plot, notifier=None):
                         f"add_selection={dict(audit_plan.get('add_selection_diagnostics') or {})}, "
                         f"selected_coord_hashes={dict(audit_plan.get('selected_coord_hashes') or {})}, "
                         f"operation_order={str(audit_plan.get('operation_order', ''))}, "
+                        f"amount_mode={str(audit_plan.get('amount_mode', ''))}, "
+                        f"amount_bin_ratio={float(audit_plan.get('amount_bin_ratio', 0.0) or 0.0):.7f}, "
+                        f"amount_fine_log_residual={float(audit_plan.get('amount_fine_log_residual', 0.0) or 0.0):.7f}, "
+                        f"amount_total_ratio={float(audit_plan.get('amount_total_ratio_before_count', 0.0) or 0.0):.7f}, "
                         f"residual_alpha={float(audit_plan.get('residual_alpha', 0.0)):.6f}, "
                         f"actual_encodes=(baseline={int(actual_audit.get('baseline', audit_compression.get('den6_online_baseline_actual_encode_count', 0)))}, "
                         f"edited={int(actual_audit.get('edited', audit_compression.get('den6_online_edited_actual_encode_count', 0)))}, "
@@ -16219,6 +16397,8 @@ def train(model, args, loss, writer, plot, notifier=None):
                         int(getattr(args, "network_k_proposal_count", 8))
                         if k_all_actual_enabled else 1
                     )
+                    if single_plan_cache_only_stage:
+                        expected_edited_actual = 0
                     failures = []
                     for key, expected in (
                         ("network_forward_count", 1),
@@ -16404,6 +16584,26 @@ def train(model, args, loss, writer, plot, notifier=None):
                         f"actual={float(audit_compression.get('actual_encode_time_total', 0.0) or 0.0):.3f}, "
                         f"network={dict(getattr(audit_model, 'last_runtime_timing', {}) or {})})"
                     )
+                    if heuristic_mode == "single_plan_student":
+                        single_distill_debug = dict(getattr(
+                            audit_model, "last_single_plan_distillation_debug", {}
+                        ) or {})
+                        writer.write(
+                            "SinglePlanDistillationAudit: "
+                            f"teacher_hard_apply=0, actual_encode={edited_encodes}, "
+                            f"loss={float(single_distill_debug.get('weighted', 0.0) or 0.0):.6g}, "
+                            f"prune_reachable={float(single_distill_debug.get('prune_source_reachable', 0.0) or 0.0):.6g}, "
+                            f"adjust_reachable={float(single_distill_debug.get('adjust_source_reachable', 0.0) or 0.0):.6g}, "
+                            f"prune_raw_recall={float(single_distill_debug.get('prune_raw_topk_recall', 0.0) or 0.0):.6g}, "
+                            f"adjust_raw_recall={float(single_distill_debug.get('adjust_raw_topk_recall', 0.0) or 0.0):.6g}, "
+                            f"prune_fixed_oracle={float(single_distill_debug.get('prune_fixed_feature_oracle_recall', 0.0) or 0.0):.6g}, "
+                            f"adjust_fixed_oracle={float(single_distill_debug.get('adjust_fixed_feature_oracle_recall', 0.0) or 0.0):.6g}, "
+                            f"prune_recall={float(single_distill_debug.get('prune_source_recall', 0.0) or 0.0):.6g}, "
+                            f"add_target_recall={float(single_distill_debug.get('add_target_recall', 0.0) or 0.0):.6g}, "
+                            f"adjust_recall={float(single_distill_debug.get('adjust_source_recall', 0.0) or 0.0):.6g}, "
+                            f"direction_recall={float(single_distill_debug.get('adjust_direction_recall', 0.0) or 0.0):.6g}, "
+                            f"teacher_role={single_distill_debug.get('teacher_role', '')}"
+                        )
                     if heuristic_mode == "network_k_proposal_policy":
                         selected_slot_value = int(round(_audit_scalar("k_proposal_selected_slot")))
                         writer.write(
@@ -16971,7 +17171,7 @@ if __name__ == '__main__':
         torch.backends.cudnn.allow_tf32 = True
         variable_length_full_cloud = (
             str(getattr(args, "heuristic_guidance_mode", "")).strip().lower()
-            in {"ana_den6_online", "network_only_codec_policy", "network_k_proposal_policy"}
+            in {"ana_den6_online", "network_only_codec_policy", "network_k_proposal_policy", "single_plan_student"}
         )
         # 8iの点数はframeごとに変わる。benchmark=Trueだと巨大Conv1dの
         # algorithm/workspace探索が形状ごとに増え続けるため、この経路では
@@ -17027,7 +17227,9 @@ if __name__ == '__main__':
     encoder_state = adapt_encoder_state_dict_for_sparse_input(model, encoder_state, writer=writer)
     model.encoder.load_state_dict(encoder_state, strict=False)
     for p in model.encoder.parameters():
-        p.requires_grad = False
+        # Single-Plan representation段階だけはargs正規化でencoder_0grad=Falseに
+        # している。Stage 2/3と既存modeでは従来どおり固定する。
+        p.requires_grad = not bool(getattr(args, "encoder_0grad", True))
     writer.write("RepKPU encoder loaded: repkpu_model/ckpt-best.pth")
     writer.write(f"SetupTiming: encoder_ckpt_load={time.time() - setup_ckpt_t0:.3f}s")
 

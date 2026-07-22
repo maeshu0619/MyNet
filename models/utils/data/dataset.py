@@ -223,10 +223,13 @@ class PlyDirDataset(torch.utils.data.Dataset):
         if args.trainORtest == "train" and repeat_single > 0:
             if (
                 str(getattr(args, "heuristic_guidance_mode", "")).strip().lower()
-                not in {"network_only_codec_policy", "network_k_proposal_policy"}
+                not in {
+                    "network_only_codec_policy", "network_k_proposal_policy",
+                    "single_plan_student", "ana_den6_online",
+                }
             ):
                 raise ValueError(
-                    "network_only_diagnostic_repeat_single_frame is restricted to Network-only mode"
+                    "network_only_diagnostic_repeat_single_frame is restricted to policy diagnostic modes"
                 )
             # Repeat the exact same path, rather than aliases/symlinks, so the
             # baseline scalar cache and policy baseline are tested correctly.

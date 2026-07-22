@@ -11,7 +11,8 @@ from models.utils.training.utils import (
 
 
 def split_trainable_params(model, args):
-    # encoderは固定する前提なので除外する。
+    # 通常はencoderを固定する。Single-Plan Stage 1だけは明示設定に従って含める。
+    exclude_encoder = bool(getattr(args, "encoder_0grad", True))
     if args.deform:
         deform_params = [
             p for n, p in model.named_parameters()
@@ -21,14 +22,14 @@ def split_trainable_params(model, args):
             p for n, p in model.named_parameters()
             if ("disp_module" not in n)
             and ("actuator" not in n)
-            and ("encoder" not in n)
+            and (("encoder" not in n) or not exclude_encoder)
             and p.requires_grad
         ]
     else:
         deform_params = []
         other_params = [
             p for n, p in model.named_parameters()
-            if ("encoder" not in n) and p.requires_grad
+            if (("encoder" not in n) or not exclude_encoder) and p.requires_grad
         ]
 
     return other_params, deform_params
@@ -61,8 +62,20 @@ def build_optimizer_and_scheduler(model, args, writer):
     other_params = [parameter for parameter in other_params if id(parameter) not in k_param_ids]
     deform_params = [parameter for parameter in deform_params if id(parameter) not in k_param_ids]
 
+    single_names = {
+        name for name in named_trainable
+        if "single_plan_student." in name
+    }
+    single_params = [named_trainable[name] for name in sorted(single_names)]
+    single_param_ids = {id(parameter) for parameter in single_params}
+    other_params = [parameter for parameter in other_params if id(parameter) not in single_param_ids]
+    deform_params = [parameter for parameter in deform_params if id(parameter) not in single_param_ids]
+
     num_enc_trainable = sum(p.requires_grad for p in model.encoder.parameters())
-    writer.write(f"Trainable encoder params: {num_enc_trainable} (should be 0)")
+    writer.write(
+        f"Trainable encoder params: {num_enc_trainable} "
+        f"(expected={'0' if bool(getattr(args, 'encoder_0grad', True)) else '>0'})"
+    )
 
     assert args.optim in ["adam", "sgd"]
 
@@ -83,6 +96,12 @@ def build_optimizer_and_scheduler(model, args, writer):
                 "lr": args.lr * float(getattr(args, "network_k_critic_lr_scale", 1.0)),
                 "name": "network_k_critic",
             })
+        if single_params:
+            groups.append({
+                "params": single_params,
+                "lr": args.lr * float(getattr(args, "single_plan_student_lr_scale", 1.0)),
+                "name": "single_plan_student",
+            })
         optimizer = optim.Adam(groups, lr=args.lr, weight_decay=args.weight_decay)
     else:
         args.lr = args.lr * 100
@@ -101,6 +120,12 @@ def build_optimizer_and_scheduler(model, args, writer):
                 "params": k_critic_params,
                 "lr": args.lr * float(getattr(args, "network_k_critic_lr_scale", 1.0)),
                 "name": "network_k_critic",
+            })
+        if single_params:
+            groups.append({
+                "params": single_params,
+                "lr": args.lr * float(getattr(args, "single_plan_student_lr_scale", 1.0)),
+                "name": "single_plan_student",
             })
         optimizer = optim.SGD(
             groups,

@@ -2296,7 +2296,7 @@ class OctreeStructureAnalysis(nn.Module):
         # proxyへ置換せず、そのままHeuristic guidanceへ渡す。
         network_only_mode = (
             str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower()
-            in {"network_only_codec_policy", "network_k_proposal_policy"}
+            in {"network_only_codec_policy", "network_k_proposal_policy", "single_plan_student"}
         )
         if not network_only_mode:
             exact_den6_guidance = (
@@ -2380,7 +2380,7 @@ class OctreeStructureAnalysis(nn.Module):
 
         if (
             str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower()
-            in {"network_only_codec_policy", "network_k_proposal_policy"}
+            in {"network_only_codec_policy", "network_k_proposal_policy", "single_plan_student"}
         ):
             # The fixed Octree/local features above remain available, but no
             # heuristic score, cached action, rank, or teacher payload is built.

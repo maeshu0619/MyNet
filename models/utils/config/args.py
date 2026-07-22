@@ -2534,7 +2534,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--min_main_lr', default=1e-5, type=float, help='main optimizerの学習率floor')
     parser.add_argument('--min_surrogate_lr', default=1e-6, type=float, help='Surrogate optimizerの学習率floor')
     parser.add_argument('--max_files', default=10, type=int, help='1系列の1Epochで読み込むフレーム数')
-    parser.add_argument('--train_frames_per_sequence', default=150, type=int, help='各系列で訓練に使用する先頭フレーム数。残りは訓練窓から除外する')
+    parser.add_argument('--train_frames_per_sequence', default=90, type=int, help='各系列で訓練に使用する先頭フレーム数。残りは訓練窓から除外する')
     parser.add_argument('--episodes', default=128, type=int, help='学習エピソード数')
     parser.add_argument('--lr', default=1e-3, type=float, help='学習率')
     parser.add_argument('--save_eval', default='loss', type=str, help='評価指標（lossまたはpsnr）')
@@ -2765,14 +2765,15 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--heuristic_guidance_enabled', default=True, type=str2bool, help='ana_den6由来HeuristicをWhere/Amount/Actionのpriorとして使う')
     parser.add_argument(
         '--heuristic_guidance_network_only_inference',
-        default=True,
+        default=False,
         type=str2bool,
-        help='eval/test時はden6・cache・workerを呼ばず、蒸留済みNetwork headだけで1 planを決める',
+        help='True時だけeval/testでExact cacheを切り、Network-only性能を別測定する',
     )
     parser.add_argument(
         '--heuristic_guidance_mode',
-        default='network_k_proposal_policy',
+        default='ana_den6_online',
         choices=[
+            'single_plan_student',
             'network_k_proposal_policy',
             'network_only_codec_policy',
             'proxy_prior',
@@ -2782,10 +2783,48 @@ def parse_pugan_args(parser, file_day, file_time):
             'ana_den6_reference_ply',
         ],
         help=(
-            'SparsePCGC行動経路。既定network_k_proposal_policyはden/Pool/teacherを使わず、'
-            '1 shared forwardでK専門planを生成しCriticが1つを選ぶ。'
+            'SparsePCGC行動経路。既定ana_den6_onlineは063943と同じExact den6候補順位をanchorにし、'
+            'Network residualで1つの複合planを選ぶ。'
             'network_only_codec_policyは旧単一候補の比較用legacy mode'
         ),
+    )
+    parser.add_argument('--single_plan_student_hidden_dim', default=48, type=int)
+    parser.add_argument('--single_plan_student_max_total_ratio', default=0.0099, type=float)
+    parser.add_argument('--single_plan_student_unfreeze_upstream', default=False, type=str2bool)
+    parser.add_argument(
+        '--single_plan_stage1_train_encoder',
+        default=True,
+        type=str2bool,
+        help='representation段階だけencoderとStudent上流を学習し、Stage 2以降は固定する',
+    )
+    parser.add_argument(
+        '--single_plan_training_stage',
+        default='actual_calibration',
+        choices=['representation', 'fast_distillation', 'actual_calibration'],
+        type=str,
+        help='Single-Plan学習段階。前2段階ではfresh codec/geometryを実行しない',
+    )
+    parser.add_argument('--single_plan_debug_hash', default=False, type=str2bool)
+    parser.add_argument('--single_plan_local_tile_size', default=0, type=int)
+    parser.add_argument(
+        '--exact_teacher_cache_root',
+        default='/data/maejima/log/mynet_exact_teacher_cache',
+        type=str,
+        help='訓練専用Layer A Exact Teacher Cache。推論では参照禁止。',
+    )
+    parser.add_argument('--single_plan_distillation_weight', default=1.0, type=float)
+    parser.add_argument('--single_plan_student_lr_scale', default=1.0, type=float)
+    parser.add_argument('--single_plan_policy_gradient_weight', default=0.0, type=float)
+    parser.add_argument('--single_plan_feature_cache_enabled', default=False, type=str2bool)
+    parser.add_argument(
+        '--single_plan_teacher_datasets',
+        default=(
+            '/data/maejima/log/mynet_kproposal_offline/8i_actual_plans.json.gz,'
+            '/data/maejima/log/mynet_kproposal_offline/mvub_actual_plans.json.gz,'
+            '/data/maejima/log/mynet_kproposal_offline/uvg_actual_plans.json.gz'
+        ),
+        type=str,
+        help='訓練専用Exact Actual教師。推論では読まない。',
     )
     parser.add_argument('--network_k_proposal_count', default=8, type=int)
     parser.add_argument('--network_k_proposal_hidden_dim', default=48, type=int)
@@ -2833,7 +2872,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--network_k_elite_direction_weight', default=0.25, type=float)
     parser.add_argument('--network_k_elite_min_gain_percent', default=1e-6, type=float)
     parser.add_argument(
-        '--network_k_all_actual_enabled', default=True, type=str2bool,
+        '--network_k_all_actual_enabled', default=False, type=str2bool,
         help=(
             'NetworkのK executable planを全件Actual評価し、絶対Actual rewardで'
             'theta/Where/Direction/Criticを更新する。falseは旧1-plan比較用'
@@ -2997,9 +3036,9 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--heuristic_guidance_online_compact_reserve_factor',
-        default=1.0,
+        default=4.0,
         type=float,
-        help='一意なden6 plan以外もonline候補として保持する倍率。既定1.0は確定planだけを保持する',
+        help='Exact anchor件数に対して保持するden6 edit-unit順位の倍率。既定4.0でNetworkが順位を学べる余地を残す',
     )
     parser.add_argument(
         '--heuristic_guidance_online_full_pool_limit',
@@ -3060,6 +3099,18 @@ def parse_pugan_args(parser, file_day, file_time):
         default=0.08,
         type=float,
         help='Amountをden6中心から微小探索するlog-normal標準偏差',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_amount_bins',
+        default='0.0005,0.0010,0.0025,0.0050,0.0099',
+        type=str,
+        help='Exact固定後にNetworkが選ぶden6 total edit ratioの離散集合',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_amount_temperature',
+        default=0.35,
+        type=float,
+        help='離散Amount選択の温度',
     )
     parser.add_argument(
         '--heuristic_guidance_online_policy_weight',
@@ -4155,12 +4206,13 @@ def parse_pugan_args(parser, file_day, file_time):
         args.sparsepcgc_dense_scale_sr_list = str(args.sparsepcgc_scale_sr)
     args.heuristic_guidance_enabled = bool(getattr(args, "heuristic_guidance_enabled", True))
     args.heuristic_guidance_network_only_inference = bool(
-        getattr(args, "heuristic_guidance_network_only_inference", True)
+        getattr(args, "heuristic_guidance_network_only_inference", False)
     )
     args.heuristic_guidance_mode = str(
-        getattr(args, "heuristic_guidance_mode", "network_k_proposal_policy")
+        getattr(args, "heuristic_guidance_mode", "ana_den6_online")
     ).strip().lower()
     valid_guidance_modes = {
+        "single_plan_student",
         "network_k_proposal_policy",
         "network_only_codec_policy",
         "proxy_prior",
@@ -4171,6 +4223,32 @@ def parse_pugan_args(parser, file_day, file_time):
     }
     if args.heuristic_guidance_mode not in valid_guidance_modes:
         raise ValueError(f"未知のheuristic_guidance_mode: {args.heuristic_guidance_mode}")
+    args.single_plan_student_hidden_dim = max(
+        int(getattr(args, "single_plan_student_hidden_dim", 48)), 16
+    )
+    args.single_plan_local_tile_size = max(
+        int(getattr(args, "single_plan_local_tile_size", 0)), 0
+    )
+    args.single_plan_training_stage = str(
+        getattr(args, "single_plan_training_stage", "actual_calibration")
+    ).strip().lower()
+    if (
+        str(getattr(args, "heuristic_guidance_mode", "")).strip().lower()
+        == "single_plan_student"
+        and args.single_plan_training_stage == "representation"
+        and bool(getattr(args, "single_plan_stage1_train_encoder", True))
+    ):
+        args.encoder_0grad = False
+        args.single_plan_student_unfreeze_upstream = True
+    args.single_plan_student_max_total_ratio = min(max(
+        float(getattr(args, "single_plan_student_max_total_ratio", 0.0099)), 1e-5
+    ), 0.0099)
+    args.single_plan_distillation_weight = max(
+        float(getattr(args, "single_plan_distillation_weight", 1.0)), 0.0
+    )
+    args.single_plan_policy_gradient_weight = max(
+        float(getattr(args, "single_plan_policy_gradient_weight", 0.0)), 0.0
+    )
     args.network_only_policy_hidden_dim = max(
         int(getattr(args, "network_only_policy_hidden_dim", 48)), 16
     )
@@ -4440,7 +4518,7 @@ def parse_pugan_args(parser, file_day, file_time):
         int(getattr(args, "heuristic_guidance_online_pool_limit", 0)), 0
     )
     args.heuristic_guidance_online_compact_reserve_factor = min(max(
-        float(getattr(args, "heuristic_guidance_online_compact_reserve_factor", 1.0)), 1.0
+        float(getattr(args, "heuristic_guidance_online_compact_reserve_factor", 4.0)), 1.0
     ), 4.0)
     args.heuristic_guidance_online_full_pool_limit = max(
         int(getattr(args, "heuristic_guidance_online_full_pool_limit", 0)), 0
@@ -4499,7 +4577,7 @@ def parse_pugan_args(parser, file_day, file_time):
     args.heuristic_guidance_auto_build_exact_single_plan_teacher = bool(
         getattr(args, "heuristic_guidance_auto_build_exact_single_plan_teacher", True)
     )
-    if args.heuristic_guidance_mode in {"network_only_codec_policy", "network_k_proposal_policy"}:
+    if args.heuristic_guidance_mode in {"network_only_codec_policy", "network_k_proposal_policy", "single_plan_student"}:
         # Explicit Network-only full-cloud path.  No legacy selector/oracle or
         # den6 prefetch is allowed to participate in action selection.
         args.heuristic_guidance_enabled = False
@@ -4560,9 +4638,9 @@ def parse_pugan_args(parser, file_day, file_time):
         if not _cli_option_was_provided("--more_training"):
             args.more_training = False
     if args.heuristic_guidance_enabled and args.heuristic_guidance_mode == "ana_den6_online":
-        # online方式は全点群から1%未満の微小Voxelを1planだけ選ぶ。
-        # 候補pool・複数Actual比較・加工後結果cacheは使わず、毎StepのNetwork出力を
-        # そのStepの唯一のActual/Surrogate教師対象にする。
+        # 063943互換のden6 edit-unit順位から、全点群の1%未満を1つの複合planへまとめる。
+        # 完成planの複数Actual比較は行わず、Network residualを加えた最終1 planだけを
+        # そのStepのActual/Surrogate教師対象にする。
         # 旧subtree oracleやfull-cloud Amount多候補評価を併走させない。
         args.train_patch_subset_enable = False
         args.sparsepcgc_training_mode = "legacy"
@@ -4648,8 +4726,14 @@ def parse_pugan_args(parser, file_day, file_time):
                 args.repair_init_drop_ratio = float(prune_init)
             if not _cli_option_was_provided("--repair_init_move_ratio"):
                 args.repair_init_move_ratio = float(move_init)
-            if not _cli_option_was_provided("--repair_amount_target_mode"):
-                args.repair_amount_target_mode = "none"
+        if not _cli_option_was_provided("--repair_amount_target_mode"):
+            args.repair_amount_target_mode = "none"
+        if not _cli_option_was_provided("--sparsepcgc_algorithmic_amount_bins"):
+            args.sparsepcgc_algorithmic_amount_bins = (
+                "0.0005,0.0010,0.0025,0.0050,0.0099"
+            )
+        if not _cli_option_was_provided("--sparsepcgc_algorithmic_amount_init_ratio"):
+            args.sparsepcgc_algorithmic_amount_init_ratio = 0.0025
             # actual Rateはden6と同じfull-cloud基準で毎Step確認する。
             if not _cli_option_was_provided("--train_full_cloud_anchor_every_step"):
                 args.train_full_cloud_anchor_every_step = True
@@ -7757,7 +7841,7 @@ def parse_pugan_args(parser, file_day, file_time):
             args.repair_move_score_noise_start = max(float(getattr(args, "repair_move_score_noise_start", 0.0)), 0.05)
         if not _cli_option_was_provided("--repair_move_score_noise_end"):
             args.repair_move_score_noise_end = max(float(getattr(args, "repair_move_score_noise_end", 0.0)), 0.01)
-    if str(getattr(args, "heuristic_guidance_mode", "")).strip().lower() in {"network_only_codec_policy", "network_k_proposal_policy"}:
+    if str(getattr(args, "heuristic_guidance_mode", "")).strip().lower() in {"network_only_codec_policy", "network_k_proposal_policy", "single_plan_student"}:
         # Exploration is sampled inside NetworkOnlyCodecPolicy so the sampled
         # action and the recorded log-probability refer to the same policy.
         args.repair_drop_score_noise_start = 0.0
@@ -7788,6 +7872,9 @@ def parse_pugan_args(parser, file_day, file_time):
     args.draco_encoder_path = _resolve_from_base_path(args.draco_encoder_path, args.draco_root)
     args.draco_decoder_path = _resolve_from_base_path(args.draco_decoder_path, args.draco_root)
     args.save_dir = _resolve_repo_or_cwd_path(args.save_dir)
+    args.exact_teacher_cache_root = _resolve_repo_or_cwd_path(
+        str(getattr(args, "exact_teacher_cache_root", "/data/maejima/log/mynet_exact_teacher_cache"))
+    )
     args.out_path = _resolve_repo_or_cwd_path(args.out_path)
     args.log_root = _resolve_repo_or_cwd_path(args.log_root)
     args.save_ply_dir = _resolve_repo_or_cwd_path(args.save_ply_dir)
@@ -7874,17 +7961,17 @@ def parse_pugan_args(parser, file_day, file_time):
         if not _cli_option_was_provided("--repair_operation_gate_random_mix_end"):
             args.repair_operation_gate_random_mix_end = 0.0
         if args.heuristic_guidance_mode == "ana_den6_online":
-            # 行動選択はNetwork単独に限定する。codec prior/oracleは特徴ではなく
-            # hard選択を上書きするため、この経路では使用しない。
+            # Exact den6順位＋Network residualを既定とする。GT-onlyへ黙って
+            # 劣化させず、未知frameは初回だけExact cacheを構築する。
             args.sparsepcgc_codec_prune_prior = False
-            args.sparsepcgc_enable_add_experiment = False
+            args.sparsepcgc_enable_add_experiment = True
             args.sparsepcgc_actual_oracle_edit = False
             args.sparsepcgc_actual_oracle_apply_teacher_actions = False
             args.sparsepcgc_actual_oracle_apply_full_override = False
             args.sparsepcgc_actual_gate_prune = False
             args.sparsepcgc_actual_gate_non_prune = False
-            args.heuristic_guidance_require_exact_single_plan_teacher = False
-            args.heuristic_guidance_auto_build_exact_single_plan_teacher = False
+            args.heuristic_guidance_require_exact_single_plan_teacher = True
+            args.heuristic_guidance_auto_build_exact_single_plan_teacher = True
             args.heuristic_guidance_teacher_bootstrap_steps = 0
             # 旧設定の3000/150/25倍は1更新でAmount headを飽和させ、Step 2で
             # 3操作すべてが上限へ飛ぶ。one-plan policyでは実Actualを毎Step得るため、
@@ -7935,7 +8022,7 @@ def parse_pugan_args(parser, file_day, file_time):
             args.repair_move_score_noise_start = 0.0
         if not _cli_option_was_provided("--repair_move_score_noise_end"):
             args.repair_move_score_noise_end = 0.0
-    if str(getattr(args, "heuristic_guidance_mode", "")).strip().lower() in {"network_only_codec_policy", "network_k_proposal_policy"}:
+    if str(getattr(args, "heuristic_guidance_mode", "")).strip().lower() in {"network_only_codec_policy", "network_k_proposal_policy", "single_plan_student"}:
         # Final isolation guard: generic SparsePCGC defaults are normalized
         # above and historically re-enabled priors/bandit Amount after the
         # mode-specific block.  Reassert the Network-only contract last.

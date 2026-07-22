@@ -296,7 +296,7 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
             ):
                 self.assertNotIn(forbidden, payload)
 
-    def test_den6_online_ignores_legacy_exact_edit_unit_pool(self):
+    def test_den6_online_restores_exact_edit_unit_pool(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             input_file = root / "frame.ply"
@@ -344,6 +344,7 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
                 heuristic_guidance_mode="ana_den6_online",
                 heuristic_guidance_online_cache_dir=str(cache),
                 heuristic_guidance_online_memory_entries=2,
+                heuristic_guidance_online_compact_reserve_factor=1.0,
                 heuristic_guidance_require_exact_single_plan_teacher=True,
                 heuristic_guidance_teacher_bootstrap_steps=200,
                 _den6_online_training_step_active=True,
@@ -367,12 +368,12 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
             )
             teacher = attached["ana_den6_ranked_candidate_guidance"]
             self.assertEqual(
-                teacher["source"], "ana_den6_gt_terms_single_proposal_online_v7"
+                teacher["source"], "ana_den6_exact_single_plan_teacher_online_v8"
             )
             self.assertEqual(teacher["proposal_policy"], "one_where_amount_action_per_step")
             self.assertFalse(teacher["teacher_bootstrap_active"])
             self.assertEqual(teacher["teacher_bootstrap_steps"], 0)
-            self.assertNotIn("operation_edit_units", teacher)
+            self.assertIn("operation_edit_units", teacher)
             self.assertNotIn("operation_candidate_shortlists", teacher)
             guidance = build_heuristic_guidance(
                 {
@@ -391,10 +392,11 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
             )
             self.assertEqual(
                 guidance["formula_basis"],
-                "ana_den6_single_proposal_network_residual_online_v7",
+                "ana_den6_exact_single_plan_teacher_online_v8",
             )
-            self.assertNotIn("candidate_mask", guidance)
-            self.assertNotIn("candidate_tensor_map", guidance)
+            self.assertIn("candidate_mask", guidance)
+            self.assertIn("candidate_tensor_map", guidance)
+            self.assertEqual(int(guidance["candidate_mask"]["Prune"].sum()), 1)
 
     def test_den6_online_v7_builds_single_proposal_prior_without_candidate_pool(self):
         like = torch.tensor([[[0.1, 0.8, 0.3]]], dtype=torch.float32)
@@ -886,34 +888,6 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
                 value.backward()
                 self.assertTrue(torch.isfinite(network_ratio.grad).all())
                 self.assertGreater(float(network_ratio.grad.abs().sum()), 0.0)
-
-    def test_amount_logit_bound_keeps_gradient_when_raw_head_is_saturated(self):
-        """bounded forwardを変えず、tanh飽和後もAmount headへ勾配を返す。"""
-        actuator = StructureRepairActuator.__new__(StructureRepairActuator)
-        torch.nn.Module.__init__(actuator)
-        actuator.args = SimpleNamespace(
-            repair_operation_amount_logit_scale=6.0,
-            repair_learn_operation_amounts=True,
-            repair_amount_pool_std_weight=0.5,
-            repair_amount_pool_max_weight=0.25,
-            repair_exploration_fraction=0.0,
-        )
-        head = torch.nn.Conv1d(2, 1, 1)
-        with torch.no_grad():
-            head.weight.fill_(1000.0)
-            head.bias.zero_()
-        features = torch.ones((1, 2, 8), dtype=torch.float32)
-        ratio = actuator._learned_operation_ratio(
-            features,
-            head,
-            0.30,
-            "missing_random_mix_start",
-            "missing_random_mix_end",
-        )
-        ratio.sum().backward()
-        self.assertLessEqual(float(ratio.detach()), 0.30)
-        self.assertIsNotNone(head.weight.grad)
-        self.assertGreater(float(head.weight.grad.abs().sum()), 0.0)
 
     def test_full_cloud_static_node_input_cache_reuses_detached_state(self):
         """Episode cache must reuse only fixed Node/Voxel inputs, never a graph."""

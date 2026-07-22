@@ -1,12 +1,9 @@
-"""GT固定特徴だけを渡し、Networkが毎Stepちょうど1 planを作るonline入口。
+"""063943互換のden6 Exact順位をNetwork residualへ渡すonline入口。
 
-軽量cacheはGT識別情報と幾何統計だけを保持する。訓練・推論のどちらでもHeuristic
-candidate pool、過去plan、加工後点群、加工後loss、保存済み行動教師を読まない。
-Actual encodeもNetworkが生成した1 planに対して1回だけ行う。
-
-GTの実圧縮項はLoss.actual_gt_cache、GT点群はdataset._PLY_CACHEがそれぞれ既存の
-責務として保持する。このmoduleへ重複保存せず、加工後点群・加工後loss・Network
-の選択結果は一切保存しない。
+cache内の候補は複数の完成planではなく、1つのAdd/Prune/Adjust複合planを組む
+Voxel edit-unit順位である。Step 0は保存Exact planを再生し、その後は同じ順位へ
+Network residualを加える。Actual encodeは最終的に選ばれた1 planだけに1回行う。
+Network-only推論は別フラグで測定し、Exact anchorの成績と混同しない。
 """
 
 from __future__ import annotations
@@ -425,6 +422,9 @@ def _load_exact_single_plan_teacher(
     }
     exact_cache_paths = list(root.glob(f"{dataset}_{stem}_{setting_id}_*.pt"))
     exact_cache_paths += list(root.glob(f"exact_single_plan_{dataset}_{stem}_{setting_id}_*.json"))
+    reserve_factor = min(max(float(getattr(
+        args, "heuristic_guidance_online_compact_reserve_factor", 4.0
+    )), 1.0), 4.0)
     for path in sorted(exact_cache_paths):
         try:
             candidate = (
@@ -451,6 +451,22 @@ def _load_exact_single_plan_teacher(
             continue
         anchor_plan = candidate.get("initial_heuristic_plan")
         if not isinstance(anchor_plan, Mapping) or not bool(anchor_plan.get("available", False)):
+            continue
+        anchor_counts = dict(
+            candidate.get("anchor_operation_counts")
+            or anchor_plan.get("operation_counts")
+            or {}
+        )
+        full_counts = dict(candidate.get("full_pool_counts") or {})
+        # reserve>1では、Exact planだけを保持した旧cacheを候補学習へ流用しない。
+        # 旧cacheは削除せず、必要な順位を持つ別cacheを初回だけ生成する。
+        if reserve_factor > 1.0 and any(
+            len(edit_units[name]) < min(
+                int(full_counts.get(name, len(edit_units[name]))),
+                int(np.ceil(max(int(anchor_counts.get(name, 1)), 1) * reserve_factor)),
+            )
+            for name in ("Add", "Prune", "Adjust")
+        ):
             continue
 
         teacher = dict(candidate)
@@ -480,7 +496,12 @@ def _load_exact_single_plan_teacher(
         "/data/maejima/log/mynet_den6_manifests",
     ))).expanduser().resolve()
     scale_m = int(identity["scale_m"])
-    for path in sorted(manifest_root.glob(f"{dataset}_{stem}_m{scale_m}_*.json")):
+    manifest_paths = (
+        []
+        if reserve_factor > 1.0
+        else sorted(manifest_root.glob(f"{dataset}_{stem}_m{scale_m}_*.json"))
+    )
+    for path in manifest_paths:
         try:
             manifest = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError, TypeError):
@@ -587,8 +608,9 @@ def _load_exact_single_plan_teacher(
             args, "sparsepcgc_root", Path(__file__).resolve().parents[4] / "compress/octree/SparsePCGC"
         ))).expanduser().resolve()
         signature = str(identity["input_sha256"])[:16]
+        reserve_tag = str(reserve_factor).replace(".", "p")
         output_json = root / (
-            f"exact_single_plan_{dataset}_{stem}_{setting_id}_{signature}.json"
+            f"exact_single_plan_{dataset}_{stem}_{setting_id}_{signature}_rf{reserve_tag}.json"
         )
         output_root = root / "build" / f"{dataset}_{stem}_{setting_id}_{signature}"
         command = [
@@ -638,21 +660,38 @@ def attach_ana_den6_online_guidance(
     *,
     device: torch.device,
 ) -> dict[str, Any]:
-    """GT metadataを付け、単一提案priorの識別情報をNetworkへ渡す。"""
+    """den6 Exact edit-unit poolを訓練・評価用contextへ付与する。"""
     mode = str(getattr(args, "heuristic_guidance_mode", "proxy_prior")).strip().lower()
     if mode != "ana_den6_online":
         return dict(context)
     if not isinstance(context, Mapping):
         raise RuntimeError("ana_den6 onlineにはfull-cloud canonical contextが必要である")
-    # 保存済み行動の有無で訓練経路が変わると、同じStepでもframeごとにteacher有無が
-    # 混在する。033500ログで起きた120/200 Step崩壊の直接原因なので、online経路は
-    # 常にGT固定metadataだけを渡す。旧exact loaderは過去cacheの解析互換用に残すが、
-    # 訓練・推論からは呼ばない。
-    payload = _load_or_build_payload(context, args)
+    # 063943経路と同様に、den6が順位付けしたedit-unit集合とExact anchorを
+    # 最優先する。欠落時にGT proxyへ静かに劣化させない。
+    identity = None
+    if context.get("input_file") and context.get("input_sha256"):
+        identity = _identity(
+            args,
+            Path(str(context["input_file"])),
+            str(context["input_sha256"]),
+        )
+    else:
+        current_input = str(getattr(args, "_current_input_file", "") or "").strip()
+        current_path = Path(current_input).expanduser().resolve() if current_input else None
+        if current_path is not None and current_path.is_file():
+            identity = _identity(args, current_path, _sha256_file(current_path))
+    payload = _load_exact_single_plan_teacher(args, identity) if identity is not None else None
+    if payload is None:
+        if bool(getattr(args, "heuristic_guidance_require_exact_single_plan_teacher", True)):
+            raise RuntimeError(
+                "ana_den6 Exact cacheが見つからない。proxy/全Voxel分類へfallbackせず、"
+                "初回だけden6 workerでcacheを構築すること"
+            )
+        payload = _load_or_build_payload(context, args)
     payload["teacher_bootstrap_active"] = False
     payload["teacher_bootstrap_steps"] = 0
     out = dict(context)
-    # key名は既存Networkとの互換性を保つが、中身はGT固定項だけである。
+    # key名は既存Networkとの互換性を保つ。中身はden6候補順位と1つのanchor planである。
     out["ana_den6_ranked_candidate_guidance"] = payload
     fixed_path = str(payload.get("gt_fixed_feature_path", "")).strip()
     if fixed_path:

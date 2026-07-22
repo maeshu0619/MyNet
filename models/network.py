@@ -26,7 +26,9 @@ from .modules.structure_actuator import StructureRepairActuator
 from .modules.structure_policy import POLICY_NAMES, StructureRepairPolicy
 from .modules.network_only_codec_policy import NetworkOnlyCodecPolicy
 from .modules.network_k_proposal_policy import NetworkKProposalPolicy
+from .modules.single_plan_student import SinglePlanStudentPolicy
 from .utils.loss.k_proposal_distillation import KProposalSetLoss
+from .utils.loss.single_plan_distillation import SinglePlanDistillationLoss
 
 
 class Network(nn.Module):
@@ -63,6 +65,7 @@ class Network(nn.Module):
         self._den6_online_objective_baseline = OrderedDict()
         self.last_discrete_policy_debug = {}
         self.last_k_proposal_terms = None
+        self.last_single_plan_student_terms = None
         self.last_k_all_actual_debug = {}
         # Network自身が実行したActual経験だけを保持する。Heuristic候補Poolとは分離する。
         self._network_k_actual_replay = OrderedDict()
@@ -113,7 +116,23 @@ class Network(nn.Module):
                 getattr(self.args, "network_k_proposal_shortlist_size", 32768)
             ),
         )
+        self.single_plan_student = SinglePlanStudentPolicy(
+            in_channels=actuator_feature_dim,
+            hidden_dim=int(getattr(self.args, "single_plan_student_hidden_dim", 48)),
+            max_total_ratio=float(
+                getattr(self.args, "single_plan_student_max_total_ratio", 0.0099)
+            ),
+            # 入力Octreeだけから作れるparent pattern/child slot/coarse特徴を
+            # den5 probeなしで利用し、Teacherの局所順位を蒸留する。
+            fixed_feature_dim=17,
+        )
+        if str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower() == "single_plan_student":
+            # 最終Single-Plan経路ではK Actor/Criticをoptimizerと保存graphから外す。
+            # legacy K modeを選んだ場合の実装自体は保持する。
+            for parameter in self.network_k_proposal_policy.parameters():
+                parameter.requires_grad_(False)
         self.k_proposal_set_loss = KProposalSetLoss()
+        self.single_plan_distillation_loss_module = SinglePlanDistillationLoss()
         proposal_amount_bins = getattr(self.args, "sparsepcgc_proposal_amount_bin_values", None)
         if not isinstance(proposal_amount_bins, (list, tuple)) or not proposal_amount_bins:
             proposal_amount_bins = (0.0, 0.015, 0.021, 0.026, 0.031, 0.038, 0.044, 0.05)
@@ -307,7 +326,7 @@ class Network(nn.Module):
         if not torch.is_tensor(reward):
             raise TypeError("discrete_policy_lossのrewardはTensorである必要がある")
         mode = str(getattr(self.args, "heuristic_guidance_mode", "proxy_prior")).strip().lower()
-        if mode not in {"ana_den6_online", "network_only_codec_policy", "network_k_proposal_policy"}:
+        if mode not in {"ana_den6_online", "network_only_codec_policy", "network_k_proposal_policy", "single_plan_student"}:
             return reward.new_zeros(())
         state = self.last_actuator_voxel_state
         if not isinstance(state, dict):
@@ -373,7 +392,7 @@ class Network(nn.Module):
             policy_loss = policy_loss + entropy_weighted
         adaptive_amount_entropy = objective.new_zeros(())
         adaptive_amount_entropy_weighted = objective.new_zeros(())
-        if mode in {"network_only_codec_policy", "network_k_proposal_policy"}:
+        if mode in {"network_only_codec_policy", "network_k_proposal_policy", "single_plan_student"}:
             amount_entropy = state.get("network_only_amount_entropy", None)
             ratio_mean = state.get("network_only_total_ratio_mean", None)
             shares_mean = state.get("network_only_shares_mean", None)
@@ -421,7 +440,7 @@ class Network(nn.Module):
         if not torch.is_tensor(actual_bit_percent):
             raise TypeError("actual_bit_percent must be a Tensor")
         if str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower() not in {
-            "network_only_codec_policy", "network_k_proposal_policy"
+            "network_only_codec_policy", "network_k_proposal_policy", "single_plan_student"
         }:
             return actual_bit_percent.new_zeros(())
         state = self.last_actuator_voxel_state
@@ -449,6 +468,30 @@ class Network(nn.Module):
     def score_algorithmic_proposal_subtrees(self, subtree_features):
         """Score candidate subtrees for the algorithmic proposal selector path."""
         return self.algorithmic_proposal_selector(subtree_features)
+
+    def single_plan_teacher_distillation_loss(self, teacher):
+        """訓練専用Teacherラベルを現在のStudent出力へ適用する。"""
+        if str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower() != "single_plan_student":
+            raise RuntimeError("Single-Plan蒸留はsingle_plan_student mode専用である")
+        if not self.training:
+            raise RuntimeError("推論時のTeacher参照は禁止である")
+        terms = self.last_single_plan_student_terms
+        state = getattr(self, "last_actuator_voxel_state", None)
+        voxel_coords = state.get("initial_voxel_coords") if isinstance(state, dict) else None
+        if not isinstance(terms, dict) or not torch.is_tensor(voxel_coords):
+            raise RuntimeError("Single-Plan Student forward結果がない")
+        value, metrics = self.single_plan_distillation_loss_module(
+            terms, voxel_coords, teacher
+        )
+        weight = max(float(getattr(
+            self.args, "single_plan_distillation_weight", 1.0
+        )), 0.0)
+        self.last_single_plan_distillation_debug = dict(metrics)
+        self.last_single_plan_distillation_debug["weight"] = weight
+        self.last_single_plan_distillation_debug["weighted"] = float(
+            (value.detach() * weight).cpu()
+        )
+        return value * weight
 
     def k_proposal_offline_distillation_loss(self, teacher):
         """Fit K specialists from an explicitly supplied offline Actual set.
@@ -2373,7 +2416,7 @@ class Network(nn.Module):
         guidance_mode = str(
             getattr(self.args, "heuristic_guidance_mode", "")
         ).strip().lower()
-        if guidance_mode in {"ana_den6_online", "network_only_codec_policy", "network_k_proposal_policy"}:
+        if guidance_mode in {"ana_den6_online", "network_only_codec_policy", "network_k_proposal_policy", "single_plan_student"}:
             if isinstance(full_octree_context, dict) and any(
                 key.startswith("actual_oracle_")
                 for key in full_octree_context
@@ -2508,7 +2551,7 @@ class Network(nn.Module):
             self.training
             and getattr(self.args, "full_cloud_activation_checkpoint", True)
             and str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower()
-            in {"ana_den6_online", "network_only_codec_policy", "network_k_proposal_policy"}
+            in {"ana_den6_online", "network_only_codec_policy", "network_k_proposal_policy", "single_plan_student"}
         )
         self.cost_attributor.activation_checkpointing = checkpoint_full_cloud_heads
         self.policy_module.activation_checkpointing = checkpoint_full_cloud_heads
@@ -2535,7 +2578,7 @@ class Network(nn.Module):
             getattr(self.args, "heuristic_guidance_mode", "proxy_prior")
         ).strip().lower()
         network_only_codec_mode = guidance_mode in {
-            "network_only_codec_policy", "network_k_proposal_policy"
+            "network_only_codec_policy", "network_k_proposal_policy", "single_plan_student"
         }
         network_only_guidance_forward = bool(
             guidance_mode == "ana_den6_online"
@@ -3360,6 +3403,7 @@ class Network(nn.Module):
         ) # 構造特徴、原因スコアなどをチャネル方向に結合
         network_only_policy_terms = None
         k_proposal_terms = None
+        self.last_single_plan_student_terms = None
         if guidance_mode == "network_only_codec_policy":
             # Legacy diagnosis/policy tensors are fixed observations for the
             # new codec policy.  Detaching here prevents the one-plan Actual
@@ -3420,6 +3464,19 @@ class Network(nn.Module):
             )
             self.last_k_proposal_terms = k_proposal_terms
             network_only_policy_terms = k_proposal_terms["selected_policy_terms"]
+        elif guidance_mode == "single_plan_student":
+            # Teacher/Cacheはここへ渡さない。Student自身のlogitから作った1 planだけを
+            # 共通Executable契約へ変換し、Actuatorへ直接適用する。
+            if not bool(getattr(self.args, "single_plan_student_unfreeze_upstream", False)):
+                actuator_input = actuator_input.detach()
+            self.last_single_plan_student_terms = self.single_plan_student(
+                actuator_input,
+                structure.get("global_voxel_coords"),
+                self.args,
+                training=self.training,
+                fixed_features=structure.get("network_k_fixed_features"),
+            )
+            network_only_policy_terms = self.last_single_plan_student_terms
         full_cloud_amount_terms = None
         if (
             is_full_cloud_forward
@@ -3497,7 +3554,7 @@ class Network(nn.Module):
         # workspace reservations.
         if (
             is_full_cloud_forward
-            and guidance_mode in {"ana_den6_online", "network_only_codec_policy", "network_k_proposal_policy"}
+            and guidance_mode in {"ana_den6_online", "network_only_codec_policy", "network_k_proposal_policy", "single_plan_student"}
             and not network_only_guidance_forward
             and bool(getattr(self.args, "den6_online_release_cuda_cache_before_actuator", True))
             and pts_xyz.is_cuda
@@ -3510,7 +3567,7 @@ class Network(nn.Module):
         offload_saved_tensors = bool(
             self.training
             and is_full_cloud_forward
-            and guidance_mode in {"ana_den6_online", "network_only_codec_policy", "network_k_proposal_policy"}
+            and guidance_mode in {"ana_den6_online", "network_only_codec_policy", "network_k_proposal_policy", "single_plan_student"}
             and offload_threshold_mb > 0.0
             and pts_xyz.is_cuda
         )
@@ -3527,6 +3584,17 @@ class Network(nn.Module):
         else:
             saved_tensor_context = nullcontext()
 
+        external_executable_plan = None
+        if isinstance(k_proposal_terms, dict):
+            external_executable_plan = k_proposal_terms.get("selected_executable_plan")
+        elif (
+            guidance_mode == "single_plan_student"
+            and isinstance(self.last_single_plan_student_terms, dict)
+        ):
+            external_executable_plan = self.last_single_plan_student_terms.get(
+                "executable_plan"
+            )
+
         with saved_tensor_context:
             pts_out, final_w, edit_loss, actuator_stats = self.actuator( # 実際に点操作を行う
                 pts_xyz=pts_xyz,
@@ -3541,10 +3609,7 @@ class Network(nn.Module):
                 full_octree_context=full_octree_context,
                 full_cloud_amount_terms=full_cloud_amount_terms,
                 network_only_policy_terms=network_only_policy_terms,
-                external_executable_plan=(
-                    k_proposal_terms.get("selected_executable_plan")
-                    if isinstance(k_proposal_terms, dict) else None
-                ),
+                external_executable_plan=external_executable_plan,
             )
         if isinstance(actuator_stats, dict):
             actuator_stats["actuator_octree_context_source"] = str(actuator_octree_context_source)
@@ -3602,6 +3667,34 @@ class Network(nn.Module):
                 actuator_stats["k_proposal_execution_count_mismatch"] = (
                     executed_counts - selected_expected
                 ).abs().sum(dim=1)
+            if guidance_mode == "single_plan_student" and isinstance(
+                self.last_single_plan_student_terms, dict
+            ):
+                single_terms = self.last_single_plan_student_terms
+                executable = single_terms["executable_plan"]
+                expected = executable.accepted_count[:, 0]
+                executed = expected.new_tensor((
+                    float(actuator_stats.get("voxel_edit_drop_count", 0) or 0),
+                    float(actuator_stats.get("voxel_edit_add_count", 0) or 0),
+                    float(actuator_stats.get("voxel_edit_move_count", 0) or 0),
+                )).view(1, 3).expand_as(expected)
+                actuator_stats.update({
+                    "single_plan_network_forward_count": 1,
+                    "single_plan_count": 1,
+                    "single_plan_k_slot_count": 0,
+                    "single_plan_critic_count": 0,
+                    "single_plan_teacher_reference_count": 0,
+                    "single_plan_cache_reference_count": 0,
+                    "single_plan_den6_call_count": 0,
+                    "single_plan_candidate_actual_encode_count": 0,
+                    "single_plan_expected_count": expected,
+                    "single_plan_executed_count": executed,
+                    "single_plan_execution_count_mismatch": (executed - expected).abs().sum(1),
+                    "single_plan_utility_gain": single_terms["utility_absolute_gain"],
+                    "single_plan_utility_geometry": single_terms["utility_geometry_cost"],
+                    "single_plan_utility_edit": single_terms["utility_edit_cost"],
+                    "single_plan_utility_uncertainty": single_terms["utility_uncertainty"],
+                })
             
         # Actuatorが内部で更新したVoxel状態をLoss / compression.py 側から読めるように保存する。
         actuator_voxel_state = {

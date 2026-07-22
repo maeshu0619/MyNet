@@ -622,12 +622,16 @@ def build_heuristic_guidance(structure: Mapping[str, Any], args: Any) -> Dict[st
         and isinstance(exact, Mapping)
         and str(exact.get("source", "")) == "ana_den6_gt_terms_single_proposal_online_v7"
     )
-    if mode == "ana_den6_online" and not single_proposal_online:
+    exact_anchor_online = bool(
+        mode == "ana_den6_online"
+        and isinstance(exact, Mapping)
+        and str(exact.get("source", "")) == "ana_den6_exact_single_plan_teacher_online_v8"
+    )
+    if mode == "ana_den6_online" and not (single_proposal_online or exact_anchor_online):
         raise RuntimeError(
-            "ana_den6_onlineはGT固定特徴だけを受け付ける。"
-            "candidate Pool/shortlist/teacher planの注入は禁止されている"
+            "ana_den6_onlineにはGT固定特徴またはfingerprint一致済みExact candidate Pool cacheが必要である"
         )
-    if mode == "ana_den6_residual":
+    if mode == "ana_den6_residual" or exact_anchor_online:
         if not isinstance(exact, Mapping):
             raise RuntimeError(
                 "ana_den6_residualでexact candidate guidanceがNetworkへ伝播していない。"

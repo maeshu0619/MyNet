@@ -27,13 +27,20 @@ OPERATION_NAMES = ("Prune", "Add", "Adjust")
 class NetworkOnlyCodecPolicy(nn.Module):
     """Predict one composite Add/Prune/Adjust plan from one forward pass."""
 
-    def __init__(self, in_channels, hidden_dim=48, max_total_ratio=0.0099):
+    def __init__(
+        self,
+        in_channels,
+        hidden_dim=48,
+        max_total_ratio=0.0099,
+        fixed_feature_dim=6,
+        direct_where_head=False,
+    ):
         super().__init__()
         self.max_total_ratio = float(max_total_ratio)
         local_hidden = max(int(hidden_dim), 16)
         global_hidden = max(int(hidden_dim), 32)
 
-        self.fixed_feature_dim = 6
+        self.fixed_feature_dim = int(fixed_feature_dim)
         policy_in_channels = int(in_channels) + self.fixed_feature_dim
         self.local_trunk = nn.Sequential(
             nn.Conv1d(policy_in_channels, local_hidden, 1),
@@ -42,6 +49,9 @@ class NetworkOnlyCodecPolicy(nn.Module):
             nn.SiLU(inplace=True),
         )
         self.local_cost_head = nn.Conv1d(local_hidden, 3 * len(LOCAL_COST_NAMES), 1)
+        self.direct_where_head = (
+            nn.Conv1d(local_hidden, 3, 1) if bool(direct_where_head) else None
+        )
         # Two local 3-D direction fields (Add and Adjust) plus concentration.
         self.direction_field_head = nn.Conv1d(local_hidden, 8, 1)
 
@@ -142,6 +152,30 @@ class NetworkOnlyCodecPolicy(nn.Module):
         straight_through = hard.detach() + probability - probability.detach()
         return straight_through, probability, hard
 
+    def _local_outputs(self, policy_features, tile_size=0):
+        """1x1 local headをexact tileで評価し、中間hiddenの全点常駐を避ける。"""
+        points = int(policy_features.shape[-1])
+        tile_size = int(tile_size)
+        if tile_size <= 0 or tile_size >= points:
+            local = self.local_trunk(policy_features)
+            direct = self.direct_where_head(local) if self.direct_where_head is not None else None
+            return self.local_cost_head(local), self.direction_field_head(local), direct
+        costs = []
+        directions = []
+        direct_scores = []
+        for start in range(0, points, tile_size):
+            stop = min(start + tile_size, points)
+            local = self.local_trunk(policy_features[:, :, start:stop])
+            costs.append(self.local_cost_head(local))
+            directions.append(self.direction_field_head(local))
+            if self.direct_where_head is not None:
+                direct_scores.append(self.direct_where_head(local))
+        return (
+            torch.cat(costs, dim=2),
+            torch.cat(directions, dim=2),
+            torch.cat(direct_scores, dim=2) if direct_scores else None,
+        )
+
     def forward(self, features, args, training=None, fixed_features=None):
         if features.ndim != 3:
             raise ValueError("NetworkOnlyCodecPolicy expects [B,C,N] features")
@@ -156,8 +190,11 @@ class NetworkOnlyCodecPolicy(nn.Module):
                 f"{(batch, self.fixed_feature_dim, points)}, got {tuple(fixed_features.shape)}"
             )
         policy_features = torch.cat((features, fixed_features.to(features)), dim=1)
-        local = self.local_trunk(policy_features)
-        local_cost = self.local_cost_head(local).view(
+        local_cost_raw, direction_field_raw, direct_where_logits = self._local_outputs(
+            policy_features,
+            tile_size=int(getattr(args, "single_plan_local_tile_size", 0)),
+        )
+        local_cost = local_cost_raw.view(
             batch, 3, len(LOCAL_COST_NAMES), points
         )
         # Risks/new bits should subtract from gain; the signs are architectural,
@@ -196,6 +233,10 @@ class NetworkOnlyCodecPolicy(nn.Module):
             )
         coefficients = torch.tanh(coefficient_latent)
         base_where_logits = (signed_local_cost * coefficients.unsqueeze(-1)).sum(dim=2)
+        if direct_where_logits is not None:
+            # 蒸留用Studentはoperation別の順位を直接受ける。codec-cost basisは
+            # 解釈可能な補助表現として残し、両者の和を最終scoreにする。
+            base_where_logits = base_where_logits + direct_where_logits
 
         amount_mean_logit = self.amount_head(global_feature).view(batch, 1, 1)
         amount_scale = F.softplus(self.amount_scale_head(global_feature)).view(batch, 1, 1) + 1e-3
@@ -283,7 +324,7 @@ class NetworkOnlyCodecPolicy(nn.Module):
                 where_logits = where_logits + gumbel * where_sampling_temperature.detach()
         operation_ratios = total_ratio * shares * gates
 
-        direction_field = self.direction_field_head(local).view(batch, 2, 4, points)
+        direction_field = direction_field_raw.view(batch, 2, 4, points)
         base_vectors = F.normalize(direction_field[:, :, :3], dim=2, eps=1e-6)
         concentration = F.softplus(direction_field[:, :, 3:4]) + 0.1
         base_direction_logits = torch.einsum(

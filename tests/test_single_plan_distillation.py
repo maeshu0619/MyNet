@@ -1,0 +1,55 @@
+from types import SimpleNamespace
+import unittest
+
+import torch
+
+from models.modules.single_plan_student import SinglePlanStudentPolicy
+from models.utils.loss.single_plan_distillation import SinglePlanDistillationLoss
+
+
+class SinglePlanDistillationTest(unittest.TestCase):
+    def test_operation_specific_teacher_has_gradient_without_add_source(self):
+        torch.manual_seed(2)
+        points = 128
+        coords = torch.stack((
+            torch.arange(points) * 3, torch.zeros(points, dtype=torch.long),
+            torch.zeros(points, dtype=torch.long),
+        )).view(1, 3, points)
+        features = torch.randn(1, 8, points)
+        fixed = torch.randn(1, 6, points)
+        args = SimpleNamespace(
+            sparsepcgc_psnr_resolution=1023, sparsepcgc_scale_ae=0,
+            sparsepcgc_scale_sr=2, sparsepcgc_scale_m=8,
+            sparsepcgc_voxel_size=1.0, sparsepcgc_pos_quantscale=1,
+            sparsepcgc_native_bit_depth=10, _global_train_step=0,
+            network_only_exploration_anneal_steps=200,
+            network_only_action_exploration_floor=0.0,
+            network_only_where_gumbel_scale=0.0,
+            single_plan_debug_hash=False,
+        )
+        model = SinglePlanStudentPolicy(8, hidden_dim=16).train()
+        terms = model(features, coords, args, training=False, fixed_features=fixed)
+        teacher = {
+            "total_ratio_percent": 0.25,
+            "shares": {"Prune": 0.4, "Add": 0.4, "Adjust": 0.2},
+            "operation_order": "Prune>Add>Adjust",
+            "actual_gain_percent": 3.0,
+            "geometry": {"D1_loss_db": 0.1, "D2_loss_db": 0.2},
+            "candidates": [
+                {"operation": "Prune", "remove_coords": [[0, 0, 0]], "add_coords": []},
+                # Add source/directionは旧schemaどおり欠損のままにする。
+                {"operation": "Add", "remove_coords": [], "add_coords": [[1, 0, 0]]},
+                {"operation": "Adjust", "remove_coords": [[3, 0, 0]], "add_coords": [[4, 0, 0]]},
+            ],
+        }
+        value, metrics = SinglePlanDistillationLoss()(terms, coords, teacher)
+        value.backward()
+        self.assertTrue(torch.isfinite(value))
+        self.assertGreater(metrics["add_target_reachable"], 0)
+        self.assertIsNotNone(model.policy.local_cost_head.weight.grad)
+        self.assertGreater(float(model.policy.local_cost_head.weight.grad.abs().sum()), 0.0)
+
+
+if __name__ == "__main__":
+    unittest.main()
+

@@ -671,7 +671,8 @@ class SurrogateCompressionLossMixin:
         stored = dict(entry)
         stored.pop("cache_hit", None)
         if str(getattr(args, "heuristic_guidance_mode", "")).strip().lower() in {
-            "ana_den6_online", "network_only_codec_policy"
+            "ana_den6_online", "network_only_codec_policy", "network_k_proposal_policy",
+            "single_plan_student",
         }:
             # single-proposal onlineは毎Stepの唯一の加工結果をその場で教師にする。
             # 加工後lossを次Stepへ持ち越すcache/last entryは作らない。
@@ -1146,7 +1147,7 @@ class SurrogateCompressionLossMixin:
             else:
                 den6_online_train = bool(
                     str(getattr(args, "heuristic_guidance_mode", "")).strip().lower()
-                    in {"ana_den6_online", "network_only_codec_policy", "network_k_proposal_policy"}
+                    in {"ana_den6_online", "network_only_codec_policy", "network_k_proposal_policy", "single_plan_student"}
                     and bool(getattr(args, "_den6_online_training_step_active", False))
                 )
                 if den6_online_train:

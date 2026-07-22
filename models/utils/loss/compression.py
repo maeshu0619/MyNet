@@ -18,7 +18,7 @@ class CompressionLossMixin:
         """Loss is not an nn.Module, so training state must come from train.py."""
         return bool(
             str(getattr(args, "heuristic_guidance_mode", "")).strip().lower()
-            in {"ana_den6_online", "network_only_codec_policy", "network_k_proposal_policy"}
+            in {"ana_den6_online", "network_only_codec_policy", "network_k_proposal_policy", "single_plan_student"}
             and getattr(args, "_den6_online_training_step_active", False)
         )
 

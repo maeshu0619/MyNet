@@ -200,7 +200,7 @@ class StructureRepairActuator(nn.Module):
             self.training
             and getattr(self.args, "full_cloud_activation_checkpoint", True)
             and str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower()
-            in {"ana_den6_online", "network_only_codec_policy", "network_k_proposal_policy"}
+            in {"ana_den6_online", "network_only_codec_policy", "network_k_proposal_policy", "single_plan_student"}
         )
         if enabled:
             dummy = features.new_zeros((), requires_grad=True)
@@ -2800,6 +2800,12 @@ class StructureRepairActuator(nn.Module):
         Plackett-Luce surrogate).  Unlike independent Bernoulli likelihoods,
         it is invariant to a common logit shift and therefore trains ranking.
         """
+        if base_logits.ndim == 2:
+            base_logits = base_logits.unsqueeze(1)
+        if executed.ndim == 2:
+            executed = executed.unsqueeze(1)
+        if base_logits.ndim != 3 or executed.ndim != 3:
+            raise ValueError("top-k log probability expects [B,N] or [B,C,N]")
         base_logits = torch.nan_to_num(
             base_logits.float(), nan=0.0, posinf=20.0, neginf=-20.0
         )
@@ -2929,13 +2935,7 @@ class StructureRepairActuator(nn.Module):
             neginf=-float(getattr(self.args, "repair_operation_amount_logit_scale", 6.0)),
         )
         ratio_logit_scale = max(float(getattr(self.args, "repair_operation_amount_logit_scale", 6.0)), 1e-6)
-        bounded_forward = ratio_logit_scale * torch.tanh(
-            raw_logit / ratio_logit_scale
-        )
-        # forwardは従来どおり[-scale, scale]へ制限する一方、raw logitが
-        # 長期訓練で飽和してもAmount headの勾配を0にしないSTEとする。
-        # 実行Amount・top-k・actual評価値は変更しない。
-        bounded_logit = raw_logit + (bounded_forward - raw_logit).detach()
+        bounded_logit = ratio_logit_scale * torch.tanh(raw_logit / ratio_logit_scale)
         learned_ratio = torch.sigmoid(bounded_logit) * float(max_ratio)
 
         if bool(getattr(self.args, "repair_learn_operation_amounts", True)):
@@ -3476,6 +3476,8 @@ class StructureRepairActuator(nn.Module):
         move_score,
         move_logits,
         add_pair_logits,
+        amount_selector_logits=None,
+        amount_residual_raw=None,
     ):
         """den6順位を基盤に、1Stepで1つだけonline planをsampleする。"""
         if not isinstance(guidance, dict):
@@ -3566,31 +3568,96 @@ class StructureRepairActuator(nn.Module):
             and not unique_plan_mode
         )
 
-        # Amountはden6初期値の近傍だけをlog-normalで探索する。
-        amount_sigma = max(
-            float(getattr(self.args, "heuristic_guidance_online_amount_log_sigma", 0.08)),
-            0.0,
-        )
-        sampled_ratio_tensors = {}
-        amount_log_prob_terms = []
-        for operation in operations:
-            mean_ratio = ratio_tensors[operation]
-            if exploration_active and amount_sigma > 0.0:
-                epsilon = torch.randn_like(mean_ratio).detach()
-                sigma_effective = max(amount_sigma * float(residual_alpha), 1e-6)
-                sampled_log = mean_ratio.log() + sigma_effective * epsilon
-                sampled_ratio = sampled_log.exp().detach()
-                normal = torch.distributions.Normal(
-                    mean_ratio.log(),
-                    mean_ratio.new_tensor(sigma_effective),
+        # AmountはStep 0でden6 Exact値へ固定し、その後はNetwork値をden6で
+        # 実際に比較したtotal-ratio集合へSTE量子化する。連続量の無制限探索や
+        # operation別hard overrideには戻さない。
+        raw_bins = str(getattr(
+            self.args,
+            "heuristic_guidance_online_amount_bins",
+            "0.0005,0.0010,0.0025,0.0050,0.0099",
+        ))
+        try:
+            amount_bins = sorted({
+                min(max(float(value.strip()), 1e-9), max_total_ratio)
+                for value in raw_bins.split(",") if value.strip()
+            })
+        except (TypeError, ValueError):
+            amount_bins = [0.0005, 0.0010, 0.0025, 0.0050, max_total_ratio]
+        if not amount_bins:
+            raise RuntimeError("ana_den6 online Amount離散binが空である")
+        bin_tensor = next(iter(ratio_tensors.values())).new_tensor(amount_bins)
+        learned_total = sum(ratio_tensors.values()).clamp(1e-9, max_total_ratio)
+        amount_temperature = max(float(getattr(
+            self.args, "heuristic_guidance_online_amount_temperature", 0.35
+        )), 0.05)
+        if torch.is_tensor(amount_selector_logits):
+            selector = amount_selector_logits.reshape(amount_selector_logits.shape[0], -1)[0]
+            # class 0は旧Amount selectorのno-opである。Exact den6経路では
+            # 0収束を許さず、正のden6離散binだけを学習対象にする。
+            selector = selector[1:]
+            if int(selector.numel()) != int(bin_tensor.numel()):
+                raise RuntimeError(
+                    "ana_den6 Amount selectorと離散bin数が一致しない: "
+                    f"selector={int(selector.numel())}, bins={int(bin_tensor.numel())}"
                 )
-                amount_log_prob_terms.append(normal.log_prob(sampled_log.detach()))
-            else:
-                sampled_ratio = mean_ratio.detach()
-                amount_log_prob_terms.append(mean_ratio.new_zeros(()))
-            sampled_ratio_tensors[operation] = sampled_ratio
-
-        sampled_total_ratio = sum(sampled_ratio_tensors.values())
+            amount_logits = selector.float() / amount_temperature
+            amount_prob = torch.softmax(amount_logits, dim=0)
+            learned_total_for_backward = (amount_prob * bin_tensor).sum()
+        else:
+            # 単体再生・legacy manifest用。通常trainでは上の既存Network headを使う。
+            amount_logits = -torch.abs(
+                bin_tensor.log() - learned_total.log().reshape(1)
+            ) / amount_temperature
+            learned_total_for_backward = learned_total
+        if current_step < exact_anchor_steps:
+            selected_amount_bin = torch.argmin(
+                torch.abs(bin_tensor - float(prior_total_ratio))
+            )
+        elif exploration_active:
+            uniform = torch.rand_like(amount_logits).clamp_(1e-8, 1.0 - 1e-8)
+            gumbel = -torch.log(-torch.log(uniform))
+            selected_amount_bin = torch.argmax(
+                amount_logits + gumbel * float(residual_alpha)
+            )
+        else:
+            selected_amount_bin = torch.argmax(amount_logits)
+        hard_total = bin_tensor[selected_amount_bin]
+        coarse_total_ratio = (
+            hard_total.detach()
+            + learned_total_for_backward
+            - learned_total_for_backward.detach()
+        )
+        # 粗いden6 Amount binの内側は、既存Network residual headで連続的に
+        # 微調整する。Step 0はExact値のまま、以後はanchor移行率に合わせて
+        # 探索幅を広げるため、同じ入力でも操作数が永久固定されない。
+        fine_mean = coarse_total_ratio.new_zeros(())
+        if torch.is_tensor(amount_residual_raw):
+            fine_mean = torch.tanh(amount_residual_raw.float().mean()) * float(
+                amount_beta
+            ) * float(residual_alpha)
+        fine_sigma = max(float(getattr(
+            self.args, "heuristic_guidance_online_amount_log_sigma", 0.08
+        )), 0.0) * float(residual_alpha)
+        if exploration_active and fine_sigma > 0.0:
+            fine_noise = torch.randn_like(fine_mean).detach()
+            fine_sample = fine_mean + float(fine_sigma) * fine_noise
+            fine_distribution = torch.distributions.Normal(
+                fine_mean, fine_mean.new_tensor(max(fine_sigma, 1e-6))
+            )
+            fine_log_prob = fine_distribution.log_prob(fine_sample.detach())
+        else:
+            fine_sample = fine_mean
+            fine_log_prob = fine_mean.new_zeros(())
+        sampled_total_ratio = coarse_total_ratio * torch.exp(fine_sample)
+        learned_share_total = sum(ratio_tensors.values()).clamp_min(1e-12)
+        sampled_ratio_tensors = {
+            name: sampled_total_ratio * ratio_tensors[name] / learned_share_total
+            for name in operations
+        }
+        amount_log_prob_terms = [
+            torch.log_softmax(amount_logits, dim=0)[selected_amount_bin],
+            fine_log_prob,
+        ]
         sampled_total_value = float(sampled_total_ratio.detach().cpu())
         if sampled_total_value > max_total_ratio:
             scale = max_total_ratio / max(sampled_total_value, 1e-12)
@@ -3681,26 +3748,15 @@ class StructureRepairActuator(nn.Module):
                 order_tensor = torch.argsort(order_score - tie_break * 1e-12, descending=True)
             ordered_indices[operation] = order_tensor.cpu().tolist()
 
-        # Action順序はStep 0ではden6 priority、以降はNetwork Amount/Action確率から1回sampleする。
+        # operation order/6 variantはden6内部のplan構築結果であり、Networkの
+        # 独立Actionにはしない。cacheに保存されたpriorityを全Stepで再利用する。
         priority = tuple(exact.get("operation_priority") or operations)
         if set(priority) != set(operations):
             priority = operations
         action_ratio_stack = torch.stack([ratio_tensors[name] for name in operations])
         action_probs = action_ratio_stack / action_ratio_stack.sum().clamp_min(1e-12)
         action_log_probs = torch.log(action_probs.clamp_min(1e-12))
-        if exploration_active:
-            uniform = torch.rand_like(action_log_probs).clamp_(1e-8, 1.0 - 1e-8)
-            gumbel = -torch.log(-torch.log(uniform))
-            action_order_idx = torch.argsort(
-                (
-                    action_log_probs
-                    + gumbel * float(gumbel_scale) * float(residual_alpha)
-                ).detach(),
-                descending=True,
-            )
-            operation_order = tuple(operations[int(index)] for index in action_order_idx.cpu().tolist())
-        else:
-            operation_order = priority
+        operation_order = priority
 
         # 1Stepにつき、この1回の順序・1回の候補sampleから1planだけを構築する。
         occupied = {
@@ -3786,18 +3842,37 @@ class StructureRepairActuator(nn.Module):
             "plan_count": 1,
             "pool_reference_count": 1,
             "candidate_actual_encode_count": 0,
-            "proposal_source": "network_residual_behavior_cloning_teacher",
+            "proposal_source": "den6_exact_rank_plus_network_residual",
+            "performance_source": (
+                "exact_teacher_anchor"
+                if current_step < exact_anchor_steps
+                else "heuristic_rank_plus_network_residual"
+            ),
+            "network_only_performance": False,
             "teacher_bootstrap_active": bool(exact.get("teacher_bootstrap_active", False)),
             "selected_action_index": -1,
             "selected_action_mask": [1, 1, 1],
             "selected_action_count": 3,
             "selected_counts": selected_counts,
+            "selected_amount_ratios": {
+                name: float(selected_counts[name]) / max(float(point_count), 1.0)
+                for name in operations
+            },
             "operation_order": ">".join(operation_order),
             "variant_index": 0,
             "selected_candidate_ids": selected_ids,
             "residual_alpha": float(residual_alpha),
             "anchor_phase": float(anchor_phase),
             "requested_counts": requested_counts,
+            "amount_bin_index": int(selected_amount_bin.detach().cpu()),
+            "amount_bin_ratio": float(hard_total.detach().cpu()),
+            "amount_fine_log_residual": float(fine_sample.detach().cpu()),
+            "amount_total_ratio_before_count": float(sampled_total_ratio.detach().cpu()),
+            "amount_mode": (
+                "exact_fixed"
+                if current_step < exact_anchor_steps
+                else "network_discrete_plus_fine_residual"
+            ),
             "removed_voxel_count": len(removes),
             "added_voxel_count": len(adds),
             "ratio_fallback_applied": selected_counts != requested_counts,
@@ -4154,7 +4229,7 @@ class StructureRepairActuator(nn.Module):
         sparsepcgc_context = compress_key == "sparsepcgc"
         network_only_codec_mode = (
             str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower()
-            in {"network_only_codec_policy", "network_k_proposal_policy"}
+            in {"network_only_codec_policy", "network_k_proposal_policy", "single_plan_student"}
         )
         if network_only_codec_mode and not isinstance(network_only_policy_terms, dict):
             raise RuntimeError(
@@ -4348,7 +4423,7 @@ class StructureRepairActuator(nn.Module):
         empty_target_mask = self._empty_neighbor_target_mask(voxel_coords, voxel_cache=voxel_cache)
         online_den6_single_proposal = (
             str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower()
-            == "ana_den6_online"
+            in {"ana_den6_online", "single_plan_student"}
         )
 
         B, _, N = pts_xyz.shape
@@ -8003,7 +8078,9 @@ class StructureRepairActuator(nn.Module):
                     "final_count": int(external_valid[batch_index].sum().item()),
                     "subtree_prune_count": 0,
                 })
-            if bool(getattr(self.args, "network_k_debug_plan_hash", False)):
+            if bool(getattr(self.args, "network_k_debug_plan_hash", False)) or bool(
+                getattr(self.args, "single_plan_debug_hash", False)
+            ):
                 external_executable_plan_hash = executable_plan_hashes(
                     external_executable_plan
                 )[0][0]
@@ -8031,6 +8108,8 @@ class StructureRepairActuator(nn.Module):
                 move_score,
                 move_logits,
                 exact_add_pair_logits,
+                algorithmic_amount_selector_logits,
+                algorithmic_amount_residual_raw,
             )
             if exact_plan_result is not None:
                 exact_plan_coords, exact_residual_plan_debug = exact_plan_result
@@ -8154,6 +8233,8 @@ class StructureRepairActuator(nn.Module):
                 move_score,
                 move_logits,
                 exact_add_pair_logits,
+                algorithmic_amount_selector_logits,
+                algorithmic_amount_residual_raw,
             )
             if exact_plan_result is not None:
                 exact_plan_coords, exact_residual_plan_debug = exact_plan_result
@@ -10501,7 +10582,11 @@ class StructureRepairActuator(nn.Module):
             policy_eps = max(float(torch.finfo(pts_xyz.dtype).eps), 1e-6)
 
             def _executed_where_log_prob(base_logits, executed):
-                sampling_temperature = network_only_policy_terms.get(
+                policy_terms = (
+                    network_only_policy_terms
+                    if isinstance(network_only_policy_terms, dict) else {}
+                )
+                sampling_temperature = policy_terms.get(
                     "where_sampling_temperature", base_logits.new_tensor(1.0)
                 )
                 # Hard selection is Gumbel-top-k.  Use the corresponding
