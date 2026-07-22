@@ -10,8 +10,8 @@ from cfgs.utils import str2bool
 pretrained_date = "20260701"
 pretrained_time = "230148"
 
-surrogate_date = "20260701"
-surrogate_time = "230148"
+surrogate_date = "20260721"
+surrogate_time = "103909"
 
 model_date = "20260719"
 model_time = "063943"
@@ -2790,6 +2790,8 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--network_k_proposal_count', default=8, type=int)
     parser.add_argument('--network_k_proposal_hidden_dim', default=48, type=int)
     parser.add_argument('--network_k_proposal_shortlist_size', default=32768, type=int)
+    parser.add_argument('--network_k_actor_lr_scale', default=0.1, type=float)
+    parser.add_argument('--network_k_critic_lr_scale', default=1.0, type=float)
     parser.add_argument(
         '--network_k_target_domain', default='neighbor26_empty',
         choices=['neighbor26_empty', 'child_slot'],
@@ -2804,6 +2806,11 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--network_k_critic_lambda_uncertainty', default=0.05, type=float)
     parser.add_argument('--network_k_critic_gain_scale', default=5.0, type=float)
     parser.add_argument('--network_k_critic_geometry_scale', default=1.0, type=float)
+    parser.add_argument('--network_k_critic_huber_beta', default=0.05, type=float)
+    parser.add_argument('--network_k_critic_sign_loss_weight', default=0.25, type=float)
+    parser.add_argument('--network_k_critic_improvement_sign_weight', default=4.0, type=float)
+    parser.add_argument('--network_k_critic_sign_scale', default=0.10, type=float)
+    parser.add_argument('--network_k_critic_selection_temperature', default=0.10, type=float)
     parser.add_argument('--network_k_unfreeze_local_trunk', default=False, type=str2bool)
     parser.add_argument('--network_k_unfreeze_upstream', default=False, type=str2bool)
     parser.add_argument('--network_k_debug_plan_hash', default=False, type=str2bool)
@@ -2815,25 +2822,92 @@ def parse_pugan_args(parser, file_day, file_time):
         '--network_k_target_set_loss_cadence', default=5, type=int,
         help='offline Add/Adjust target集合の密教師を計算するStep間隔。',
     )
-    parser.add_argument('--network_k_elite_enabled', default=False, type=str2bool)
+    parser.add_argument('--network_k_elite_enabled', default=True, type=str2bool)
     parser.add_argument('--network_k_elite_cadence', default=50, type=int)
-    parser.add_argument('--network_k_elite_replay_capacity', default=2048, type=int)
+    parser.add_argument('--network_k_elite_replay_capacity', default=256, type=int)
+    parser.add_argument('--network_k_elite_replay_count', default=8, type=int)
+    parser.add_argument('--network_k_elite_replay_weight', default=1.0, type=float)
+    parser.add_argument('--network_k_replay_shortlist_plan_limit', default=8, type=int)
+    parser.add_argument('--network_k_replay_shortlist_point_limit', default=8192, type=int)
+    parser.add_argument('--network_k_elite_where_weight', default=0.25, type=float)
+    parser.add_argument('--network_k_elite_direction_weight', default=0.25, type=float)
+    parser.add_argument('--network_k_elite_min_gain_percent', default=1e-6, type=float)
     parser.add_argument(
-        '--network_k_all_actual_enabled', default=False, type=str2bool,
+        '--network_k_all_actual_enabled', default=True, type=str2bool,
         help=(
-            '既知1 state診断専用。NetworkのK executable planを全件Actual評価し、'
-            'state内相対rewardでtheta/Where/Direction/Criticを更新する'
+            'NetworkのK executable planを全件Actual評価し、絶対Actual rewardで'
+            'theta/Where/Direction/Criticを更新する。falseは旧1-plan比較用'
         ),
     )
-    parser.add_argument('--network_k_all_actual_temperature', default=1.0, type=float)
-    parser.add_argument('--network_k_all_actual_temperature_min', default=0.25, type=float)
-    parser.add_argument('--network_k_all_actual_anneal_steps', default=500, type=int)
+    parser.add_argument('--network_k_all_actual_temperature', default=1.25, type=float)
+    parser.add_argument('--network_k_all_actual_temperature_min', default=0.50, type=float)
+    parser.add_argument('--network_k_all_actual_anneal_steps', default=5000, type=int)
+    parser.add_argument('--network_k_min_positive_before_anneal', default=8, type=int)
+    parser.add_argument('--network_k_freeze_negative_theta_until_positive', default=True, type=str2bool, help='正改善経験が十分たまるまで悪化planでratio/share/orderを一点化しない')
     parser.add_argument('--network_k_all_actual_coefficient_std', default=0.15, type=float)
     parser.add_argument('--network_k_all_actual_direction_std', default=0.10, type=float)
     parser.add_argument('--network_k_all_actual_actor_weight', default=1.0, type=float)
     parser.add_argument('--network_k_all_actual_critic_weight', default=0.5, type=float)
     parser.add_argument('--network_k_all_actual_ranking_weight', default=0.25, type=float)
+    parser.add_argument(
+        '--network_k_all_actual_local_value_weight', default=0.5, type=float,
+        help='実行Voxelのclean score加重和をActual gainへ合わせる局所教師係数',
+    )
+    parser.add_argument(
+        '--network_k_all_actual_critic_selection_weight', default=1.0, type=float,
+        help='全K Actualの最良slotをCriticが選ぶ交差entropy係数',
+    )
     parser.add_argument('--network_k_all_actual_entropy_weight', default=0.01, type=float)
+    parser.add_argument(
+        '--network_k_entropy_floor_target', default=0.60, type=float,
+        help='ratio/share/order/variant/Whereの正規化entropy下限',
+    )
+    parser.add_argument(
+        '--network_k_entropy_floor_weight', default=1.0, type=float,
+        help='探索分布が早期に一点へ崩壊した時だけ働くentropy下限loss係数',
+    )
+    parser.add_argument('--network_k_all_actual_reward_scale_percent', default=1.0, type=float)
+    parser.add_argument('--network_k_all_actual_absolute_advantage_weight', default=1.0, type=float)
+    parser.add_argument('--network_k_all_actual_relative_advantage_weight', default=0.25, type=float)
+    parser.add_argument(
+        '--network_k_coverage_positive_actor_weight', default=1.0, type=float,
+        help='系統探索slotで実改善したplanだけをNetwork分布へ再現する係数',
+    )
+    parser.add_argument(
+        '--network_k_coverage_spatial_actor_weight', default=1.0, type=float,
+        help='schedule探索slotのActualをWhere・Direction・score係数へ返す係数',
+    )
+    parser.add_argument(
+        '--network_k_coverage_pair_ranking_weight', default=0.5, type=float,
+        help='同一thetaの2 plan Actual差でWhere順位を学ぶ係数',
+    )
+    parser.add_argument(
+        '--network_k_coverage_pair_where_contrast_weight', default=0.5, type=float,
+        help='同一theta候補対のActual差を固有source順位へ返す係数',
+    )
+    parser.add_argument(
+        '--network_k_shortlist_exploration_fraction', default=0.5, type=float,
+        help='訓練時shortlistを座標hash巡回へ割り当てる比率',
+    )
+    parser.add_argument('--network_k_all_actual_diversity_weight', default=0.02, type=float)
+    parser.add_argument(
+        '--network_k_offline_bootstrap_steps', default=0, type=int,
+        help='診断用offline教師の更新回数。純粋なNetwork-only訓練では0のまま使用する',
+    )
+    parser.add_argument(
+        '--network_k_require_cache_free_training', default=True, type=str2bool,
+        help='通常K訓練でoffline候補・teacher・cache参照を例外として拒否する',
+    )
+    parser.add_argument('--network_k_coverage_enabled', default=True, type=str2bool)
+    parser.add_argument(
+        '--network_k_coverage_slots', default=6, type=int,
+        help='各Stepでθ格子を巡回するslot数。残りslotは学習分布から探索する',
+    )
+    parser.add_argument(
+        '--network_k_coverage_share_stride', default=7919, type=int,
+        help='ratio/share/order/variant直積を重複なく巡回する互いに素な置換stride',
+    )
+    parser.add_argument('--network_k_offline_bootstrap_loss_weight', default=1.0, type=float)
     parser.add_argument(
         '--network_k_all_actual_selected_surrogate_weight', default=0.1, type=float,
         help='全K Actual更新と併用する選択plan Surrogate勾配の係数',
@@ -2850,9 +2924,9 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--network_k_offline_dataset',
-        default='/data/maejima/log/mynet_kproposal_offline/kproposal_modes_k8_schema_v2.json.gz',
+        default='',
         type=str,
-        help='K専門slotのtraining-only offline Actual mode dataset。空ならonline scalar学習のみ',
+        help='明示的な診断時だけ使うoffline dataset。通常Network-only訓練は空文字',
     )
     parser.add_argument(
         '--network_k_offline_split', default='train', choices=['train', 'validation', 'test'],
@@ -3165,6 +3239,12 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--compression_surrogate_levels', default='4,6,8', type=str, help='Soft octree surrogate特徴に使う階層')
     parser.add_argument('--compression_surrogate_hidden_dim', default=128, type=int, help='圧縮サロゲートMLPの隠れ次元')
     parser.add_argument('--compression_surrogate_lr', default=3e-3, type=float, help='圧縮サロゲートのオンライン学習率')
+    parser.add_argument('--compression_surrogate_huber_beta', default=0.05, type=float, help='微小な実圧縮差にも勾配を返すHuber遷移幅')
+    parser.add_argument('--compression_surrogate_sign_loss_weight', default=0.25, type=float, help='Actual改善/悪化符号を模倣する補助損失係数')
+    parser.add_argument('--compression_surrogate_improvement_sign_weight', default=4.0, type=float, help='希少な改善教師の符号損失倍率')
+    parser.add_argument('--compression_surrogate_sign_scale', default=0.10, type=float, help='符号分類logitへ変換するpercent尺度')
+    parser.add_argument('--compression_surrogate_sign_deadband', default=1e-4, type=float, help='符号教師から除くActual 0近傍幅')
+    parser.add_argument('--compression_surrogate_reference_cache_entries', default=64, type=int, help='GT固定Surrogate特徴の厳密cache件数')
     parser.add_argument('--compression_surrogate_weight_decay', default=1e-5, type=float, help='圧縮サロゲートのweight decay')
     parser.add_argument('--compression_surrogate_train_steps', default=2, type=int, help='教師更新時にサロゲートを教師bitに合わせて更新する回数')
     parser.add_argument('--compression_surrogate_warmup_steps', default=2, type=int, help='実ネットワーク更新前に行うSurrogate専用学習回数')
@@ -3329,7 +3409,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--surrogate_pretrain_max_wall_time_sec', default=0, type=float, help='pretrain最大実行秒数。0以下で無効')
     parser.add_argument('--surrogate_update_during_training', default=True, type=str2bool, help='通常学習中もSurrogate online更新を続けるか')
     parser.add_argument('--surrogate_update_interval', default=1, type=int, help='通常学習中のSurrogate optimizer更新間隔')
-    parser.add_argument('--surrogate_joint_lr_scale', default=0.1, type=float, help='pretrain後の通常学習中Surrogate LR倍率')
+    parser.add_argument('--surrogate_joint_lr_scale', default=0.5, type=float, help='pretrain後の通常学習中Surrogate LR倍率')
     parser.add_argument('--surrogate_update_on_teacher_refresh_only', default=False, type=str2bool, help='Trueならteacher refresh時だけSurrogateを更新し、replay更新を止める')
     parser.add_argument('--surrogate_full_cloud_calib_interval', default=0, type=int, help='subtree学習中にfull-cloud actual teacher校正を入れる間隔。0で無効')
     parser.add_argument('--surrogate_full_cloud_calib_max_samples', default=1, type=int, help='full-cloud校正で使う最大サンプル数の予約設定')
@@ -3614,6 +3694,9 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--log_sync_every', default=0, type=int, help='ログ同期間隔')
     parser.add_argument('--verbose_step_logs', default=False, type=str2bool, help='詳細ログを出すか。通常学習ではGPU同期と大量I/Oを避けるため既定False')
     parser.add_argument('--compact_step_text_log', default=True, type=str2bool, help='train.txtのStep本文ログを要点だけの短い行へ絞る')
+    parser.add_argument('--network_only_audit_verbose', default=False, type=str2bool, help='Network-only監査の全Tensor辞書を本文へ出すか。counter検証とCSV/図には影響しない')
+    parser.add_argument('--network_only_head_audit_interval', default=10, type=int, help='Network-only head更新normを計測するStep間隔')
+    parser.add_argument('--full_cloud_empty_cache_threshold_mb', default=8192.0, type=float, help='backward前にCUDA allocator cacheを返すmain process reserved memory閾値')
     parser.add_argument('--epoch_plot_rate', default=1, type=int, help='エポックごとのプロット保存間隔')
     parser.add_argument('--episode_plot_rate', default=1, type=int, help='エピソードごとのプロット保存間隔')
     parser.add_argument('--plot_max_points', default=512, type=int, help='1枚のグラフに描画する最大点数（超過時は等間隔に間引く）')
@@ -4100,6 +4183,12 @@ def parse_pugan_args(parser, file_day, file_time):
     args.network_k_proposal_shortlist_size = max(
         int(getattr(args, "network_k_proposal_shortlist_size", 32768)), 256
     )
+    args.network_k_actor_lr_scale = max(
+        float(getattr(args, "network_k_actor_lr_scale", 0.1)), 1e-4
+    )
+    args.network_k_critic_lr_scale = max(
+        float(getattr(args, "network_k_critic_lr_scale", 1.0)), 1e-4
+    )
     args.network_k_target_domain = str(
         getattr(args, "network_k_target_domain", "neighbor26_empty")
     ).strip().lower()
@@ -4130,6 +4219,21 @@ def parse_pugan_args(parser, file_day, file_time):
     args.network_k_critic_geometry_scale = max(
         float(getattr(args, "network_k_critic_geometry_scale", 1.0)), 1e-6
     )
+    args.network_k_critic_huber_beta = max(
+        float(getattr(args, "network_k_critic_huber_beta", 0.05)), 1e-4
+    )
+    args.network_k_critic_sign_loss_weight = max(
+        float(getattr(args, "network_k_critic_sign_loss_weight", 0.25)), 0.0
+    )
+    args.network_k_critic_improvement_sign_weight = max(
+        float(getattr(args, "network_k_critic_improvement_sign_weight", 4.0)), 1.0
+    )
+    args.network_k_critic_sign_scale = max(
+        float(getattr(args, "network_k_critic_sign_scale", 0.10)), 1e-4
+    )
+    args.network_k_critic_selection_temperature = max(
+        float(getattr(args, "network_k_critic_selection_temperature", 0.10)), 1e-3
+    )
     args.network_k_elite_cadence = max(
         int(getattr(args, "network_k_elite_cadence", 50)), 1
     )
@@ -4137,14 +4241,20 @@ def parse_pugan_args(parser, file_day, file_time):
         getattr(args, "network_k_all_actual_enabled", False)
     )
     args.network_k_all_actual_temperature = max(
-        float(getattr(args, "network_k_all_actual_temperature", 1.0)), 0.05
+        float(getattr(args, "network_k_all_actual_temperature", 1.25)), 0.05
     )
     args.network_k_all_actual_temperature_min = min(max(
-        float(getattr(args, "network_k_all_actual_temperature_min", 0.25)), 0.01
+        float(getattr(args, "network_k_all_actual_temperature_min", 0.50)), 0.01
     ), args.network_k_all_actual_temperature)
     args.network_k_all_actual_anneal_steps = max(
-        int(getattr(args, "network_k_all_actual_anneal_steps", 500)), 1
+        int(getattr(args, "network_k_all_actual_anneal_steps", 5000)), 1
     )
+    args.network_k_min_positive_before_anneal = max(
+        int(getattr(args, "network_k_min_positive_before_anneal", 8)), 0
+    )
+    args.network_k_freeze_negative_theta_until_positive = bool(getattr(
+        args, "network_k_freeze_negative_theta_until_positive", True
+    ))
     args.network_k_all_actual_coefficient_std = max(
         float(getattr(args, "network_k_all_actual_coefficient_std", 0.15)), 1e-4
     )
@@ -4155,10 +4265,38 @@ def parse_pugan_args(parser, file_day, file_time):
         ("network_k_all_actual_actor_weight", 1.0),
         ("network_k_all_actual_critic_weight", 0.5),
         ("network_k_all_actual_ranking_weight", 0.25),
+        ("network_k_all_actual_local_value_weight", 0.5),
+        ("network_k_all_actual_critic_selection_weight", 1.0),
         ("network_k_all_actual_entropy_weight", 0.01),
+        ("network_k_entropy_floor_weight", 1.0),
+        ("network_k_all_actual_reward_scale_percent", 1.0),
+        ("network_k_all_actual_absolute_advantage_weight", 1.0),
+        ("network_k_all_actual_relative_advantage_weight", 0.25),
+        ("network_k_coverage_positive_actor_weight", 1.0),
+        ("network_k_coverage_spatial_actor_weight", 1.0),
+        ("network_k_coverage_pair_ranking_weight", 0.5),
+        ("network_k_coverage_pair_where_contrast_weight", 0.5),
+        ("network_k_all_actual_diversity_weight", 0.02),
         ("network_k_all_actual_selected_surrogate_weight", 0.1),
+        ("network_k_elite_replay_weight", 1.0),
+        ("network_k_elite_where_weight", 0.25),
+        ("network_k_elite_direction_weight", 0.25),
+        ("network_k_elite_min_gain_percent", 1e-6),
+        ("network_k_offline_bootstrap_loss_weight", 1.0),
     ):
         setattr(args, name, max(float(getattr(args, name, default)), 0.0))
+    args.network_k_entropy_floor_target = min(max(
+        float(getattr(args, "network_k_entropy_floor_target", 0.60)), 0.0
+    ), 1.0)
+    args.network_k_shortlist_exploration_fraction = min(max(float(getattr(
+        args, "network_k_shortlist_exploration_fraction", 0.5
+    )), 0.0), 0.9)
+    args.network_k_replay_shortlist_plan_limit = max(int(getattr(
+        args, "network_k_replay_shortlist_plan_limit", 8
+    )), 1)
+    args.network_k_replay_shortlist_point_limit = max(int(getattr(
+        args, "network_k_replay_shortlist_point_limit", 8192
+    )), 1)
     if args.network_k_all_actual_enabled:
         if args.heuristic_guidance_mode != "network_k_proposal_policy":
             raise ValueError(
@@ -4167,11 +4305,32 @@ def parse_pugan_args(parser, file_day, file_time):
         if int(args.network_k_proposal_count) not in {8, 16}:
             raise ValueError("K all-Actualのproposal数は8または16に限定する")
     args.network_k_elite_replay_capacity = max(
-        int(getattr(args, "network_k_elite_replay_capacity", 2048)), 8
+        int(getattr(args, "network_k_elite_replay_capacity", 256)), 8
+    )
+    args.network_k_elite_replay_count = min(max(
+        int(getattr(args, "network_k_elite_replay_count", 8)), 1
+    ), int(args.network_k_proposal_count))
+    args.network_k_offline_bootstrap_steps = max(
+        int(getattr(args, "network_k_offline_bootstrap_steps", 0)), 0
     )
     args.network_k_offline_dataset = str(
         getattr(args, "network_k_offline_dataset", "") or ""
     ).strip()
+    args.network_k_coverage_slots = min(max(
+        int(getattr(args, "network_k_coverage_slots", 6)), 0
+    ), int(args.network_k_proposal_count))
+    args.network_k_coverage_share_stride = max(
+        int(getattr(args, "network_k_coverage_share_stride", 37)), 1
+    )
+    if (
+        bool(getattr(args, "network_k_require_cache_free_training", True))
+        and args.heuristic_guidance_mode == "network_k_proposal_policy"
+        and (args.network_k_offline_dataset or args.network_k_offline_bootstrap_steps > 0)
+    ):
+        raise ValueError(
+            "Network-only訓練ではoffline候補/cache/teacherを使用できない。"
+            "診断時だけ--network_k_require_cache_free_training falseを明示すること"
+        )
     args.network_k_offline_split = str(
         getattr(args, "network_k_offline_split", "train") or "train"
     ).strip().lower()
@@ -4919,7 +5078,25 @@ def parse_pugan_args(parser, file_day, file_time):
     args.train_grad_clip = max(float(getattr(args, "train_grad_clip", 0.0)), 0.0)
     args.surrogate_update_during_training = bool(getattr(args, "surrogate_update_during_training", True))
     args.surrogate_update_interval = max(int(getattr(args, "surrogate_update_interval", 1)), 1)
-    args.surrogate_joint_lr_scale = max(float(getattr(args, "surrogate_joint_lr_scale", 0.1)), 0.0)
+    args.surrogate_joint_lr_scale = max(float(getattr(args, "surrogate_joint_lr_scale", 0.5)), 0.0)
+    args.compression_surrogate_huber_beta = max(
+        float(getattr(args, "compression_surrogate_huber_beta", 0.05)), 1e-4
+    )
+    args.compression_surrogate_sign_loss_weight = max(
+        float(getattr(args, "compression_surrogate_sign_loss_weight", 0.25)), 0.0
+    )
+    args.compression_surrogate_improvement_sign_weight = max(
+        float(getattr(args, "compression_surrogate_improvement_sign_weight", 4.0)), 1.0
+    )
+    args.compression_surrogate_sign_scale = max(
+        float(getattr(args, "compression_surrogate_sign_scale", 0.10)), 1e-4
+    )
+    args.compression_surrogate_sign_deadband = max(
+        float(getattr(args, "compression_surrogate_sign_deadband", 1e-4)), 0.0
+    )
+    args.compression_surrogate_reference_cache_entries = max(
+        int(getattr(args, "compression_surrogate_reference_cache_entries", 64)), 1
+    )
     args.surrogate_update_on_teacher_refresh_only = bool(
         getattr(args, "surrogate_update_on_teacher_refresh_only", False)
     )
@@ -5033,6 +5210,15 @@ def parse_pugan_args(parser, file_day, file_time):
     args.log_step_time = bool(getattr(args, "log_step_time", True))
     args.log_gpu_memory = bool(getattr(args, "log_gpu_memory", True))
     args.compact_step_text_log = bool(getattr(args, "compact_step_text_log", True))
+    args.network_only_audit_verbose = bool(getattr(
+        args, "network_only_audit_verbose", False
+    ))
+    args.network_only_head_audit_interval = max(int(getattr(
+        args, "network_only_head_audit_interval", 10
+    )), 1)
+    args.full_cloud_empty_cache_threshold_mb = max(float(getattr(
+        args, "full_cloud_empty_cache_threshold_mb", 8192.0
+    )), 0.0)
     args.profile_interval = max(int(getattr(args, "profile_interval", 100)), 1)
     args.lr_scheduler_enabled = bool(getattr(args, "lr_scheduler_enabled", False))
     args.min_main_lr = max(float(getattr(args, "min_main_lr", 1e-5)), 0.0)

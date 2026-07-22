@@ -4,7 +4,7 @@ import inspect
 import json
 import tempfile
 import unittest
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest import mock
 
 import torch
@@ -16,6 +16,7 @@ from models.utils.loss.k_proposal_distillation import (
     KProposalSetLoss,
     OfflineKProposalTeacherStore,
 )
+from models.utils.surrogate.pretrain import _build_surrogate_pretrain_canonical_context
 
 
 def _args(**overrides):
@@ -39,7 +40,7 @@ class NetworkKProposalPolicyTest(unittest.TestCase):
             25, hidden_dim=16, proposal_count=8, shortlist_size=256
         ).eval()
         self.features = torch.randn(1, 25, 4096)
-        self.fixed = torch.rand(1, 6, 4096)
+        self.fixed = torch.rand(1, 17, 4096)
         self.coords = torch.randint(0, 512, (1, 3, 4096))
 
     def _forward(self):
@@ -67,6 +68,67 @@ class NetworkKProposalPolicyTest(unittest.TestCase):
                 fixed_features=None, voxel_coords=self.coords,
             )
 
+    def test_old_k_checkpoint_keeps_existing_trunk_shapes(self):
+        state = {
+            key: value.clone()
+            for key, value in self.policy.state_dict().items()
+            if not key.startswith("fixed_codec_basis_head.")
+        }
+        restored = NetworkKProposalPolicy(
+            25, hidden_dim=16, proposal_count=8, shortlist_size=256
+        )
+        incompatible = restored.load_state_dict(state, strict=False)
+        self.assertIn(
+            "fixed_codec_basis_head.weight", incompatible.missing_keys
+        )
+        self.assertTrue(torch.equal(
+            restored.shared_local_trunk[0].weight,
+            self.policy.shared_local_trunk[0].weight,
+        ))
+        self.assertTrue(torch.equal(
+            restored.shared_global_trunk[0].weight,
+            self.policy.shared_global_trunk[0].weight,
+        ))
+
+    def test_octree_pattern_channels_seed_operation_specific_codec_basis(self):
+        policy = NetworkKProposalPolicy(
+            25, hidden_dim=16, proposal_count=8, shortlist_size=256
+        ).eval()
+        with torch.no_grad():
+            for parameter in policy.shared_local_trunk.parameters():
+                parameter.zero_()
+            policy.shared_basis_head.weight.zero_()
+            policy.shared_basis_head.bias.zero_()
+        fixed = torch.zeros_like(self.fixed)
+        fixed[:, 6] = 0.75
+        output = policy(
+            self.features, _args(), training=False,
+            fixed_features=fixed, voxel_coords=self.coords,
+        )
+        prune_direct = output["shared_basis"][:, 0, 0]
+        add_direct = output["shared_basis"][:, 1, 0]
+        self.assertTrue(torch.allclose(prune_direct, torch.full_like(prune_direct, 0.1875)))
+        self.assertTrue(torch.allclose(add_direct, torch.zeros_like(add_direct)))
+
+    def test_where_policy_logits_are_scale_normalized_without_rank_change(self):
+        output = self._forward()
+        policy_logits = output["policy_base_slot_logits"]
+        self.assertTrue(torch.isfinite(policy_logits).all())
+        self.assertLess(float(policy_logits.mean(dim=3).abs().max()), 1e-4)
+        self.assertGreater(float(output["where_policy_entropy"].mean()), 0.1)
+        raw_order = output["slot_logits"].argsort(dim=3)
+        normalized_order = policy_logits.argsort(dim=3)
+        self.assertTrue(torch.equal(raw_order, normalized_order))
+
+    def test_categorical_logits_remain_explorable_after_raw_scale_growth(self):
+        with torch.no_grad():
+            self.policy.slot_ratio_bias.fill_(-100.0)
+            self.policy.slot_ratio_bias[:, 0] = 100.0
+        output = self._forward()
+        self.assertTrue(bool((output["ratio_class"] == 0).all()))
+        normalized = output["ratio_policy_entropy"] / torch.log(torch.tensor(5.0))
+        self.assertGreater(float(normalized.min()), 0.20)
+
     def test_training_teacher_source_augments_but_preserves_natural_shortlist(self):
         teacher_coord = self.coords[0, :, 3000].tolist()
         output = self.policy(
@@ -78,6 +140,21 @@ class NetworkKProposalPolicyTest(unittest.TestCase):
         )
         self.assertEqual(output["natural_shortlist_indices"].shape[1], 256)
         self.assertTrue(bool((output["shortlist_indices"] == 3000).any()))
+
+    def test_training_actual_replay_source_augments_but_inference_rejects_it(self):
+        output = self.policy(
+            self.features, _args(), training=True,
+            fixed_features=self.fixed, voxel_coords=self.coords,
+            replay_source_indices=(3000, 3001),
+        )
+        self.assertEqual(output["natural_shortlist_indices"].shape[1], 256)
+        self.assertTrue(bool((output["shortlist_indices"] == 3000).any()))
+        with self.assertRaises(RuntimeError):
+            self.policy(
+                self.features, _args(), training=False,
+                fixed_features=self.fixed, voxel_coords=self.coords,
+                replay_source_indices=(3000,),
+            )
 
     def test_inference_rejects_teacher_shortlist(self):
         with self.assertRaises(RuntimeError):
@@ -265,6 +342,110 @@ class NetworkKProposalPolicyTest(unittest.TestCase):
         for key in ("ratio_class", "shares", "order_class", "variant_class", "slot_logits"):
             self.assertTrue(torch.equal(first[key], second[key]), key)
 
+    def test_temperature_anneal_waits_for_positive_state_experience(self):
+        self.policy.train()
+        common = dict(
+            network_k_all_actual_enabled=True,
+            network_k_all_actual_temperature=1.25,
+            network_k_all_actual_temperature_min=0.50,
+            network_k_all_actual_anneal_steps=5000,
+            network_k_min_positive_before_anneal=8,
+            _global_train_step=4000,
+        )
+        blocked = self.policy(
+            self.features,
+            _args(_network_k_positive_experience_count=0, **common),
+            training=True,
+            fixed_features=self.fixed,
+            voxel_coords=self.coords,
+        )
+        annealed = self.policy(
+            self.features,
+            _args(
+                _network_k_positive_experience_count=8,
+                _network_k_anneal_unlock_step=3000,
+                **common,
+            ),
+            training=True,
+            fixed_features=self.fixed,
+            voxel_coords=self.coords,
+        )
+        self.assertTrue(blocked["exploration_anneal_blocked"])
+        self.assertAlmostEqual(float(blocked["exploration_temperature"]), 1.25, places=5)
+        self.assertFalse(annealed["exploration_anneal_blocked"])
+        self.assertAlmostEqual(float(annealed["exploration_anneal_progress"]), 0.2, places=5)
+        self.assertAlmostEqual(float(annealed["exploration_temperature"]), 1.10, places=5)
+
+    def test_all_actual_training_changes_all_eight_executable_patterns(self):
+        self.policy.train()
+        args = _args(
+            network_k_all_actual_enabled=True,
+            network_k_all_actual_temperature=1.0,
+            network_k_all_actual_temperature_min=0.25,
+            network_k_all_actual_anneal_steps=500,
+            network_k_all_actual_coefficient_std=0.15,
+            network_k_all_actual_direction_std=0.10,
+            network_k_share_lattice_step=0.05,
+            network_k_target_domain="neighbor26_empty",
+            network_k_offline_dataset="",
+            _global_train_step=0,
+        )
+        first = self.policy(
+            self.features, args, training=True,
+            fixed_features=self.fixed, voxel_coords=self.coords,
+        )
+        second = self.policy(
+            self.features, args, training=True,
+            fixed_features=self.fixed, voxel_coords=self.coords,
+        )
+        first_hashes = first["executable_plans"]["plan_hash"][0]
+        second_hashes = second["executable_plans"]["plan_hash"][0]
+        self.assertEqual(len(set(first_hashes)), 8)
+        self.assertEqual(len(set(second_hashes)), 8)
+        self.assertGreaterEqual(
+            sum(left != right for left, right in zip(first_hashes, second_hashes)), 6
+        )
+
+    def test_cache_free_coverage_slots_rotate_theta_and_cover_share_lattice(self):
+        self.policy.train()
+        common = dict(
+            network_k_all_actual_enabled=True,
+            network_k_coverage_enabled=True,
+            network_k_coverage_slots=4,
+            network_k_coverage_share_stride=37,
+            network_k_offline_dataset="",
+        )
+        torch.manual_seed(91)
+        first = self.policy(
+            self.features, _args(_global_train_step=40, _network_k_state_visit=0, **common), training=True,
+            fixed_features=self.fixed, voxel_coords=self.coords,
+        )
+        torch.manual_seed(91)
+        second = self.policy(
+            self.features, _args(_global_train_step=80, _network_k_state_visit=1, **common), training=True,
+            fixed_features=self.fixed, voxel_coords=self.coords,
+        )
+        self.assertEqual(first["coverage_slot_count"], 4)
+        self.assertEqual(first["coverage_sequence_step"], 40)
+        self.assertEqual(second["coverage_sequence_step"], 123)
+        self.assertEqual(first["coverage_theta_index"].tolist(), [120, 120, 121, 122, 123, 124, 125, 126])
+        self.assertEqual(second["coverage_theta_index"].tolist(), [369, 369, 370, 371, 372, 373, 374, 375])
+        self.assertTrue(torch.equal(first["ratio_class"][0, 0:1], first["ratio_class"][0, 1:2]))
+        self.assertTrue(torch.allclose(first["shares"][0, 0:1], first["shares"][0, 1:2]))
+        self.assertNotEqual(
+            int(first["coverage_permuted_theta_index"][2]),
+            int(first["coverage_permuted_theta_index"][3]),
+        )
+        self.assertTrue(torch.equal(
+            first["ratio_class"][0, :4],
+            first["coverage_permuted_theta_index"][:4].remainder(5),
+        ))
+        first_lattice = first["coverage_share_lattice_index"][:4]
+        expected_share = self.policy.share_lattice.index_select(0, first_lattice)
+        self.assertTrue(torch.allclose(first["shares"][0, :4], expected_share))
+        visited = {int((theta * 37) % 30780) for theta in range(30780)}
+        self.assertEqual(len(visited), 30780)
+
     def test_all_actual_relative_reward_has_correct_actor_sign(self):
         log_prob = torch.zeros(1, 8, requires_grad=True)
         predicted_gain = torch.zeros(1, 8, 1, requires_grad=True)
@@ -289,6 +470,219 @@ class NetworkKProposalPolicyTest(unittest.TestCase):
         self.assertLess(float(actor_grad[0, 0]), 0.0)
         self.assertGreater(float(actor_grad[0, 4]), 0.0)
         self.assertTrue(total.requires_grad)
+
+    def test_real_policy_actor_scale_is_finite_after_where_normalization(self):
+        self.policy.train()
+        args = _args(
+            heuristic_guidance_mode="network_k_proposal_policy",
+            network_k_all_actual_enabled=True,
+            network_k_coverage_enabled=True,
+            network_k_coverage_slots=4,
+            network_k_entropy_floor_target=0.20,
+            network_k_entropy_floor_weight=0.25,
+        )
+        output = self.policy(
+            self.features, args, training=True,
+            fixed_features=self.fixed, voxel_coords=self.coords,
+        )
+        dummy = SimpleNamespace(
+            training=True,
+            args=args,
+            last_k_proposal_terms=output,
+            last_k_all_actual_debug={},
+        )
+        actual = torch.tensor([[0.10, -0.20, 0.05, 0.30, -0.10, 0.0, 0.20, -0.05]])
+        total = network_module.Network.k_proposal_all_actual_loss(dummy, actual)
+        total.backward()
+        self.assertTrue(torch.isfinite(total))
+        self.assertLess(abs(dummy.last_k_all_actual_debug["actor_raw"]), 100.0)
+        self.assertGreater(
+            dummy.last_k_all_actual_debug["coverage_pair_where_contrast_raw"],
+            0.0,
+        )
+        self.assertTrue(torch.isfinite(self.policy.shared_basis_head.weight.grad).all())
+
+    def test_local_gain_uses_executed_clean_scores_not_order_descriptor(self):
+        self.policy.train()
+        output = self.policy(
+            self.features,
+            _args(network_k_all_actual_enabled=True),
+            training=True,
+            fixed_features=self.fixed,
+            voxel_coords=self.coords,
+        )
+        local_gain = output["predicted_local_gain_all"]
+        self.assertEqual(tuple(local_gain.shape), (1, 8))
+        self.assertTrue(local_gain.requires_grad)
+        self.assertFalse(torch.allclose(local_gain, torch.full_like(local_gain, 1.5)))
+        local_gain.sum().backward()
+        self.assertIsNotNone(self.policy.shared_basis_head.weight.grad)
+        self.assertGreater(float(self.policy.shared_basis_head.weight.grad.abs().sum()), 0.0)
+
+    def test_all_worsening_plans_never_receive_positive_advantage(self):
+        log_prob = torch.zeros(1, 8, requires_grad=True)
+        predicted_gain = torch.zeros(1, 8, 1, requires_grad=True)
+        dummy = SimpleNamespace(
+            training=True,
+            args=_args(
+                heuristic_guidance_mode="network_k_proposal_policy",
+                network_k_all_actual_enabled=True,
+            ),
+            last_k_proposal_terms={
+                "slot_policy_log_prob": log_prob,
+                "predicted_plan_gain": predicted_gain,
+                "slot_policy_entropy": torch.ones(1, 8, requires_grad=True),
+                "selected_slot": torch.zeros(1, dtype=torch.long),
+            },
+            last_k_all_actual_debug={},
+        )
+        worsening = torch.tensor([[0.01, 0.10, 0.20, 0.40, 0.80, 0.05, 0.30, 0.60]])
+        total = network_module.Network.k_proposal_all_actual_loss(dummy, worsening)
+        combined = torch.tensor(dummy.last_k_all_actual_debug["combined_advantage"])
+        self.assertTrue(bool((combined <= 0.0).all()))
+        self.assertEqual(dummy.last_k_all_actual_debug["worsening_reinforced_count"], 0)
+        actor_grad = torch.autograd.grad(total, log_prob)[0]
+        self.assertTrue(bool((actor_grad >= 0.0).all()))
+
+    def test_worsening_scheduled_slots_do_not_collapse_on_policy_distribution(self):
+        theta_log_prob = torch.zeros(1, 8, requires_grad=True)
+        spatial_log_prob = torch.zeros(1, 8, requires_grad=True)
+        log_prob = theta_log_prob + spatial_log_prob
+        predicted_gain = torch.zeros(1, 8, 1, requires_grad=True)
+        dummy = SimpleNamespace(
+            training=True,
+            args=_args(
+                heuristic_guidance_mode="network_k_proposal_policy",
+                network_k_all_actual_enabled=True,
+            ),
+            last_k_proposal_terms={
+                "slot_policy_log_prob": log_prob,
+                "theta_policy_log_prob": theta_log_prob,
+                "spatial_policy_log_prob": spatial_log_prob,
+                "predicted_plan_gain": predicted_gain,
+                "slot_policy_entropy": torch.ones(1, 8, requires_grad=True),
+                "selected_slot": torch.zeros(1, dtype=torch.long),
+                "coverage_slot_mask": torch.tensor(
+                    [True, True, True, True, False, False, False, False]
+                ),
+            },
+            last_k_all_actual_debug={},
+        )
+        compression = torch.tensor([[1.0, 0.8, 0.6, 0.4, -0.2, 0.1, 0.2, 0.3]])
+        total = network_module.Network.k_proposal_all_actual_loss(dummy, compression)
+        theta_grad, spatial_grad = torch.autograd.grad(
+            total, (theta_log_prob, spatial_log_prob)
+        )
+        self.assertTrue(torch.equal(theta_grad[0, :4], torch.zeros(4)))
+        self.assertTrue(bool((spatial_grad[0, :4] > 0.0).all()))
+        self.assertLess(float(theta_grad[0, 4]), 0.0)
+
+    def test_training_shortlist_moves_over_full_input_without_affecting_inference(self):
+        self.policy.train()
+        args0 = _args(
+            network_k_all_actual_enabled=True,
+            network_k_shortlist_exploration_fraction=0.5,
+            _global_train_step=0,
+        )
+        args1 = _args(
+            network_k_all_actual_enabled=True,
+            network_k_shortlist_exploration_fraction=0.5,
+            _global_train_step=1,
+        )
+        torch.manual_seed(11)
+        first = self.policy(
+            self.features, args0, training=True,
+            fixed_features=self.fixed, voxel_coords=self.coords,
+        )
+        torch.manual_seed(11)
+        second = self.policy(
+            self.features, args1, training=True,
+            fixed_features=self.fixed, voxel_coords=self.coords,
+        )
+        self.assertFalse(torch.equal(
+            first["natural_shortlist_indices"],
+            second["natural_shortlist_indices"],
+        ))
+        self.policy.eval()
+        inferred0 = self.policy(
+            self.features, args0, training=False,
+            fixed_features=self.fixed, voxel_coords=self.coords,
+        )
+        inferred1 = self.policy(
+            self.features, args1, training=False,
+            fixed_features=self.fixed, voxel_coords=self.coords,
+        )
+        self.assertTrue(torch.equal(
+            inferred0["natural_shortlist_indices"],
+            inferred1["natural_shortlist_indices"],
+        ))
+
+    def test_positive_actual_experience_enters_mode_balanced_elite_replay(self):
+        self.policy.train()
+        output = self.policy(
+            self.features,
+            _args(network_k_all_actual_enabled=True),
+            training=True,
+            fixed_features=self.fixed,
+            voxel_coords=self.coords,
+        )
+        dummy = SimpleNamespace(
+            training=True,
+            args=_args(
+                heuristic_guidance_mode="network_k_proposal_policy",
+                network_k_all_actual_enabled=True,
+                network_k_elite_enabled=True,
+                network_k_elite_replay_capacity=64,
+                network_k_elite_replay_count=8,
+                network_k_elite_replay_weight=0.25,
+                network_k_elite_min_gain_percent=1e-6,
+            ),
+            last_k_proposal_terms=output,
+            last_k_all_actual_debug={},
+            _network_k_actual_replay={},
+            _network_k_previous_plan_hashes={},
+        )
+        dummy._store_network_k_actual_experience = MethodType(
+            network_module.Network._store_network_k_actual_experience, dummy
+        )
+        dummy._network_k_elite_replay_loss = MethodType(
+            network_module.Network._network_k_elite_replay_loss, dummy
+        )
+        dummy._network_k_positive_replay_source_indices = MethodType(
+            network_module.Network._network_k_positive_replay_source_indices, dummy
+        )
+        actual_loss = torch.tensor([[-2.0, 0.4, 0.2, 0.1, 0.5, 0.3, 0.7, 0.6]])
+        total = network_module.Network.k_proposal_all_actual_loss(
+            dummy, actual_loss, state_key="known-state"
+        )
+        self.assertTrue(total.requires_grad)
+        debug = dummy.last_k_all_actual_debug
+        self.assertEqual(debug["replay_store"]["positive"], 1)
+        self.assertGreaterEqual(debug["replay_elite"]["elite_count"], 1)
+        self.assertAlmostEqual(debug["replay_elite"]["best_replay_gain"], 2.0, places=5)
+        self.assertEqual(debug["replay_store"]["policy_mean_l2_delta"], -1.0)
+        replay_sources = dummy._network_k_positive_replay_source_indices("known-state")
+        self.assertTrue(replay_sources)
+
+        shifted_probability = output["ratio_probability"].detach().roll(1, dims=2)
+        output["ratio_probability"] = shifted_probability
+        network_module.Network.k_proposal_all_actual_loss(
+            dummy, actual_loss, state_key="known-state"
+        )
+        self.assertGreater(
+            dummy.last_k_all_actual_debug["replay_store"]["policy_mean_l2_delta"], 0.0
+        )
+
+    def test_surrogate_pretrain_builds_required_full_cloud_canonical_basis(self):
+        context = _build_surrogate_pretrain_canonical_context(
+            torch.rand(1, 3, 128), _args()
+        )
+        self.assertEqual(context["octree_input_mode"], "full_cloud")
+        self.assertEqual(context["canonical_source"], "surrogate_pretrain")
+        self.assertTrue(torch.is_tensor(context["global_voxel_coords"]))
+        self.assertTrue(torch.equal(
+            context["global_voxel_coords"], context["full_global_voxel_coords"]
+        ))
 
     def test_set_loss_updates_proposal_and_critic_heads(self):
         self.policy.train()
@@ -372,15 +766,18 @@ class KAllActualEvaluatorTest(unittest.TestCase):
         class DummyLoss(CompressionLossMixin):
             def __init__(self):
                 self.encoded = 0
+                self.aux_indices = None
 
             def _get_cached_actual_gt(self, cache_key):
                 return {"bit": 1000.0}
 
-            def _encode_actual_many(self, args, xyz_list):
+            def _encode_actual_many(self, args, xyz_list, attach_aux_indices=None):
                 self.encoded += len(xyz_list)
+                self.aux_indices = tuple(attach_aux_indices or ())
                 return [
                     {"bit": 1000.0 - 10.0 * index, "point_count": int(xyz.shape[-1]),
-                     "actual_finished": True}
+                     "actual_finished": True,
+                     "actual_aux_stats_attached": index in self.aux_indices}
                     for index, xyz in enumerate(xyz_list)
                 ]
 
@@ -423,6 +820,8 @@ class KAllActualEvaluatorTest(unittest.TestCase):
         self.assertEqual(result["baseline_actual_encode_count"], 0)
         self.assertTrue(result["baseline_scalar_cache_hit"])
         self.assertEqual(result["selected_stats"]["bit"], 970.0)
+        self.assertEqual(dummy.aux_indices, (3,))
+        self.assertEqual(result["proposal_aux_stats_count"], 1)
         self.assertEqual(tuple(result["actual_compression_percent"].shape), (1, 8))
 
 

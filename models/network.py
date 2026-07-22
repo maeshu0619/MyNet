@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import time
+import math
 from collections import OrderedDict
 from contextlib import nullcontext
 
@@ -63,6 +64,10 @@ class Network(nn.Module):
         self.last_discrete_policy_debug = {}
         self.last_k_proposal_terms = None
         self.last_k_all_actual_debug = {}
+        # Network自身が実行したActual経験だけを保持する。Heuristic候補Poolとは分離する。
+        self._network_k_actual_replay = OrderedDict()
+        self._network_k_previous_plan_hashes = {}
+        self._network_k_previous_distribution_means = {}
 
         """モジュールセットアップ"""
         self.encoder = PointTransformer(self.args) # 特徴抽出器
@@ -459,8 +464,370 @@ class Network(nn.Module):
             raise RuntimeError("K proposal forward must run before distillation loss")
         return self.k_proposal_set_loss(self.last_k_proposal_terms, teacher)
 
-    def k_proposal_all_actual_loss(self, actual_compression_percent):
-        """8実行planの実測相対rewardを各specialistへ直接返す。"""
+    @staticmethod
+    def _network_k_replay_mode_key(record):
+        """ratio/share/order/variantでActual経験をmode分割する。"""
+        share_bins = tuple(int(round(float(value) / 0.05)) for value in record["shares"])
+        return (
+            int(record["ratio_class"]), share_bins,
+            int(record["order_class"]), int(record["variant_class"]),
+        )
+
+    def _network_k_positive_replay_source_indices(self, state_key):
+        """現在stateの正改善Actual経験から、再学習すべきsource indexだけを返す。"""
+        if state_key is None or not self.training:
+            return None
+        state_replay = self._network_k_actual_replay.get(str(state_key), {})
+        if not state_replay:
+            return None
+        mode_best = {}
+        for record in state_replay.values():
+            if float(record.get("actual_gain", 0.0)) <= 0.0:
+                continue
+            mode_key = record.get("mode_key")
+            if (
+                mode_key not in mode_best
+                or float(record["actual_gain"]) > float(mode_best[mode_key]["actual_gain"])
+            ):
+                mode_best[mode_key] = record
+        plan_limit = max(int(getattr(
+            self.args, "network_k_replay_shortlist_plan_limit", 8
+        )), 1)
+        point_limit = max(int(getattr(
+            self.args, "network_k_replay_shortlist_point_limit", 8192
+        )), 1)
+        elites = sorted(
+            mode_best.values(), key=lambda item: float(item["actual_gain"]), reverse=True
+        )[:plan_limit]
+        indices = []
+        seen = set()
+        for elite in elites:
+            for operation_indices in elite.get("source_indices", ()):
+                for value in operation_indices:
+                    index = int(value)
+                    if index in seen:
+                        continue
+                    seen.add(index)
+                    indices.append(index)
+                    if len(indices) >= point_limit:
+                        return tuple(indices)
+        return tuple(indices) if indices else None
+
+    def _store_network_k_actual_experience(self, state_key, actual_gain, terms):
+        """実際に圧縮したK planだけを重複排除して保存する。"""
+        if state_key is None or not hasattr(self, "_network_k_actual_replay"):
+            return {"stored": 0, "positive": 0, "plan_change_count": -1}
+        if actual_gain.shape[0] != 1:
+            raise RuntimeError("K Actual replayはbatch_size=1の逐次stateを前提とする")
+        executable = terms.get("executable_plan_batch")
+        plan_hashes = getattr(executable, "plan_hash", None)
+        if executable is None or plan_hashes is None:
+            raise RuntimeError("K Actual replayにはpost-collision executable plan hashが必要である")
+        state_name = str(state_key)
+        state_replay = self._network_k_actual_replay.setdefault(state_name, OrderedDict())
+        mean_parts = []
+        for name in (
+            "ratio_probability", "order_probability", "variant_probability"
+        ):
+            value = terms.get(name)
+            if torch.is_tensor(value):
+                mean_parts.append(value.detach().float().reshape(value.shape[0], value.shape[1], -1))
+        share_logits = terms.get("share_logits")
+        if torch.is_tensor(share_logits):
+            mean_parts.append(torch.softmax(
+                share_logits.detach().float(), dim=2
+            ).reshape(share_logits.shape[0], share_logits.shape[1], -1))
+        coefficient_mean = terms.get("coefficient_mean_raw")
+        if torch.is_tensor(coefficient_mean):
+            mean_parts.append(torch.tanh(
+                coefficient_mean.detach().float()
+            ).reshape(coefficient_mean.shape[0], coefficient_mean.shape[1], -1))
+        direction_mean = terms.get("direction_delta_mean")
+        if torch.is_tensor(direction_mean):
+            mean_parts.append(direction_mean.detach().float().reshape(
+                direction_mean.shape[0], direction_mean.shape[1], -1
+            ))
+        distribution_mean_delta = -1.0
+        if mean_parts:
+            current_distribution_mean = torch.cat(mean_parts, dim=2)[0].cpu()
+            if not hasattr(self, "_network_k_previous_distribution_means"):
+                self._network_k_previous_distribution_means = {}
+            previous_distribution_mean = self._network_k_previous_distribution_means.get(
+                state_name
+            )
+            if torch.is_tensor(previous_distribution_mean):
+                distribution_mean_delta = float(torch.sqrt(torch.mean(
+                    (current_distribution_mean - previous_distribution_mean).pow(2)
+                )))
+            self._network_k_previous_distribution_means[state_name] = current_distribution_mean
+        current_hashes = tuple(str(value) for value in plan_hashes[0])
+        previous_hashes = self._network_k_previous_plan_hashes.get(state_name)
+        plan_change_count = (
+            -1 if previous_hashes is None
+            else sum(left != right for left, right in zip(previous_hashes, current_hashes))
+        )
+        self._network_k_previous_plan_hashes[state_name] = current_hashes
+        stored = 0
+        positive = 0
+        coefficients = terms.get("coefficients")
+        direction_delta = terms.get("direction_delta_all")
+        for slot, plan_hash in enumerate(current_hashes):
+            gain = float(actual_gain[0, slot].detach().cpu())
+            positive += int(gain > 0.0)
+            # 悪化planはそのStepの絶対Actor/Criticで処理し、座標列をreplayへ
+            # 永続化しない。これにより多数stateでもmemoryが増え続けない。
+            if gain <= 0.0:
+                continue
+            sources = []
+            directions = []
+            for operation in range(3):
+                accepted = executable.accepted_mask[0, slot, operation].bool()
+                sources.append(tuple(
+                    int(value) for value in executable.source_index[
+                        0, slot, operation
+                    ][accepted].detach().cpu().tolist()
+                ))
+                directions.append(tuple(
+                    int(value) for value in executable.direction_index[
+                        0, slot, operation
+                    ][accepted].detach().cpu().tolist()
+                ))
+            record = {
+                "plan_hash": plan_hash,
+                "actual_gain": gain,
+                "ratio_class": int(terms["ratio_class"][0, slot].detach().cpu()),
+                "shares": tuple(float(value) for value in terms["shares"][0, slot].detach().cpu()),
+                "order_class": int(terms["order_class"][0, slot].detach().cpu()),
+                "variant_class": int(terms["variant_class"][0, slot].detach().cpu()),
+                "coefficients": (
+                    coefficients[0, slot].detach().cpu().clone()
+                    if torch.is_tensor(coefficients) else None
+                ),
+                "direction_delta": (
+                    direction_delta[0, slot].detach().cpu().clone()
+                    if torch.is_tensor(direction_delta) else None
+                ),
+                "source_indices": tuple(sources),
+                "direction_indices": tuple(directions),
+            }
+            record["mode_key"] = Network._network_k_replay_mode_key(record)
+            old = state_replay.get(plan_hash)
+            if old is None or gain > float(old["actual_gain"]):
+                state_replay[plan_hash] = record
+                state_replay.move_to_end(plan_hash)
+                stored += 1
+        capacity = max(int(getattr(
+            self.args, "network_k_elite_replay_capacity", 256
+        )), 8)
+        total_size = sum(len(records) for records in self._network_k_actual_replay.values())
+        while total_size > capacity:
+            worst_state, worst_key = min(
+                (
+                    (replay_state, plan_key)
+                    for replay_state, records in self._network_k_actual_replay.items()
+                    for plan_key in records
+                ),
+                key=lambda item: float(
+                    self._network_k_actual_replay[item[0]][item[1]]["actual_gain"]
+                ),
+            )
+            self._network_k_actual_replay[worst_state].pop(worst_key)
+            if not self._network_k_actual_replay[worst_state]:
+                self._network_k_actual_replay.pop(worst_state)
+            total_size -= 1
+        current_state_size = len(self._network_k_actual_replay.get(state_name, {}))
+        self.args._network_k_positive_experience_count = int(current_state_size)
+        minimum_positive = max(int(getattr(
+            self.args, "network_k_min_positive_before_anneal", 8
+        )), 0)
+        if current_state_size >= minimum_positive:
+            if not hasattr(self, "_network_k_anneal_unlock_steps"):
+                self._network_k_anneal_unlock_steps = {}
+            self.args._network_k_anneal_unlock_step = int(
+                self._network_k_anneal_unlock_steps.setdefault(
+                    state_name, int(getattr(self.args, "_global_train_step", 0))
+                )
+            )
+        return {
+            "stored": stored,
+            "positive": positive,
+            "state_size": len(self._network_k_actual_replay.get(state_name, {})),
+            "total_size": total_size,
+            "plan_change_count": plan_change_count,
+            "policy_mean_l2_delta": distribution_mean_delta,
+        }
+
+    def _network_k_elite_replay_loss(self, state_key, terms):
+        """正改善したmodeの最良経験だけを各specialistへ再教師化する。"""
+        reference = terms["slot_policy_log_prob"]
+        zero = reference.sum() * 0.0
+        if (
+            state_key is None
+            or not bool(getattr(self.args, "network_k_elite_enabled", True))
+            or not hasattr(self, "_network_k_actual_replay")
+        ):
+            return zero, {"elite_count": 0, "where_recall": 0.0}
+        state_replay = self._network_k_actual_replay.get(str(state_key), {})
+        mode_best = {}
+        minimum_gain = max(float(getattr(
+            self.args, "network_k_elite_min_gain_percent", 1e-6
+        )), 0.0)
+        for record in state_replay.values():
+            if float(record["actual_gain"]) <= minimum_gain:
+                continue
+            mode_key = record["mode_key"]
+            if mode_key not in mode_best or record["actual_gain"] > mode_best[mode_key]["actual_gain"]:
+                mode_best[mode_key] = record
+        elite_limit = min(
+            int(reference.shape[1]),
+            max(int(getattr(self.args, "network_k_elite_replay_count", reference.shape[1])), 1),
+        )
+        elites = sorted(
+            mode_best.values(), key=lambda item: float(item["actual_gain"]), reverse=True
+        )[:elite_limit]
+        if not elites:
+            return zero, {"elite_count": 0, "where_recall": 0.0}
+
+        ratio_logits = terms["ratio_logits"]
+        share_logits = terms["share_logits"]
+        order_logits = terms["order_logits"]
+        variant_logits = terms["variant_logits"]
+        current_shares = torch.softmax(share_logits.detach(), dim=2)
+        used_slots = set()
+        assignments = []
+        for elite in elites:
+            target_share = reference.new_tensor(elite["shares"])
+            costs = (
+                -torch.log_softmax(ratio_logits.detach()[0], 1)[:, elite["ratio_class"]]
+                -torch.log_softmax(order_logits.detach()[0], 1)[:, elite["order_class"]]
+                -torch.log_softmax(variant_logits.detach()[0], 1)[:, elite["variant_class"]]
+                + 4.0 * (current_shares[0] - target_share).abs().mean(1)
+            )
+            for slot in used_slots:
+                costs[slot] = torch.inf
+            slot = int(costs.argmin().cpu())
+            used_slots.add(slot)
+            assignments.append((slot, elite))
+
+        shortlist = terms["shortlist_indices"][0]
+        replay_where_logits = terms.get("policy_base_slot_logits", terms["slot_logits"])
+        replay_direction_field = terms.get("shared_direction_field")
+        replay_direction_mean = terms.get("direction_delta_mean")
+        replay_direction_offsets = terms.get("unit_neighbor_offsets")
+        point_count = int(terms["shared_basis"].shape[-1])
+        inverse = torch.full(
+            (point_count,), -1, device=shortlist.device, dtype=torch.long
+        )
+        inverse[shortlist] = torch.arange(shortlist.numel(), device=shortlist.device)
+        loss_rows = []
+        recalled = 0
+        source_total = 0
+        gains = reference.new_tensor([max(float(item[1]["actual_gain"]), 1e-6) for item in assignments])
+        gain_weights = gains / gains.sum().clamp_min(1e-8)
+        for row_index, (slot, elite) in enumerate(assignments):
+            row = (
+                torch.nn.functional.cross_entropy(
+                    ratio_logits[0, slot].view(1, -1),
+                    ratio_logits.new_tensor([elite["ratio_class"]], dtype=torch.long),
+                )
+                + torch.nn.functional.cross_entropy(
+                    order_logits[0, slot].view(1, -1),
+                    order_logits.new_tensor([elite["order_class"]], dtype=torch.long),
+                )
+                + torch.nn.functional.cross_entropy(
+                    variant_logits[0, slot].view(1, -1),
+                    variant_logits.new_tensor([elite["variant_class"]], dtype=torch.long),
+                )
+                - (reference.new_tensor(elite["shares"]) * torch.log_softmax(
+                    share_logits[0, slot], dim=0
+                )).sum()
+            )
+            coefficient_target = elite.get("coefficients")
+            if coefficient_target is not None and torch.is_tensor(terms.get("coefficient_mean_raw")):
+                row = row + 0.25 * torch.nn.functional.smooth_l1_loss(
+                    torch.tanh(terms["coefficient_mean_raw"][0, slot]),
+                    coefficient_target.to(terms["coefficient_mean_raw"]),
+                    beta=0.25,
+                )
+            direction_target = elite.get("direction_delta")
+            if direction_target is not None and torch.is_tensor(terms.get("direction_delta_mean")):
+                row = row + 0.25 * torch.nn.functional.smooth_l1_loss(
+                    terms["direction_delta_mean"][0, slot],
+                    direction_target.to(terms["direction_delta_mean"]),
+                    beta=0.25,
+                )
+            where_rows = []
+            direction_rows = []
+            for operation, source_values in enumerate(elite["source_indices"]):
+                if not source_values:
+                    continue
+                source = torch.as_tensor(source_values, device=inverse.device, dtype=torch.long)
+                position = inverse.index_select(0, source)
+                source_total += int(position.numel())
+                position = position[position >= 0]
+                recalled += int(position.numel())
+                if position.numel():
+                    where_rows.append(
+                        -torch.log_softmax(
+                            replay_where_logits[0, slot, operation], dim=0
+                        ).index_select(0, position).mean()
+                    )
+                direction_groups = elite.get("direction_indices", ()) or ()
+                direction_values = (
+                    direction_groups[operation]
+                    if len(direction_groups) > operation else ()
+                )
+                if (
+                    operation in (1, 2)
+                    and source.numel() == len(direction_values)
+                    and torch.is_tensor(replay_direction_field)
+                    and torch.is_tensor(replay_direction_mean)
+                    and torch.is_tensor(replay_direction_offsets)
+                ):
+                    direction_operation = 0 if operation == 1 else 1
+                    vectors = replay_direction_field[
+                        0, direction_operation, :3
+                    ].index_select(1, source).transpose(0, 1)
+                    vectors = torch.nn.functional.normalize(
+                        vectors + replay_direction_mean[
+                            0, slot, direction_operation
+                        ], dim=1, eps=1e-6
+                    )
+                    concentration = torch.nn.functional.softplus(
+                        replay_direction_field[
+                            0, direction_operation, 3
+                        ].index_select(0, source)
+                    ).unsqueeze(1) + 0.1
+                    logits = (
+                        vectors @ replay_direction_offsets.to(vectors).transpose(0, 1)
+                    ) * concentration
+                    chosen_direction = torch.as_tensor(
+                        direction_values, device=logits.device, dtype=torch.long
+                    )
+                    direction_rows.append(-torch.log_softmax(
+                        logits, dim=1
+                    ).gather(1, chosen_direction.view(-1, 1)).mean())
+            if where_rows:
+                row = row + max(float(getattr(
+                    self.args, "network_k_elite_where_weight", 0.25
+                )), 0.0) * torch.stack(where_rows).mean()
+            if direction_rows:
+                row = row + max(float(getattr(
+                    self.args, "network_k_elite_direction_weight", 0.25
+                )), 0.0) * torch.stack(direction_rows).mean()
+            loss_rows.append(row * gain_weights[row_index])
+        return torch.stack(loss_rows).sum(), {
+            "elite_count": len(assignments),
+            "where_recall": float(recalled) / max(float(source_total), 1.0),
+            "best_replay_gain": max(float(elite["actual_gain"]) for elite in elites),
+            "direction_teacher_count": sum(
+                len((item[1].get("direction_indices", ()) or ((), (), ()))[operation])
+                for item in assignments for operation in (1, 2)
+            ),
+        }
+
+    def k_proposal_all_actual_loss(self, actual_compression_percent, state_key=None):
+        """K実行planの絶対Actual rewardを各specialistへ直接返す。"""
         if not self.training:
             raise RuntimeError("K all-Actual lossは訓練時だけ使用できる")
         if not bool(getattr(self.args, "network_k_all_actual_enabled", False)):
@@ -481,15 +848,209 @@ class Network(nn.Module):
         # compression lossは負が改善、gain/rewardは正が改善へ統一する。
         actual_gain = -actual_loss
         centered = actual_gain - actual_gain.mean(dim=1, keepdim=True)
-        advantage = centered / actual_gain.std(dim=1, keepdim=True).clamp_min(1e-4)
-        actor_raw = -(advantage.detach() * log_prob).mean()
-        critic_raw = torch.nn.functional.smooth_l1_loss(
-            predicted_gain.squeeze(-1), actual_gain.detach(), beta=0.25
+        relative_advantage = centered / actual_gain.std(
+            dim=1, keepdim=True
+        ).clamp_min(1e-4)
+        reward_scale = max(float(getattr(
+            self.args, "network_k_all_actual_reward_scale_percent", 1.0
+        )), 1e-4)
+        absolute_advantage = torch.tanh(actual_gain / reward_scale)
+        absolute_weight = max(float(getattr(
+            self.args, "network_k_all_actual_absolute_advantage_weight", 1.0
+        )), 0.0)
+        relative_weight = max(float(getattr(
+            self.args, "network_k_all_actual_relative_advantage_weight", 0.25
+        )), 0.0)
+        advantage = (
+            absolute_advantage * absolute_weight
+            + relative_advantage * relative_weight
         )
+        # 8候補が全て悪化した時、最もましな悪化planを正rewardにしてはいけない。
+        advantage = torch.where(
+            actual_gain > 1e-9,
+            torch.maximum(advantage, absolute_advantage * absolute_weight),
+            torch.where(
+                actual_gain < -1e-9,
+                torch.minimum(advantage, absolute_advantage * absolute_weight),
+                torch.zeros_like(advantage),
+            ),
+        )
+        worsening_reinforced = (actual_gain <= 0.0) & (advantage > 1e-9)
+        if bool(worsening_reinforced.any()):
+            raise RuntimeError("悪化または0% planへ正のActor advantageが割り当てられた")
+        coverage_mask = terms.get("coverage_slot_mask")
+        if torch.is_tensor(coverage_mask):
+            coverage_mask = coverage_mask.to(
+                device=log_prob.device, dtype=torch.bool
+            ).view(1, -1).expand_as(log_prob)
+        else:
+            coverage_mask = torch.zeros_like(log_prob, dtype=torch.bool)
+        on_policy_mask = ~coverage_mask
+        on_policy_weight = on_policy_mask.to(log_prob.dtype)
+        spatial_log_prob = terms.get("spatial_policy_log_prob")
+        theta_log_prob = terms.get("theta_policy_log_prob")
+        positive_history_count = int(terms.get("positive_experience_count", 0) or 0)
+        minimum_positive_history = max(int(getattr(
+            self.args, "network_k_min_positive_before_anneal", 8
+        )), 0)
+        block_negative_theta = bool(
+            getattr(self.args, "network_k_freeze_negative_theta_until_positive", True)
+            and positive_history_count < minimum_positive_history
+            and torch.is_tensor(spatial_log_prob)
+            and torch.is_tensor(theta_log_prob)
+        )
+        if block_negative_theta:
+            # 改善が見つかる前は悪化planのtheta勾配だけを止め、Where/Direction
+            # の失敗教師は維持する。正改善を発見した行だけthetaも強化する。
+            actor_on_policy_log_prob = spatial_log_prob + theta_log_prob * (
+                actual_gain > 0.0
+            ).to(theta_log_prob.dtype)
+        else:
+            actor_on_policy_log_prob = log_prob
+        actor_on_policy_raw = -(
+            advantage.detach() * actor_on_policy_log_prob * on_policy_weight
+        ).sum() / on_policy_weight.sum().clamp_min(1.0)
+        # 系統探索slotは外部scheduleで選んだoff-policy標本なので、悪化時に
+        # Network分布全体を一点へ押し潰さない。正改善だけを再現対象にする。
+        coverage_positive_advantage = torch.tanh(
+            actual_gain.clamp_min(0.0) / reward_scale
+        ) * coverage_mask.to(actual_gain.dtype)
+        positive_count = (coverage_positive_advantage > 0.0).sum()
+        if bool(positive_count > 0):
+            actor_coverage_positive_raw = -(
+                coverage_positive_advantage.detach() * log_prob
+            ).sum() / positive_count.to(log_prob.dtype)
+        else:
+            actor_coverage_positive_raw = log_prob.sum() * 0.0
+        coverage_positive_weight = max(float(getattr(
+            self.args, "network_k_coverage_positive_actor_weight", 1.0
+        )), 0.0)
+        if torch.is_tensor(spatial_log_prob):
+            # θはschedule由来でも、Where/Direction/score係数はNetworkが標本化
+            # している。全8件のActualを局所mapへ返し、評価の半分を捨てない。
+            coverage_weight = coverage_mask.to(log_prob.dtype)
+            actor_coverage_spatial_raw = -(
+                advantage.detach() * spatial_log_prob * coverage_weight
+            ).sum() / coverage_weight.sum().clamp_min(1.0)
+        else:
+            actor_coverage_spatial_raw = log_prob.sum() * 0.0
+        coverage_spatial_weight = max(float(getattr(
+            self.args, "network_k_coverage_spatial_actor_weight", 1.0
+        )), 0.0)
+        coverage_pair_ranking_raw = log_prob.sum() * 0.0
+        coverage_pair_where_contrast_raw = log_prob.sum() * 0.0
+        pair_size = int(terms.get("coverage_pair_size", 0) or 0)
+        if torch.is_tensor(spatial_log_prob) and pair_size == 2:
+            pair_losses = []
+            where_contrast_losses = []
+            compact_plans = terms.get("compact_plans", {})
+            selected_masks = (
+                compact_plans.get("selected_shortlist_mask")
+                if isinstance(compact_plans, dict) else None
+            )
+            where_logits = terms.get("policy_base_slot_logits")
+            coverage_count = min(
+                int(coverage_mask[0].sum().item()), pair_size
+            )
+            for left in range(0, coverage_count - 1, pair_size):
+                right = left + 1
+                gain_difference = actual_gain[:, left] - actual_gain[:, right]
+                valid_pair = gain_difference.abs() > 1e-6
+                if bool(valid_pair.any()):
+                    log_probability_difference = (
+                        spatial_log_prob[:, left] - spatial_log_prob[:, right]
+                    )
+                    pair_losses.append(torch.nn.functional.softplus(
+                        -gain_difference.detach().sign()[valid_pair]
+                        * log_probability_difference[valid_pair]
+                    ).mean())
+                    # 同一thetaでActual差が付いた候補対について、共通Voxelを
+                    # 除いたsourceだけを比較し、局所mapへ直接順位教師を返す。
+                    if torch.is_tensor(selected_masks) and torch.is_tensor(where_logits):
+                        for batch_index in valid_pair.nonzero(as_tuple=False).flatten().tolist():
+                            if bool(gain_difference[batch_index] > 0.0):
+                                winner, loser = left, right
+                            else:
+                                winner, loser = right, left
+                            winner_mask = selected_masks[batch_index, winner]
+                            loser_mask = selected_masks[batch_index, loser]
+                            common_logits = 0.5 * (
+                                where_logits[batch_index, winner]
+                                + where_logits[batch_index, loser]
+                            )
+                            for operation in range(3):
+                                winner_only = winner_mask[operation] & ~loser_mask[operation]
+                                loser_only = loser_mask[operation] & ~winner_mask[operation]
+                                if bool(winner_only.any()) and bool(loser_only.any()):
+                                    margin = (
+                                        common_logits[operation][winner_only].mean()
+                                        - common_logits[operation][loser_only].mean()
+                                    )
+                                    where_contrast_losses.append(
+                                        torch.nn.functional.softplus(-margin)
+                                    )
+            if pair_losses:
+                coverage_pair_ranking_raw = torch.stack(pair_losses).mean()
+            if where_contrast_losses:
+                coverage_pair_where_contrast_raw = torch.stack(
+                    where_contrast_losses
+                ).mean()
+        coverage_pair_ranking_weight = max(float(getattr(
+            self.args, "network_k_coverage_pair_ranking_weight", 0.5
+        )), 0.0)
+        coverage_pair_where_contrast_weight = max(float(getattr(
+            self.args, "network_k_coverage_pair_where_contrast_weight", 0.5
+        )), 0.0)
+        actor_raw = (
+            actor_on_policy_raw
+            + actor_coverage_positive_raw * coverage_positive_weight
+            + actor_coverage_spatial_raw * coverage_spatial_weight
+            + coverage_pair_ranking_raw * coverage_pair_ranking_weight
+            + coverage_pair_where_contrast_raw
+            * coverage_pair_where_contrast_weight
+        )
+        predicted_gain_flat = predicted_gain.squeeze(-1)
+        critic_regression_raw = torch.nn.functional.smooth_l1_loss(
+            predicted_gain_flat,
+            actual_gain.detach(),
+            beta=max(float(getattr(
+                self.args, "network_k_critic_huber_beta", 0.05
+            )), 1e-4),
+        )
+        critic_sign_active = actual_gain.abs() > 1e-4
+        if bool(critic_sign_active.any()):
+            critic_sign_target = (actual_gain > 0.0).to(predicted_gain_flat.dtype)
+            critic_sign_rows = torch.nn.functional.binary_cross_entropy_with_logits(
+                predicted_gain_flat / max(float(getattr(
+                    self.args, "network_k_critic_sign_scale", 0.10
+                )), 1e-4),
+                critic_sign_target,
+                reduction="none",
+            )
+            critic_sign_rows = critic_sign_rows * torch.where(
+                critic_sign_target > 0.5,
+                critic_sign_rows.new_tensor(max(float(getattr(
+                    self.args, "network_k_critic_improvement_sign_weight", 4.0
+                )), 1.0)),
+                critic_sign_rows.new_tensor(1.0),
+            )
+            critic_sign_raw = critic_sign_rows[critic_sign_active].mean()
+        else:
+            critic_sign_raw = predicted_gain_flat.sum() * 0.0
+        critic_raw = critic_regression_raw + max(float(getattr(
+            self.args, "network_k_critic_sign_loss_weight", 0.25
+        )), 0.0) * critic_sign_raw
+        predicted_local_gain = terms.get("predicted_local_gain_all")
+        if torch.is_tensor(predicted_local_gain):
+            local_value_raw = torch.nn.functional.smooth_l1_loss(
+                predicted_local_gain, actual_gain.detach(), beta=0.25
+            )
+        else:
+            local_value_raw = actor_raw.new_zeros(())
         pair_difference = actual_gain[:, :, None] - actual_gain[:, None, :]
         predicted_difference = (
-            predicted_gain.squeeze(-1)[:, :, None]
-            - predicted_gain.squeeze(-1)[:, None, :]
+            predicted_gain_flat[:, :, None]
+            - predicted_gain_flat[:, None, :]
         )
         pair_mask = pair_difference.abs() > 1e-6
         if bool(pair_mask.any()):
@@ -498,7 +1059,78 @@ class Network(nn.Module):
             ).mean()
         else:
             ranking_raw = actor_raw.new_zeros(())
+        actual_best_slot = actual_gain.argmax(dim=1)
+        critic_selection_raw = torch.nn.functional.cross_entropy(
+            predicted_gain_flat / max(float(getattr(
+                self.args, "network_k_critic_selection_temperature", 0.10
+            )), 1e-3),
+            actual_best_slot.detach(),
+        )
         entropy_raw = entropy.mean()
+        entropy_target = min(max(float(getattr(
+            self.args, "network_k_entropy_floor_target", 0.35
+        )), 0.0), 1.0)
+        normalized_entropies = {}
+        slot_logits_for_entropy = terms.get("slot_logits")
+        where_class_count = (
+            int(slot_logits_for_entropy.shape[-1])
+            if torch.is_tensor(slot_logits_for_entropy) else 2
+        )
+        entropy_denominators = {
+            "ratio": math.log(5.0),
+            "share": math.log(3.0),
+            "order": math.log(6.0),
+            "variant": math.log(6.0),
+            "where": math.log(max(where_class_count, 2)),
+            "direction": math.log(26.0),
+        }
+        for family, key in (
+            ("ratio", "ratio_policy_entropy"),
+            ("share", "share_policy_entropy"),
+            ("order", "order_policy_entropy"),
+            ("variant", "variant_policy_entropy"),
+            ("where", "where_policy_entropy"),
+            ("direction", "direction_policy_entropy"),
+        ):
+            value = terms.get(key)
+            if torch.is_tensor(value):
+                normalized_entropies[family] = (
+                    value / max(entropy_denominators[family], 1e-6)
+                ).mean()
+        if normalized_entropies:
+            entropy_floor_raw = torch.stack([
+                torch.relu(value.new_tensor(entropy_target) - value).pow(2)
+                for value in normalized_entropies.values()
+            ]).mean()
+        else:
+            entropy_floor_raw = actor_raw.new_zeros(())
+        store_experience = getattr(self, "_store_network_k_actual_experience", None)
+        elite_replay = getattr(self, "_network_k_elite_replay_loss", None)
+        replay_store_debug = (
+            store_experience(state_key, actual_gain, terms)
+            if callable(store_experience)
+            else {"stored": 0, "positive": 0, "plan_change_count": -1}
+        )
+        replay_raw, replay_debug = (
+            elite_replay(state_key, terms)
+            if callable(elite_replay)
+            else (actor_raw.new_zeros(()), {"elite_count": 0, "where_recall": 0.0})
+        )
+        signature_parts = [
+            terms.get("ratio_probability"), terms.get("shares"),
+            terms.get("order_probability"), terms.get("variant_probability"),
+        ]
+        signature_parts = [value for value in signature_parts if torch.is_tensor(value)]
+        if signature_parts:
+            signature = torch.cat(signature_parts, dim=2)
+            signature = torch.nn.functional.normalize(signature, dim=2, eps=1e-6)
+            similarity = torch.matmul(signature, signature.transpose(1, 2))
+            off_diagonal = ~torch.eye(
+                similarity.shape[1], device=similarity.device, dtype=torch.bool
+            ).unsqueeze(0)
+            diversity_raw = torch.relu(similarity[off_diagonal.expand_as(similarity)] - 0.90).pow(2).mean()
+        else:
+            diversity_raw = actor_raw.new_zeros(())
         actor_weight = max(float(getattr(
             self.args, "network_k_all_actual_actor_weight", 1.0
         )), 0.0)
@@ -508,16 +1140,36 @@ class Network(nn.Module):
         ranking_weight = max(float(getattr(
             self.args, "network_k_all_actual_ranking_weight", 0.25
         )), 0.0)
+        local_value_weight = max(float(getattr(
+            self.args, "network_k_all_actual_local_value_weight", 0.5
+        )), 0.0)
+        critic_selection_weight = max(float(getattr(
+            self.args, "network_k_all_actual_critic_selection_weight", 1.0
+        )), 0.0)
         entropy_weight = max(float(getattr(
             self.args, "network_k_all_actual_entropy_weight", 0.01
+        )), 0.0)
+        replay_weight = max(float(getattr(
+            self.args, "network_k_elite_replay_weight", 1.0
+        )), 0.0)
+        diversity_weight = max(float(getattr(
+            self.args, "network_k_all_actual_diversity_weight", 0.02
+        )), 0.0)
+        entropy_floor_weight = max(float(getattr(
+            self.args, "network_k_entropy_floor_weight", 1.0
         )), 0.0)
         total = (
             actor_raw * actor_weight
             + critic_raw * critic_weight
             + ranking_raw * ranking_weight
+            + local_value_raw * local_value_weight
+            + critic_selection_raw * critic_selection_weight
             - entropy_raw * entropy_weight
+            + replay_raw * replay_weight
+            + diversity_raw * diversity_weight
+            + entropy_floor_raw * entropy_floor_weight
         )
-        best_slot = actual_gain.argmax(dim=1)
+        best_slot = actual_best_slot
         selected_slot = terms["selected_slot"].to(best_slot)
         self.last_k_all_actual_debug = {
             "actual_compression_percent": actual_loss.detach().cpu().tolist(),
@@ -533,9 +1185,59 @@ class Network(nn.Module):
                 - actual_gain.gather(1, selected_slot.view(-1, 1))
             ).detach().cpu().tolist(),
             "actor_raw": float(actor_raw.detach().cpu()),
+            "actor_on_policy_raw": float(actor_on_policy_raw.detach().cpu()),
+            "actor_coverage_positive_raw": float(
+                actor_coverage_positive_raw.detach().cpu()
+            ),
+            "actor_coverage_spatial_raw": float(
+                actor_coverage_spatial_raw.detach().cpu()
+            ),
+            "coverage_pair_ranking_raw": float(
+                coverage_pair_ranking_raw.detach().cpu()
+            ),
+            "coverage_pair_where_contrast_raw": float(
+                coverage_pair_where_contrast_raw.detach().cpu()
+            ),
+            "coverage_positive_plan_count": int(positive_count.detach().cpu()),
+            "absolute_advantage": absolute_advantage.detach().cpu().tolist(),
+            "relative_advantage": relative_advantage.detach().cpu().tolist(),
+            "combined_advantage": advantage.detach().cpu().tolist(),
+            "worsening_reinforced_count": int(worsening_reinforced.sum().detach().cpu()),
+            "negative_theta_update_blocked": bool(block_negative_theta),
             "critic_raw": float(critic_raw.detach().cpu()),
+            "critic_regression_raw": float(critic_regression_raw.detach().cpu()),
+            "critic_sign_raw": float(critic_sign_raw.detach().cpu()),
+            "critic_mae_percent": float(
+                (predicted_gain_flat - actual_gain).abs().mean().detach().cpu()
+            ),
+            "critic_sign_match": float(
+                torch.sign(predicted_gain_flat).eq(torch.sign(actual_gain))
+                .to(torch.float32).mean().detach().cpu()
+            ),
+            "local_value_raw": float(local_value_raw.detach().cpu()),
+            "local_value_weighted": float(
+                (local_value_raw * local_value_weight).detach().cpu()
+            ),
             "ranking_raw": float(ranking_raw.detach().cpu()),
+            "critic_selection_raw": float(critic_selection_raw.detach().cpu()),
+            "critic_selection_weighted": float(
+                (critic_selection_raw * critic_selection_weight).detach().cpu()
+            ),
             "entropy_raw": float(entropy_raw.detach().cpu()),
+            "entropy_floor_raw": float(entropy_floor_raw.detach().cpu()),
+            "entropy_floor_weighted": float(
+                (entropy_floor_raw * entropy_floor_weight).detach().cpu()
+            ),
+            "normalized_entropy": {
+                family: float(value.detach().cpu())
+                for family, value in normalized_entropies.items()
+            },
+            "elite_replay_raw": float(replay_raw.detach().cpu()),
+            "elite_replay_weighted": float((replay_raw * replay_weight).detach().cpu()),
+            "theta_diversity_raw": float(diversity_raw.detach().cpu()),
+            "theta_diversity_weighted": float((diversity_raw * diversity_weight).detach().cpu()),
+            "replay_store": replay_store_debug,
+            "replay_elite": replay_debug,
             "total": float(total.detach().cpu()),
             "ratio_class": terms["ratio_class"].detach().cpu().tolist()
             if torch.is_tensor(terms.get("ratio_class")) else [],
@@ -551,9 +1253,27 @@ class Network(nn.Module):
             "exploration_temperature": float(
                 terms["exploration_temperature"].detach().cpu()
             ) if torch.is_tensor(terms.get("exploration_temperature")) else 0.0,
+            "exploration_anneal_blocked": bool(
+                terms.get("exploration_anneal_blocked", False)
+            ),
+            "positive_experience_count": int(
+                terms.get("positive_experience_count", 0)
+            ),
             "exploration_anneal_progress": float(
                 terms["exploration_anneal_progress"].detach().cpu()
             ) if torch.is_tensor(terms.get("exploration_anneal_progress")) else 0.0,
+            "coverage_slot_count": int(terms.get("coverage_slot_count", 0)),
+            "coverage_sequence_step": int(terms.get("coverage_sequence_step", -1)),
+            "coverage_theta_index": terms["coverage_theta_index"].detach().cpu().tolist()
+            if torch.is_tensor(terms.get("coverage_theta_index")) else [],
+            "coverage_permuted_theta_index": terms[
+                "coverage_permuted_theta_index"
+            ].detach().cpu().tolist()
+            if torch.is_tensor(terms.get("coverage_permuted_theta_index")) else [],
+            "coverage_share_lattice_index": terms[
+                "coverage_share_lattice_index"
+            ].detach().cpu().tolist()
+            if torch.is_tensor(terms.get("coverage_share_lattice_index")) else [],
         }
         return total
 
@@ -2665,12 +3385,38 @@ class Network(nn.Module):
                 raise RuntimeError(
                     "推論時はHeuristic分解診断modeを使用できない"
                 )
+            current_state_key = getattr(
+                self.args, "_network_k_current_state_key", None
+            )
+            state_replay = self._network_k_actual_replay.get(
+                str(current_state_key), {}
+            ) if current_state_key is not None else {}
+            self.args._network_k_positive_experience_count = int(len(state_replay))
+            minimum_positive = max(int(getattr(
+                self.args, "network_k_min_positive_before_anneal", 8
+            )), 0)
+            if not hasattr(self, "_network_k_anneal_unlock_steps"):
+                self._network_k_anneal_unlock_steps = {}
+            if len(state_replay) >= minimum_positive and current_state_key is not None:
+                unlock_step = self._network_k_anneal_unlock_steps.setdefault(
+                    str(current_state_key),
+                    int(getattr(self.args, "_global_train_step", 0)),
+                )
+                self.args._network_k_anneal_unlock_step = int(unlock_step)
+            else:
+                self.args._network_k_anneal_unlock_step = int(getattr(
+                    self.args, "_global_train_step", 0
+                ))
             k_proposal_terms = self.network_k_proposal_policy(
                 actuator_input,
                 self.args,
                 training=self.training,
-                fixed_features=structure.get("network_only_fixed_features"),
+                fixed_features=structure.get("network_k_fixed_features"),
                 voxel_coords=structure.get("global_voxel_coords"),
+                replay_source_indices=(
+                    self._network_k_positive_replay_source_indices(current_state_key)
+                    if self.training else None
+                ),
             )
             self.last_k_proposal_terms = k_proposal_terms
             network_only_policy_terms = k_proposal_terms["selected_policy_terms"]

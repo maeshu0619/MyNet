@@ -324,6 +324,10 @@ def _k_medoids(rows, maximum_modes):
         assignment = distance[:, medoids].argmin(axis=1)
         changed = False
         for mode in range(mode_count):
+            # slot 0は保存Actualの厳密な最上位planに固定する。通常のmedoid更新で
+            # cluster中心へ置換すると、K内の上限そのものが低下してしまう。
+            if mode == 0:
+                continue
             members = np.nonzero(assignment == mode)[0]
             if not len(members):
                 continue
@@ -334,6 +338,8 @@ def _k_medoids(rows, maximum_modes):
                 changed = True
         if not changed:
             break
+    if medoids[0] != first:
+        raise RuntimeError("Actual最上位medoidの固定契約が壊れた")
     assignment = distance[:, medoids].argmin(axis=1)
     return medoids, assignment, descriptors, distance
 

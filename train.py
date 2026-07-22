@@ -12249,29 +12249,48 @@ def train(model, args, loss, writer, plot, notifier=None):
     k_proposal_teacher_store = None
     k_offline_path = str(getattr(args, "network_k_offline_dataset", "") or "").strip()
     k_all_actual_enabled = bool(getattr(args, "network_k_all_actual_enabled", False))
+    k_cache_free_required = bool(getattr(
+        args, "network_k_require_cache_free_training", True
+    ))
+    if (
+        k_all_actual_enabled
+        and k_cache_free_required
+        and (
+            k_offline_path
+            or int(getattr(args, "network_k_offline_bootstrap_steps", 0)) > 0
+        )
+    ):
+        raise RuntimeError(
+            "Network-only K訓練でoffline候補/cache/teacherが有効になっている"
+        )
     if k_all_actual_enabled:
         unique_training_files = sorted({
             os.path.realpath(path)
             for _, dataset in seq_datasets
             for path in getattr(dataset, "files", ())
         })
-        if len(unique_training_files) != 1:
-            raise RuntimeError(
-                "K all-Actualは既知1 state専用である。"
-                "network_k_diagnostic_sequence_name、max_files=1、"
-                "network_only_diagnostic_repeat_single_frameを設定し、"
-                f"入力PLYを1種類に限定すること（現在{len(unique_training_files)}種類）"
-            )
         writer.write(
             "KAllActualMode: "
-            f"input={unique_training_files[0]}, K={int(args.network_k_proposal_count)}, "
-            "teacher=0, cache_plan=0, den5=0, den6=0, actual_per_step=K"
+            f"state_count={len(unique_training_files)}, K={int(args.network_k_proposal_count)}, "
+            f"offline_bootstrap_steps_per_state={int(getattr(args, 'network_k_offline_bootstrap_steps', 0))}, "
+            f"offline_bootstrap_cadence={int(getattr(args, 'network_k_offline_bootstrap_cadence', 5))}, "
+            f"cache_free_training={int(k_cache_free_required)}, "
+            f"offline_teacher={int(bool(k_offline_path and int(getattr(args, 'network_k_offline_bootstrap_steps', 0)) > 0))}, "
+            "cache_plan=0, den5=0, den6=0, actual_per_step=K, reward=absolute_actual"
+        )
+    elif str(getattr(args, "heuristic_guidance_mode", "")).strip().lower() == "network_k_proposal_policy":
+        writer.write(
+            "KAllActualMode: disabled; Critic選択済み1 planだけをActual評価する。"
+            "8 proposal全件Actual学習ではない。"
         )
     if (
         str(getattr(args, "heuristic_guidance_mode", "")).strip().lower()
         == "network_k_proposal_policy"
         and k_offline_path
-        and not k_all_actual_enabled
+        and (
+            not k_all_actual_enabled
+            or int(getattr(args, "network_k_offline_bootstrap_steps", 0)) > 0
+        )
     ):
         if not os.path.isfile(k_offline_path):
             raise FileNotFoundError(f"network_k_offline_dataset not found: {k_offline_path}")
@@ -12279,7 +12298,9 @@ def train(model, args, loss, writer, plot, notifier=None):
         writer.write(
             "KProposalOfflineTeacher: "
             f"path={k_offline_path}, split={args.network_k_offline_split}, "
-            f"states={len(k_proposal_teacher_store.states)}, runtime_den6=0, candidate_actual=0"
+            f"states={len(k_proposal_teacher_store.states)}, "
+            f"bootstrap_only={bool(k_all_actual_enabled)}, "
+            "runtime_den6=0, candidate_actual=0"
         )
     total_train_files = sum(len(dataset) for _, dataset in seq_datasets) # 全シーケンスに含まれる点群ファイル数を合計し、総Step数の見積もりなどに使用
     den6_prefetch_lookahead = max(
@@ -12416,6 +12437,8 @@ def train(model, args, loss, writer, plot, notifier=None):
     global_train_step = 0
     global_epoch = 0
     scheduler_step_count = 0
+    # 候補そのものは保存せず、同一stateが次のθ領域へ進むための訪問回数だけを保持する。
+    network_k_state_visit_counts = {}
     for episode in range(args.episodes): # Episode開始
         writer.write(f"◆◆◆ Episode {episode + 1} / {args.episodes} ◆◆◆")
 
@@ -12488,6 +12511,11 @@ def train(model, args, loss, writer, plot, notifier=None):
                     getattr(args, "sparsepcgc_training_mode", "subtree_selector")
                 ).strip().lower()
                 heuristic_mode = str(getattr(args, "heuristic_guidance_mode", "")).strip().lower()
+                if heuristic_mode == "network_k_proposal_policy":
+                    state_visit = int(network_k_state_visit_counts.get(cache_key, 0))
+                    args._network_k_state_visit = state_visit
+                    args._network_k_current_state_key = cache_key
+                    network_k_state_visit_counts[cache_key] = state_visit + 1
                 den6_online_full_cloud = heuristic_mode == "ana_den6_online"
                 network_only_full_cloud = heuristic_mode in {
                     "network_only_codec_policy", "network_k_proposal_policy"
@@ -12760,6 +12788,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                             if (
                                 heuristic_mode == "network_k_proposal_policy"
                                 and isinstance(k_proposal_teacher_store, OfflineKProposalTeacherStore)
+                                and not k_all_actual_enabled
                             ):
                                 training_state_id = k_proposal_teacher_store.find_state_for_input(
                                     file_path,
@@ -14169,13 +14198,26 @@ def train(model, args, loss, writer, plot, notifier=None):
                         0.0,
                     )
                     if k_all_actual_enabled:
-                        # 全Kの実測相対rewardを主信号にし、選択1案だけのSurrogateが
+                        # 全Kの実測絶対rewardを主信号にし、選択1案だけのSurrogateが
                         # 8専門slotを同じ方向へ引く影響は小さく残す。
                         compression_weight *= max(float(getattr(
                             args,
                             "network_k_all_actual_selected_surrogate_weight",
                             0.1,
                         )), 0.0)
+                        if isinstance(k_all_actual_result, dict):
+                            selected_index = int(k_all_actual_result.get("selected_slot", 0))
+                            selected_actual_rows = k_all_actual_result.get(
+                                "actual_compression_percent"
+                            )
+                            if torch.is_tensor(selected_actual_rows):
+                                selected_actual_percent = float(
+                                    selected_actual_rows.reshape(-1)[selected_index].detach().cpu()
+                                )
+                                # Surrogateの符号が未校正でも、Actualで悪化したplanを
+                                # 微分可能proxyが正例として押し戻さないようにする。
+                                if selected_actual_percent >= 0.0:
+                                    compression_weight = 0.0
                     L = (
                         geometry_weight * L_geom
                         + stage_factors["com"] * compression_weight * L_com_objective
@@ -14295,6 +14337,12 @@ def train(model, args, loss, writer, plot, notifier=None):
                     if (
                         heuristic_mode == "network_k_proposal_policy"
                         and isinstance(k_proposal_teacher_store, OfflineKProposalTeacherStore)
+                        and (
+                            not k_all_actual_enabled
+                            or global_train_step < int(getattr(
+                                args, "network_k_offline_bootstrap_steps", 0
+                            ))
+                        )
                     ):
                         offline_state_id = k_proposal_teacher_store.find_state_for_input(
                             file_path,
@@ -14395,13 +14443,130 @@ def train(model, args, loss, writer, plot, notifier=None):
                     if not isinstance(k_all_actual_result, dict):
                         raise RuntimeError("K all-Actual評価結果が学習損失へ届いていない")
                     base_model_for_policy = model.module if hasattr(model, "module") else model
+                    # 163件の保存Actualは初期化期間だけ使用する。teacher座標を
+                    # shortlistへ注入せず、現在Networkが自然に出した候補へ教師化する。
+                    bootstrap_state_id = None
+                    bootstrap_active = False
+                    if isinstance(k_proposal_teacher_store, OfflineKProposalTeacherStore):
+                        bootstrap_state_id = k_proposal_teacher_store.find_state_for_input(
+                            file_path,
+                            args,
+                            split=str(getattr(args, "network_k_offline_split", "train")),
+                        )
+                        bootstrap_counts = getattr(
+                            args, "_network_k_offline_bootstrap_state_steps", None
+                        )
+                        if not isinstance(bootstrap_counts, dict):
+                            bootstrap_counts = {}
+                            args._network_k_offline_bootstrap_state_steps = bootstrap_counts
+                        bootstrap_encounters = getattr(
+                            args, "_network_k_offline_bootstrap_state_encounters", None
+                        )
+                        if not isinstance(bootstrap_encounters, dict):
+                            bootstrap_encounters = {}
+                            args._network_k_offline_bootstrap_state_encounters = bootstrap_encounters
+                        encounter_index = int(bootstrap_encounters.get(
+                            bootstrap_state_id, 0
+                        )) if bootstrap_state_id is not None else 0
+                        bootstrap_cadence = max(int(getattr(
+                            args, "network_k_offline_bootstrap_cadence", 5
+                        )), 1)
+                        bootstrap_active = bool(
+                            bootstrap_state_id is not None
+                            and int(bootstrap_counts.get(bootstrap_state_id, 0))
+                            < int(getattr(args, "network_k_offline_bootstrap_steps", 0))
+                            and encounter_index % bootstrap_cadence == 0
+                        )
+                        if bootstrap_state_id is not None:
+                            bootstrap_encounters[bootstrap_state_id] = encounter_index + 1
+                        if bootstrap_active:
+                            bootstrap_t0 = time.time()
+                            proposal_output = getattr(
+                                base_model_for_policy, "last_k_proposal_terms", None
+                            )
+                            actuator_state = getattr(
+                                base_model_for_policy, "last_actuator_voxel_state", None
+                            )
+                            initial_voxel_coords = (
+                                actuator_state.get("initial_voxel_coords")
+                                if isinstance(actuator_state, dict) else None
+                            )
+                            if not isinstance(proposal_output, dict) or not torch.is_tensor(initial_voxel_coords):
+                                raise RuntimeError("K Actual bootstrapにproposal/canonical voxelがない")
+                            bootstrap_teacher = k_proposal_teacher_store.teacher_for_output(
+                                bootstrap_state_id,
+                                proposal_output,
+                                initial_voxel_coords,
+                                split=str(getattr(args, "network_k_offline_split", "train")),
+                            )
+                            bootstrap_losses = base_model_for_policy.k_proposal_offline_distillation_loss(
+                                bootstrap_teacher
+                            )
+                            bootstrap_weight = max(float(getattr(
+                                args, "network_k_offline_bootstrap_loss_weight", 1.0
+                            )), 0.0)
+                            bootstrap_loss = bootstrap_losses["total"] * bootstrap_weight
+                            if not bootstrap_loss.requires_grad:
+                                raise RuntimeError("163候補bootstrap lossの勾配が切れている")
+                            L = L + bootstrap_loss
+                            compression_debug_terms.update({
+                                "k_all_actual_offline_bootstrap_active": True,
+                                "k_all_actual_offline_bootstrap_state_id": bootstrap_state_id,
+                                "k_all_actual_offline_bootstrap_loss": float(
+                                    bootstrap_loss.detach().cpu()
+                                ),
+                                "k_all_actual_offline_bootstrap_state_step": int(
+                                    bootstrap_counts.get(bootstrap_state_id, 0)
+                                ),
+                                "k_all_actual_offline_bootstrap_encounter": encounter_index,
+                                "k_all_actual_offline_bootstrap_cadence": bootstrap_cadence,
+                                "k_all_actual_offline_bootstrap_dense_target_active": True,
+                                "k_all_actual_offline_bootstrap_time": float(
+                                    time.time() - bootstrap_t0
+                                ),
+                                "k_all_actual_shortlist_natural_recall": float(
+                                    bootstrap_teacher["shortlist_natural_recall"][
+                                        bootstrap_teacher["shortlist_natural_recall_mask"]
+                                    ].mean().detach().cpu()
+                                ) if bool(bootstrap_teacher[
+                                    "shortlist_natural_recall_mask"
+                                ].any()) else float("nan"),
+                            })
+                            for metric_name, metric_value in bootstrap_losses.get(
+                                "metrics", {}
+                            ).items():
+                                if torch.is_tensor(metric_value):
+                                    metric_value = float(metric_value.detach().cpu())
+                                compression_debug_terms[
+                                    f"k_all_actual_bootstrap_{metric_name}"
+                                ] = metric_value
+                            bootstrap_counts[bootstrap_state_id] = int(
+                                bootstrap_counts.get(bootstrap_state_id, 0)
+                            ) + 1
+                        elif (
+                            bootstrap_state_id is not None
+                            and int(bootstrap_counts.get(bootstrap_state_id, 0))
+                            < int(getattr(args, "network_k_offline_bootstrap_steps", 0))
+                        ):
+                            compression_debug_terms.update({
+                                "k_all_actual_offline_bootstrap_active": False,
+                                "k_all_actual_offline_bootstrap_deferred": True,
+                                "k_all_actual_offline_bootstrap_encounter": encounter_index,
+                                "k_all_actual_offline_bootstrap_cadence": bootstrap_cadence,
+                            })
+                        elif bootstrap_state_id is None:
+                            compression_debug_terms.update({
+                                "k_all_actual_offline_bootstrap_active": False,
+                                "k_all_actual_offline_bootstrap_miss": True,
+                            })
                     all_actual_loss_fn = getattr(
                         base_model_for_policy, "k_proposal_all_actual_loss", None
                     )
                     if not callable(all_actual_loss_fn):
                         raise RuntimeError("K all-Actual policy lossがNetworkに存在しない")
                     L_k_all_actual = all_actual_loss_fn(
-                        k_all_actual_result["actual_compression_percent"]
+                        k_all_actual_result["actual_compression_percent"],
+                        state_key=cache_key,
                     )
                     if not torch.is_tensor(L_k_all_actual) or not L_k_all_actual.requires_grad:
                         raise RuntimeError("K all-Actual policy lossの勾配が切れている")
@@ -14417,6 +14582,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                     compression_debug_terms.update({
                         "k_all_actual_proposal_count": int(
                             k_all_actual_result["proposal_actual_encode_count"]
+                        ),
+                        "k_all_actual_proposal_aux_stats_count": int(
+                            k_all_actual_result.get("proposal_aux_stats_count", 0)
                         ),
                         "k_all_actual_baseline_bits": float(
                             k_all_actual_result["baseline_bits"]
@@ -15228,7 +15396,13 @@ def train(model, args, loss, writer, plot, notifier=None):
                 total_loss_finite = bool(torch.isfinite(L.detach()).all().item()) and skip_optimizer_reason is None # LがNanなどでないか否かの判定
                 param_update_snapshots = None # 更新前パラメータの記録を見作成で初期化
                 network_only_param_before = None
-                if network_only_full_cloud and total_loss_finite:
+                network_only_head_audit_due = bool(
+                    global_train_step == 0
+                    or global_train_step % max(int(getattr(
+                        args, "network_only_head_audit_interval", 10
+                    )), 1) == 0
+                )
+                if network_only_full_cloud and total_loss_finite and network_only_head_audit_due:
                     audit_model = _unwrap_train_model(model)
                     policy_module_for_audit = (
                         audit_model.network_k_proposal_policy
@@ -15248,7 +15422,12 @@ def train(model, args, loss, writer, plot, notifier=None):
                 # allocator cacheに阻まれないよう未使用blockだけを返却する。
                 # 生きているFP32 Tensorとautograd graphには触れない。
                 if one_plan_full_cloud and use_cuda and torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                    reserved_mb = float(torch.cuda.memory_reserved()) / (1024.0 * 1024.0)
+                    cache_threshold_mb = float(getattr(
+                        args, "full_cloud_empty_cache_threshold_mb", 8192.0
+                    ))
+                    if cache_threshold_mb <= 0.0 or reserved_mb >= cache_threshold_mb:
+                        torch.cuda.empty_cache()
                 if skip_optimizer_reason is not None: # Optimizer更新を止める必要があるか否かの判定
                     writer.write(
                         f"Skip Optimizing!!! reason={skip_optimizer_reason}; "
@@ -15541,7 +15720,8 @@ def train(model, args, loss, writer, plot, notifier=None):
                     grouped = {
                         "where": (
                             "local_trunk", "local_cost_head", "shared_local_trunk",
-                            "shared_basis_head", "plan_tokens", "token_mixer", "coefficient_head",
+                            "shared_basis_head", "fixed_codec_basis_head", "plan_tokens",
+                            "token_mixer", "coefficient_head",
                             "coefficient_scale_head", "priority_head", "threshold_head",
                             "order_head", "variant_head", "slot_order_bias", "slot_variant_bias",
                         ),
@@ -16159,10 +16339,35 @@ def train(model, args, loss, writer, plot, notifier=None):
                     )
                     loss_dominance_warning = loss_dominance_ratio > 100.0
 
+                    k_all_actual_full_log = dict(
+                        getattr(audit_model, "last_k_all_actual_debug", {}) or {}
+                    )
+                    if bool(getattr(args, "network_only_audit_verbose", False)):
+                        k_all_actual_text_log = k_all_actual_full_log
+                    else:
+                        k_all_actual_text_log = {
+                            key: k_all_actual_full_log.get(key)
+                            for key in (
+                                "actual_best_compression_percent",
+                                "actual_mean_compression_percent",
+                                "actual_improving_plan_count",
+                                "actual_zero_plan_count",
+                                "actual_best_slot",
+                                "critic_selected_slot",
+                                "critic_regret_percent",
+                                "critic_mae_percent",
+                                "critic_sign_match",
+                                "unique_executable_plan_count",
+                                "exploration_temperature",
+                                "exploration_anneal_blocked",
+                                "positive_experience_count",
+                            )
+                            if key in k_all_actual_full_log
+                        }
                     writer.write(
                         "NetworkOnlyAudit: "
                         f"counters={contract}, "
-                        f"k_all_actual={dict(getattr(audit_model, 'last_k_all_actual_debug', {}) or {})}, "
+                        f"k_all_actual={k_all_actual_text_log}, "
                         f"counts={dict(audit_plan.get('selected_counts') or {})}, "
                         f"ratios={dict(audit_plan.get('selected_amount_ratios') or {})}, "
                         f"shares_raw={_audit_list('network_only_shares_raw')}, "

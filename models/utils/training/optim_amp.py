@@ -37,27 +37,73 @@ def split_trainable_params(model, args):
 def build_optimizer_and_scheduler(model, args, writer):
     other_params, deform_params = split_trainable_params(model, args)
 
+    # K-policyは巨大な離散空間を探索するActorと、毎StepのActualへ素早く
+    # 追従すべきCriticで適切な学習速度が異なるため、LR groupを分離する。
+    named_trainable = {
+        name: parameter for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    }
+    k_critic_names = {
+        name for name in named_trainable
+        if "network_k_proposal_policy." in name
+        and any(token in name for token in (
+            ".critic.", ".critic_gain_head.", ".critic_geometry_head.",
+            ".critic_interaction_head.", ".critic_uncertainty_head.",
+        ))
+    }
+    k_actor_names = {
+        name for name in named_trainable
+        if "network_k_proposal_policy." in name and name not in k_critic_names
+    }
+    k_actor_params = [named_trainable[name] for name in sorted(k_actor_names)]
+    k_critic_params = [named_trainable[name] for name in sorted(k_critic_names)]
+    k_param_ids = {id(parameter) for parameter in (*k_actor_params, *k_critic_params)}
+    other_params = [parameter for parameter in other_params if id(parameter) not in k_param_ids]
+    deform_params = [parameter for parameter in deform_params if id(parameter) not in k_param_ids]
+
     num_enc_trainable = sum(p.requires_grad for p in model.encoder.parameters())
     writer.write(f"Trainable encoder params: {num_enc_trainable} (should be 0)")
 
     assert args.optim in ["adam", "sgd"]
 
     if args.optim == "adam":
-        optimizer = optim.Adam(
-            [
-                {"params": other_params},
-                {"params": deform_params, "lr": args.lr * 0.1},
-            ],
-            lr=args.lr,
-            weight_decay=args.weight_decay,
-        )
+        groups = [
+            {"params": other_params, "name": "main"},
+            {"params": deform_params, "lr": args.lr * 0.1, "name": "deform"},
+        ]
+        if k_actor_params:
+            groups.append({
+                "params": k_actor_params,
+                "lr": args.lr * float(getattr(args, "network_k_actor_lr_scale", 0.1)),
+                "name": "network_k_actor",
+            })
+        if k_critic_params:
+            groups.append({
+                "params": k_critic_params,
+                "lr": args.lr * float(getattr(args, "network_k_critic_lr_scale", 1.0)),
+                "name": "network_k_critic",
+            })
+        optimizer = optim.Adam(groups, lr=args.lr, weight_decay=args.weight_decay)
     else:
         args.lr = args.lr * 100
+        groups = [
+            {"params": other_params, "name": "main"},
+            {"params": deform_params, "lr": args.lr * 0.1, "name": "deform"},
+        ]
+        if k_actor_params:
+            groups.append({
+                "params": k_actor_params,
+                "lr": args.lr * float(getattr(args, "network_k_actor_lr_scale", 0.1)),
+                "name": "network_k_actor",
+            })
+        if k_critic_params:
+            groups.append({
+                "params": k_critic_params,
+                "lr": args.lr * float(getattr(args, "network_k_critic_lr_scale", 1.0)),
+                "name": "network_k_critic",
+            })
         optimizer = optim.SGD(
-            [
-                {"params": other_params},
-                {"params": deform_params, "lr": args.lr * 0.1},
-            ],
+            groups,
             lr=args.lr,
         )
 
@@ -65,6 +111,14 @@ def build_optimizer_and_scheduler(model, args, writer):
         optimizer,
         step_size=args.lr_decay_step,
         gamma=args.gamma,
+    )
+
+    writer.write(
+        "OptimizerGroups: "
+        + ", ".join(
+            f"{group.get('name', 'unnamed')}[lr={float(group['lr']):.6g},params={len(group['params'])}]"
+            for group in optimizer.param_groups
+        )
     )
 
     return optimizer, scheduler_steplr

@@ -30,6 +30,37 @@ from .checkpoint import (
 )
 from ..pointcloud.utils_repkpu import *
 from ..pointcloud.octree_subtree import *
+from ..pointcloud.sparsepcgc_voxel import (
+    attach_sparsepcgc_voxel_meta,
+    quantize_sparsepcgc_coords,
+)
+
+
+def _build_surrogate_pretrain_canonical_context(input_xyz, args, coord_scale=None):
+    """事前学習入力にも通常訓練と同じcanonical Voxel基底を付与する。"""
+    quantized_result = quantize_sparsepcgc_coords(
+        input_xyz,
+        args,
+        coord_scale=coord_scale,
+        offset=None,
+        return_metadata=True,
+    )
+    if isinstance(quantized_result, tuple) and len(quantized_result) == 2:
+        quantized, metadata = quantized_result
+    else:
+        quantized, metadata = quantized_result, {}
+    context = attach_sparsepcgc_voxel_meta(
+        {
+            "octree_context_scope": "full_cloud",
+            "octree_input_mode": "full_cloud",
+            "canonical_source": "surrogate_pretrain",
+        },
+        quantized.detach().to(dtype=torch.long),
+        metadata,
+    )
+    context["full_global_voxel_coords"] = context["global_voxel_coords"]
+    context["full_occupied_voxel_coords"] = context["global_voxel_coords"]
+    return context
 
 
 def _surrogate_pretrain_dataset_fingerprint(args, loss, seq_datasets):
@@ -154,7 +185,7 @@ def _set_loaded_surrogate_joint_lr(args, loss, writer):
     if optimizer is None:
         return []
     joint_lr = max(float(getattr(args, "compression_surrogate_lr", 1e-3)), 0.0) * max(
-        float(getattr(args, "surrogate_joint_lr_scale", 0.1)),
+        float(getattr(args, "surrogate_joint_lr_scale", 0.5)),
         0.0,
     )
     lrs = [joint_lr for _ in optimizer.param_groups]
@@ -769,6 +800,9 @@ def run_surrogate_pretrain(
                                 subtree_xyz = subtree_sample["subtree_xyz"]
                                 subtree_attr = subtree_sample.get("subtree_attr")
                                 cache_key = subtree_sample["subtree_cache_key"]
+                                subtree_canonical_context = _build_surrogate_pretrain_canonical_context(
+                                    subtree_xyz[:, :3, :], args
+                                )
                                 with autocast_ctx:
                                     (
                                         gen_subtree_pts,
@@ -785,6 +819,8 @@ def run_surrogate_pretrain(
                                         subtree_attr,
                                         cache_key=cache_key,
                                         return_attr_output=False,
+                                        full_octree_context=subtree_canonical_context,
+                                        octree_input_mode="full_cloud",
                                     )
                                     gen_xyz = gen_subtree_pts[:, :3, :]
                                     final_w_for_loss = None
@@ -822,6 +858,9 @@ def run_surrogate_pretrain(
                                 cache_key,
                                 use_cuda,
                             )
+                            full_canonical_context = _build_surrogate_pretrain_canonical_context(
+                                patches[:, :3, :], args, coord_scale=fd_xyz
+                            )
                             with autocast_ctx:
                                 gen_patches, _L_attr, _L_policy, _L_actuator, final_w, _Lp_out, _La_fit, _La_rep, _out_label = model.forward(
                                     patches,
@@ -829,6 +868,8 @@ def run_surrogate_pretrain(
                                     cache_key=cache_key,
                                     coord_scale=fd_xyz,
                                     return_attr_output=False,
+                                    full_octree_context=full_canonical_context,
+                                    octree_input_mode="full_cloud",
                                 )
                                 gen_xyz = (centroid_xyz + gen_patches[:, :3, :] * fd_xyz).contiguous()
                                 final_w_for_loss = None
@@ -1122,7 +1163,7 @@ def run_surrogate_pretrain(
         if original_replay_max_entries is not None:
             loss.surrogate_replay_max_entries = original_replay_max_entries
         if original_surrogate_lrs:
-            joint_scale = float(getattr(args, "surrogate_joint_lr_scale", 0.1))
+            joint_scale = float(getattr(args, "surrogate_joint_lr_scale", 0.5))
             joint_lrs = [lr * joint_scale for lr in original_surrogate_lrs]
             set_optimizer_lrs(surrogate_optimizer, joint_lrs)
             writer.write(

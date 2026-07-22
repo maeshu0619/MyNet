@@ -404,6 +404,35 @@ class SurrogateCompressionLossMixin:
 
         return torch.stack(features, dim=0).to(device=gen_xyz.device, dtype=torch.float32)
 
+    def _cached_surrogate_reference_features(self, args, gt_xyz, cache_key):
+        """GTのみから決まるSurrogate特徴を同一入力・設定で厳密に再利用する。"""
+        if not cache_key:
+            return self._build_soft_compression_features(args, gt_xyz, gt_xyz, None), False
+        cache = getattr(self, "_surrogate_reference_feature_cache", None)
+        if cache is None:
+            cache = {}
+            self._surrogate_reference_feature_cache = cache
+        key = (
+            str(cache_key), tuple(int(value) for value in self.surrogate_levels),
+            tuple(int(value) for value in gt_xyz.shape), str(gt_xyz.device),
+            str(gt_xyz.dtype), float(self._surrogate_effective_qs(
+                args, self._surrogate_backend_label(args).replace("_surrogate", "")
+            )),
+        )
+        cached = cache.get(key)
+        if torch.is_tensor(cached):
+            return cached.to(device=gt_xyz.device), True
+        value = self._build_soft_compression_features(
+            args, gt_xyz, gt_xyz, None
+        ).detach()
+        cache[key] = value
+        max_entries = max(int(getattr(
+            args, "compression_surrogate_reference_cache_entries", 64
+        )), 1)
+        while len(cache) > max_entries:
+            cache.pop(next(iter(cache)))
+        return value, False
+
     @staticmethod
     def _surrogate_effective_qs(args, codec_key):
         if str(codec_key).strip().lower() == "sparsepcgc":
@@ -782,6 +811,8 @@ class SurrogateCompressionLossMixin:
 
     def _train_compression_surrogate(self, args, x_soft, target, train_steps=None):
         self._last_surrogate_grad_norm = 0.0
+        self._last_surrogate_regression_loss = 0.0
+        self._last_surrogate_sign_loss = 0.0
         if train_steps is None:
             train_steps = max(int(getattr(args, "compression_surrogate_train_steps", 2)), 0)
         else:
@@ -807,6 +838,21 @@ class SurrogateCompressionLossMixin:
         y_det = target.detach().expand(x_det.shape[0], -1)
         last_loss = x_soft.new_zeros(())
         weight = float(getattr(args, "compression_surrogate_bit_weight", 1.0))
+        huber_beta = max(float(getattr(
+            args, "compression_surrogate_huber_beta", 0.05
+        )), 1e-4)
+        sign_weight = max(float(getattr(
+            args, "compression_surrogate_sign_loss_weight", 0.25
+        )), 0.0)
+        improvement_sign_weight = max(float(getattr(
+            args, "compression_surrogate_improvement_sign_weight", 4.0
+        )), 1.0)
+        sign_scale = max(float(getattr(
+            args, "compression_surrogate_sign_scale", 0.10
+        )), 1e-4)
+        sign_deadband = max(float(getattr(
+            args, "compression_surrogate_sign_deadband", 1e-4
+        )), 0.0)
 
         with self._compression_autocast_ctx(x_soft.device):
             for _ in range(train_steps):
@@ -816,7 +862,28 @@ class SurrogateCompressionLossMixin:
                     self.surrogate_optimizer.zero_grad(set_to_none=True)
                     self._reset_compression_surrogate("non-finite prediction during train")
                     return x_soft.new_zeros(())
-                loss = float(weight) * F.smooth_l1_loss(pred, y_det, reduction="mean")
+                regression_loss = F.smooth_l1_loss(
+                    pred, y_det, reduction="mean", beta=huber_beta
+                )
+                sign_active = y_det.abs() > sign_deadband
+                if bool(sign_active.any()):
+                    improvement_target = (y_det < -sign_deadband).to(pred.dtype)
+                    sign_rows = F.binary_cross_entropy_with_logits(
+                        -pred / sign_scale,
+                        improvement_target,
+                        reduction="none",
+                    )
+                    sign_rows = sign_rows * torch.where(
+                        improvement_target > 0.5,
+                        sign_rows.new_tensor(improvement_sign_weight),
+                        sign_rows.new_tensor(1.0),
+                    )
+                    sign_loss = sign_rows[sign_active].mean()
+                else:
+                    sign_loss = pred.sum() * 0.0
+                loss = float(weight) * (
+                    regression_loss + sign_weight * sign_loss
+                )
                 if not torch.isfinite(loss):
                     self.surrogate_optimizer.zero_grad(set_to_none=True)
                     self._reset_compression_surrogate("non-finite loss during train")
@@ -843,6 +910,10 @@ class SurrogateCompressionLossMixin:
                     self._reset_compression_surrogate("non-finite params after optimizer step")
                     return x_soft.new_zeros(())
                 last_loss = loss.detach()
+                self._last_surrogate_regression_loss = float(
+                    regression_loss.detach().cpu()
+                )
+                self._last_surrogate_sign_loss = float(sign_loss.detach().cpu())
 
         self.compression_surrogate.eval()
         self._set_surrogate_trainable(False)
@@ -936,8 +1007,11 @@ class SurrogateCompressionLossMixin:
         need_soft_aux = bool(log_soft_aux or aux_node_weight > 0.0 or aux_single_weight > 0.0)
         need_sparse_aux = bool(getattr(args, "sparsepcgc_aux_loss", True) and self._is_sparsepcgc_context(args))
         x_ref = None
+        reference_feature_cache_hit = False
         if need_soft_aux or need_sparse_aux:
-            x_ref = self._build_soft_compression_features(args, gt_xyz, gt_xyz, None)
+            x_ref, reference_feature_cache_hit = self._cached_surrogate_reference_features(
+                args, gt_xyz, cache_key
+            )
         if need_soft_aux:
             soft_node_percent, soft_single_percent = self._soft_aux_percent_from_features(x_soft, x_ref)
         else:
@@ -1511,6 +1585,9 @@ class SurrogateCompressionLossMixin:
         target_percent = pred_percent.new_tensor(float(target_percent_value)).detach().reshape(())
         surrogate_signed_bit_error = pred_percent - target_percent
         surrogate_abs_bit_error = surrogate_signed_bit_error.abs()
+        surrogate_sign_match = float(
+            torch.sign(pred_percent).eq(torch.sign(target_percent)).detach().cpu()
+        )
         train_target_t = pred_percent.new_tensor(float(target_train_percent_value)).reshape(())
         raw_actual_t = pred_percent.new_tensor(float(target_raw_percent_value)).reshape(())
         surrogate_loss_against_train_target = F.smooth_l1_loss(pred_percent.reshape(1), train_target_t.detach().reshape(1), reduction="mean")
@@ -2046,6 +2123,16 @@ class SurrogateCompressionLossMixin:
             "pred_clip_max": float(pred_clip_max_value),
             "surrogate_loss_for_grad": self._scalar(surrogate_loss_for_grad_weighted.detach()),
             "surrogate_grad_norm": float(getattr(self, "_last_surrogate_grad_norm", 0.0)),
+            "surrogate_regression_train_loss": float(getattr(
+                self, "_last_surrogate_regression_loss", 0.0
+            )),
+            "surrogate_sign_train_loss": float(getattr(
+                self, "_last_surrogate_sign_loss", 0.0
+            )),
+            "surrogate_sign_match_current": float(surrogate_sign_match),
+            "surrogate_reference_feature_cache_hit": bool(
+                reference_feature_cache_hit
+            ),
             "proxy_aux_for_grad": self._scalar(proxy_aux_for_grad.detach()),
             "grad_source": grad_source,
             "detach_surrogate_from_network": bool(detach_surrogate_from_network),

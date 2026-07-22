@@ -61,34 +61,13 @@ class PlotMaker():
         self.step_x_his = []
         self.epo_x_his = []
         self.epi_x_his = []
-        online_den6 = str(getattr(args, "heuristic_guidance_mode", "")).strip().lower() == "ana_den6_online"
-        self.edit_keys = (
-            ["added_ratio_percent", "deleted_ratio_percent", "adjusted_ratio_percent"]
-            if online_den6
-            else [
-                "added_ratio_percent",
-                "deleted_ratio_percent",
-                "full_cloud_voxel_drop_ratio_percent",
-                "adjusted_ratio_percent",
-                "oracle_full_cloud_prune_ratio_percent",
-                "full_cloud_amount_final_ratio",
-                "full_cloud_amount_selected_residual",
-                "full_cloud_amount_teacher_residual",
-                "full_cloud_amount_pred_residual",
-                "full_cloud_amount_drop_count",
-                "full_cloud_amount_actual_delta",
-                "full_cloud_amount_surrogate_delta",
-                "full_cloud_amount_geom_loss",
-                "full_cloud_amount_residual_loss",
-                "full_cloud_amount_total_loss",
-                "full_cloud_amount_noop_selected",
-                "full_cloud_amount_actual_eval_count",
-                "full_cloud_amount_teacher_ratio",
-                "full_cloud_amount_oracle_best_ratio",
-                "full_cloud_amount_oracle_gap",
-                "full_cloud_amount_actual_finished_count",
-            ]
-        )
+        # Point Edit図は実際の3操作だけを表示する。Amount診断やOracle値は
+        # compression/operation metricsへ残し、Point Edit図へ混在させない。
+        self.edit_keys = [
+            "added_ratio_percent",
+            "deleted_ratio_percent",
+            "adjusted_ratio_percent",
+        ]
         self.step_edit_his = [[] for _ in self.edit_keys]
         self.epo_edit_his = [[] for _ in self.edit_keys]
         self.epi_edit_his = [[] for _ in self.edit_keys]
@@ -1049,16 +1028,12 @@ class PlotMaker():
         edit_titles = {
             "added_ratio_percent": "Add",
             "deleted_ratio_percent": "Prune",
-            "full_cloud_voxel_drop_ratio_percent": "FullCloudVoxelPrune",
             "adjusted_ratio_percent": "Adjust",
-            "oracle_full_cloud_prune_ratio_percent": "OracleFullPrune",
         }
         edit_colors = {
             "added_ratio_percent": "#2ca02c",
             "deleted_ratio_percent": "#d62728",
-            "full_cloud_voxel_drop_ratio_percent": "#ff7f0e",
             "adjusted_ratio_percent": "#1f77b4",
-            "oracle_full_cloud_prune_ratio_percent": "#9467bd",
         }
         fig, axes = plot_mod.subplots(
             len(self.edit_keys),

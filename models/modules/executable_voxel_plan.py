@@ -60,6 +60,54 @@ def _row_membership(query: torch.Tensor, reference: torch.Tensor) -> torch.Tenso
     return inside & (ref_ids[safe] == query_ids)
 
 
+class _StaticRowMembershipIndex:
+    """大きな固定occupied集合を1回だけsortし、複数queryで再利用する。"""
+
+    def __init__(self, reference: torch.Tensor, padding: int = 1):
+        reference = reference.to(torch.long)
+        if reference.ndim != 2 or reference.shape[1] != 3:
+            raise ValueError("reference must be [N,3]")
+        self.empty = reference.numel() == 0
+        if self.empty:
+            self.lower = reference.new_zeros((3,))
+            self.upper = reference.new_zeros((3,))
+            self.span = reference.new_ones((3,))
+            self.sorted_keys = reference.new_empty((0,))
+            return
+        pad = max(int(padding), 0)
+        self.lower = reference.amin(dim=0) - pad
+        self.upper = reference.amax(dim=0) + pad
+        self.span = (self.upper - self.lower + 1).clamp_min(1)
+        span_product = int(self.span[0].item()) * int(self.span[1].item()) * int(
+            self.span[2].item()
+        )
+        if span_product >= (1 << 62):
+            raise OverflowError("Voxel coordinate span is too large for int64 membership keys")
+        self.sorted_keys = torch.sort(self._keys(reference)).values
+
+    def _keys(self, rows: torch.Tensor) -> torch.Tensor:
+        shifted = rows.to(torch.long) - self.lower.view(1, 3)
+        return (
+            shifted[:, 0] * self.span[1] * self.span[2]
+            + shifted[:, 1] * self.span[2]
+            + shifted[:, 2]
+        )
+
+    def contains(self, query: torch.Tensor) -> torch.Tensor:
+        if query.numel() == 0 or self.empty:
+            return torch.zeros(query.shape[0], dtype=torch.bool, device=query.device)
+        query = query.to(torch.long)
+        in_domain = ((query >= self.lower) & (query <= self.upper)).all(dim=1)
+        safe_query = torch.maximum(torch.minimum(query, self.upper), self.lower)
+        keys = self._keys(safe_query)
+        position = torch.searchsorted(self.sorted_keys, keys)
+        inside = position < self.sorted_keys.numel()
+        safe_position = position.clamp_max(max(int(self.sorted_keys.numel()) - 1, 0))
+        return in_domain & inside & (
+            self.sorted_keys.index_select(0, safe_position) == keys
+        )
+
+
 def coordinate_indices(query: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
     """[Q,3]を[R,3]へ疎joinし、一致しないrowは-1を返す。"""
     if query.ndim != 2 or reference.ndim != 2 or query.shape[1] != 3 or reference.shape[1] != 3:
@@ -242,8 +290,11 @@ class ExecutableVoxelPlanBuilder:
         score_max = operation_scores.new_zeros((batch, slots, 3))
 
         # B/K/operationだけを制御loopとし、点ごとのPython loopは作らない。
+        initial_unique_counts = []
         for b in range(batch):
             initial = torch.unique(coords[b], dim=0, sorted=True)
+            initial_unique_counts.append(int(initial.shape[0]))
+            initial_membership = _StaticRowMembershipIndex(initial, padding=1)
             for k in range(slots):
                 removed = initial.new_empty((0, 3))
                 added = initial.new_empty((0, 3))
@@ -335,7 +386,9 @@ class ExecutableVoxelPlanBuilder:
                         reject_reason[b, k, operation, 5] += int(
                             ((~domain_valid) & valid_direction).sum().item()
                         )
-                        occupied = _row_membership(target.reshape(-1, 3), initial).view(window, 26)
+                        occupied = initial_membership.contains(
+                            target.reshape(-1, 3)
+                        ).view(window, 26)
                         reject_reason[b, k, operation, 2] += int((occupied & valid_direction).sum().item())
                         valid = valid_direction & domain_valid & ~occupied
                         # 既採用targetとの重複およびsource-target交差をoperation順に解決する。
@@ -403,8 +456,7 @@ class ExecutableVoxelPlanBuilder:
         budget_mask = torch.arange(capacity, device=requested.device).view(1, 1, 1, -1) < requested.unsqueeze(-1)
         reject_mask = budget_mask & ~accepted_mask
         unique_count = torch.tensor(
-            [torch.unique(coords[b], dim=0).shape[0] for b in range(batch)],
-            device=requested.device, dtype=torch.long,
+            initial_unique_counts, device=requested.device, dtype=torch.long,
         ).view(batch, 1)
         final_count = unique_count - accepted_count[:, :, PRUNE] + accepted_count[:, :, ADD]
         denominator = unique_count.clamp_min(1).to(operation_scores.dtype).unsqueeze(-1)
@@ -495,18 +547,27 @@ def apply_selected_executable_plan(
     selected = select_executable_plan(plan, selected_slot)
     outputs = []
     for b in range(coords.shape[0]):
-        current = torch.unique(coords[b], dim=0, sorted=True)
-        for operation in selected.operation_order[b, 0].tolist():
+        # Builder確定後は全操作のsource/targetが衝突解消済みである。
+        # 100万Voxelのunique/membershipを操作ごとに繰り返さず、source indexで
+        # 一度だけ除去し、空きtargetを一度だけ追加して同じ最終集合を作る。
+        keep = torch.ones(coords.shape[1], dtype=torch.bool, device=coords.device)
+        add_rows = []
+        for operation in (PRUNE, ADD, ADJUST):
             mask = selected.accepted_mask[b, 0, operation]
-            sources = selected.source_coord[b, 0, operation][mask]
-            targets = selected.target_coord[b, 0, operation][mask]
-            if operation == PRUNE:
-                current = _remove_rows(current, sources)
-            elif operation == ADD:
-                current = _append_rows(current, targets)
-            else:
-                current = _append_rows(_remove_rows(current, sources), targets)
-        outputs.append(torch.unique(current, dim=0, sorted=True))
+            if operation in (PRUNE, ADJUST):
+                source_indices = selected.source_index[b, 0, operation][mask]
+                source_indices = source_indices[
+                    (source_indices >= 0) & (source_indices < coords.shape[1])
+                ]
+                keep[source_indices] = False
+            if operation in (ADD, ADJUST):
+                add_rows.append(selected.target_coord[b, 0, operation][mask])
+        current = coords[b][keep]
+        if add_rows:
+            added = torch.cat(add_rows, dim=0)
+            if added.numel():
+                current = torch.cat((current, added.to(current)), dim=0)
+        outputs.append(current)
     width = max([int(value.shape[0]) for value in outputs] or [0])
     padded = coords.new_zeros((coords.shape[0], 3, width))
     valid = torch.zeros((coords.shape[0], width), dtype=torch.bool, device=coords.device)

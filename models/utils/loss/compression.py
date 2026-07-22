@@ -967,7 +967,7 @@ class CompressionLossMixin:
             )
         return result
 
-    def _encode_actual_many(self, args, xyz_list):
+    def _encode_actual_many(self, args, xyz_list, attach_aux_indices=None):
         if (
             self._is_den6_online_training_step(args)
             and not bool(getattr(args, "network_k_all_actual_enabled", False))
@@ -1036,11 +1036,22 @@ class CompressionLossMixin:
                     )
                     raw_stats_list.append(stats)
 
+        aux_index_set = (
+            None if attach_aux_indices is None
+            else {int(value) for value in attach_aux_indices}
+        )
         stats_list = []
-        for pts_b, raw_stats in zip(point_tensors, raw_stats_list):
+        for candidate_index, (pts_b, raw_stats) in enumerate(zip(point_tensors, raw_stats_list)):
             stats = dict(raw_stats or {})
-            if torch.is_tensor(pts_b) and bool(stats.get("actual_finished", False)):
+            if (
+                torch.is_tensor(pts_b)
+                and bool(stats.get("actual_finished", False))
+                and (aux_index_set is None or candidate_index in aux_index_set)
+            ):
                 stats = self._attach_octree_aux_stats(args, pts_b, stats)
+                stats["actual_aux_stats_attached"] = True
+            else:
+                stats["actual_aux_stats_attached"] = False
             stats_list.append(stats)
         return stats_list
 
@@ -1064,7 +1075,7 @@ class CompressionLossMixin:
         if plan is None or not torch.is_tensor(initial_coords):
             raise RuntimeError("K executable planまたは初期Voxel座標が欠落した")
         if int(plan.operation_order.shape[0]) != 1 or int(initial_coords.shape[0]) != 1:
-            raise RuntimeError("K all-Actualは既知1 state、batch_size=1だけを受け付ける")
+            raise RuntimeError("K all-Actualは逐次stateのbatch_size=1だけを受け付ける")
         proposal_count = int(plan.operation_order.shape[1])
         expected_count = int(getattr(args, "network_k_proposal_count", proposal_count))
         if proposal_count != expected_count:
@@ -1100,12 +1111,17 @@ class CompressionLossMixin:
             candidate_point_counts.append(int(candidate_xyz.shape[-1]))
             # worker転送直前までCPUに置き、K個の全点TensorをGPUへ常駐させない。
             candidates.append(candidate_xyz[0].detach().to(device="cpu", dtype=torch.float32))
+        selected_slot = int(proposal_output["selected_slot"].reshape(-1)[0].detach().cpu())
         previous_force_fresh = bool(
             getattr(args, "_sparsepcgc_force_fresh_actual_encode", False)
         )
         setattr(args, "_sparsepcgc_force_fresh_actual_encode", True)
         try:
-            stats_list = self._encode_actual_many(args, candidates)
+            # K順位教師に必要なのは各bitだけである。重いOctree補助統計は
+            # 通常Surrogateへ再利用するCritic選択planの1件だけへ付加する。
+            stats_list = self._encode_actual_many(
+                args, candidates, attach_aux_indices=(selected_slot,)
+            )
         finally:
             setattr(args, "_sparsepcgc_force_fresh_actual_encode", previous_force_fresh)
         if len(stats_list) != proposal_count:
@@ -1122,7 +1138,6 @@ class CompressionLossMixin:
             bits = float(stats["bit"])
             compression_percent.append(self._relative_percent(bits, gt_bits))
             stats["point_count"] = int(stats.get("point_count", candidate_point_counts[slot]))
-        selected_slot = int(proposal_output["selected_slot"].reshape(-1)[0].detach().cpu())
         actual_tensor = proposal_output["predicted_plan_gain"].new_tensor(
             compression_percent
         ).view(1, proposal_count)
@@ -1139,6 +1154,10 @@ class CompressionLossMixin:
             # ここで評価するのはHeuristic candidateではなくNetworkが完成させたplanである。
             "candidate_actual_encode_count": 0,
             "proposal_actual_encode_count": proposal_count,
+            "proposal_aux_stats_count": int(sum(
+                bool(stats.get("actual_aux_stats_attached", False))
+                for stats in stats_list
+            )),
             "total_actual_encode_count": proposal_count + baseline_actual_encode_count,
             "candidate_point_counts": candidate_point_counts,
             "den6_call_count": 0,

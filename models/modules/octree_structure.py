@@ -610,6 +610,10 @@ class OctreeStructureAnalysis(nn.Module):
             "delete_nll_gain": torch.zeros((B, N), device=device, dtype=dtype),
             "add_nll_gain": torch.zeros((B, N), device=device, dtype=dtype),
             "move_nll_gain": torch.zeros((B, N), device=device, dtype=dtype),
+            "coarse4_delete_nll_gain": torch.zeros((B, N), device=device, dtype=dtype),
+            "coarse4_add_nll_gain": torch.zeros((B, N), device=device, dtype=dtype),
+            "coarse4_move_nll_gain": torch.zeros((B, N), device=device, dtype=dtype),
+            "coarse4_parent_nll": torch.zeros((B, N), device=device, dtype=dtype),
             "delete_valid_mask": torch.zeros((B, N), device=device, dtype=torch.bool),
             "add_valid_mask": torch.zeros((B, N), device=device, dtype=torch.bool),
             "move_valid_mask": torch.zeros((B, N), device=device, dtype=torch.bool),
@@ -742,6 +746,10 @@ class OctreeStructureAnalysis(nn.Module):
         best_add_child_slot_list = []
         best_move_target_child_slot_list = []
         best_operation_hint_list = []
+        coarse4_delete_nll_gain_list = []
+        coarse4_add_nll_gain_list = []
+        coarse4_move_nll_gain_list = []
+        coarse4_parent_nll_list = []
 
         delete_gain_mean_values = []
         add_gain_mean_values = []
@@ -779,6 +787,10 @@ class OctreeStructureAnalysis(nn.Module):
                 best_add_child_slot_list.append(torch.full((N,), -1, device=device, dtype=torch.long))
                 best_move_target_child_slot_list.append(torch.full((N,), -1, device=device, dtype=torch.long))
                 best_operation_hint_list.append(torch.zeros((N,), device=device, dtype=torch.long))
+                coarse4_delete_nll_gain_list.append(torch.zeros((N,), device=device, dtype=dtype))
+                coarse4_add_nll_gain_list.append(torch.zeros((N,), device=device, dtype=dtype))
+                coarse4_move_nll_gain_list.append(torch.zeros((N,), device=device, dtype=dtype))
+                coarse4_parent_nll_list.append(torch.zeros((N,), device=device, dtype=dtype))
                 continue
 
             parent_coords = torch.div(coords_n3, 2, rounding_mode="floor")
@@ -852,6 +864,42 @@ class OctreeStructureAnalysis(nn.Module):
                 device=device,
                 dtype=dtype,
             )
+            # SparsePCGCの内部確率は参照せず、入力座標だけから4-Voxel尺度の
+            # occupancy遷移を作る。保存plan監査でleaf単独よりsource recallが
+            # 高かったため、候補ではなく汎化可能な固定特徴として利用する。
+            coarse_nodes = torch.div(coords_n3, 4, rounding_mode="floor")
+            coarse_parents = torch.div(coarse_nodes, 2, rounding_mode="floor")
+            coarse_unique_parents, coarse_inverse = torch.unique(
+                coarse_parents, dim=0, sorted=True, return_inverse=True
+            )
+            coarse_child_slot = (
+                (coarse_nodes[:, 0] & 1)
+                + 2 * (coarse_nodes[:, 1] & 1)
+                + 4 * (coarse_nodes[:, 2] & 1)
+            ).to(dtype=torch.long)
+            coarse_occupancy = torch.zeros(
+                (coarse_unique_parents.shape[0], 8), device=device, dtype=torch.bool
+            )
+            coarse_occupancy[coarse_inverse, coarse_child_slot] = True
+            coarse_code = (
+                coarse_occupancy.to(dtype=torch.long) * pattern_weights
+            ).sum(dim=1)
+            coarse_child_count = coarse_occupancy.sum(dim=1).to(dtype=dtype)
+            coarse_scores = self._leaf_pattern_candidate_scores_single(
+                coarse_code,
+                coarse_child_count,
+                coarse_child_slot,
+                coarse_inverse,
+                device=device,
+                dtype=dtype,
+            )
+            coarse_hist = torch.bincount(coarse_code, minlength=256).to(dtype=dtype)
+            coarse_probability = (
+                coarse_hist.index_select(0, coarse_code) + 1.0
+            ) / (coarse_hist.sum() + 256.0).clamp_min(1.0)
+            coarse_parent_nll = -torch.log2(
+                coarse_probability.clamp_min(torch.finfo(dtype).eps)
+            ).index_select(0, coarse_inverse)
 
             child_slot_list.append(child_slot)
             parent_code_list.append(parent_code_point)
@@ -871,6 +919,10 @@ class OctreeStructureAnalysis(nn.Module):
             best_add_child_slot_list.append(candidate_scores["best_add_child_slot"])
             best_move_target_child_slot_list.append(candidate_scores["best_move_target_child_slot"])
             best_operation_hint_list.append(candidate_scores["best_operation_hint"])
+            coarse4_delete_nll_gain_list.append(coarse_scores["delete_nll_gain"])
+            coarse4_add_nll_gain_list.append(coarse_scores["add_nll_gain"])
+            coarse4_move_nll_gain_list.append(coarse_scores["move_nll_gain"])
+            coarse4_parent_nll_list.append(coarse_parent_nll)
 
             unique_parent_count_max = max(unique_parent_count_max, int(unique_parents.shape[0]))
             if collect_debug_scalars:
@@ -915,6 +967,10 @@ class OctreeStructureAnalysis(nn.Module):
         best_add_child_slot_out = torch.stack(best_add_child_slot_list, dim=0)
         best_move_target_child_slot_out = torch.stack(best_move_target_child_slot_list, dim=0)
         best_operation_hint_out = torch.stack(best_operation_hint_list, dim=0)
+        coarse4_delete_nll_gain_out = torch.stack(coarse4_delete_nll_gain_list, dim=0)
+        coarse4_add_nll_gain_out = torch.stack(coarse4_add_nll_gain_list, dim=0)
+        coarse4_move_nll_gain_out = torch.stack(coarse4_move_nll_gain_list, dim=0)
+        coarse4_parent_nll_out = torch.stack(coarse4_parent_nll_list, dim=0)
 
         return {
             "available": True,
@@ -940,6 +996,10 @@ class OctreeStructureAnalysis(nn.Module):
             "delete_nll_gain": delete_nll_gain_out.detach(),
             "add_nll_gain": add_nll_gain_out.detach(),
             "move_nll_gain": move_nll_gain_out.detach(),
+            "coarse4_delete_nll_gain": coarse4_delete_nll_gain_out.detach(),
+            "coarse4_add_nll_gain": coarse4_add_nll_gain_out.detach(),
+            "coarse4_move_nll_gain": coarse4_move_nll_gain_out.detach(),
+            "coarse4_parent_nll": coarse4_parent_nll_out.detach(),
             "delete_valid_mask": delete_valid_mask_out.detach(),
             "add_valid_mask": add_valid_mask_out.detach(),
             "move_valid_mask": move_valid_mask_out.detach(),
@@ -2267,6 +2327,55 @@ class OctreeStructureAnalysis(nn.Module):
             # features; no dataset ID, codec probe, plan, or teacher is used.
             result["network_only_fixed_features"] = neighbor_details.unsqueeze(0).to(
                 device=pts_xyz.device, dtype=input_dtype
+            )
+            # den5/den6のsymbol probeは使わず、入力Octreeだけから既に算出済みの
+            # parent-pattern統計をK policyへ追加する。候補・順位・teacherではなく、
+            # 未知入力でも同じforward内で再計算できる局所coding特徴である。
+            leaf_channels = self._leaf_pattern_feature_channels(
+                leaf_pattern_diag,
+                neighbor_details.new_zeros((1, 1, neighbor_details.shape[-1])),
+            )
+            child_slot = leaf_pattern_diag.get("child_slot") if isinstance(
+                leaf_pattern_diag, dict
+            ) else None
+            if torch.is_tensor(child_slot):
+                child_slot_feature = child_slot.to(
+                    device=pts_xyz.device, dtype=input_dtype
+                ).unsqueeze(1).clamp_min(0.0) / 7.0
+            else:
+                child_slot_feature = pts_xyz.new_zeros((1, 1, pts_xyz.shape[-1]))
+            result["network_k_fixed_features"] = torch.cat(
+                (
+                    result["network_only_fixed_features"],
+                    leaf_channels["delete_gain"].to(dtype=input_dtype),
+                    leaf_channels["add_gain"].to(dtype=input_dtype),
+                    leaf_channels["move_gain"].to(dtype=input_dtype),
+                    leaf_channels["parent_nll"].to(dtype=input_dtype),
+                    leaf_channels["parent_freq"].to(dtype=input_dtype),
+                    leaf_channels["child_count"].to(dtype=input_dtype),
+                    child_slot_feature,
+                    torch.tanh(
+                        leaf_pattern_diag["coarse4_delete_nll_gain"].to(
+                            device=pts_xyz.device, dtype=input_dtype
+                        ).unsqueeze(1) / 4.0
+                    ),
+                    torch.tanh(
+                        leaf_pattern_diag["coarse4_add_nll_gain"].to(
+                            device=pts_xyz.device, dtype=input_dtype
+                        ).unsqueeze(1) / 4.0
+                    ),
+                    torch.tanh(
+                        leaf_pattern_diag["coarse4_move_nll_gain"].to(
+                            device=pts_xyz.device, dtype=input_dtype
+                        ).unsqueeze(1) / 4.0
+                    ),
+                    torch.tanh(
+                        leaf_pattern_diag["coarse4_parent_nll"].to(
+                            device=pts_xyz.device, dtype=input_dtype
+                        ).unsqueeze(1) / 8.0
+                    ).clamp(0.0, 1.0),
+                ),
+                dim=1,
             )
 
         if (

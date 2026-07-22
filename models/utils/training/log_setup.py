@@ -116,7 +116,7 @@ def log_loss_weight_setup(writer, args):
             f"pretrain_sparsepcgc_debug_interval={int(getattr(args, 'surrogate_pretrain_sparsepcgc_debug_interval', 0))}, "
             f"update_during_training={bool(getattr(args, 'surrogate_update_during_training', True))}, "
             f"update_interval={int(getattr(args, 'surrogate_update_interval', 1))}, "
-            f"joint_lr_scale={float(getattr(args, 'surrogate_joint_lr_scale', 0.1))}, "
+            f"joint_lr_scale={float(getattr(args, 'surrogate_joint_lr_scale', 0.5))}, "
             f"teacher_refresh_only={bool(getattr(args, 'surrogate_update_on_teacher_refresh_only', False))}"
         )
         writer.write("Compression Surrogate Backward: enabled")
