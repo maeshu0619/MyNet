@@ -3102,9 +3102,15 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--heuristic_guidance_online_amount_bins',
-        default='0.0005,0.0010,0.0025,0.0050,0.0099',
+        default='0.00225,0.002375,0.0025,0.002625,0.00275',
         type=str,
-        help='Exact固定後にNetworkが選ぶden6 total edit ratioの離散集合',
+        help='Exact 0.25%を中心にNetworkが微調整するtotal edit ratioの局所離散集合',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_amount_residual_scale',
+        default=0.10,
+        type=float,
+        help='Add/Prune/Adjust shareをden6初期値から動かす対数残差の上限',
     )
     parser.add_argument(
         '--heuristic_guidance_online_amount_temperature',
@@ -3228,9 +3234,9 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--heuristic_guidance_network_residual_weight',
-        default=0.50,
+        default=0.05,
         type=float,
-        help='den6 candidate rankへ加えるNetwork残差scoreの最大重み。anchor中は0から連続的に増える',
+        help='den6 candidate rankへ加える局所Network残差の最大重み。順位全体を壊さず境界近傍だけを入れ替える',
     )
     parser.add_argument(
         '--heuristic_guidance_outside_pool_logit_penalty',
@@ -4492,8 +4498,12 @@ def parse_pugan_args(parser, file_day, file_time):
         float(getattr(args, "heuristic_guidance_final_where_weight", 0.25)), 0.0
     )
     args.heuristic_guidance_network_residual_weight = max(
-        float(getattr(args, "heuristic_guidance_network_residual_weight", 0.50)), 0.0
+        float(getattr(args, "heuristic_guidance_network_residual_weight", 0.05)), 0.0
     )
+    args.heuristic_guidance_online_amount_residual_scale = min(max(
+        float(getattr(args, "heuristic_guidance_online_amount_residual_scale", 0.10)),
+        0.0,
+    ), 0.25)
     args.heuristic_guidance_outside_pool_logit_penalty = max(
         float(getattr(args, "heuristic_guidance_outside_pool_logit_penalty", 20.0)), 0.0
     )
@@ -4730,7 +4740,7 @@ def parse_pugan_args(parser, file_day, file_time):
             args.repair_amount_target_mode = "none"
         if not _cli_option_was_provided("--sparsepcgc_algorithmic_amount_bins"):
             args.sparsepcgc_algorithmic_amount_bins = (
-                "0.0005,0.0010,0.0025,0.0050,0.0099"
+                "0.00225,0.002375,0.0025,0.002625,0.00275"
             )
         if not _cli_option_was_provided("--sparsepcgc_algorithmic_amount_init_ratio"):
             args.sparsepcgc_algorithmic_amount_init_ratio = 0.0025

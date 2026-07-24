@@ -3545,7 +3545,7 @@ class StructureRepairActuator(nn.Module):
             "Adjust": learned_move_ratio.float().mean().clamp_min(1e-9),
         }
         amount_beta = min(max(float(
-            getattr(self.args, "heuristic_guidance_online_amount_residual_scale", 0.35)
+            getattr(self.args, "heuristic_guidance_online_amount_residual_scale", 0.10)
         ), 0.0), 1.0)
         ratio_tensors = {}
         for name in operations:
@@ -3574,7 +3574,7 @@ class StructureRepairActuator(nn.Module):
         raw_bins = str(getattr(
             self.args,
             "heuristic_guidance_online_amount_bins",
-            "0.0005,0.0010,0.0025,0.0050,0.0099",
+            "0.00225,0.002375,0.0025,0.002625,0.00275",
         ))
         try:
             amount_bins = sorted({
@@ -3582,7 +3582,7 @@ class StructureRepairActuator(nn.Module):
                 for value in raw_bins.split(",") if value.strip()
             })
         except (TypeError, ValueError):
-            amount_bins = [0.0005, 0.0010, 0.0025, 0.0050, max_total_ratio]
+            amount_bins = [0.00225, 0.002375, 0.0025, 0.002625, 0.00275]
         if not amount_bins:
             raise RuntimeError("ana_den6 online Amount離散binが空である")
         bin_tensor = next(iter(ratio_tensors.values())).new_tensor(amount_bins)
@@ -3704,7 +3704,7 @@ class StructureRepairActuator(nn.Module):
             add_pair_logits,
         )
         residual_weight = max(
-            float(getattr(self.args, "heuristic_guidance_network_residual_weight", 0.50)),
+            float(getattr(self.args, "heuristic_guidance_network_residual_weight", 0.05)),
             0.0,
         )
         temperature = max(float(
@@ -3834,6 +3834,20 @@ class StructureRepairActuator(nn.Module):
         )
 
         selected_ids = [str(candidate.get("candidate_id", "")) for _, _, candidate in selected]
+        anchor_plan_for_delta = exact.get(
+            "heuristic_anchor_plan", exact.get("initial_heuristic_plan", {})
+        )
+        anchor_ids_for_delta = set(
+            str(value) for value in (
+                anchor_plan_for_delta.get("candidate_ids", ())
+                if isinstance(anchor_plan_for_delta, dict) else ()
+            )
+        )
+        selected_id_set = set(selected_ids)
+        residual_changed_count = len(selected_id_set.symmetric_difference(anchor_ids_for_delta))
+        residual_changed_ratio = residual_changed_count / max(
+            float(len(selected_id_set | anchor_ids_for_delta)), 1.0
+        )
         selected_total_ratio = sum(selected_counts.values()) / max(float(point_count), 1.0)
         selected_changed_ratio = (
             selected_counts["Add"] + selected_counts["Prune"] + 2 * selected_counts["Adjust"]
@@ -3862,6 +3876,9 @@ class StructureRepairActuator(nn.Module):
             "variant_index": 0,
             "selected_candidate_ids": selected_ids,
             "residual_alpha": float(residual_alpha),
+            "where_residual_weight": float(residual_weight),
+            "residual_changed_candidate_count": int(residual_changed_count),
+            "residual_changed_candidate_ratio": float(residual_changed_ratio),
             "anchor_phase": float(anchor_phase),
             "requested_counts": requested_counts,
             "amount_bin_index": int(selected_amount_bin.detach().cpu()),
