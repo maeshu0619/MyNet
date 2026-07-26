@@ -1078,6 +1078,9 @@ class SurrogateCompressionLossMixin:
         policy_actual_noop_guard_raw_total_bit = float("nan")
         policy_actual_noop_guard_raw_edit_record_bits = float("nan")
         cached_gt = None
+        baseline_actual_encode_count = 0
+        current_gt_actual_encode_time = 0.0
+        current_gen_actual_encode_time = 0.0
         local_proxy_rate_target_value = float("nan")
         local_proxy_aux_target_value = float("nan")
         local_proxy_rate_error = ""
@@ -1100,11 +1103,13 @@ class SurrogateCompressionLossMixin:
         if teacher_refreshed:
             actual_t0 = time.time() if timing_enabled else 0.0
             cached_gt = self._get_cached_actual_gt(cache_key)
-            baseline_actual_encode_count = 0
             if cached_gt is None:
                 cached_gt = self._encode_actual_batch(args, gt_xyz)
                 self._store_cached_actual_gt(cache_key, cached_gt)
                 baseline_actual_encode_count = 1
+                current_gt_actual_encode_time = float(
+                    cached_gt.get("encode_time", 0.0)
+                )
             # actual codec教師は評価指標なので、train用ノイズなしの編集点群で測る。
             actual_xyz = gen_xyz if actual_gen_xyz is None else actual_gen_xyz
             actual_final_w = final_w
@@ -1155,6 +1160,9 @@ class SurrogateCompressionLossMixin:
                         raise RuntimeError("ana_den6_onlineは1 Step = 1 edited actual encodeのためbatch_size=1が必要")
                     self._guard_den6_online_edited_actual_encode(args)
                 stats_gen = self._encode_actual_batch(args, actual_xyz, final_w=actual_final_w)
+                current_gen_actual_encode_time = float(
+                    stats_gen.get("encode_time", 0.0)
+                )
                 if den6_online_train:
                     self._den6_online_actual_audit = {
                         "baseline": int(baseline_actual_encode_count),
@@ -2067,10 +2075,12 @@ class SurrogateCompressionLossMixin:
                 "gen_actual_bit": gen_actual_bit,
                 "gen_total_bit_with_edit_record": float(gen_total_bit_with_edit_record),
                 "actual_edit_record_bits": float(actual_edit_record_bits),
-                "gt_actual_encode_time": float(cached_gt.get("encode_time", 0.0)),
-            "gen_actual_encode_time": float(stats_gen.get("encode_time", 0.0)) if stats_gen is not None else 0.0,
-            "actual_encode_time_total": float(cached_gt.get("encode_time", 0.0))
-            + (float(stats_gen.get("encode_time", 0.0)) if stats_gen is not None else 0.0),
+                # Cache entryに保存された過去の生成時間ではなく、このStepで
+                # 実際にcodecを呼んだ時間だけを計上する。
+                "gt_actual_encode_time": float(current_gt_actual_encode_time),
+            "gen_actual_encode_time": float(current_gen_actual_encode_time),
+            "actual_encode_time_total": float(current_gt_actual_encode_time)
+            + float(current_gen_actual_encode_time),
             "gt_unique_coord_count": int(cached_gt.get("unique_coord_count", cached_gt.get("point_count", 0))),
             "gen_unique_coord_count": int(
                 stats_gen.get("unique_coord_count", stats_gen.get("point_count", gen_points))

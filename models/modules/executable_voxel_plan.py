@@ -234,6 +234,8 @@ class ExecutableVoxelPlanBuilder:
         operation_enabled: Optional[torch.Tensor] = None,
         source_indices: Optional[torch.Tensor] = None,
         debug_hash: bool = False,
+        collect_reject_reasons: bool = True,
+        assume_unique_coords: bool = False,
     ) -> ExecutableVoxelPlanBatch:
         coords = self._normalise_coords(voxel_coords)
         if operation_scores.ndim != 4 or operation_scores.shape[2] != 3:
@@ -292,7 +294,16 @@ class ExecutableVoxelPlanBuilder:
         # B/K/operationだけを制御loopとし、点ごとのPython loopは作らない。
         initial_unique_counts = []
         for b in range(batch):
-            initial = torch.unique(coords[b], dim=0, sorted=True)
+            # Networkのcanonical voxel入力は既に一意である。推論hot pathでは
+            # 100万行の再uniqueを避け、debug時だけ契約違反を検査する。
+            if assume_unique_coords:
+                initial = coords[b]
+                if debug_hash and int(torch.unique(initial, dim=0).shape[0]) != int(
+                    initial.shape[0]
+                ):
+                    raise ValueError("assume_unique_coords=Trueだが重複Voxelが存在する")
+            else:
+                initial = torch.unique(coords[b], dim=0, sorted=True)
             initial_unique_counts.append(int(initial.shape[0]))
             initial_membership = _StaticRowMembershipIndex(initial, padding=1)
             for k in range(slots):
@@ -304,7 +315,8 @@ class ExecutableVoxelPlanBuilder:
                     if wanted <= 0:
                         continue
                     if not bool(enabled[b, k, operation]):
-                        reject_reason[b, k, operation, 7] += wanted
+                        if collect_reject_reasons:
+                            reject_reason[b, k, operation, 7] += wanted
                         continue
                     scores = operation_scores[b, k, operation]
                     finite = torch.isfinite(scores)
@@ -314,7 +326,8 @@ class ExecutableVoxelPlanBuilder:
                         max(wanted, wanted * self.source_window_multiplier),
                     )
                     if source_window <= 0:
-                        reject_reason[b, k, operation, 8] += wanted
+                        if collect_reject_reasons:
+                            reject_reason[b, k, operation, 8] += wanted
                         continue
                     ranked_values, ranked = torch.topk(
                         scores.masked_fill(~finite, -torch.inf),
@@ -326,21 +339,24 @@ class ExecutableVoxelPlanBuilder:
                     ranked = candidate_source_index[b].index_select(0, ranked_local)
                     ranked_coords = coords[b].index_select(0, ranked)
                     unique_source = _first_row_mask(ranked_coords)
-                    reject_reason[b, k, operation, 0] += int((~unique_source).sum().item())
+                    if collect_reject_reasons:
+                        reject_reason[b, k, operation, 0] += (~unique_source).sum()
                     ranked_local = ranked_local[unique_source]
                     ranked = ranked[unique_source]
                     ranked_coords = ranked_coords[unique_source]
                     still_present = ~_row_membership(ranked_coords, removed)
-                    reject_reason[b, k, operation, 1] += int((~still_present).sum().item())
+                    if collect_reject_reasons:
+                        reject_reason[b, k, operation, 1] += (~still_present).sum()
                     ranked_local = ranked_local[still_present]
                     ranked = ranked[still_present]
                     ranked_coords = ranked_coords[still_present]
 
                     if operation == PRUNE:
                         take = min(wanted, int(ranked.numel()))
-                        reject_reason[b, k, operation, 8] += max(
-                            int(ranked.numel()) - wanted, 0
-                        )
+                        if collect_reject_reasons:
+                            reject_reason[b, k, operation, 8] += max(
+                                int(ranked.numel()) - wanted, 0
+                            )
                         chosen_index = ranked[:take]
                         chosen_local_index = ranked_local[:take]
                         chosen_source = ranked_coords[:take]
@@ -365,7 +381,8 @@ class ExecutableVoxelPlanBuilder:
                             else:
                                 mask = mask.index_select(0, ranked)
                             valid_direction &= mask.to(torch.bool)
-                        reject_reason[b, k, operation, 4] += int((~valid_direction).sum().item())
+                        if collect_reject_reasons:
+                            reject_reason[b, k, operation, 4] += (~valid_direction).sum()
                         target = ranked_coords[:, None, :] + offsets.view(1, 26, 3)
                         domain_valid = torch.ones_like(valid_direction)
                         if target_coord_min is not None:
@@ -383,19 +400,28 @@ class ExecutableVoxelPlanBuilder:
                             if supplied.shape != domain_valid.shape:
                                 raise ValueError("target valid provider must return [source_count,26]")
                             domain_valid &= supplied
-                        reject_reason[b, k, operation, 5] += int(
-                            ((~domain_valid) & valid_direction).sum().item()
-                        )
+                        if collect_reject_reasons:
+                            reject_reason[b, k, operation, 5] += (
+                                (~domain_valid) & valid_direction
+                            ).sum()
                         occupied = initial_membership.contains(
                             target.reshape(-1, 3)
                         ).view(window, 26)
-                        reject_reason[b, k, operation, 2] += int((occupied & valid_direction).sum().item())
+                        if collect_reject_reasons:
+                            reject_reason[b, k, operation, 2] += (
+                                occupied & valid_direction
+                            ).sum()
                         valid = valid_direction & domain_valid & ~occupied
                         # 既採用targetとの重複およびsource-target交差をoperation順に解決する。
                         duplicate_target = _row_membership(target.reshape(-1, 3), added).view(window, 26)
                         conflict = _row_membership(target.reshape(-1, 3), removed).view(window, 26)
-                        reject_reason[b, k, operation, 3] += int((duplicate_target & valid).sum().item())
-                        reject_reason[b, k, operation, 6] += int((conflict & valid).sum().item())
+                        if collect_reject_reasons:
+                            reject_reason[b, k, operation, 3] += (
+                                duplicate_target & valid
+                            ).sum()
+                            reject_reason[b, k, operation, 6] += (
+                                conflict & valid
+                            ).sum()
                         valid &= ~duplicate_target & ~conflict
                         pair_score = scores.index_select(0, ranked_local).unsqueeze(1) + direction
                         flat_order = torch.argsort(
@@ -413,12 +439,16 @@ class ExecutableVoxelPlanBuilder:
                         source_first = _first_row_mask(pair_source_coord)
                         target_first = _first_row_mask(pair_target)
                         admissible = source_first & target_first
-                        reject_reason[b, k, operation, 0] += int((~source_first).sum().item())
-                        reject_reason[b, k, operation, 3] += int((source_first & ~target_first).sum().item())
+                        if collect_reject_reasons:
+                            reject_reason[b, k, operation, 0] += (~source_first).sum()
+                            reject_reason[b, k, operation, 3] += (
+                                source_first & ~target_first
+                            ).sum()
                         selected_pair = admissible.nonzero(as_tuple=False).flatten()[:wanted]
-                        reject_reason[b, k, operation, 8] += max(
-                            int(admissible.sum().item()) - wanted, 0
-                        )
+                        if collect_reject_reasons:
+                            reject_reason[b, k, operation, 8] += torch.clamp(
+                                admissible.sum() - wanted, min=0
+                            )
                         take = int(selected_pair.numel())
                         chosen_index = pair_source_index.index_select(0, selected_pair)
                         chosen_local_index = pair_source_local_index.index_select(0, selected_pair)

@@ -78,6 +78,39 @@ class SinglePlanStudentTest(unittest.TestCase):
         ))
         self.assertEqual(full["executable_plan"].plan_hash, tiled["executable_plan"].plan_hash)
 
+    def test_fast_inference_builder_keeps_executable_plan(self):
+        torch.manual_seed(9)
+        points = 1024
+        coords = torch.stack((
+            torch.arange(points) * 2, torch.zeros(points, dtype=torch.long),
+            torch.zeros(points, dtype=torch.long),
+        )).view(1, 3, points)
+        features = torch.randn(1, 12, points)
+        fixed = torch.randn(1, 6, points)
+        model = SinglePlanStudentPolicy(12, hidden_dim=16).eval()
+        diagnostic_args = _args()
+        diagnostic_args.single_plan_collect_reject_reasons = True
+        fast_args = _args()
+        fast_args.single_plan_debug_hash = True
+        fast_args.single_plan_collect_reject_reasons = False
+        with torch.no_grad():
+            diagnostic = model(
+                features, coords, diagnostic_args, training=False,
+                fixed_features=fixed,
+            )
+            fast = model(
+                features, coords, fast_args, training=False,
+                fixed_features=fixed,
+            )
+        self.assertEqual(
+            diagnostic["executable_plan"].plan_hash,
+            fast["executable_plan"].plan_hash,
+        )
+        self.assertTrue(torch.equal(
+            diagnostic["executable_plan"].accepted_count,
+            fast["executable_plan"].accepted_count,
+        ))
+
 
 if __name__ == "__main__":
     unittest.main()

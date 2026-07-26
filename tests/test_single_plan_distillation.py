@@ -4,6 +4,7 @@ import unittest
 import torch
 
 from models.modules.single_plan_student import SinglePlanStudentPolicy
+from models.network import Network
 from models.utils.loss.single_plan_distillation import SinglePlanDistillationLoss
 
 
@@ -49,7 +50,42 @@ class SinglePlanDistillationTest(unittest.TestCase):
         self.assertIsNotNone(model.policy.local_cost_head.weight.grad)
         self.assertGreater(float(model.policy.local_cost_head.weight.grad.abs().sum()), 0.0)
 
+    def test_den6_shadow_distillation_updates_persistent_counter(self):
+        """Exact訓練中だけshadow蒸留を許可し、checkpoint契約値を増やす。"""
+        class _Loss(torch.nn.Module):
+            def forward(self, terms, voxel_coords, teacher):
+                del voxel_coords, teacher
+                value = terms["probe"].pow(2).mean()
+                return value, {"probe": float(value.detach())}
+
+        network = Network.__new__(Network)
+        torch.nn.Module.__init__(network)
+        network.args = SimpleNamespace(
+            heuristic_guidance_mode="ana_den6_online",
+            single_plan_shadow_distillation=True,
+            single_plan_distillation_weight=1.0,
+        )
+        network.last_single_plan_student_terms = {
+            "probe": torch.tensor([2.0], requires_grad=True)
+        }
+        network.last_actuator_voxel_state = {
+            "initial_voxel_coords": torch.zeros((1, 3, 1), dtype=torch.long)
+        }
+        network.single_plan_distillation_loss_module = _Loss()
+        network.last_single_plan_distillation_debug = {}
+        network.register_buffer(
+            "single_plan_distillation_updates",
+            torch.zeros((), dtype=torch.long),
+        )
+        network.training = True
+        loss = network.single_plan_teacher_distillation_loss({"plan_key": "one"})
+        loss.backward()
+        self.assertEqual(int(network.single_plan_distillation_updates), 1)
+        self.assertGreater(
+            float(network.last_single_plan_student_terms["probe"].grad.abs().sum()),
+            0.0,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
-

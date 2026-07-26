@@ -2817,6 +2817,24 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--single_plan_policy_gradient_weight', default=0.0, type=float)
     parser.add_argument('--single_plan_feature_cache_enabled', default=False, type=str2bool)
     parser.add_argument(
+        '--single_plan_shadow_distillation',
+        default=True,
+        type=str2bool,
+        help='ana_den6_online訓練で実行した1 planを同時にSingle-Plan Studentへ蒸留する',
+    )
+    parser.add_argument(
+        '--test_force_single_plan_student',
+        default=True,
+        type=str2bool,
+        help='SparsePCGC推論をCache/denなしのSingle-Plan Studentへ強制する',
+    )
+    parser.add_argument(
+        '--test_require_trained_single_plan_student',
+        default=True,
+        type=str2bool,
+        help='蒸留更新0回のcheckpointをNetwork-only推論で拒否する',
+    )
+    parser.add_argument(
         '--single_plan_teacher_datasets',
         default=(
             '/data/maejima/log/mynet_kproposal_offline/8i_actual_plans.json.gz,'
@@ -3048,9 +3066,9 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--heuristic_guidance_online_memory_entries',
-        default=4,
+        default=64,
         type=int,
-        help='process内に保持するframe別den6候補payload数',
+        help='process内にimmutable保持するframe別den6 Exact payload数',
     )
     parser.add_argument(
         '--heuristic_guidance_online_prefetch_workers',
@@ -3147,6 +3165,24 @@ def parse_pugan_args(parser, file_day, file_time):
         default=2.0,
         type=float,
         help='single-proposal Actual policy advantageの絶対値上限',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_geometry_policy_weight',
+        default=0.10,
+        type=float,
+        help='圧縮改善を維持したplanのGeometry改善を離散Amountへ返す二次方策重み',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_geometry_compression_tolerance',
+        default=0.25,
+        type=float,
+        help='Geometry方策更新を許可するActual圧縮率EMAからの悪化許容幅[percentage point]',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_geometry_advantage_clip',
+        default=0.25,
+        type=float,
+        help='Geometry相対改善advantageの絶対値上限',
     )
     parser.add_argument(
         '--heuristic_guidance_online_grad_audit',
@@ -3255,6 +3291,18 @@ def parse_pugan_args(parser, file_day, file_time):
         default=8,
         type=int,
         help='frame/subtree別にTensor化済みden6 candidate guidanceを保持する最大件数',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_cpu_tensor_cache_entries',
+        default=64,
+        type=int,
+        help='固定den6候補の座標写像をCPUに保持する最大frame数',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_cpu_tensor_cache_max_memory_mb',
+        default=2048,
+        type=int,
+        help='固定den6候補のCPU座標写像キャッシュ上限(MB)',
     )
     parser.add_argument(
         '--heuristic_guidance_disable_full_cloud_amount_override',
@@ -3732,6 +3780,8 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--full_cloud_saved_tensor_cpu_offload_mb', default=1.0, type=float, help='full-cloud Actuatorのbackward用FP32 Tensorを公式save_on_cpuで可逆退避するか（0で無効、正数で有効）')
     parser.add_argument('--full_cloud_saved_tensor_pin_memory', default=False, type=str2bool, help='save_on_cpu退避をpinned memoryに置くか。長時間学習では共有メモリ増加を避けるため既定False')
     parser.add_argument('--structure_neighbor_query_chunk', default=32768, type=int, help='26近傍occupancyを完全一致のまま分割検索する点数（小さいほど一時GPUメモリを削減）')
+    parser.add_argument('--structure_fixed_cache_max_entries', default=64, type=int, help='固定GTの26近傍・parent分割CPUキャッシュ最大件数')
+    parser.add_argument('--structure_fixed_cache_max_memory_mb', default=4096, type=int, help='固定GTの26近傍・parent分割CPUキャッシュ上限(MB)')
     parser.add_argument('--den6_online_release_cuda_cache_before_actuator', default=True, type=str2bool, help='構造解析終了後に不要となったCUDA検索workspace cacheをActuator前に返却する')
     parser.add_argument('--den6_online_release_cuda_cache_before_actual', default=True, type=str2bool, help='ana_den6_onlineの実圧縮worker起動直前に未使用CUDA allocator cacheだけを返却し、2プロセス重複時のGPU使用量を抑える')
     parser.add_argument('--amp_init_scale', default=1.0, type=float, help='GradScaler初期値')
@@ -3739,7 +3789,13 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--cache_frozen_inputs', default=True, type=str2bool, help='Encoder出力をキャッシュするか')
     parser.add_argument('--cache_gt_loss', default=True, type=str2bool, help='GT側損失をキャッシュするか')
     parser.add_argument('--cache_max_entries', default=192, type=int, help='キャッシュ最大数')
-    parser.add_argument('--cache_max_memory_mb', default=8192, type=int, help='キャッシュ最大メモリ（MB）')
+    parser.add_argument('--cache_max_memory_mb', default=12288, type=int, help='固定Node CPUキャッシュ最大メモリ（MB）')
+    parser.add_argument(
+        '--static_node_cache_cpu',
+        default=True,
+        type=str2bool,
+        help='固定Node/Voxel入力をFP32のままCPUへ保持し、使用frameだけGPUへ戻す',
+    )
     parser.add_argument('--auto_disable_partial_frozen_cache', default=True, type=str2bool, help='キャッシュ不足時に自動無効化するか')
     parser.add_argument('--clear_main_ply_cache_for_workers', default=True, type=str2bool, help='メモリ重複を防ぐためキャッシュ削除')
     parser.add_argument('--warmup_frozen_cache', default=False, type=str2bool, help='事前にキャッシュを作るか')
@@ -4252,6 +4308,15 @@ def parse_pugan_args(parser, file_day, file_time):
     args.single_plan_distillation_weight = max(
         float(getattr(args, "single_plan_distillation_weight", 1.0)), 0.0
     )
+    args.single_plan_shadow_distillation = bool(
+        getattr(args, "single_plan_shadow_distillation", True)
+    )
+    args.test_force_single_plan_student = bool(
+        getattr(args, "test_force_single_plan_student", True)
+    )
+    args.test_require_trained_single_plan_student = bool(
+        getattr(args, "test_require_trained_single_plan_student", True)
+    )
     args.single_plan_policy_gradient_weight = max(
         float(getattr(args, "single_plan_policy_gradient_weight", 0.0)), 0.0
     )
@@ -4534,7 +4599,7 @@ def parse_pugan_args(parser, file_day, file_time):
         int(getattr(args, "heuristic_guidance_online_full_pool_limit", 0)), 0
     )
     args.heuristic_guidance_online_memory_entries = max(
-        int(getattr(args, "heuristic_guidance_online_memory_entries", 4)), 1
+        int(getattr(args, "heuristic_guidance_online_memory_entries", 64)), 1
     )
     args.heuristic_guidance_online_prefetch_workers = max(
         int(getattr(args, "heuristic_guidance_online_prefetch_workers", 2)), 0

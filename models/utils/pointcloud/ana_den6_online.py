@@ -420,11 +420,47 @@ def _load_exact_single_plan_teacher(
         "ana_den6_exact_unique_plan_online_v6",
         "ana_den6_exact_one_pattern_anchor_online_v6",
     }
-    exact_cache_paths = list(root.glob(f"{dataset}_{stem}_{setting_id}_*.pt"))
-    exact_cache_paths += list(root.glob(f"exact_single_plan_{dataset}_{stem}_{setting_id}_*.json"))
     reserve_factor = min(max(float(getattr(
         args, "heuristic_guidance_online_compact_reserve_factor", 4.0
     )), 1.0), 4.0)
+
+    exact_identity_key = "|".join((
+            "exact_single_plan_teacher_v8",
+            str(identity["input_sha256"]),
+            str(identity["dataset"]),
+            str(identity["setting_id"]),
+            str(identity["codec_mode"]),
+            str(identity["checkpoint_identifier"]),
+            str(reserve_factor),
+    ))
+
+    def load_memory() -> dict[str, Any] | None:
+        cached = _GLOBAL_PAYLOAD_CACHE.get(exact_identity_key)
+        if not isinstance(cached, Mapping):
+            return None
+        _GLOBAL_PAYLOAD_CACHE.move_to_end(exact_identity_key)
+        _CACHE_STATS["memory_hit"] += 1
+        _CACHE_STATS["exact_teacher_hit"] += 1
+        setattr(args, "_ana_den6_online_cache_stats", dict(_CACHE_STATS))
+        return dict(cached)
+
+    def store_memory(path: Path, teacher: Mapping[str, Any]) -> None:
+        del path
+        _GLOBAL_PAYLOAD_CACHE[exact_identity_key] = dict(teacher)
+        _GLOBAL_PAYLOAD_CACHE.move_to_end(exact_identity_key)
+        max_entries = max(
+            int(getattr(args, "heuristic_guidance_online_memory_entries", 64)), 1
+        )
+        while len(_GLOBAL_PAYLOAD_CACHE) > max_entries:
+            _GLOBAL_PAYLOAD_CACHE.popitem(last=False)
+
+    memory_teacher = load_memory()
+    if memory_teacher is not None:
+        return memory_teacher
+    exact_cache_paths = list(root.glob(f"{dataset}_{stem}_{setting_id}_*.pt"))
+    exact_cache_paths += list(
+        root.glob(f"exact_single_plan_{dataset}_{stem}_{setting_id}_*.json")
+    )
     for path in sorted(exact_cache_paths):
         try:
             candidate = (
@@ -484,6 +520,7 @@ def _load_exact_single_plan_teacher(
         teacher["cache_signature"] = hashlib.sha256(
             (str(path.resolve()) + "|" + str(identity["input_sha256"])).encode("utf-8")
         ).hexdigest()
+        store_memory(path, teacher)
         _CACHE_STATS["exact_teacher_hit"] += 1
         setattr(args, "_ana_den6_online_cache_stats", dict(_CACHE_STATS))
         return teacher
@@ -585,6 +622,7 @@ def _load_exact_single_plan_teacher(
                 (str(path.resolve()) + "|" + str(identity["input_sha256"])).encode("utf-8")
             ).hexdigest(),
         }
+        store_memory(path, teacher)
         _CACHE_STATS["exact_teacher_hit"] += 1
         setattr(args, "_ana_den6_online_cache_stats", dict(_CACHE_STATS))
         return teacher

@@ -63,6 +63,7 @@ class Network(nn.Module):
         self.last_actuator_soft_terms = {} # 直近Forward時の微分可能な点操作proxyを保存する辞書
         self.last_runtime_timing = {} # 直近Forward時の実行時間計測結果を保存する辞書を初期化
         self._den6_online_objective_baseline = OrderedDict()
+        self._den6_online_geometry_baseline = OrderedDict()
         self.last_discrete_policy_debug = {}
         self.last_k_proposal_terms = None
         self.last_single_plan_student_terms = None
@@ -71,6 +72,11 @@ class Network(nn.Module):
         self._network_k_actual_replay = OrderedDict()
         self._network_k_previous_plan_hashes = {}
         self._network_k_previous_distribution_means = {}
+        # checkpointへ保存し、未学習Studentを推論で誤使用しないための契約値。
+        self.register_buffer(
+            "single_plan_distillation_updates",
+            torch.zeros((), dtype=torch.long),
+        )
 
         """モジュールセットアップ"""
         self.encoder = PointTransformer(self.args) # 特徴抽出器
@@ -223,14 +229,64 @@ class Network(nn.Module):
         return max_entries, max_memory_mb * 1024 * 1024
 
     @staticmethod
-    def _input_cache_value_bytes(value):
+    def _input_cache_value_bytes(value, seen=None):
+        if seen is None:
+            seen = set()
         if torch.is_tensor(value):
+            storage = value.untyped_storage() if hasattr(value, "untyped_storage") else value.storage()
+            identity = (str(value.device), int(storage.data_ptr()))
+            if identity in seen:
+                return 0
+            seen.add(identity)
             return int(value.numel()) * int(value.element_size())
         if isinstance(value, dict):
-            return sum(Network._input_cache_value_bytes(item) for item in value.values())
+            return sum(
+                Network._input_cache_value_bytes(item, seen)
+                for item in value.values()
+            )
         if isinstance(value, (list, tuple)):
-            return sum(Network._input_cache_value_bytes(item) for item in value)
+            return sum(Network._input_cache_value_bytes(item, seen) for item in value)
         return 0
+
+    @staticmethod
+    def _clone_static_cache_value(value, device, memo=None):
+        """固定Node入力を値不変のままCPU/GPU間で複製する。
+
+        同じTensorを複数keyが参照する場合はaliasを維持し、容量と転送を重複
+        させない。固定入力は学習対象でないためautograd graphは保持しない。
+        """
+        if memo is None:
+            memo = {}
+        if torch.is_tensor(value):
+            identity = id(value)
+            cached = memo.get(identity)
+            if cached is not None:
+                return cached
+            detached = value.detach()
+            # device転送自体が独立storageを作るため、転送後の二重cloneを避ける。
+            cloned = (
+                detached.clone()
+                if detached.device == torch.device(device)
+                else detached.to(device=device)
+            )
+            memo[identity] = cloned
+            return cloned
+        if isinstance(value, dict):
+            return {
+                key: Network._clone_static_cache_value(item, device, memo)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [
+                Network._clone_static_cache_value(item, device, memo)
+                for item in value
+            ]
+        if isinstance(value, tuple):
+            return tuple(
+                Network._clone_static_cache_value(item, device, memo)
+                for item in value
+            )
+        return value
 
     def _static_node_cache_key(self, cache_key, source):
         if not cache_key:
@@ -261,13 +317,13 @@ class Network(nn.Module):
         state = entry.get("state")
         if not isinstance(state, dict):
             return None
-        # Cached states are immutable detached tensors.  The normal forward
-        # path never writes them in-place, so returning the GPU tensors avoids
-        # a second full-cloud device copy on every episode.
+        self.input_cache.move_to_end(key)
+        if bool(getattr(self.args, "static_node_cache_cpu", True)):
+            return self._clone_static_cache_value(state, device)
+        # GPU cache互換modeでも別deviceのTensorは使用しない。
         for value in state.values():
             if torch.is_tensor(value) and value.device != device:
                 return None
-        self.input_cache.move_to_end(key)
         return state
 
     def _put_static_node_cache(self, cache_key, source, state):
@@ -277,20 +333,21 @@ class Network(nn.Module):
         max_entries, max_bytes = self._input_cache_limits()
         if not key or max_entries <= 0 or max_bytes <= 0:
             return
-        cached_state = {
-            name: value.detach() if torch.is_tensor(value) else value
-            for name, value in state.items()
-        }
+        cached_state = (
+            self._clone_static_cache_value(state, torch.device("cpu"))
+            if bool(getattr(self.args, "static_node_cache_cpu", True))
+            else {
+                name: value.detach() if torch.is_tensor(value) else value
+                for name, value in state.items()
+            }
+        )
         entry_bytes = self._input_cache_value_bytes(cached_state)
         # Do not evict the whole useful cache for a frame that cannot fit.
         if entry_bytes > max_bytes:
             return
         # Training scans every frame sequentially and revisits it only in the
-        # next episode.  If the complete working set cannot fit, an LRU of
-        # these large GPU tensors has zero reuse: the early frames evict the
-        # late frames before either can be hit.  Bypass that provably
-        # thrashing cache.  This changes neither inputs nor arithmetic; it
-        # only avoids retaining several GB of unreachable tensors.
+        # next episode.  If the complete working set cannot fit, an LRUには
+        # 再利用がないためbypassする。CPU cache既定ならGPUメモリは消費しない。
         expected_entries = max(int(getattr(self, "expected_input_cache_entries", 0)), 0)
         capacity_by_bytes = int(max_bytes // max(entry_bytes, 1))
         effective_capacity = min(int(max_entries), int(capacity_by_bytes))
@@ -321,7 +378,7 @@ class Network(nn.Module):
     #     return None
 
     """補助関数"""
-    def discrete_policy_loss(self, reward):
+    def discrete_policy_loss(self, reward, geometry=None):
         """Update the executed one-plan policy from the actual codec scalar."""
         if not torch.is_tensor(reward):
             raise TypeError("discrete_policy_lossのrewardはTensorである必要がある")
@@ -390,6 +447,78 @@ class Network(nn.Module):
         entropy_weighted = -entropy_weight * entropy_raw
         if torch.is_tensor(entropy):
             policy_loss = policy_loss + entropy_weighted
+        # hard整数化されたExact Amountは通常のGeometry lossから微分できない。
+        # 圧縮改善を保つplanだけに限定し、実測Geometryの改善をAmount方策へ
+        # 二次的に返す。操作量を減らす方向そのものは固定しない。
+        geometry_policy_raw = objective.new_zeros(())
+        geometry_policy_weighted = objective.new_zeros(())
+        geometry_advantage = objective.new_zeros(())
+        geometry_guard_passed = False
+        amount_log_prob = state.get("den6_online_amount_log_prob", None)
+        if (
+            mode == "ana_den6_online"
+            and torch.is_tensor(geometry)
+            and torch.is_tensor(amount_log_prob)
+        ):
+            geometry_baseline = getattr(
+                self, "_den6_online_geometry_baseline", None
+            )
+            if geometry_baseline is None:
+                geometry_baseline = OrderedDict()
+                self._den6_online_geometry_baseline = geometry_baseline
+            geometry_objective = torch.nan_to_num(
+                geometry.float().mean(), nan=0.0, posinf=1e3, neginf=0.0
+            )
+            geometry_seen = cache_key in geometry_baseline
+            previous_geometry = float(geometry_baseline.get(
+                cache_key, float(geometry_objective.detach().cpu())
+            ))
+            compression_tolerance = max(float(getattr(
+                self.args,
+                "heuristic_guidance_online_geometry_compression_tolerance",
+                0.25,
+            )), 0.0)
+            geometry_guard_passed = bool(
+                float(objective.detach().cpu())
+                <= min(
+                    0.0,
+                    float(effective_baseline_t.detach().cpu()) + compression_tolerance,
+                )
+            )
+            if geometry_seen and geometry_guard_passed:
+                previous_geometry_t = geometry_objective.new_tensor(previous_geometry)
+                geometry_advantage = (
+                    previous_geometry_t - geometry_objective.detach()
+                ) / previous_geometry_t.abs().clamp_min(1e-8)
+                geometry_clip = max(float(getattr(
+                    self.args,
+                    "heuristic_guidance_online_geometry_advantage_clip",
+                    0.25,
+                )), 0.0)
+                if geometry_clip > 0.0:
+                    geometry_advantage = geometry_advantage.clamp(
+                        -geometry_clip, geometry_clip
+                    )
+                geometry_policy_raw = (
+                    -geometry_advantage * amount_log_prob.float().mean()
+                )
+                geometry_weight = max(float(getattr(
+                    self.args,
+                    "heuristic_guidance_online_geometry_policy_weight",
+                    0.10,
+                )), 0.0)
+                geometry_policy_weighted = geometry_weight * geometry_policy_raw
+                policy_loss = policy_loss + geometry_policy_weighted
+            if geometry_guard_passed:
+                updated_geometry = (
+                    (1.0 - baseline_alpha) * previous_geometry
+                    + baseline_alpha * float(geometry_objective.detach().cpu())
+                    if geometry_seen else float(geometry_objective.detach().cpu())
+                )
+                geometry_baseline[cache_key] = updated_geometry
+                geometry_baseline.move_to_end(cache_key)
+                while len(geometry_baseline) > 4096:
+                    geometry_baseline.popitem(last=False)
         adaptive_amount_entropy = objective.new_zeros(())
         adaptive_amount_entropy_weighted = objective.new_zeros(())
         if mode in {"network_only_codec_policy", "network_k_proposal_policy", "single_plan_student"}:
@@ -428,6 +557,10 @@ class Network(nn.Module):
             "policy_core_weighted": float(policy_core_weighted.detach().cpu()),
             "entropy_raw": float(entropy_raw.detach().cpu()),
             "entropy_weighted": float(entropy_weighted.detach().cpu()),
+            "geometry_policy_guard_passed": bool(geometry_guard_passed),
+            "geometry_policy_advantage": float(geometry_advantage.detach().cpu()),
+            "geometry_policy_raw": float(geometry_policy_raw.detach().cpu()),
+            "geometry_policy_weighted": float(geometry_policy_weighted.detach().cpu()),
             "adaptive_amount_entropy_raw": float(adaptive_amount_entropy.detach().cpu()),
             "adaptive_amount_entropy_weighted": float(adaptive_amount_entropy_weighted.detach().cpu()),
             "baseline_ema_alpha": float(baseline_alpha),
@@ -471,8 +604,15 @@ class Network(nn.Module):
 
     def single_plan_teacher_distillation_loss(self, teacher):
         """訓練専用Teacherラベルを現在のStudent出力へ適用する。"""
-        if str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower() != "single_plan_student":
-            raise RuntimeError("Single-Plan蒸留はsingle_plan_student mode専用である")
+        mode = str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower()
+        shadow_enabled = bool(
+            mode == "ana_den6_online"
+            and getattr(self.args, "single_plan_shadow_distillation", True)
+        )
+        if mode != "single_plan_student" and not shadow_enabled:
+            raise RuntimeError(
+                "Single-Plan蒸留はsingle_plan_studentまたはana_den6_online shadow専用である"
+            )
         if not self.training:
             raise RuntimeError("推論時のTeacher参照は禁止である")
         terms = self.last_single_plan_student_terms
@@ -491,6 +631,8 @@ class Network(nn.Module):
         self.last_single_plan_distillation_debug["weighted"] = float(
             (value.detach() * weight).cpu()
         )
+        with torch.no_grad():
+            self.single_plan_distillation_updates.add_(1)
         return value * weight
 
     def k_proposal_offline_distillation_loss(self, teacher):
@@ -3180,6 +3322,7 @@ class Network(nn.Module):
                 subtree_tree=canonical_subtree_tree,
                 full_octree_context=full_octree_context,
                 octree_input_mode=octree_input_mode,
+                cache_key=cache_key,
             )
             if timing_enabled:
                 self._sync_if_cuda_tensor(pts_xyz)
@@ -3477,6 +3620,24 @@ class Network(nn.Module):
                 fixed_features=structure.get("network_k_fixed_features"),
             )
             network_only_policy_terms = self.last_single_plan_student_terms
+        elif (
+            guidance_mode == "ana_den6_online"
+            and self.training
+            and bool(getattr(self.args, "single_plan_shadow_distillation", True))
+        ):
+            # 実行planは従来どおりExact den6 + Network residualの1 planである。
+            # 同じ入力特徴からStudentも1 planを作るが、こちらは適用せず蒸留loss
+            # だけに使用する。したがって訓練Actual値や063943経路を変更しない。
+            shadow_input = actuator_input
+            if not bool(getattr(self.args, "single_plan_student_unfreeze_upstream", False)):
+                shadow_input = shadow_input.detach()
+            self.last_single_plan_student_terms = self.single_plan_student(
+                shadow_input,
+                structure.get("global_voxel_coords"),
+                self.args,
+                training=True,
+                fixed_features=structure.get("network_k_fixed_features"),
+            )
         full_cloud_amount_terms = None
         if (
             is_full_cloud_forward
@@ -3798,6 +3959,17 @@ class Network(nn.Module):
                 "network_only_amount_entropy",
                 "network_only_action_entropy",
                 "network_only_direction_sampling_temperature",
+                "single_plan_network_forward_count",
+                "single_plan_count",
+                "single_plan_k_slot_count",
+                "single_plan_critic_count",
+                "single_plan_teacher_reference_count",
+                "single_plan_cache_reference_count",
+                "single_plan_den6_call_count",
+                "single_plan_candidate_actual_encode_count",
+                "single_plan_expected_count",
+                "single_plan_executed_count",
+                "single_plan_execution_count_mismatch",
             )
             if actuator_stats.get(key, None) is not None
         }
@@ -4835,6 +5007,22 @@ class Network(nn.Module):
                 ),
             }
 
+        if isinstance(self.last_structure_debug, dict):
+            self.last_structure_debug.update({
+                "fixed_structure_cache_hit": bool(
+                    structure.get("fixed_structure_cache_hit", False)
+                    if isinstance(structure, dict) else False
+                ),
+                "fixed_structure_cache_entries": int(
+                    structure.get("fixed_structure_cache_entries", 0)
+                    if isinstance(structure, dict) else 0
+                ),
+                "fixed_structure_cache_bytes": int(
+                    structure.get("fixed_structure_cache_bytes", 0)
+                    if isinstance(structure, dict) else 0
+                ),
+            })
+
         if timing_enabled:
             actuator_runtime = getattr(self.actuator, "last_runtime_timing", {}) or {}
             self.last_runtime_timing = {
@@ -4851,6 +5039,10 @@ class Network(nn.Module):
                 "adjust_move_module": round(float(actuator_runtime.get("adjust_move", 0.0)), 6),
                 "postprocess": round(float(actuator_runtime.get("postprocess", 0.0)), 6),
                 "actuator_setup": round(float(actuator_runtime.get("setup", 0.0)), 6),
+                "fixed_structure_cache_hit": float(
+                    bool(structure.get("fixed_structure_cache_hit", False))
+                    if isinstance(structure, dict) else False
+                ),
             }
         else:
             self.last_runtime_timing = {}

@@ -104,6 +104,16 @@ class SinglePlanStudentPolicy(nn.Module):
             direction_logit_provider=self._direction_provider(terms, offsets),
             operation_enabled=enabled,
             debug_hash=bool(getattr(args, "single_plan_debug_hash", False)),
+            # 推論時はplanを変えないreject詳細の集計によるGPU同期を避ける。
+            collect_reject_reasons=bool(
+                getattr(
+                    args,
+                    "single_plan_collect_reject_reasons",
+                    training or bool(getattr(args, "single_plan_debug_hash", False)),
+                )
+            ),
+            # global_voxel_coordsはOctreeが生成したcanonical occupied voxelである。
+            assume_unique_coords=True,
         )
         utility_raw = self.utility_head(executable.plan_descriptor[:, 0].float())
         absolute_gain, geometry_cost, edit_cost, log_uncertainty = utility_raw.unbind(dim=1)

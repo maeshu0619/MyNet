@@ -579,6 +579,43 @@ def test(model, args, writer):
             )
             _sync_cuda(use_cuda)
             model_forward_total_time = time.perf_counter() - forward_start
+            if (
+                str(getattr(args, "heuristic_guidance_mode", "")).strip().lower()
+                == "single_plan_student"
+            ):
+                base_model = model.module if hasattr(model, "module") else model
+                contract_state = getattr(
+                    base_model, "last_actuator_voxel_state", None
+                )
+                if not isinstance(contract_state, dict):
+                    raise RuntimeError("Single-Plan推論の実行状態がない")
+                expected_contract = {
+                    "single_plan_network_forward_count": 1,
+                    "single_plan_count": 1,
+                    "single_plan_k_slot_count": 0,
+                    "single_plan_critic_count": 0,
+                    "single_plan_teacher_reference_count": 0,
+                    "single_plan_cache_reference_count": 0,
+                    "single_plan_den6_call_count": 0,
+                    "single_plan_candidate_actual_encode_count": 0,
+                }
+                failures = [
+                    "{}={}".format(name, _to_int(contract_state.get(name, -1)))
+                    for name, expected in expected_contract.items()
+                    if _to_int(contract_state.get(name, -1)) != expected
+                ]
+                mismatch = contract_state.get(
+                    "single_plan_execution_count_mismatch", None
+                )
+                if torch.is_tensor(mismatch) and float(
+                    mismatch.detach().abs().sum().cpu()
+                ) != 0.0:
+                    failures.append("executed_count_mismatch")
+                if failures:
+                    raise RuntimeError(
+                        "Single-Plan cache-free推論契約違反: "
+                        + ", ".join(failures)
+                    )
 
             full_cloud_context = inference_result.get("full_octree_context", None)
             if isinstance(full_cloud_context, dict):
@@ -758,6 +795,19 @@ if __name__ == "__main__":
     parser.add_argument("--trainORtest", default="test", type=str, help="run mode")
     args = parse_pugan_args(parser, file_day, file_time)
     args.trainORtest = "test"
+    compress_key = str(getattr(args, "compress", "")).strip().lower().replace(
+        "-", ""
+    ).replace("_", "")
+    if (
+        compress_key == "sparsepcgc"
+        and bool(getattr(args, "test_force_single_plan_student", True))
+    ):
+        # 推論ではTeacher/den6/cacheへ到達できないmodeを明示的に選ぶ。
+        # checkpoint内Studentだけで未知入力から1 planを決定する。
+        args.heuristic_guidance_mode = "single_plan_student"
+        args.heuristic_guidance_enabled = False
+        args.heuristic_guidance_network_only_inference = True
+        args.single_plan_training_stage = "actual_calibration"
     _configure_mp_start_method(args)
 
     if torch.cuda.is_available() and not args.cpu and args.use_tf32:
@@ -792,6 +842,28 @@ if __name__ == "__main__":
     model_load_start = time.perf_counter()
     model = _load_trained_model(args, writer)
     model_load_time = time.perf_counter() - model_load_start
+    base_model = model.module if hasattr(model, "module") else model
+    if (
+        str(getattr(args, "heuristic_guidance_mode", "")).strip().lower()
+        == "single_plan_student"
+        and bool(getattr(args, "test_require_trained_single_plan_student", True))
+    ):
+        update_count = int(
+            getattr(
+                base_model,
+                "single_plan_distillation_updates",
+                torch.zeros((), dtype=torch.long),
+            ).detach().cpu()
+        )
+        if update_count <= 0:
+            raise RuntimeError(
+                "checkpointのSingle-Plan Student蒸留更新回数が0である。"
+                "未学習Studentを高速推論結果として使用できない"
+            )
+        writer.write(
+            f"SinglePlanInferenceContract: distillation_updates={update_count}, "
+            "teacher=0, cache=0, den6=0, actual_candidate=0"
+        )
 
     writer.write("Model checkpoint loaded. model.eval() is active.")
     terminal_log(f"=== Setup Complete === model_load_time={model_load_time:.3f}s")

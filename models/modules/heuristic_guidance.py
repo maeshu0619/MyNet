@@ -14,9 +14,68 @@ import math
 from typing import Any, Dict, Mapping
 
 import torch
+from .executable_voxel_plan import coordinate_indices
 
 
 _EXACT_GUIDANCE_CACHE: "OrderedDict[tuple[str, str, str, int], Dict[str, Any]]" = OrderedDict()
+_EXACT_GUIDANCE_CPU_CACHE: "OrderedDict[tuple[str, str, int], Dict[str, Any]]" = OrderedDict()
+_EXACT_GUIDANCE_CPU_CACHE_BYTES = 0
+
+
+def _guidance_tensor_tree(value: Any, device: torch.device) -> Any:
+    """候補manifestを複製せず、写像済みTensorだけを指定deviceへ移す。"""
+    if torch.is_tensor(value):
+        return value.detach().to(device=device)
+    if isinstance(value, dict):
+        return {
+            key: _guidance_tensor_tree(item, device)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _guidance_tensor_bytes(value: Any) -> int:
+    if torch.is_tensor(value):
+        return int(value.numel()) * int(value.element_size())
+    if isinstance(value, dict):
+        return sum(_guidance_tensor_bytes(item) for item in value.values())
+    return 0
+
+
+def _store_exact_guidance_cpu(
+    key: tuple[str, str, int],
+    guidance: Mapping[str, Any],
+    exact: Mapping[str, Any],
+    args: Any,
+) -> None:
+    """固定候補の座標写像だけをCPUへ保存し、全Voxel辞書の再構築を防ぐ。"""
+    global _EXACT_GUIDANCE_CPU_CACHE_BYTES
+    cpu_guidance = _guidance_tensor_tree(dict(guidance), torch.device("cpu"))
+    # 大きいcandidate manifestは既存Layer A cacheの同一objectを参照する。
+    cpu_guidance["exact_candidate_guidance"] = exact
+    entry_bytes = _guidance_tensor_bytes(cpu_guidance)
+    max_entries = max(int(getattr(
+        args, "heuristic_guidance_cpu_tensor_cache_entries", 64
+    )), 0)
+    max_bytes = max(int(getattr(
+        args, "heuristic_guidance_cpu_tensor_cache_max_memory_mb", 2048
+    )), 0) * 1024 * 1024
+    if max_entries <= 0 or max_bytes <= 0 or entry_bytes > max_bytes:
+        return
+    old = _EXACT_GUIDANCE_CPU_CACHE.pop(key, None)
+    if isinstance(old, dict):
+        _EXACT_GUIDANCE_CPU_CACHE_BYTES -= int(old.get("bytes", 0))
+    _EXACT_GUIDANCE_CPU_CACHE[key] = {
+        "guidance": cpu_guidance,
+        "bytes": int(entry_bytes),
+    }
+    _EXACT_GUIDANCE_CPU_CACHE_BYTES += int(entry_bytes)
+    while _EXACT_GUIDANCE_CPU_CACHE and (
+        len(_EXACT_GUIDANCE_CPU_CACHE) > max_entries
+        or _EXACT_GUIDANCE_CPU_CACHE_BYTES > max_bytes
+    ):
+        _, removed = _EXACT_GUIDANCE_CPU_CACHE.popitem(last=False)
+        _EXACT_GUIDANCE_CPU_CACHE_BYTES -= int(removed.get("bytes", 0))
 
 
 def release_exact_guidance_cache(args: Any = None) -> None:
@@ -273,6 +332,17 @@ def _exact_den6_guidance(
     if isinstance(cached_guidance, dict):
         _EXACT_GUIDANCE_CACHE.move_to_end(cache_key)
         return cached_guidance
+    cpu_cache_key = (cache_signature, str(like.dtype), int(coords.shape[-1]))
+    cached_cpu_entry = _EXACT_GUIDANCE_CPU_CACHE.get(cpu_cache_key)
+    if isinstance(cached_cpu_entry, dict):
+        cached_cpu = cached_cpu_entry.get("guidance")
+        if isinstance(cached_cpu, dict):
+            _EXACT_GUIDANCE_CPU_CACHE.move_to_end(cpu_cache_key)
+            restored = _guidance_tensor_tree(cached_cpu, like.device)
+            restored["exact_candidate_guidance"] = exact
+            restored["cpu_tensor_cache_hit"] = True
+            _EXACT_GUIDANCE_CACHE[cache_key] = restored
+            return restored
 
     # online/residual training visits a different full-cloud frame every step.
     # Keeping mapped CUDA tensors for old frames cannot produce a cache hit in
@@ -291,8 +361,46 @@ def _exact_den6_guidance(
     if not isinstance(pools, Mapping):
         raise RuntimeError("ana_den6 exact guidanceに局所候補shortlistが無い")
     B, _, N = coords.shape
+    # 候補poolが実際に参照する座標だけを疎joinする。従来は100万Voxel全部を
+    # CPU list/dictへ変換していたが、候補に無関係な座標はlookupへ不要である。
+    query_coord_set = set()
+    for operation in ("Add", "Prune", "Adjust"):
+        pool = pools.get(operation)
+        if not isinstance(pool, list):
+            raise RuntimeError(f"ana_den6 exact guidanceの{operation} poolが不正である")
+        for candidate in pool:
+            if not isinstance(candidate, Mapping):
+                continue
+            remove_coords = [
+                tuple(int(v) for v in coord)
+                for coord in candidate.get("remove_coords", ())
+            ]
+            add_coords = [
+                tuple(int(v) for v in coord)
+                for coord in candidate.get("add_coords", ())
+            ]
+            query_coord_set.update(remove_coords)
+            query_coord_set.update(add_coords)
+            if operation == "Add":
+                for target in add_coords:
+                    for offset in _NEIGHBOR_OFFSETS_26:
+                        query_coord_set.add(tuple(
+                            target[axis] - offset[axis] for axis in range(3)
+                        ))
+    query_coord_rows = sorted(query_coord_set)
+    query_coord_tensor = (
+        torch.as_tensor(
+            query_coord_rows, device=coords.device, dtype=torch.long
+        ).reshape(-1, 3)
+        if query_coord_rows
+        else coords.new_empty((0, 3))
+    )
     where_prior = {name: like.new_zeros((B, 1, N)) for name in ("Add", "Prune", "Adjust")}
     candidate_mask = {name: torch.zeros((B, 1, N), device=like.device, dtype=torch.bool) for name in where_prior}
+    where_sparse_lists = {
+        name: {"batch": [], "source": [], "score": []}
+        for name in where_prior
+    }
     # target方向はdense [B,26,N]で常駐させると8iで100MB級になるため、
     # den6候補pairだけをCOO形式で保持し、Actuatorの既存方向logit上へ必要時にscatterする。
     direction_sparse_lists = {
@@ -309,16 +417,24 @@ def _exact_den6_guidance(
             "pair_candidate_index": [],
             "pair_source_index": [],
             "pair_direction_index": [],
+            "static_compatible": [],
         }
         for operation in ("Add", "Prune", "Adjust")
     }
     mapped = {name: 0 for name in where_prior}
     unmapped = {name: 0 for name in where_prior}
 
-    # manifestはCPU上の固定Heuristicである。1 frameにつき一度だけ座標辞書を作る。
+    # manifestはCPU上の固定Heuristicである。候補関連座標だけをGPU疎joinする。
     for b in range(B):
-        rows = coords[b].transpose(0, 1).detach().cpu().tolist()
-        lookup = {tuple(int(value) for value in row): index for index, row in enumerate(rows)}
+        query_indices = coordinate_indices(
+            query_coord_tensor,
+            coords[b].transpose(0, 1).contiguous(),
+        ).detach().cpu().tolist()
+        lookup = {
+            coord: int(index)
+            for coord, index in zip(query_coord_rows, query_indices)
+            if int(index) >= 0
+        }
         occupied = set(lookup)
         for operation in ("Add", "Prune", "Adjust"):
             pool = pools.get(operation)
@@ -349,11 +465,10 @@ def _exact_den6_guidance(
                         source_index = lookup.get(source)
                         if source_index is None:
                             continue
-                        where_prior[operation][b, 0, source_index] = torch.maximum(
-                            where_prior[operation][b, 0, source_index],
-                            like.new_tensor(rank_score),
-                        )
-                        candidate_mask[operation][b, 0, source_index] = True
+                        sparse_where = where_sparse_lists[operation]
+                        sparse_where["batch"].append(b)
+                        sparse_where["source"].append(source_index)
+                        sparse_where["score"].append(rank_score)
                         if candidate_source_index < 0:
                             candidate_source_index = int(source_index)
                         mapped_this = True
@@ -365,11 +480,10 @@ def _exact_den6_guidance(
                         offset = tuple(target[axis] - source[axis] for axis in range(3))
                         direction_index = _OFFSET_TO_INDEX.get(offset)
                         if source_index is not None and direction_index is not None:
-                            where_prior[operation][b, 0, source_index] = torch.maximum(
-                                where_prior[operation][b, 0, source_index],
-                                like.new_tensor(rank_score),
-                            )
-                            candidate_mask[operation][b, 0, source_index] = True
+                            sparse_where = where_sparse_lists[operation]
+                            sparse_where["batch"].append(b)
+                            sparse_where["source"].append(source_index)
+                            sparse_where["score"].append(rank_score)
                             pair = direction_sparse_lists[operation]
                             pair["batch"].append(b)
                             pair["source"].append(source_index)
@@ -385,11 +499,10 @@ def _exact_den6_guidance(
                             if source not in occupied:
                                 continue
                             source_index = lookup[source]
-                            where_prior[operation][b, 0, source_index] = torch.maximum(
-                                where_prior[operation][b, 0, source_index],
-                                like.new_tensor(rank_score),
-                            )
-                            candidate_mask[operation][b, 0, source_index] = True
+                            sparse_where = where_sparse_lists[operation]
+                            sparse_where["batch"].append(b)
+                            sparse_where["source"].append(source_index)
+                            sparse_where["score"].append(rank_score)
                             pair = direction_sparse_lists[operation]
                             pair["batch"].append(b)
                             pair["source"].append(source_index)
@@ -403,6 +516,10 @@ def _exact_den6_guidance(
                     candidate_map["rank_score"].append(float(rank_score))
                     candidate_map["source_index"].append(int(candidate_source_index))
                     candidate_map["direction_index"].append(int(candidate_direction_index))
+                    candidate_map["static_compatible"].append(bool(
+                        set(remove_coords).issubset(occupied)
+                        and not bool(set(add_coords) & occupied)
+                    ))
                     for source_index, direction_index in candidate_add_pairs:
                         candidate_map["pair_candidate_index"].append(int(fallback_rank))
                         candidate_map["pair_source_index"].append(int(source_index))
@@ -411,6 +528,43 @@ def _exact_den6_guidance(
                     mapped[operation] += 1
                 else:
                     unmapped[operation] += 1
+
+    for operation, values in where_sparse_lists.items():
+        if not values["source"]:
+            continue
+        batch_index = torch.as_tensor(
+            values["batch"], device=like.device, dtype=torch.long
+        )
+        source_index = torch.as_tensor(
+            values["source"], device=like.device, dtype=torch.long
+        )
+        score = torch.as_tensor(
+            values["score"], device=like.device, dtype=like.dtype
+        )
+        flat_index = batch_index * int(N) + source_index
+        flat_prior = where_prior[operation].reshape(-1)
+        if hasattr(flat_prior, "scatter_reduce_"):
+            flat_prior.scatter_reduce_(
+                0, flat_index, score, reduce="amax", include_self=True
+            )
+        else:
+            # PyTorch旧版fallbackも、GPU代入はunique sourceごとに一括する。
+            best = {}
+            for index, value in zip(
+                flat_index.detach().cpu().tolist(),
+                score.detach().cpu().tolist(),
+            ):
+                best[int(index)] = max(float(value), best.get(int(index), 0.0))
+            unique_index = torch.as_tensor(
+                list(best), device=like.device, dtype=torch.long
+            )
+            unique_score = torch.as_tensor(
+                list(best.values()), device=like.device, dtype=like.dtype
+            )
+            flat_prior.index_copy_(0, unique_index, unique_score)
+        candidate_mask[operation].reshape(-1).index_fill_(
+            0, torch.unique(flat_index), True
+        )
 
     direction_sparse = {}
     for operation, values in direction_sparse_lists.items():
@@ -431,6 +585,7 @@ def _exact_den6_guidance(
             "pair_candidate_index": torch.as_tensor(values["pair_candidate_index"], device=like.device, dtype=torch.long),
             "pair_source_index": torch.as_tensor(values["pair_source_index"], device=like.device, dtype=torch.long),
             "pair_direction_index": torch.as_tensor(values["pair_direction_index"], device=like.device, dtype=torch.long),
+            "static_compatible": torch.as_tensor(values["static_compatible"], device=like.device, dtype=torch.bool),
         }
 
     shares_raw = exact.get("operation_shares") or {}
@@ -485,7 +640,9 @@ def _exact_den6_guidance(
         "exact_candidate_guidance": exact,
         "exact_candidate_mapped_count": mapped,
         "exact_candidate_unmapped_count": unmapped,
+        "cpu_tensor_cache_hit": False,
     }
+    _store_exact_guidance_cpu(cpu_cache_key, guidance, exact, args)
     _EXACT_GUIDANCE_CACHE[cache_key] = guidance
     _EXACT_GUIDANCE_CACHE.move_to_end(cache_key)
     while len(_EXACT_GUIDANCE_CACHE) > 8:

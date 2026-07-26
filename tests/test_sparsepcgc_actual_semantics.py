@@ -13,7 +13,11 @@ from unittest.mock import patch
 
 import torch
 
-from models.modules.heuristic_guidance import build_heuristic_guidance, resolve_profile
+from models.modules.heuristic_guidance import (
+    build_heuristic_guidance,
+    release_exact_guidance_cache,
+    resolve_profile,
+)
 from models.modules.octree_structure import OctreeStructureAnalysis
 from models.modules.structure_actuator import StructureRepairActuator
 from models.network import Network
@@ -397,6 +401,30 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
             self.assertIn("candidate_mask", guidance)
             self.assertIn("candidate_tensor_map", guidance)
             self.assertEqual(int(guidance["candidate_mask"]["Prune"].sum()), 1)
+            # GPU/Step cacheを解放しても、固定CPU座標写像から同じTensorを復元する。
+            release_exact_guidance_cache(args)
+            guidance_warm = build_heuristic_guidance(
+                {
+                    "occupancy_nll_proxy": torch.zeros((1, 1, 3)),
+                    "global_voxel_coords": context["global_voxel_coords"],
+                    "ana_den6_ranked_candidate_guidance": teacher,
+                },
+                args,
+            )
+            self.assertTrue(guidance_warm["cpu_tensor_cache_hit"])
+            for operation in ("Add", "Prune", "Adjust"):
+                self.assertTrue(torch.equal(
+                    guidance["candidate_mask"][operation],
+                    guidance_warm["candidate_mask"][operation],
+                ))
+                self.assertTrue(torch.equal(
+                    guidance["candidate_tensor_map"][operation][
+                        "static_compatible"
+                    ],
+                    guidance_warm["candidate_tensor_map"][operation][
+                        "static_compatible"
+                    ],
+                ))
 
     def test_den6_online_v7_builds_single_proposal_prior_without_candidate_pool(self):
         like = torch.tensor([[[0.1, 0.8, 0.3]]], dtype=torch.float32)
@@ -580,6 +608,61 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         self.assertLess(gradient(-4.0), 0.0)   # no-op 0%より改善
         self.assertGreater(gradient(-3.0), 0.0)  # 過去最良-4%より悪化
         self.assertLess(gradient(-4.5), 0.0)   # 過去最良を更新
+
+    def test_den6_geometry_credit_updates_amount_only_inside_compression_guard(self):
+        """圧縮改善を保ったGeometry改善だけを離散Amountへ返す。"""
+        network = Network.__new__(Network)
+        torch.nn.Module.__init__(network)
+        network.args = SimpleNamespace(
+            heuristic_guidance_mode="ana_den6_online",
+            _current_input_file="fixture.ply",
+            sparsepcgc_scale_ae=0,
+            sparsepcgc_scale_sr=2,
+            sparsepcgc_scale_m=8,
+            heuristic_guidance_online_policy_weight=1.0,
+            heuristic_guidance_online_entropy_weight=0.0,
+            heuristic_guidance_online_reward_scale=1.0,
+            heuristic_guidance_online_advantage_clip=10.0,
+            heuristic_guidance_online_geometry_policy_weight=1.0,
+            heuristic_guidance_online_geometry_compression_tolerance=0.25,
+            heuristic_guidance_online_geometry_advantage_clip=1.0,
+        )
+        key = "fixture.ply|0|2|8"
+        network._den6_online_objective_baseline = __import__("collections").OrderedDict(
+            [(key, -4.0)]
+        )
+        network._den6_online_geometry_baseline = __import__("collections").OrderedDict(
+            [(key, 0.01)]
+        )
+        amount_log_prob = torch.tensor(0.0, requires_grad=True)
+        policy_log_prob = torch.tensor(0.0, requires_grad=True)
+        network.last_actuator_voxel_state = {
+            "den6_online_policy_log_prob": policy_log_prob,
+            "den6_online_policy_entropy": policy_log_prob.new_zeros(()),
+            "den6_online_amount_log_prob": amount_log_prob,
+        }
+        loss = network.discrete_policy_loss(
+            torch.tensor(-4.0), geometry=torch.tensor(0.009)
+        )
+        amount_grad = torch.autograd.grad(loss, amount_log_prob, retain_graph=True)[0]
+        self.assertLess(float(amount_grad), 0.0)
+        self.assertTrue(network.last_discrete_policy_debug["geometry_policy_guard_passed"])
+
+        rejected_amount_log_prob = torch.tensor(0.0, requires_grad=True)
+        rejected_policy_log_prob = torch.tensor(0.0, requires_grad=True)
+        network.last_actuator_voxel_state = {
+            "den6_online_policy_log_prob": rejected_policy_log_prob,
+            "den6_online_policy_entropy": rejected_policy_log_prob.new_zeros(()),
+            "den6_online_amount_log_prob": rejected_amount_log_prob,
+        }
+        rejected = network.discrete_policy_loss(
+            torch.tensor(-3.0), geometry=torch.tensor(0.008)
+        )
+        rejected_grad = torch.autograd.grad(
+            rejected, rejected_amount_log_prob, allow_unused=True
+        )[0]
+        self.assertIsNone(rejected_grad)
+        self.assertFalse(network.last_discrete_policy_debug["geometry_policy_guard_passed"])
 
     def test_reproduction_reference_matches_saved_mvub_plan(self):
         path = Path(__file__).resolve().parents[1] / "tools" / "ana_den6_reproduce.py"
@@ -836,6 +919,52 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         final_coords, debug = result
         self.assertEqual(debug["selected_counts"], {"Add": 1, "Prune": 1, "Adjust": 1})
         self.assertEqual(_coord_hash(final_coords), _coord_hash(expected))
+        expected_sorted = torch.unique(
+            expected[0].transpose(0, 1), dim=0, sorted=True
+        ).transpose(0, 1).unsqueeze(0)
+        self.assertTrue(torch.equal(final_coords, expected_sorted))
+        self.assertTrue(debug["static_candidate_compatibility_used"])
+        shadow_teacher = debug["single_plan_shadow_teacher"]
+        self.assertEqual(shadow_teacher["plan_key"], debug["plan_hash"])
+        self.assertEqual(len(shadow_teacher["candidates"]), 3)
+        self.assertEqual(
+            {row["operation"] for row in shadow_teacher["candidates"]},
+            {"Add", "Prune", "Adjust"},
+        )
+
+        # anchor後は3つの既存Amount headの出力を共通残差へ潰さず、
+        # operation別の残差として保持する。
+        actuator.args._global_train_step = 1000
+        actuator.args.heuristic_guidance_online_amount_log_sigma = 0.0
+        actuator.args.heuristic_guidance_online_amount_residual_scale = 0.10
+        add_ratio = torch.tensor([[[0.0018]]], requires_grad=True)
+        prune_ratio = torch.tensor([[[0.0007]]], requires_grad=True)
+        adjust_ratio = torch.tensor([[[0.0003]]], requires_grad=True)
+        residual_result = actuator._build_exact_den6_residual_plan(
+            guidance,
+            coords,
+            add_ratio,
+            prune_ratio,
+            adjust_ratio,
+            torch.zeros((1, 1, coords.shape[-1])),
+            torch.zeros((1, 1, coords.shape[-1])),
+            torch.zeros((1, 26, coords.shape[-1])),
+            torch.zeros((1, coords.shape[-1], 26)),
+        )
+        self.assertIsNotNone(residual_result)
+        operation_residuals = residual_result[1]["operation_amount_mean_log_residuals"]
+        self.assertEqual(set(operation_residuals), {"Add", "Prune", "Adjust"})
+        self.assertEqual(len({round(value, 7) for value in operation_residuals.values()}), 3)
+        operation_gradients = torch.autograd.grad(
+            residual_result[1]["policy_log_prob"],
+            (add_ratio, prune_ratio, adjust_ratio),
+        )
+        self.assertTrue(all(torch.isfinite(value).all() for value in operation_gradients))
+        self.assertTrue(all(float(value.abs().sum()) > 0.0 for value in operation_gradients))
+        self.assertEqual(
+            len({round(float(value.reshape(-1)[0]), 7) for value in operation_gradients}),
+            3,
+        )
 
     def test_den6_anchor_amounts_are_operation_specific_at_step_zero(self):
         """8i m=8の0.25%を旧5% Prune候補で上書きしない。"""
@@ -895,6 +1024,7 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         network.args = SimpleNamespace(
             cache_max_entries=2,
             cache_max_memory_mb=1,
+            static_node_cache_cpu=False,
             qs=2,
             sparsepcgc_voxel_size=1.0,
             sparsepcgc_pos_quantscale=1,

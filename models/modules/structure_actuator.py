@@ -3355,6 +3355,16 @@ class StructureRepairActuator(nn.Module):
         return True
 
     @staticmethod
+    def _den6_candidate_conflict_free(candidate, removes, adds):
+        """GTに対する適合性確認済み候補へ、plan内衝突だけを適用する。"""
+        candidate_removes, candidate_adds = StructureRepairActuator._den6_candidate_coord_sets(candidate)
+        if removes & candidate_removes or adds & candidate_adds:
+            return False
+        if removes & candidate_adds or adds & candidate_removes:
+            return False
+        return True
+
+    @staticmethod
     def _den6_pool_permutation_indices(order_indices, variant):
         size = len(order_indices)
         if size <= 1:
@@ -3567,6 +3577,14 @@ class StructureRepairActuator(nn.Module):
             and current_step >= exact_anchor_steps
             and not unique_plan_mode
         )
+        # cacheが一意plan由来でも、Amountは3つの独立分布として学習する。
+        # unique_plan_modeでこれまで探索まで止めていたこともAmount grad=0の
+        # 原因だった。候補plan数は増やさず、実行する複合planは常に1つのまま。
+        amount_exploration_active = bool(
+            online_mode
+            and self.training
+            and current_step >= exact_anchor_steps
+        )
 
         # AmountはStep 0でden6 Exact値へ固定し、その後はNetwork値をden6で
         # 実際に比較したtotal-ratio集合へSTE量子化する。連続量の無制限探索や
@@ -3627,36 +3645,49 @@ class StructureRepairActuator(nn.Module):
             + learned_total_for_backward
             - learned_total_for_backward.detach()
         )
-        # 粗いden6 Amount binの内側は、既存Network residual headで連続的に
-        # 微調整する。Step 0はExact値のまま、以後はanchor移行率に合わせて
-        # 探索幅を広げるため、同じ入力でも操作数が永久固定されない。
-        fine_mean = coarse_total_ratio.new_zeros(())
-        if torch.is_tensor(amount_residual_raw):
-            fine_mean = torch.tanh(amount_residual_raw.float().mean()) * float(
-                amount_beta
-            ) * float(residual_alpha)
+        # 粗いtotal binの内側では、Add/Prune/Adjustそれぞれの既存Amount
+        # headが独立した対数残差を出す。従来は単一fine_sampleを3操作へ
+        # 一括乗算していたため、各headが異なる判断をしてもhard Amountへ
+        # 同じ残差として現れ、Actual方策勾配も個別headへ届かなかった。
+        # shared residual headはlegacy経路用に残すが、Exact online Amountには
+        # 使用しない。totalは離散bin、内訳は3つのAmount headが担当する。
         fine_sigma = max(float(getattr(
             self.args, "heuristic_guidance_online_amount_log_sigma", 0.08
         )), 0.0) * float(residual_alpha)
-        if exploration_active and fine_sigma > 0.0:
-            fine_noise = torch.randn_like(fine_mean).detach()
-            fine_sample = fine_mean + float(fine_sigma) * fine_noise
-            fine_distribution = torch.distributions.Normal(
-                fine_mean, fine_mean.new_tensor(max(fine_sigma, 1e-6))
+        operation_fine_means = {
+            name: torch.log(
+                ratio_tensors[name] / ratio_tensors[name].new_tensor(prior_ratios[name])
             )
-            fine_log_prob = fine_distribution.log_prob(fine_sample.detach())
-        else:
-            fine_sample = fine_mean
-            fine_log_prob = fine_mean.new_zeros(())
-        sampled_total_ratio = coarse_total_ratio * torch.exp(fine_sample)
-        learned_share_total = sum(ratio_tensors.values()).clamp_min(1e-12)
-        sampled_ratio_tensors = {
-            name: sampled_total_ratio * ratio_tensors[name] / learned_share_total
             for name in operations
         }
+        operation_fine_samples = {}
+        operation_fine_log_probs = {}
+        for name in operations:
+            fine_mean = operation_fine_means[name]
+            if amount_exploration_active and fine_sigma > 0.0:
+                fine_noise = torch.randn_like(fine_mean).detach()
+                fine_sample = fine_mean + float(fine_sigma) * fine_noise
+                fine_distribution = torch.distributions.Normal(
+                    fine_mean, fine_mean.new_tensor(max(fine_sigma, 1e-6))
+                )
+                fine_log_prob = fine_distribution.log_prob(fine_sample.detach())
+            else:
+                fine_sample = fine_mean
+                fine_log_prob = fine_mean.new_zeros(())
+            operation_fine_samples[name] = fine_sample
+            operation_fine_log_probs[name] = fine_log_prob
+        sampled_ratio_tensors = {
+            name: (
+                coarse_total_ratio
+                * coarse_total_ratio.new_tensor(prior_shares[name] / prior_share_sum)
+                * torch.exp(operation_fine_samples[name])
+            )
+            for name in operations
+        }
+        sampled_total_ratio = sum(sampled_ratio_tensors.values())
         amount_log_prob_terms = [
             torch.log_softmax(amount_logits, dim=0)[selected_amount_bin],
-            fine_log_prob,
+            *[operation_fine_log_probs[name] for name in operations],
         ]
         sampled_total_value = float(sampled_total_ratio.detach().cpu())
         if sampled_total_value > max_total_ratio:
@@ -3714,6 +3745,7 @@ class StructureRepairActuator(nn.Module):
             getattr(self.args, "heuristic_guidance_online_gumbel_scale", 0.10)
         ), 0.0)
         ordered_indices = {}
+        static_compatible = {}
         candidate_log_probs = {}
         candidate_entropies = []
         combined_logits = {}
@@ -3729,6 +3761,14 @@ class StructureRepairActuator(nn.Module):
             probs = torch.softmax(scaled_logits, dim=0)
             candidate_log_probs[operation] = log_probs
             candidate_entropies.append(-(probs * log_probs).sum())
+            static_mask = mapping.get("static_compatible")
+            if (
+                torch.is_tensor(static_mask)
+                and int(static_mask.numel()) == int(scaled_logits.numel())
+            ):
+                static_compatible[operation] = (
+                    static_mask.detach().to(device="cpu", dtype=torch.bool).tolist()
+                )
             if exploration_active:
                 uniform = torch.rand_like(scaled_logits).clamp_(1e-8, 1.0 - 1e-8)
                 gumbel = -torch.log(-torch.log(uniform))
@@ -3753,16 +3793,24 @@ class StructureRepairActuator(nn.Module):
         priority = tuple(exact.get("operation_priority") or operations)
         if set(priority) != set(operations):
             priority = operations
-        action_ratio_stack = torch.stack([ratio_tensors[name] for name in operations])
+        action_ratio_stack = torch.stack([sampled_ratio_tensors[name] for name in operations])
         action_probs = action_ratio_stack / action_ratio_stack.sum().clamp_min(1e-12)
         action_log_probs = torch.log(action_probs.clamp_min(1e-12))
         operation_order = priority
 
         # 1Stepにつき、この1回の順序・1回の候補sampleから1planだけを構築する。
-        occupied = {
-            tuple(int(value) for value in row)
-            for row in voxel_coords[0].transpose(0, 1).detach().cpu().tolist()
-        }
+        # 初回候補写像時にGT occupied適合性を厳密に保存済みなら、100万Voxelを
+        # 毎Step Python setへ再変換しない。旧schemaだけは従来経路へ戻す。
+        static_compatibility_available = all(
+            len(static_compatible.get(name, ())) == len(pools[name])
+            for name in operations
+        )
+        occupied = None
+        if not static_compatibility_available:
+            occupied = {
+                tuple(int(value) for value in row)
+                for row in voxel_coords[0].transpose(0, 1).detach().cpu().tolist()
+            }
         selected = []
         removes = set()
         adds = set()
@@ -3772,7 +3820,17 @@ class StructureRepairActuator(nn.Module):
                 if selected_counts[operation] >= requested_counts[operation]:
                     break
                 candidate = pools[operation][candidate_index]
-                if not self._den6_candidate_compatible(candidate, occupied, removes, adds):
+                if static_compatibility_available:
+                    if not static_compatible[operation][candidate_index]:
+                        continue
+                    compatible = self._den6_candidate_conflict_free(
+                        candidate, removes, adds
+                    )
+                else:
+                    compatible = self._den6_candidate_compatible(
+                        candidate, occupied, removes, adds
+                    )
+                if not compatible:
                     continue
                 candidate_removes, candidate_adds = self._den6_candidate_coord_sets(candidate)
                 removes.update(candidate_removes)
@@ -3810,7 +3868,26 @@ class StructureRepairActuator(nn.Module):
             torch.as_tensor(sorted(adds), device=source_rows.device, dtype=torch.long)
             if adds else source_rows.new_empty((0, 3))
         )
-        final_rows = torch.unique(torch.cat([source_rows, add_rows], dim=0), dim=0, sorted=True)
+        combined_final_rows = torch.cat([source_rows, add_rows], dim=0)
+        if combined_final_rows.numel() > 0:
+            # sourceはcanonical unique、addsはset、両者の交差は上のden6
+            # compatibilityで除外済みである。全点torch.unique(dim=0)を再実行
+            # せず、同じ(x,y,z)辞書順へcollision-free keyで並べる。
+            final_mins = combined_final_rows.amin(dim=0)
+            final_spans = (
+                combined_final_rows.amax(dim=0) - final_mins + 1
+            ).clamp_min(1)
+            shifted_final = combined_final_rows - final_mins
+            final_keys = (
+                shifted_final[:, 0] * final_spans[1] * final_spans[2]
+                + shifted_final[:, 1] * final_spans[2]
+                + shifted_final[:, 2]
+            )
+            final_rows = combined_final_rows.index_select(
+                0, torch.argsort(final_keys)
+            )
+        else:
+            final_rows = combined_final_rows
         final_coords = final_rows.transpose(0, 1).contiguous().unsqueeze(0)
 
         selected_where_log_probs = []
@@ -3855,6 +3932,12 @@ class StructureRepairActuator(nn.Module):
         debug = {
             "plan_count": 1,
             "pool_reference_count": 1,
+            "guidance_cpu_tensor_cache_hit": bool(
+                guidance.get("cpu_tensor_cache_hit", False)
+            ),
+            "static_candidate_compatibility_used": bool(
+                static_compatibility_available
+            ),
             "candidate_actual_encode_count": 0,
             "proposal_source": "den6_exact_rank_plus_network_residual",
             "performance_source": (
@@ -3883,7 +3966,24 @@ class StructureRepairActuator(nn.Module):
             "requested_counts": requested_counts,
             "amount_bin_index": int(selected_amount_bin.detach().cpu()),
             "amount_bin_ratio": float(hard_total.detach().cpu()),
-            "amount_fine_log_residual": float(fine_sample.detach().cpu()),
+            "amount_fine_log_residual": float(
+                torch.stack([
+                    operation_fine_samples[name].reshape(())
+                    for name in operations
+                ]).mean().detach().cpu()
+            ),
+            "operation_amount_log_residuals": {
+                name: float(operation_fine_samples[name].detach().cpu())
+                for name in operations
+            },
+            "operation_amount_mean_log_residuals": {
+                name: float(operation_fine_means[name].detach().cpu())
+                for name in operations
+            },
+            "operation_amount_log_probs": {
+                name: operation_fine_log_probs[name]
+                for name in operations
+            },
             "amount_total_ratio_before_count": float(sampled_total_ratio.detach().cpu()),
             "amount_mode": (
                 "exact_fixed"
@@ -3897,6 +3997,7 @@ class StructureRepairActuator(nn.Module):
             "selected_changed_voxel_ratio": float(selected_changed_ratio),
             "one_pattern_only": True,
             "exploration_active": bool(exploration_active),
+            "amount_exploration_active": bool(amount_exploration_active),
             "policy_log_prob": policy_log_prob,
             "policy_entropy": policy_entropy,
             "where_log_prob": where_log_prob,
@@ -3911,6 +4012,31 @@ class StructureRepairActuator(nn.Module):
         debug["plan_hash"] = hashlib.sha256(
             json.dumps(plan_hash_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
+        # 訓練時のshadow Studentへ渡すのは、このStepで実際に選択・実行した
+        # 1 planだけである。Pool全体や未実行候補は渡さず、推論時にも保持しない。
+        selected_count_sum = max(sum(selected_counts.values()), 1)
+        debug["single_plan_shadow_teacher"] = {
+            "plan_key": debug["plan_hash"],
+            "total_ratio_percent": 100.0 * float(selected_total_ratio),
+            "shares": {
+                name: float(selected_counts[name]) / float(selected_count_sum)
+                for name in operations
+            },
+            "operation_order": debug["operation_order"],
+            "candidates": [
+                {
+                    "candidate_id": str(candidate.get("candidate_id", "")),
+                    "operation": operation,
+                    "remove_coords": list(candidate.get("remove_coords") or []),
+                    "add_coords": list(candidate.get("add_coords") or []),
+                }
+                for operation, _, candidate in selected
+            ],
+            # ActualとGeometryはtrain.pyで同じ実行planの測定後に設定する。
+            "actual_gain_percent": 0.0,
+            "geometry": {},
+            "_teacher_role": "elite",
+        }
 
         # Step 0はden6 Heuristicだけで作ったinitial planと一致することを検査する。
         if current_step < exact_anchor_steps:
@@ -7624,24 +7750,27 @@ class StructureRepairActuator(nn.Module):
                         current_empty_target_pair_mask[b] = ~occupied_now
                 valid_pair = valid_pair & current_empty_target_pair_mask
 
-            # AMP/float16環境では、float32の最小値(-3e38)をhalf Tensorへ入れるとoverflowする。
-            # そのため、masked_fillに使う負値は、必ず対象Tensor自身のdtypeから作る。
+            # AMP/float16環境では、float32の最小値をhalf Tensorへ入れない。
             add_dir_logits = add_voxel_logits.permute(0, 2, 1).contiguous()
             add_dir_mask_value = torch.finfo(add_dir_logits.dtype).min
-            add_dir_logits = add_dir_logits.masked_fill(~valid_pair, add_dir_mask_value)
-
+            add_dir_logits = add_dir_logits.masked_fill(
+                ~valid_pair, add_dir_mask_value
+            )
             add_dir_target_logits = (
                 -offset_norm.to(dtype=add_dir_logits.dtype).view(1, 1, -1)
             ).expand_as(add_dir_logits)
             add_dir_target_logits = add_dir_target_logits.masked_fill(
-                ~valid_pair,
-                add_dir_mask_value,
+                ~valid_pair, add_dir_mask_value
             )
-            add_dir_target = torch.softmax(add_dir_target_logits, dim=2).detach()
+            add_dir_target = torch.softmax(
+                add_dir_target_logits, dim=2
+            ).detach()
             add_direction_ce_per_point = -(
                 add_dir_target * torch.log_softmax(add_dir_logits, dim=2)
             ).sum(dim=2, keepdim=True)
-            add_valid_point = valid_pair.any(dim=2, keepdim=True).to(dtype=add_direction_ce_per_point.dtype)
+            add_valid_point = valid_pair.any(
+                dim=2, keepdim=True
+            ).to(dtype=add_direction_ce_per_point.dtype)
             add_direction_ce = (
                 add_direction_ce_per_point * add_valid_point
             ).sum() / add_valid_point.sum().clamp_min(1.0)

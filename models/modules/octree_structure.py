@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from collections import OrderedDict
 from contextlib import nullcontext
 from ..utils.pointcloud.utils_repkpu import get_knn_pts
 from ..utils.compression.proxy_octree import ProxyOctreeConfig, SoftOctreeRateProxy
@@ -42,6 +43,76 @@ class OctreeStructureAnalysis(nn.Module):
             ctx_dim=self.ctx_dim,
         )
         self.proxy_octree_ctx = SoftOctreeRateProxy(proxy_cfg)
+        # full-cloud GTだけに依存する整数構造をCPUへ保持する。
+        # 全40ch特徴を保存せず、重い26近傍検索とparent分割だけを再利用する。
+        self._fixed_structure_cache = OrderedDict()
+        self._fixed_structure_cache_bytes = 0
+
+    @staticmethod
+    def _fixed_cache_tensor_bytes(value):
+        if not torch.is_tensor(value):
+            return 0
+        return int(value.numel()) * int(value.element_size())
+
+    def _fixed_structure_cache_key(self, cache_key):
+        if not cache_key:
+            return ""
+        return "|".join((
+            "octree_fixed_structure_v1",
+            str(cache_key),
+            str(self.qs),
+            str(self.max_depth),
+            str(getattr(self.args, "structure_neighbor_query_chunk", 32768)),
+        ))
+
+    def _get_fixed_structure_cache(self, cache_key, device):
+        key = self._fixed_structure_cache_key(cache_key)
+        entry = self._fixed_structure_cache.get(key)
+        if not isinstance(entry, dict):
+            return None
+        self._fixed_structure_cache.move_to_end(key)
+        return {
+            name: value.to(device=device)
+            if torch.is_tensor(value) else value
+            for name, value in entry["value"].items()
+        }
+
+    def _put_fixed_structure_cache(self, cache_key, value):
+        key = self._fixed_structure_cache_key(cache_key)
+        if not key or not isinstance(value, dict):
+            return
+        max_entries = max(int(getattr(
+            self.args, "structure_fixed_cache_max_entries", 64
+        )), 0)
+        max_bytes = max(int(getattr(
+            self.args, "structure_fixed_cache_max_memory_mb", 4096
+        )), 0) * 1024 * 1024
+        if max_entries <= 0 or max_bytes <= 0:
+            return
+        cpu_value = {
+            name: item.detach().to(device="cpu").clone()
+            if torch.is_tensor(item) else item
+            for name, item in value.items()
+        }
+        entry_bytes = sum(
+            self._fixed_cache_tensor_bytes(item) for item in cpu_value.values()
+        )
+        if entry_bytes > max_bytes:
+            return
+        old = self._fixed_structure_cache.pop(key, None)
+        if isinstance(old, dict):
+            self._fixed_structure_cache_bytes -= int(old.get("bytes", 0))
+        self._fixed_structure_cache[key] = {
+            "value": cpu_value,
+            "bytes": int(entry_bytes),
+        }
+        self._fixed_structure_cache_bytes += int(entry_bytes)
+        while self._fixed_structure_cache and (
+            len(self._fixed_structure_cache) > max_entries
+            or self._fixed_structure_cache_bytes > max_bytes
+        ):
+            _, removed = self._fixed_structure_cache.popitem(last=False)
+            self._fixed_structure_cache_bytes -= int(removed.get("bytes", 0))
 
     @staticmethod
     def _effective_qs(args):
@@ -1678,8 +1749,20 @@ class OctreeStructureAnalysis(nn.Module):
                 f"global_voxel_coords must be normalized to [N, 3], got {tuple(coords.shape)}"
             )
         
-        parent_coords = torch.div(coords, 2, rounding_mode="floor")
-        unique_parents, inverse = torch.unique(parent_coords, dim=0, sorted=True, return_inverse=True)
+        active_parent = getattr(self, "_active_canonical_parent_cache", None)
+        if (
+            isinstance(active_parent, dict)
+            and torch.is_tensor(active_parent.get("unique_parents"))
+            and torch.is_tensor(active_parent.get("inverse"))
+            and int(active_parent["inverse"].numel()) == int(coords.shape[0])
+        ):
+            unique_parents = active_parent["unique_parents"].to(device=device)
+            inverse = active_parent["inverse"].to(device=device)
+        else:
+            parent_coords = torch.div(coords, 2, rounding_mode="floor")
+            unique_parents, inverse = torch.unique(
+                parent_coords, dim=0, sorted=True, return_inverse=True
+            )
         # _leaf_pattern_diagnosis_from_coords receives these same canonical
         # coordinates later in this forward.  Sharing the parent partition
         # removes a second large torch.unique without changing child slots,
@@ -1781,18 +1864,28 @@ class OctreeStructureAnalysis(nn.Module):
         subtree_tree=None,
         full_octree_context=None,
         octree_input_mode="auto",
+        cache_key=None,
     ):
         if pts_xyz.ndim != 3 or pts_xyz.shape[1] != 3:
             raise ValueError("pts_xyz must have shape [B, 3, N]")
 
-        # Per-forward only.  Never reuse a neighbour map across frames.
+        fixed_cache = self._get_fixed_structure_cache(cache_key, pts_xyz.device)
+        fixed_cache_hit = isinstance(fixed_cache, dict)
         self._active_canonical_neighbor_cache = {
-            "allow_write": True,
-            "allow_read": False,
-            "value": None,
-            "details": None,
+            "allow_write": not fixed_cache_hit,
+            "allow_read": fixed_cache_hit,
+            "value": fixed_cache.get("neighbor_value")
+            if fixed_cache_hit else None,
+            "details": fixed_cache.get("neighbor_details")
+            if fixed_cache_hit else None,
         }
-        self._active_canonical_parent_cache = None
+        self._active_canonical_parent_cache = (
+            {
+                "unique_parents": fixed_cache.get("unique_parents"),
+                "inverse": fixed_cache.get("parent_inverse"),
+            }
+            if fixed_cache_hit else None
+        )
 
         input_dtype = pts_xyz.dtype
         work_xyz = pts_xyz.float() if pts_xyz.dtype in (torch.float16, torch.bfloat16) else pts_xyz
@@ -2387,4 +2480,30 @@ class OctreeStructureAnalysis(nn.Module):
             result["heuristic_guidance"] = None
         else:
             result["heuristic_guidance"] = build_heuristic_guidance(result, self.args)
+        if cache_key and not fixed_cache_hit:
+            neighbor_cache = getattr(
+                self, "_active_canonical_neighbor_cache", None
+            )
+            parent_cache = getattr(
+                self, "_active_canonical_parent_cache", None
+            )
+            fixed_value = {
+                "neighbor_value": neighbor_cache.get("value")
+                if isinstance(neighbor_cache, dict) else None,
+                "neighbor_details": neighbor_cache.get("details")
+                if isinstance(neighbor_cache, dict) else None,
+                "unique_parents": parent_cache.get("unique_parents")
+                if isinstance(parent_cache, dict) else None,
+                "parent_inverse": parent_cache.get("inverse")
+                if isinstance(parent_cache, dict) else None,
+            }
+            if all(torch.is_tensor(item) for item in fixed_value.values()):
+                self._put_fixed_structure_cache(cache_key, fixed_value)
+        result["fixed_structure_cache_hit"] = bool(fixed_cache_hit)
+        result["fixed_structure_cache_entries"] = int(
+            len(self._fixed_structure_cache)
+        )
+        result["fixed_structure_cache_bytes"] = int(
+            self._fixed_structure_cache_bytes
+        )
         return result

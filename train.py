@@ -391,40 +391,84 @@ def _episode_input_common_cache_enabled(args):
     return bool(getattr(args, "episode_input_common_cache", False))
 
 
-def _clone_input_common_cache_value_to_cpu(value):
+def _clone_input_common_cache_value_to_cpu(value, memo=None):
+    """Tensor aliasを保ったまま入力共通値をCPUへ退避する。
+
+    full cloud contextでは同じcanonical座標Tensorを互換用の複数keyから
+    参照する。keyごとにcloneすると値は同じでも容量が3倍になり、全frameを
+    保持できず逐次走査でLRU hitが永久に0になるため、同一objectを1回だけ複製する。
+    """
+    if memo is None:
+        memo = {}
     if torch.is_tensor(value):
-        return value.detach().to(device="cpu").clone()
+        identity = id(value)
+        cached = memo.get(identity)
+        if cached is not None:
+            return cached
+        cloned = value.detach().to(device="cpu").clone()
+        memo[identity] = cloned
+        return cloned
     if isinstance(value, dict):
-        return {key: _clone_input_common_cache_value_to_cpu(item) for key, item in value.items()}
+        return {
+            key: _clone_input_common_cache_value_to_cpu(item, memo)
+            for key, item in value.items()
+        }
     if isinstance(value, list):
-        return [_clone_input_common_cache_value_to_cpu(item) for item in value]
+        return [_clone_input_common_cache_value_to_cpu(item, memo) for item in value]
     if isinstance(value, tuple):
-        return tuple(_clone_input_common_cache_value_to_cpu(item) for item in value)
+        return tuple(_clone_input_common_cache_value_to_cpu(item, memo) for item in value)
     return value
 
 
-def _clone_input_common_cache_value_to_device(value, device=None):
+def _clone_input_common_cache_value_to_device(value, device=None, memo=None):
+    """CPU CacheのTensor aliasを壊さず、現在device用の独立値を返す。"""
+    if memo is None:
+        memo = {}
     if torch.is_tensor(value):
+        identity = id(value)
+        cached = memo.get(identity)
+        if cached is not None:
+            return cached
         out = value.detach().clone()
         if device is not None:
             out = out.to(device=device)
+        memo[identity] = out
         return out
     if isinstance(value, dict):
-        return {key: _clone_input_common_cache_value_to_device(item, device=device) for key, item in value.items()}
+        return {
+            key: _clone_input_common_cache_value_to_device(item, device=device, memo=memo)
+            for key, item in value.items()
+        }
     if isinstance(value, list):
-        return [_clone_input_common_cache_value_to_device(item, device=device) for item in value]
+        return [
+            _clone_input_common_cache_value_to_device(item, device=device, memo=memo)
+            for item in value
+        ]
     if isinstance(value, tuple):
-        return tuple(_clone_input_common_cache_value_to_device(item, device=device) for item in value)
+        return tuple(
+            _clone_input_common_cache_value_to_device(item, device=device, memo=memo)
+            for item in value
+        )
     return value
 
 
-def _estimate_input_common_cache_bytes(value):
+def _estimate_input_common_cache_bytes(value, seen=None):
+    """共有Tensor storageを一度だけ数え、Cache容量判定を実使用量へ合わせる。"""
+    if seen is None:
+        seen = set()
     if torch.is_tensor(value):
+        storage = value.untyped_storage() if hasattr(value, "untyped_storage") else value.storage()
+        identity = (str(value.device), int(storage.data_ptr()))
+        if identity in seen:
+            return 0
+        seen.add(identity)
         return int(value.numel()) * int(value.element_size())
     if isinstance(value, dict):
-        return sum(_estimate_input_common_cache_bytes(item) for item in value.values())
+        return sum(
+            _estimate_input_common_cache_bytes(item, seen) for item in value.values()
+        )
     if isinstance(value, (list, tuple)):
-        return sum(_estimate_input_common_cache_bytes(item) for item in value)
+        return sum(_estimate_input_common_cache_bytes(item, seen) for item in value)
     return 0
 
 
@@ -14362,7 +14406,10 @@ def train(model, args, loss, writer, plot, notifier=None):
                     online_policy_objective = L_downstream.new_tensor(
                         float(actual_policy_value)
                     )
-                    online_policy_loss = policy_loss_fn(online_policy_objective)
+                    online_policy_loss = policy_loss_fn(
+                        online_policy_objective,
+                        geometry=L_geom.detach(),
+                    )
                     if not torch.is_tensor(online_policy_loss):
                         raise RuntimeError(
                             f"{heuristic_mode}のdiscrete_policy_lossがTensorを返していない"
@@ -14575,6 +14622,89 @@ def train(model, args, loss, writer, plot, notifier=None):
                         )
                         latest_compression_debug.update(compression_debug_terms)
                         loss.last_compression_debug = latest_compression_debug
+
+                if (
+                    heuristic_mode == "ana_den6_online"
+                    and bool(getattr(args, "single_plan_shadow_distillation", True))
+                ):
+                    # このStepで実行したExact+Network residualの1 planだけを、
+                    # 同じ入力を見たSingle-Plan Studentへ蒸留する。未実行Poolや
+                    # cache planをStudent forwardへ注入せず、Actual回数も増やさない。
+                    base_student = model.module if hasattr(model, "module") else model
+                    shadow_state = getattr(
+                        base_student, "last_actuator_voxel_state", None
+                    )
+                    shadow_debug = (
+                        shadow_state.get("ana_den6_exact_residual_plan_debug", {})
+                        if isinstance(shadow_state, dict) else {}
+                    )
+                    shadow_teacher = (
+                        dict(shadow_debug.get("single_plan_shadow_teacher") or {})
+                        if isinstance(shadow_debug, dict) else {}
+                    )
+                    if not shadow_teacher:
+                        raise RuntimeError(
+                            "ana_den6 online実行planからSingle-Plan shadow教師を作れない"
+                        )
+                    shadow_actual = finite_float_or_none(
+                        compression_debug_terms.get(
+                            "actual_total_bit_percent_fresh",
+                            compression_debug_terms.get(
+                                "actual_total_bit_percent", None
+                            ),
+                        )
+                    )
+                    if shadow_actual is None:
+                        raise RuntimeError(
+                            "Single-Plan shadow蒸留に実行planのActual値がない"
+                        )
+                    shadow_teacher["actual_gain_percent"] = -float(shadow_actual)
+                    shadow_geometry = case_float(L_geom, float("nan"))
+                    if not math.isfinite(shadow_geometry):
+                        raise RuntimeError(
+                            "Single-Plan shadow蒸留にGeometry値がない"
+                        )
+                    shadow_teacher["geometry"] = {
+                        "D1_loss_db": float(shadow_geometry),
+                        "D2_loss_db": float(shadow_geometry),
+                    }
+                    distill_fn = getattr(
+                        base_student, "single_plan_teacher_distillation_loss", None
+                    )
+                    if not callable(distill_fn):
+                        raise RuntimeError("Single-Plan shadow蒸留lossがない")
+                    shadow_distill = distill_fn(shadow_teacher)
+                    if not shadow_distill.requires_grad:
+                        raise RuntimeError("Single-Plan shadow蒸留lossの勾配が切れている")
+                    L = L + shadow_distill
+                    compression_debug_terms.update({
+                        "single_plan_shadow_distillation": True,
+                        "single_plan_shadow_plan_key": str(
+                            shadow_teacher["plan_key"]
+                        ),
+                        "single_plan_shadow_actual_gain": float(
+                            shadow_teacher["actual_gain_percent"]
+                        ),
+                        "single_plan_shadow_loss": float(
+                            shadow_distill.detach().cpu()
+                        ),
+                        "single_plan_shadow_update_count": int(
+                            base_student.single_plan_distillation_updates.detach().cpu()
+                        ),
+                    })
+                    compression_debug_terms.update({
+                        "single_plan_shadow_{}".format(key): value
+                        for key, value in dict(getattr(
+                            base_student,
+                            "last_single_plan_distillation_debug",
+                            {},
+                        )).items()
+                    })
+                    latest_compression_debug = dict(
+                        getattr(loss, "last_compression_debug", {}) or {}
+                    )
+                    latest_compression_debug.update(compression_debug_terms)
+                    loss.last_compression_debug = latest_compression_debug
 
                 if k_all_actual_enabled:
                     if heuristic_mode != "network_k_proposal_policy":
@@ -16294,6 +16424,8 @@ def train(model, args, loss, writer, plot, notifier=None):
                         f"cache={dict(cache_stats) if isinstance(cache_stats, dict) else {}}, "
                         f"plan_count={int(audit_plan.get('plan_count', 0) or 0)}, "
                         f"pool_reference_count={int(audit_plan.get('pool_reference_count', 0) or 0)}, "
+                        f"guidance_cpu_hit={bool(audit_plan.get('guidance_cpu_tensor_cache_hit', False))}, "
+                        f"static_compatibility={bool(audit_plan.get('static_candidate_compatibility_used', False))}, "
                         f"proposal_source={str(audit_plan.get('proposal_source', ''))}, "
                         f"performance_source={str(audit_plan.get('performance_source', ''))}, "
                         f"network_only_performance={bool(audit_plan.get('network_only_performance', False))}, "
@@ -16313,6 +16445,8 @@ def train(model, args, loss, writer, plot, notifier=None):
                         f"amount_mode={str(audit_plan.get('amount_mode', ''))}, "
                         f"amount_bin_ratio={float(audit_plan.get('amount_bin_ratio', 0.0) or 0.0):.7f}, "
                         f"amount_fine_log_residual={float(audit_plan.get('amount_fine_log_residual', 0.0) or 0.0):.7f}, "
+                        f"operation_amount_log_residuals={dict(audit_plan.get('operation_amount_log_residuals') or {})}, "
+                        f"operation_amount_mean_log_residuals={dict(audit_plan.get('operation_amount_mean_log_residuals') or {})}, "
                         f"amount_total_ratio={float(audit_plan.get('amount_total_ratio_before_count', 0.0) or 0.0):.7f}, "
                         f"residual_alpha={float(audit_plan.get('residual_alpha', 0.0)):.6f}, "
                         f"where_residual_weight={float(audit_plan.get('where_residual_weight', 0.0) or 0.0):.6f}, "
