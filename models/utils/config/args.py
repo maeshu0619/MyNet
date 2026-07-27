@@ -2815,6 +2815,24 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--single_plan_distillation_weight', default=1.0, type=float)
     parser.add_argument('--single_plan_student_lr_scale', default=1.0, type=float)
     parser.add_argument('--single_plan_policy_gradient_weight', default=0.0, type=float)
+    parser.add_argument(
+        '--single_plan_shadow_target_ratio',
+        default=0.10,
+        type=float,
+        help='ana_den6_onlineのShadow蒸留を圧縮主目的の絶対値に対して許容する比率',
+    )
+    parser.add_argument(
+        '--single_plan_shadow_balance_min_scale',
+        default=0.01,
+        type=float,
+        help='Shadow蒸留の動的balanceで維持する最小scale',
+    )
+    parser.add_argument(
+        '--single_plan_shadow_balance_max_scale',
+        default=1.0,
+        type=float,
+        help='Shadow蒸留の動的balanceで許可する最大scale',
+    )
     parser.add_argument('--single_plan_feature_cache_enabled', default=False, type=str2bool)
     parser.add_argument(
         '--single_plan_shadow_distillation',
@@ -3126,9 +3144,9 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--heuristic_guidance_online_amount_residual_scale',
-        default=0.10,
+        default=0.35,
         type=float,
-        help='Add/Prune/Adjust shareをden6初期値から動かす対数残差の上限',
+        help='Add/Prune/Adjustをden6初期値から独立に動かす対数残差の上限',
     )
     parser.add_argument(
         '--heuristic_guidance_online_amount_temperature',
@@ -4313,6 +4331,16 @@ def parse_pugan_args(parser, file_day, file_time):
     args.single_plan_distillation_weight = max(
         float(getattr(args, "single_plan_distillation_weight", 1.0)), 0.0
     )
+    args.single_plan_shadow_target_ratio = max(
+        float(getattr(args, "single_plan_shadow_target_ratio", 0.10)), 0.0
+    )
+    args.single_plan_shadow_balance_min_scale = min(max(
+        float(getattr(args, "single_plan_shadow_balance_min_scale", 0.01)), 0.0
+    ), 1.0)
+    args.single_plan_shadow_balance_max_scale = min(max(
+        float(getattr(args, "single_plan_shadow_balance_max_scale", 1.0)),
+        args.single_plan_shadow_balance_min_scale,
+    ), 1.0)
     args.single_plan_shadow_distillation = bool(
         getattr(args, "single_plan_shadow_distillation", True)
     )
@@ -4571,9 +4599,9 @@ def parse_pugan_args(parser, file_day, file_time):
         float(getattr(args, "heuristic_guidance_network_residual_weight", 0.05)), 0.0
     )
     args.heuristic_guidance_online_amount_residual_scale = min(max(
-        float(getattr(args, "heuristic_guidance_online_amount_residual_scale", 0.10)),
+        float(getattr(args, "heuristic_guidance_online_amount_residual_scale", 0.35)),
         0.0,
-    ), 0.25)
+    ), 0.50)
     args.heuristic_guidance_outside_pool_logit_penalty = max(
         float(getattr(args, "heuristic_guidance_outside_pool_logit_penalty", 20.0)), 0.0
     )

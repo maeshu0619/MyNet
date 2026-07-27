@@ -6,9 +6,35 @@ import torch
 from models.modules.single_plan_student import SinglePlanStudentPolicy
 from models.network import Network
 from models.utils.loss.single_plan_distillation import SinglePlanDistillationLoss
+from models.utils.training.compression_primary_loss import (
+    _compression_primary_support_balance,
+)
 
 
 class SinglePlanDistillationTest(unittest.TestCase):
+    def test_shadow_distillation_is_bounded_by_primary_objective(self):
+        """Shadow蒸留を残しつつ、圧縮主目的より大きい勾配支配を防ぐ。"""
+        args = SimpleNamespace(
+            single_plan_shadow_target_ratio=0.10,
+            single_plan_shadow_balance_min_scale=0.01,
+            single_plan_shadow_balance_max_scale=1.0,
+        )
+        primary = torch.tensor(-10.0)
+        shadow = torch.tensor(100.0, requires_grad=True)
+        balance = _compression_primary_support_balance(
+            args,
+            primary,
+            shadow,
+            target_ratio_name="single_plan_shadow_target_ratio",
+            min_scale_name="single_plan_shadow_balance_min_scale",
+            max_scale_name="single_plan_shadow_balance_max_scale",
+        )
+        self.assertAlmostEqual(balance["scale"], 0.01, places=7)
+        weighted = balance["scale"] * shadow
+        self.assertAlmostEqual(float(weighted.detach()), 1.0, places=7)
+        weighted.backward()
+        self.assertGreater(float(shadow.grad.abs()), 0.0)
+
     def test_operation_specific_teacher_has_gradient_without_add_source(self):
         torch.manual_seed(2)
         points = 128

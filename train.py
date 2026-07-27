@@ -13586,6 +13586,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                 L_downstream = legacy_L_downstream
                 L_discrete_policy = L.new_zeros(())
                 cp_debug = {} # compression primaryモード用のdebug情報を空辞書で初期化
+                compression_support_anchor = L_com_objective
                 if compression_primary_mode and not network_only_full_cloud: # legacy圧縮優先経路
                     L, L_com_objective, cp_debug = build_compression_primary_loss(
                         args,
@@ -14683,9 +14684,27 @@ def train(model, args, loss, writer, plot, notifier=None):
                     )
                     if not callable(distill_fn):
                         raise RuntimeError("Single-Plan shadow蒸留lossがない")
-                    shadow_distill = distill_fn(shadow_teacher)
-                    if not shadow_distill.requires_grad:
+                    shadow_distill_raw = distill_fn(shadow_teacher)
+                    if not shadow_distill_raw.requires_grad:
                         raise RuntimeError("Single-Plan shadow蒸留lossの勾配が切れている")
+                    # Student蒸留は維持する。ただし生損失をそのまま全モデル共通の
+                    # gradient clipへ入れず、圧縮主目的に対する比率で正規化する。
+                    shadow_balance = _compression_primary_support_balance(
+                        args,
+                        (
+                            compression_support_anchor
+                            if torch.is_tensor(compression_support_anchor)
+                            else L_com_objective
+                        ),
+                        shadow_distill_raw,
+                        enabled=True,
+                        target_ratio_name="single_plan_shadow_target_ratio",
+                        min_scale_name="single_plan_shadow_balance_min_scale",
+                        max_scale_name="single_plan_shadow_balance_max_scale",
+                        disabled_reason="single_plan_shadow_balance_disabled",
+                    )
+                    shadow_distill_scale = float(shadow_balance["scale"])
+                    shadow_distill = shadow_distill_scale * shadow_distill_raw
                     L = L + shadow_distill
                     compression_debug_terms.update({
                         "single_plan_shadow_distillation": True,
@@ -14697,6 +14716,18 @@ def train(model, args, loss, writer, plot, notifier=None):
                         ),
                         "single_plan_shadow_loss": float(
                             shadow_distill.detach().cpu()
+                        ),
+                        "single_plan_shadow_loss_raw": float(
+                            shadow_distill_raw.detach().cpu()
+                        ),
+                        "single_plan_shadow_loss_scale": float(
+                            shadow_distill_scale
+                        ),
+                        "single_plan_shadow_target_ratio": float(
+                            shadow_balance.get("target_ratio", 0.0) or 0.0
+                        ),
+                        "single_plan_shadow_balance_reason": str(
+                            shadow_balance.get("reason", "")
                         ),
                         "single_plan_shadow_update_count": int(
                             base_student.single_plan_distillation_updates.detach().cpu()
@@ -16486,6 +16517,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                         f"advantage={float(audit_compression.get('den6_online_policy_advantage', 0.0) or 0.0):.6g}, "
                         f"log_prob={float(audit_compression.get('den6_online_policy_log_prob', 0.0) or 0.0):.6g}, "
                         f"loss={float(audit_compression.get('den6_online_policy_policy_loss', 0.0) or 0.0):.6g})"
+                        f", shadow=(raw={float(audit_compression.get('single_plan_shadow_loss_raw', 0.0) or 0.0):.6g}, "
+                        f"scaled={float(audit_compression.get('single_plan_shadow_loss', 0.0) or 0.0):.6g}, "
+                        f"scale={float(audit_compression.get('single_plan_shadow_loss_scale', 0.0) or 0.0):.6g})"
                         f", timing=(step_before_audit={float(time.time() - st_step):.3f}s, "
                         f"actual_total={float(audit_compression.get('actual_encode_time_total', 0.0) or 0.0):.3f}s, "
                         f"actual_gt={float(audit_compression.get('gt_actual_encode_time', 0.0) or 0.0):.3f}s, "

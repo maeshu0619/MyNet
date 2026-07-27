@@ -3552,8 +3552,8 @@ class StructureRepairActuator(nn.Module):
             "Adjust": learned_move_ratio.float().mean().clamp_min(1e-9),
         }
         amount_beta = min(max(float(
-            getattr(self.args, "heuristic_guidance_online_amount_residual_scale", 0.10)
-        ), 0.0), 1.0)
+            getattr(self.args, "heuristic_guidance_online_amount_residual_scale", 0.35)
+        ), 0.0), 0.50)
         ratio_tensors = {}
         for name in operations:
             prior_t = learned_raw[name].new_tensor(prior_ratios[name])
