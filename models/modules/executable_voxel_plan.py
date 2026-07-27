@@ -133,6 +133,52 @@ def coordinate_indices(query: torch.Tensor, reference: torch.Tensor) -> torch.Te
     return result
 
 
+def scatter_amax_1d_compat_(
+    output: torch.Tensor,
+    index: torch.Tensor,
+    source: torch.Tensor,
+) -> torch.Tensor:
+    """PyTorch 1.11でも1次元scatter amaxをGPU同期loopなしで行う。"""
+    if output.ndim != 1 or index.ndim != 1 or source.ndim != 1:
+        raise ValueError("scatter_amax_1d_compat_ expects one-dimensional tensors")
+    if int(index.numel()) != int(source.numel()):
+        raise ValueError("index and source must have the same number of values")
+    if int(index.numel()) == 0:
+        return output
+    if bool((index < 0).any().item()) or bool((index >= output.numel()).any().item()):
+        raise IndexError("scatter_amax index is outside output")
+    native = getattr(output, "scatter_reduce_", None)
+    if callable(native):
+        output.scatter_reduce_(0, index, source, reduce="amax", include_self=True)
+        return output
+
+    # 値の降順順位をindexと組み合わせると、同一indexの先頭が最大値になる。
+    # PyTorch 1.11にはstable sortがないため、順位を整数keyへ明示的に埋め込む。
+    value_order = torch.argsort(source, descending=True)
+    ordered_index = index.index_select(0, value_order)
+    rank = torch.arange(
+        ordered_index.numel(), device=index.device, dtype=torch.long
+    )
+    stride = int(ordered_index.numel()) + 1
+    max_index = int(ordered_index.max().item())
+    if max_index > (torch.iinfo(torch.long).max - stride) // stride:
+        raise OverflowError("scatter_amax compatibility sort key exceeds int64")
+    index_order = torch.argsort(ordered_index * stride + rank)
+    grouped_index = ordered_index.index_select(0, index_order)
+    first = torch.ones_like(grouped_index, dtype=torch.bool)
+    if int(grouped_index.numel()) > 1:
+        first[1:] = grouped_index[1:] != grouped_index[:-1]
+    selected_order = value_order.index_select(0, index_order[first])
+    selected_index = index.index_select(0, selected_order)
+    selected_source = source.index_select(0, selected_order)
+    selected_source = torch.maximum(
+        output.index_select(0, selected_index),
+        selected_source,
+    )
+    output.index_copy_(0, selected_index, selected_source)
+    return output
+
+
 def _first_row_mask(rows: torch.Tensor) -> torch.Tensor:
     """score順Tensorに対し同一rowの最初だけを残す。"""
     if rows.numel() == 0:

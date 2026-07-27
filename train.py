@@ -74,6 +74,9 @@ from models.utils.training.full_cloud_actual_correction import (
     update_full_cloud_actual_correction_state,
     build_full_cloud_actual_correction_loss,
 )
+from models.utils.training.saved_tensor_offload import (
+    selective_saved_tensor_cpu_offload,
+)
 
 from models.utils.training.utils import *
 from models.utils.training.noise_debug import *
@@ -12856,14 +12859,19 @@ def train(model, args, loss, writer, plot, notifier=None):
                             )
                         autocast_ctx = torch.cuda.amp.autocast(dtype=amp_dtype, enabled=use_amp) if use_cuda else nullcontext()
                         grad_ctx = torch.no_grad() if full_cloud_anchor_no_grad else nullcontext()
-                        model_saved_tensor_ctx = (
-                            torch.autograd.graph.save_on_cpu(
-                                pin_memory=bool(
-                                    getattr(args, "full_cloud_saved_tensor_pin_memory", False)
-                                )
-                            )
-                            if network_only_full_cloud and use_cuda and not full_cloud_anchor_no_grad
-                            else nullcontext()
+                        saved_tensor_threshold_mb = float(getattr(
+                            args, "full_cloud_saved_tensor_cpu_offload_mb", 0.25
+                        ))
+                        model_saved_tensor_ctx = selective_saved_tensor_cpu_offload(
+                            saved_tensor_threshold_mb,
+                            pin_memory=bool(getattr(
+                                args, "full_cloud_saved_tensor_pin_memory", False
+                            )),
+                            enabled=(
+                                network_only_full_cloud
+                                and use_cuda
+                                and not full_cloud_anchor_no_grad
+                            ),
                         )
 
                         with grad_ctx, autocast_ctx, model_saved_tensor_ctx: # 全体点群をno-gradでモデルに入力し、teacher更新用の出力だけ得る
@@ -12949,14 +12957,16 @@ def train(model, args, loss, writer, plot, notifier=None):
                             final_w_for_loss = final_w
                         autocast_ctx = torch.cuda.amp.autocast(dtype=amp_dtype, enabled=use_amp) if use_cuda else nullcontext() # 形状損失と圧縮損失の計算もAMP文脈で行うための設定を作る
                         loss_grad_ctx = torch.no_grad() if full_cloud_anchor_no_grad else nullcontext()
-                        loss_saved_tensor_ctx = (
-                            torch.autograd.graph.save_on_cpu(
-                                pin_memory=bool(
-                                    getattr(args, "full_cloud_saved_tensor_pin_memory", False)
-                                )
-                            )
-                            if network_only_full_cloud and use_cuda and not full_cloud_anchor_no_grad
-                            else nullcontext()
+                        loss_saved_tensor_ctx = selective_saved_tensor_cpu_offload(
+                            saved_tensor_threshold_mb,
+                            pin_memory=bool(getattr(
+                                args, "full_cloud_saved_tensor_pin_memory", False
+                            )),
+                            enabled=(
+                                network_only_full_cloud
+                                and use_cuda
+                                and not full_cloud_anchor_no_grad
+                            ),
                         )
 
                         with loss_grad_ctx, autocast_ctx, loss_saved_tensor_ctx:

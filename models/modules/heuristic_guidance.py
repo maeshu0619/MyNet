@@ -14,7 +14,7 @@ import math
 from typing import Any, Dict, Mapping
 
 import torch
-from .executable_voxel_plan import coordinate_indices
+from .executable_voxel_plan import coordinate_indices, scatter_amax_1d_compat_
 
 
 _EXACT_GUIDANCE_CACHE: "OrderedDict[tuple[str, str, str, int], Dict[str, Any]]" = OrderedDict()
@@ -543,25 +543,7 @@ def _exact_den6_guidance(
         )
         flat_index = batch_index * int(N) + source_index
         flat_prior = where_prior[operation].reshape(-1)
-        if hasattr(flat_prior, "scatter_reduce_"):
-            flat_prior.scatter_reduce_(
-                0, flat_index, score, reduce="amax", include_self=True
-            )
-        else:
-            # PyTorch旧版fallbackも、GPU代入はunique sourceごとに一括する。
-            best = {}
-            for index, value in zip(
-                flat_index.detach().cpu().tolist(),
-                score.detach().cpu().tolist(),
-            ):
-                best[int(index)] = max(float(value), best.get(int(index), 0.0))
-            unique_index = torch.as_tensor(
-                list(best), device=like.device, dtype=torch.long
-            )
-            unique_score = torch.as_tensor(
-                list(best.values()), device=like.device, dtype=like.dtype
-            )
-            flat_prior.index_copy_(0, unique_index, unique_score)
+        scatter_amax_1d_compat_(flat_prior, flat_index, score)
         candidate_mask[operation].reshape(-1).index_fill_(
             0, torch.unique(flat_index), True
         )

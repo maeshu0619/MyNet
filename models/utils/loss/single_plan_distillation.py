@@ -226,28 +226,31 @@ class SinglePlanDistillationLoss(nn.Module):
             source_queries = add_targets[:, None, :] - self.offsets.to(coords).view(1, 26, 3)
             source_indices = coordinate_indices(source_queries.reshape(-1, 3), coords).view(-1, 26)
             valid = source_indices >= 0
-            target_scores = []
-            for target_index in range(add_targets.shape[0]):
-                source = source_indices[target_index][valid[target_index]]
-                if source.numel() == 0:
-                    continue
-                directions = torch.nonzero(valid[target_index], as_tuple=False).flatten()
-                direction_score = self._direction_scores(terms, 0, source)
-                pair = where[1].index_select(0, source) + direction_score.gather(
+            valid_pairs = torch.nonzero(valid, as_tuple=False)
+            if valid_pairs.numel():
+                target_rows = valid_pairs[:, 0]
+                directions = valid_pairs[:, 1]
+                sources = source_indices[target_rows, directions]
+                direction_score = self._direction_scores(terms, 0, sources).gather(
                     1, directions.view(-1, 1)
                 ).squeeze(1)
-                target_scores.append(torch.logsumexp(pair, dim=0))
-            if target_scores:
-                reachable_add = len(target_scores)
+                pair = where[1].index_select(0, sources) + direction_score
+                pair_matrix = pair.new_full(valid.shape, float("-inf"))
+                pair_matrix[target_rows, directions] = pair
+                reachable_mask = valid.any(dim=1)
+                target_scores = torch.logsumexp(
+                    pair_matrix[reachable_mask], dim=1
+                )
+                reachable_add = int(reachable_mask.sum().detach().cpu())
                 # target到達pairを全source×26の近似partitionと比較し、logit全体の
                 # 一様シフトやscale発散でlossを下げられない相対rankingにする。
                 partition = torch.logsumexp(where[1], dim=0) + math.log(26.0)
                 add_target_loss = F.softplus(
-                    partition - torch.stack(target_scores).mean()
+                    partition - target_scores.mean()
                 )
                 if not positive_teacher:
                     add_target_loss = F.softplus(
-                        torch.stack(target_scores).mean() - partition
+                        target_scores.mean() - partition
                     )
 
         direction_loss = where.new_zeros(())

@@ -16,6 +16,7 @@ from models.utils.pointcloud.sparsepcgc_voxel import (
 from .executable_voxel_plan import (
     apply_selected_executable_plan,
     executable_plan_hashes,
+    scatter_amax_1d_compat_,
 )
 
 class StructureRepairActuator(nn.Module):
@@ -1761,6 +1762,13 @@ class StructureRepairActuator(nn.Module):
                 if voxel_count <= 0:
                     out[b] = logits[b]
                     continue
+                # canonical full-cloud入力は1点=1 occupied voxelである。
+                # この場合、Voxel平均は各点自身なのでscatter_add・除算・
+                # inverse復元を行っても値は変わらない。巨大な方向headでは
+                # この恒等処理が支配的になるため、厳密に同じTensorを返す。
+                if voxel_count == N:
+                    out[b] = logits[b]
+                    continue
                 inverse = item["inverse"]
                 index = inverse.view(1, N).expand(K, N)
                 sums = logits.new_zeros((K, voxel_count))
@@ -3148,12 +3156,7 @@ class StructureRepairActuator(nn.Module):
                     )
                     flat = dense.reshape(-1)
                     values = rank_score[valid].clamp(0.0, 1.0)
-                    if hasattr(flat, "scatter_reduce_"):
-                        flat.scatter_reduce_(0, flat_index, values, reduce="amax", include_self=True)
-                    else:
-                        # 古いPyTorch向けfallback。candidate pair数だけを走査する。
-                        for index, value in zip(flat_index.tolist(), values.tolist()):
-                            flat[index] = max(float(flat[index]), float(value))
+                    scatter_amax_1d_compat_(flat, flat_index, values)
                 return dense
 
         # v1互換。新規residual modeでは通常使用しない。
@@ -3463,15 +3466,9 @@ class StructureRepairActuator(nn.Module):
                             add_pair_logits[0, pair_source[valid], pair_direction[valid]].float()
                         )
                         index = pair_candidate[valid]
-                        if hasattr(network_score, "scatter_reduce_"):
-                            network_score.scatter_reduce_(
-                                0, index, pair_value, reduce="amax", include_self=True
-                            )
-                        else:
-                            for candidate_index, value in zip(index.tolist(), pair_value.tolist()):
-                                network_score[candidate_index] = max(
-                                    float(network_score[candidate_index]), float(value)
-                                )
+                        scatter_amax_1d_compat_(
+                            network_score, index, pair_value
+                        )
             output[operation] = self._normalize_candidate_network_score(network_score)
         return output
 
@@ -7751,29 +7748,61 @@ class StructureRepairActuator(nn.Module):
                 valid_pair = valid_pair & current_empty_target_pair_mask
 
             # AMP/float16環境では、float32の最小値をhalf Tensorへ入れない。
-            add_dir_logits = add_voxel_logits.permute(0, 2, 1).contiguous()
-            add_dir_mask_value = torch.finfo(add_dir_logits.dtype).min
-            add_dir_logits = add_dir_logits.masked_fill(
-                ~valid_pair, add_dir_mask_value
-            )
-            add_dir_target_logits = (
-                -offset_norm.to(dtype=add_dir_logits.dtype).view(1, 1, -1)
-            ).expand_as(add_dir_logits)
-            add_dir_target_logits = add_dir_target_logits.masked_fill(
-                ~valid_pair, add_dir_mask_value
-            )
-            add_dir_target = torch.softmax(
-                add_dir_target_logits, dim=2
-            ).detach()
-            add_direction_ce_per_point = -(
-                add_dir_target * torch.log_softmax(add_dir_logits, dim=2)
-            ).sum(dim=2, keepdim=True)
-            add_valid_point = valid_pair.any(
-                dim=2, keepdim=True
-            ).to(dtype=add_direction_ce_per_point.dtype)
-            add_direction_ce = (
-                add_direction_ce_per_point * add_valid_point
-            ).sum() / add_valid_point.sum().clamp_min(1.0)
+            add_dir_logits_all = add_voxel_logits.permute(0, 2, 1).contiguous()
+            add_dir_mask_value = torch.finfo(add_dir_logits_all.dtype).min
+            if exact_den6_candidate_mode:
+                # Exact候補外のsourceはvalid方向が1つもなく、旧式でもCEへ
+                # 最後に0を掛ける。候補source行だけを取り出して同じ26方向CEを
+                # 計算し、N×26のmasked logits/softmaxを作らない。
+                valid_source = valid_pair.any(dim=2)
+                flat_source = valid_source.reshape(-1).nonzero(
+                    as_tuple=False
+                ).reshape(-1)
+                if int(flat_source.numel()) > 0:
+                    flat_logits = add_dir_logits_all.reshape(-1, K_add).index_select(
+                        0, flat_source
+                    )
+                    flat_valid = valid_pair.reshape(-1, K_add).index_select(
+                        0, flat_source
+                    )
+                    sparse_logits = flat_logits.masked_fill(
+                        ~flat_valid, add_dir_mask_value
+                    )
+                    sparse_target_logits = (
+                        -offset_norm.to(dtype=sparse_logits.dtype).view(1, -1)
+                    ).expand_as(sparse_logits).masked_fill(
+                        ~flat_valid, add_dir_mask_value
+                    )
+                    sparse_target = torch.softmax(
+                        sparse_target_logits, dim=1
+                    ).detach()
+                    add_direction_ce = -(
+                        sparse_target * torch.log_softmax(sparse_logits, dim=1)
+                    ).sum(dim=1).mean()
+                else:
+                    add_direction_ce = add_dir_logits_all.new_zeros(())
+            else:
+                add_dir_logits = add_dir_logits_all.masked_fill(
+                    ~valid_pair, add_dir_mask_value
+                )
+                add_dir_target_logits = (
+                    -offset_norm.to(dtype=add_dir_logits.dtype).view(1, 1, -1)
+                ).expand_as(add_dir_logits)
+                add_dir_target_logits = add_dir_target_logits.masked_fill(
+                    ~valid_pair, add_dir_mask_value
+                )
+                add_dir_target = torch.softmax(
+                    add_dir_target_logits, dim=2
+                ).detach()
+                add_direction_ce_per_point = -(
+                    add_dir_target * torch.log_softmax(add_dir_logits, dim=2)
+                ).sum(dim=2, keepdim=True)
+                add_valid_point = valid_pair.any(
+                    dim=2, keepdim=True
+                ).to(dtype=add_direction_ce_per_point.dtype)
+                add_direction_ce = (
+                    add_direction_ce_per_point * add_valid_point
+                ).sum() / add_valid_point.sum().clamp_min(1.0)
             valid_counts = valid_pair.reshape(B, -1).sum(dim=1)
             requested_add_k = (
                 0
@@ -9200,11 +9229,10 @@ class StructureRepairActuator(nn.Module):
                 actual_oracle_candidate_where_loss = actual_oracle_candidate_where_loss + drop_oracle_loss
 
             if add_enabled and (actual_oracle_has_add or actual_oracle_has_bad_add):
-                oracle_add_logit = self._run_large_head(self.add_head, actuator_features)
-                oracle_add_logit = self._scale_where_downstream_grad(
-                    oracle_add_logit,
-                    op_name="add",
-                )
+                # Add headは同じ入力に対して上で既に実行済みである。
+                # 補助教師用に再forwardすると全点headとbackward graphを重複して
+                # 作るため、同一Tensorから同じvoxel平均だけを計算する。
+                oracle_add_logit = learned_add_logit
                 oracle_add_logit = self._voxel_mean_logits(
                     oracle_add_logit,
                     voxel_coords,
@@ -9218,16 +9246,9 @@ class StructureRepairActuator(nn.Module):
                 )
                 add_where_actuator_loss = add_where_actuator_loss + oracle_candidate_weight * add_oracle_loss
                 actual_oracle_candidate_where_loss = actual_oracle_candidate_where_loss + add_oracle_loss
-                oracle_add_direction_logits = self._run_large_head(self.add_voxel_head, actuator_features)
-                oracle_add_direction_logits = self._scale_where_downstream_grad(
-                    oracle_add_direction_logits,
-                    op_name="add",
-                )
-                oracle_add_direction_logits = self._voxel_mean_logits(
-                    oracle_add_direction_logits,
-                    voxel_coords,
-                    voxel_cache=voxel_cache,
-                )
+                # learned_add_direction_logitsはbias加算前の同じhead出力であり、
+                # oracleが必要とする値と一致するため再利用する。
+                oracle_add_direction_logits = learned_add_direction_logits
                 if actual_oracle_has_bad_add and not actual_oracle_has_add:
                     bad_direction_mask = actual_oracle_add_bad_mask.to(
                         device=oracle_add_direction_logits.device,
@@ -9273,16 +9294,8 @@ class StructureRepairActuator(nn.Module):
                 move_where_actuator_loss = (
                     move_where_actuator_loss + oracle_candidate_weight * subtree_move_oracle_loss
                 )
-                oracle_move_direction_logits = self._run_large_head(self.move_voxel_head, actuator_features)
-                oracle_move_direction_logits = self._scale_where_downstream_grad(
-                    oracle_move_direction_logits,
-                    op_name="move",
-                )
-                oracle_move_direction_logits = self._voxel_mean_logits(
-                    oracle_move_direction_logits,
-                    voxel_coords,
-                    voxel_cache=voxel_cache,
-                )
+                # Adjust方向headも同じ入力に対して既に計算済みである。
+                oracle_move_direction_logits = learned_move_direction_logits
                 move_direction_oracle_loss = _oracle_direction_loss(
                     oracle_move_direction_logits,
                     leaf_move_op_mask,

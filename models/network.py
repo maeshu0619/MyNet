@@ -29,6 +29,7 @@ from .modules.network_k_proposal_policy import NetworkKProposalPolicy
 from .modules.single_plan_student import SinglePlanStudentPolicy
 from .utils.loss.k_proposal_distillation import KProposalSetLoss
 from .utils.loss.single_plan_distillation import SinglePlanDistillationLoss
+from .utils.training.saved_tensor_offload import selective_saved_tensor_cpu_offload
 
 
 class Network(nn.Module):
@@ -3723,7 +3724,7 @@ class Network(nn.Module):
             torch.cuda.empty_cache()
 
         offload_threshold_mb = float(
-            getattr(self.args, "full_cloud_saved_tensor_cpu_offload_mb", 1.0)
+            getattr(self.args, "full_cloud_saved_tensor_cpu_offload_mb", 0.25)
         )
         offload_saved_tensors = bool(
             self.training
@@ -3732,18 +3733,13 @@ class Network(nn.Module):
             and offload_threshold_mb > 0.0
             and pts_xyz.is_cuda
         )
-        if offload_saved_tensors:
-            # Full graph offload is intentional here. Selective offload was
-            # faster, but retained many individually-small masks and reached
-            # 12 GiB in the main process (plus the codec worker) after only a
-            # few same-frame steps.
-            saved_tensor_context = torch.autograd.graph.save_on_cpu(
-                pin_memory=bool(
-                    getattr(self.args, "full_cloud_saved_tensor_pin_memory", False)
-                )
-            )
-        else:
-            saved_tensor_context = nullcontext()
+        saved_tensor_context = selective_saved_tensor_cpu_offload(
+            offload_threshold_mb,
+            pin_memory=bool(
+                getattr(self.args, "full_cloud_saved_tensor_pin_memory", False)
+            ),
+            enabled=offload_saved_tensors,
+        )
 
         external_executable_plan = None
         if isinstance(k_proposal_terms, dict):

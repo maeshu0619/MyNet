@@ -3761,7 +3761,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--episode_input_common_cache', default=True, type=str2bool, help='同じ入力データをEpisodeごとに繰り返すとき、入力依存の共通前処理をCPUキャッシュして再利用するか')
     parser.add_argument('--episode_input_common_cache_enable_dataset_cache', default=True, type=str2bool, help='episode_input_common_cache=True時にPLY dataset_cacheも自動で有効化するか')
     parser.add_argument('--episode_input_common_cache_max_entries', default=0, type=int, help='Episode共通前処理キャッシュの最大件数(0なら学習ファイル数まで自動設定)')
-    parser.add_argument('--episode_input_common_cache_max_memory_mb', default=2048, type=int, help='Episode共通前処理キャッシュのCPUメモリ上限(MB, 0で無制限)')
+    parser.add_argument('--episode_input_common_cache_max_memory_mb', default=512, type=int, help='Episode共通前処理キャッシュのCPUメモリ上限(MB, 0で無制限)')
     parser.add_argument('--episode_input_subtree_runtime_cache', default=True, type=str2bool, help='Episode共通キャッシュ内に、Subtreeごとの入力点群/属性/canonical metadataを保存して再利用するか')
     parser.add_argument('--episode_input_subtree_runtime_prewarm_all', default=False, type=str2bool, help='Episode共通キャッシュ有効時、各サンプルの候補Subtree runtime入力を初回Stepでまとめて作成し、Episode2以降で再利用するか')
     parser.add_argument('--episode_input_subtree_runtime_max_groups', default=0, type=int, help='Subtree runtime prewarm対象の最大Subtree数。0なら候補全件')
@@ -3777,11 +3777,16 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--use_amp', default=True, type=str2bool, help='混合精度学習を使うか')
     parser.add_argument('--amp_dtype', default='auto', type=str, help='AMPのデータ型')
     parser.add_argument('--full_cloud_activation_checkpoint', default=True, type=str2bool, help='FP32精度を維持したままfull-cloud headの中間activationをbackward時に再計算してGPUメモリを削減する')
-    parser.add_argument('--full_cloud_saved_tensor_cpu_offload_mb', default=1.0, type=float, help='full-cloud Actuatorのbackward用FP32 Tensorを公式save_on_cpuで可逆退避するか（0で無効、正数で有効）')
+    parser.add_argument(
+        '--full_cloud_saved_tensor_cpu_offload_mb',
+        default=0.25,
+        type=float,
+        help='full-cloud backward用saved Tensorを可逆CPU退避する最小サイズMB（0で無効）',
+    )
     parser.add_argument('--full_cloud_saved_tensor_pin_memory', default=False, type=str2bool, help='save_on_cpu退避をpinned memoryに置くか。長時間学習では共有メモリ増加を避けるため既定False')
     parser.add_argument('--structure_neighbor_query_chunk', default=32768, type=int, help='26近傍occupancyを完全一致のまま分割検索する点数（小さいほど一時GPUメモリを削減）')
     parser.add_argument('--structure_fixed_cache_max_entries', default=64, type=int, help='固定GTの26近傍・parent分割CPUキャッシュ最大件数')
-    parser.add_argument('--structure_fixed_cache_max_memory_mb', default=4096, type=int, help='固定GTの26近傍・parent分割CPUキャッシュ上限(MB)')
+    parser.add_argument('--structure_fixed_cache_max_memory_mb', default=1024, type=int, help='固定GTの26近傍・parent分割CPUキャッシュ上限(MB)')
     parser.add_argument('--den6_online_release_cuda_cache_before_actuator', default=True, type=str2bool, help='構造解析終了後に不要となったCUDA検索workspace cacheをActuator前に返却する')
     parser.add_argument('--den6_online_release_cuda_cache_before_actual', default=True, type=str2bool, help='ana_den6_onlineの実圧縮worker起動直前に未使用CUDA allocator cacheだけを返却し、2プロセス重複時のGPU使用量を抑える')
     parser.add_argument('--amp_init_scale', default=1.0, type=float, help='GradScaler初期値')
@@ -3789,7 +3794,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--cache_frozen_inputs', default=True, type=str2bool, help='Encoder出力をキャッシュするか')
     parser.add_argument('--cache_gt_loss', default=True, type=str2bool, help='GT側損失をキャッシュするか')
     parser.add_argument('--cache_max_entries', default=192, type=int, help='キャッシュ最大数')
-    parser.add_argument('--cache_max_memory_mb', default=12288, type=int, help='固定Node CPUキャッシュ最大メモリ（MB）')
+    parser.add_argument('--cache_max_memory_mb', default=2048, type=int, help='固定Node CPUキャッシュ最大メモリ（MB）')
     parser.add_argument(
         '--static_node_cache_cpu',
         default=True,

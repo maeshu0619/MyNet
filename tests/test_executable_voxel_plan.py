@@ -10,12 +10,28 @@ from models.modules.executable_voxel_plan import (
     apply_selected_executable_plan,
     coordinate_indices,
     executable_plan_hashes,
+    scatter_amax_1d_compat_,
     select_executable_plan,
 )
 from models.modules.structure_actuator import StructureRepairActuator
 
 
 class ExecutableVoxelPlanTest(unittest.TestCase):
+    def test_scatter_amax_compat_matches_scalar_reference_and_keeps_gradient(self):
+        index = torch.tensor([3, 1, 3, 4, 1, 3], dtype=torch.long)
+        source = torch.tensor(
+            [0.2, 0.5, 0.9, 0.4, 0.7, 0.8], requires_grad=True
+        )
+        output = torch.zeros(6)
+        actual = scatter_amax_1d_compat_(output, index, source)
+        expected = torch.tensor([0.0, 0.7, 0.0, 0.9, 0.4, 0.0])
+        self.assertTrue(torch.equal(actual, expected))
+        actual.sum().backward()
+        self.assertTrue(torch.equal(
+            source.grad,
+            torch.tensor([0.0, 0.0, 1.0, 1.0, 1.0, 0.0]),
+        ))
+
     def test_coordinate_indices_exact_sparse_join(self):
         reference = torch.tensor([[2, 0, 0], [0, 0, 0], [1, 0, 0]])
         query = torch.tensor([[1, 0, 0], [9, 9, 9], [2, 0, 0]])
