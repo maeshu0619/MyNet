@@ -448,9 +448,13 @@ def _load_exact_single_plan_teacher(
         del path
         _GLOBAL_PAYLOAD_CACHE[exact_identity_key] = dict(teacher)
         _GLOBAL_PAYLOAD_CACHE.move_to_end(exact_identity_key)
-        max_entries = max(
-            int(getattr(args, "heuristic_guidance_online_memory_entries", 64)), 1
-        )
+        # Exact JSONは1件約8MBでも、座標整数をPython objectへ展開すると
+        # file size以上のRAMを使う。64 frame保持は今回のmain process
+        # OS OOMを悪化させるため、同一Step内の再利用に足りる直近数件へ
+        # 制限する。順位・plan・Actual値は一切変更しない。
+        max_entries = min(max(
+            int(getattr(args, "heuristic_guidance_online_memory_entries", 4)), 1
+        ), 4)
         while len(_GLOBAL_PAYLOAD_CACHE) > max_entries:
             _GLOBAL_PAYLOAD_CACHE.popitem(last=False)
 

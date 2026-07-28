@@ -8,6 +8,7 @@ from models.network import Network
 from models.utils.loss.single_plan_distillation import SinglePlanDistillationLoss
 from models.utils.training.compression_primary_loss import (
     _compression_primary_support_balance,
+    monotonic_support_scale,
 )
 
 
@@ -34,6 +35,38 @@ class SinglePlanDistillationTest(unittest.TestCase):
         self.assertAlmostEqual(float(weighted.detach()), 1.0, places=7)
         weighted.backward()
         self.assertGreater(float(shadow.grad.abs()), 0.0)
+
+    def test_shadow_scale_does_not_hide_distillation_convergence(self):
+        """raw蒸留loss低下時にscaleを逆増幅せず、weighted lossも低下させる。"""
+        args = SimpleNamespace(
+            single_plan_shadow_target_ratio=0.10,
+            single_plan_shadow_balance_min_scale=0.01,
+            single_plan_shadow_balance_max_scale=1.0,
+        )
+        primary = torch.tensor(-10.0)
+        first = _compression_primary_support_balance(
+            args,
+            primary,
+            torch.tensor(100.0),
+            target_ratio_name="single_plan_shadow_target_ratio",
+            min_scale_name="single_plan_shadow_balance_min_scale",
+            max_scale_name="single_plan_shadow_balance_max_scale",
+        )
+        later = _compression_primary_support_balance(
+            args,
+            primary,
+            torch.tensor(10.0),
+            target_ratio_name="single_plan_shadow_target_ratio",
+            min_scale_name="single_plan_shadow_balance_min_scale",
+            max_scale_name="single_plan_shadow_balance_max_scale",
+        )
+        effective_later = monotonic_support_scale(
+            first["scale"], later["scale"]
+        )
+        self.assertAlmostEqual(first["scale"], 0.01, places=7)
+        self.assertAlmostEqual(later["scale"], 0.10, places=7)
+        self.assertAlmostEqual(effective_later, 0.01, places=7)
+        self.assertLess(effective_later * 10.0, first["scale"] * 100.0)
 
     def test_operation_specific_teacher_has_gradient_without_add_source(self):
         torch.manual_seed(2)

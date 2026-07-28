@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import math
 from typing import Any, Dict, Mapping
 
+import numpy as np
 import torch
 from .executable_voxel_plan import coordinate_indices, scatter_amax_1d_compat_
 
@@ -26,33 +27,49 @@ def _guidance_tensor_tree(value: Any, device: torch.device) -> Any:
     """候補manifestを複製せず、写像済みTensorだけを指定deviceへ移す。"""
     if torch.is_tensor(value):
         return value.detach().to(device=device)
+    if isinstance(value, np.ndarray):
+        return value
     if isinstance(value, dict):
         return {
             key: _guidance_tensor_tree(item, device)
             for key, item in value.items()
         }
+    if isinstance(value, list):
+        return [_guidance_tensor_tree(item, device) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_guidance_tensor_tree(item, device) for item in value)
     return value
 
 
 def _guidance_tensor_bytes(value: Any) -> int:
     if torch.is_tensor(value):
         return int(value.numel()) * int(value.element_size())
+    if isinstance(value, np.ndarray):
+        return int(value.nbytes)
     if isinstance(value, dict):
         return sum(_guidance_tensor_bytes(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return sum(_guidance_tensor_bytes(item) for item in value)
     return 0
 
 
 def _store_exact_guidance_cpu(
     key: tuple[str, str, int],
     guidance: Mapping[str, Any],
-    exact: Mapping[str, Any],
+    _exact: Mapping[str, Any],
     args: Any,
 ) -> None:
     """固定候補の座標写像だけをCPUへ保存し、全Voxel辞書の再構築を防ぐ。"""
     global _EXACT_GUIDANCE_CPU_CACHE_BYTES
-    cpu_guidance = _guidance_tensor_tree(dict(guidance), torch.device("cpu"))
-    # 大きいcandidate manifestは既存Layer A cacheの同一objectを参照する。
-    cpu_guidance["exact_candidate_guidance"] = exact
+    # exact_candidate_guidanceは約20MBのJSONを展開した巨大Python manifestで、
+    # 参照先のLayer A LRUがevictされても、このCPU cacheが最大64 frame分を
+    # 生存させていた。復元時には現在frameのexactを必ず再設定するため保存不要。
+    mapped_only = {
+        key: value
+        for key, value in guidance.items()
+        if key != "exact_candidate_guidance"
+    }
+    cpu_guidance = _guidance_tensor_tree(mapped_only, torch.device("cpu"))
     entry_bytes = _guidance_tensor_bytes(cpu_guidance)
     max_entries = max(int(getattr(
         args, "heuristic_guidance_cpu_tensor_cache_entries", 64

@@ -78,6 +78,12 @@ class Network(nn.Module):
             "single_plan_distillation_updates",
             torch.zeros((), dtype=torch.long),
         )
+        # 初期Stepで決めたShadow蒸留scaleをcheckpointへ保存する。
+        # raw lossが下がった後にscaleを逆増幅せず、収束を全体Lossへ反映する。
+        self.register_buffer(
+            "single_plan_shadow_balance_scale",
+            torch.full((), float("nan"), dtype=torch.float32),
+        )
 
         """モジュールセットアップ"""
         self.encoder = PointTransformer(self.args) # 特徴抽出器
@@ -207,8 +213,13 @@ class Network(nn.Module):
         unnecessarily increasing the CUDA peak without affecting learning.
         """
         self.debug_tensors = {}
+        self.last_structure_debug = {}
+        self.last_encoder_debug = {}
         self.last_actuator_voxel_state = None
         self.last_actuator_soft_terms = {}
+        self.last_k_proposal_terms = None
+        self.last_single_plan_student_terms = None
+        self.last_k_all_actual_debug = {}
         release_exact_guidance_cache(self.args)
         for module in (self.actuator, self.cost_attributor, self.policy_module):
             if hasattr(module, "debug_tensors"):
@@ -394,14 +405,44 @@ class Network(nn.Module):
         if not torch.is_tensor(log_prob) or not log_prob.requires_grad:
             return reward.new_zeros(())
         objective = torch.nan_to_num(reward.float().mean(), nan=0.0, posinf=1e3, neginf=-1e3)
+        input_file = str(getattr(self.args, "_current_input_file", ""))
         cache_key = "|".join((
-            str(getattr(self.args, "_current_input_file", "")),
+            input_file,
             str(getattr(self.args, "sparsepcgc_scale_ae", 0)),
             str(getattr(self.args, "sparsepcgc_scale_sr", 0)),
             str(getattr(self.args, "sparsepcgc_scale_m", 8)),
         ))
+        normalized_input_file = input_file.replace("\\", "/")
+        sequence_name = (
+            normalized_input_file.rsplit("/", 1)[0]
+            if "/" in normalized_input_file
+            else normalized_input_file
+        )
+        sequence_key = "|".join((
+            sequence_name,
+            str(getattr(self.args, "sparsepcgc_scale_ae", 0)),
+            str(getattr(self.args, "sparsepcgc_scale_sr", 0)),
+            str(getattr(self.args, "sparsepcgc_scale_m", 8)),
+        ))
+        sequence_objective_baseline = getattr(
+            self, "_den6_online_sequence_objective_baseline", None
+        )
+        if sequence_objective_baseline is None:
+            sequence_objective_baseline = OrderedDict()
+            self._den6_online_sequence_objective_baseline = sequence_objective_baseline
         baseline_seen = cache_key in self._den6_online_objective_baseline
-        previous = self._den6_online_objective_baseline.get(cache_key, 0.0)
+        sequence_baseline_seen = sequence_key in sequence_objective_baseline
+        if baseline_seen:
+            previous = self._den6_online_objective_baseline[cache_key]
+            baseline_source = "frame"
+        elif sequence_baseline_seen:
+            # 最初の数百Stepは未知frameが続くため、frame EMAだけでは毎回
+            # no-op 0%基準になりActualの良し悪しを区別できない。
+            previous = sequence_objective_baseline[sequence_key]
+            baseline_source = "sequence"
+        else:
+            previous = 0.0
+            baseline_source = "noop"
         previous_t = objective.new_tensor(float(previous))
         # objectiveはActual圧縮率[%]で、小さいほど良い。baselineより小さい時に
         # 今回の唯一のplanの選択確率を増やす。±1%未満の信号が他損失に埋もれない
@@ -438,6 +479,18 @@ class Network(nn.Module):
         self._den6_online_objective_baseline.move_to_end(cache_key)
         while len(self._den6_online_objective_baseline) > 4096:
             self._den6_online_objective_baseline.popitem(last=False)
+        previous_sequence = float(sequence_objective_baseline.get(
+            sequence_key, objective_value
+        ))
+        updated_sequence = (
+            (1.0 - baseline_alpha) * previous_sequence
+            + baseline_alpha * objective_value
+            if sequence_baseline_seen else objective_value
+        )
+        sequence_objective_baseline[sequence_key] = float(updated_sequence)
+        sequence_objective_baseline.move_to_end(sequence_key)
+        while len(sequence_objective_baseline) > 128:
+            sequence_objective_baseline.popitem(last=False)
 
         weight = max(float(getattr(self.args, "heuristic_guidance_online_policy_weight", 1.0)), 0.0)
         entropy_weight = max(float(getattr(self.args, "heuristic_guidance_online_entropy_weight", 0.001)), 0.0)
@@ -455,6 +508,7 @@ class Network(nn.Module):
         geometry_policy_weighted = objective.new_zeros(())
         geometry_advantage = objective.new_zeros(())
         geometry_guard_passed = False
+        geometry_baseline_source = "unavailable"
         amount_log_prob = state.get("den6_online_amount_log_prob", None)
         if (
             mode == "ana_den6_online"
@@ -471,9 +525,22 @@ class Network(nn.Module):
                 geometry.float().mean(), nan=0.0, posinf=1e3, neginf=0.0
             )
             geometry_seen = cache_key in geometry_baseline
-            previous_geometry = float(geometry_baseline.get(
-                cache_key, float(geometry_objective.detach().cpu())
-            ))
+            sequence_geometry_baseline = getattr(
+                self, "_den6_online_sequence_geometry_baseline", None
+            )
+            if sequence_geometry_baseline is None:
+                sequence_geometry_baseline = OrderedDict()
+                self._den6_online_sequence_geometry_baseline = sequence_geometry_baseline
+            sequence_geometry_seen = sequence_key in sequence_geometry_baseline
+            if geometry_seen:
+                previous_geometry = float(geometry_baseline[cache_key])
+                geometry_baseline_source = "frame"
+            elif sequence_geometry_seen:
+                previous_geometry = float(sequence_geometry_baseline[sequence_key])
+                geometry_baseline_source = "sequence"
+            else:
+                previous_geometry = float(geometry_objective.detach().cpu())
+                geometry_baseline_source = "initialize"
             compression_tolerance = max(float(getattr(
                 self.args,
                 "heuristic_guidance_online_geometry_compression_tolerance",
@@ -486,7 +553,10 @@ class Network(nn.Module):
                     float(effective_baseline_t.detach().cpu()) + compression_tolerance,
                 )
             )
-            if geometry_seen and geometry_guard_passed:
+            geometry_reference_available = bool(
+                geometry_seen or sequence_geometry_seen
+            )
+            if geometry_reference_available and geometry_guard_passed:
                 previous_geometry_t = geometry_objective.new_tensor(previous_geometry)
                 geometry_advantage = (
                     previous_geometry_t - geometry_objective.detach()
@@ -520,6 +590,21 @@ class Network(nn.Module):
                 geometry_baseline.move_to_end(cache_key)
                 while len(geometry_baseline) > 4096:
                     geometry_baseline.popitem(last=False)
+                previous_sequence_geometry = float(sequence_geometry_baseline.get(
+                    sequence_key, float(geometry_objective.detach().cpu())
+                ))
+                updated_sequence_geometry = (
+                    (1.0 - baseline_alpha) * previous_sequence_geometry
+                    + baseline_alpha * float(geometry_objective.detach().cpu())
+                    if sequence_geometry_seen
+                    else float(geometry_objective.detach().cpu())
+                )
+                sequence_geometry_baseline[sequence_key] = float(
+                    updated_sequence_geometry
+                )
+                sequence_geometry_baseline.move_to_end(sequence_key)
+                while len(sequence_geometry_baseline) > 128:
+                    sequence_geometry_baseline.popitem(last=False)
         adaptive_amount_entropy = objective.new_zeros(())
         adaptive_amount_entropy_weighted = objective.new_zeros(())
         if mode in {"network_only_codec_policy", "network_k_proposal_policy", "single_plan_student"}:
@@ -550,6 +635,8 @@ class Network(nn.Module):
         self.last_discrete_policy_debug = {
             "objective": float(objective.detach().cpu()),
             "objective_baseline": float(previous),
+            "objective_baseline_source": str(baseline_source),
+            "objective_sequence_baseline": float(updated_sequence),
             "objective_effective_baseline": float(effective_baseline_t.detach().cpu()),
             "advantage": float(advantage.detach().cpu()),
             "log_prob": float(log_prob.detach().float().mean().cpu()),
@@ -559,6 +646,7 @@ class Network(nn.Module):
             "entropy_raw": float(entropy_raw.detach().cpu()),
             "entropy_weighted": float(entropy_weighted.detach().cpu()),
             "geometry_policy_guard_passed": bool(geometry_guard_passed),
+            "geometry_policy_baseline_source": str(geometry_baseline_source),
             "geometry_policy_advantage": float(geometry_advantage.detach().cpu()),
             "geometry_policy_raw": float(geometry_policy_raw.detach().cpu()),
             "geometry_policy_weighted": float(geometry_policy_weighted.detach().cpu()),

@@ -140,6 +140,17 @@ def _compression_primary_support_balance(
     }
 
 
+def monotonic_support_scale(previous_scale, proposed_scale):
+    """初期の支配を抑えたscaleを、loss低下に合わせて逆増幅しない。"""
+    proposed = float(proposed_scale)
+    previous = float(previous_scale)
+    if not math.isfinite(proposed) or proposed < 0.0:
+        raise ValueError("proposed_scaleは有限の非負値である必要がある")
+    if not math.isfinite(previous) or previous < 0.0:
+        return proposed
+    return min(previous, proposed)
+
+
 def term_requires_grad(value):
     return bool(torch.is_tensor(value) and value.requires_grad)
 

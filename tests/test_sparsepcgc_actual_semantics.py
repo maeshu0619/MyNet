@@ -11,8 +11,10 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import numpy as np
 import torch
 
+import models.modules.heuristic_guidance as heuristic_guidance_module
 from models.modules.heuristic_guidance import (
     build_heuristic_guidance,
     release_exact_guidance_cache,
@@ -110,6 +112,39 @@ class _EveryStepFixture(CompressionLossMixin):
 
 
 class SparsePCGCActualSemanticsTest(unittest.TestCase):
+    def test_cpu_guidance_cache_does_not_retain_exact_manifest(self):
+        """固定Tensor cacheへ巨大なframe別candidate manifestを保持しない。"""
+        module = heuristic_guidance_module
+        key = ("memory-regression", "torch.float32", 3)
+        exact = {
+            "operation_edit_units": {
+                "Prune": [{"payload": "x" * 1024}],
+            },
+        }
+        guidance = {
+            "candidate_mask": {"Prune": torch.ones(3, dtype=torch.bool)},
+            "numpy_debug": np.zeros((128,), dtype=np.float32),
+            "exact_candidate_guidance": exact,
+        }
+        args = SimpleNamespace(
+            heuristic_guidance_cpu_tensor_cache_entries=2,
+            heuristic_guidance_cpu_tensor_cache_max_memory_mb=1,
+        )
+        try:
+            module._store_exact_guidance_cpu(key, guidance, exact, args)
+            stored = module._EXACT_GUIDANCE_CPU_CACHE[key]["guidance"]
+            self.assertNotIn("exact_candidate_guidance", stored)
+            self.assertEqual(
+                module._guidance_tensor_bytes(stored["numpy_debug"]),
+                int(stored["numpy_debug"].nbytes),
+            )
+        finally:
+            removed = module._EXACT_GUIDANCE_CPU_CACHE.pop(key, None)
+            if isinstance(removed, dict):
+                module._EXACT_GUIDANCE_CPU_CACHE_BYTES -= int(
+                    removed.get("bytes", 0)
+                )
+
     def test_full_cloud_input_preserves_every_point(self):
         points = torch.arange(2 * 17 * 6, dtype=torch.float32).reshape(2, 17, 6)
         prepared = prepare_full_cloud_input_pcd(points, use_cuda=False)
@@ -145,15 +180,25 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         network.policy_module = torch.nn.Identity()
         network.policy_module.debug_tensors = {"large": torch.ones(8)}
         network.debug_tensors = {"large": torch.ones(8)}
+        network.last_structure_debug = {"large": torch.ones(8)}
+        network.last_encoder_debug = {"large": torch.ones(8)}
         network.last_actuator_voxel_state = {"coords": torch.ones(8)}
         network.last_actuator_soft_terms = {"soft": torch.ones(8)}
+        network.last_k_proposal_terms = {"large": torch.ones(8)}
+        network.last_single_plan_student_terms = {"large": torch.ones(8)}
+        network.last_k_all_actual_debug = {"large": torch.ones(8)}
         network.input_cache = {"reusable": {"state": torch.ones(8)}}
 
         network.release_step_transient_state()
 
         self.assertEqual(network.debug_tensors, {})
+        self.assertEqual(network.last_structure_debug, {})
+        self.assertEqual(network.last_encoder_debug, {})
         self.assertIsNone(network.last_actuator_voxel_state)
         self.assertEqual(network.last_actuator_soft_terms, {})
+        self.assertIsNone(network.last_k_proposal_terms)
+        self.assertIsNone(network.last_single_plan_student_terms)
+        self.assertEqual(network.last_k_all_actual_debug, {})
         self.assertEqual(network.actuator.debug_tensors, {})
         self.assertEqual(network.cost_attributor.debug_tensors, {})
         self.assertEqual(network.policy_module.debug_tensors, {})
@@ -663,6 +708,105 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         )[0]
         self.assertIsNone(rejected_grad)
         self.assertFalse(network.last_discrete_policy_debug["geometry_policy_guard_passed"])
+
+    def test_den6_sequence_baseline_credits_new_frames_immediately(self):
+        """未知frameが続いてもsequence EMAでActualとGeometryを比較する。"""
+        network = Network.__new__(Network)
+        torch.nn.Module.__init__(network)
+        network.args = SimpleNamespace(
+            heuristic_guidance_mode="ana_den6_online",
+            _current_input_file="/dataset/longdress/frame_0001.ply",
+            sparsepcgc_scale_ae=0,
+            sparsepcgc_scale_sr=2,
+            sparsepcgc_scale_m=8,
+            heuristic_guidance_online_policy_weight=1.0,
+            heuristic_guidance_online_entropy_weight=0.0,
+            heuristic_guidance_online_reward_scale=1.0,
+            heuristic_guidance_online_advantage_clip=10.0,
+            heuristic_guidance_online_reward_ema=0.1,
+            heuristic_guidance_online_geometry_policy_weight=1.0,
+            heuristic_guidance_online_geometry_compression_tolerance=0.25,
+            heuristic_guidance_online_geometry_advantage_clip=1.0,
+        )
+        network._den6_online_objective_baseline = __import__("collections").OrderedDict()
+        network._den6_online_geometry_baseline = __import__("collections").OrderedDict()
+
+        first_policy = torch.tensor(0.0, requires_grad=True)
+        first_amount = torch.tensor(0.0, requires_grad=True)
+        network.last_actuator_voxel_state = {
+            "den6_online_policy_log_prob": first_policy,
+            "den6_online_policy_entropy": first_policy.new_zeros(()),
+            "den6_online_amount_log_prob": first_amount,
+        }
+        network.discrete_policy_loss(
+            torch.tensor(-4.0), geometry=torch.tensor(0.010)
+        )
+
+        network.args._current_input_file = "/dataset/longdress/frame_0002.ply"
+        second_policy = torch.tensor(0.0, requires_grad=True)
+        second_amount = torch.tensor(0.0, requires_grad=True)
+        network.last_actuator_voxel_state = {
+            "den6_online_policy_log_prob": second_policy,
+            "den6_online_policy_entropy": second_policy.new_zeros(()),
+            "den6_online_amount_log_prob": second_amount,
+        }
+        second = network.discrete_policy_loss(
+            torch.tensor(-4.0), geometry=torch.tensor(0.009)
+        )
+        amount_grad = torch.autograd.grad(second, second_amount)[0]
+        self.assertLess(float(amount_grad), 0.0)
+        self.assertEqual(
+            network.last_discrete_policy_debug["objective_baseline_source"],
+            "sequence",
+        )
+        self.assertEqual(
+            network.last_discrete_policy_debug["geometry_policy_baseline_source"],
+            "sequence",
+        )
+
+    def test_den6_sequence_baseline_reverses_gradient_for_worse_new_frame(self):
+        """同一sequenceの未出frameでもActualの良化・悪化を同じ正例にしない。"""
+        network = Network.__new__(Network)
+        torch.nn.Module.__init__(network)
+        network.args = SimpleNamespace(
+            heuristic_guidance_mode="ana_den6_online",
+            _current_input_file="/dataset/loot/frame_0001.ply",
+            sparsepcgc_scale_ae=0,
+            sparsepcgc_scale_sr=2,
+            sparsepcgc_scale_m=8,
+            heuristic_guidance_online_policy_weight=1.0,
+            heuristic_guidance_online_entropy_weight=0.0,
+            heuristic_guidance_online_reward_scale=1.0,
+            heuristic_guidance_online_advantage_clip=10.0,
+            heuristic_guidance_online_reward_ema=0.1,
+            heuristic_guidance_online_geometry_policy_weight=0.0,
+        )
+        network._den6_online_objective_baseline = __import__("collections").OrderedDict()
+        network.last_actuator_voxel_state = {
+            "den6_online_policy_log_prob": torch.tensor(0.0, requires_grad=True),
+            "den6_online_policy_entropy": torch.tensor(0.0),
+        }
+        network.discrete_policy_loss(torch.tensor(-4.0))
+
+        network.args._current_input_file = "/dataset/loot/frame_0002.ply"
+        worse_log_prob = torch.tensor(0.0, requires_grad=True)
+        network.last_actuator_voxel_state = {
+            "den6_online_policy_log_prob": worse_log_prob,
+            "den6_online_policy_entropy": worse_log_prob.new_zeros(()),
+        }
+        worse_loss = network.discrete_policy_loss(torch.tensor(-3.0))
+        worse_grad = torch.autograd.grad(worse_loss, worse_log_prob)[0]
+
+        network.args._current_input_file = "/dataset/loot/frame_0003.ply"
+        better_log_prob = torch.tensor(0.0, requires_grad=True)
+        network.last_actuator_voxel_state = {
+            "den6_online_policy_log_prob": better_log_prob,
+            "den6_online_policy_entropy": better_log_prob.new_zeros(()),
+        }
+        better_loss = network.discrete_policy_loss(torch.tensor(-5.0))
+        better_grad = torch.autograd.grad(better_loss, better_log_prob)[0]
+        self.assertGreater(float(worse_grad), 0.0)
+        self.assertLess(float(better_grad), 0.0)
 
     def test_reproduction_reference_matches_saved_mvub_plan(self):
         path = Path(__file__).resolve().parents[1] / "tools" / "ana_den6_reproduce.py"

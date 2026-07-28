@@ -77,6 +77,7 @@ from models.utils.training.full_cloud_actual_correction import (
 from models.utils.training.saved_tensor_offload import (
     selective_saved_tensor_cpu_offload,
 )
+from models.utils.training.memory_diagnostics import MemoryDiagnosticsCSV
 
 from models.utils.training.utils import *
 from models.utils.training.noise_debug import *
@@ -91,7 +92,10 @@ from models.utils.training.scalar_utils import *
 from models.utils.training.correlation_debug import *
 from models.utils.training.sparsepcgc_controls import *
 from models.utils.training.compression_primary_loss import *
-from models.utils.training.compression_primary_loss import _compression_primary_support_balance
+from models.utils.training.compression_primary_loss import (
+    _compression_primary_support_balance,
+    monotonic_support_scale,
+)
 from models.utils.training.full_context_subtree_loss import build_full_context_subtree_delta_loss
 from models.utils.training.case_debug import *
 from models.utils.training.metric_csv import *
@@ -12465,6 +12469,35 @@ def train(model, args, loss, writer, plot, notifier=None):
         writer.write(f"StepGradCSV: disabled path={metric_csv_paths['step_grad']}")
 
     """原因診断のためのログ"""
+    memory_diagnostics_path = os.path.join(
+        step_grad_dir, f"{args.time}_memory_diagnostics.csv"
+    )
+    memory_diagnostics = MemoryDiagnosticsCSV(memory_diagnostics_path)
+
+    def _record_memory(
+        phase, *, episode=-1, epoch=-1, step=-1, global_step=-1, sample=""
+    ):
+        """診断失敗で学習を止めず、OOM直前の行だけ確実に残す。"""
+        try:
+            return memory_diagnostics.record(
+                phase,
+                args=args,
+                model=model,
+                loss=loss,
+                episode=episode,
+                epoch=epoch,
+                step=step,
+                global_step=global_step,
+                sample=sample,
+            )
+        except Exception as exc:
+            writer.write(
+                "MemoryDiagnosticsWarning: "
+                f"phase={phase}, error={type(exc).__name__}: {str(exc)[:200]}"
+            )
+            return {}
+
+    writer.write(f"MemoryDiagnosticsCSV: enabled path={memory_diagnostics_path}")
     for_better_path = init_for_better_logger(args, plot, writer) # 改善・改悪要因を記録する詳細分析ログ
     checkpoint_gate_refs = {} # ChackPoint保存判定で使う基準値や過去値を保持
     best_trackers = None # 複数指標でBest CheckPointを追跡するための状態を初期化
@@ -12531,8 +12564,12 @@ def train(model, args, loss, writer, plot, notifier=None):
     scheduler_step_count = 0
     # 候補そのものは保存せず、同一stateが次のθ領域へ進むための訪問回数だけを保持する。
     network_k_state_visit_counts = {}
+    _record_memory("train_loop_start", global_step=global_train_step)
     for episode in range(args.episodes): # Episode開始
         writer.write(f"◆◆◆ Episode {episode + 1} / {args.episodes} ◆◆◆")
+        _record_memory(
+            "episode_start", episode=episode + 1, global_step=global_train_step
+        )
 
         """Stage変更"""
         current_stage = resolve_compression_fixed_stage(args) # EpisodeでStageを切り替えず、圧縮損失が常に効くjoint Stageへ固定する
@@ -12572,6 +12609,13 @@ def train(model, args, loss, writer, plot, notifier=None):
         for epoch, (seq_dir, dataset) in enumerate(seq_datasets): # Epoch開始
             writer.write(f"⦿⦿⦿ Epoch {epoch + 1}/{num_seq} : {seq_dir} ⦿⦿⦿")
             sequence_name = os.path.basename(os.path.normpath(str(seq_dir)))
+            _record_memory(
+                "epoch_before_loader",
+                episode=episode + 1,
+                epoch=epoch + 1,
+                global_step=global_train_step,
+                sample=sequence_name,
+            )
 
             """基本情報のセットアップ"""
             active_dataset = apply_epoch_file_window(dataset, args, episode) # 各系列の訓練用150件内をEpisodeごとにmax_files件ずつ進める
@@ -12582,6 +12626,13 @@ def train(model, args, loss, writer, plot, notifier=None):
                 prefetch_ana_den6_online_guidance(args, active_files[:den6_prefetch_lookahead])
             epoch_has_optimizer_step = False
             epoch_metric_sums = None
+            _record_memory(
+                "epoch_loader_ready",
+                episode=episode + 1,
+                epoch=epoch + 1,
+                global_step=global_train_step,
+                sample=sequence_name,
+            )
 
             for step, pts in enumerate(loader): # Step開始
                 """基本情報のセットアップ"""
@@ -12594,6 +12645,14 @@ def train(model, args, loss, writer, plot, notifier=None):
                         )
                 optimizer.zero_grad(set_to_none=True) # 前Stepの勾配を必ず消し、条件分岐による勾配蓄積を防ぐ
                 file_path = active_dataset.files[step]
+                _record_memory(
+                    "step_after_data_load",
+                    episode=episode + 1,
+                    epoch=epoch + 1,
+                    step=step + 1,
+                    global_step=global_train_step,
+                    sample=os.path.basename(str(file_path)),
+                )
                 # den6 v2 manifestは入力PLYのSHA256とcodec設定で厳密照合する。
                 # proxyや別frameへ黙ってfallbackさせないため、各Stepで実ファイルを明示する。
                 args._current_input_file = str(Path(file_path).expanduser().resolve())
@@ -14430,6 +14489,30 @@ def train(model, args, loss, writer, plot, notifier=None):
                         online_policy_loss = online_policy_loss * max(float(getattr(
                             args, "single_plan_policy_gradient_weight", 0.0
                         )), 0.0)
+                    elif heuristic_mode == "ana_den6_online":
+                        # 現在のforward係数0.1はLoss図をPolicyで支配しないため維持する。
+                        # backwardだけ063943時の実効係数1.0相当へ戻し、Actual/Geometryの
+                        # 相対評価をWhere/Amount/Actionへ十分に伝える。
+                        policy_backward_scale = max(float(getattr(
+                            args,
+                            "heuristic_guidance_online_policy_backward_scale",
+                            10.0,
+                        )), 0.0)
+                        online_policy_loss = (
+                            online_policy_loss.detach()
+                            + policy_backward_scale
+                            * (online_policy_loss - online_policy_loss.detach())
+                        )
+                        compression_debug_terms[
+                            "den6_online_policy_backward_scale"
+                        ] = float(policy_backward_scale)
+                        latest_policy_debug = dict(
+                            getattr(loss, "last_compression_debug", {}) or {}
+                        )
+                        latest_policy_debug[
+                            "den6_online_policy_backward_scale"
+                        ] = float(policy_backward_scale)
+                        loss.last_compression_debug = latest_policy_debug
                     policy_debug = dict(
                         getattr(base_model_for_policy, "last_discrete_policy_debug", {}) or {}
                     )
@@ -14703,7 +14786,28 @@ def train(model, args, loss, writer, plot, notifier=None):
                         max_scale_name="single_plan_shadow_balance_max_scale",
                         disabled_reason="single_plan_shadow_balance_disabled",
                     )
-                    shadow_distill_scale = float(shadow_balance["scale"])
+                    proposed_shadow_scale = float(shadow_balance["scale"])
+                    shadow_scale_state = getattr(
+                        base_student, "single_plan_shadow_balance_scale", None
+                    )
+                    previous_shadow_scale = float("nan")
+                    if torch.is_tensor(shadow_scale_state):
+                        previous_shadow_scale = float(
+                            shadow_scale_state.detach().float().cpu()
+                        )
+                    shadow_distill_scale = monotonic_support_scale(
+                        previous_shadow_scale,
+                        proposed_shadow_scale,
+                    )
+                    if torch.is_tensor(shadow_scale_state):
+                        with torch.no_grad():
+                            shadow_scale_state.fill_(shadow_distill_scale)
+                    if not math.isfinite(previous_shadow_scale):
+                        shadow_scale_reason = "initial_calibration"
+                    elif shadow_distill_scale < previous_shadow_scale:
+                        shadow_scale_reason = "budget_tightened"
+                    else:
+                        shadow_scale_reason = "convergence_preserved"
                     shadow_distill = shadow_distill_scale * shadow_distill_raw
                     L = L + shadow_distill
                     compression_debug_terms.update({
@@ -14723,11 +14827,14 @@ def train(model, args, loss, writer, plot, notifier=None):
                         "single_plan_shadow_loss_scale": float(
                             shadow_distill_scale
                         ),
+                        "single_plan_shadow_loss_scale_proposed": float(
+                            proposed_shadow_scale
+                        ),
                         "single_plan_shadow_target_ratio": float(
                             shadow_balance.get("target_ratio", 0.0) or 0.0
                         ),
                         "single_plan_shadow_balance_reason": str(
-                            shadow_balance.get("reason", "")
+                            shadow_scale_reason
                         ),
                         "single_plan_shadow_update_count": int(
                             base_student.single_plan_distillation_updates.detach().cpu()
@@ -16491,6 +16598,13 @@ def train(model, args, loss, writer, plot, notifier=None):
                         f"amount_total_ratio={float(audit_plan.get('amount_total_ratio_before_count', 0.0) or 0.0):.7f}, "
                         f"residual_alpha={float(audit_plan.get('residual_alpha', 0.0)):.6f}, "
                         f"where_residual_weight={float(audit_plan.get('where_residual_weight', 0.0) or 0.0):.6f}, "
+                        f"policy_baseline_source={str(audit_compression.get('den6_online_policy_objective_baseline_source', ''))}, "
+                        f"policy_baseline={float(audit_compression.get('den6_online_policy_objective_baseline', 0.0) or 0.0):.6f}, "
+                        f"policy_advantage={float(audit_compression.get('den6_online_policy_advantage', 0.0) or 0.0):.6f}, "
+                        f"policy_backward_scale={float(audit_compression.get('den6_online_policy_backward_scale', 1.0) or 1.0):.3f}, "
+                        f"geometry_policy_source={str(audit_compression.get('den6_online_policy_geometry_policy_baseline_source', ''))}, "
+                        f"geometry_policy_advantage={float(audit_compression.get('den6_online_policy_geometry_policy_advantage', 0.0) or 0.0):.6f}, "
+                        f"geometry_policy_weighted={float(audit_compression.get('den6_online_policy_geometry_policy_weighted', 0.0) or 0.0):.6f}, "
                         f"residual_candidate_delta=(count={int(audit_plan.get('residual_changed_candidate_count', 0) or 0)}, "
                         f"ratio={float(audit_plan.get('residual_changed_candidate_ratio', 0.0) or 0.0):.6f}), "
                         f"actual_encodes=(baseline={int(actual_audit.get('baseline', audit_compression.get('den6_online_baseline_actual_encode_count', 0)))}, "
@@ -16519,7 +16633,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                         f"loss={float(audit_compression.get('den6_online_policy_policy_loss', 0.0) or 0.0):.6g})"
                         f", shadow=(raw={float(audit_compression.get('single_plan_shadow_loss_raw', 0.0) or 0.0):.6g}, "
                         f"scaled={float(audit_compression.get('single_plan_shadow_loss', 0.0) or 0.0):.6g}, "
-                        f"scale={float(audit_compression.get('single_plan_shadow_loss_scale', 0.0) or 0.0):.6g})"
+                        f"scale={float(audit_compression.get('single_plan_shadow_loss_scale', 0.0) or 0.0):.6g}, "
+                        f"proposed={float(audit_compression.get('single_plan_shadow_loss_scale_proposed', 0.0) or 0.0):.6g}, "
+                        f"reason={str(audit_compression.get('single_plan_shadow_balance_reason', ''))})"
                         f", timing=(step_before_audit={float(time.time() - st_step):.3f}s, "
                         f"actual_total={float(audit_compression.get('actual_encode_time_total', 0.0) or 0.0):.3f}s, "
                         f"actual_gt={float(audit_compression.get('gt_actual_encode_time', 0.0) or 0.0):.3f}s, "
@@ -16983,6 +17099,14 @@ def train(model, args, loss, writer, plot, notifier=None):
                     if use_cuda and torch.cuda.is_available():
                         torch.cuda.empty_cache()
                     _release_cpu_step_memory()
+                _record_memory(
+                    "step_after_cleanup",
+                    episode=episode + 1,
+                    epoch=epoch + 1,
+                    step=step + 1,
+                    global_step=global_train_step,
+                    sample=os.path.basename(str(file_path)),
+                )
                 global_train_step += 1
                 max_train_steps = int(getattr(args, "max_train_steps", 0))
                 if max_train_steps > 0 and global_train_step >= max_train_steps:
@@ -17016,6 +17140,13 @@ def train(model, args, loss, writer, plot, notifier=None):
             log_epoch_point_edit_average( writer, epoch_edit_info, global_epoch) # Epoch単位の点ん操作統計をログに記録
             global_epoch += 1
             # Epochごとの図生成は通常の詳細Stepログ削減とは独立して残す。
+            _record_memory(
+                "epoch_before_plots",
+                episode=episode + 1,
+                epoch=epoch + 1,
+                global_step=global_train_step,
+                sample=sequence_name,
+            )
             plot.plot_loss_curve("step")
             plot.plot_loss_curve("epo")
             plot.plot_point_edit_curve("step")
@@ -17024,6 +17155,13 @@ def train(model, args, loss, writer, plot, notifier=None):
             plot.plot_occupancy_curve("epo")
             plot.plot_voxel_collision_curve("step")
             plot.plot_voxel_collision_curve("epo")
+            _record_memory(
+                "epoch_after_plots",
+                episode=episode + 1,
+                epoch=epoch + 1,
+                global_step=global_train_step,
+                sample=sequence_name,
+            )
             writer.write(f"Saved step/epoch plots/csv: {plot.save_dir}")
             writer.flush()
         if episode_metric_sums is not None:
@@ -17037,10 +17175,20 @@ def train(model, args, loss, writer, plot, notifier=None):
         plot.record_occupancy_metrics("epi", episode + 1)
         plot.record_voxel_collision_metrics("epi", episode + 1)
         log_episode_point_edit_average( writer, episode_edit_info, episode)
+        _record_memory(
+            "episode_before_plots",
+            episode=episode + 1,
+            global_step=global_train_step,
+        )
         plot.plot_loss_curve("epi")
         plot.plot_point_edit_curve("epi")
         plot.plot_occupancy_curve("epi")
         plot.plot_voxel_collision_curve("epi")
+        _record_memory(
+            "episode_after_plots",
+            episode=episode + 1,
+            global_step=global_train_step,
+        )
         writer.write(f"Saved episode plots/csv: {plot.save_dir}")
         if _episode_input_common_cache_enabled(args):
             cache_summary = _episode_input_common_cache_summary(args)
@@ -17055,6 +17203,11 @@ def train(model, args, loss, writer, plot, notifier=None):
             )
         writer.flush()
         checkpoint_metrics = finalize_checkpoint_metrics( args, current_stage, episode, plot, episode_checkpoint_sums, checkpoint_gate_refs)
+        _record_memory(
+            "episode_before_full_cloud_validation",
+            episode=episode + 1,
+            global_step=global_train_step,
+        )
         full_cloud_val = run_episode_full_cloud_validation(
             model=model,
             args=args,
@@ -17066,6 +17219,11 @@ def train(model, args, loss, writer, plot, notifier=None):
             use_cuda=use_cuda,
             use_amp=use_amp,
             amp_dtype=amp_dtype,
+        )
+        _record_memory(
+            "episode_after_full_cloud_validation",
+            episode=episode + 1,
+            global_step=global_train_step,
         )
         checkpoint_metrics["full_cloud_val_actual_percent"] = full_cloud_val.get("value")
         checkpoint_metrics["full_cloud_val_actual_count"] = int(full_cloud_val.get("count") or 0)
@@ -17326,6 +17484,12 @@ def train(model, args, loss, writer, plot, notifier=None):
         log_for_better_episode( for_better_path, args=args, episode=episode, stage=current_stage, checkpoint_metrics=checkpoint_metrics, compression_episode_metrics=compression_episode_metrics, operation_episode_metrics=operation_episode_metrics, best_trackers=best_trackers, model_path=model_path)
         if notifier is not None:
             notifier.episode_finished( episode=episode + 1, total_episodes=args.episodes, loss_value=float(plot.epi_loss_return()), model_path=model_path, log_path=getattr(writer, "file_path", None))
+    _record_memory(
+        "train_complete",
+        episode=int(args.episodes),
+        global_step=global_train_step,
+    )
+    memory_diagnostics.close()
     return best_loss
 
 if __name__ == '__main__':
