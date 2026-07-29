@@ -511,6 +511,9 @@ def _load_exact_single_plan_teacher(
 
         teacher = dict(candidate)
         teacher.pop("operation_candidate_shortlists", None)
+        # 完全Poolはoffline蒸留Cache構築専用であり、通常のHeuristic実行planへ
+        # 混入させない。必要なcompact edit unitsだけを下で明示的に渡す。
+        teacher.pop("operation_candidate_pools", None)
         teacher.pop("ranked_candidate_pools", None)
         teacher.pop("initial_heuristic_plan", None)
         teacher["operation_edit_units"] = dict(edit_units)

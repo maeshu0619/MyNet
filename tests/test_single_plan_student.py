@@ -18,6 +18,12 @@ def _args():
         network_only_where_gumbel_scale=1.0,
         single_plan_debug_hash=True,
         single_plan_local_tile_size=0,
+        single_plan_training_stage="representation",
+        single_plan_amount_learning_enabled=False,
+        single_plan_fixed_total_ratio=0.0025,
+        single_plan_fixed_prune_share=0.40,
+        single_plan_fixed_add_share=0.40,
+        single_plan_fixed_adjust_share=0.20,
     )
 
 
@@ -109,6 +115,40 @@ class SinglePlanStudentTest(unittest.TestCase):
         self.assertTrue(torch.equal(
             diagnostic["executable_plan"].accepted_count,
             fast["executable_plan"].accepted_count,
+        ))
+
+    def test_representation_train_and_test_use_identical_plan(self):
+        torch.manual_seed(11)
+        points = 4000
+        coords = torch.stack((
+            torch.arange(points) * 2,
+            torch.zeros(points, dtype=torch.long),
+            torch.zeros(points, dtype=torch.long),
+        )).view(1, 3, points)
+        features = torch.randn(1, 12, points)
+        fixed = torch.randn(1, 6, points)
+        model = SinglePlanStudentPolicy(12, hidden_dim=16)
+        args = _args()
+        model.train()
+        train_terms = model.generate_plan(
+            features, coords, args, training=True, fixed_features=fixed
+        )
+        model.eval()
+        with torch.no_grad():
+            test_terms = model.generate_plan(
+                features, coords, args, training=False, fixed_features=fixed
+            )
+        self.assertEqual(
+            train_terms["executable_plan"].plan_hash,
+            test_terms["executable_plan"].plan_hash,
+        )
+        self.assertTrue(torch.equal(
+            train_terms["executed_requested_count"],
+            torch.tensor([[[4, 4, 2]]]),
+        ))
+        self.assertTrue(torch.equal(
+            train_terms["executed_operation_order"],
+            torch.tensor([[[1, 0, 2]]]),
         ))
 
 

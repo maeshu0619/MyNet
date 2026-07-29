@@ -12355,6 +12355,79 @@ def train(model, args, loss, writer, plot, notifier=None):
                     sum(len(rows) for rows in single_plan_teacher_store.states.values()),
                 )
             )
+            if str(getattr(
+                args, "single_plan_training_stage", "representation"
+            )).strip().lower() in {"representation", "fast_distillation"}:
+                setting_id = (
+                    "native_vs{}_pq{}_ae{}_sr{}_m{}".format(
+                        float(getattr(args, "sparsepcgc_voxel_size", 1.0)),
+                        int(getattr(args, "sparsepcgc_pos_quantscale", 1)),
+                        int(getattr(args, "sparsepcgc_scale_ae", 0)),
+                        int(getattr(args, "sparsepcgc_scale_sr", 2)),
+                        int(getattr(args, "sparsepcgc_scale_m", 8)),
+                    ).replace("vs1.0", "vs1")
+                )
+                cached_paths = set()
+                matching_state_ids = set()
+                for rows in single_plan_teacher_store.states.values():
+                    if not rows:
+                        continue
+                    state = dict(rows[0].get("state_key") or {})
+                    if str(state.get("setting_id", "")) == setting_id:
+                        cached_paths.add(os.path.realpath(str(state.get("input_file", ""))))
+                        matching_state_ids.add(
+                            "{}|{}".format(
+                                str(state.get("input_sha256", "")),
+                                str(state.get("setting_id", "")),
+                            )
+                        )
+                incomplete_teacher_states = (
+                    single_plan_teacher_store.incomplete_state_reasons()
+                )
+                matching_incomplete = {
+                    state_id: reason
+                    for state_id, reason in incomplete_teacher_states.items()
+                    if state_id in matching_state_ids
+                }
+                if (
+                    bool(getattr(
+                        args, "single_plan_require_complete_teacher_pool", True
+                    ))
+                    and matching_incomplete
+                ):
+                    raise RuntimeError(
+                        "Single-Plan Gate B未達: 現codec設定の完全candidate Pool"
+                        "またはscore/rankが欠けているため、Pool外Voxelを"
+                        "negative化する蒸留を停止した。欠損state例={}".format(
+                            list(matching_incomplete.items())[:3]
+                        )
+                    )
+                selected_datasets = []
+                selected_file_count = 0
+                for seq_dir, dataset in seq_datasets:
+                    selected_files = [
+                        path for path in getattr(dataset, "files", ())
+                        if os.path.realpath(path) in cached_paths
+                    ]
+                    if selected_files:
+                        dataset.files = selected_files
+                        dataset.all_files = list(selected_files)
+                        selected_datasets.append((seq_dir, dataset))
+                        selected_file_count += len(selected_files)
+                if selected_file_count <= 0:
+                    raise RuntimeError(
+                        "Single-Plan offline蒸留対象と現在のdataset/codec設定が一致しない。"
+                        "未知frameをnegativeやActual探索へ黙って置換しない"
+                    )
+                seq_datasets = selected_datasets
+                writer.write(
+                    "SinglePlanOfflineCoverage: stage={}, setting={}, frames={}, "
+                    "uncached_frame_apply=0".format(
+                        str(getattr(args, "single_plan_training_stage", "")),
+                        setting_id,
+                        selected_file_count,
+                    )
+                )
         else:
             raise RuntimeError(
                 "Single-Plan訓練用Layer A Cacheがない。"
@@ -16970,6 +17043,16 @@ def train(model, args, loss, writer, plot, notifier=None):
                             f"adjust_reachable={float(single_distill_debug.get('adjust_source_reachable', 0.0) or 0.0):.6g}, "
                             f"prune_raw_recall={float(single_distill_debug.get('prune_raw_topk_recall', 0.0) or 0.0):.6g}, "
                             f"adjust_raw_recall={float(single_distill_debug.get('adjust_raw_topk_recall', 0.0) or 0.0):.6g}, "
+                            f"prune_topm={float(single_distill_debug.get('prune_source_topm_coverage', 0.0) or 0.0):.6g}, "
+                            f"adjust_topm={float(single_distill_debug.get('adjust_source_topm_coverage', 0.0) or 0.0):.6g}, "
+                            f"prune_rank_r={float(single_distill_debug.get('prune_rank_spearman', float('nan'))):.6g}, "
+                            f"adjust_rank_r={float(single_distill_debug.get('adjust_rank_spearman', float('nan'))):.6g}, "
+                            f"score_loss=({float(single_distill_debug.get('prune_score_loss', 0.0) or 0.0):.6g},"
+                            f"{float(single_distill_debug.get('add_score_loss', 0.0) or 0.0):.6g},"
+                            f"{float(single_distill_debug.get('adjust_score_loss', 0.0) or 0.0):.6g}), "
+                            f"rank_loss=({float(single_distill_debug.get('prune_rank_loss', 0.0) or 0.0):.6g},"
+                            f"{float(single_distill_debug.get('add_rank_loss', 0.0) or 0.0):.6g},"
+                            f"{float(single_distill_debug.get('adjust_rank_loss', 0.0) or 0.0):.6g}), "
                             f"prune_fixed_oracle={float(single_distill_debug.get('prune_fixed_feature_oracle_recall', 0.0) or 0.0):.6g}, "
                             f"adjust_fixed_oracle={float(single_distill_debug.get('adjust_fixed_feature_oracle_recall', 0.0) or 0.0):.6g}, "
                             f"prune_recall={float(single_distill_debug.get('prune_source_recall', 0.0) or 0.0):.6g}, "
@@ -17382,6 +17465,50 @@ def train(model, args, loss, writer, plot, notifier=None):
             checkpoint_reasons.append("optimizer_step_success_ratio_low")
         if not nonfinite_consecutive_ok:
             checkpoint_reasons.append("consecutive_nonfinite_grad")
+        single_plan_actual_gate_ok = True
+        if (
+            str(getattr(args, "heuristic_guidance_mode", "")).strip().lower()
+            == "single_plan_student"
+            and str(getattr(
+                args, "single_plan_training_stage", "representation"
+            )).strip().lower() == "actual_calibration"
+        ):
+            base_student = model.module if hasattr(model, "module") else model
+            actual_eval_count = int(
+                base_student.single_plan_actual_training_updates.detach().cpu()
+            )
+            checkpoint_delta = finite_float_or_none(
+                checkpoint_metrics.get("checkpoint_actual_delta")
+            )
+            validation_delta = finite_float_or_none(
+                checkpoint_metrics.get("full_cloud_val_actual_percent")
+            )
+            operation_nonzero = all(
+                float(checkpoint_metrics.get(name, 0.0) or 0.0) > 0.0
+                for name in (
+                    "added_ratio_percent",
+                    "deleted_ratio_percent",
+                    "adjusted_ratio_percent",
+                )
+            )
+            single_plan_actual_gate_ok = bool(
+                actual_eval_count > 0
+                and checkpoint_delta is not None
+                and checkpoint_delta < 0.0
+                and validation_delta is not None
+                and validation_delta < 0.0
+                and operation_nonzero
+            )
+            if actual_eval_count <= 0:
+                checkpoint_reasons.append("student_actual_eval_count_zero")
+            if checkpoint_delta is None or checkpoint_delta >= 0.0:
+                checkpoint_reasons.append("student_train_actual_not_improving")
+            if validation_delta is None or validation_delta >= 0.0:
+                checkpoint_reasons.append("student_validation_actual_not_improving")
+            if not operation_nonzero:
+                checkpoint_reasons.append("student_operation_missing")
+            checkpoint_metrics["student_actual_eval_count"] = actual_eval_count
+            checkpoint_metrics["student_actual_gate_ok"] = single_plan_actual_gate_ok
         checkpoint_metrics.update(
             {
                 "optimizer_step_count": int(episode_optimizer_step_count),
@@ -17395,6 +17522,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                     checkpoint_metrics.get("checkpoint_eligible", False)
                     and optimizer_success_ok
                     and nonfinite_consecutive_ok
+                    and single_plan_actual_gate_ok
                 ),
                 "checkpoint_ineligible_reason": ",".join(dict.fromkeys(checkpoint_reasons)),
             }

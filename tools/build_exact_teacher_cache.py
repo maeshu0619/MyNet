@@ -84,6 +84,22 @@ def run(args):
         sources = [str(den5), str(den6), str(checkpoint), *sorted(source_by_state[state_id])]
         if online_path is not None:
             sources.append(str(online_path))
+        candidate_pools = dict(
+            (online_payload or {}).get("operation_candidate_pools") or {}
+        )
+        if not candidate_pools:
+            candidate_pools = dict(
+                (online_payload or {}).get("operation_candidate_shortlists") or {}
+            )
+        full_pool_counts = dict(
+            (online_payload or {}).get("full_pool_counts") or {}
+        )
+        candidate_pool_complete = bool(candidate_pools) and all(
+            len(candidate_pools.get(name) or ())
+            == int(full_pool_counts.get(name, -1))
+            and len(candidate_pools.get(name) or ()) > 0
+            for name in ("Add", "Prune", "Adjust")
+        )
         codec = {
             key: state.get(key) for key in (
                 "codec_mode", "setting_id", "scale_m", "scale_ae", "scale_sr",
@@ -132,12 +148,14 @@ def run(args):
             "actual_label_interpolation": False,
             "teacher_hard_apply_allowed": False,
             "den6_exact_candidate_cache": online_payload,
+            "operation_candidate_pools": candidate_pools,
+            "candidate_pool_complete": candidate_pool_complete,
             "candidate_shortlist_available": online_payload is not None,
             "missing_fields": {
                 "add_source": True,
                 "add_direction": True,
                 "reject_reason": True,
-                "full_candidate_pool": True,
+                "full_candidate_pool": not candidate_pool_complete,
                 "octree_fixed_features": True,
             },
         }

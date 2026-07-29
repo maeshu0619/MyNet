@@ -41,7 +41,21 @@ class SinglePlanStudentPolicy(nn.Module):
         nn.init.zeros_(self.utility_head[-1].bias)
 
     @staticmethod
-    def _requested_counts(terms, point_count: int) -> torch.Tensor:
+    def _requested_counts(terms, point_count: int, args) -> torch.Tensor:
+        if not bool(getattr(args, "single_plan_amount_learning_enabled", False)):
+            total_ratio = max(
+                float(getattr(args, "single_plan_fixed_total_ratio", 0.0025)),
+                0.0,
+            )
+            shares = terms["shares"].new_tensor((
+                float(getattr(args, "single_plan_fixed_prune_share", 0.40)),
+                float(getattr(args, "single_plan_fixed_add_share", 0.40)),
+                float(getattr(args, "single_plan_fixed_adjust_share", 0.20)),
+            ))
+            # Phase 1/2は0.10/0.10/0.05%を直接整数化し、全操作を必ず残す。
+            return torch.ceil(
+                shares.view(1, 3) * total_ratio * float(point_count)
+            ).to(torch.long).clamp_min(1).expand(terms["shares"].shape[0], -1)
         total_ratio = terms["total_ratio"].squeeze(-1).squeeze(-1)
         shares = terms["shares"].squeeze(-1)
         gates = terms["gate_hard"].squeeze(-1)
@@ -75,11 +89,14 @@ class SinglePlanStudentPolicy(nn.Module):
 
         return provider
 
-    def forward(self, features, voxel_coords, args, *, training=None, fixed_features=None):
+    def generate_plan(
+        self, features, voxel_coords, args, *, training=None, fixed_features=None
+    ):
+        """train/eval/testで共有する唯一のStudent plan生成関数。"""
         if training is None:
             training = self.training
         stage = str(getattr(
-            args, "single_plan_training_stage", "actual_calibration"
+            args, "single_plan_training_stage", "representation"
         )).strip().lower()
         policy_training = bool(training and stage == "actual_calibration")
         terms = self.policy(
@@ -91,10 +108,20 @@ class SinglePlanStudentPolicy(nn.Module):
         if voxel_coords is None:
             raise RuntimeError("Single-Plan Studentにはcanonical voxel座標が必要である")
         point_count = int(features.shape[-1])
-        requested = self._requested_counts(terms, point_count).unsqueeze(1)
-        operation_order = terms["priority_order"].unsqueeze(1)
+        requested = self._requested_counts(terms, point_count, args).unsqueeze(1)
+        # order/variantは独立Actionにせず、共通Plan Builderの決定規則へ固定する。
+        operation_order = torch.tensor(
+            (1, 0, 2), device=features.device, dtype=torch.long
+        ).view(1, 1, 3).expand(features.shape[0], -1, -1)
         operation_scores = terms["where_logits"].unsqueeze(1)
-        enabled = terms["gate_hard"].squeeze(-1).to(torch.bool).unsqueeze(1)
+        if bool(getattr(args, "single_plan_amount_learning_enabled", False)):
+            enabled = terms["gate_hard"].squeeze(-1).to(torch.bool).unsqueeze(1)
+        else:
+            enabled = torch.ones(
+                (features.shape[0], 1, 3),
+                device=features.device,
+                dtype=torch.bool,
+            )
         offsets = self.plan_builder.neighbor_offsets.to(device=features.device)
         executable = self.plan_builder.build(
             voxel_coords=voxel_coords,
@@ -120,6 +147,14 @@ class SinglePlanStudentPolicy(nn.Module):
         uncertainty = F.softplus(log_uncertainty)
         terms.update({
             "executable_plan": executable,
+            "executed_requested_count": requested,
+            "executed_operation_order": operation_order,
+            "executed_amount_is_fixed": not bool(
+                getattr(args, "single_plan_amount_learning_enabled", False)
+            ),
+            "amount_learning_enabled": bool(
+                getattr(args, "single_plan_amount_learning_enabled", False)
+            ),
             "utility_absolute_gain": absolute_gain,
             "utility_geometry_cost": geometry_cost,
             "utility_edit_cost": edit_cost,
@@ -136,3 +171,12 @@ class SinglePlanStudentPolicy(nn.Module):
             "candidate_actual_encode_count": 0,
         })
         return terms
+
+    def forward(self, features, voxel_coords, args, *, training=None, fixed_features=None):
+        return self.generate_plan(
+            features,
+            voxel_coords,
+            args,
+            training=training,
+            fixed_features=fixed_features,
+        )

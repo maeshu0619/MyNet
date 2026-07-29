@@ -2771,7 +2771,7 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--heuristic_guidance_mode',
-        default='ana_den6_online',
+        default='single_plan_student',
         choices=[
             'single_plan_student',
             'network_k_proposal_policy',
@@ -2783,15 +2783,24 @@ def parse_pugan_args(parser, file_day, file_time):
             'ana_den6_reference_ply',
         ],
         help=(
-            'SparsePCGC行動経路。既定ana_den6_onlineは訓練時にExact den6順位を'
-            'anchorとして高品質な1複合planを実行し、同時に推論用Single-Plan '
-            'Studentへ蒸留する。Network-only性能はTeacher Actualと分離して扱う。'
+            'SparsePCGC行動経路。既定single_plan_studentはTeacherをlossにだけ使い、'
+            '訓練・検証・推論の適用planを同じNetwork-only経路で生成する。'
+            'ana_den6_onlineはTeacher再現診断専用である。'
             'network_only_codec_policyは旧単一候補の比較用legacy mode'
         ),
     )
     parser.add_argument('--single_plan_student_hidden_dim', default=48, type=int)
     parser.add_argument('--single_plan_student_max_total_ratio', default=0.0099, type=float)
     parser.add_argument('--single_plan_student_unfreeze_upstream', default=False, type=str2bool)
+    parser.add_argument(
+        '--single_plan_require_complete_teacher_pool',
+        default=True,
+        type=str2bool,
+        help=(
+            'Offline蒸留でoperation別の完全Teacher候補Poolとscore/rankを必須にする。'
+            'Pool外Voxelを誤ってnegative化しないため既定True'
+        ),
+    )
     parser.add_argument(
         '--single_plan_stage1_train_encoder',
         default=True,
@@ -2800,11 +2809,21 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--single_plan_training_stage',
-        default='actual_calibration',
+        default='representation',
         choices=['representation', 'fast_distillation', 'actual_calibration'],
         type=str,
         help='Single-Plan学習段階。前2段階ではfresh codec/geometryを実行しない',
     )
+    parser.add_argument(
+        '--single_plan_amount_learning_enabled',
+        default=False,
+        type=str2bool,
+        help='Phase 3以降だけtotal ratio/share/gateを学習planへ反映する',
+    )
+    parser.add_argument('--single_plan_fixed_total_ratio', default=0.0025, type=float)
+    parser.add_argument('--single_plan_fixed_prune_share', default=0.40, type=float)
+    parser.add_argument('--single_plan_fixed_add_share', default=0.40, type=float)
+    parser.add_argument('--single_plan_fixed_adjust_share', default=0.20, type=float)
     parser.add_argument('--single_plan_debug_hash', default=False, type=str2bool)
     parser.add_argument('--single_plan_local_tile_size', default=0, type=int)
     parser.add_argument(
@@ -4321,7 +4340,7 @@ def parse_pugan_args(parser, file_day, file_time):
         getattr(args, "heuristic_guidance_network_only_inference", False)
     )
     args.heuristic_guidance_mode = str(
-        getattr(args, "heuristic_guidance_mode", "ana_den6_online")
+        getattr(args, "heuristic_guidance_mode", "single_plan_student")
     ).strip().lower()
     valid_guidance_modes = {
         "single_plan_student",
@@ -4342,8 +4361,25 @@ def parse_pugan_args(parser, file_day, file_time):
         int(getattr(args, "single_plan_local_tile_size", 0)), 0
     )
     args.single_plan_training_stage = str(
-        getattr(args, "single_plan_training_stage", "actual_calibration")
+        getattr(args, "single_plan_training_stage", "representation")
     ).strip().lower()
+    args.single_plan_amount_learning_enabled = bool(
+        getattr(args, "single_plan_amount_learning_enabled", False)
+    )
+    args.single_plan_fixed_total_ratio = min(max(
+        float(getattr(args, "single_plan_fixed_total_ratio", 0.0025)), 1e-6
+    ), 0.0099)
+    fixed_shares = [
+        max(float(getattr(args, "single_plan_fixed_prune_share", 0.40)), 0.0),
+        max(float(getattr(args, "single_plan_fixed_add_share", 0.40)), 0.0),
+        max(float(getattr(args, "single_plan_fixed_adjust_share", 0.20)), 0.0),
+    ]
+    fixed_share_sum = max(sum(fixed_shares), 1e-12)
+    (
+        args.single_plan_fixed_prune_share,
+        args.single_plan_fixed_add_share,
+        args.single_plan_fixed_adjust_share,
+    ) = tuple(value / fixed_share_sum for value in fixed_shares)
     if (
         str(getattr(args, "heuristic_guidance_mode", "")).strip().lower()
         == "single_plan_student"

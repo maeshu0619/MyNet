@@ -226,6 +226,11 @@ def main() -> int:
     parser.add_argument("--max-total-ratio", default=0.0099, type=float, help="候補poolを用意する最大総操作率")
     parser.add_argument("--full-pool-limit-per-operation", default=0, type=int)
     parser.add_argument("--compact-reserve-factor", default=1.0, type=float)
+    parser.add_argument(
+        "--persist-full-pools",
+        action="store_true",
+        help="訓練専用Teacher Cache向けにden6の完全operation poolも保存する",
+    )
     parser.add_argument("--output-json", required=True)
     parser.add_argument(
         "--fixed-features-output",
@@ -632,6 +637,9 @@ def main() -> int:
             "plan_variants": int(args.plan_variants),
             "anchor_operation_counts": dict(initial_counts),
             "operation_candidate_shortlists": serialized_pools,
+            "operation_candidate_pools": (
+                full_serialized_pools if bool(cli.persist_full_pools) else None
+            ),
             "shortlist_limits": shortlist_limits,
             "full_pool_counts": {name: len(full_serialized_pools[name]) for name in OPERATIONS},
             "pool_diagnostics": diagnostics,
