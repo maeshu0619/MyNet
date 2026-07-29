@@ -14804,10 +14804,18 @@ def train(model, args, loss, writer, plot, notifier=None):
                     # このmodeではActuatorへ適用されたplanもActual入力もStudent由来である。
                     # Shadow TeacherのActualを数えず、推論と同じ経路の校正履歴だけを
                     # checkpointへ保存する。
+                    current_loss_debug = dict(
+                        getattr(loss, "last_compression_debug", {}) or {}
+                    )
                     student_actual_percent = finite_float_or_none(
                         compression_debug_terms.get(
                             "actual_total_bit_percent_fresh",
-                            None,
+                            current_loss_debug.get(
+                                "actual_total_bit_percent_fresh",
+                                current_loss_debug.get(
+                                    "actual_total_bit_percent", None
+                                ),
+                            ),
                         )
                     )
                     if student_actual_percent is not None:
@@ -14823,7 +14831,13 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 student_actual_percent
                             ),
                             "single_plan_actual_source": "network_executable_plan",
+                            # ``fresh_teacher`` はSurrogate内部で「fresh Actual教師」
+                            # を表す旧名称だが、Heuristic Teacherとの混同を避け、
+                            # 表示上はStudent実行planのActualであることを明示する。
+                            "actual_value_source": "fresh_student_actual",
                         })
+                        current_loss_debug.update(compression_debug_terms)
+                        loss.last_compression_debug = current_loss_debug
                     setting_id = (
                         "native_vs{}_pq{}_ae{}_sr{}_m{}".format(
                             float(getattr(args, "sparsepcgc_voxel_size", 1.0)),
@@ -17160,7 +17174,10 @@ def train(model, args, loss, writer, plot, notifier=None):
                 # このStepのbackward・計測・記録がすべて終わった後だけ参照を切る。
                 # 計算内容は変えず、前Stepのfull-cloud Tensorと次Stepのforwardが
                 # 同時にGPU上へ存在することを防ぐ。
-                if den6_online_full_cloud:
+                if one_plan_full_cloud:
+                    # den6だけでなくNetwork-only/Single-Planも同じfull-cloud
+                    # autograd graphとsaved-tensor offloadを作る。旧条件では
+                    # Single-Plan時だけ前StepのCPU payloadが残り続けていた。
                     base_model_for_release = _unwrap_train_model(model)
                     release_step_state = getattr(base_model_for_release, "release_step_transient_state", None)
                     if callable(release_step_state):

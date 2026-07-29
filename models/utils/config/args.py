@@ -2809,10 +2809,13 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--single_plan_training_stage',
-        default='representation',
+        default='actual_calibration',
         choices=['representation', 'fast_distillation', 'actual_calibration'],
         type=str,
-        help='Single-Plan学習段階。前2段階ではfresh codec/geometryを実行しない',
+        help=(
+            'Single-Plan学習段階。既定actual_calibrationはStudent planを毎Step'
+            '実圧縮し、Actual/Geometryログを記録する'
+        ),
     )
     parser.add_argument(
         '--single_plan_amount_learning_enabled',
@@ -4361,7 +4364,7 @@ def parse_pugan_args(parser, file_day, file_time):
         int(getattr(args, "single_plan_local_tile_size", 0)), 0
     )
     args.single_plan_training_stage = str(
-        getattr(args, "single_plan_training_stage", "representation")
+        getattr(args, "single_plan_training_stage", "actual_calibration")
     ).strip().lower()
     args.single_plan_amount_learning_enabled = bool(
         getattr(args, "single_plan_amount_learning_enabled", False)
