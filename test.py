@@ -860,8 +860,31 @@ if __name__ == "__main__":
                 "checkpointのSingle-Plan Student蒸留更新回数が0である。"
                 "未学習Studentを高速推論結果として使用できない"
             )
+        actual_update_count = int(
+            getattr(
+                base_model,
+                "single_plan_actual_training_updates",
+                torch.zeros((), dtype=torch.long),
+            ).detach().cpu()
+        )
+        if (
+            bool(getattr(
+                args,
+                "test_require_actual_calibrated_single_plan_student",
+                True,
+            ))
+            and actual_update_count <= 0
+        ):
+            raise RuntimeError(
+                "このcheckpointはHeuristic planのActualだけで保存されており、"
+                "Single-Plan Student自身のActual訓練履歴が0である。"
+                "train.pyをsingle_plan_student modeで再開してから推論すること。"
+                "診断目的で旧checkpointを実行する場合だけ"
+                "--test_require_actual_calibrated_single_plan_student falseを指定できる"
+            )
         writer.write(
             f"SinglePlanInferenceContract: distillation_updates={update_count}, "
+            f"actual_training_updates={actual_update_count}, "
             "teacher=0, cache=0, den6=0, actual_candidate=0"
         )
 

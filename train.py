@@ -76,6 +76,9 @@ from models.utils.training.full_cloud_actual_correction import (
 )
 from models.utils.training.saved_tensor_offload import (
     selective_saved_tensor_cpu_offload,
+    release_autograd_transient_references,
+    release_saved_tensor_offload_payloads,
+    saved_tensor_offload_stats,
 )
 from models.utils.training.memory_diagnostics import MemoryDiagnosticsCSV
 
@@ -12230,9 +12233,25 @@ def load_more_training_checkpoint(model, args, writer):
 
     # DataParallelで保存された場合の module. 接頭辞を除去する
     cleaned_state_dict = {}
+    current_state_dict = model.state_dict()
+    shape_mismatch_keys = []
     for key, value in state_dict.items():
         key_text = str(key)
         new_key = key_text[7:] if key_text.startswith("module.") else key_text
+        current_value = current_state_dict.get(new_key)
+        if (
+            torch.is_tensor(value)
+            and torch.is_tensor(current_value)
+            and tuple(value.shape) != tuple(current_value.shape)
+        ):
+            # strict=Falseでもshape不一致はPyTorchが例外にする。互換性のない
+            # legacy補助headだけを初期値のまま残し、Student重みは保持する。
+            shape_mismatch_keys.append(
+                "{}:{}->{}".format(
+                    new_key, tuple(value.shape), tuple(current_value.shape)
+                )
+            )
+            continue
         cleaned_state_dict[new_key] = value
 
     incompatible = model.load_state_dict(cleaned_state_dict, strict=False)
@@ -12244,6 +12263,12 @@ def load_more_training_checkpoint(model, args, writer):
     writer.write(f"MoreTraining: loaded_parameter_keys={len(cleaned_state_dict)}")
     writer.write(f"MoreTraining: missing_keys_count={len(missing_keys)}")
     writer.write(f"MoreTraining: unexpected_keys_count={len(unexpected_keys)}")
+    writer.write(f"MoreTraining: shape_mismatch_skipped_count={len(shape_mismatch_keys)}")
+    if shape_mismatch_keys:
+        writer.write(
+            "MoreTraining: shape_mismatch_skipped_detail="
+            + ", ".join(shape_mismatch_keys[:50])
+        )
 
     if missing_keys:
         writer.write("MoreTraining: missing_keys_detail=" + ", ".join(missing_keys[:50]))
@@ -12312,6 +12337,11 @@ def train(model, args, loss, writer, plot, notifier=None):
     seq_datasets = [(seq_dir, PlyDirDataset(args, seq_dir)) for seq_dir in seq_dirs] # 各シーケンス内のPLY点群ファイルを読み込むデータセットを作る
     single_plan_teacher_store = None
     if str(getattr(args, "heuristic_guidance_mode", "")).strip().lower() == "single_plan_student":
+        writer.write(
+            "TrainingPerformanceContract: applied_plan=single_plan_student, "
+            "actual_source=network_executable_plan, den6_apply=0, pool_apply=0, "
+            "train_test_policy_match=1"
+        )
         exact_cache_root = str(getattr(args, "exact_teacher_cache_root", "") or "").strip()
         if exact_cache_root and os.path.isdir(exact_cache_root):
             single_plan_teacher_store = SinglePlanTeacherStore.from_exact_cache_root(
@@ -12331,6 +12361,12 @@ def train(model, args, loss, writer, plot, notifier=None):
                 "tools/build_exact_teacher_cache.pyでfingerprint検証済みcacheを構築すること。"
                 "旧datasetへのsilent fallbackは許可しない"
             )
+    elif str(getattr(args, "heuristic_guidance_mode", "")).strip().lower() == "ana_den6_online":
+        writer.write(
+            "TrainingPerformanceContract: applied_plan=den6_exact_rank_plus_network_residual, "
+            "actual_source=heuristic_teacher_plan, network_only_performance=0, "
+            "deployment_checkpoint_eligible=0"
+        )
     k_proposal_teacher_store = None
     k_offline_path = str(getattr(args, "network_k_offline_dataset", "") or "").strip()
     k_all_actual_enabled = bool(getattr(args, "network_k_all_actual_enabled", False))
@@ -13388,6 +13424,17 @@ def train(model, args, loss, writer, plot, notifier=None):
                 # compression loss側で作られた微分可能な内訳を取得する。
                 terms = dict(getattr(loss, "last_compression_terms", {}) or {})
                 compression_debug_terms = dict(getattr(loss, "last_compression_debug", {}) or {})
+                if (
+                    heuristic_mode == "single_plan_student"
+                    and compression_debug_terms.get(
+                        "actual_total_bit_percent_fresh", None
+                    ) is not None
+                ):
+                    # compression backendでいうteacherは「Actual codec scalar」を
+                    # 指すため、行動Teacher planと誤読されないsource名へ上書きする。
+                    compression_debug_terms["actual_value_source"] = "fresh_network_plan"
+                    compression_debug_terms["policy_action_source"] = "single_plan_student"
+                    loss.last_compression_debug = dict(compression_debug_terms)
                 actual_total_bit_percent_term = compression_debug_terms.get(
                     "actual_total_bit_percent_fresh",
                     compression_debug_terms.get("actual_total_bit_percent", None),
@@ -14673,6 +14720,29 @@ def train(model, args, loss, writer, plot, notifier=None):
                     heuristic_mode == "single_plan_student"
                     and isinstance(single_plan_teacher_store, SinglePlanTeacherStore)
                 ):
+                    # このmodeではActuatorへ適用されたplanもActual入力もStudent由来である。
+                    # Shadow TeacherのActualを数えず、推論と同じ経路の校正履歴だけを
+                    # checkpointへ保存する。
+                    student_actual_percent = finite_float_or_none(
+                        compression_debug_terms.get(
+                            "actual_total_bit_percent_fresh",
+                            None,
+                        )
+                    )
+                    if student_actual_percent is not None:
+                        base_student = model.module if hasattr(model, "module") else model
+                        with torch.no_grad():
+                            base_student.single_plan_actual_training_updates.add_(1)
+                        compression_debug_terms.update({
+                            "single_plan_actual_training_update": True,
+                            "single_plan_actual_training_updates": int(
+                                base_student.single_plan_actual_training_updates.detach().cpu()
+                            ),
+                            "single_plan_actual_compression_percent": float(
+                                student_actual_percent
+                            ),
+                            "single_plan_actual_source": "network_executable_plan",
+                        })
                     setting_id = (
                         "native_vs{}_pq{}_ae{}_sr{}_m{}".format(
                             float(getattr(args, "sparsepcgc_voxel_size", 1.0)),
@@ -16689,6 +16759,13 @@ def train(model, args, loss, writer, plot, notifier=None):
                         "proposal_actual_encode_count": int(
                             actual_audit.get("proposal", 0) or 0
                         ),
+                        "single_plan_actual_training_updates": int(
+                            getattr(
+                                audit_model,
+                                "single_plan_actual_training_updates",
+                                torch.zeros((), dtype=torch.long),
+                            ).detach().cpu()
+                        ),
                     }
                     expected_edited_actual = (
                         int(getattr(args, "network_k_proposal_count", 8))
@@ -17096,9 +17173,64 @@ def train(model, args, loss, writer, plot, notifier=None):
                     setattr(args, "_current_sparsepcgc_proposal_terms_by_key", {})
                     setattr(args, "_current_sparsepcgc_proposal_selection_meta", {"enabled": False})
                     setattr(args, "_last_voxel_restored_actual_debug", {})
+                    released_autograd_refs = release_autograd_transient_references(
+                        model=model,
+                        loss=loss,
+                        args=args,
+                    )
+                    if released_autograd_refs and global_train_step == 0:
+                        writer.write(
+                            "AutogradTransientRelease: "
+                            + ", ".join(released_autograd_refs[:24])
+                        )
+                    # backward・勾配監査・ログが全て完了したため、autograd nodeが
+                    # Python側に残っていてもCPUへ退避した巨大payloadは不要。
+                    offload_release = release_saved_tensor_offload_payloads()
+                    if (
+                        global_train_step == 0
+                        and int(offload_release.get("released_count", 0)) > 0
+                    ):
+                        writer.write(
+                            "SavedTensorOffloadRelease: "
+                            f"count={int(offload_release['released_count'])}, "
+                            f"mb={float(offload_release['released_bytes']) / (1024.0 ** 2):.3f}"
+                        )
                     if use_cuda and torch.cuda.is_available():
                         torch.cuda.empty_cache()
                     _release_cpu_step_memory()
+                    # 解放漏れが再発してもOS全体のRAMを食い切る前に停止する。
+                    # 直近実走では約70MB/Stepが残り、最終的にSSHまで不通になった。
+                    offload_after_cleanup = saved_tensor_offload_stats()
+                    outstanding_offload_bytes = int(
+                        offload_after_cleanup.get("outstanding_bytes", 0)
+                    )
+                    previous_offload_bytes = int(getattr(
+                        args, "_saved_tensor_offload_previous_cleanup_bytes", 0
+                    ))
+                    leak_steps = int(getattr(
+                        args, "_saved_tensor_offload_growth_steps", 0
+                    ))
+                    if outstanding_offload_bytes > previous_offload_bytes + 16 * 1024 * 1024:
+                        leak_steps += 1
+                    else:
+                        leak_steps = 0
+                    setattr(
+                        args,
+                        "_saved_tensor_offload_previous_cleanup_bytes",
+                        outstanding_offload_bytes,
+                    )
+                    setattr(args, "_saved_tensor_offload_growth_steps", leak_steps)
+                    if (
+                        outstanding_offload_bytes >= 1024 * 1024 * 1024
+                        and leak_steps >= 3
+                    ):
+                        raise RuntimeError(
+                            "saved-tensor CPU offload leak guard: "
+                            f"{outstanding_offload_bytes / (1024.0 ** 2):.1f}MB "
+                            f"remains after cleanup and grew for {leak_steps} steps. "
+                            "Training was stopped before the Linux OOM killer could "
+                            "terminate Python/SSH. Check *_memory_diagnostics.csv."
+                        )
                 _record_memory(
                     "step_after_cleanup",
                     episode=episode + 1,

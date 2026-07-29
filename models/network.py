@@ -78,6 +78,12 @@ class Network(nn.Module):
             "single_plan_distillation_updates",
             torch.zeros((), dtype=torch.long),
         )
+        # Teacher planをActual評価した回数ではなく、Student自身が生成・適用した
+        # planをActual評価して主損失へ使用した回数だけを保存する。
+        self.register_buffer(
+            "single_plan_actual_training_updates",
+            torch.zeros((), dtype=torch.long),
+        )
         # 初期Stepで決めたShadow蒸留scaleをcheckpointへ保存する。
         # raw lossが下がった後にscaleを逆増幅せず、収束を全体Lossへ反映する。
         self.register_buffer(

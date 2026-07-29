@@ -7,14 +7,14 @@ from cfgs.utils import str2bool
 
 # sparsepcgc_move_existing_target_only
 
-pretrained_date = "20260701"
-pretrained_time = "230148"
+pretrained_date = ""
+pretrained_time = ""
 
-surrogate_date = "20260721"
-surrogate_time = "103909"
+surrogate_date = "20260729"
+surrogate_time = "001750"
 
-model_date = "20260719"
-model_time = "063943"
+model_date = "20260729"
+model_time = "001750"
 
 # method_com = "OctAttention"
 method_com = "SparsePCGC"
@@ -2783,8 +2783,9 @@ def parse_pugan_args(parser, file_day, file_time):
             'ana_den6_reference_ply',
         ],
         help=(
-            'SparsePCGC行動経路。既定ana_den6_onlineは063943と同じExact den6候補順位をanchorにし、'
-            'Network residualで1つの複合planを選ぶ。'
+            'SparsePCGC行動経路。既定ana_den6_onlineは訓練時にExact den6順位を'
+            'anchorとして高品質な1複合planを実行し、同時に推論用Single-Plan '
+            'Studentへ蒸留する。Network-only性能はTeacher Actualと分離して扱う。'
             'network_only_codec_policyは旧単一候補の比較用legacy mode'
         ),
     )
@@ -2851,6 +2852,15 @@ def parse_pugan_args(parser, file_day, file_time):
         default=True,
         type=str2bool,
         help='蒸留更新0回のcheckpointをNetwork-only推論で拒否する',
+    )
+    parser.add_argument(
+        '--test_require_actual_calibrated_single_plan_student',
+        default=True,
+        type=str2bool,
+        help=(
+            'Networkが生成したSingle-Planを訓練中に実Actual評価した履歴がない'
+            'checkpointを、推論性能確認へ誤使用しない'
+        ),
     )
     parser.add_argument(
         '--single_plan_teacher_datasets',
@@ -3892,12 +3902,23 @@ def parse_pugan_args(parser, file_day, file_time):
     # グローバル設定値をログで確認しやすいようにargsへ保存する
     args.method_com = method_com
     args.model_name = model_name
+    # pretrained_*はCLI既定が空文字なので、more_training pathを組み立てる前に
+    # 現在選択中のmodel日時へ正規化する。後段だけで補完すると空ディレクトリを
+    # 指したままtrain.pyが開始前に失敗する。
+    args.pretrained_date = (
+        str(getattr(args, "pretrained_date", pretrained_date)).strip()
+        or str(model_date).strip()
+    )
+    args.pretrained_time = (
+        str(getattr(args, "pretrained_time", pretrained_time)).strip()
+        or str(model_time).strip()
+    )
     if bool(getattr(args, "more_training", False)):
         if not str(getattr(args, "more_training_ckpt", "")).strip():
-            args.more_training_ckpt = _more_training_checkpoint_path(
+            args.more_training_ckpt = _pretrained_checkpoint_path(
                 args.pretrained_date,
                 args.pretrained_time,
-                method_value=method_com,
+                args.compress,
                 model_stem=model_name,
             )
         else:
@@ -4756,7 +4777,10 @@ def parse_pugan_args(parser, file_day, file_time):
         args.heuristic_guidance_teacher_distill_weight = 0.0
         args.heuristic_guidance_exact_anchor_steps = 0
         if not _cli_option_was_provided("--more_training"):
-            args.more_training = False
+            # Single-Planへ移行するときは、既存checkpoint内で既に蒸留された
+            # Student重みを捨てず、そこからNetwork planのActual校正を続ける。
+            # 他のNetwork-only比較modeは従来どおりfresh開始にする。
+            args.more_training = args.heuristic_guidance_mode == "single_plan_student"
     if args.heuristic_guidance_enabled and args.heuristic_guidance_mode == "ana_den6_online":
         # 063943互換のden6 edit-unit順位から、全点群の1%未満を1つの複合planへまとめる。
         # 完成planの複数Actual比較は行わず、Network residualを加えた最終1 planだけを
@@ -4882,8 +4906,16 @@ def parse_pugan_args(parser, file_day, file_time):
     args.run_name = str(getattr(args, "run_name", "")).strip()
     if not args.run_name:
         args.run_name = f"{args.time}_{args.surrogate_name}"
-    args.pretrained_date = str(getattr(args, "pretrained_date", pretrained_date)).strip()
-    args.pretrained_time = str(getattr(args, "pretrained_time", pretrained_time)).strip()
+    # 推論用checkpoint日時が未指定なら、現在選択中の学習model日時を使う。
+    # 空文字のままでは ".../Mynetwork_train/_SparsePCGC" へ誤解決される。
+    args.pretrained_date = (
+        str(getattr(args, "pretrained_date", pretrained_date)).strip()
+        or str(model_date).strip()
+    )
+    args.pretrained_time = (
+        str(getattr(args, "pretrained_time", pretrained_time)).strip()
+        or str(model_time).strip()
+    )
     if not _cli_option_was_provided("--ckpt") and not getattr(args, "checkpoint", None):
         args.ckpt = _pretrained_checkpoint_path(
             args.pretrained_date,
