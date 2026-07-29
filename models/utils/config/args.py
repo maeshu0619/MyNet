@@ -2794,11 +2794,11 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--single_plan_student_unfreeze_upstream', default=False, type=str2bool)
     parser.add_argument(
         '--single_plan_require_complete_teacher_pool',
-        default=True,
+        default=False,
         type=str2bool,
         help=(
             'Offline蒸留でoperation別の完全Teacher候補Poolとscore/rankを必須にする。'
-            'Pool外Voxelを誤ってnegative化しないため既定True'
+            'FalseでもPool外Voxelをnegative化せず、保存済み正例だけを使用する'
         ),
     )
     parser.add_argument(

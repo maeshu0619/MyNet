@@ -12402,6 +12402,14 @@ def train(model, args, loss, writer, plot, notifier=None):
                             list(matching_incomplete.items())[:3]
                         )
                     )
+                if matching_incomplete:
+                    writer.write(
+                        "SinglePlanTeacherWarning: Gate B incomplete; "
+                        "using selected-positive/available-rank supervision only, "
+                        "unlisted_voxel_negative=0, states={}".format(
+                            len(matching_incomplete)
+                        )
+                    )
                 selected_datasets = []
                 selected_file_count = 0
                 for seq_dir, dataset in seq_datasets:
