@@ -26,7 +26,7 @@ from .modules.structure_actuator import StructureRepairActuator
 from .modules.structure_policy import POLICY_NAMES, StructureRepairPolicy
 from .modules.network_only_codec_policy import NetworkOnlyCodecPolicy
 from .modules.network_k_proposal_policy import NetworkKProposalPolicy
-from .modules.single_plan_student import SinglePlanStudentPolicy
+from .modules.fast_heuristic_emulator import FastHeuristicEmulator
 from .utils.loss.k_proposal_distillation import KProposalSetLoss
 from .utils.loss.single_plan_distillation import SinglePlanDistillationLoss
 from .utils.training.saved_tensor_offload import selective_saved_tensor_cpu_offload
@@ -135,7 +135,8 @@ class Network(nn.Module):
                 getattr(self.args, "network_k_proposal_shortlist_size", 32768)
             ),
         )
-        self.single_plan_student = SinglePlanStudentPolicy(
+        # checkpoint互換の属性名は維持し、実体だけを独立Emulator classにする。
+        self.single_plan_student = FastHeuristicEmulator(
             in_channels=actuator_feature_dim,
             hidden_dim=int(getattr(self.args, "single_plan_student_hidden_dim", 48)),
             max_total_ratio=float(
@@ -145,8 +146,10 @@ class Network(nn.Module):
             # den5 probeなしで利用し、Teacherの局所順位を蒸留する。
             fixed_feature_dim=17,
         )
-        if str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower() == "single_plan_student":
-            # 最終Single-Plan経路ではK Actor/Criticをoptimizerと保存graphから外す。
+        if str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower() in {
+            "single_plan_student", "ana_den6_online"
+        }:
+            # Single-Plan/Emulator経路ではK Actor/Criticをoptimizerから外す。
             # legacy K modeを選んだ場合の実装自体は保持する。
             for parameter in self.network_k_proposal_policy.parameters():
                 parameter.requires_grad_(False)
@@ -3726,12 +3729,18 @@ class Network(nn.Module):
             shadow_input = actuator_input
             if not bool(getattr(self.args, "single_plan_student_unfreeze_upstream", False)):
                 shadow_input = shadow_input.detach()
+            shadow_fixed_features = structure.get("network_k_fixed_features")
+            if (
+                torch.is_tensor(shadow_fixed_features)
+                and not bool(getattr(self.args, "single_plan_student_unfreeze_upstream", False))
+            ):
+                shadow_fixed_features = shadow_fixed_features.detach()
             self.last_single_plan_student_terms = self.single_plan_student(
                 shadow_input,
                 structure.get("global_voxel_coords"),
                 self.args,
                 training=True,
-                fixed_features=structure.get("network_k_fixed_features"),
+                fixed_features=shadow_fixed_features,
             )
         full_cloud_amount_terms = None
         if (
@@ -5111,6 +5120,10 @@ class Network(nn.Module):
                     structure.get("fixed_structure_cache_bytes", 0)
                     if isinstance(structure, dict) else 0
                 ),
+                "fixed_structure_cache_source": str(
+                    structure.get("fixed_structure_cache_source", "miss")
+                    if isinstance(structure, dict) else "miss"
+                ),
             })
 
         if timing_enabled:
@@ -5131,6 +5144,11 @@ class Network(nn.Module):
                 "actuator_setup": round(float(actuator_runtime.get("setup", 0.0)), 6),
                 "fixed_structure_cache_hit": float(
                     bool(structure.get("fixed_structure_cache_hit", False))
+                    if isinstance(structure, dict) else False
+                ),
+                "fixed_structure_disk_cache_hit": float(
+                    str(structure.get("fixed_structure_cache_source", ""))
+                    == "disk"
                     if isinstance(structure, dict) else False
                 ),
             }

@@ -2,9 +2,15 @@ from types import SimpleNamespace
 import unittest
 
 import torch
+import torch.nn as nn
 
 from models.modules.executable_voxel_plan import apply_selected_executable_plan
+from models.modules.fast_heuristic_emulator import FastHeuristicEmulator
 from models.modules.single_plan_student import SinglePlanStudentPolicy
+from models.utils.training.optim_amp import (
+    build_emulator_optimizer_and_scheduler,
+    build_optimizer_and_scheduler,
+)
 
 
 def _args():
@@ -28,6 +34,55 @@ def _args():
 
 
 class SinglePlanStudentTest(unittest.TestCase):
+    def test_fast_emulator_reuses_single_plan_contract(self):
+        emulator = FastHeuristicEmulator(in_channels=8, hidden_dim=16, fixed_feature_dim=6)
+        self.assertIsInstance(emulator, SinglePlanStudentPolicy)
+
+    def test_ana_den6_emulator_optimizer_is_disjoint(self):
+        class DummyWriter:
+            def write(self, _message):
+                pass
+
+        class DummyModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.encoder = nn.Linear(2, 2)
+                self.main = nn.Linear(2, 2)
+                self.single_plan_student = nn.Linear(2, 2)
+
+        args = SimpleNamespace(
+            deform=False,
+            encoder_0grad=True,
+            heuristic_guidance_mode="ana_den6_online",
+            single_plan_shadow_distillation=True,
+            single_plan_student_lr_scale=1.0,
+            optim="adam",
+            lr=1e-3,
+            weight_decay=0.0,
+            lr_decay_step=10,
+            gamma=0.5,
+        )
+        model = DummyModel()
+        main_optimizer, _ = build_optimizer_and_scheduler(model, args, DummyWriter())
+        emulator_optimizer, _ = build_emulator_optimizer_and_scheduler(
+            model, args, DummyWriter()
+        )
+        main_ids = {
+            id(parameter)
+            for group in main_optimizer.param_groups
+            for parameter in group["params"]
+        }
+        emulator_ids = {
+            id(parameter)
+            for group in emulator_optimizer.param_groups
+            for parameter in group["params"]
+        }
+        student_ids = {
+            id(parameter) for parameter in model.single_plan_student.parameters()
+        }
+        self.assertFalse(main_ids & emulator_ids)
+        self.assertEqual(emulator_ids, student_ids)
+
     def test_deterministic_one_plan_without_k_or_critic(self):
         torch.manual_seed(1)
         points = 2000

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import ctypes
+import gc
 import json
 import os
 import sys
@@ -11,6 +13,12 @@ from types import SimpleNamespace
 from typing import Any, Mapping
 
 _PROTOCOL_OUT = None
+try:
+    _LIBC_MALLOC_TRIM = ctypes.CDLL("libc.so.6").malloc_trim
+    _LIBC_MALLOC_TRIM.argtypes = [ctypes.c_size_t]
+    _LIBC_MALLOC_TRIM.restype = ctypes.c_int
+except (OSError, AttributeError):
+    _LIBC_MALLOC_TRIM = None
 
 
 def _csv_int_list(value: str) -> list[int]:
@@ -123,6 +131,12 @@ def _parse_args() -> argparse.Namespace:
         "--gpu-stats-print",
         action="store_true",
         help="encode_one前後のCUDA/GPU使用量をstderrへ出す",
+    )
+    parser.add_argument(
+        "--cpu-trim-interval",
+        type=int,
+        default=16,
+        help="永続workerの解放済みCPU領域をOSへ返すrequest間隔（0で無効）",
     )
     return parser.parse_args()
 
@@ -259,6 +273,7 @@ def main() -> int:
         ready_payload.update(_collect_cuda_stats("sparsepcgc_worker_init"))
     _emit(ready_payload)
 
+    completed_requests = 0
     for raw_line in sys.stdin:
         line = raw_line.strip()
         if not line:
@@ -316,6 +331,16 @@ def main() -> int:
             result["sparsepcgc_scale_sr"] = int(args.scale_sr)
             result["sparsepcgc_mode_effective"] = str(args.mode)
             result.setdefault("sparsepcgc_rate_definition", result.get("rate_definition", "physical_bin_bits"))
+            completed_requests += 1
+            trim_interval = max(int(args.cpu_trim_interval), 0)
+            cpu_trimmed = bool(
+                trim_interval > 0 and completed_requests % trim_interval == 0
+            )
+            if cpu_trimmed:
+                gc.collect()
+                if _LIBC_MALLOC_TRIM is not None:
+                    _LIBC_MALLOC_TRIM(0)
+            result["sparsepcgc_worker_cpu_trimmed"] = cpu_trimmed
 
             if bool(args.gpu_stats):
                 result.update(gpu_before)

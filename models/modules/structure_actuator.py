@@ -3932,6 +3932,9 @@ class StructureRepairActuator(nn.Module):
             "guidance_cpu_tensor_cache_hit": bool(
                 guidance.get("cpu_tensor_cache_hit", False)
             ),
+            "guidance_disk_tensor_cache_hit": bool(
+                guidance.get("disk_tensor_cache_hit", False)
+            ),
             "static_candidate_compatibility_used": bool(
                 static_compatibility_available
             ),

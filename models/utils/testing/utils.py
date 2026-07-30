@@ -19,6 +19,10 @@ from models.utils.patching.patch import (
     denormalize_patch_output,
     merge_patch_outputs,
 )
+from models.utils.pointcloud.sparsepcgc_voxel import (
+    attach_sparsepcgc_voxel_meta,
+    quantize_sparsepcgc_coords,
+)
 
 def _build_full_cloud_canonical_context_for_test(input_pcd, args):
     """
@@ -39,18 +43,17 @@ def _build_full_cloud_canonical_context_for_test(input_pcd, args):
         )
 
     xyz = input_pcd[:, :3, :].contiguous()
-    device = xyz.device
-    dtype = xyz.dtype
 
-    voxel_size = float(getattr(args, "sparsepcgc_voxel_size", 1.0))
-    pos_q = int(getattr(args, "sparsepcgc_pos_quantscale", 1))
-    effective_qs = max(voxel_size * max(pos_q, 1), 1e-9)
-
-    # full cloud 全体で共通の原点を使う。
-    # これにより、同一サンプル内の voxel coords が一意な canonical basis になる。
-    global_offset = xyz.amin(dim=2, keepdim=True).detach()
-
-    coords = torch.round((xyz - global_offset) / effective_qs).to(torch.long)
+    # train.pyと同じcanonical量子化を使う。従来のtest専用min-offsetは
+    # den6 Cacheの絶対Voxel座標と一致せず、Prune/Adjustを全件無効化していた。
+    coords, voxel_meta = quantize_sparsepcgc_coords(
+        xyz,
+        args,
+        coord_scale=None,
+        offset=None,
+        return_metadata=True,
+    )
+    coords = coords.detach().to(dtype=torch.long)
 
     coords_n3 = coords[0].transpose(0, 1).contiguous()
 
@@ -62,17 +65,14 @@ def _build_full_cloud_canonical_context_for_test(input_pcd, args):
         + coords_n3[:, 2] * 83492791
     ).view(1, -1).contiguous()
 
-    return {
-        "global_voxel_coords": coords,
+    context = attach_sparsepcgc_voxel_meta({
+        "octree_context_scope": "full_cloud",
+        "octree_input_mode": "full_cloud",
         "global_morton_keys": global_keys,
-        "global_offset": global_offset,
-        "global_qs": torch.full(
-            (xyz.shape[0],),
-            float(effective_qs),
-            device=device,
-            dtype=dtype,
-        ),
-    }
+    }, coords, voxel_meta)
+    context["full_global_voxel_coords"] = context["global_voxel_coords"]
+    context["full_occupied_voxel_coords"] = context["global_voxel_coords"]
+    return context
 
 def _adapt_encoder_state_dict_for_sparse_input(model, encoder_state, writer=None):
     key = "stem.0.weight"

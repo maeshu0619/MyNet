@@ -1,9 +1,12 @@
 from types import SimpleNamespace
+from pathlib import Path
+import tempfile
 import unittest
 
 import torch
 
 from models.network import Network
+from models.modules import heuristic_guidance
 from models.modules.octree_structure import OctreeStructureAnalysis
 from train import (
     _clone_input_common_cache_value_to_cpu,
@@ -159,6 +162,68 @@ class InputCommonCacheTest(unittest.TestCase):
             "network_k_fixed_features",
         ):
             self.assertTrue(torch.equal(cold[key], warm[key]), key)
+
+    def test_fixed_tensor_disk_caches_are_bitwise_identical(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            guidance_args = SimpleNamespace(
+                heuristic_guidance_tensor_disk_cache=True,
+                heuristic_guidance_tensor_disk_cache_dir=str(
+                    Path(tmp_dir) / "guidance"
+                ),
+            )
+            guidance_key = ("fingerprint", "torch.float32", 4)
+            guidance_value = {
+                "where": torch.tensor([[1.0, 2.0, 3.0, 4.0]]),
+                "nested": {"ids": torch.tensor([3, 1], dtype=torch.long)},
+            }
+            heuristic_guidance._store_exact_guidance_disk(
+                guidance_args, guidance_key, guidance_value
+            )
+            restored = heuristic_guidance._load_exact_guidance_disk(
+                guidance_args, guidance_key
+            )
+            self.assertIsNotNone(restored)
+            self.assertTrue(torch.equal(
+                restored["where"], guidance_value["where"]
+            ))
+            self.assertTrue(torch.equal(
+                restored["nested"]["ids"], guidance_value["nested"]["ids"]
+            ))
+
+            octree_args = SimpleNamespace(
+                compress="SparsePCGC",
+                sparsepcgc_effective_qs=1.0,
+                sparsepcgc_voxel_size=1.0,
+                sparsepcgc_pos_quantscale=1,
+                octree_ctx_level=5,
+                octree_ctx_dim=8,
+                structure_geo_k=8,
+                structure_geo_max_points=0,
+                proxy_max_depth=12,
+                octree_diag_levels="4,6",
+                structure_neighbor_query_chunk=32,
+                structure_fixed_disk_cache=True,
+                structure_fixed_disk_cache_dir=str(Path(tmp_dir) / "octree"),
+                structure_fixed_cache_max_entries=0,
+                structure_fixed_cache_max_memory_mb=0,
+            )
+            module = OctreeStructureAnalysis(octree_args)
+            fixed = {
+                "neighbor_value": torch.arange(6, dtype=torch.float32),
+                "neighbor_details": torch.arange(
+                    12, dtype=torch.float32
+                ).reshape(3, 4),
+                "unique_parents": torch.tensor([1, 3, 5]),
+                "parent_inverse": torch.tensor([0, 1, 1, 2]),
+            }
+            module._put_fixed_structure_cache("frame-key", fixed)
+            self.assertEqual(len(module._fixed_structure_cache), 0)
+            restored_fixed = module._get_fixed_structure_cache(
+                "frame-key", torch.device("cpu")
+            )
+            self.assertEqual(module._fixed_structure_cache_source, "disk")
+            for name, expected in fixed.items():
+                self.assertTrue(torch.equal(restored_fixed[name], expected), name)
 
 
 if __name__ == "__main__":

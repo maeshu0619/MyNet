@@ -167,6 +167,87 @@ def _limit_training_seq_dirs(seq_dirs, args):
         return list(seq_dirs[:3])
     return list(seq_dirs)
 
+
+def _configure_streaming_exact_caches(args, seq_datasets, writer):
+    """巡回幅より小さいLRUを止め、固定Tensorは厳密なdisk cacheへ移す。"""
+    if not bool(getattr(args, "streaming_cache_auto_policy", True)):
+        return
+    train_limit = max(int(getattr(args, "train_frames_per_sequence", 0)), 0)
+    paths = []
+    for _, dataset in seq_datasets:
+        source = list(getattr(dataset, "all_files", ()) or getattr(dataset, "files", ()))
+        if train_limit > 0:
+            source = source[:train_limit]
+        paths.extend(os.path.realpath(str(path)) for path in source)
+    paths = sorted(set(paths))
+    if not paths:
+        return
+    total_disk_bytes = 0
+    for path in paths:
+        try:
+            total_disk_bytes += int(os.path.getsize(path))
+        except OSError:
+            pass
+
+    working_set = len(paths)
+    dataset_entries = max(int(getattr(args, "dataset_cache_max_entries", 64)), 0)
+    dataset_bytes = max(
+        int(getattr(args, "dataset_cache_max_memory_mb", 1024)), 0
+    ) * 1024 * 1024
+    dataset_cannot_cover = (
+        dataset_entries <= 0
+        or working_set > dataset_entries
+        or (dataset_bytes > 0 and total_disk_bytes > dataset_bytes)
+    )
+
+    episode_entries = int(getattr(args, "episode_input_common_cache_max_entries", 0))
+    if episode_entries <= 0:
+        episode_entries = working_set
+    episode_bytes = max(
+        int(getattr(args, "episode_input_common_cache_max_memory_mb", 512)), 0
+    ) * 1024 * 1024
+    # canonical contextは少なくとも入力座標と同じ規模になるため、
+    # 圧縮済みPLY総量さえ上限を超える場合は全巡回を保持できない。
+    episode_cannot_cover = (
+        episode_entries <= 0
+        or working_set > episode_entries
+        or (episode_bytes > 0 and total_disk_bytes > episode_bytes)
+    )
+
+    if dataset_cannot_cover:
+        args.dataset_cache = False
+        clear_ply_cache()
+        for _, dataset in seq_datasets:
+            dataset.use_cache = False
+    if episode_cannot_cover:
+        args.episode_input_common_cache = False
+
+    hot_entries = max(int(getattr(args, "streaming_cache_hot_entries", 4)), 0)
+    if working_set > hot_entries:
+        args.heuristic_guidance_cpu_tensor_cache_entries = min(
+            max(int(getattr(
+                args, "heuristic_guidance_cpu_tensor_cache_entries", 64
+            )), 0),
+            hot_entries,
+        )
+        args.structure_fixed_cache_max_entries = min(
+            max(int(getattr(args, "structure_fixed_cache_max_entries", 64)), 0),
+            hot_entries,
+        )
+    args.heuristic_guidance_tensor_disk_cache = True
+    args.structure_fixed_disk_cache = True
+    writer.write(
+        "StreamingExactCachePolicy: "
+        f"working_set={working_set}, "
+        f"ply_disk_total_mb={total_disk_bytes / (1024.0 ** 2):.1f}, "
+        f"dataset_ram_cache={int(bool(getattr(args, 'dataset_cache', False)))}, "
+        f"episode_common_ram_cache={int(bool(getattr(args, 'episode_input_common_cache', False)))}, "
+        f"guidance_hot_entries={int(getattr(args, 'heuristic_guidance_cpu_tensor_cache_entries', 0))}, "
+        f"structure_hot_entries={int(getattr(args, 'structure_fixed_cache_max_entries', 0))}, "
+        "guidance_disk_cache=1, structure_disk_cache=1"
+    )
+
+
 def _sparsepcgc_outcome_actual_percent(debug):
     """
     Outcome Weighted Imitation用にactual圧縮損失を取り出す。
@@ -12504,6 +12585,7 @@ def train(model, args, loss, writer, plot, notifier=None):
             f"bootstrap_only={bool(k_all_actual_enabled)}, "
             "runtime_den6=0, candidate_actual=0"
         )
+    _configure_streaming_exact_caches(args, seq_datasets, writer)
     total_train_files = sum(len(dataset) for _, dataset in seq_datasets) # 全シーケンスに含まれる点群ファイル数を合計し、総Step数の見積もりなどに使用
     den6_prefetch_lookahead = max(
         int(getattr(args, "heuristic_guidance_online_prefetch_lookahead", 0)), 0
@@ -12628,6 +12710,9 @@ def train(model, args, loss, writer, plot, notifier=None):
 
     """学習セットアップ"""
     optimizer, scheduler_steplr = build_optimizer_and_scheduler( model, args, writer) # モデルの重み更新に使うOptimizerと学習率を変えるStepLR schedduler
+    emulator_optimizer, emulator_scheduler = build_emulator_optimizer_and_scheduler(
+        model, args, writer
+    )
     apply_optimizer_lr_floor(optimizer, args, label="main", writer=writer, global_step=0, reason="train_start") # main LRが開始時点からfloor未満なら下限値へ戻す
     amp_state = setup_amp( model, args, writer) # CUDA利用可否
     use_cuda = amp_state["use_cuda"] # GPU使用の有無
@@ -12635,6 +12720,10 @@ def train(model, args, loss, writer, plot, notifier=None):
     amp_dtype = amp_state["amp_dtype"] # AMPで使う浮動小数点型の保存
     amp_scaler_enabled = amp_state["amp_scaler_enabled"] # GradScalerを使うのか否か
     scaler = amp_state["scaler"] # AMPのGradScaler。AMPでスケーリングされた勾配を逆スケーリングしてOptimizerに渡すために使う
+    emulator_scaler = torch.cuda.amp.GradScaler(
+        enabled=bool(amp_scaler_enabled and emulator_optimizer is not None),
+        init_scale=float(getattr(args, "amp_init_scale", 1.0)),
+    )
     amp_overflow_patience = amp_state["amp_overflow_patience"] # AMPでオーバーフローが起きたときに、学習を安定させるためにOptimizerのステップをスキップする回数の設定
     consecutive_amp_skips = amp_state["consecutive_amp_skips"] # AMPでオーバーフローが起きたときにOptimizerのステップをスキップする回数のカウンタ
     consecutive_nonfinite_grad_skips = 0
@@ -12671,6 +12760,8 @@ def train(model, args, loss, writer, plot, notifier=None):
                 f"elapsed={time.time() - actual_worker_warmup_start:.3f}s"
             )
     optimizer.zero_grad(set_to_none=True) # 本学習開始前にOptimizer内の勾配を削除
+    if emulator_optimizer is not None:
+        emulator_optimizer.zero_grad(set_to_none=True)
 
     """==========================================================="""
     """トレーニング"""
@@ -12761,6 +12852,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                             args, (active_files[next_prefetch_index],)
                         )
                 optimizer.zero_grad(set_to_none=True) # 前Stepの勾配を必ず消し、条件分岐による勾配蓄積を防ぐ
+                if emulator_optimizer is not None:
+                    emulator_optimizer.zero_grad(set_to_none=True)
+                emulator_loss = None
                 file_path = active_dataset.files[step]
                 _record_memory(
                     "step_after_data_load",
@@ -14974,7 +15068,8 @@ def train(model, args, loss, writer, plot, notifier=None):
                     else:
                         shadow_scale_reason = "convergence_preserved"
                     shadow_distill = shadow_distill_scale * shadow_distill_raw
-                    L = L + shadow_distill
+                    # Exact主Lossへ混ぜず、独立optimizerでEmulatorだけを更新する。
+                    emulator_loss = shadow_distill
                     compression_debug_terms.update({
                         "single_plan_shadow_distillation": True,
                         "single_plan_shadow_plan_key": str(
@@ -15974,6 +16069,76 @@ def train(model, args, loss, writer, plot, notifier=None):
                         )
 
                 """勾配を流す"""
+                emulator_step_completed = False
+                if emulator_optimizer is not None and torch.is_tensor(emulator_loss):
+                    emulator_parameters = [
+                        parameter
+                        for group in emulator_optimizer.param_groups
+                        for parameter in group["params"]
+                        if parameter.requires_grad
+                    ]
+                    emulator_before = [
+                        parameter.detach().clone()
+                        for parameter in emulator_parameters
+                    ]
+                    emulator_finite = bool(
+                        torch.isfinite(emulator_loss.detach()).all().item()
+                    )
+                    if emulator_finite:
+                        if bool(emulator_scaler.is_enabled()):
+                            emulator_scaler.scale(emulator_loss).backward()
+                            emulator_scaler.unscale_(emulator_optimizer)
+                            emulator_grad_norm = float(torch.nn.utils.clip_grad_norm_(
+                                emulator_parameters,
+                                max_norm=float(getattr(
+                                    args, "single_plan_student_grad_clip", 1.0
+                                )),
+                            ))
+                            emulator_scaler.step(emulator_optimizer)
+                            emulator_scaler.update()
+                        else:
+                            emulator_loss.backward()
+                            emulator_grad_norm = float(torch.nn.utils.clip_grad_norm_(
+                                emulator_parameters,
+                                max_norm=float(getattr(
+                                    args, "single_plan_student_grad_clip", 1.0
+                                )),
+                            ))
+                            emulator_optimizer.step()
+                        emulator_step_completed = True
+                        emulator_update_norm = math.sqrt(sum(
+                            float(
+                                (parameter.detach() - before).float().pow(2).sum().cpu()
+                            )
+                            for parameter, before in zip(
+                                emulator_parameters, emulator_before
+                            )
+                        ))
+                    else:
+                        emulator_grad_norm = float("nan")
+                        emulator_update_norm = 0.0
+                    compression_debug_terms.update({
+                        "fast_emulator_optimizer_separate": True,
+                        "fast_emulator_optimizer_step": bool(emulator_step_completed),
+                        "fast_emulator_loss": float(
+                            emulator_loss.detach().float().cpu()
+                        ),
+                        "fast_emulator_grad_norm_raw": float(emulator_grad_norm),
+                        "fast_emulator_parameter_update_norm": float(
+                            emulator_update_norm
+                        ),
+                    })
+                    comp_debug.update({
+                        key: compression_debug_terms[key]
+                        for key in (
+                            "fast_emulator_optimizer_separate",
+                            "fast_emulator_optimizer_step",
+                            "fast_emulator_loss",
+                            "fast_emulator_grad_norm_raw",
+                            "fast_emulator_parameter_update_norm",
+                        )
+                    })
+                    loss.last_compression_debug = comp_debug
                 step_completed = False # Optimizer更新が成功したかのフラグ
                 total_loss_finite = bool(torch.isfinite(L.detach()).all().item()) and skip_optimizer_reason is None # LがNanなどでないか否かの判定
                 param_update_snapshots = None # 更新前パラメータの記録を見作成で初期化
@@ -16738,6 +16903,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                         f"plan_count={int(audit_plan.get('plan_count', 0) or 0)}, "
                         f"pool_reference_count={int(audit_plan.get('pool_reference_count', 0) or 0)}, "
                         f"guidance_cpu_hit={bool(audit_plan.get('guidance_cpu_tensor_cache_hit', False))}, "
+                        f"guidance_disk_hit={bool(audit_plan.get('guidance_disk_tensor_cache_hit', False))}, "
                         f"static_compatibility={bool(audit_plan.get('static_candidate_compatibility_used', False))}, "
                         f"proposal_source={str(audit_plan.get('proposal_source', ''))}, "
                         f"performance_source={str(audit_plan.get('performance_source', ''))}, "
@@ -16801,6 +16967,17 @@ def train(model, args, loss, writer, plot, notifier=None):
                         f"scale={float(audit_compression.get('single_plan_shadow_loss_scale', 0.0) or 0.0):.6g}, "
                         f"proposed={float(audit_compression.get('single_plan_shadow_loss_scale_proposed', 0.0) or 0.0):.6g}, "
                         f"reason={str(audit_compression.get('single_plan_shadow_balance_reason', ''))})"
+                        f", emulator=(separate={bool(audit_compression.get('fast_emulator_optimizer_separate', False))}, "
+                        f"step={bool(audit_compression.get('fast_emulator_optimizer_step', False))}, "
+                        f"grad={float(audit_compression.get('fast_emulator_grad_norm_raw', 0.0) or 0.0):.6g}, "
+                        f"update={float(audit_compression.get('fast_emulator_parameter_update_norm', 0.0) or 0.0):.6g}, "
+                        f"prune_topm={float(audit_compression.get('single_plan_shadow_prune_source_topm_coverage', 0.0) or 0.0):.4f}, "
+                        f"adjust_topm={float(audit_compression.get('single_plan_shadow_adjust_source_topm_coverage', 0.0) or 0.0):.4f}, "
+                        f"direction={float(audit_compression.get('single_plan_shadow_adjust_direction_recall', 0.0) or 0.0):.4f}, "
+                        f"prune_feature_oracle={float(audit_compression.get('single_plan_shadow_prune_fixed_feature_oracle_recall', 0.0) or 0.0):.4f}, "
+                        f"adjust_feature_oracle={float(audit_compression.get('single_plan_shadow_adjust_fixed_feature_oracle_recall', 0.0) or 0.0):.4f}, "
+                        f"prune_rank={float(audit_compression.get('single_plan_shadow_prune_rank_spearman', 0.0) or 0.0):.4f}, "
+                        f"adjust_rank={float(audit_compression.get('single_plan_shadow_adjust_rank_spearman', 0.0) or 0.0):.4f})"
                         f", timing=(step_before_audit={float(time.time() - st_step):.3f}s, "
                         f"actual_total={float(audit_compression.get('actual_encode_time_total', 0.0) or 0.0):.3f}s, "
                         f"actual_gt={float(audit_compression.get('gt_actual_encode_time', 0.0) or 0.0):.3f}s, "
@@ -17358,6 +17535,8 @@ def train(model, args, loss, writer, plot, notifier=None):
             """lr scheduler"""
             if epoch_has_optimizer_step:
                 scheduler_event = step_scheduler_with_floor( scheduler_steplr, optimizer, args, writer=writer, global_epoch=global_epoch + 1, global_step=global_train_step) # StepLRを進める場合でもLR floorを必ず適用する
+                if emulator_scheduler is not None and emulator_optimizer is not None:
+                    emulator_scheduler.step()
                 if scheduler_event.get("scheduler_stepped"):
                     scheduler_step_count += 1
                 scheduler_event["scheduler_step_count"] = scheduler_step_count

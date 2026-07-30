@@ -23,8 +23,8 @@ method_name = "Mine"
 
 model_name = "best_loss_joint"
 
-dataname = "8i"
-# dataname = "MVUB"
+# dataname = "8i"
+dataname = "MVUB"
 # dataname = "UVG"
 
 dataset_name = "longdress"
@@ -2761,6 +2761,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--sparsepcgc_pos_quantscale_list', default='4', type=str, help='SparsePCGC sparse_lossy_gpcc用posQuantscale list')
     parser.add_argument('--sparsepcgc_scale_m', default=8, type=int, help='SparsePCGC dense lossyの有効m。既定8')
     parser.add_argument('--sparsepcgc_scale_ae', default=0, type=int, choices=[0, 1], help='mからAE/SRを決める際のAE scale。ana_den6と同じ既定0')
+    parser.add_argument('--sparsepcgc_scale_sr', default=None, type=int, help='SparsePCGC dense lossyのSR scale。未指定時はnative bit depth-m-AEから自動計算')
     parser.add_argument('--sparsepcgc_native_bit_depth', default=0, type=int, help='m=bit_depth-(AE+SR)を計算するnative bit depth。0は8i/MVUB=10、UVG=9を自動選択')
     parser.add_argument('--heuristic_guidance_enabled', default=True, type=str2bool, help='ana_den6由来HeuristicをWhere/Amount/Actionのpriorとして使う')
     parser.add_argument(
@@ -2771,7 +2772,7 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--heuristic_guidance_mode',
-        default='single_plan_student',
+        default='ana_den6_online',
         choices=[
             'single_plan_student',
             'network_k_proposal_policy',
@@ -2783,9 +2784,9 @@ def parse_pugan_args(parser, file_day, file_time):
             'ana_den6_reference_ply',
         ],
         help=(
-            'SparsePCGC行動経路。既定single_plan_studentはTeacherをlossにだけ使い、'
-            '訓練・検証・推論の適用planを同じNetwork-only経路で生成する。'
-            'ana_den6_onlineはTeacher再現診断専用である。'
+            'SparsePCGC行動経路。既定ana_den6_onlineは訓練時にExact den6順位'
+            '＋Network residualの1複合planを実行する。推論時はtest.pyが'
+            'single_plan_studentへ強制し、den6/Cacheを参照しない。'
             'network_only_codec_policyは旧単一候補の比較用legacy mode'
         ),
     )
@@ -3172,7 +3173,7 @@ def parse_pugan_args(parser, file_day, file_time):
         '--heuristic_guidance_online_amount_bins',
         default='0.00225,0.002375,0.0025,0.002625,0.00275',
         type=str,
-        help='Exact 0.25%を中心にNetworkが微調整するtotal edit ratioの局所離散集合',
+        help='Exact 0.25%%を中心にNetworkが微調整するtotal edit ratioの局所離散集合',
     )
     parser.add_argument(
         '--heuristic_guidance_online_amount_residual_scale',
@@ -3359,6 +3360,18 @@ def parse_pugan_args(parser, file_day, file_time):
         default=2048,
         type=int,
         help='固定den6候補のCPU座標写像キャッシュ上限(MB)',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_tensor_disk_cache',
+        default=True,
+        type=str2bool,
+        help='写像済みden6固定Tensorをfingerprint付きでディスク保存し、frame巡回後も厳密再利用する',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_tensor_disk_cache_dir',
+        default='',
+        type=str,
+        help='写像済みden6固定Tensorの保存先。空ならonline cache配下',
     )
     parser.add_argument(
         '--heuristic_guidance_disable_full_cloud_amount_override',
@@ -3818,6 +3831,8 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--episode_input_common_cache_enable_dataset_cache', default=True, type=str2bool, help='episode_input_common_cache=True時にPLY dataset_cacheも自動で有効化するか')
     parser.add_argument('--episode_input_common_cache_max_entries', default=0, type=int, help='Episode共通前処理キャッシュの最大件数(0なら学習ファイル数まで自動設定)')
     parser.add_argument('--episode_input_common_cache_max_memory_mb', default=512, type=int, help='Episode共通前処理キャッシュのCPUメモリ上限(MB, 0で無制限)')
+    parser.add_argument('--streaming_cache_auto_policy', default=True, type=str2bool, help='巡回frame数がRAM LRU容量を超えるときhit=0の巨大RAM cacheを自動停止し、固定Tensor disk cacheを使う')
+    parser.add_argument('--streaming_cache_hot_entries', default=4, type=int, help='巡回学習時にCPUへ残す固定Tensorの直近frame数')
     parser.add_argument('--episode_input_subtree_runtime_cache', default=True, type=str2bool, help='Episode共通キャッシュ内に、Subtreeごとの入力点群/属性/canonical metadataを保存して再利用するか')
     parser.add_argument('--episode_input_subtree_runtime_prewarm_all', default=False, type=str2bool, help='Episode共通キャッシュ有効時、各サンプルの候補Subtree runtime入力を初回Stepでまとめて作成し、Episode2以降で再利用するか')
     parser.add_argument('--episode_input_subtree_runtime_max_groups', default=0, type=int, help='Subtree runtime prewarm対象の最大Subtree数。0なら候補全件')
@@ -3843,6 +3858,8 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--structure_neighbor_query_chunk', default=32768, type=int, help='26近傍occupancyを完全一致のまま分割検索する点数（小さいほど一時GPUメモリを削減）')
     parser.add_argument('--structure_fixed_cache_max_entries', default=64, type=int, help='固定GTの26近傍・parent分割CPUキャッシュ最大件数')
     parser.add_argument('--structure_fixed_cache_max_memory_mb', default=1024, type=int, help='固定GTの26近傍・parent分割CPUキャッシュ上限(MB)')
+    parser.add_argument('--structure_fixed_disk_cache', default=True, type=str2bool, help='固定GTの26近傍・parent分割Tensorをfingerprint付きでディスクへ保存する')
+    parser.add_argument('--structure_fixed_disk_cache_dir', default='', type=str, help='固定Octree Tensorの保存先。空ならden6 online cache配下')
     parser.add_argument('--den6_online_release_cuda_cache_before_actuator', default=True, type=str2bool, help='構造解析終了後に不要となったCUDA検索workspace cacheをActuator前に返却する')
     parser.add_argument('--den6_online_release_cuda_cache_before_actual', default=True, type=str2bool, help='ana_den6_onlineの実圧縮worker起動直前に未使用CUDA allocator cacheだけを返却し、2プロセス重複時のGPU使用量を抑える')
     parser.add_argument('--amp_init_scale', default=1.0, type=float, help='GradScaler初期値')
@@ -4319,19 +4336,37 @@ def parse_pugan_args(parser, file_day, file_time):
     args.sparsepcgc_scale_m = int(getattr(args, "sparsepcgc_scale_m", 8))
     args.sparsepcgc_scale_ae = int(getattr(args, "sparsepcgc_scale_ae", 0))
     requested_native_bit_depth = int(getattr(args, "sparsepcgc_native_bit_depth", 0))
+    dataset_key_for_m = str(getattr(args, "dataname", "8i")).strip().lower()
     if requested_native_bit_depth <= 0:
-        dataset_key_for_m = str(getattr(args, "dataname", "8i")).strip().lower()
         # den6の実測設定に合わせ、UVGは9-bit、8i/MVUBは10-bitを使う。
         requested_native_bit_depth = 9 if dataset_key_for_m == "uvg" else 10
     args.sparsepcgc_native_bit_depth = max(requested_native_bit_depth, 1)
     if not _cli_option_was_provided("--sparsepcgc_psnr_resolution"):
         args.sparsepcgc_psnr_resolution = 511 if dataset_key_for_m == "uvg" else 1023
-    sparsepcgc_scale_sr = args.sparsepcgc_native_bit_depth - args.sparsepcgc_scale_m - args.sparsepcgc_scale_ae
+    derived_sparsepcgc_scale_sr = (
+        args.sparsepcgc_native_bit_depth
+        - args.sparsepcgc_scale_m
+        - args.sparsepcgc_scale_ae
+    )
+    requested_sparsepcgc_scale_sr = getattr(args, "sparsepcgc_scale_sr", None)
+    sparsepcgc_scale_sr = (
+        derived_sparsepcgc_scale_sr
+        if requested_sparsepcgc_scale_sr is None
+        else int(requested_sparsepcgc_scale_sr)
+    )
     if sparsepcgc_scale_sr < 0:
         raise ValueError(
             "SparsePCGC dense lossy設定が不正である: "
             f"bit_depth={args.sparsepcgc_native_bit_depth}, AE={args.sparsepcgc_scale_ae}, "
-            f"m={args.sparsepcgc_scale_m}"
+            f"SR={sparsepcgc_scale_sr}, m={args.sparsepcgc_scale_m}"
+        )
+    if sparsepcgc_scale_sr != derived_sparsepcgc_scale_sr:
+        raise ValueError(
+            "SparsePCGC dense lossy設定のscaleが不整合である: "
+            f"AE({args.sparsepcgc_scale_ae})+SR({sparsepcgc_scale_sr})"
+            f"+m({args.sparsepcgc_scale_m})="
+            f"{args.sparsepcgc_scale_ae + sparsepcgc_scale_sr + args.sparsepcgc_scale_m}, "
+            f"native_bit_depth={args.sparsepcgc_native_bit_depth}"
         )
     args.sparsepcgc_scale_sr = int(sparsepcgc_scale_sr)
     if not _cli_option_was_provided("--sparsepcgc_dense_scale_ae_list"):
@@ -4343,7 +4378,7 @@ def parse_pugan_args(parser, file_day, file_time):
         getattr(args, "heuristic_guidance_network_only_inference", False)
     )
     args.heuristic_guidance_mode = str(
-        getattr(args, "heuristic_guidance_mode", "single_plan_student")
+        getattr(args, "heuristic_guidance_mode", "ana_den6_online")
     ).strip().lower()
     valid_guidance_modes = {
         "single_plan_student",
@@ -5074,7 +5109,7 @@ def parse_pugan_args(parser, file_day, file_time):
             "ana_den6_online", "ana_den6_residual", "ana_den6_reproduce", "ana_den6_reference_ply"
         }
     ):
-        # den6の比較対象は native_vs1_pq1_ae0_sr{native-m}_m{m} であり、
+        # den6の比較対象は指定されたAE/SR/mを含むsetting IDで分離されるため、
         # qs連動や別modeを許すと同じhard voxel集合でもbitが一致しない。
         expected_sr = args.sparsepcgc_native_bit_depth - args.sparsepcgc_scale_m - args.sparsepcgc_scale_ae
         mismatches = []
@@ -5086,10 +5121,10 @@ def parse_pugan_args(parser, file_day, file_time):
             mismatches.append(f"voxel_size={args.sparsepcgc_voxel_size} (expected 1.0)")
         if args.sparsepcgc_pos_quantscale != 1:
             mismatches.append(f"pos_quantscale={args.sparsepcgc_pos_quantscale} (expected 1)")
-        if args.sparsepcgc_scale_ae != 0 or args.sparsepcgc_scale_sr != expected_sr:
+        if args.sparsepcgc_scale_sr != expected_sr:
             mismatches.append(
                 f"AE/SR={args.sparsepcgc_scale_ae}/{args.sparsepcgc_scale_sr} "
-                f"(expected 0/{expected_sr})"
+                f"(expected {args.sparsepcgc_scale_ae}/{expected_sr})"
             )
         expected_resolution = 511 if dataset_key_for_m == "uvg" else 1023
         if int(args.sparsepcgc_psnr_resolution) != expected_resolution:

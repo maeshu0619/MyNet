@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 from typing import Any, Mapping
 
 import numpy as np
@@ -30,7 +31,17 @@ _FIXED_FEATURE_CACHE: "OrderedDict[str, dict[str, np.ndarray]]" = OrderedDict()
 _CACHE_STATS = {
     "build": 0, "memory_hit": 0, "disk_hit": 0,
     "exact_teacher_hit": 0, "exact_teacher_missing": 0,
+    "exact_teacher_build": 0, "exact_teacher_build_failed": 0,
+    "exact_teacher_fresh_build_load": 0,
 }
+
+
+def reset_ana_den6_online_runtime_cache() -> None:
+    """test2のcold計測前に、同一process内の再利用状態だけを破棄する。"""
+    _GLOBAL_PAYLOAD_CACHE.clear()
+    _FIXED_FEATURE_CACHE.clear()
+    for key in tuple(_CACHE_STATS):
+        _CACHE_STATS[key] = 0
 
 
 def _sha256_file(path: Path) -> str:
@@ -440,7 +451,10 @@ def _load_exact_single_plan_teacher(
             return None
         _GLOBAL_PAYLOAD_CACHE.move_to_end(exact_identity_key)
         _CACHE_STATS["memory_hit"] += 1
-        _CACHE_STATS["exact_teacher_hit"] += 1
+        if bool(getattr(args, "_ana_den6_online_fresh_build_load", False)):
+            _CACHE_STATS["exact_teacher_fresh_build_load"] += 1
+        else:
+            _CACHE_STATS["exact_teacher_hit"] += 1
         setattr(args, "_ana_den6_online_cache_stats", dict(_CACHE_STATS))
         return dict(cached)
 
@@ -528,7 +542,10 @@ def _load_exact_single_plan_teacher(
             (str(path.resolve()) + "|" + str(identity["input_sha256"])).encode("utf-8")
         ).hexdigest()
         store_memory(path, teacher)
-        _CACHE_STATS["exact_teacher_hit"] += 1
+        if bool(getattr(args, "_ana_den6_online_fresh_build_load", False)):
+            _CACHE_STATS["exact_teacher_fresh_build_load"] += 1
+        else:
+            _CACHE_STATS["exact_teacher_hit"] += 1
         setattr(args, "_ana_den6_online_cache_stats", dict(_CACHE_STATS))
         return teacher
 
@@ -542,7 +559,12 @@ def _load_exact_single_plan_teacher(
     scale_m = int(identity["scale_m"])
     manifest_paths = (
         []
-        if reserve_factor > 1.0
+        if (
+            reserve_factor > 1.0
+            or not bool(getattr(
+                args, "heuristic_guidance_allow_den6_manifest_fallback", True
+            ))
+        )
         else sorted(manifest_root.glob(f"{dataset}_{stem}_m{scale_m}_*.json"))
     )
     for path in manifest_paths:
@@ -675,15 +697,23 @@ def _load_exact_single_plan_teacher(
             "--output-json", str(output_json),
             "--output-root", str(output_root),
         ]
+        if bool(getattr(args, "cpu", False)):
+            command.append("--cpu")
+        _CACHE_STATS["exact_teacher_build"] += 1
+        setattr(args, "_ana_den6_online_cache_stats", dict(_CACHE_STATS))
         completed = subprocess.run(command, check=False)
         if completed.returncode == 0 and output_json.is_file():
             # 同じ関数を1回だけ再試行する。再帰先ではbuildを無効にして、
             # worker異常時の無限再起動を防ぐ。
             setattr(args, "heuristic_guidance_auto_build_exact_single_plan_teacher", False)
+            setattr(args, "_ana_den6_online_fresh_build_load", True)
             try:
                 return _load_exact_single_plan_teacher(args, identity)
             finally:
+                setattr(args, "_ana_den6_online_fresh_build_load", False)
                 setattr(args, "heuristic_guidance_auto_build_exact_single_plan_teacher", True)
+        _CACHE_STATS["exact_teacher_build_failed"] += 1
+        setattr(args, "_ana_den6_online_cache_stats", dict(_CACHE_STATS))
     _CACHE_STATS["exact_teacher_missing"] += 1
     setattr(args, "_ana_den6_online_cache_stats", dict(_CACHE_STATS))
     return None
@@ -713,6 +743,8 @@ def attach_ana_den6_online_guidance(
         raise RuntimeError("ana_den6 onlineにはfull-cloud canonical contextが必要である")
     # 063943経路と同様に、den6が順位付けしたedit-unit集合とExact anchorを
     # 最優先する。欠落時にGT proxyへ静かに劣化させない。
+    timing_start = time.perf_counter()
+    stats_before = dict(_CACHE_STATS)
     identity = None
     if context.get("input_file") and context.get("input_sha256"):
         identity = _identity(
@@ -733,6 +765,32 @@ def attach_ana_den6_online_guidance(
                 "初回だけden6 workerでcacheを構築すること"
             )
         payload = _load_or_build_payload(context, args)
+    timing_end = time.perf_counter()
+    stats_after = dict(_CACHE_STATS)
+    setattr(args, "_ana_den6_online_last_timing", {
+        "heuristic_pool_wall_time": float(timing_end - timing_start),
+        "worker_reported_time": float(payload.get("elapsed_sec", 0.0) or 0.0),
+        "exact_teacher_build_delta": int(
+            stats_after.get("exact_teacher_build", 0)
+            - stats_before.get("exact_teacher_build", 0)
+        ),
+        "memory_hit_delta": int(
+            stats_after.get("memory_hit", 0) - stats_before.get("memory_hit", 0)
+        ),
+        "disk_hit_delta": int(
+            stats_after.get("disk_hit", 0) - stats_before.get("disk_hit", 0)
+        ),
+        "exact_teacher_hit_delta": int(
+            stats_after.get("exact_teacher_hit", 0)
+            - stats_before.get("exact_teacher_hit", 0)
+        ),
+        "fresh_build_load_delta": int(
+            stats_after.get("exact_teacher_fresh_build_load", 0)
+            - stats_before.get("exact_teacher_fresh_build_load", 0)
+        ),
+        "cache_root": str(getattr(args, "heuristic_guidance_online_cache_dir", "")),
+        "input_file": str(getattr(args, "_current_input_file", "")),
+    })
     payload["teacher_bootstrap_active"] = False
     payload["teacher_bootstrap_steps"] = 0
     out = dict(context)

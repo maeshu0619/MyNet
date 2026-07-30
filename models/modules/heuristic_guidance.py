@@ -10,8 +10,12 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass
+import hashlib
 import math
-from typing import Any, Dict, Mapping
+import os
+from pathlib import Path
+import time
+from typing import Any, Dict, Mapping, Optional
 
 import numpy as np
 import torch
@@ -21,6 +25,7 @@ from .executable_voxel_plan import coordinate_indices, scatter_amax_1d_compat_
 _EXACT_GUIDANCE_CACHE: "OrderedDict[tuple[str, str, str, int], Dict[str, Any]]" = OrderedDict()
 _EXACT_GUIDANCE_CPU_CACHE: "OrderedDict[tuple[str, str, int], Dict[str, Any]]" = OrderedDict()
 _EXACT_GUIDANCE_CPU_CACHE_BYTES = 0
+_EXACT_GUIDANCE_DISK_SCHEMA = "exact_guidance_mapped_tensor_v1"
 
 
 def _guidance_tensor_tree(value: Any, device: torch.device) -> Any:
@@ -53,14 +58,8 @@ def _guidance_tensor_bytes(value: Any) -> int:
     return 0
 
 
-def _store_exact_guidance_cpu(
-    key: tuple[str, str, int],
-    guidance: Mapping[str, Any],
-    _exact: Mapping[str, Any],
-    args: Any,
-) -> None:
-    """固定候補の座標写像だけをCPUへ保存し、全Voxel辞書の再構築を防ぐ。"""
-    global _EXACT_GUIDANCE_CPU_CACHE_BYTES
+def _mapped_guidance_cpu(guidance: Mapping[str, Any]) -> Dict[str, Any]:
+    """巨大な元manifestを除き、写像済みTensorだけをCPUへ移す。"""
     # exact_candidate_guidanceは約20MBのJSONを展開した巨大Python manifestで、
     # 参照先のLayer A LRUがevictされても、このCPU cacheが最大64 frame分を
     # 生存させていた。復元時には現在frameのexactを必ず再設定するため保存不要。
@@ -69,7 +68,22 @@ def _store_exact_guidance_cpu(
         for key, value in guidance.items()
         if key != "exact_candidate_guidance"
     }
-    cpu_guidance = _guidance_tensor_tree(mapped_only, torch.device("cpu"))
+    return _guidance_tensor_tree(mapped_only, torch.device("cpu"))
+
+
+def _store_exact_guidance_cpu(
+    key: tuple[str, str, int],
+    guidance: Mapping[str, Any],
+    _exact: Mapping[str, Any],
+    args: Any,
+    *,
+    cpu_guidance: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """固定候補の座標写像だけを小さいCPU hot cacheへ保存する。"""
+    global _EXACT_GUIDANCE_CPU_CACHE_BYTES
+    if not isinstance(cpu_guidance, Mapping):
+        cpu_guidance = _mapped_guidance_cpu(guidance)
+    cpu_guidance = dict(cpu_guidance)
     entry_bytes = _guidance_tensor_bytes(cpu_guidance)
     max_entries = max(int(getattr(
         args, "heuristic_guidance_cpu_tensor_cache_entries", 64
@@ -78,7 +92,7 @@ def _store_exact_guidance_cpu(
         args, "heuristic_guidance_cpu_tensor_cache_max_memory_mb", 2048
     )), 0) * 1024 * 1024
     if max_entries <= 0 or max_bytes <= 0 or entry_bytes > max_bytes:
-        return
+        return cpu_guidance
     old = _EXACT_GUIDANCE_CPU_CACHE.pop(key, None)
     if isinstance(old, dict):
         _EXACT_GUIDANCE_CPU_CACHE_BYTES -= int(old.get("bytes", 0))
@@ -93,6 +107,80 @@ def _store_exact_guidance_cpu(
     ):
         _, removed = _EXACT_GUIDANCE_CPU_CACHE.popitem(last=False)
         _EXACT_GUIDANCE_CPU_CACHE_BYTES -= int(removed.get("bytes", 0))
+    return cpu_guidance
+
+
+def _exact_guidance_disk_path(
+    args: Any,
+    key: tuple[str, str, int],
+) -> Optional[Path]:
+    if not bool(getattr(args, "heuristic_guidance_tensor_disk_cache", False)):
+        return None
+    configured = str(getattr(
+        args, "heuristic_guidance_tensor_disk_cache_dir", ""
+    ) or "").strip()
+    if configured:
+        root = Path(configured).expanduser()
+    else:
+        online_root = str(getattr(
+            args,
+            "heuristic_guidance_online_cache_dir",
+            "/data/maejima/log/mynet_den6_online_cache",
+        ))
+        root = Path(online_root).expanduser() / "mapped_guidance_tensor_v1"
+    digest = hashlib.sha256(repr(tuple(key)).encode("utf-8")).hexdigest()
+    return root / digest[:2] / f"{digest}.pt"
+
+
+def _load_exact_guidance_disk(
+    args: Any,
+    key: tuple[str, str, int],
+) -> Optional[Dict[str, Any]]:
+    path = _exact_guidance_disk_path(args, key)
+    if path is None or not path.is_file():
+        return None
+    try:
+        payload = torch.load(str(path), map_location="cpu")
+    except Exception:
+        return None
+    if (
+        not isinstance(payload, Mapping)
+        or payload.get("schema") != _EXACT_GUIDANCE_DISK_SCHEMA
+        or tuple(payload.get("key", ())) != tuple(key)
+        or not isinstance(payload.get("guidance"), Mapping)
+    ):
+        return None
+    return dict(payload["guidance"])
+
+
+def _store_exact_guidance_disk(
+    args: Any,
+    key: tuple[str, str, int],
+    cpu_guidance: Mapping[str, Any],
+) -> None:
+    path = _exact_guidance_disk_path(args, key)
+    if path is None or path.is_file():
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_name(
+            f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+        )
+        torch.save(
+            {
+                "schema": _EXACT_GUIDANCE_DISK_SCHEMA,
+                "key": tuple(key),
+                "guidance": dict(cpu_guidance),
+            },
+            str(tmp_path),
+        )
+        os.replace(str(tmp_path), str(path))
+    except Exception:
+        try:
+            if "tmp_path" in locals() and tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
 
 
 def release_exact_guidance_cache(args: Any = None) -> None:
@@ -349,6 +437,13 @@ def _exact_den6_guidance(
     if isinstance(cached_guidance, dict):
         _EXACT_GUIDANCE_CACHE.move_to_end(cache_key)
         return cached_guidance
+    # online/residual trainingは異なるfull-cloud frameを順に処理する。
+    # 同一frame GPU hitを上で返した後、CPU/diskから次frameを復元する前に
+    # 旧frameのCUDA写像を解放する。従来はCPU hitのreturnがこの解放処理を
+    # 飛び越え、validation 5 frame分がGPUへ残っていた。
+    mode = str(getattr(args, "heuristic_guidance_mode", "proxy_prior")).strip().lower()
+    if mode in {"ana_den6_online", "ana_den6_residual"}:
+        _EXACT_GUIDANCE_CACHE.clear()
     cpu_cache_key = (cache_signature, str(like.dtype), int(coords.shape[-1]))
     cached_cpu_entry = _EXACT_GUIDANCE_CPU_CACHE.get(cpu_cache_key)
     if isinstance(cached_cpu_entry, dict):
@@ -358,17 +453,29 @@ def _exact_den6_guidance(
             restored = _guidance_tensor_tree(cached_cpu, like.device)
             restored["exact_candidate_guidance"] = exact
             restored["cpu_tensor_cache_hit"] = True
+            restored["disk_tensor_cache_hit"] = False
             _EXACT_GUIDANCE_CACHE[cache_key] = restored
             return restored
+    disk_guidance = _load_exact_guidance_disk(args, cpu_cache_key)
+    if isinstance(disk_guidance, dict):
+        _store_exact_guidance_cpu(
+            cpu_cache_key,
+            disk_guidance,
+            exact,
+            args,
+            cpu_guidance=disk_guidance,
+        )
+        restored = _guidance_tensor_tree(disk_guidance, like.device)
+        restored["exact_candidate_guidance"] = exact
+        restored["cpu_tensor_cache_hit"] = False
+        restored["disk_tensor_cache_hit"] = True
+        _EXACT_GUIDANCE_CACHE[cache_key] = restored
+        return restored
 
     # online/residual training visits a different full-cloud frame every step.
     # Keeping mapped CUDA tensors for old frames cannot produce a cache hit in
     # the current step and used several GiB per frame.  Drop the previous frame
     # *before* allocating the next one, while retaining same-frame reuse above.
-    mode = str(getattr(args, "heuristic_guidance_mode", "proxy_prior")).strip().lower()
-    if mode in {"ana_den6_online", "ana_den6_residual"}:
-        _EXACT_GUIDANCE_CACHE.clear()
-
     pools = exact.get("operation_edit_units")
     if not isinstance(pools, Mapping):
         pools = exact.get("operation_candidate_shortlists")
@@ -640,8 +747,12 @@ def _exact_den6_guidance(
         "exact_candidate_mapped_count": mapped,
         "exact_candidate_unmapped_count": unmapped,
         "cpu_tensor_cache_hit": False,
+        "disk_tensor_cache_hit": False,
     }
-    _store_exact_guidance_cpu(cpu_cache_key, guidance, exact, args)
+    cpu_guidance = _store_exact_guidance_cpu(
+        cpu_cache_key, guidance, exact, args
+    )
+    _store_exact_guidance_disk(args, cpu_cache_key, cpu_guidance)
     _EXACT_GUIDANCE_CACHE[cache_key] = guidance
     _EXACT_GUIDANCE_CACHE.move_to_end(cache_key)
     while len(_EXACT_GUIDANCE_CACHE) > 8:

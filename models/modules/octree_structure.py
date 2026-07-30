@@ -2,6 +2,10 @@ import torch
 import torch.nn as nn
 from collections import OrderedDict
 from contextlib import nullcontext
+import hashlib
+import os
+from pathlib import Path
+import time
 from ..utils.pointcloud.utils_repkpu import get_knn_pts
 from ..utils.compression.proxy_octree import ProxyOctreeConfig, SoftOctreeRateProxy
 from .heuristic_guidance import build_heuristic_guidance
@@ -47,6 +51,7 @@ class OctreeStructureAnalysis(nn.Module):
         # 全40ch特徴を保存せず、重い26近傍検索とparent分割だけを再利用する。
         self._fixed_structure_cache = OrderedDict()
         self._fixed_structure_cache_bytes = 0
+        self._fixed_structure_cache_source = "miss"
 
     @staticmethod
     def _fixed_cache_tensor_bytes(value):
@@ -65,39 +70,94 @@ class OctreeStructureAnalysis(nn.Module):
             str(getattr(self.args, "structure_neighbor_query_chunk", 32768)),
         ))
 
-    def _get_fixed_structure_cache(self, cache_key, device):
-        key = self._fixed_structure_cache_key(cache_key)
-        entry = self._fixed_structure_cache.get(key)
-        if not isinstance(entry, dict):
+    def _fixed_structure_disk_path(self, key):
+        if not key or not bool(getattr(
+            self.args, "structure_fixed_disk_cache", False
+        )):
             return None
-        self._fixed_structure_cache.move_to_end(key)
+        configured = str(getattr(
+            self.args, "structure_fixed_disk_cache_dir", ""
+        ) or "").strip()
+        if configured:
+            root = Path(configured).expanduser()
+        else:
+            online_root = str(getattr(
+                self.args,
+                "heuristic_guidance_online_cache_dir",
+                "/data/maejima/log/mynet_den6_online_cache",
+            ))
+            root = Path(online_root).expanduser() / "octree_fixed_tensor_v1"
+        digest = hashlib.sha256(str(key).encode("utf-8")).hexdigest()
+        return root / digest[:2] / f"{digest}.pt"
+
+    @staticmethod
+    def _fixed_value_to_cpu(value):
         return {
-            name: value.to(device=device)
-            if torch.is_tensor(value) else value
-            for name, value in entry["value"].items()
+            name: item.detach().to(device="cpu").clone()
+            if torch.is_tensor(item) else item
+            for name, item in value.items()
         }
 
-    def _put_fixed_structure_cache(self, cache_key, value):
-        key = self._fixed_structure_cache_key(cache_key)
-        if not key or not isinstance(value, dict):
+    def _load_fixed_structure_disk(self, key):
+        path = self._fixed_structure_disk_path(key)
+        if path is None or not path.is_file():
+            return None
+        try:
+            payload = torch.load(str(path), map_location="cpu")
+        except Exception:
+            return None
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema") != "octree_fixed_structure_tensor_v1"
+            or payload.get("key") != key
+            or not isinstance(payload.get("value"), dict)
+        ):
+            return None
+        value = payload["value"]
+        if not all(torch.is_tensor(item) for item in value.values()):
+            return None
+        return value
+
+    def _store_fixed_structure_disk(self, key, cpu_value):
+        path = self._fixed_structure_disk_path(key)
+        if path is None or path.is_file():
             return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = path.with_name(
+                f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+            )
+            torch.save(
+                {
+                    "schema": "octree_fixed_structure_tensor_v1",
+                    "key": key,
+                    "value": cpu_value,
+                },
+                str(tmp_path),
+            )
+            os.replace(str(tmp_path), str(path))
+        except Exception:
+            try:
+                if "tmp_path" in locals() and tmp_path.exists():
+                    tmp_path.unlink()
+            except OSError:
+                pass
+
+    def _put_fixed_structure_ram(self, key, cpu_value):
+        entry_bytes = sum(
+            self._fixed_cache_tensor_bytes(item) for item in cpu_value.values()
+        )
         max_entries = max(int(getattr(
             self.args, "structure_fixed_cache_max_entries", 64
         )), 0)
         max_bytes = max(int(getattr(
             self.args, "structure_fixed_cache_max_memory_mb", 4096
         )), 0) * 1024 * 1024
-        if max_entries <= 0 or max_bytes <= 0:
-            return
-        cpu_value = {
-            name: item.detach().to(device="cpu").clone()
-            if torch.is_tensor(item) else item
-            for name, item in value.items()
-        }
-        entry_bytes = sum(
-            self._fixed_cache_tensor_bytes(item) for item in cpu_value.values()
-        )
-        if entry_bytes > max_bytes:
+        if (
+            max_entries <= 0
+            or max_bytes <= 0
+            or entry_bytes > max_bytes
+        ):
             return
         old = self._fixed_structure_cache.pop(key, None)
         if isinstance(old, dict):
@@ -113,6 +173,34 @@ class OctreeStructureAnalysis(nn.Module):
         ):
             _, removed = self._fixed_structure_cache.popitem(last=False)
             self._fixed_structure_cache_bytes -= int(removed.get("bytes", 0))
+
+    def _get_fixed_structure_cache(self, cache_key, device):
+        key = self._fixed_structure_cache_key(cache_key)
+        entry = self._fixed_structure_cache.get(key)
+        if isinstance(entry, dict):
+            self._fixed_structure_cache.move_to_end(key)
+            cpu_value = entry["value"]
+            self._fixed_structure_cache_source = "memory"
+        else:
+            cpu_value = self._load_fixed_structure_disk(key)
+            if not isinstance(cpu_value, dict):
+                self._fixed_structure_cache_source = "miss"
+                return None
+            self._put_fixed_structure_ram(key, cpu_value)
+            self._fixed_structure_cache_source = "disk"
+        return {
+            name: value.to(device=device)
+            if torch.is_tensor(value) else value
+            for name, value in cpu_value.items()
+        }
+
+    def _put_fixed_structure_cache(self, cache_key, value):
+        key = self._fixed_structure_cache_key(cache_key)
+        if not key or not isinstance(value, dict):
+            return
+        cpu_value = self._fixed_value_to_cpu(value)
+        self._store_fixed_structure_disk(key, cpu_value)
+        self._put_fixed_structure_ram(key, cpu_value)
 
     @staticmethod
     def _effective_qs(args):
@@ -2500,6 +2588,9 @@ class OctreeStructureAnalysis(nn.Module):
             if all(torch.is_tensor(item) for item in fixed_value.values()):
                 self._put_fixed_structure_cache(cache_key, fixed_value)
         result["fixed_structure_cache_hit"] = bool(fixed_cache_hit)
+        result["fixed_structure_cache_source"] = str(
+            self._fixed_structure_cache_source
+        )
         result["fixed_structure_cache_entries"] = int(
             len(self._fixed_structure_cache)
         )

@@ -70,6 +70,11 @@ def build_optimizer_and_scheduler(model, args, writer):
     single_param_ids = {id(parameter) for parameter in single_params}
     other_params = [parameter for parameter in other_params if id(parameter) not in single_param_ids]
     deform_params = [parameter for parameter in deform_params if id(parameter) not in single_param_ids]
+    separate_emulator = (
+        str(getattr(args, "heuristic_guidance_mode", "")).strip().lower()
+        == "ana_den6_online"
+        and bool(getattr(args, "single_plan_shadow_distillation", True))
+    )
 
     num_enc_trainable = sum(p.requires_grad for p in model.encoder.parameters())
     writer.write(
@@ -96,7 +101,7 @@ def build_optimizer_and_scheduler(model, args, writer):
                 "lr": args.lr * float(getattr(args, "network_k_critic_lr_scale", 1.0)),
                 "name": "network_k_critic",
             })
-        if single_params:
+        if single_params and not separate_emulator:
             groups.append({
                 "params": single_params,
                 "lr": args.lr * float(getattr(args, "single_plan_student_lr_scale", 1.0)),
@@ -121,7 +126,7 @@ def build_optimizer_and_scheduler(model, args, writer):
                 "lr": args.lr * float(getattr(args, "network_k_critic_lr_scale", 1.0)),
                 "name": "network_k_critic",
             })
-        if single_params:
+        if single_params and not separate_emulator:
             groups.append({
                 "params": single_params,
                 "lr": args.lr * float(getattr(args, "single_plan_student_lr_scale", 1.0)),
@@ -147,6 +152,37 @@ def build_optimizer_and_scheduler(model, args, writer):
     )
 
     return optimizer, scheduler_steplr
+
+
+def build_emulator_optimizer_and_scheduler(model, args, writer):
+    """Exact主経路と共有しないEmulator専用optimizerを作る。"""
+    mode = str(getattr(args, "heuristic_guidance_mode", "")).strip().lower()
+    if mode != "ana_den6_online" or not bool(
+        getattr(args, "single_plan_shadow_distillation", True)
+    ):
+        return None, None
+    base_model = model.module if hasattr(model, "module") else model
+    emulator = getattr(base_model, "single_plan_student", None)
+    if emulator is None:
+        raise RuntimeError("Fast Heuristic Emulatorが初期化されていない")
+    parameters = [parameter for parameter in emulator.parameters() if parameter.requires_grad]
+    if not parameters:
+        raise RuntimeError("Fast Heuristic Emulatorに学習可能parameterがない")
+    lr = float(args.lr) * float(getattr(args, "single_plan_student_lr_scale", 1.0))
+    if str(args.optim).strip().lower() == "adam":
+        optimizer = optim.Adam(parameters, lr=lr, weight_decay=float(args.weight_decay))
+    else:
+        optimizer = optim.SGD(parameters, lr=lr)
+    scheduler = optim.lr_scheduler.StepLR(
+        optimizer,
+        step_size=args.lr_decay_step,
+        gamma=args.gamma,
+    )
+    writer.write(
+        "FastHeuristicEmulatorOptimizer: "
+        f"separate=True, lr={lr:.6g}, params={len(parameters)}"
+    )
+    return optimizer, scheduler
 
 
 def setup_amp(model, args, writer):
