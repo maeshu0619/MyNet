@@ -462,6 +462,10 @@ class _SparsePCGCActualEncoder:
             str(int(getattr(self.args, "sparsepcgc_scale_ae", 0))),
             "--scale-sr",
             str(int(getattr(self.args, "sparsepcgc_scale_sr", 2))),
+            "--cpu-trim-interval",
+            str(max(int(getattr(
+                self.args, "sparsepcgc_worker_cpu_trim_interval", 16
+            )), 0)),
         ]
         if bool(getattr(self.args, "sparsepcgc_inner_psnr", False)):
             cmd.append("--inner-psnr")

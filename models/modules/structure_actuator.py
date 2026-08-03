@@ -3624,7 +3624,8 @@ class StructureRepairActuator(nn.Module):
                 bin_tensor.log() - learned_total.log().reshape(1)
             ) / amount_temperature
             learned_total_for_backward = learned_total
-        if current_step < exact_anchor_steps:
+        exact_anchor_active = current_step < exact_anchor_steps
+        if exact_anchor_active:
             selected_amount_bin = torch.argmin(
                 torch.abs(bin_tensor - float(prior_total_ratio))
             )
@@ -3636,7 +3637,15 @@ class StructureRepairActuator(nn.Module):
             )
         else:
             selected_amount_bin = torch.argmax(amount_logits)
-        hard_total = bin_tensor[selected_amount_bin]
+        # den6の初期総量はdataset/codec条件で異なる。UVG m=8では0.50%であり、
+        # 8i向けの0.225--0.275%学習binへStep 0から丸めるとworkerが保存した
+        # Exact planとは別の要求数になる。anchor中のhard forwardだけはworkerの
+        # total_ratioをそのまま再生し、anchor終了後だけNetworkの離散binを使う。
+        hard_total = (
+            bin_tensor.new_tensor(float(prior_total_ratio))
+            if exact_anchor_active
+            else bin_tensor[selected_amount_bin]
+        )
         coarse_total_ratio = (
             hard_total.detach()
             + learned_total_for_backward
@@ -3942,7 +3951,7 @@ class StructureRepairActuator(nn.Module):
             "proposal_source": "den6_exact_rank_plus_network_residual",
             "performance_source": (
                 "exact_teacher_anchor"
-                if current_step < exact_anchor_steps
+                if exact_anchor_active
                 else "heuristic_rank_plus_network_residual"
             ),
             "network_only_performance": False,
@@ -4039,7 +4048,7 @@ class StructureRepairActuator(nn.Module):
         }
 
         # Step 0はden6 Heuristicだけで作ったinitial planと一致することを検査する。
-        if current_step < exact_anchor_steps:
+        if exact_anchor_active:
             initial_plan = exact.get(
                 "heuristic_anchor_plan", exact.get("initial_heuristic_plan", {})
             )

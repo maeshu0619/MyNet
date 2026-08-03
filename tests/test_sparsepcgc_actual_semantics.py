@@ -24,6 +24,9 @@ from models.modules.octree_structure import OctreeStructureAnalysis
 from models.modules.structure_actuator import StructureRepairActuator
 from models.network import Network
 from models.utils.loss.compression import CompressionLossMixin
+from models.utils.loss.sparsepcgc_teacher_worker import (
+    _encoder_reported_cuda_cleanup,
+)
 from models.utils.training.utils import surrogate_compression_plot_metric
 from models.utils.training.train_flow import prepare_full_cloud_input_pcd
 from models.utils.pointcloud.ana_den6_reference import (
@@ -112,6 +115,47 @@ class _EveryStepFixture(CompressionLossMixin):
 
 
 class SparsePCGCActualSemanticsTest(unittest.TestCase):
+    def test_worker_does_not_repeat_encoder_cuda_cleanup(self):
+        self.assertTrue(_encoder_reported_cuda_cleanup({
+            "cuda_after_cleanup_reserved_gb": 0.0
+        }))
+        self.assertFalse(_encoder_reported_cuda_cleanup({
+            "cuda_reserved_gb": 1.0
+        }))
+
+    def test_actual_batch_preserves_wrapper_runtime_breakdown(self):
+        class Encoder:
+            codec_name = "sparsepcgc"
+
+            def encode_bits(self, pts):
+                return {
+                    "bit": 80.0,
+                    "bpp": 20.0,
+                    "bpn": 8.0,
+                    "single": 2.0,
+                    "node": 10.0,
+                    "point_count": int(pts.shape[-1]),
+                    "encode_time": 4.0,
+                    "sparsepcgc_input_prepare_time": 0.1,
+                    "sparsepcgc_ply_write_time": 0.2,
+                    "sparsepcgc_worker_roundtrip_time": 3.7,
+                }
+
+        class Fixture(CompressionLossMixin):
+            def _get_actual_encoder(self, _args):
+                return Encoder()
+
+            def _attach_octree_aux_stats(self, _args, _pts, stats):
+                return stats
+
+        result = Fixture()._encode_actual_batch(
+            SimpleNamespace(), torch.zeros((1, 3, 4))
+        )
+        self.assertEqual(result["bit"], 80.0)
+        self.assertEqual(result["sparsepcgc_input_prepare_time"], 0.1)
+        self.assertEqual(result["sparsepcgc_ply_write_time"], 0.2)
+        self.assertEqual(result["sparsepcgc_worker_roundtrip_time"], 3.7)
+
     def test_cpu_guidance_cache_does_not_retain_exact_manifest(self):
         """固定Tensor cacheへ巨大なframe別candidate manifestを保持しない。"""
         module = heuristic_guidance_module
@@ -1012,7 +1056,8 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
             "manifest_sha256": "fixture",
             "dataset": "8I",
             "scale_m": 8,
-            "total_ratio": 0.0025,
+            # UVGと同様、既定の8i学習bin外にある0.50% anchorを再生する。
+            "total_ratio": 0.005,
             "operation_shares": {"Add": 0.4, "Prune": 0.4, "Adjust": 0.2},
             "operation_heuristics": {},
             "operation_priority": ["Add", "Prune", "Adjust"],
@@ -1062,6 +1107,7 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         self.assertIsNotNone(result)
         final_coords, debug = result
         self.assertEqual(debug["selected_counts"], {"Add": 1, "Prune": 1, "Adjust": 1})
+        self.assertAlmostEqual(debug["amount_bin_ratio"], 0.005, places=9)
         self.assertEqual(_coord_hash(final_coords), _coord_hash(expected))
         expected_sorted = torch.unique(
             expected[0].transpose(0, 1), dim=0, sorted=True

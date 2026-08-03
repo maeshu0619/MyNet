@@ -24,8 +24,8 @@ method_name = "Mine"
 model_name = "best_loss_joint"
 
 # dataname = "8i"
-dataname = "MVUB"
-# dataname = "UVG"
+# dataname = "MVUB"
+dataname = "UVG"
 
 dataset_name = "longdress"
 # dataset_name = "loot"
@@ -2699,6 +2699,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--sparsepcgc_actual_result_cache', default=True, type=str2bool, help='同一Voxel集合・同一codec設定のactual結果をprocess内LRU cacheで再利用するか')
     parser.add_argument('--sparsepcgc_actual_result_cache_max_entries', default=256, type=int, help='SparsePCGC actual結果LRU cacheの最大件数')
     parser.add_argument('--sparsepcgc_omp_threads', default=12, type=int, help='SparsePCGC workerのOMP thread数')
+    parser.add_argument('--sparsepcgc_worker_cpu_trim_interval', default=16, type=int, help='永続workerの解放済みCPU領域をOSへ返すrequest間隔（0で無効）')
     parser.add_argument('--sparsepcgc_actual_gt_disk_cache', default=True, type=str2bool, help='静的GTの実SparsePCGC統計をcodec条件付きで永続cacheするか')
     parser.add_argument('--sparsepcgc_actual_gt_disk_cache_dir', default=str((_DATA_ROOT / 'cache' / 'sparsepcgc_actual_gt').resolve()), type=str, help='実SparsePCGC GT統計の永続cache先')
     parser.add_argument('--sparsepcgc_actual_oracle_release_cuda_cache', default=False, type=str2bool, help='actual oracle直前にmyNet側の未使用CUDA予約領域を解放するか（同期コストが大きいため既定False）')
@@ -8199,6 +8200,12 @@ def parse_pugan_args(parser, file_day, file_time):
             args.heuristic_guidance_require_exact_single_plan_teacher = True
             args.heuristic_guidance_auto_build_exact_single_plan_teacher = True
             args.heuristic_guidance_teacher_bootstrap_steps = 0
+            # 未知frameではden6 Pool生成workerもSparsePCGCモデルを使う。
+            # Actual workerを先に常駐させると初回cache生成中だけGPU上に2モデルが
+            # 同居するため、online modeの既定はActual workerを最初のencode時に
+            # 遅延起動する。明示CLI指定は尊重し、計算内容とActual回数は変えない。
+            if not _cli_option_was_provided("--sparsepcgc_warmup_worker_before_train"):
+                args.sparsepcgc_warmup_worker_before_train = False
             # 旧設定の3000/150/25倍は1更新でAmount headを飽和させ、Step 2で
             # 3操作すべてが上限へ飛ぶ。one-plan policyでは実Actualを毎Step得るため、
             # 人工的な下流勾配増幅は不要である。

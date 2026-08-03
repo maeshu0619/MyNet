@@ -47,6 +47,17 @@ def _jsonable(value: Any) -> Any:
 def _debug(message: str) -> None:
     print(f"[SparsePCGCWorker] {message}", file=sys.stderr, flush=True)
 
+
+def _encoder_reported_cuda_cleanup(result: Any) -> bool:
+    return bool(
+        isinstance(result, Mapping)
+        and any(
+            str(key).startswith("cuda_after_cleanup_")
+            for key in result.keys()
+        )
+    )
+
+
 def _collect_cuda_stats(prefix: str = "sparsepcgc_worker") -> dict[str, Any]:
     """
     SparsePCGC workerプロセス側のCUDA使用量を数値dictで返す。
@@ -308,16 +319,18 @@ def main() -> int:
                     exact_teacher_fallback_reason=str(request.get("exact_teacher_fallback_reason", "")),
                 )
 
-            # The encoder model remains resident for the next request, but its
-            # convolution workspaces do not.  Return only those unused blocks
-            # before the main process starts backward; values and model state
-            # are unchanged and worker startup is still paid only once.
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except Exception:
-                pass
+            # 現行encoder_multipleはencode_one内部の_run_tracked終了時に
+            # CUDA workspaceを既に解放し、その事実をcuda_after_cleanupで返す。
+            # 同じempty_cacheをwrapperでも連続実行すると毎Step同期だけが重複する。
+            # 古いencoder_multiple互換時だけwrapper側で解放する。
+            internal_cuda_cleanup = _encoder_reported_cuda_cleanup(result)
+            if not internal_cuda_cleanup:
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
 
             gpu_after = {}
             if bool(args.gpu_stats):
@@ -325,6 +338,9 @@ def main() -> int:
 
             if not isinstance(result, dict):
                 result = {"sparsepcgc_worker_raw_result": result}
+            result["sparsepcgc_worker_internal_cuda_cleanup"] = bool(
+                internal_cuda_cleanup
+            )
 
             result["sparsepcgc_scale_m"] = int(args.scale_m)
             result["sparsepcgc_scale_ae"] = int(args.scale_ae)
@@ -336,10 +352,6 @@ def main() -> int:
             cpu_trimmed = bool(
                 trim_interval > 0 and completed_requests % trim_interval == 0
             )
-            if cpu_trimmed:
-                gc.collect()
-                if _LIBC_MALLOC_TRIM is not None:
-                    _LIBC_MALLOC_TRIM(0)
             result["sparsepcgc_worker_cpu_trimmed"] = cpu_trimmed
 
             if bool(args.gpu_stats):
@@ -388,6 +400,12 @@ def main() -> int:
                     )
 
             _emit({"status": "ok", "request_id": request_id, "result": result})
+            # response受信後のmain processはbackwardへ進めるため、CPU heapの
+            # trimは応答後に行い、次requestまでの空き時間へ隠す。
+            if cpu_trimmed:
+                gc.collect()
+                if _LIBC_MALLOC_TRIM is not None:
+                    _LIBC_MALLOC_TRIM(0)
             if bool(request.get("exit_after_response", False)):
                 return 0
         except Exception as exc:

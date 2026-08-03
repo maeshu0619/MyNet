@@ -782,6 +782,18 @@ class CompressionLossMixin:
         total_octree_single = sum(float(s.get("octree_single", s.get("single", 0.0))) for s in stats_list)
         total_octree_node = sum(float(s.get("octree_node", s.get("node", 0.0))) for s in stats_list)
         total_encode_time = sum(float(s.get("encode_time", 0.0)) for s in stats_list)
+        total_input_prepare_time = sum(
+            float(s.get("sparsepcgc_input_prepare_time", 0.0))
+            for s in stats_list
+        )
+        total_ply_write_time = sum(
+            float(s.get("sparsepcgc_ply_write_time", 0.0))
+            for s in stats_list
+        )
+        total_worker_roundtrip_time = sum(
+            float(s.get("sparsepcgc_worker_roundtrip_time", 0.0))
+            for s in stats_list
+        )
         total_unique_coord = sum(int(s.get("unique_coord_count", s.get("point_count", 0))) for s in stats_list)
         max_octree_depth = max((int(s.get("octree_depth", 0)) for s in stats_list), default=0)
         total_leaf = sum(int(s.get("octree_leaf_count", s.get("point_count", 0))) for s in stats_list)
@@ -928,6 +940,9 @@ class CompressionLossMixin:
                 (int(s.get("sparsepcgc_actual_result_cache_hit_count", 0)) for s in stats_list),
                 default=0,
             ),
+            "sparsepcgc_input_prepare_time": float(total_input_prepare_time),
+            "sparsepcgc_ply_write_time": float(total_ply_write_time),
+            "sparsepcgc_worker_roundtrip_time": float(total_worker_roundtrip_time),
             "per_batch": stats_list,
         }
         if exact_enabled:
