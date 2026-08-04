@@ -213,6 +213,83 @@ def _compact_online_shortlist(
     return [dict(item) for item in pool if str(item.get("candidate_id", "")) in keep_ids]
 
 
+def _baseline_codec_rate_only(
+    base: ModuleType,
+    coder: Any,
+    input_file: Path,
+    setting: Any,
+    args: argparse.Namespace,
+    root: Path,
+) -> dict[str, Any]:
+    """候補順位に必要なexact bitだけを取得し、未使用のD1/D2診断を省く。"""
+    start = time.time()
+    file_tag = base._safe_name(input_file)
+    setting_dir = base._ensure_dir(
+        root / "baseline_codec_outputs" / str(setting.setting_id) / file_tag
+    )
+    bin_path = setting_dir / f"{file_tag}.bin"
+    decoded_path = setting_dir / f"{file_tag}_dec.ply"
+    row: dict[str, Any] = {
+        "status": "ok",
+        "input_file": str(input_file),
+        "decoded_file": str(decoded_path),
+        "main_bin_file": str(bin_path),
+        "setting_id": str(setting.setting_id),
+        "scale_ae": int(setting.scale_ae),
+        "scale_sr": int(setting.scale_sr),
+        "scale_m": int(setting.scale_m),
+    }
+    try:
+        # test_psnr=FalseでもSparsePCGCのencode/decodeとdecoder-complete bitは
+        # 同一である。候補生成が参照しないpc_error二重実行だけを省略する。
+        raw = coder.test(
+            str(input_file),
+            str(bin_path),
+            str(decoded_path),
+            voxel_size=1.0,
+            posQuantscale=1,
+            scale_AE=int(setting.scale_ae),
+            scale_SR=int(setting.scale_sr),
+            psnr_resolution=int(setting.psnr_resolution),
+            test_psnr=False,
+        )
+        normalized = base._normalize_coder_result(
+            raw if isinstance(raw, Mapping) else {}
+        )
+        row.update(normalized)
+        logical_bits = float(row.get("decoder_complete_bits", float("nan")))
+        main_bits = (
+            float(bin_path.stat().st_size * 8)
+            if bin_path.exists()
+            else float("nan")
+        )
+        if not math.isfinite(logical_bits) or logical_bits <= 0.0:
+            raise RuntimeError(
+                f"baseline decoder-complete bitが不正である: {logical_bits}"
+            )
+        row["main_bin_bits"] = main_bits if math.isfinite(main_bits) else ""
+        row["side_information_bits"] = (
+            max(logical_bits - main_bits, 0.0)
+            if math.isfinite(main_bits)
+            else ""
+        )
+        row["rate_definition"] = (
+            "decoder_complete_logical_bits_from_LossyCoderDense.test"
+        )
+        row["formal_metric_status"] = "skipped_for_online_plan_generation"
+        row["formal_D1_PSNR"] = ""
+        row["formal_D2_PSNR"] = ""
+    except Exception as exc:
+        row.update({
+            "status": "error",
+            "error_message": f"{type(exc).__name__}:{exc}",
+        })
+    row["elapsed_sec"] = round(time.time() - start, 6)
+    if row.get("status") != "ok":
+        raise RuntimeError("baseline codec失敗: " + str(row.get("error_message")))
+    return row
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="ana_den6 online candidate cache worker")
     parser.add_argument("--sparsepcgc-root", required=True)
@@ -239,6 +316,11 @@ def main() -> int:
     )
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--cpu", action="store_true")
+    parser.add_argument(
+        "--baseline-formal-metrics",
+        action="store_true",
+        help="候補生成には不要なbaseline D1/D2診断も実行する",
+    )
     cli = parser.parse_args()
 
     sparse_root = Path(cli.sparsepcgc_root).expanduser().resolve()
@@ -335,9 +417,16 @@ def main() -> int:
     coder = codec_base._load_dense_coder(args, device)
     try:
         raw_count, unique_count, _, _ = den5._count_raw_and_unique_voxels(codec_base, input_file)
-        baseline_codec = engine._baseline_codec(
-            codec_base, coder, input_file, setting, args, output_root
-        )
+        if bool(cli.baseline_formal_metrics):
+            baseline_codec = engine._baseline_codec(
+                codec_base, coder, input_file, setting, args, output_root
+            )
+            baseline_probe_mode = "formal_metrics"
+        else:
+            baseline_codec = _baseline_codec_rate_only(
+                codec_base, coder, input_file, setting, args, output_root
+            )
+            baseline_probe_mode = "rate_only_exact_bits"
         codec_base._cleanup()
         baseline_probe = engine._probe_state(
             codec_base,
@@ -554,6 +643,7 @@ def main() -> int:
         )
         # 順位はden6._prepare_operation_poolsが返した順序をそのまま保持する。
         full_serialized_pools: dict[str, list[dict[str, Any]]] = {}
+        pool_ids_by_operation: dict[str, set[str]] = {}
         for operation in OPERATIONS:
             pool = list(pools.get(operation, ()))[:per_operation_limits[operation]]
             full_serialized_pools[operation] = [
@@ -567,6 +657,10 @@ def main() -> int:
                 )
                 for rank, candidate in enumerate(pool)
             ]
+            pool_ids_by_operation[operation] = {
+                str(item.get("candidate_id", ""))
+                for item in full_serialized_pools[operation]
+            }
             pools[operation] = pool
             if not pool:
                 raise RuntimeError(f"ana_den6 online候補poolが空である: {operation}")
@@ -603,13 +697,7 @@ def main() -> int:
         serialized_pools = {
             operation: _compact_online_shortlist(
                 full_serialized_pools[operation],
-                {
-                    candidate_id
-                    for candidate_id in selected_ids
-                    if candidate_id in {
-                        str(item.get("candidate_id", "")) for item in full_serialized_pools[operation]
-                    }
-                },
+                selected_ids.intersection(pool_ids_by_operation[operation]),
                 shortlist_limits[operation],
             )
             for operation in OPERATIONS
@@ -647,6 +735,7 @@ def main() -> int:
             "baseline_decoder_complete_bits": float(
                 baseline_codec.get("decoder_complete_bits", baseline_codec.get("bit", 0.0))
             ),
+            "baseline_probe_mode": baseline_probe_mode,
             "den6_path": str(den6_path),
             "den6_sha256": _sha256_file(den6_path),
             "den5_path": str(den5_path),

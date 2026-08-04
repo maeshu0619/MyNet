@@ -260,6 +260,32 @@ def _prepare_test2_cold_pool_step(args, step):
     return step_root
 
 
+def _acquire_test2_codec_gpu_lock(writer, step):
+    """複数test2のden6/Actual workerが同じGPUへ同時常駐するのを防ぐ。"""
+    import fcntl
+
+    lock_path = Path("/tmp/mynet_test2_sparsepcgc_gpu.lock")
+    handle = lock_path.open("a+")
+    wait_start = time.perf_counter()
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    wait_time = time.perf_counter() - wait_start
+    writer.write(
+        f"Test2CodecGpuLock: step={int(step) + 1}, wait={wait_time:.6f}s"
+    )
+    return handle
+
+
+def _release_test2_codec_gpu_lock(handle):
+    if handle is None:
+        return
+    import fcntl
+
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
+
+
 def _output_point_path(args, step, input_path):
     output_dir = Path(os.path.abspath(os.path.expanduser(args.save_ply_dir)))
     # encoder2decoder.py が同じframe番号のGTへ確実に対応付けられる名前にする。
@@ -670,11 +696,8 @@ def test(model, args, writer):
 
     use_amp = bool(use_cuda and getattr(args, "use_amp", False))
     amp_dtype = torch.float16
-    actual_encoder = (
-        build_actual_encoder(args, writer=writer)
-        if bool(getattr(args, "test2_verify_actual", True))
-        else None
-    )
+    verify_actual = bool(getattr(args, "test2_verify_actual", True))
+    actual_encoder = None
     rows = []
     verification_entries = []
     total_start = time.perf_counter()
@@ -687,6 +710,13 @@ def test(model, args, writer):
         for step, pts in enumerate(loader):
             if max_samples > 0 and len(rows) >= max_samples:
                 break
+
+            # 前Stepのpersistent Actual workerを残したままden6 workerを起動すると、
+            # 複数ターミナル実行時にGPUメモリが重なりworkerが強制終了し得る。
+            if actual_encoder is not None and hasattr(actual_encoder, "close"):
+                actual_encoder.close()
+                actual_encoder = None
+            codec_gpu_lock = _acquire_test2_codec_gpu_lock(writer, step)
 
             total_files = len(dataset)
             if max_samples > 0:
@@ -969,6 +999,8 @@ def test(model, args, writer):
             edited_actual_bits = float("nan")
             actual_compression_loss_percent = float("nan")
             actual_codec_time = 0.0
+            if verify_actual and actual_encoder is None:
+                actual_encoder = build_actual_encoder(args, writer=writer)
             if actual_encoder is not None:
                 actual_start = time.perf_counter()
                 gt_stats = dict(actual_encoder.encode_bits(input_pcd[0, :3].float()))
@@ -1107,6 +1139,8 @@ def test(model, args, writer):
             if raw_points != input_points:
                 writer.write(f"InputDownsample: {raw_points} -> {input_points}")
 
+            _release_test2_codec_gpu_lock(codec_gpu_lock)
+            codec_gpu_lock = None
             fetch_start = time.perf_counter()
 
     _write_summary(rows, writer)

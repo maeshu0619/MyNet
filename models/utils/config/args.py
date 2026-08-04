@@ -13,8 +13,13 @@ pretrained_time = ""
 surrogate_date = "20260729"
 surrogate_time = "001750"
 
-model_date = "20260729"
-model_time = "001750"
+# model_date = "20260729"
+# model_time = "001750"
+# model_date = "20260731"
+# model_time = "023726"
+model_date = "20260801"
+model_time = "072958"
+
 
 # method_com = "OctAttention"
 method_com = "SparsePCGC"
@@ -246,7 +251,13 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--print_actuator_hard_soft_compare', action='store_true', help='Actuatorのhard/soft出力の統計を取る比較モード')
     parser.add_argument('--print_rate', default=1, type=int, help='ログ出力頻度（1なら毎ステップ、0なら最初と最後のみ）')
     parser.add_argument('--dataname', default=dataname, type=str, help='データセットの名称')
-    parser.add_argument('--dataset_name', default=dataset_name, type=str, help='データセット内シーケンスの名称')
+    parser.add_argument(
+        '--dataset_name', '--datasetname',
+        dest='dataset_name',
+        default=dataset_name,
+        type=str,
+        help='データセット内シーケンスの名称',
+    )
     parser.add_argument(
         '--train_8i_sequence_mode',
         default='all4',
@@ -3742,7 +3753,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--output_dir', default=None, type=str, help='test.py用alias: 編集後点群保存先。指定時は--save_ply_dirを上書き')
     parser.add_argument('--max_test_samples', default=0, type=int, help='test.pyで処理する最大sample数。0以下なら全件')
     parser.add_argument('--input_dir_test', default=str(_data_subset_dir("ground")), type=str, help='テスト用入力点群のパス')
-    parser.add_argument('--max_files_test', default=5, type=int, help='テスト時に読み込む最大ファイル数')
+    parser.add_argument('--max_files_test', default=10, type=int, help='テスト時に読み込む最大ファイル数')
     parser.add_argument('--save_ply_dir', default=str(_data_subset_dir("test", dataname, dataset_name)), type=str, help='出力点群の保存先')
     parser.add_argument('--codec_eval_dir', default=str(_data_subset_dir("test")), type=str, help='encoder2decoder.py 系が参照する評価用PLYの同期先')
     parser.add_argument('--test_compute_loss', default=True, type=str2bool, help='test.pyで幾何・圧縮統計をログ出力するか')

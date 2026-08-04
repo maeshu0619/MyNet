@@ -712,6 +712,12 @@ def _load_exact_single_plan_teacher(
             finally:
                 setattr(args, "_ana_den6_online_fresh_build_load", False)
                 setattr(args, "heuristic_guidance_auto_build_exact_single_plan_teacher", True)
+        setattr(args, "_ana_den6_online_last_build_error", {
+            "returncode": int(completed.returncode),
+            "output_json_exists": bool(output_json.is_file()),
+            "output_json": str(output_json),
+            "input_file": str(identity["input_file"]),
+        })
         _CACHE_STATS["exact_teacher_build_failed"] += 1
         setattr(args, "_ana_den6_online_cache_stats", dict(_CACHE_STATS))
     _CACHE_STATS["exact_teacher_missing"] += 1
@@ -760,9 +766,13 @@ def attach_ana_den6_online_guidance(
     payload = _load_exact_single_plan_teacher(args, identity) if identity is not None else None
     if payload is None:
         if bool(getattr(args, "heuristic_guidance_require_exact_single_plan_teacher", True)):
+            build_error = dict(
+                getattr(args, "_ana_den6_online_last_build_error", {}) or {}
+            )
             raise RuntimeError(
                 "ana_den6 Exact cacheが見つからない。proxy/全Voxel分類へfallbackせず、"
-                "初回だけden6 workerでcacheを構築すること"
+                "初回だけden6 workerでcacheを構築すること。"
+                f" worker_error={build_error}"
             )
         payload = _load_or_build_payload(context, args)
     timing_end = time.perf_counter()
