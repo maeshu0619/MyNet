@@ -2,9 +2,6 @@ import math
 
 from .scalar_utils import case_float
 
-def is_actual_training_backend(args):
-    backend = str(getattr(args, "compression_loss_backend", "proxy")).strip().lower()
-    return backend.endswith("_surrogate") or "_actual" in backend
 
 
 def is_fresh_actual(args, comp_debug):

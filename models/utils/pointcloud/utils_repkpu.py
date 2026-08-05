@@ -125,34 +125,9 @@ def _raise_if_slow_knn_fallback(op_name):
             f"{POINTOPS_IMPORT_ERROR}"
         )
 
-def print_gpu_mem(tag):
-    allocated = torch.cuda.memory_allocated() / 1024**2
-    reserved  = torch.cuda.memory_reserved() / 1024**2
-    print(f"[{tag}] allocated={allocated:.1f}MB reserved={reserved:.1f}MB")
 
-def print_mem(tag):
-    if psutil is None:
-        return
-    p = psutil.Process(os.getpid())
-    print(f"[MEM] {tag}: {p.memory_info().rss / 1024**3:.2f} GB")
 
-def print_cuda_mem(tag):
-    if not torch.cuda.is_available():
-        return
-    alloc = torch.cuda.memory_allocated() / 1024**3
-    reserved = torch.cuda.memory_reserved() / 1024**3
-    max_alloc = torch.cuda.max_memory_allocated() / 1024**3
-    print(f"[CUDA] {tag}: alloc={alloc:.2f}GB reserved={reserved:.2f}GB max={max_alloc:.2f}GB")
 
-def mem(tag):
-    if not torch.cuda.is_available():
-        return
-    p = psutil.Process(os.getpid())
-    
-    alloc = torch.cuda.memory_allocated() / 1024**3
-    reserved = torch.cuda.memory_reserved() / 1024**3
-    max_alloc = torch.cuda.max_memory_allocated() / 1024**3
-    print(f"{tag:<24}| CPU: {p.memory_info().rss / 1024**3:.2f} GB, GPU: alloc={alloc:.2f}GB")
 
 
 def set_seed(seed, deterministic=False):
@@ -196,21 +171,6 @@ def index_points(pts, idx, chunk=262144):
 
     return res
 
-def chamfer_sqrt(p1, p2):
-    """
-    Chamfer距離（CD）の平均を計算する
-    """
-    if chamfer_dist is None:
-        dist = torch.cdist(p1, p2).pow(2)
-        d1 = dist.min(dim=2).values
-        d2 = dist.min(dim=1).values
-    else:
-        d1, d2, _, _ = chamfer_dist(p1, p2)
-    d1 = torch.clamp(d1, min=1e-9)
-    d2 = torch.clamp(d2, min=1e-9)
-    d1 = torch.mean(torch.sqrt(d1))
-    d2 = torch.mean(torch.sqrt(d2))
-    return (d1 + d2) / 2
 
 
 def FPS(pts, fps_pts_num):
@@ -375,54 +335,7 @@ def normalize_point_cloud(input, centroid=None, furthest_distance=None):
     return input, centroid, furthest_distance
 
 
-def add_noise(pts, sigma, clamp):
-    """
-    ノイズ付与
-    """
-    # input: (b, 3, n)
 
-    assert (clamp > 0)
-    jittered_data = torch.clamp(sigma * torch.randn_like(pts), -1 * clamp, clamp).cuda()
-    jittered_data += pts
-
-    return jittered_data
-
-def extract_knn_patch(k, pts, center_pts, return_idx=False):
-    # (b, 3, n) → (n, 3)
-    pts_trans = rearrange(pts.squeeze(0), 'c n -> n c').contiguous()
-    center_pts_trans = rearrange(center_pts.squeeze(0), 'c m -> m c').contiguous()
-    if NearestNeighbors is None:
-        dist = torch.cdist(center_pts_trans.unsqueeze(0), pts_trans.unsqueeze(0)).squeeze(0)
-        knn_idx_t = torch.topk(dist, k=k_eff, largest=False, dim=-1).indices.long()
-        patches = pts_trans.index_select(0, knn_idx_t.reshape(-1)).view(knn_idx_t.shape[0], k_eff, pts_trans.shape[1])
-        patches = rearrange(patches, 'm k c -> m c k').contiguous()
-        if return_idx:
-            return patches, knn_idx_t
-        return patches
-
-    pts_np = pts_trans.detach().cpu().numpy()
-    center_pts_np = center_pts_trans.detach().cpu().numpy()
-
-    n_points = int(pts_np.shape[0])
-    if n_points <= 0:
-        raise ValueError("extract_knn_patch received an empty point set")
-    k_eff = int(min(max(int(k), 1), n_points))
-
-    knn_search = NearestNeighbors(n_neighbors=k_eff, algorithm='auto')
-    knn_search.fit(pts_np)
-
-    # (m, k)
-    knn_idx = knn_search.kneighbors(center_pts_np, return_distance=False)
-
-    # (m, k, 3)
-    patches = np.take(pts_np, knn_idx, axis=0)
-    patches = torch.from_numpy(patches).float().cuda()
-    patches = rearrange(patches, 'm k c -> m c k').contiguous()
-
-    if return_idx:
-        return patches, torch.from_numpy(knn_idx).long().cuda()
-    else:
-        return patches
         
 # def extract_knn_patch(k, pts, center_pts):
 #     """
@@ -448,30 +361,3 @@ def extract_knn_patch(k, pts, center_pts, return_idx=False):
 #     patches = rearrange(patches, 'm k c -> m c k').contiguous()
 
 #     return patches
-
-
-def get_logger(name, log_dir):
-    logger = logging.getLogger(name)
-    logger.setLevel(logging.DEBUG)
-    formatter = logging.Formatter('[%(asctime)s::%(name)s::%(levelname)s] %(message)s')
-    # output to console
-    stream_handler = logging.StreamHandler()
-    stream_handler.setLevel(logging.DEBUG)
-    stream_handler.setFormatter(formatter)
-    logger.addHandler(stream_handler)
-    # output to log file
-    log_name = name + '_log.txt'
-    file_handler = logging.FileHandler(os.path.join(log_dir, log_name))
-    file_handler.setLevel(logging.INFO)
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
-
-    return logger
-
-def reset_model_args(train_args, model_args):
-    for arg in vars(train_args):
-        setattr(model_args, arg, getattr(train_args, arg))
-
-def get_cd_loss(args, coarse_pts, gt_pts):
-    loss_cd = chamfer_sqrt(coarse_pts.permute(0,2,1).contiguous(), gt_pts.permute(0,2,1).contiguous()) * 1e3
-    return loss_cd

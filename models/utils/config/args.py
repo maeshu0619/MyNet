@@ -123,22 +123,6 @@ def _default_checkpoint_path() -> str:
 
     return str(sparsepcgc_case_preferred.resolve())
 
-def _more_training_checkpoint_path(
-    date_value: str,
-    time_value: str,
-    method_value: str = method_com,
-    model_stem: str = model_name,
-) -> str:
-    # more_training=True のときに、追加学習の初期値として読み込むモデルパスを作る
-    path = (
-        _LOG_ROOT
-        / str(date_value)
-        / "MyNetwork_train"
-        / "pretrained"
-        / f"{time_value}_{method_value}"
-        / f"{model_stem}.pth"
-    )
-    return str(path.resolve())
 
 
 def _resolve_repo_or_cwd_path(raw_path: str) -> str:
@@ -286,12 +270,6 @@ def parse_pugan_args(parser, file_day, file_time):
         help='SparsePCGC exact candidateが無効なstepで使うfallback teacherの重み',
     )
     parser.add_argument(
-        '--sparsepcgc_exact_require_valid_candidate',
-        default=True,
-        type=str2bool,
-        help='SparsePCGC exact teacherをvalid扱いする条件としてcandidate_count>0かつfinite値を要求する',
-    )
-    parser.add_argument(
         '--repair_operation_amount_logit_weight',
         default=0.0,
         type=float,
@@ -375,9 +353,7 @@ def parse_pugan_args(parser, file_day, file_time):
     # Encoder, FP Module
     parser.add_argument('--encoder_dim', default=64, type=int, help='各dense blockにおける特徴次元数（入力/出力）')
     parser.add_argument('--out_dim', default=64, type=int, help='各dense blockにおける特徴次元数（入力/出力）')
-    parser.add_argument('--local_feat_dim', default=192, type=int, help='局所幾何特徴の次元（Analyzer用）')
     parser.add_argument('--fused_feat_dim', default=64, type=int, help='Encoderで統合された特徴の次元')
-    parser.add_argument('--fp_mlp_channels', nargs='+', type=int, default=[128, 64], help='Feature PropagationのMLPの隠れ層チャネル数')
     parser.add_argument('--encoder_pre_downsample', default=True, type=str2bool, help='Encoder入力の前だけcoarse化するか')
     parser.add_argument('--encoder_pre_downsample_mode', default='voxel', type=str, help='Encoder前downsample方法(voxel)')
     parser.add_argument('--encoder_sparse_tensor', default=True, type=str2bool, help='入力点群を点数維持のSparse Tensor表現(量子化座標+occupancy feature)へ変換するか')
@@ -1966,12 +1942,6 @@ def parse_pugan_args(parser, file_day, file_time):
         help='決定的なfull-cloud structured prune変換のblock size/ratio指定bit下限',
     )
     parser.add_argument(
-        '--sparsepcgc_actual_oracle_min_improve_percent',
-        default=0.0,
-        type=float,
-        help='actual oracle候補を採択する最小改善率。0ならactual bitが少しでも下がった候補だけ採択',
-    )
-    parser.add_argument(
         '--sparsepcgc_actual_oracle_actual_eval_max',
         default=8,
         type=int,
@@ -2140,12 +2110,6 @@ def parse_pugan_args(parser, file_day, file_time):
         help='高速診断teacherが1 subtreeでAdd教師にする最大voxel数',
     )
     parser.add_argument(
-        '--sparsepcgc_actual_oracle_log',
-        default=True,
-        type=str2bool,
-        help='actual oracle候補探索の結果をstep logへ出す',
-    )
-    parser.add_argument(
         '--sparsepcgc_actual_oracle_fast_fallback_after_reject',
         default=False,
         type=str2bool,
@@ -2158,50 +2122,18 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--encoder_feature_propagation', default='knn_inverse_distance', type=str, help='coarse encoder特徴のfull点群への戻し方')
     parser.add_argument('--encoder_feature_propagation_k', default=3, type=int, help='coarse encoder特徴伝播のkNN数')
     # Pruning Module
-    parser.add_argument('--prune_hidden_dim', default=64, type=int, help='Pruning用MLPの隠れ層次元')
-    parser.add_argument('--prune_d_high_is_inlier', default=True, type=str2bool, help='dスコアが高いほどインライアとみなすか')
-    parser.add_argument('--prune_robust_c', default=2.0, type=float, help='ロバスト重みのパラメータ')
-    parser.add_argument('--prune_ratio_min', default=0.85, type=float, help='保持割合の最小値')
-    parser.add_argument('--prune_ratio_max', default=0.995, type=float, help='保持割合の最大値')
-    parser.add_argument('--prune_use_label_count', default=True, type=str2bool, help='外れ点ラベルの数をPruningの保持点数教師として使うか')
     # Adding Module
-    parser.add_argument('--add_hidden_dim', default=64, type=int, help='Add ModuleのMLP隠れ層次元')
-    parser.add_argument('--add_fit_ref_max', default=4096, type=int, help='フィッティング損失計算で参照する最大点数')
-    parser.add_argument('--add_attr', default=True, type=str2bool, help='追加点に色情報を付与するか')
-    parser.add_argument('--add_color', default='Red', type=str, help='追加点の色')
-    parser.add_argument('--add_th', default=0.5, type=float, help='追加判定のしきい値')
     parser.add_argument('--target_add_ratio', default=0.0, type=float, help='目標とする追加割合')
     parser.add_argument('--max_add_ratio', default=0.30, type=float, help='追加割合の最大値')
-    parser.add_argument('--add_oct_weight', default=1.0, type=float, help='Octreeグリッドへのスナップの重み')
-    parser.add_argument('--lambda_sparse', default=1e-3, type=float, help='スパース性の正則化係数')
     # Displacement Module
-    parser.add_argument('--disp_hidden_dim', default=64, type=int, help='Displacement用MLPの隠れ層次元')
     parser.add_argument('--max_disp_offset', default=0.002, type=float, help='最大移動距離（メートル）')
-    parser.add_argument('--disp_num_blocks',default=4,type=int,help='残差ブロックの数')
-    parser.add_argument('--disp_num_steps',default=1,type=int,help='反復更新回数')
-    parser.add_argument('--disp_step_size',default=1.0,type=float,help='移動更新のステップサイズ')
-    parser.add_argument('--disp_step_decay',default=0.95,type=float,help='ステップサイズの減衰率')
-    parser.add_argument('--disp_grad_clip',default=10.0,type=float,help='勾配クリッピング値')
     parser.add_argument('--target_disp_ratio', default=0.25, type=float, help='移動する点の目標割合')
-    parser.add_argument('--disp_use_gate',default=True,type=str2bool,help='ゲーティング機構を使うか')
-    parser.add_argument('--disp_reg_weight', default=1e-4, type=float, help='移動量の正則化係数')
-    parser.add_argument('--disp_ratio_weight', default=1e-4, type=float, help='移動割合の正則化係数')
-    parser.add_argument('--disp_occ_weight', default=1e-4, type=float, help='新規Octree voxelを作る変位へのペナルティ係数')
     parser.add_argument('--disp_snap_strength', default=0.35, type=float, help='Octreeグリッドへのスナップ強度')
-    parser.add_argument('--disp_use_grid_feat', default=True, type=str2bool, help='Octree量子化位相特徴をDisplacementに入力するか')
-    parser.add_argument('--disp_guard_new_voxels', default=True, type=str2bool, help='既存occupied voxel以外へ移動する変位を禁止するか')
-    parser.add_argument('--disp_mag_bias', default=-1.0, type=float, help='移動量の初期バイアス')
-    parser.add_argument('--disp_gate_bias', default=0.0, type=float, help='ゲートの初期バイアス')
-    parser.add_argument('--disp_soft_match_tau', default=0.05, type=float, help='soft top-kの温度パラメータ')
 
 
     # Analyzer
-    parser.add_argument('--octree_qlevel', type=int, default=12,help='Octree量子化レベル')
     parser.add_argument('--octree_ctx_level', type=int, default=5,help='Octreeコンテキストの深さ')
     parser.add_argument('--octree_ctx_dim', type=int, default=8,help='Octreeコンテキスト特徴次元')
-    parser.add_argument('--outlier_label_th_scale', default=4.0, type=float, help='外れ値判定のしきい値スケール（MAD基準）')
-    parser.add_argument('--outlier_label_min_ratio', default=0.03, type=float, help='外れ値割合の最小値')
-    parser.add_argument('--outlier_label_max_ratio', default=0.15, type=float, help='外れ値割合の最大値')
     # Cause-decomposed octree structure repair network
     parser.add_argument('--structure_hidden_dim', default=96, type=int, help='原因分解・修復ポリシーMLPの隠れ次元')
     parser.add_argument('--repair_actuator_hidden_dim', default=64, type=int, help='構造修復アクチュエータの隠れ次元')
@@ -2361,7 +2293,6 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--full_context_subtree_loss_weight', default=0.2, type=float, help='full-context subtree delta lossの重み')
     parser.add_argument('--full_context_subtree_loss_grad_weight', default=0.1, type=float, help='full-context subtree delta lossのproxy勾配重み')
     parser.add_argument('--full_context_subtree_loss_require_context', default=True, type=str2bool, help='subtree_tree/full_octree_contextがない場合はfull-context subtree lossを無効化する')
-    parser.add_argument('--full_context_subtree_loss_log', default=False, type=str2bool, help='full-context subtree delta lossのdebugログを出す。通常学習では既定False')
     parser.add_argument('--full_context_subtree_loss_node_weight', default=0.05, type=float, help='full-context subtree loss内のnode count差分重み')
     parser.add_argument('--full_context_subtree_loss_single_weight', default=0.10, type=float, help='full-context subtree loss内のsingle-child差分重み')
     parser.add_argument('--full_context_subtree_loss_entropy_weight', default=0.20, type=float, help='full-context subtree loss内のoccupancy entropy差分重み')
@@ -2377,7 +2308,6 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--full_context_subtree_soft_proxy_add_weight', default=0.5, type=float, help='full-context subtree soft proxy内のAdd抑制重み')
     parser.add_argument('--full_context_subtree_soft_proxy_drop_weight', default=0.0, type=float, help='full-context subtree soft proxy内のDrop抑制重み')
     parser.add_argument('--full_cloud_actual_correction', default=True, type=str2bool, help='periodic full cloud actualを使ってsubtree/proxy lossを補正する')
-    parser.add_argument('--full_cloud_actual_correction_weight', default=0.05, type=float, help='full cloud actual correctionをlossへ反映する重み')
     parser.add_argument('--cp_full_cloud_actual_correction_weight', default=0.05, type=float, help='compression_primary時にfull cloud actual correctionをlossへ反映する重み')
     parser.add_argument('--full_cloud_actual_correction_warmup_steps', default=0, type=int, help='full cloud actual correctionを有効化するまでのwarmup step')
     parser.add_argument('--full_cloud_actual_correction_ema', default=0.90, type=float, help='full cloud actual gapのEMA係数')
@@ -2538,7 +2468,6 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--out_path', default=str((_LOG_ROOT / file_day / "MyNetwork_train" / "pretrained" / file_time).resolve()), type=str, help='チェックポイント保存先')
     parser.add_argument('--log_root', default=str(_LOG_ROOT), type=str, help='学習・推論ログ保存ルート')
     parser.add_argument('--optim', default='adam', type=str, help='最適化手法（adamまたはsgd）')
-    parser.add_argument('--expansion', action='store_true', help='拡張データを使用するか')
     parser.add_argument('--gamma', default=0.5, type=float, help='学習率減衰の係数')
     parser.add_argument('--lr_decay_step', default=24, type=int, help='学習率を減衰させるステップ間隔')
     parser.add_argument('--lr_scheduler_enabled', default=False, type=str2bool, help='TrueならEpoch単位のStepLRを使う。SparsePCGCではLR崩壊防止のため既定でFalse')
@@ -2548,12 +2477,10 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--train_frames_per_sequence', default=90, type=int, help='各系列で訓練に使用する先頭フレーム数。残りは訓練窓から除外する')
     parser.add_argument('--episodes', default=128, type=int, help='学習エピソード数')
     parser.add_argument('--lr', default=1e-3, type=float, help='学習率')
-    parser.add_argument('--save_eval', default='loss', type=str, help='評価指標（lossまたはpsnr）')
     parser.add_argument('--deform', default=False, type=str2bool, help='変形モジュールをゆっくり学習するか')
     parser.add_argument('--loss_type', default='cd', type=str, help='幾何損失の種類')
     parser.add_argument('--method_name', default=method_name, type=str, help='ログ上の提案手法名')
     parser.add_argument('--run_name', default='', type=str, help='チェックポイント保存名。空なら <time>_<compress> を使う')
-    parser.add_argument('--geometry_audit_max_points', default=8192, type=int, help='geometry監査用にCDを計算する最大点数(0で無効)')
     parser.add_argument('--operation_count_drop_threshold', default=0.50, type=float, help='学習ログで削除点として数えるkeep確率のしきい値')
     parser.add_argument('--operation_count_adjust_threshold', default=1e-6, type=float, help='学習ログで調整点として数える最小移動距離')
 
@@ -2607,21 +2534,10 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--actual_total_bit_objective_mix', default=1.0, type=float, help='actual/surrogate backendでL_com直結と内訳合成を混ぜる比率。1.0なら実bit差分のみ')
     parser.add_argument('--com_sparsepcgc', default=0.0, type=float, help='SparsePCGC補助proxy項へ掛ける重み。主objectiveには既定で混ぜない')
     parser.add_argument('--com_lowprob', default=1, type=float, help='proxy backend で low-probability occupancy 項へ掛ける重み')
-    parser.add_argument('--com_ent',   default=2, type=float, help='旧 proxyOctreeCompression 経路のエントロピー項重み（現行構造修復lossでは未使用）')
-    parser.add_argument('--prun_cnt',   default=5, type=float, help='旧 Pruning loss の個数制御重み（現行構造修復lossでは未使用）')
-    parser.add_argument('--prun_out',   default=20*100, type=float, help='旧 Pruning loss の外れ値重み（現行構造修復lossでは未使用）')
-    parser.add_argument('--add_cnt',    default=5, type=float, help='旧 Add loss の個数制御重み（現行構造修復lossでは未使用）')
-    parser.add_argument('--add_fit',    default=4*100, type=float, help='旧 Add loss のフィッティング重み（現行構造修復lossでは未使用）')
-    parser.add_argument('--add_rep',    default=1*100, type=float, help='旧 Add loss の分散抑制重み（現行構造修復lossでは未使用）')
-    parser.add_argument('--disp_cnt',    default=5, type=float, help='旧 Displacement loss の個数制御重み（現行構造修復lossでは未使用）')
-    parser.add_argument('--disp_fit',    default=4*100, type=float, help='旧 Displacement loss のフィッティング重み（現行構造修復lossでは未使用）')
 
     parser.add_argument('--lambda_p',   default=10**-5, type=float, help='soft圧縮損失の係数')
     parser.add_argument('--discrete_loss_mode', default='ste_hard', type=str, help='離散学習のモード')
     parser.add_argument('--discrete_surrogate_weight', default=1.0, type=float, help='STE時の代理勾配の重み')
-    parser.add_argument('--discrete_policy_weight', default=1, type=float, help='ポリシー勾配の重み')
-    parser.add_argument('--discrete_policy_reward_clip', default=100.0, type=float, help='報酬のクリップ値（0で無効）')
-    parser.add_argument('--discrete_policy_baseline_momentum', default=0.95, type=float, help='ベースラインのEMA係数')
     parser.add_argument(
         '--compression_loss_delta',
         default=True,
@@ -2679,8 +2595,6 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--qs', type=int, default=2, help='量子化ステップサイズ')
 
     # Octree Compression
-    parser.add_argument('--max_gpu_mem_it', type=int, default=2**9, help='GPUメモリ制限に応じた反復回数')
-    parser.add_argument('--oa_subprocess', default=False, type=str2bool, help='サブプロセスで圧縮を行うか')
     parser.add_argument('--surrogate', default=False, type=str2bool, help='Trueなら明示的にcodec別Surrogate backendへ切り替える（SparsePCGCは既定でSurrogate backend）')
     parser.add_argument('--compression_loss_backend', default='sparsepcgc_surrogate', type=str, help='圧縮損失の計算方法。既定は毎StepのSparsePCGC実圧縮値を教師にSurrogateを更新し、実測値をforward、Surrogate勾配をbackwardへ使う')
     parser.add_argument('--compression_grad_probe', default=False, type=str2bool, help='圧縮損失から出力点群へ勾配が流れるか各stepで表示するか')
@@ -2713,7 +2627,6 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--sparsepcgc_worker_cpu_trim_interval', default=16, type=int, help='永続workerの解放済みCPU領域をOSへ返すrequest間隔（0で無効）')
     parser.add_argument('--sparsepcgc_actual_gt_disk_cache', default=True, type=str2bool, help='静的GTの実SparsePCGC統計をcodec条件付きで永続cacheするか')
     parser.add_argument('--sparsepcgc_actual_gt_disk_cache_dir', default=str((_DATA_ROOT / 'cache' / 'sparsepcgc_actual_gt').resolve()), type=str, help='実SparsePCGC GT統計の永続cache先')
-    parser.add_argument('--sparsepcgc_actual_oracle_release_cuda_cache', default=False, type=str2bool, help='actual oracle直前にmyNet側の未使用CUDA予約領域を解放するか（同期コストが大きいため既定False）')
     parser.add_argument(
         '--sparsepcgc_worker_gpu_stats',
         default=False,
@@ -2869,7 +2782,6 @@ def parse_pugan_args(parser, file_day, file_time):
         type=float,
         help='Shadow蒸留の動的balanceで許可する最大scale',
     )
-    parser.add_argument('--single_plan_feature_cache_enabled', default=False, type=str2bool)
     parser.add_argument(
         '--single_plan_shadow_distillation',
         default=True,
@@ -2897,16 +2809,6 @@ def parse_pugan_args(parser, file_day, file_time):
             'checkpointを、推論性能確認へ誤使用しない'
         ),
     )
-    parser.add_argument(
-        '--single_plan_teacher_datasets',
-        default=(
-            '/data/maejima/log/mynet_kproposal_offline/8i_actual_plans.json.gz,'
-            '/data/maejima/log/mynet_kproposal_offline/mvub_actual_plans.json.gz,'
-            '/data/maejima/log/mynet_kproposal_offline/uvg_actual_plans.json.gz'
-        ),
-        type=str,
-        help='訓練専用Exact Actual教師。推論では読まない。',
-    )
     parser.add_argument('--network_k_proposal_count', default=8, type=int)
     parser.add_argument('--network_k_proposal_hidden_dim', default=48, type=int)
     parser.add_argument('--network_k_proposal_shortlist_size', default=32768, type=int)
@@ -2931,7 +2833,6 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--network_k_critic_improvement_sign_weight', default=4.0, type=float)
     parser.add_argument('--network_k_critic_sign_scale', default=0.10, type=float)
     parser.add_argument('--network_k_critic_selection_temperature', default=0.10, type=float)
-    parser.add_argument('--network_k_unfreeze_local_trunk', default=False, type=str2bool)
     parser.add_argument('--network_k_unfreeze_upstream', default=False, type=str2bool)
     parser.add_argument('--network_k_debug_plan_hash', default=False, type=str2bool)
     parser.add_argument(
@@ -3101,13 +3002,6 @@ def parse_pugan_args(parser, file_day, file_time):
         default='',
         type=str,
         help='online worker用Pythonの絶対path。指定時はconda envより優先する',
-    )
-    parser.add_argument(
-        '--heuristic_guidance_online_worker_device',
-        default='cpu',
-        choices=['cpu', 'auto', 'cuda'],
-        type=str,
-        help='初回候補cache生成workerのdevice。train GPUとの同時確保を避けるため既定CPU',
     )
     parser.add_argument(
         '--heuristic_guidance_online_pool_limit',
@@ -3504,7 +3398,6 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--compression_surrogate_grad_clip', default=10.0, type=float, help='圧縮サロゲートの勾配クリップ')
     parser.add_argument('--compression_surrogate_empty_cache_after_update', default=True, type=str2bool, help='Surrogate更新直後にCUDA cacheを解放してGPU使用量の山を抑える')
     parser.add_argument('--compression_surrogate_empty_cache_threshold_mb', default=12288.0, type=float, help='CUDA cache解放を開始するreserved memory閾値(MB、0なら毎回)')
-    parser.add_argument('--compression_surrogate_target_scale', default=100.0, type=float, help='旧互換用。実圧縮教師百分率モードでは未使用')
     parser.add_argument('--compression_surrogate_pred_clip', default=0.0, type=float, help='サロゲートが予測する実圧縮bit差百分率のtanhクリップ（0で無効）')
     parser.add_argument('--surrogate_pred_clip_percent', default=-1.0, type=float, help='compression_surrogate_pred_clipの明示alias。負値ならcompression_surrogate_pred_clipを使う')
     parser.add_argument('--surrogate_target_clip_percent', default=0.0, type=float, help='実圧縮教師targetのclip幅。0で無効にしてraw percentを教師にする')
@@ -3512,16 +3405,6 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--surrogate_log_bit_ratio_scale', default=100.0, type=float, help='log bit ratio教師を使う場合の倍率')
     parser.add_argument('--compression_surrogate_occ_gain', default=1.0, type=float, help='Soft occupancy変換のゲイン')
     parser.add_argument('--compression_surrogate_bit_weight', default=4.0, type=float, help='サロゲート教師損失のbit重み')
-    parser.add_argument('--compression_surrogate_node_weight', default=1.0, type=float, help='旧互換用。実圧縮教師百分率モードでは未使用')
-    parser.add_argument('--compression_surrogate_single_weight', default=1.0, type=float, help='旧互換用。実圧縮教師百分率モードでは未使用')
-    parser.add_argument('--compression_surrogate_bpn_weight', default=1.0, type=float, help='旧互換用。実圧縮教師百分率モードでは未使用')
-    parser.add_argument('--compression_surrogate_entropy_weight', default=1.0, type=float, help='旧互換用。実圧縮教師百分率モードでは未使用')
-    parser.add_argument('--compression_surrogate_comp_bit_weight', default=1.0, type=float, help='旧互換用。実圧縮教師百分率モードでは未使用')
-    parser.add_argument('--compression_surrogate_comp_node_weight', default=0.25, type=float, help='旧互換用。実圧縮教師百分率モードでは未使用')
-    parser.add_argument('--compression_surrogate_comp_single_weight', default=0.25, type=float, help='旧互換用。実圧縮教師百分率モードでは未使用')
-    parser.add_argument('--compression_surrogate_comp_bpn_weight', default=0.25, type=float, help='旧互換用。実圧縮教師百分率モードでは未使用')
-    parser.add_argument('--compression_surrogate_comp_entropy_weight', default=0.25, type=float, help='旧互換用。実圧縮教師百分率モードでは未使用')
-    parser.add_argument('--compression_surrogate_loss_scale', default=100.0, type=float, help='旧互換用。実圧縮教師百分率モードでは未使用')
     parser.add_argument('--sparsepcgc_aux_loss', default=True, type=str2bool, help='SparsePCGC向けactive coordinate/孤立proxy補助lossを使うか')
     parser.add_argument('--sparsepcgc_aux_backprop', default=False, type=str2bool, help='SparsePCGC soft proxy補助項を主圧縮lossへ勾配として流すか。Falseなら補助値は別ログに残し、実bit Surrogate本体を最適化する')
     parser.add_argument(
@@ -3793,7 +3676,6 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--patch_build_mode', default='spatial_sort', type=str, help='パッチ構築方法(spatial_sort/fps_cover)')
     parser.add_argument('--patch_owned_ratio', default=0.9375, type=float, help='各パッチで固有に担当する点の割合')
     parser.add_argument('--patch_sort_grid_size', default=1024, type=int, help='spatial_sort時の粗い空間グリッド分解能')
-    parser.add_argument('--patch_info_cache', default=True, type=str2bool, help='パッチ分割結果をCPUキャッシュして再利用するか')
     parser.add_argument('--train_patch_subset_enable', default=True, type=str2bool, help='train時にpatch subsetではなくOctree subtree subset学習を使うか')
     parser.add_argument('--train_subtree_level', default=4, type=int, help='train subtree深さ(0ならrepair_unit_levelを使う)')
     parser.add_argument('--train_subtree_randomize_level', default=True, type=str2bool, help='train時にsubtree深さを一定範囲でランダム化するか')
@@ -3815,7 +3697,6 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--train_full_cloud_val_frames', default=5, type=int, help='episode末にfull-cloud actual validationへ使う最大フレーム数。0で無効')
     parser.add_argument('--train_subtree_full_cloud_prob', default=0.03, type=float, help='subtree subset学習時に確率的にfull-cloud anchorへ切り替える確率')
     parser.add_argument('--train_patch_subset_sampling', default='coverage_cycle', type=str, help='subtree subset学習の選択方法(coverage_cycle)')
-    parser.add_argument('--train_patch_subset_log', default=True, type=str2bool, help='subtree subset学習の選択状況をログ出力するか')
     parser.add_argument('--train_subtree_stat_log_limit', default=16, type=int, help='SubtreeSelectionログでOctree統計を計算する最大subtree数')
     parser.add_argument('--sparsepcgc_subtree_potential_priority', default=True, type=str2bool, help='SparsePCGC訓練時、actual oracle前にleaf occupancy pattern potentialが高いSubtreeを優先選択する')
     parser.add_argument('--sparsepcgc_subtree_potential_max_scan', default=64, type=int, help='potential priorityで1stepに軽量スコア計算するSubtree候補数上限')
@@ -3854,7 +3735,6 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--mp_start_method', default='auto', type=str, help='マルチプロセス起動方法')
     parser.add_argument('--weight_decay', default=0, type=float, help='重み減衰')
     parser.add_argument('--bptt', default=1024, type=float, help='（内部用パラメータ）')
-    parser.add_argument('--parallel', default=False, type=str2bool, help='並列モデルを使うか')
     parser.add_argument('--module_bn_use_running_stats', default=False, type=str2bool, help='Encoder以外のBatchNormでrunning statsを使うか')
     parser.add_argument('--use_tf32', default=True, type=str2bool, help='TF32を使用するか')
     parser.add_argument('--use_amp', default=True, type=str2bool, help='混合精度学習を使うか')
@@ -3900,8 +3780,6 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--network_only_audit_verbose', default=False, type=str2bool, help='Network-only監査の全Tensor辞書を本文へ出すか。counter検証とCSV/図には影響しない')
     parser.add_argument('--network_only_head_audit_interval', default=10, type=int, help='Network-only head更新normを計測するStep間隔')
     parser.add_argument('--full_cloud_empty_cache_threshold_mb', default=8192.0, type=float, help='backward前にCUDA allocator cacheを返すmain process reserved memory閾値')
-    parser.add_argument('--epoch_plot_rate', default=1, type=int, help='エポックごとのプロット保存間隔')
-    parser.add_argument('--episode_plot_rate', default=1, type=int, help='エピソードごとのプロット保存間隔')
     parser.add_argument('--plot_max_points', default=512, type=int, help='1枚のグラフに描画する最大点数（超過時は等間隔に間引く）')
     parser.add_argument('--plot_skip_outlier_steps', default=True, type=str2bool, help='Trueなら極端に大きいstep値をプロット履歴から除外する')
     parser.add_argument('--plot_outlier_abs_threshold', default=1e6, type=float, help='この絶対値を超えるstep値をプロットから除外する閾値（0以下で無効）')

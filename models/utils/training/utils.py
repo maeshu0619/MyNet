@@ -18,7 +18,6 @@ from models.utils.patching.patch import (
     patch_info_to_cpu,
     patch_info_to_device,
 )
-from models.utils.training.utils_grad import *
 from models.network import Network
 from models.utils.loss.loss import Loss
 from models.utils.notify.mail_notify import TrainingMailNotifier
@@ -96,60 +95,10 @@ def write_structure_decision_debug(writer, prefix, structure_debug):
         writer.write(f"{prefix}OctreeLevels: " + "; ".join(parts))
 
 
-def compression_stat_qs(args):
-    codec = str(getattr(args, "compress", "OctAttention")).strip().lower().replace("_", "").replace("-", "")
-
-    if codec == "sparsepcgc":
-        return max(float(getattr(args, "sparsepcgc_voxel_size", 1.0)), 1e-9)
-
-    if codec == "gpcc":
-        return max(float(getattr(args, "gpcc_effective_qs", getattr(args, "qs", 1.0))), 1e-9)
-
-    return max(float(getattr(args, "qs", 1.0)), 1e-9)
 
 
-def format_triplet(values):
-    if not values:
-        return "0/0.0/0"
-
-    mean = sum(values) / float(max(len(values), 1))
-    return f"{min(values):.0f}/{mean:.1f}/{max(values):.0f}"
 
 
-def summarize_subtree_octree_stats(input_xyz, groups, args):
-    limit = max(int(getattr(args, "train_subtree_stat_log_limit", 16)), 0)
-    if limit <= 0 or not groups:
-        return None
-
-    qs = compression_stat_qs(args)
-
-    nodes = []
-    singles = []
-    depths = []
-
-    for _subtree_key, point_idx in groups[:limit]:
-        pts = input_xyz[0, :3, :].index_select(1, point_idx).contiguous()
-
-        stats = hard_octree_occupancy_stats(
-            pts,
-            qs=qs,
-            max_depth=int(getattr(args, "compression_octree_stat_depth", 0)),
-            quant_mode="sparsepcgc"
-            if str(getattr(args, "compress", "")).strip().lower().replace("-", "").replace("_", "") == "sparsepcgc"
-            else "round",
-            pos_quantscale=int(getattr(args, "sparsepcgc_pos_quantscale", 1)),
-        )
-
-        nodes.append(float(stats["node_count"]))
-        singles.append(float(stats["single_child_count"]))
-        depths.append(float(stats["max_depth"]))
-
-    return {
-        "count": len(nodes),
-        "node": format_triplet(nodes),
-        "single": format_triplet(singles),
-        "depth": format_triplet(depths),
-    }
 
 def should_log_step(step_idx, total_count, rate):
     rate = int(rate)
@@ -325,103 +274,10 @@ def point_ratio_percent(numerator, denominator):
     return 100.0 * float(numerator) / float(denom)
 
 
-def new_point_edit_sums():
-    return {
-        "input_points": 0,
-        "pre_output_points": 0,
-        "output_points": 0,
-        "added_points": 0,
-        "deleted_points": 0,
-        "adjusted_points": 0,
-        "net_change": 0,
-        "adjust_mean_sum": 0.0,
-        "adjust_max": 0.0,
-        "voxel_edit_input_count": 0,
-        "voxel_edit_add_count": 0,
-        "voxel_edit_drop_count": 0,
-        "voxel_edit_move_count": 0,
-        "voxel_edit_final_count": 0,
-        "full_cloud_voxel_count": 0,
-        "count": 0,
-    }
 
 
-def add_point_edit_sums(edit_sums, edit_stats):
-    if edit_stats is None:
-        return edit_sums
-    if edit_sums is None:
-        edit_sums = new_point_edit_sums()
-    for key in (
-        "input_points",
-        "pre_output_points",
-        "output_points",
-        "added_points",
-        "deleted_points",
-        "adjusted_points",
-        "net_change",
-        "voxel_edit_input_count",
-        "voxel_edit_add_count",
-        "voxel_edit_drop_count",
-        "voxel_edit_move_count",
-        "voxel_edit_final_count",
-    ):
-        edit_sums[key] += int(edit_stats.get(key, 0))
-    edit_sums["full_cloud_voxel_count"] = max(
-        int(edit_sums.get("full_cloud_voxel_count", 0)),
-        int(edit_stats.get("full_cloud_voxel_count", 0) or 0),
-    )
-    edit_sums["adjust_mean_sum"] += float(edit_stats.get("adjust_mean", 0.0))
-    edit_sums["adjust_max"] = max(float(edit_sums["adjust_max"]), float(edit_stats.get("adjust_max", 0.0)))
-    edit_sums["count"] += 1
-    return edit_sums
 
 
-def finalize_point_edit_sums(edit_sums):
-    if edit_sums is None:
-        return None
-    count = max(int(edit_sums.get("count", 0)), 1)
-    finalized = dict(edit_sums)
-    finalized["input_points_avg"] = float(edit_sums.get("input_points", 0)) / float(count)
-    finalized["pre_output_points_avg"] = float(edit_sums.get("pre_output_points", 0)) / float(count)
-    finalized["output_points_avg"] = float(edit_sums.get("output_points", 0)) / float(count)
-    finalized["added_points_avg"] = float(edit_sums.get("added_points", 0)) / float(count)
-    finalized["deleted_points_avg"] = float(edit_sums.get("deleted_points", 0)) / float(count)
-    finalized["adjusted_points_avg"] = float(edit_sums.get("adjusted_points", 0)) / float(count)
-    finalized["net_change_avg"] = float(edit_sums.get("net_change", 0)) / float(count)
-    finalized["adjust_mean"] = float(edit_sums.get("adjust_mean_sum", 0.0)) / float(count)
-    finalized["added_ratio_percent"] = point_ratio_percent(
-        finalized.get("added_points", 0),
-        finalized.get("input_points", 0),
-    )
-    finalized["deleted_ratio_percent"] = point_ratio_percent(
-        finalized.get("deleted_points", 0),
-        finalized.get("input_points", 0),
-    )
-    finalized["adjusted_ratio_percent"] = point_ratio_percent(
-        finalized.get("adjusted_points", 0),
-        finalized.get("input_points", 0),
-    )
-    voxel_input_count = int(finalized.get("voxel_edit_input_count", 0) or 0)
-    voxel_drop_count = int(finalized.get("voxel_edit_drop_count", 0) or 0)
-    full_cloud_voxel_count = int(finalized.get("full_cloud_voxel_count", 0) or 0)
-    full_cloud_denominator = full_cloud_voxel_count if full_cloud_voxel_count > 0 else voxel_input_count
-    finalized["voxel_add_ratio_percent"] = point_ratio_percent(
-        finalized.get("voxel_edit_add_count", 0),
-        voxel_input_count,
-    )
-    finalized["voxel_drop_ratio_percent"] = point_ratio_percent(
-        voxel_drop_count,
-        voxel_input_count,
-    )
-    finalized["voxel_move_ratio_percent"] = point_ratio_percent(
-        finalized.get("voxel_edit_move_count", 0),
-        voxel_input_count,
-    )
-    finalized["full_cloud_voxel_drop_ratio_percent"] = point_ratio_percent(
-        voxel_drop_count,
-        full_cloud_denominator,
-    )
-    return finalized
 
 
 def aligned_edit_ref_xyz(input_xyz, output_points):
@@ -632,88 +488,10 @@ def make_step_cache_key(file_path, args):
         f"|patch_sort_grid_size={int(getattr(args, 'patch_sort_grid_size', 1024))}"
     )
 
-def effective_patch_batch_size(args, patch_count=None, patch_size=None, is_train=True, writer=None):
-    patch_count = max(int(patch_count or getattr(args, "patch_batch_size", 1)), 1)
-    mode = str(getattr(args, "patch_parallel_mode", "auto")).strip().lower()
-    fixed = max(int(getattr(args, "patch_batch_size", 1)), 1)
-    if mode == "all":
-        return patch_count
-    if mode == "fixed":
-        return min(fixed, patch_count)
-
-    budget_name = "patch_parallel_points_budget_train" if is_train else "patch_parallel_points_budget_test"
-    budget_points = int(getattr(args, budget_name, 0))
-    patch_size = max(int(patch_size or getattr(args, "num_points", fixed)), 1)
-    if budget_points <= 0:
-        return min(fixed, patch_count)
-    auto_batch = max(budget_points // patch_size, 1)
-    return min(max(auto_batch, 1), patch_count)
 
 
-def select_patch_subset_ids(patch_info, global_step, args):
-    total_patches = int(patch_info["num_patches"])
-    if total_patches <= 0:
-        raise ValueError("Patch subset selection received zero patches.")
-
-    ref_tensor = patch_info.get("patch_input_idx")
-    device = ref_tensor.device if torch.is_tensor(ref_tensor) else "cpu"
-    if not bool(getattr(args, "train_patch_subset_enable", False)):
-        return torch.arange(total_patches, device=device, dtype=torch.long)
-
-    sampling = str(getattr(args, "train_patch_subset_sampling", "coverage_cycle")).strip().lower()
-    if sampling != "coverage_cycle":
-        raise ValueError(f"Unsupported train patch subset sampling mode: {sampling}")
-
-    patches_per_step = int(getattr(args, "train_patch_subset_patches_per_step", total_patches))
-    if patches_per_step < 1:
-        raise ValueError("train_patch_subset_patches_per_step must be >= 1")
-    if patches_per_step >= total_patches:
-        return torch.arange(total_patches, device=device, dtype=torch.long)
-
-    stride = max(int(math.ceil(total_patches / float(patches_per_step))), 1)
-    offset = int(global_step) % stride
-    selected = []
-    seen = set()
-    for class_shift in range(stride):
-        start = (offset + class_shift) % stride
-        for patch_id in range(start, total_patches, stride):
-            if patch_id in seen:
-                continue
-            selected.append(patch_id)
-            seen.add(patch_id)
-            if len(selected) >= patches_per_step:
-                break
-        if len(selected) >= patches_per_step:
-            break
-
-    if len(selected) < patches_per_step:
-        for patch_id in range(total_patches):
-            if patch_id in seen:
-                continue
-            selected.append(patch_id)
-            if len(selected) >= patches_per_step:
-                break
-
-    return torch.tensor(selected, device=device, dtype=torch.long)
 
 
-def make_patch_subset_cache_key(cache_key, selected_patch_ids, total_patch_count=None):
-    if cache_key is None:
-        cache_key = ""
-    if selected_patch_ids is None:
-        return cache_key
-
-    if torch.is_tensor(selected_patch_ids):
-        subset_ids = selected_patch_ids.detach().to(torch.long).cpu().tolist()
-    else:
-        subset_ids = [int(patch_id) for patch_id in selected_patch_ids]
-
-    if total_patch_count is not None and len(subset_ids) >= int(total_patch_count):
-        return cache_key
-
-    subset_text = ",".join(str(patch_id) for patch_id in subset_ids)
-    subset_hash = hashlib.sha1(subset_text.encode("utf-8")).hexdigest()[:16]
-    return f"{cache_key}|subset={subset_hash}"
 
 
 def format_bytes(num_bytes):
@@ -877,10 +655,6 @@ def trainable_parameters(module):
     return [param for param in module.parameters() if param.requires_grad]
 
 
-def first_trainable_parameter(module):
-    for param in trainable_parameters(module):
-        return param
-    return None
 
 
 def snapshot_module_parameters(module):
@@ -1041,14 +815,6 @@ def use_memory_safe_loader_workers(args, model, writer):
     return 0
 
 
-def resolve_training_stage_for_episode(args, episode_idx):
-    if not bool(getattr(args, "two_stage_training", False)):
-        return str(getattr(args, "training_stage", "joint")).strip().lower()
-    diagnosis_episodes = int(getattr(args, "diagnosis_episodes", 0))
-    if diagnosis_episodes <= 0:
-        ratio = float(getattr(args, "diagnosis_episode_ratio", 0.25))
-        diagnosis_episodes = max(int(round(float(getattr(args, "episodes", 1)) * ratio)), 1)
-    return "diagnosis" if int(episode_idx) < diagnosis_episodes else "joint"
 
 
 def stage_loss_factors(args):
@@ -1070,54 +836,8 @@ def stage_loss_factors(args):
     }
 
 
-def get_patch_info(input_pcd, args, cache_key, patch_info_cache):
-    cache_enabled = bool(getattr(args, "patch_info_cache", True))
-    cache_max_entries = max(int(getattr(args, "cache_max_entries", 64)), 0)
-    if cache_enabled and cache_key:
-        cached = patch_info_cache.get(cache_key)
-        if cached is not None:
-            patch_info_cache.move_to_end(cache_key)
-            return patch_info_to_device(cached, device=input_pcd.device, dtype=input_pcd.dtype)
-
-    patch_info = build_patch_info(input_pcd, args)
-
-    if cache_enabled and cache_key and cache_max_entries > 0:
-        patch_info_cache[cache_key] = patch_info_to_cpu(patch_info)
-        patch_info_cache.move_to_end(cache_key)
-        while len(patch_info_cache) > cache_max_entries:
-            patch_info_cache.popitem(last=False)
-
-    return patch_info
 
 
-def accumulate_grouped_patch_geometry(
-    geom_groups,
-    loss,
-    args,
-):
-    if not geom_groups:
-        return None, 0.0
-
-    ref_tensor = next(iter(geom_groups.values()))["gen"][0]
-    total = ref_tensor.new_zeros(())
-    total_weight = 0.0
-    for group in geom_groups.values():
-        gen_batch = torch.cat(group["gen"], dim=0)
-        gt_batch = torch.cat(group["gt"], dim=0)
-        final_w_batch = None
-        if group["final_w"] is not None:
-            final_w_batch = torch.cat(group["final_w"], dim=0)
-        group_loss = loss.get_geometry_loss(
-            args,
-            gen_pts=gen_batch,
-            gt_pts=gt_batch,
-            final_w=final_w_batch,
-            out_label=None,
-        )
-        weight = float(group["weight"])
-        total = total + group_loss * weight
-        total_weight += weight
-    return total, total_weight
 
 
 def stable_index_subset(num_points, max_points, method, key, seed):
@@ -1162,64 +882,8 @@ def downsample_input_batch(input_pcd, args, cache_key):
     return input_pcd.index_select(1, idx)
 
 
-def sample_geometry_audit_tensors(gen_pts, gt_pts, final_w, out_label, args, cache_key):
-    max_points = max(int(getattr(args, "geometry_audit_max_points", 0)), 0)
-    if max_points <= 0:
-        return gen_pts, gt_pts, final_w, out_label
-
-    def _sample_pts(tensor, key_suffix):
-        idx = stable_index_subset(
-            num_points=tensor.shape[-1],
-            max_points=max_points,
-            method=getattr(args, "input_sampling", "random"),
-            key=f"{cache_key}|{key_suffix}",
-            seed=args.seed,
-        )
-        if idx is None:
-            return tensor, None
-        idx = idx.to(device=tensor.device, dtype=torch.long)
-        return tensor.index_select(2, idx), idx
-
-    gen_pts_audit, gen_idx = _sample_pts(gen_pts, "geom_audit_gen")
-    gt_pts_audit, gt_idx = _sample_pts(gt_pts, "geom_audit_gt")
-    final_w_audit = None
-    out_label_audit = out_label
-    if final_w is not None and gen_idx is not None:
-        final_w_audit = final_w.index_select(2, gen_idx)
-    elif final_w is not None:
-        final_w_audit = final_w
-    if out_label is not None and gt_idx is not None:
-        dim = 2 if out_label.dim() == 3 else 1
-        out_label_audit = out_label.index_select(dim, gt_idx)
-    return gen_pts_audit, gt_pts_audit, final_w_audit, out_label_audit
 
 
-def run_geometry_audit(loss_obj, args, gen_pts, gt_pts, final_w, out_label, cache_key):
-    if gen_pts.dim() == 3 and gen_pts.shape[1] > 3:
-        gen_pts = gen_pts[:, :3, :]
-    if gt_pts.dim() == 3 and gt_pts.shape[1] > 3:
-        gt_pts = gt_pts[:, :3, :]
-    gen_a, gt_a, w_a, label_a = sample_geometry_audit_tensors(
-        gen_pts,
-        gt_pts,
-        final_w,
-        out_label,
-        args,
-        cache_key,
-    )
-    with torch.no_grad():
-        geom_value = loss_obj.get_geometry_loss(
-            args,
-            gen_pts=gen_a,
-            gt_pts=gt_a,
-            final_w=w_a,
-            out_label=label_a,
-        )
-    geom_debug = dict(getattr(loss_obj, "last_geometry_debug", {}) or {})
-    geom_debug["audit_value"] = float(geom_value.detach().cpu())
-    geom_debug["audit_gen_points"] = int(gen_a.shape[-1])
-    geom_debug["audit_gt_points"] = int(gt_a.shape[-1])
-    return geom_debug
 
 
 def move_xyz_to_device(pts, use_cuda):

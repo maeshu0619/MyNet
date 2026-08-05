@@ -23,35 +23,6 @@ def _finite_filter(xyz, drop_nonfinite=True):
     return torch.nan_to_num(xyz), int(finite_mask.sum().item())
 
 
-def sparsepcgc_quantized_coords(
-    pts_3n,
-    voxel_size,
-    pos_quantscale,
-    *,
-    drop_nonfinite=True,
-    shift_min_to_zero=False,
-):
-    """SparsePCGCのround+unique前の量子化座標を返す。"""
-    with torch.no_grad():
-        xyz = _as_points_n3(pts_3n)
-        if xyz is None:
-            return torch.empty((0, 3), dtype=torch.long)
-        xyz = xyz.detach().to(dtype=torch.float32)
-        xyz, _ = _finite_filter(xyz, drop_nonfinite=drop_nonfinite)
-        if xyz.numel() == 0:
-            return torch.empty((0, 3), device=xyz.device, dtype=torch.long)
-
-        voxel = max(float(voxel_size), 1e-9)
-        pos_q = max(float(pos_quantscale), 1.0)
-        coords = torch.round(xyz / voxel)
-        if pos_q > 1.0:
-            coords = torch.round(coords / pos_q)
-        coords = coords.to(torch.long)
-        if shift_min_to_zero and coords.numel() > 0:
-            # 座標全体の平行移動はunique数や重複率を変えない。
-            # Sparse Tensorの入力座標を非負にそろえたい確認用途だけで使う。
-            coords = coords - coords.amin(dim=0, keepdim=True)
-        return coords
 
 
 def _quantize_xyz_n3(xyz, voxel_size, pos_quantscale):

@@ -20,14 +20,6 @@ def case_int(value, default=0):
     except (TypeError, ValueError, OverflowError):
         return int(default)
 
-def format_duration_seconds(seconds):
-    seconds = case_float(seconds, 0.0)
-    if not math.isfinite(seconds) or seconds < 0.0:
-        seconds = 0.0
-    total = int(round(seconds))
-    hours, rem = divmod(total, 3600)
-    minutes, secs = divmod(rem, 60)
-    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 def process_rss_mb():
     try:

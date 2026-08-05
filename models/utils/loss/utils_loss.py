@@ -35,14 +35,6 @@ from Chamfer3D.dist_chamfer_3D import chamfer_3DDist
 chamfer_dist = chamfer_3DDist()
 
 
-def make_gt_key(gt_pts: torch.Tensor) -> str:
-    # 全点ハッシュは重いので、先頭の一部＋shapeで簡易キーにする
-    # 衝突リスクはあるが実用上は低い。厳密にやるならデータローダから frame_id を渡すのが最適。
-    x = gt_pts.detach().contiguous().view(-1)
-    take = min(x.numel(), 4096)  # 先頭4096要素だけ
-    cpu = x[:take].cpu().numpy().tobytes()
-    h = hashlib.sha1(cpu).hexdigest()
-    return f"{tuple(gt_pts.shape)}_{h}"
 
 def estimate_normals_open3d(gt_pts: torch.Tensor, k: int = 16) -> torch.Tensor:
     if o3d is None:
@@ -100,57 +92,6 @@ def estimate_normals_pca(gt_pts: torch.Tensor, k: int = 16) -> torch.Tensor:
 
     return normals.permute(0, 2, 1).contiguous()                   # [B,3,N]
 
-def point2plane_loss(gen_pts: torch.Tensor,
-                     gt_pts: torch.Tensor,
-                     gt_normals=None,
-                     k: int = 16,
-                     reduction: str = "mean",
-                     use_torch_ops: bool = False) -> torch.Tensor:
-    """
-    gen_pts: [B, 3, Ng]
-    gt_pts : [B, 3, Nt]
-    gt_normals: [B, 3, Nt] or None
-    """
-    assert gen_pts.ndim == 3 and gt_pts.ndim == 3
-    B, _, Ng = gen_pts.shape
-    _, _, Nt = gt_pts.shape
-
-    # print(f"[P2P] B={B} Ng={Ng} Nt={Nt} k={k}")
-
-    gt_xyz  = gt_pts.permute(0, 2, 1).contiguous()
-    gen_xyz = gen_pts.permute(0, 2, 1).contiguous()
-
-    # ★ ここが今回の肝：外から渡された法線を使う
-    if gt_normals is None:
-        if use_torch_ops:
-            gt_normals = estimate_normals_pca(gt_pts, k=k)
-        else:
-            gt_normals = estimate_normals_open3d(gt_pts, k=k)
-
-    normals_xyz = gt_normals.permute(0, 2, 1).contiguous()
-
-    if use_torch_ops:
-        nn_idx = _torch_knn_idx(gen_xyz, gt_xyz, 1).squeeze(-1)
-    else:
-        nn_idx = _faiss_knn_idx(gen_xyz, gt_xyz, 1).squeeze(-1)
-
-    base = (torch.arange(B, device=gen_pts.device).view(B, 1) * Nt)
-    gt_flat = gt_xyz.reshape(B * Nt, 3)
-    n_flat  = normals_xyz.reshape(B * Nt, 3)
-    nn_flat = (nn_idx + base).reshape(-1)
-
-    nn_gt = gt_flat[nn_flat].reshape(B, Ng, 3)
-    nn_n  = n_flat[nn_flat].reshape(B, Ng, 3)
-
-    diff = gen_xyz - nn_gt
-    dist_plane = (diff * nn_n).sum(dim=2).abs()
-
-    if reduction == "mean":
-        return dist_plane.mean()
-    elif reduction == "sum":
-        return dist_plane.sum()
-    else:
-        return dist_plane
 
 
 def _torch_knn_idx(query_xyz_bnm: torch.Tensor, ref_xyz_brm: torch.Tensor, k: int,
@@ -220,28 +161,8 @@ def _faiss_knn_idx(query_xyz_bnm: torch.Tensor, ref_xyz_brm: torch.Tensor, k: in
 
     return torch.stack(idx_list, dim=0)  # [B, N, k]
 
-def knn_gpu(xyz: torch.Tensor, k: int):
-    """
-    xyz: (B, N, 3)
-    return: idx (B, N, k)
-    完全最近傍（精度100%）
-    GPU並列版
-    """
-    return _torch_knn_idx(xyz, xyz, k, exclude_self=True)
 
-def chamfer_sqrt(p1, p2):
-    d1, d2, _, _ = chamfer_dist(_normalize_point_cloud(p1), _normalize_point_cloud(p2))
-    d1 = torch.mean(d1)
-    d2 = torch.mean(d2)
-    return (d1 + d2)
 
-def _normalize_point_cloud(pc):
-    # b, n, 3
-    centroid = torch.mean(pc, dim=1, keepdim = True) # b, 1, 3
-    pc = pc - centroid # b, n, 3
-    furthest_distance = torch.max(torch.sqrt(torch.sum(pc**2, dim=-1, keepdim=True)), dim=1, keepdim=True)[0] # b, 1, 1
-    pc = pc / furthest_distance
-    return pc
 
 def remove_outlier_points_by_label(gt_pts: torch.Tensor, outlier_label: torch.Tensor):
     """
@@ -346,77 +267,8 @@ def chamfer_l2_loss_and_weight_surrogate(
     return hard_loss, surrogate_loss
 
 
-def chamfer_prune_soft_loss(
-    gen_pts: torch.Tensor,
-    gt_pts: torch.Tensor,
-    final_w: torch.Tensor,
-    detach_dist: bool = True
-) -> torch.Tensor:
-    """
-    gen_pts: [B, 3, N_gen]   最終出力点群
-    gt_pts:  [B, 3, N_gt]    入力点群 = GT
-    keep_w_full: [B, 1, N_gt]  Pruning前全点に対する keep重み
-    """
 
-    gen = gen_pts.transpose(1, 2).contiguous()   # [B, N_gen, 3]
-    gt  = gt_pts.transpose(1, 2).contiguous()    # [B, N_gt, 3]
 
-    dist1, dist2, _, _ = chamfer_dist(gen, gt)   # dist2: [B, N_gt]
-
-    if detach_dist:
-        dist2 = dist2.detach()
-
-    final_w = final_w.clamp(0.0, 1.0).to(dist2.dtype)
-
-    # 落とした点ほど重く見る
-    drop_w = 1.0 - final_w
-
-    loss = (dist2 * drop_w).sum() / (drop_w.sum() + 1e-12)
-    return loss
-
-def psnr_loss(gen_pts: torch.Tensor, gt_pts: torch.Tensor, peak=1023.0) -> torch.Tensor:
-    """
-    PSNR = 10 * log10( peak^2 / MSE )
-    Loss としては -PSNR を返す
-    """
-
-    gen = gen_pts.transpose(1, 2).contiguous()
-    gt  = gt_pts.transpose(1, 2).contiguous()
-
-    dist1, _, _, _ = chamfer_dist(gen, gt)
-    mse = dist1.mean()
-
-    psnr = 10.0 * torch.log10((peak ** 2) / (mse + 1e-8))
-    return -psnr
-
-def normal_consistency_loss(gen_pts, gt_pts, gt_normals=None, k=16):
-    """
-    gen_pts: [B,3,N]
-    gt_pts : [B,3,N]
-    """
-    if gt_normals is None:
-        gt_normals = estimate_normals_open3d(gt_pts, k=k)
-
-    gen_normals = estimate_normals_open3d(gen_pts, k=k)
-
-    gen_xyz = gen_pts.permute(0,2,1)
-    gt_xyz  = gt_pts.permute(0,2,1)
-
-    nn_idx = _faiss_knn_idx(gen_xyz, gt_xyz, 1).squeeze(-1)
-
-    B, Ng = nn_idx.shape
-    Nt = gt_pts.shape[2]
-
-    base = (torch.arange(B, device=gen_pts.device).view(B,1) * Nt)
-    gt_norm_flat = gt_normals.permute(0,2,1).reshape(B*Nt,3)
-    nn_flat = (nn_idx + base).reshape(-1)
-
-    nn_gt_norm = gt_norm_flat[nn_flat].reshape(B,Ng,3)
-    gen_norm = gen_normals.permute(0,2,1)
-
-    dot = (gen_norm * nn_gt_norm).sum(dim=2).abs()
-
-    return (1 - dot).mean()
 
 class ManifoldnessConstraint(nn.Module):
     """
@@ -517,95 +369,11 @@ class ManifoldnessConstraint(nn.Module):
 import torch
 import torch.nn.functional as F
 
-def compute_fit_loss(sq_distances, conv_radius):
-    """
-    Args:
-        sq_distances: (B, N, K, Nkp)
-            squared distances between neighbor points and kernel points
-        conv_radius: float
-            convolution radius for normalization
-    Returns:
-        scalar loss
-    """
-    # sqrt to get Euclidean distance
-    distances = torch.sqrt(sq_distances)  # (B, N, K, Nkp)
-
-    # nearest neighbor distance for each kernel point
-    min_dist, _ = torch.min(distances, dim=-2)  # (B, N, Nkp)
-
-    # normalize
-    loss = (min_dist / conv_radius) ** 2  # (B, N, Nkp)
-
-    # L1 to zero
-    fit_loss = F.l1_loss(loss, torch.zeros_like(loss))
-
-    return fit_loss
-
-def compute_rep_loss(deform_kp_pos, conv_radius, repulse_extent):
-    """
-    Args:
-        deform_kp_pos: (B, 3, N, Nkp)
-            deformed kernel point positions
-        conv_radius: float
-        repulse_extent: float
-    Returns:
-        scalar loss
-    """
-
-    B, _, N, Nkp = deform_kp_pos.shape
-
-    # normalize
-    norm_kp_pos = deform_kp_pos / conv_radius
-    norm_kp_pos = norm_kp_pos.permute(0, 2, 3, 1).contiguous()
-    norm_kp_pos = norm_kp_pos.view(-1, Nkp, 3)  # (B*N, Nkp, 3)
-
-    total_loss = 0.0
-
-    for i in range(Nkp):
-        # exclude itself
-        other = torch.cat(
-            [norm_kp_pos[:, :i, :], norm_kp_pos[:, i+1:, :]],
-            dim=1
-        ).detach()
-
-        # pairwise distance
-        distances = torch.sqrt(
-            torch.sum(
-                (other - norm_kp_pos[:, i:i+1, :]) ** 2,
-                dim=2
-            )
-        )
-
-        # penalize if too close
-        rep = torch.clamp_max(distances - repulse_extent, max=0.0) ** 2
-        rep = torch.sum(rep, dim=1)
-
-        total_loss += F.l1_loss(rep, torch.zeros_like(rep)) / Nkp
-
-    return total_loss
 
 
-def prune_count_loss(keep_prob, target_ratio):
-    """
-    keep_prob: (B,N)
-    """
-    B, N = keep_prob.shape
-    mean_ratio = keep_prob.mean(dim=1)
-    loss = ((mean_ratio - target_ratio) ** 2).mean()
-    return loss
 
 
-def prune_outlier_loss(keep_prob, density):
-    """
-    外れ点抑制
-    density: (B,1,N) または (B,N)
-    """
-    if density.dim() == 3:
-        density = density.squeeze(1)
 
-    d_norm = density / (density.mean(dim=1, keepdim=True) + 1e-6)
-    loss = (keep_prob * d_norm).mean()
-    return loss
 
 def compute_d2_psnr(
     ref: torch.Tensor,

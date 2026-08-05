@@ -3368,24 +3368,6 @@ class StructureRepairActuator(nn.Module):
         return True
 
     @staticmethod
-    def _den6_pool_permutation_indices(order_indices, variant):
-        size = len(order_indices)
-        if size <= 1:
-            return list(order_indices)
-        start = int(variant) % size
-        possible = [1, 2, 3, 5, 7, 11, 13, 17]
-        offset = int(variant) % len(possible)
-        stride = next(
-            (
-                value
-                for value in possible[offset:] + possible[:offset]
-                if math.gcd(value, size) == 1
-            ),
-            1,
-        )
-        return [order_indices[(start + index * stride) % size] for index in range(size)]
-
-    @staticmethod
     def _normalize_candidate_network_score(value):
         value = torch.nan_to_num(value.float(), nan=0.0, posinf=0.0, neginf=0.0)
         if value.numel() <= 1:
@@ -9132,35 +9114,6 @@ class StructureRepairActuator(nn.Module):
                 0.0,
             )
 
-            def _oracle_where_bce(pred, good_mask, bad_mask, bad_score):
-                good_mask = good_mask.to(device=pred.device, dtype=torch.bool)
-                bad_mask = bad_mask.to(device=pred.device, dtype=torch.bool) & (~good_mask)
-                valid = good_mask | bad_mask
-                if not bool(valid.detach().any().item()):
-                    return pred.new_zeros(()), 0
-                target = good_mask.to(device=pred.device, dtype=pred.dtype)
-                weight = torch.ones_like(pred, dtype=pred.dtype)
-                if torch.is_tensor(bad_score):
-                    weight = weight + bad_mask.to(dtype=pred.dtype) * bad_score.to(
-                        device=pred.device,
-                        dtype=pred.dtype,
-                    ).clamp(0.0, 5.0)
-                pred_safe = torch.nan_to_num(
-                    pred,
-                    nan=0.5,
-                    posinf=1.0,
-                    neginf=0.0,
-                ).clamp(eps, 1.0 - eps)
-                with torch.cuda.amp.autocast(enabled=False):
-                    raw = torch.nn.functional.binary_cross_entropy(
-                        pred_safe.float(),
-                        target.float(),
-                        reduction="none",
-                    )
-                valid_f = valid.to(device=raw.device, dtype=raw.dtype)
-                denom = (valid_f * weight.float()).sum().clamp_min(1.0)
-                loss_value = (raw * valid_f * weight.float()).sum() / denom
-                return loss_value.to(dtype=pred.dtype), int(bad_mask.detach().sum().item())
 
             def _oracle_where_bce_logits(logit, good_mask, bad_mask, bad_score):
                 good_mask = good_mask.to(device=logit.device, dtype=torch.bool)

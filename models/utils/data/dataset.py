@@ -268,18 +268,6 @@ class PlyDirDataset(torch.utils.data.Dataset):
                 _PLY_CACHE_BYTES -= int(evicted.numel()) * int(evicted.element_size())
         return points
 
-def collect_seq_dirs(root):
-    root = _resolve_data_path(root)
-    seq_dirs = []
-    with os.scandir(root) as root_entries:
-        for dataset_entry in root_entries:
-            if not dataset_entry.is_dir():
-                continue
-            with os.scandir(dataset_entry.path) as seq_entries:
-                for seq_entry in seq_entries:
-                    if seq_entry.is_dir():
-                        seq_dirs.append(seq_entry.path)
-    return sorted(seq_dirs)
 
 def collect_seq_dirs2(root, dataset_name=None):
     """

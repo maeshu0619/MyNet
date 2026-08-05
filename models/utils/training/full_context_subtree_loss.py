@@ -133,13 +133,6 @@ def _first_existing_tensor(dict_obj, keys):
     return None
 
 
-def _first_existing_value(dict_obj, keys):
-    if not isinstance(dict_obj, dict):
-        return None
-    for key in keys:
-        if key in dict_obj and dict_obj.get(key, None) is not None:
-            return dict_obj.get(key)
-    return None
 
 def _first_grad_tensor(dict_obj, keys):
     """

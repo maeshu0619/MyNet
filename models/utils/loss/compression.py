@@ -100,15 +100,6 @@ class CompressionLossMixin:
             coords = torch.round(coords / float(pos_q))
         return coords.to(torch.long)
 
-    @staticmethod
-    def _coord_key_3d(coords):
-        if coords.numel() == 0:
-            return coords.new_zeros((0,), dtype=torch.long)
-        mins = coords.amin(dim=0)
-        shifted = coords - mins
-        span = (shifted.amax(dim=0) + 1).clamp_min(1)
-        return shifted[:, 0] * span[1] * span[2] + shifted[:, 1] * span[2] + shifted[:, 2]
-
     def _sparsepcgc_isolated_count(self, unique_coords):
         if unique_coords.numel() == 0:
             return 0, 0.0

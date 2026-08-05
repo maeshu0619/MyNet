@@ -217,96 +217,14 @@ def _downsample_input_batch(input_pcd, args, cache_key):
     return input_pcd.index_select(1, idx)
 
 
-def _sample_geometry_audit_tensors(gen_pts, gt_pts, final_w, out_label, args, cache_key):
-    max_points = max(int(getattr(args, "geometry_audit_max_points", 0)), 0)
-    if max_points <= 0:
-        return gen_pts, gt_pts, final_w, out_label
-
-    def _sample_pts(tensor, key_suffix):
-        idx = _stable_index_subset(
-            num_points=tensor.shape[-1],
-            max_points=max_points,
-            method=getattr(args, "input_sampling", "random"),
-            key=f"{cache_key}|{key_suffix}",
-            seed=args.seed,
-        )
-        if idx is None:
-            return tensor, None
-        idx = idx.to(device=tensor.device, dtype=torch.long)
-        return tensor.index_select(2, idx), idx
-
-    gen_pts_audit, gen_idx = _sample_pts(gen_pts, "geom_audit_gen")
-    gt_pts_audit, gt_idx = _sample_pts(gt_pts, "geom_audit_gt")
-    final_w_audit = None
-    out_label_audit = out_label
-    if final_w is not None and gen_idx is not None:
-        final_w_audit = final_w.index_select(2, gen_idx)
-    elif final_w is not None:
-        final_w_audit = final_w
-    if out_label is not None and gt_idx is not None:
-        dim = 2 if out_label.dim() == 3 else 1
-        out_label_audit = out_label.index_select(dim, gt_idx)
-    return gen_pts_audit, gt_pts_audit, final_w_audit, out_label_audit
 
 
-def _resolved_test_save_paths(args, step_idx):
-    base_dir = Path(os.path.abspath(os.path.expanduser(args.save_ply_dir)))
-    codec_eval_dir = Path(
-        os.path.abspath(
-            os.path.expanduser(getattr(args, "codec_eval_dir", args.save_ply_dir))
-        )
-    )
-    run_dir = base_dir / "runs" / f"{args.date}_{args.time}_{Path(args.ckpt).stem}"
-    filename = f"{step_idx:04d}_{getattr(args, 'method_name', 'Mine')}.ply"
-    return {
-        "primary_dir": base_dir,
-        "primary_path": base_dir / filename,
-        "run_dir": run_dir,
-        "run_path": run_dir / filename,
-        "codec_eval_dir": codec_eval_dir,
-        "codec_eval_path": codec_eval_dir / filename,
-    }
 
 
-def _copy_file_if_needed(src_path, dst_path):
-    src = Path(src_path)
-    dst = Path(dst_path)
-    if src.resolve() == dst.resolve():
-        return dst
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src, dst)
-    return dst
 
 
-def _cleanup_codec_eval_slot(codec_eval_dir, step_idx, keep_path):
-    keep = Path(keep_path).resolve()
-    slot_prefix = f"{int(step_idx):04d}_"
-    for path in Path(codec_eval_dir).glob(f"{slot_prefix}*.ply"):
-        if path.resolve() == keep:
-            continue
-        try:
-            path.unlink()
-        except OSError:
-            pass
 
 
-def _format_log_value(value, kind="float"):
-    if value is None:
-        return "nan"
-    if isinstance(value, (str, Path)):
-        return str(value)
-    if kind == "int":
-        return str(int(round(float(value))))
-    value = float(value)
-    if np.isnan(value):
-        return "nan"
-    if np.isposinf(value):
-        return "inf"
-    if np.isneginf(value):
-        return "-inf"
-    if kind == "time":
-        return f"{value:.6f}"
-    return f"{value:.6g}"
 
 
 def _emit_table(title, headers, rows, writer):
@@ -327,204 +245,24 @@ def _emit_table(title, headers, rows, writer):
         writer.write(_row(row))
 
 
-def _format_named_float_map(values):
-    if not values:
-        return "n/a"
-    return ", ".join(f"{key}={float(value):.4f}" for key, value in values.items())
 
 
-def _average_named_float_maps(chunks, key):
-    sums = {}
-    counts = {}
-    for chunk in chunks:
-        mapping = chunk.get(key) or {}
-        for name, value in mapping.items():
-            sums[name] = sums.get(name, 0.0) + float(value)
-            counts[name] = counts.get(name, 0) + 1
-    return {
-        name: sums[name] / float(max(counts[name], 1))
-        for name in sums
-    }
 
 
-def _sum_named_counts(chunks, key):
-    totals = {}
-    for chunk in chunks:
-        mapping = chunk.get(key) or {}
-        for name, value in mapping.items():
-            totals[name] = totals.get(name, 0) + int(value)
-    return totals
 
 
-def _merge_operation_by_cause(chunks):
-    merged = {}
-    for chunk in chunks:
-        for cause_name, info in (chunk.get("operation_by_cause") or {}).items():
-            entry = merged.setdefault(cause_name, {"count": 0, "ops": {}, "confidence_sum": 0.0, "confidence_count": 0})
-            count = int(info.get("count", 0))
-            operation = info.get("operation", "none")
-            entry["count"] += count
-            entry["ops"][operation] = entry["ops"].get(operation, 0) + count
-            entry["confidence_sum"] += float(info.get("confidence", 0.0))
-            entry["confidence_count"] += 1
-    result = {}
-    for cause_name, entry in merged.items():
-        operation = max(entry["ops"], key=entry["ops"].get) if entry["ops"] else "none"
-        result[cause_name] = {
-            "count": int(entry["count"]),
-            "operation": operation,
-            "confidence": entry["confidence_sum"] / float(max(entry["confidence_count"], 1)),
-        }
-    return result
 
 
-def _merge_octree_level_debug(chunks):
-    buckets = {}
-    for chunk in chunks:
-        for item in chunk.get("octree_level_debug") or []:
-            level = int(item.get("level", 0))
-            bucket = buckets.setdefault(level, {"count": 0, "occupied": 0.0, "single_ratio": 0.0, "children": 0.0})
-            bucket["count"] += 1
-            bucket["occupied"] += float(item.get("occupied_mean", 0.0))
-            bucket["single_ratio"] += float(item.get("single_ratio_mean", 0.0))
-            bucket["children"] += float(item.get("mean_children_mean", 0.0))
-    merged = []
-    for level in sorted(buckets):
-        bucket = buckets[level]
-        count = float(max(bucket["count"], 1))
-        merged.append(
-            {
-                "level": level,
-                "occupied_mean": bucket["occupied"] / count,
-                "single_ratio_mean": bucket["single_ratio"] / count,
-                "mean_children_mean": bucket["children"] / count,
-            }
-        )
-    return merged
 
 
-def _aggregate_structure_debug_chunks(chunks):
-    chunks = [chunk for chunk in (chunks or []) if chunk]
-    if not chunks:
-        return {}
-    if len(chunks) == 1:
-        return dict(chunks[0])
-    merged = dict(chunks[-1])
-    merged["cause_mean"] = _average_named_float_maps(chunks, "cause_mean")
-    merged["subtree_cause_mean"] = _average_named_float_maps(chunks, "subtree_cause_mean")
-    merged["policy_mean"] = _average_named_float_maps(chunks, "policy_mean")
-    merged["cause_argmax_counts"] = _sum_named_counts(chunks, "cause_argmax_counts")
-    merged["policy_argmax_counts"] = _sum_named_counts(chunks, "policy_argmax_counts")
-    merged["operation_by_cause"] = _merge_operation_by_cause(chunks)
-    merged["policy_entropy"] = float(np.mean([float(chunk.get("policy_entropy", 0.0)) for chunk in chunks]))
-    merged["policy_diversity"] = max(int(chunk.get("policy_diversity", 0)) for chunk in chunks)
-    for key in ("add_ratio", "drop_ratio", "keep_ratio", "add_candidate_ratio"):
-        merged[key] = float(np.mean([float(chunk.get(key, 0.0)) for chunk in chunks]))
-    for key in ("add_count", "add_effective_count"):
-        merged[key] = int(sum(int(chunk.get(key, 0)) for chunk in chunks))
-    merged["octree_level_debug"] = _merge_octree_level_debug(chunks)
-    merged["chunk_count"] = len(chunks)
-    return merged
 
 
-def _write_structure_decision_debug(writer, prefix, structure_debug):
-    if not structure_debug:
-        return
-    cause_mean = structure_debug.get("subtree_cause_mean") or structure_debug.get("cause_mean") or {}
-    policy_mean = structure_debug.get("policy_mean") or {}
-    top_cause = max(cause_mean, key=cause_mean.get) if cause_mean else "n/a"
-    top_policy = max(policy_mean, key=policy_mean.get) if policy_mean else "n/a"
-    writer.write(
-        f"{prefix}: "
-        f"top_cause={top_cause}, top_policy={top_policy}, "
-        f"policy_entropy={float(structure_debug.get('policy_entropy', 0.0)):.6f}, "
-        f"policy_diversity={int(structure_debug.get('policy_diversity', 0))}, "
-        f"chunks={int(structure_debug.get('chunk_count', 1))}, "
-        f"add_ratio={float(structure_debug.get('add_ratio', 0.0)):.6f}, "
-        f"add_count={int(structure_debug.get('add_count', 0))}, "
-        f"add_effective_count={int(structure_debug.get('add_effective_count', 0))}, "
-        f"cause_mean=[{_format_named_float_map(cause_mean)}], "
-        f"policy_mean=[{_format_named_float_map(policy_mean)}]"
-    )
-    operation_by_cause = structure_debug.get("operation_by_cause") or {}
-    if operation_by_cause:
-        parts = []
-        for cause_name, info in operation_by_cause.items():
-            parts.append(
-                f"{cause_name}->{info.get('operation', 'none')}"
-                f"(count={int(info.get('count', 0))}, conf={float(info.get('confidence', 0.0)):.4f})"
-            )
-        writer.write(f"{prefix}ByCause: " + "; ".join(parts))
-    level_debug = structure_debug.get("octree_level_debug") or []
-    if level_debug:
-        parts = []
-        for item in level_debug:
-            parts.append(
-                f"L{int(item.get('level', 0))}:"
-                f"occ={float(item.get('occupied_mean', 0.0)):.1f},"
-                f"single_ratio={float(item.get('single_ratio_mean', 0.0)):.4f},"
-                f"children={float(item.get('mean_children_mean', 0.0)):.3f}"
-            )
-        writer.write(f"{prefix}OctreeLevels: " + "; ".join(parts))
 
 
-def _emit_step_result_table(step_idx, step_record, writer):
-    _emit_table(
-        f"Step {step_idx + 1} Result",
-        ["field", "value"],
-        [
-            ("input_path", step_record["input_path"]),
-            ("output_path", step_record["output_path"]),
-            ("codec_eval_path", step_record["codec_eval_path"]),
-            ("deleted_points", _format_log_value(step_record["deleted_points"], "int")),
-            ("added_points", _format_log_value(step_record["added_points"], "int")),
-            ("adjusted_points", _format_log_value(step_record["adjusted_points"], "int")),
-            ("output_points", _format_log_value(step_record["output_points"], "int")),
-            ("cd", _format_log_value(step_record["cd"])),
-            ("d1_psnr", _format_log_value(step_record["d1_psnr"])),
-            ("d2_psnr", _format_log_value(step_record["d2_psnr"])),
-            ("model_time", _format_log_value(step_record["model_time"], "time")),
-        ],
-        writer,
-    )
-    writer.write(f"\n")
 
 
-def _summary_stat(values, fn):
-    arr = np.asarray(values, dtype=np.float64)
-    arr = arr[~np.isnan(arr)]
-    if arr.size == 0:
-        return float("nan")
-    return float(fn(arr))
 
 
-def _emit_step_summary_table(step_records, writer):
-    if not step_records:
-        writer.write("StepResultSummary: no values recorded")
-        return
-    metric_specs = [
-        ("deleted_points", "Deleted Points", "int"),
-        ("added_points", "Added Points", "int"),
-        ("adjusted_points", "Adjusted Points", "int"),
-        ("output_points", "Output Points", "int"),
-        ("cd", "CD", "float"),
-        ("d1_psnr", "D1PSNR", "float"),
-        ("d2_psnr", "D2PSNR", "float"),
-        ("model_time", "Model Time", "time"),
-    ]
-    rows = []
-    for key, label, kind in metric_specs:
-        values = [record[key] for record in step_records]
-        average_kind = "float" if kind == "int" else kind
-        rows.append(
-            (
-                label,
-                _format_log_value(_summary_stat(values, np.mean), average_kind),
-                _format_log_value(_summary_stat(values, np.max), kind),
-                _format_log_value(_summary_stat(values, np.min), kind),
-            )
-        )
-    _emit_table("Step Result Summary", ["metric", "average", "max", "min"], rows, writer)
 
 
 def _autocast_context(use_cuda, use_amp, amp_dtype):
@@ -614,115 +352,18 @@ def _compute_drop_hardening(final_w, args):
     }
 
 
-def _summarize_hardening_counts(input_points, pre_output_points, keep_mask):
-    input_points = int(input_points)
-    pre_output_points = int(pre_output_points)
-    candidate_added = max(pre_output_points - input_points, 0)
-    if keep_mask is None or int(keep_mask.numel()) == 0:
-        kept_original = min(input_points, pre_output_points)
-        kept_added = candidate_added
-    else:
-        flat_keep = keep_mask.reshape(-1)
-        original_end = min(input_points, int(flat_keep.numel()), pre_output_points)
-        added_start = min(input_points, int(flat_keep.numel()), pre_output_points)
-        added_end = min(input_points + candidate_added, int(flat_keep.numel()), pre_output_points)
-        kept_original = int(flat_keep[:original_end].sum().item()) if original_end > 0 else 0
-        kept_added = int(flat_keep[added_start:added_end].sum().item()) if added_end > added_start else 0
-    deleted_original = max(input_points - kept_original, 0)
-    deleted_added = max(candidate_added - kept_added, 0)
-    return {
-        "candidate_added": int(candidate_added),
-        "kept_original": int(kept_original),
-        "deleted_original": int(deleted_original),
-        "kept_added": int(kept_added),
-        "deleted_added": int(deleted_added),
-        "net_change_after_hardening": int(kept_added - deleted_original),
-    }
 
 
-def _format_optional_float(value, digits=6):
-    if value is None:
-        return "None"
-    return f"{float(value):.{digits}f}"
 
 
-def _summarize_point_edits(input_xyz, pre_harden_gen_pts, final_gen_pts, edit_ref_xyz, keep_mask, args):
-    input_points = int(input_xyz.shape[-1])
-    pre_output_points = int(pre_harden_gen_pts.shape[-1])
-    output_points = int(final_gen_pts.shape[-1])
-    added_points = max(pre_output_points - input_points, 0)
-    deleted_points = max(input_points + added_points - output_points, 0)
-
-    if edit_ref_xyz is None:
-        edit_ref_xyz = _aligned_edit_ref_xyz(input_xyz, pre_output_points)
-
-    compare_points = min(int(pre_harden_gen_pts.shape[-1]), int(edit_ref_xyz.shape[-1]))
-    adjusted_points = 0
-    max_adjust = 0.0
-    mean_adjust = 0.0
-    threshold = max(float(getattr(args, "test_adjust_threshold", 1e-6)), 0.0)
-    if compare_points > 0:
-        gen_xyz = pre_harden_gen_pts[:, :3, :compare_points]
-        ref_xyz = edit_ref_xyz[:, :3, :compare_points].to(device=gen_xyz.device, dtype=gen_xyz.dtype)
-        delta_norm = torch.linalg.norm(gen_xyz - ref_xyz, dim=1)
-        finite_mask = torch.isfinite(delta_norm)
-        moved_mask = finite_mask & (delta_norm > threshold)
-        if keep_mask is not None and int(keep_mask.numel()) == int(delta_norm.numel()):
-            moved_mask = moved_mask.reshape(-1) & keep_mask.reshape(-1)[:moved_mask.numel()]
-            moved_mask = moved_mask.reshape(delta_norm.shape)
-        valid_delta = delta_norm[finite_mask]
-        if valid_delta.numel() > 0:
-            max_adjust = float(valid_delta.max().detach().cpu())
-            mean_adjust = float(valid_delta.mean().detach().cpu())
-        adjusted_points = int(moved_mask.sum().item())
-
-    return {
-        "input_points": input_points,
-        "pre_output_points": pre_output_points,
-        "output_points": output_points,
-        "added_points": int(added_points),
-        "deleted_points": int(deleted_points),
-        "adjusted_points": int(adjusted_points),
-        "adjust_threshold": threshold,
-        "adjust_mean": mean_adjust,
-        "adjust_max": max_adjust,
-        "net_change": output_points - input_points,
-    }
 
 
-def _compression_efficiency_value(comp_debug, fallback=None):
-    if comp_debug:
-        for key in ("actual_total_bit_percent", "total_bit"):
-            value = comp_debug.get(key)
-            if value is not None:
-                return float(value)
-    if fallback is None:
-        return None
-    if torch.is_tensor(fallback):
-        return float(fallback.detach().cpu())
-    return float(fallback)
 
 
-def _should_force_actual_codec_eval(args):
-    backend = str(getattr(args, "compression_loss_backend", "proxy")).strip().lower()
-    return backend.endswith("_surrogate")
 
 
-def _should_run_actual_codec_eval(args, step_idx=None):
-    if bool(getattr(args, "skip_actual_codec", True)):
-        return False
-    interval = max(int(getattr(args, "codec_eval_interval", 0)), 0)
-    if interval <= 0:
-        return False
-    if step_idx is None:
-        return True
-    return (int(step_idx) + 1) % interval == 0
 
 
-def _compression_eval_refresh_mode(args, step_idx=None):
-    if not _should_run_actual_codec_eval(args, step_idx=step_idx):
-        return False
-    return "always" if _should_force_actual_codec_eval(args) else True
 
 
 def _build_inference_subtree_ref(input_xyz, args):
@@ -766,23 +407,10 @@ def _build_test_subtree_groups(input_xyz, args):
     return subtree_ref, groups, subtree_stats
 
 
-def _sync_cuda_if_needed(use_cuda):
-    if use_cuda:
-        torch.cuda.synchronize()
 
 
-def _format_peak_memory_bytes(num_bytes):
-    if not num_bytes:
-        return "0B"
-    mib = float(num_bytes) / float(1024 ** 2)
-    if mib >= 1024.0:
-        return f"{mib / 1024.0:.2f}GiB"
-    return f"{mib:.1f}MiB"
 
 
-def _is_oom_error(exc):
-    message = str(exc).lower()
-    return "out of memory" in message or "cuda error: out of memory" in message
 
 
 def _effective_patch_batch_size(args, patch_count=None, patch_size=None, is_train=False, writer=None):
@@ -1164,44 +792,3 @@ def _run_named_inference_mode(mode_name, model, input_pcd, args, cache_key, use_
     if mode_name == "direct":
         return _run_direct_inference(model, input_pcd, args, use_cuda, use_amp, amp_dtype)
     raise ValueError(f"Unsupported inference mode: {mode_name}")
-
-
-def _measure_inference_mode(mode_name, model, input_pcd, args, cache_key, use_cuda, use_amp, amp_dtype, writer=None):
-    device = next(model.parameters()).device
-    if use_cuda:
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats(device)
-        _sync_cuda_if_needed(use_cuda)
-    st = time.perf_counter()
-    result = _run_named_inference_mode(
-        mode_name,
-        model,
-        input_pcd,
-        args,
-        cache_key,
-        use_cuda,
-        use_amp,
-        amp_dtype,
-        writer=writer,
-    )
-    _sync_cuda_if_needed(use_cuda)
-    elapsed = time.perf_counter() - st
-    peak_memory = int(torch.cuda.max_memory_allocated(device)) if use_cuda else 0
-    return {
-        "ok": True,
-        "mode": mode_name,
-        "elapsed": elapsed,
-        "peak_memory": peak_memory,
-        "result": result,
-    }
-
-
-def _select_auto_inference_mode(measurements, args):
-    successful = [item for item in measurements if item.get("ok", False)]
-    if not successful:
-        raise RuntimeError("Automatic inference-mode selection did not find any successful mode.")
-    fastest = min(successful, key=lambda item: item["elapsed"])
-    time_tol = float(getattr(args, "test_auto_time_tolerance", 0.10))
-    time_cutoff = fastest["elapsed"] * (1.0 + time_tol)
-    close_in_time = [item for item in successful if item["elapsed"] <= time_cutoff]
-    return min(close_in_time, key=lambda item: (item["peak_memory"], item["elapsed"]))

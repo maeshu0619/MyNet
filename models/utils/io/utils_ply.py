@@ -293,29 +293,3 @@ def write_ply(filename, field_list, field_names, triangular_faces=None):
             data.tofile(plyfile)
 
     return True
-
-
-def describe_element(name, df):
-    """Takes the columns of the dataframe and builds a ply-like description
-    Parameters
-    ----------
-    name: str
-    df: pandas DataFrame
-    Returns
-    -------
-    element: list[str]
-    """
-    property_formats = {"f": "float", "u": "uchar", "i": "int"}
-    element = ["element " + name + " " + str(len(df))]
-
-    if name == "face":
-        element.append("property list uchar int points_indices")
-
-    else:
-        for i in range(len(df.columns)):
-            # get first letter of dtype to infer format
-            f = property_formats[str(df.dtypes[i])[0]]
-            element.append("property " + f + " " + df.columns.values[i])
-
-    return element
-

@@ -60,71 +60,10 @@ def prepare_full_cloud_input_pcd(pts, use_cuda):
     return input_pcd.permute(0, 2, 1).contiguous()
 
 
-def _effective_input_point_limit(args):
-    # 既存のdownsample条件と同じ閾値を読み、Subtree深度調整の判定だけに使う。
-    max_points = int(getattr(args, "max_input_points", 0))
-    # unboundedが無効な場合は安全上限を大点群判定の代替閾値として使う。
-    if max_points <= 0 and not bool(getattr(args, "allow_unbounded_input", False)):
-        max_points = int(getattr(args, "safe_max_input_points", 0))
-    # 0以下は上限なしを表すため、深度調整も行わない。
-    return max(max_points, 0)
 
 
-def maybe_raise_subtree_depth_for_large_input(subtree_depth_meta, raw_point_count, args):
-    # 深度メタ情報を破壊せず、必要な調整結果だけをコピーへ書き込む。
-    meta = dict(subtree_depth_meta)
-
-    # 点群が大きいかどうかの判定に使う既存入力点数上限を取得する。
-    point_limit = _effective_input_point_limit(args)
-
-    # Debugログで「なぜ深度が変わったか」を確認できるよう閾値を保存する。
-    meta["large_input_point_threshold"] = int(point_limit)
-
-    # 初期状態では深度調整なしとして記録する。
-    meta["large_input_depth_adjusted"] = False
-
-    # 上限が未設定、または点数が上限内なら深度を変えない。
-    if point_limit <= 0 or int(raw_point_count) <= point_limit:
-        return meta, int(meta["depth"])
-
-    # 現在のSubtree深度を取り出す。
-    old_depth = int(meta["depth"])
-
-    # 許容される最大深度を取得する。
-    # max_depth が未設定なら old_depth + 1 を上限にして、少なくとも1段階だけ深くできるようにする。
-    max_depth = int(meta.get("max_depth", getattr(args, "train_subtree_max_depth", old_depth + 1)))
-    max_depth = max(max_depth, old_depth)
-
-    # 大点群時はSubtreeを浅くせず、1段階深くする。
-    new_depth = min(max_depth, old_depth + 1)
-
-    # Debugログで元の深度を追えるように保存する。
-    meta["large_input_depth_original"] = old_depth
-
-    # 実際に使う深度を更新する。
-    meta["depth"] = int(new_depth)
-
-    # 深度が本当に変わったかを保存する。
-    meta["large_input_depth_adjusted"] = bool(new_depth != old_depth)
-
-    # 調整後のメタ情報と深度を返す。
-    return meta, int(new_depth)
 
 
-def select_single_subtree_key(candidate_keys, selected_keys, global_step, args, cache_key):
-    # 既存Samplerが複数返した場合でも、このStepでForwardするSubtreeを必ず1個に絞る。
-    pool = selected_keys if selected_keys is not None and int(selected_keys.numel()) > 0 else candidate_keys
-    # 候補が1個以下ならそのまま返す。
-    if int(pool.numel()) <= 1:
-        return pool
-    # ファイル・Step・seedから安定した乱択Indexを作り、毎回同じ条件では同じSubtreeを選べるようにする。
-    seed_text = f"{cache_key or ''}|subtree_one|step={int(global_step)}|seed={int(getattr(args, 'seed', 0))}"
-    # SHA1から整数を作り、候補数で割った余りをSubtree位置にする。
-    selected_pos = int(hashlib.sha1(seed_text.encode("utf-8")).hexdigest()[:16], 16) % int(pool.numel())
-    # GPU上のKeyでもそのままindex_selectできるよう、同じdeviceにIndexテンソルを作る。
-    selected_idx = torch.tensor([selected_pos], device=pool.device, dtype=torch.long)
-    # 選ばれた1個のSubtree Keyだけを返す。
-    return pool.index_select(0, selected_idx)
 
 
 def weighted_compression_terms(args, terms, L_com, La_fit, include_weight=True):

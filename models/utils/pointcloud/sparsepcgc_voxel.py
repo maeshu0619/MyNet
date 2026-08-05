@@ -228,19 +228,8 @@ def restore_points_from_voxel_coords(
     }
     return xyz, restore_info
 
-def normalize_compress_key(raw_value: Any) -> str:
-    return (
-        str(raw_value)
-        .strip()
-        .lower()
-        .replace("-", "")
-        .replace("_", "")
-        .replace(" ", "")
-    )
 
 
-def is_sparsepcgc_args(args: Any) -> bool:
-    return normalize_compress_key(getattr(args, "compress", "")) == "sparsepcgc"
 
 
 def sparsepcgc_voxel_size_value(args: Any = None, default: float = 1.0) -> float:

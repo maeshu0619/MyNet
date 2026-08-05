@@ -21,15 +21,6 @@ def knn(x, src, k, transpose=False):
     return idx.long(), dists.view(b, n, k)
 
 
-def fps(x, k):
-    b, n, _ = x.shape
-    x = x.view(-1, 3)
-    offset = torch.full((b,), n, dtype=torch.long, device=x.device)
-    new_offset = torch.full((b,), k, dtype=torch.long, device=x.device)
-    offset = torch.cumsum(offset, dim=0).int()
-    new_offset = torch.cumsum(new_offset, dim=0).int()
-    idx = furthestsampling(x, offset, new_offset).long()
-    return x[idx].view(b, k, 3)
 
 
 def index_points(points, idx):
