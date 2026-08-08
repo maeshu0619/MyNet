@@ -6,7 +6,6 @@ import time
 import sys
 import numpy as np
 import hashlib
-import torch.nn as nn
 
 try:
     import open3d as o3d
@@ -265,114 +264,6 @@ def chamfer_l2_loss_and_weight_surrogate(
     loss2 = dist2.detach().mean()
     surrogate_loss = loss1 + loss2
     return hard_loss, surrogate_loss
-
-
-
-
-
-class ManifoldnessConstraint(nn.Module):
-    """
-    The Normal Consistency Constraint
-    """
-    def __init__(self, support=8, neighborhood_size=32):
-        super().__init__()
-        self.cos = nn.CosineSimilarity(dim=3, eps=1e-6)
-        self.support = support
-        self.neighborhood_size = neighborhood_size
-
-        # resourceは1回でOK
-        if faiss is not None:
-            self.faiss_res = faiss.StandardGpuResources()
-
-            # indexはメンバで持っても良いが、毎回resetが必須
-            self.cpu_index = faiss.IndexFlatL2(3)
-            self.gpu_index = faiss.index_cpu_to_gpu(self.faiss_res, 0, self.cpu_index)
-        else:
-            self.faiss_res = None
-            self.cpu_index = None
-            self.gpu_index = None
-
-    def faiss_knn(self, query_xyz_bnm: torch.Tensor, ref_xyz_brm: torch.Tensor, k: int) -> torch.Tensor:
-        """
-        注意: 毎step refが変わるので、必ず reset() → add() が必要。
-        resetを忘れるとindexが増殖して結果が壊れる。
-        """
-        B, N, _ = query_xyz_bnm.shape
-        if self.gpu_index is None:
-            return _torch_knn_idx(query_xyz_bnm, ref_xyz_brm, k)
-        idx_list = []
-
-        for b in range(B):
-            ref_np = ref_xyz_brm[b].detach().cpu().numpy().astype(np.float32, copy=False)
-            qry_np = query_xyz_bnm[b].detach().cpu().numpy().astype(np.float32, copy=False)
-
-            # ★必須：前回の点群を捨てる
-            self.gpu_index.reset()
-            self.gpu_index.add(ref_np)
-
-            _, I = self.gpu_index.search(qry_np, k)
-            idx_list.append(torch.from_numpy(I).to(ref_xyz_brm.device, dtype=torch.long))
-
-        return torch.stack(idx_list, dim=0)
-
-    def estimate_pointcloud_normals(self, xyz: torch.Tensor, neighborhood_size: int = 32) -> torch.Tensor:
-        """
-        xyz: (B, N, 3) または (B, 3, N)
-        return: (B, N, 3)
-        """
-        assert xyz.ndim == 3
-
-        if xyz.shape[1] == 3:
-            xyz = xyz.permute(0, 2, 1).contiguous()  # (B,N,3)
-
-        B, N, C = xyz.shape
-        assert C == 3
-
-        # kNN（自分自身を含むので +1 して除外）
-        knn_idx = self.faiss_knn(xyz, xyz, neighborhood_size + 1)
-        knn_idx = knn_idx[:, :, 1:]
-
-        base = torch.arange(B, device=xyz.device).view(B,1,1) * N
-        idx_flat = (knn_idx + base).reshape(-1)
-
-        xyz_flat = xyz.reshape(B*N, 3)
-        neighbors = xyz_flat[idx_flat].reshape(B, N, neighborhood_size, 3)
-
-        centroid = neighbors.mean(dim=2, keepdim=True)
-        diff = neighbors - centroid
-        cov = diff.transpose(-1, -2) @ diff
-
-        eigvals, eigvecs = torch.linalg.eigh(cov)
-        normals = eigvecs[..., 0]
-        normals = torch.nn.functional.normalize(normals, dim=-1)
-        return normals
-
-    def forward(self, xyz):
-        xyz = xyz.permute(0,2,1).contiguous()  # (B,N,3)
-
-        normals = self.estimate_pointcloud_normals(xyz, neighborhood_size=self.neighborhood_size)
-        idx = self.faiss_knn(xyz, xyz, self.support)
-
-        B, N, k = idx.shape
-        base = torch.arange(B, device=xyz.device).view(B,1,1) * N
-        idx_flat = (idx + base).reshape(-1)
-
-        normals_flat = normals.reshape(B*N, 3)
-        neighborhood = normals_flat[idx_flat].reshape(B, N, k, 3)
-
-        cos_similarity = self.cos(neighborhood[:, :, 0, :].unsqueeze(2), neighborhood)
-        penalty = 1 - cos_similarity
-        penalty = penalty.std(-1)
-        penalty = penalty.mean(-1)
-        return penalty
-    
-import torch
-import torch.nn.functional as F
-
-
-
-
-
 
 
 def compute_d2_psnr(

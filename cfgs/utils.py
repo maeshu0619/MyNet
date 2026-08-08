@@ -1,5 +1,4 @@
 import argparse
-import time
 
 def str2bool(val):
     if isinstance(val, bool):
@@ -10,12 +9,3 @@ def str2bool(val):
         return False
     else:
         raise argparse.ArgumentTypeError('Boolean value expected.')
-
-def reset_model_args(args1, args2):
-    for arg in vars(args1):
-        setattr(args2, arg, getattr(args1, arg))
-
-def cal_n_t(pts):
-    n = pts.shape[2]
-    t = time.time()
-    return t, n

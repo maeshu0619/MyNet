@@ -195,10 +195,6 @@ def _first_row_mask(rows: torch.Tensor) -> torch.Tensor:
     return result
 
 
-def _remove_rows(base: torch.Tensor, removed: torch.Tensor) -> torch.Tensor:
-    return base[~_row_membership(base, removed)] if removed.numel() else base
-
-
 def _append_rows(base: torch.Tensor, added: torch.Tensor) -> torch.Tensor:
     if added.numel() == 0:
         return base
