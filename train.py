@@ -5248,6 +5248,9 @@ def train(model, args, loss, writer, plot, notifier=None):
         checkpoint_metrics["full_cloud_val_geometry"] = full_cloud_val.get("geometry_value")
         checkpoint_metrics["full_cloud_val_fixed_objective"] = full_cloud_val.get("fixed_objective")
         checkpoint_metrics["full_cloud_val_actual_count"] = int(full_cloud_val.get("count") or 0)
+        checkpoint_metrics["full_cloud_val_sample_signature"] = str(
+            full_cloud_val.get("sample_signature") or ""
+        )
         fixed_validation_geometry = finite_float_or_none(
             full_cloud_val.get("geometry_value")
         )
@@ -5369,6 +5372,11 @@ def train(model, args, loss, writer, plot, notifier=None):
             f"reason={checkpoint_metrics.get('checkpoint_ineligible_reason') or 'none'}"
         )
         append_csv_row( metric_csv_paths.get("checkpoint_episode"), CHECKPOINT_METRIC_COLUMNS, checkpoint_metrics)
+        fixed_validation_plot = plot_fixed_validation_curve(
+            metric_csv_paths.get("checkpoint_episode")
+        )
+        if fixed_validation_plot:
+            writer.write(f"FixedValidationPlot: {fixed_validation_plot}")
         compression_episode_metrics = finalize_compression_episode_metrics( episode, current_stage, episode_compression_sums)
         append_csv_row( metric_csv_paths.get("compression_episode"), COMPRESSION_EPISODE_METRIC_COLUMNS, compression_episode_metrics)
         if episode_sequence_summary:

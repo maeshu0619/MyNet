@@ -42,6 +42,55 @@ def append_csv_row(path, columns, row):
         )
 
 
+def plot_fixed_validation_curve(path):
+    """同一フレーム集合のActual/Geometryだけを学習曲線として描画する。"""
+    if not path or not os.path.exists(path):
+        return None
+    episodes = []
+    actual = []
+    objective = []
+    geometry = []
+    with open(path, newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            try:
+                episode = int(row.get("episode", ""))
+                actual_value = float(row.get("full_cloud_val_actual_percent", ""))
+                objective_value = float(row.get("full_cloud_val_fixed_objective", ""))
+                geometry_value = float(row.get("full_cloud_val_geometry", ""))
+            except (TypeError, ValueError):
+                continue
+            if not all(math.isfinite(value) for value in (
+                actual_value, objective_value, geometry_value
+            )):
+                continue
+            episodes.append(episode)
+            actual.append(actual_value)
+            objective.append(objective_value)
+            geometry.append(geometry_value)
+    if not episodes:
+        return None
+    import matplotlib.pyplot as plt
+
+    output_path = path.replace(
+        "_checkpoint_metrics_epi.csv", "_fixed_validation_rd.png"
+    )
+    figure, axes = plt.subplots(2, 1, figsize=(9, 7), sharex=True)
+    axes[0].plot(episodes, actual, label="Actual Compression Loss (%)")
+    axes[0].plot(episodes, objective, label="Fixed RD Objective")
+    axes[0].set_ylabel("Lower is better")
+    axes[0].grid(True, alpha=0.3)
+    axes[0].legend()
+    axes[1].plot(episodes, geometry, label="Geometry Loss", color="tab:green")
+    axes[1].set_xlabel("Episode")
+    axes[1].set_ylabel("Geometry")
+    axes[1].grid(True, alpha=0.3)
+    axes[1].legend()
+    figure.tight_layout()
+    figure.savefig(output_path, dpi=160)
+    plt.close(figure)
+    return output_path
+
+
 def init_metric_csvs(args, plot, writer):
     paths = {
         "compression_step": None,

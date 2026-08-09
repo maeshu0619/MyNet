@@ -13,6 +13,7 @@ from models.utils.training.compression_primary_loss import (
     build_compression_primary_loss,
 )
 from models.utils.training.lr_control import step_scheduler_with_floor
+from models.utils.training.train_runtime import fixed_full_cloud_validation_records
 
 
 class _Writer:
@@ -111,6 +112,7 @@ class TrainingStabilityTest(unittest.TestCase):
                     "checkpoint_actual_source": "full_cloud",
                     "checkpoint_actual_delta": -3.0,
                     "checkpoint_actual_count": 1,
+                    "full_cloud_val_sample_signature": "fixed-set-a",
                 },
                 ckpt_dir=directory,
                 episode=0,
@@ -139,6 +141,7 @@ class TrainingStabilityTest(unittest.TestCase):
                     "checkpoint_actual_source": "full_cloud",
                     "checkpoint_actual_delta": -2.0,
                     "checkpoint_actual_count": 1,
+                    "full_cloud_val_sample_signature": "fixed-set-a",
                 },
                 ckpt_dir=directory,
                 episode=1,
@@ -154,6 +157,51 @@ class TrainingStabilityTest(unittest.TestCase):
                 -3.0,
             )
 
+    def test_guard_rejects_changed_validation_set(self):
+        args = self._guard_args()
+        model = torch.nn.Linear(2, 1)
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+        guard_state = {}
+        with TemporaryDirectory() as directory:
+            torch.save(model.state_dict(), os.path.join(directory, "0.pth"))
+            first = apply_actual_compression_guard(
+                args=args,
+                model=model,
+                loss=_Loss(),
+                optimizer=optimizer,
+                writer=_Writer(),
+                guard_state=guard_state,
+                checkpoint_metrics={
+                    "checkpoint_eligible": True,
+                    "checkpoint_actual_source": "full_cloud",
+                    "checkpoint_actual_delta": -3.0,
+                    "checkpoint_actual_count": 1,
+                    "full_cloud_val_sample_signature": "fixed-set-a",
+                },
+                ckpt_dir=directory,
+                episode=0,
+            )
+            self.assertEqual(first["action"], "new_best")
+            changed = apply_actual_compression_guard(
+                args=args,
+                model=model,
+                loss=_Loss(),
+                optimizer=optimizer,
+                writer=_Writer(),
+                guard_state=guard_state,
+                checkpoint_metrics={
+                    "checkpoint_eligible": True,
+                    "checkpoint_actual_source": "full_cloud",
+                    "checkpoint_actual_delta": -4.0,
+                    "checkpoint_actual_count": 1,
+                    "full_cloud_val_sample_signature": "different-set",
+                },
+                ckpt_dir=directory,
+                episode=1,
+            )
+            self.assertEqual(changed["action"], "skipped")
+            self.assertEqual(changed["reason"], "fixed_validation_signature_changed")
+
     def test_disabled_scheduler_does_not_decay_emulator_lr(self):
         parameter = torch.nn.Parameter(torch.tensor(1.0))
         optimizer = torch.optim.SGD([parameter], lr=0.1)
@@ -162,6 +210,23 @@ class TrainingStabilityTest(unittest.TestCase):
         event = step_scheduler_with_floor(scheduler, optimizer, args)
         self.assertFalse(event["scheduler_stepped"])
         self.assertAlmostEqual(optimizer.param_groups[0]["lr"], 0.1)
+
+    def test_fixed_validation_records_ignore_moving_training_window(self):
+        dataset = SimpleNamespace(
+            all_files=["/tmp/frame_0001.ply", "/tmp/frame_0002.ply", "/tmp/frame_0003.ply"],
+            files=["/tmp/frame_0001.ply", "/tmp/frame_0002.ply"],
+        )
+        args = SimpleNamespace(train_frames_per_sequence=3)
+        first, created = fixed_full_cloud_validation_records(
+            args, [("sequence", dataset)], 2
+        )
+        self.assertTrue(created)
+        dataset.files = ["/tmp/frame_0003.ply", "/tmp/frame_0001.ply"]
+        second, created_again = fixed_full_cloud_validation_records(
+            args, [("sequence", dataset)], 2
+        )
+        self.assertFalse(created_again)
+        self.assertEqual([path for _, path in first], [path for _, path in second])
 
     def test_network_autonomy_grows_only_on_fixed_validation_new_best(self):
         args = SimpleNamespace(

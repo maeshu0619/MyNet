@@ -6012,6 +6012,30 @@ def _build_exact_occupancy_ste_term(args, terms, model, out_label, before_xyz, a
 
     return ste_term, debug
 
+def fixed_full_cloud_validation_records(args, seq_datasets, max_frames):
+    """訓練窓の更新に影響されないfull-cloud検証集合を一度だけ固定する。"""
+    records = getattr(args, "_fixed_full_cloud_validation_records", None)
+    if records is not None:
+        return tuple(records), False
+    records = []
+    for _, dataset in seq_datasets:
+        source_files = list(
+            getattr(dataset, "all_files", getattr(dataset, "files", ()))
+        )
+        train_limit = int(getattr(args, "train_frames_per_sequence", 0))
+        if train_limit > 0:
+            source_files = source_files[:train_limit]
+        for file_path in source_files:
+            records.append((dataset, str(Path(file_path).expanduser().resolve())))
+            if len(records) >= int(max_frames):
+                break
+        if len(records) >= int(max_frames):
+            break
+    records = tuple(records)
+    setattr(args, "_fixed_full_cloud_validation_records", records)
+    return records, True
+
+
 def run_episode_full_cloud_validation(
     *,
     model,
@@ -6043,6 +6067,19 @@ def run_episode_full_cloud_validation(
     if source not in {"auto", "full_cloud"} or not sparsepcgc_backend:
         return {"value": None, "count": 0, "sample_names": []}
 
+    # dataset.filesはEpisodeごとに訓練窓へ更新される。ここでそれを直接読むと
+    # 「固定validation」が別フレーム同士の比較になり、guardが誤rollbackする。
+    fixed_records, fixed_records_created = fixed_full_cloud_validation_records(
+        args, seq_datasets, max_frames
+    )
+    if fixed_records_created:
+        if writer is not None and hasattr(writer, "write"):
+            writer.write(
+                "FixedFullCloudValidationSet: "
+                f"count={len(fixed_records)}, "
+                f"files={','.join(os.path.basename(path) for _, path in fixed_records)}"
+            )
+
     values = []
     geometry_values = []
     sample_names = []
@@ -6069,15 +6106,14 @@ def run_episode_full_cloud_validation(
     if old_replay_max is not None:
         loss.surrogate_replay_max_entries = 0
     try:
-        for _, dataset in seq_datasets:
-            if len(values) >= max_frames:
-                break
-            for idx in range(len(dataset)):
-                if len(values) >= max_frames:
-                    break
-                file_path = dataset.files[idx]
+        for dataset, file_path in fixed_records[:max_frames]:
                 args._current_input_file = str(Path(file_path).expanduser().resolve())
-                pts = dataset[idx]
+                load_path = getattr(dataset, "load_path", None)
+                if not callable(load_path):
+                    raise RuntimeError(
+                        "固定full-cloud validationにはPlyDirDataset.load_pathが必要である"
+                    )
+                pts = load_path(file_path)
                 input_common_cache_key = make_step_cache_key(file_path, args)
                 cache_key = f"{input_common_cache_key}|episode_full_cloud_validation"
                 args._global_train_step = int(global_step)
@@ -6263,12 +6299,16 @@ def run_episode_full_cloud_validation(
         ) * geom_penalty
     else:
         fixed_objective = None
+    validation_signature = hashlib.sha256(
+        "\n".join(str(Path(path).expanduser().resolve()) for _, path in fixed_records[:max_frames]).encode("utf-8")
+    ).hexdigest()
     writer.write(
         "FullCloudValidationSummary: "
         f"episode={episode + 1}, count={len(values)}, "
         f"actual_percent={avg_value if avg_value is not None else 'n/a'}, "
         f"geometry={avg_geometry if avg_geometry is not None else 'n/a'}, "
         f"fixed_objective={fixed_objective if fixed_objective is not None else 'n/a'}, "
+        f"sample_signature={validation_signature[:16]}, "
         f"samples={','.join(sample_names[:8]) or 'none'}"
     )
     return {
@@ -6277,6 +6317,7 @@ def run_episode_full_cloud_validation(
         "fixed_objective": fixed_objective,
         "count": len(values),
         "sample_names": sample_names,
+        "sample_signature": validation_signature,
     }
 
 def load_more_training_checkpoint(model, args, writer):

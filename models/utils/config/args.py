@@ -5829,9 +5829,13 @@ def parse_pugan_args(parser, file_day, file_time):
         if not _cli_option_was_provided("--actual_guard_require_full_state_restore"):
             args.actual_guard_require_full_state_restore = True
         if not _cli_option_was_provided("--actual_guard_decay_lr"):
-            # 固定validationで悪化を確認して完全状態へ戻した後だけLRを下げ、
-            # 同じ学習率によるrollback反復を防ぐ。
-            args.actual_guard_decay_lr = True
+            # StepLRとguardの二重減衰で序盤にLRを枯らさない。rollback時も
+            # optimizerを含む完全stateへ戻すため、追加LR低下は既定で不要。
+            args.actual_guard_decay_lr = False
+        if not _cli_option_was_provided("--actual_guard_patience"):
+            # 1～2 Episodeの一時変動で探索を巻き戻さず、固定集合で連続して
+            # 悪化した場合だけ保護を発動する。
+            args.actual_guard_patience = max(int(args.actual_guard_patience), 4)
         if not _cli_option_was_provided("--cp_tau_geom"):
             # 実測L_geomは約0.003であり、旧0.06ではpenaltyが常に0だった。
             args.cp_tau_geom = 0.0

@@ -239,9 +239,10 @@ class PlyDirDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.files)
 
-    def __getitem__(self, idx):
+    def load_path(self, path):
+        """同じDataset設定とLRUを使って、固定したPLY pathを読み込む。"""
         global _PLY_CACHE_BYTES
-        path = self.files[idx]
+        path = _resolve_data_path(path)
         if self.use_cache:
             cached = _PLY_CACHE.get(path)
             if cached is not None:
@@ -267,6 +268,9 @@ class PlyDirDataset(torch.utils.data.Dataset):
                 _, evicted = _PLY_CACHE.popitem(last=False)
                 _PLY_CACHE_BYTES -= int(evicted.numel()) * int(evicted.element_size())
         return points
+
+    def __getitem__(self, idx):
+        return self.load_path(self.files[idx])
 
 
 def collect_seq_dirs2(root, dataset_name=None):

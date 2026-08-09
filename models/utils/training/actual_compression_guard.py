@@ -346,6 +346,35 @@ def apply_actual_compression_guard(
     guard_state.setdefault("best_path", None)
     guard_state.setdefault("bad_count", 0)
 
+    if bool(getattr(args, "actual_guard_require_fixed_validation", True)):
+        signature = str(
+            checkpoint_metrics.get("full_cloud_val_sample_signature") or ""
+        ).strip()
+        if not signature:
+            return {
+                "action": "skipped",
+                "reason": "fixed_validation_signature_missing",
+                "actual_source": actual_source,
+            }
+        expected_signature = str(
+            guard_state.get("validation_signature") or ""
+        ).strip()
+        if expected_signature and signature != expected_signature:
+            guard_state["bad_count"] = 0
+            if writer is not None and hasattr(writer, "write"):
+                writer.write(
+                    "ActualCompressionGuard: skipped "
+                    "reason=fixed_validation_signature_changed"
+                )
+            return {
+                "action": "skipped",
+                "reason": "fixed_validation_signature_changed",
+                "actual_source": actual_source,
+                "validation_signature": signature,
+                "expected_validation_signature": expected_signature,
+            }
+        guard_state["validation_signature"] = signature
+
     episode_path = os.path.join(ckpt_dir, f"{episode}.pth")
     eps = max(float(getattr(args, "actual_guard_improvement_epsilon", 1e-6)), 0.0)
     if actual_delta < float(guard_state["best_delta"]) - eps:
