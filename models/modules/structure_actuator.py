@@ -3564,6 +3564,14 @@ class StructureRepairActuator(nn.Module):
             and self.training
             and current_step >= exact_anchor_steps
         )
+        # 探索は学習全期間で一定にせず、repair_exploration_fractionまで
+        # 線形に減衰させる。eval時は常に0で決定論的にする。
+        module_is_training = bool(getattr(self, "training", False))
+        exploration_multiplier = (
+            max(0.0, 1.0 - float(self._exploration_phase()))
+            if module_is_training
+            else 0.0
+        )
 
         # AmountはStep 0でden6 Exact値へ固定し、その後はNetwork値をden6で
         # 実際に比較したtotal-ratio集合へSTE量子化する。連続量の無制限探索や
@@ -3615,7 +3623,8 @@ class StructureRepairActuator(nn.Module):
             uniform = torch.rand_like(amount_logits).clamp_(1e-8, 1.0 - 1e-8)
             gumbel = -torch.log(-torch.log(uniform))
             selected_amount_bin = torch.argmax(
-                amount_logits + gumbel * float(residual_alpha)
+                amount_logits
+                + gumbel * float(residual_alpha) * float(exploration_multiplier)
             )
         else:
             selected_amount_bin = torch.argmax(amount_logits)
@@ -3641,7 +3650,7 @@ class StructureRepairActuator(nn.Module):
         # 使用しない。totalは離散bin、内訳は3つのAmount headが担当する。
         fine_sigma = max(float(getattr(
             self.args, "heuristic_guidance_online_amount_log_sigma", 0.08
-        )), 0.0) * float(residual_alpha)
+        )), 0.0) * float(residual_alpha) * float(exploration_multiplier)
         operation_fine_means = {
             name: torch.log(
                 ratio_tensors[name] / ratio_tensors[name].new_tensor(prior_ratios[name])
@@ -3722,16 +3731,37 @@ class StructureRepairActuator(nn.Module):
             move_logits,
             add_pair_logits,
         )
-        residual_weight = max(
+        residual_weight_start = max(
             float(getattr(self.args, "heuristic_guidance_network_residual_weight", 0.05)),
             0.0,
+        )
+        residual_weight_max = max(
+            float(getattr(
+                self.args,
+                "heuristic_guidance_network_residual_weight_max",
+                residual_weight_start,
+            )),
+            residual_weight_start,
+        )
+        # 候補Actual比較は増やさず、固定validationで確認済みの範囲だけ
+        # Networkがden6 Pool全体を再順位付けできる。未設定時は従来0.05。
+        residual_weight = min(
+            max(
+                float(getattr(
+                    self.args,
+                    "_heuristic_guidance_network_residual_weight_current",
+                    residual_weight_start,
+                )),
+                residual_weight_start,
+            ),
+            residual_weight_max,
         )
         temperature = max(float(
             getattr(self.args, "heuristic_guidance_online_where_temperature", 0.75)
         ), 0.05)
         gumbel_scale = max(float(
             getattr(self.args, "heuristic_guidance_online_gumbel_scale", 0.10)
-        ), 0.0)
+        ), 0.0) * float(exploration_multiplier)
         ordered_indices = {}
         static_compatible = {}
         candidate_log_probs = {}
@@ -3951,6 +3981,8 @@ class StructureRepairActuator(nn.Module):
             "selected_candidate_ids": selected_ids,
             "residual_alpha": float(residual_alpha),
             "where_residual_weight": float(residual_weight),
+            "where_residual_weight_start": float(residual_weight_start),
+            "where_residual_weight_max": float(residual_weight_max),
             "residual_changed_candidate_count": int(residual_changed_count),
             "residual_changed_candidate_ratio": float(residual_changed_ratio),
             "anchor_phase": float(anchor_phase),
@@ -3989,6 +4021,9 @@ class StructureRepairActuator(nn.Module):
             "one_pattern_only": True,
             "exploration_active": bool(exploration_active),
             "amount_exploration_active": bool(amount_exploration_active),
+            "exploration_multiplier": float(exploration_multiplier),
+            "effective_where_gumbel_scale": float(gumbel_scale),
+            "effective_amount_log_sigma": float(fine_sigma),
             "policy_log_prob": policy_log_prob,
             "policy_entropy": policy_entropy,
             "where_log_prob": where_log_prob,

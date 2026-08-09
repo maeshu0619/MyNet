@@ -115,7 +115,10 @@ from models.utils.training.metric_rows import *
 from models.utils.training.lr_control import apply_optimizer_lr_floor, step_scheduler_with_floor, optimizer_lrs_safe
 from models.utils.training.episode_metrics import *
 from models.utils.training.checkpoint_metrics import *
-from models.utils.training.actual_compression_guard import apply_actual_compression_guard
+from models.utils.training.actual_compression_guard import (
+    apply_actual_compression_guard,
+    update_network_autonomy_from_guard,
+)
 from models.utils.training.for_better_logging import *
 from models.utils.training.train_flow import * # train loopのStage固定、全点群入力、圧縮目的合成、Epoch窓選択を使う
 from models.utils.training.loss_grad_probe import build_loss_grad_probe_rows, summarize_loss_grad_probe_rows
@@ -6041,6 +6044,7 @@ def run_episode_full_cloud_validation(
         return {"value": None, "count": 0, "sample_names": []}
 
     values = []
+    geometry_values = []
     sample_names = []
     was_training = bool(model.training)
     old_replay_max = getattr(loss, "surrogate_replay_max_entries", None)
@@ -6130,6 +6134,14 @@ def run_episode_full_cloud_validation(
                         )
                         gen_xyz = gen_pts[:, :3, :]
                         final_w_for_loss = None if _discrete_loss_mode_value(args) == "hard" else final_w
+                        validation_geometry = loss.get_geometry_loss(
+                            args,
+                            gen_xyz,
+                            input_xyz[:, :3, :],
+                            final_w=final_w_for_loss,
+                            out_label=out_label,
+                        )
+                        validation_geometry_value = finite_float_or_none(validation_geometry)
                         gen_xyz_for_actual, voxel_restored_actual_debug = _select_actual_gen_xyz_from_voxel_state(
                             args,
                             writer,
@@ -6220,6 +6232,8 @@ def run_episode_full_cloud_validation(
                     if value is not None:
                         values.append(float(value))
                         sample_names.append(os.path.basename(str(file_path)))
+                        if validation_geometry_value is not None:
+                            geometry_values.append(float(validation_geometry_value))
                 except Exception as exc:
                     writer.write(
                         "FullCloudValidationWarning: "
@@ -6235,13 +6249,35 @@ def run_episode_full_cloud_validation(
             model.train()
 
     avg_value = sum(values) / float(len(values)) if values else None
+    avg_geometry = (
+        sum(geometry_values) / float(len(geometry_values))
+        if geometry_values
+        else None
+    )
+    if avg_value is not None and avg_geometry is not None:
+        geom_penalty = max(
+            avg_geometry - float(getattr(args, "cp_tau_geom", 0.0)), 0.0
+        )
+        fixed_objective = avg_value + float(
+            getattr(args, "cp_lambda_geom", 1.0)
+        ) * geom_penalty
+    else:
+        fixed_objective = None
     writer.write(
         "FullCloudValidationSummary: "
         f"episode={episode + 1}, count={len(values)}, "
         f"actual_percent={avg_value if avg_value is not None else 'n/a'}, "
+        f"geometry={avg_geometry if avg_geometry is not None else 'n/a'}, "
+        f"fixed_objective={fixed_objective if fixed_objective is not None else 'n/a'}, "
         f"samples={','.join(sample_names[:8]) or 'none'}"
     )
-    return {"value": avg_value, "count": len(values), "sample_names": sample_names}
+    return {
+        "value": avg_value,
+        "geometry_value": avg_geometry,
+        "fixed_objective": fixed_objective,
+        "count": len(values),
+        "sample_names": sample_names,
+    }
 
 def load_more_training_checkpoint(model, args, writer):
     # more_training=False の場合は、追加学習用checkpointを読まない

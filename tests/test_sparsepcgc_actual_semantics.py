@@ -1067,7 +1067,10 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
             "final_voxel_hash": _coord_hash(expected),
             "ranked_candidate_pools": {
                 "Add": [{"candidate_id": "a0", "operation": "Add", "pool_rank": 0, "remove_coords": [], "add_coords": [[2, 0, 1]]}],
-                "Prune": [{"candidate_id": "p0", "operation": "Prune", "pool_rank": 0, "remove_coords": [[0, 0, 0]], "add_coords": []}],
+                "Prune": [
+                    {"candidate_id": "p0", "operation": "Prune", "pool_rank": 0, "remove_coords": [[0, 0, 0]], "add_coords": []},
+                    {"candidate_id": "p1", "operation": "Prune", "pool_rank": 1, "remove_coords": [[0, 1, 0]], "add_coords": []},
+                ],
                 "Adjust": [{"candidate_id": "m0", "operation": "Adjust", "pool_rank": 0, "remove_coords": [[1, 0, 0]], "add_coords": [[2, 0, 0]]}],
             },
         }
@@ -1155,6 +1158,44 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
             len({round(float(value.reshape(-1)[0]), 7) for value in operation_gradients}),
             3,
         )
+
+        # 固定validationで許可されたresidual weight拡大により、同じPool内で
+        # den6順位差をNetwork scoreが逆転できることを確認する。
+        prune_map = guidance["candidate_tensor_map"]["Prune"]
+        prune_map["rank_score"] = torch.tensor([0.55, 0.45])
+        prune_map["source_index"] = torch.tensor([0, 2], dtype=torch.long)
+        drop_preference = torch.zeros((1, 1, coords.shape[-1]))
+        drop_preference[0, 0, 0] = -10.0
+        drop_preference[0, 0, 2] = 10.0
+        actuator.args.heuristic_guidance_network_residual_weight = 0.05
+        actuator.args.heuristic_guidance_network_residual_weight_max = 0.25
+        actuator.args._heuristic_guidance_network_residual_weight_current = 0.05
+        low_autonomy = actuator._build_exact_den6_residual_plan(
+            guidance,
+            coords,
+            add_ratio,
+            prune_ratio,
+            adjust_ratio,
+            drop_preference,
+            torch.zeros((1, 1, coords.shape[-1])),
+            torch.zeros((1, 26, coords.shape[-1])),
+            torch.zeros((1, coords.shape[-1], 26)),
+        )
+        actuator.args._heuristic_guidance_network_residual_weight_current = 0.25
+        high_autonomy = actuator._build_exact_den6_residual_plan(
+            guidance,
+            coords,
+            add_ratio,
+            prune_ratio,
+            adjust_ratio,
+            drop_preference,
+            torch.zeros((1, 1, coords.shape[-1])),
+            torch.zeros((1, 26, coords.shape[-1])),
+            torch.zeros((1, coords.shape[-1], 26)),
+        )
+        self.assertIn("p0", low_autonomy[1]["selected_candidate_ids"])
+        self.assertIn("p1", high_autonomy[1]["selected_candidate_ids"])
+        self.assertNotEqual(low_autonomy[1]["plan_hash"], high_autonomy[1]["plan_hash"])
 
     def test_den6_anchor_amounts_are_operation_specific_at_step_zero(self):
         """8i m=8の0.25%を旧5% Prune候補で上書きしない。"""

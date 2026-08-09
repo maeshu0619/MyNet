@@ -28,9 +28,9 @@ method_name = "Mine"
 
 model_name = "best_loss_joint"
 
-# dataname = "8i"
+dataname = "8i"
 # dataname = "MVUB"
-dataname = "UVG"
+# dataname = "UVG"
 
 dataset_name = "longdress"
 # dataset_name = "loot"
@@ -2567,7 +2567,19 @@ def parse_pugan_args(parser, file_day, file_time):
         '--heuristic_guidance_network_residual_weight',
         default=0.05,
         type=float,
-        help='den6 candidate rankへ加える局所Network残差の最大重み。順位全体を壊さず境界近傍だけを入れ替える',
+        help='den6 candidate rankへ加える局所Network残差の初期重み',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_network_residual_weight_max',
+        default=0.25,
+        type=float,
+        help='固定validation改善時に段階拡大するPool内Network再順位付け重みの上限',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_network_residual_weight_increment',
+        default=0.025,
+        type=float,
+        help='固定validationがnew bestになったEpisodeごとのNetwork再順位付け重み増分',
     )
     parser.add_argument(
         '--heuristic_guidance_outside_pool_logit_penalty',
@@ -2912,6 +2924,8 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--actual_guard_lr_decay', default=0.5, type=float, help='actual guard発動時のoptimizer LR倍率')
     parser.add_argument('--actual_guard_min_fresh', default=1, type=int, help='actual guardを判定する最低fresh actual計測数')
     parser.add_argument('--actual_guard_restore_best', default=True, type=str2bool, help='actual guard発動時にbest episode checkpointへ戻す')
+    parser.add_argument('--actual_guard_require_fixed_validation', default=True, type=str2bool, help='Trueなら同一full-cloud validationだけでguardを判定し、移動する訓練窓の平均ではrollbackしない')
+    parser.add_argument('--actual_guard_require_full_state_restore', default=True, type=str2bool, help='Trueならmodelだけでなくoptimizer/scheduler/scalerも保存済みの場合だけrollbackする')
     parser.add_argument('--actual_guard_improvement_epsilon', default=1e-6, type=float, help='actual guardのbest更新に必要な最小改善幅')
     parser.add_argument('--checkpoint_actual_source', default='auto', type=str, help='actual checkpoint/guardの主指標(auto/fresh/full_cloud)')
     parser.add_argument('--checkpoint_full_cloud_min_count', default=1, type=int, help='full_cloud actualをcheckpoint主指標に使う最低件数')
@@ -3862,6 +3876,14 @@ def parse_pugan_args(parser, file_day, file_time):
     args.heuristic_guidance_network_residual_weight = max(
         float(getattr(args, "heuristic_guidance_network_residual_weight", 0.05)), 0.0
     )
+    args.heuristic_guidance_network_residual_weight_max = max(
+        float(getattr(args, "heuristic_guidance_network_residual_weight_max", 0.25)),
+        args.heuristic_guidance_network_residual_weight,
+    )
+    args.heuristic_guidance_network_residual_weight_increment = max(
+        float(getattr(args, "heuristic_guidance_network_residual_weight_increment", 0.025)),
+        0.0,
+    )
     args.heuristic_guidance_online_amount_residual_scale = min(max(
         float(getattr(args, "heuristic_guidance_online_amount_residual_scale", 0.35)),
         0.0,
@@ -4678,6 +4700,12 @@ def parse_pugan_args(parser, file_day, file_time):
     args.actual_guard_lr_decay = min(max(float(getattr(args, "actual_guard_lr_decay", 0.5)), 0.0), 1.0)
     args.actual_guard_min_fresh = max(int(getattr(args, "actual_guard_min_fresh", 1)), 1)
     args.actual_guard_restore_best = bool(getattr(args, "actual_guard_restore_best", True))
+    args.actual_guard_require_fixed_validation = bool(
+        getattr(args, "actual_guard_require_fixed_validation", True)
+    )
+    args.actual_guard_require_full_state_restore = bool(
+        getattr(args, "actual_guard_require_full_state_restore", True)
+    )
     args.actual_guard_improvement_epsilon = max(float(getattr(args, "actual_guard_improvement_epsilon", 1e-6)), 0.0)
     args.checkpoint_actual_source = str(
         getattr(args, "checkpoint_actual_source", "auto")
@@ -5796,6 +5824,21 @@ def parse_pugan_args(parser, file_day, file_time):
             args.use_amp = False
         if not _cli_option_was_provided("--checkpoint_actual_source"):
             args.checkpoint_actual_source = "full_cloud"
+        if not _cli_option_was_provided("--actual_guard_require_fixed_validation"):
+            args.actual_guard_require_fixed_validation = True
+        if not _cli_option_was_provided("--actual_guard_require_full_state_restore"):
+            args.actual_guard_require_full_state_restore = True
+        if not _cli_option_was_provided("--actual_guard_decay_lr"):
+            # 固定validationで悪化を確認して完全状態へ戻した後だけLRを下げ、
+            # 同じ学習率によるrollback反復を防ぐ。
+            args.actual_guard_decay_lr = True
+        if not _cli_option_was_provided("--cp_tau_geom"):
+            # 実測L_geomは約0.003であり、旧0.06ではpenaltyが常に0だった。
+            args.cp_tau_geom = 0.0
+        if not _cli_option_was_provided("--cp_lambda_geom"):
+            # L_geomを圧縮percentと同程度の補助尺度へ移す。support上限は
+            # compression_primary_aux_target_ratioが引き続き保証する。
+            args.cp_lambda_geom = 100.0
         if not _cli_option_was_provided("--train_full_cloud_actual_interval"):
             # Full-cloud SparsePCGC teacher is already supplied by the splice-based
             # actual oracle.  The no-grad full-cloud anchor only produced zero

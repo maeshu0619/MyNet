@@ -5121,7 +5121,22 @@ def train(model, args, loss, writer, plot, notifier=None):
             if epoch_has_optimizer_step:
                 scheduler_event = step_scheduler_with_floor( scheduler_steplr, optimizer, args, writer=writer, global_epoch=global_epoch + 1, global_step=global_train_step) # StepLRを進める場合でもLR floorを必ず適用する
                 if emulator_scheduler is not None and emulator_optimizer is not None:
-                    emulator_scheduler.step()
+                    # main schedulerと同じ有効フラグを通す。従来はここだけ毎Epoch
+                    # 無条件にstepしており、長期訓練でEmulator LRがほぼ0になっていた。
+                    emulator_scheduler_event = step_scheduler_with_floor(
+                        emulator_scheduler,
+                        emulator_optimizer,
+                        args,
+                        writer=writer,
+                        global_epoch=global_epoch + 1,
+                        global_step=global_train_step,
+                    )
+                    scheduler_event["emulator_scheduler_stepped"] = bool(
+                        emulator_scheduler_event.get("scheduler_stepped", False)
+                    )
+                    scheduler_event["current_lr_emulator"] = optimizer_lrs_safe(
+                        emulator_optimizer
+                    )
                 if scheduler_event.get("scheduler_stepped"):
                     scheduler_step_count += 1
                 scheduler_event["scheduler_step_count"] = scheduler_step_count
@@ -5230,7 +5245,34 @@ def train(model, args, loss, writer, plot, notifier=None):
             global_step=global_train_step,
         )
         checkpoint_metrics["full_cloud_val_actual_percent"] = full_cloud_val.get("value")
+        checkpoint_metrics["full_cloud_val_geometry"] = full_cloud_val.get("geometry_value")
+        checkpoint_metrics["full_cloud_val_fixed_objective"] = full_cloud_val.get("fixed_objective")
         checkpoint_metrics["full_cloud_val_actual_count"] = int(full_cloud_val.get("count") or 0)
+        fixed_validation_geometry = finite_float_or_none(
+            full_cloud_val.get("geometry_value")
+        )
+        if fixed_validation_geometry is not None:
+            fixed_geom_reference = checkpoint_gate_refs.get("fixed_validation_geom")
+            if fixed_geom_reference is None:
+                fixed_geom_reference = float(fixed_validation_geometry)
+                checkpoint_gate_refs["fixed_validation_geom"] = fixed_geom_reference
+            relative_limit = float(getattr(args, "checkpoint_geom_rel_factor", 1.5))
+            absolute_limit = float(getattr(args, "checkpoint_geom_abs_max", 0.0))
+            fixed_geometry_ok = bool(
+                (relative_limit <= 0.0 or fixed_validation_geometry <= abs(fixed_geom_reference) * relative_limit)
+                and (absolute_limit <= 0.0 or fixed_validation_geometry <= absolute_limit)
+            )
+            checkpoint_metrics["fixed_validation_geom_reference"] = float(
+                fixed_geom_reference
+            )
+            checkpoint_metrics["geometry_ok"] = fixed_geometry_ok
+            checkpoint_metrics["safety_ok"] = bool(
+                fixed_geometry_ok
+                and checkpoint_metrics.get("repair_ok", True)
+                and checkpoint_metrics.get("node_ok", True)
+                and checkpoint_metrics.get("single_ok", True)
+                and checkpoint_metrics.get("operation_ok", True)
+            )
         if (
             str(checkpoint_metrics.get("checkpoint_actual_source", "")).strip().lower() == "full_cloud"
             and full_cloud_val.get("value") is not None
@@ -5520,7 +5562,37 @@ def train(model, args, loss, writer, plot, notifier=None):
             except Exception as exc:
                 writer.write(f"Phase7EvalSummaryCheckpointSaveWarning: {type(exc).__name__}: {exc}")
                 
-        guard_event = apply_actual_compression_guard( args=args, model=model, loss=loss, optimizer=optimizer, writer=writer, guard_state=actual_guard_state, checkpoint_metrics=checkpoint_metrics, ckpt_dir=ckpt_dir, episode=episode)
+        guard_event = apply_actual_compression_guard(
+            args=args,
+            model=model,
+            loss=loss,
+            optimizer=optimizer,
+            writer=writer,
+            guard_state=actual_guard_state,
+            checkpoint_metrics=checkpoint_metrics,
+            ckpt_dir=ckpt_dir,
+            episode=episode,
+            runtime_state={
+                "optimizer": optimizer,
+                "scheduler": scheduler_steplr,
+                "scaler": scaler,
+                "emulator_optimizer": emulator_optimizer,
+                "emulator_scheduler": emulator_scheduler,
+                "emulator_scaler": emulator_scaler,
+                "mutable_mappings": {
+                    "network_k_state_visit_counts": network_k_state_visit_counts,
+                },
+            },
+        )
+        autonomy_event = update_network_autonomy_from_guard(args, guard_event)
+        if autonomy_event.get("changed") or episode == 0:
+            writer.write(
+                "NetworkAutonomyUpdate: "
+                f"episode={episode + 1}, guard_action={autonomy_event['action']}, "
+                f"where_residual_weight={autonomy_event['previous']:.6f}"
+                f"->{autonomy_event['current']:.6f}, "
+                f"maximum={autonomy_event['maximum']:.6f}"
+            )
         if guard_event:
             guard_event["global_step"] = global_train_step
             guard_event["current_lr_main"] = optimizer_lrs_safe(optimizer)

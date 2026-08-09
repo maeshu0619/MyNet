@@ -1,10 +1,187 @@
 import math
 import os
+import random
 
 import torch
 
+try:
+    import numpy as np
+except ImportError:  # pragma: no cover - numpy無しでもguard自体は動かす
+    np = None
+
 from .checkpointing import surrogate_sidecar_filename
 from .lr_control import apply_optimizer_lr_floor, optimizer_lrs_safe
+
+
+_RUNTIME_ARG_STATE_NAMES = (
+    "_sparsepcgc_anchor_success_memory",
+    "_sparsepcgc_amount_outcome_memory",
+    "_sparsepcgc_full_cloud_sequence_amount_memory",
+    "_sparsepcgc_full_cloud_sequence_baseline_memory",
+    "_heuristic_guidance_network_residual_weight_current",
+)
+
+
+def update_network_autonomy_from_guard(args, guard_event):
+    """固定validationが改善した時だけden6 Pool内のNetwork裁量を広げる。"""
+    start = max(
+        float(getattr(args, "heuristic_guidance_network_residual_weight", 0.05)),
+        0.0,
+    )
+    maximum = max(
+        float(getattr(args, "heuristic_guidance_network_residual_weight_max", 0.25)),
+        start,
+    )
+    increment = max(
+        float(getattr(args, "heuristic_guidance_network_residual_weight_increment", 0.025)),
+        0.0,
+    )
+    current = min(
+        max(
+            float(getattr(
+                args,
+                "_heuristic_guidance_network_residual_weight_current",
+                start,
+            )),
+            start,
+        ),
+        maximum,
+    )
+    action = str((guard_event or {}).get("action", "")).strip().lower()
+    previous = current
+    # new_bestは同一固定frameで圧縮性能が改善した証拠である。候補Actualを
+    # 増やさず、次EpisodeからPool全体の再順位付け幅を一段だけ広げる。
+    if action == "new_best":
+        current = min(current + increment, maximum)
+    elif action == "rollback":
+        # 完全state restoreで保存時の裁量へ戻っている。念のため範囲だけ拘束する。
+        current = min(max(current, start), maximum)
+    setattr(args, "_heuristic_guidance_network_residual_weight_current", current)
+    event = {
+        "action": action or "none",
+        "previous": float(previous),
+        "current": float(current),
+        "start": float(start),
+        "maximum": float(maximum),
+        "increment": float(increment),
+        "changed": bool(abs(current - previous) > 1e-12),
+    }
+    if isinstance(guard_event, dict):
+        guard_event["network_autonomy_previous"] = event["previous"]
+        guard_event["network_autonomy_current"] = event["current"]
+        guard_event["network_autonomy_changed"] = event["changed"]
+    return event
+
+
+def _training_state_path(model_path):
+    stem, ext = os.path.splitext(str(model_path))
+    return f"{stem}_training_state{ext or '.pth'}"
+
+
+def _state_dict_or_none(value):
+    state_dict = getattr(value, "state_dict", None)
+    return state_dict() if callable(state_dict) else None
+
+
+def _optimizer_state_to_parameter_device(optimizer):
+    if optimizer is None:
+        return
+    parameter_device = None
+    for group in optimizer.param_groups:
+        for parameter in group.get("params", ()):
+            if torch.is_tensor(parameter):
+                parameter_device = parameter.device
+                break
+        if parameter_device is not None:
+            break
+    if parameter_device is None:
+        return
+    for state_values in optimizer.state.values():
+        for key, value in list(state_values.items()):
+            if torch.is_tensor(value):
+                state_values[key] = value.to(device=parameter_device)
+
+
+def _save_training_state(model_path, runtime_state, args):
+    """Actual guardで巻き戻す学習状態をsidecarへ保存する。"""
+    runtime_state = runtime_state or {}
+    payload = {
+        "version": 1,
+        "main_optimizer": _state_dict_or_none(runtime_state.get("optimizer")),
+        "main_scheduler": _state_dict_or_none(runtime_state.get("scheduler")),
+        "main_scaler": _state_dict_or_none(runtime_state.get("scaler")),
+        "emulator_optimizer": _state_dict_or_none(runtime_state.get("emulator_optimizer")),
+        "emulator_scheduler": _state_dict_or_none(runtime_state.get("emulator_scheduler")),
+        "emulator_scaler": _state_dict_or_none(runtime_state.get("emulator_scaler")),
+        "runtime_args": {
+            name: getattr(args, name)
+            for name in _RUNTIME_ARG_STATE_NAMES
+            if hasattr(args, name)
+        },
+        "torch_rng_state": torch.get_rng_state(),
+        "python_rng_state": random.getstate(),
+    }
+    if torch.cuda.is_available():
+        payload["cuda_rng_state_all"] = torch.cuda.get_rng_state_all()
+    if np is not None:
+        payload["numpy_rng_state"] = np.random.get_state()
+    mutable_mappings = runtime_state.get("mutable_mappings", {})
+    payload["mutable_mappings"] = {
+        str(name): dict(value)
+        for name, value in mutable_mappings.items()
+        if isinstance(value, dict)
+    }
+    path = _training_state_path(model_path)
+    tmp_path = f"{path}.tmp.{os.getpid()}"
+    torch.save(payload, tmp_path)
+    os.replace(tmp_path, path)
+    return path
+
+
+def _load_training_state(model_path, runtime_state, args):
+    """モデル重みと同じ時点のoptimizer等を復元し、部分rollbackを防ぐ。"""
+    path = _training_state_path(model_path)
+    if not os.path.exists(path):
+        return False, path
+    payload = torch.load(path, map_location="cpu")
+    runtime_state = runtime_state or {}
+    object_keys = (
+        ("optimizer", "main_optimizer"),
+        ("scheduler", "main_scheduler"),
+        ("scaler", "main_scaler"),
+        ("emulator_optimizer", "emulator_optimizer"),
+        ("emulator_scheduler", "emulator_scheduler"),
+        ("emulator_scaler", "emulator_scaler"),
+    )
+    for runtime_key, payload_key in object_keys:
+        obj = runtime_state.get(runtime_key)
+        state = payload.get(payload_key)
+        load_state_dict = getattr(obj, "load_state_dict", None)
+        if callable(load_state_dict) and isinstance(state, dict):
+            load_state_dict(state)
+            if "optimizer" in runtime_key:
+                _optimizer_state_to_parameter_device(obj)
+    for name, value in (payload.get("runtime_args") or {}).items():
+        if name in _RUNTIME_ARG_STATE_NAMES:
+            setattr(args, name, value)
+    for name, value in (payload.get("mutable_mappings") or {}).items():
+        target = (runtime_state.get("mutable_mappings") or {}).get(name)
+        if isinstance(target, dict) and isinstance(value, dict):
+            target.clear()
+            target.update(value)
+    torch_rng_state = payload.get("torch_rng_state")
+    if torch.is_tensor(torch_rng_state):
+        torch.set_rng_state(torch_rng_state)
+    cuda_rng_state_all = payload.get("cuda_rng_state_all")
+    if torch.cuda.is_available() and isinstance(cuda_rng_state_all, (list, tuple)):
+        torch.cuda.set_rng_state_all(cuda_rng_state_all)
+    python_rng_state = payload.get("python_rng_state")
+    if python_rng_state is not None:
+        random.setstate(python_rng_state)
+    numpy_rng_state = payload.get("numpy_rng_state")
+    if np is not None and numpy_rng_state is not None:
+        np.random.set_state(numpy_rng_state)
+    return True, path
 
 
 def _finite_float(value, default=None):
@@ -126,6 +303,7 @@ def apply_actual_compression_guard(
     checkpoint_metrics,
     ckpt_dir,
     episode,
+    runtime_state=None,
 ):
     if not bool(getattr(args, "actual_compression_guard", True)):
         return None
@@ -145,6 +323,14 @@ def apply_actual_compression_guard(
         }
 
     actual_source, actual_delta, actual_count = _selected_actual_metric(checkpoint_metrics)
+    if bool(getattr(args, "actual_guard_require_fixed_validation", True)) and actual_source != "full_cloud":
+        reason = "fixed_full_cloud_validation_required"
+        if writer is not None and hasattr(writer, "write"):
+            writer.write(
+                "ActualCompressionGuard: skipped "
+                f"episode={episode + 1}, reason={reason}, actual_source={actual_source}"
+            )
+        return {"action": "skipped", "reason": reason, "actual_source": actual_source}
     min_count = (
         max(int(getattr(args, "checkpoint_full_cloud_min_count", 1)), 0)
         if actual_source == "full_cloud"
@@ -166,6 +352,7 @@ def apply_actual_compression_guard(
         guard_state["best_delta"] = actual_delta
         guard_state["best_path"] = episode_path
         guard_state["bad_count"] = 0
+        training_state_path = _save_training_state(episode_path, runtime_state, args)
         message = (
             "ActualCompressionGuard: new_best "
             f"episode={episode + 1}, actual_source={actual_source}, "
@@ -180,6 +367,8 @@ def apply_actual_compression_guard(
             "actual_source": actual_source,
             "best_delta": actual_delta,
             "best_path": episode_path,
+            "training_state_path": training_state_path,
+            "training_state_saved": True,
             "bad_count": 0,
         }
 
@@ -219,15 +408,23 @@ def apply_actual_compression_guard(
     best_path = guard_state.get("best_path")
     restored = False
     surrogate_restored = False
+    training_state_restored = False
+    training_state_path = _training_state_path(best_path) if best_path else None
     if bool(getattr(args, "actual_guard_restore_best", True)) and best_path and os.path.exists(best_path):
-        _load_model_state(model, best_path)
-        surrogate_restored = _load_surrogate_state(loss, best_path)
-        _clear_loss_caches(loss)
-        clear_input_cache = getattr(model, "clear_input_cache", None)
-        if callable(clear_input_cache):
-            clear_input_cache()
-        model.train()
-        restored = True
+        training_state_restored, training_state_path = _load_training_state(
+            best_path, runtime_state, args
+        )
+        if training_state_restored or not bool(
+            getattr(args, "actual_guard_require_full_state_restore", True)
+        ):
+            _load_model_state(model, best_path)
+            surrogate_restored = _load_surrogate_state(loss, best_path)
+            _clear_loss_caches(loss)
+            clear_input_cache = getattr(model, "clear_input_cache", None)
+            if callable(clear_input_cache):
+                clear_input_cache()
+            model.train()
+            restored = True
 
     global_step = int(getattr(args, "_global_train_step", 0))
     old_lrs = optimizer_lrs_safe(optimizer)
@@ -267,9 +464,11 @@ def apply_actual_compression_guard(
             "guard_rollback": bool(restored),
             "guard_lr_changed": bool(decay_lr and old_lrs != new_lrs),
             "lr_floor_applied": bool(lr_floor_applied),
-            "rollback_reason": "fresh_actual_delta_worse_than_guard_tolerance",
+            "rollback_reason": "fixed_validation_actual_worse_than_guard_tolerance",
             "restored": restored,
             "surrogate_restored": surrogate_restored,
+            "training_state_restored": training_state_restored,
+            "training_state_path": training_state_path,
             "restore_path": best_path,
             "old_lrs": old_lrs,
             "new_lrs": new_lrs,
@@ -285,6 +484,7 @@ def apply_actual_compression_guard(
             "ActualCompressionGuard: "
             f"{event['action']} episode={episode + 1}, actual_source={actual_source}, actual_delta={actual_delta:.6f}, "
             f"best={best_delta:.6f}, restored={restored}, surrogate_restored={surrogate_restored}, "
+            f"training_state_restored={training_state_restored}, "
             f"guard_lr_changed={event['guard_lr_changed']}, new_lrs={new_lrs}"
         )
     return event

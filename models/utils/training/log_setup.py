@@ -194,9 +194,27 @@ def log_runtime_setup(writer, args):
         f"enabled={bool(getattr(args, 'actual_compression_guard', True))}, "
         f"patience={int(getattr(args, 'actual_guard_patience', 2))}, "
         f"tolerance={float(getattr(args, 'actual_guard_tolerance', 0.25)):.6g}, "
-        f"lr_decay={float(getattr(args, 'actual_guard_lr_decay', 0.5)):.6g}, "
-        f"restore_best={bool(getattr(args, 'actual_guard_restore_best', True))}"
+        f"lr_decay_enabled={bool(getattr(args, 'actual_guard_decay_lr', False))}, "
+        f"lr_decay_factor={float(getattr(args, 'actual_guard_lr_decay', 0.5)):.6g}, "
+        f"restore_best={bool(getattr(args, 'actual_guard_restore_best', True))}, "
+        f"fixed_validation_only={bool(getattr(args, 'actual_guard_require_fixed_validation', True))}, "
+        f"full_state_restore={bool(getattr(args, 'actual_guard_require_full_state_restore', True))}"
     )
+    if str(getattr(args, "loss_mode", "")).strip().lower() == "compression_primary":
+        writer.write(
+            "Compression Primary Geometry: "
+            f"lambda={float(getattr(args, 'cp_lambda_geom', 1.0)):.6g}, "
+            f"tau={float(getattr(args, 'cp_tau_geom', 0.0)):.6g}, "
+            f"aux_ratio_cap={float(getattr(args, 'compression_primary_aux_target_ratio', 0.25)):.6g}"
+        )
+    if str(getattr(args, "heuristic_guidance_mode", "")).strip().lower() == "ana_den6_online":
+        writer.write(
+            "Network Pool Autonomy: "
+            f"start={float(getattr(args, 'heuristic_guidance_network_residual_weight', 0.05)):.6g}, "
+            f"max={float(getattr(args, 'heuristic_guidance_network_residual_weight_max', 0.25)):.6g}, "
+            f"new_best_increment={float(getattr(args, 'heuristic_guidance_network_residual_weight_increment', 0.025)):.6g}, "
+            "gate=fixed_full_cloud_validation"
+        )
 
 
 def log_codec_setup(writer, args):

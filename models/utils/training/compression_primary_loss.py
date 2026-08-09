@@ -356,6 +356,13 @@ def build_compression_primary_loss(
         "cp_L_com_main": case_float(L_com_main, float("nan")),
         "cp_L_com_primary": case_float(L_com_primary, float("nan")),
         "cp_P_geom": case_float(P_geom, float("nan")),
+        "cp_geom_loss_raw": case_float(as_scalar_loss_tensor(L_geom), float("nan")),
+        "cp_geom_tau": float(getattr(args, "cp_tau_geom", 0.0)),
+        "cp_geom_lambda": float(getattr(args, "cp_lambda_geom", 1.0)),
+        "cp_geom_block_raw": case_float(geom_block, float("nan")),
+        "cp_geom_block_scaled": case_float(
+            aux_balance_scale * geom_block, float("nan")
+        ),
         "cp_P_single": case_float(P_single, float("nan")),
         "cp_P_nodes": case_float(P_nodes, float("nan")),
         "cp_P_sparsepcgc": case_float(P_sparsepcgc, float("nan")),
