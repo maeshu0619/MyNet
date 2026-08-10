@@ -1,11 +1,29 @@
 """ana_den6 online workerの同値高速化テスト。"""
 
+import argparse
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
 import unittest
 
-from tools.ana_den6_online_worker import _baseline_codec_rate_only
+from tools.ana_den6_online_worker import _baseline_codec_rate_only, _build_den6_args
+
+
+class _FakeDen6:
+    @staticmethod
+    def build_parser(_den5):
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--data")
+        parser.add_argument("--m-values")
+        parser.add_argument("--native-resolution", type=int, default=0)
+        parser.add_argument("--output-root")
+        parser.add_argument("--dataset-input")
+        parser.add_argument("--cpu", action="store_true")
+        return parser
+
+    @staticmethod
+    def _prepare_args(_den5, args):
+        return args
 
 
 class _FakeBase:
@@ -39,6 +57,19 @@ class _FakeCoder:
 
 
 class AnaDen6OnlineWorkerTest(unittest.TestCase):
+    def test_train_native_resolution_is_forwarded_to_den6(self):
+        args = _build_den6_args(
+            _FakeDen6,
+            object(),
+            data="UVG",
+            scale_m=8,
+            native_resolution=1023,
+            input_file=Path("frame.ply"),
+            output_root=Path("output"),
+            use_cpu=False,
+        )
+        self.assertEqual(args.native_resolution, 1023)
+
     def test_rate_only_baseline_keeps_exact_bits_without_psnr(self):
         with tempfile.TemporaryDirectory() as directory:
             input_file = Path(directory) / "input.ply"

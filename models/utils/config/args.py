@@ -235,6 +235,8 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--print_actuator_hard_soft_compare', action='store_true', help='Actuatorのhard/soft出力の統計を取る比較モード')
     parser.add_argument('--print_rate', default=1, type=int, help='ログ出力頻度（1なら毎ステップ、0なら最初と最後のみ）')
     parser.add_argument('--dataname', default=dataname, type=str, help='データセットの名称')
+    parser.add_argument('--train_all_datasets', default=True, type=str2bool, help='Trueなら共通のSparsePCGC設定のまま、1 Episode内で8i/MVUB/UVGを順番にすべて学習する')
+    parser.add_argument('--train_all_dataset_names', default='8i,MVUB,UVG', type=str, help='train_all_datasetsで巡回するデータセット名（カンマ区切り）')
     parser.add_argument(
         '--dataset_name', '--datasetname',
         dest='dataset_name',
@@ -1833,8 +1835,8 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--min_main_lr', default=1e-5, type=float, help='main optimizerの学習率floor')
     parser.add_argument('--min_surrogate_lr', default=1e-6, type=float, help='Surrogate optimizerの学習率floor')
     parser.add_argument('--max_files', default=10, type=int, help='1系列の1Epochで読み込むフレーム数')
-    parser.add_argument('--train_frames_per_sequence', default=90, type=int, help='各系列で訓練に使用する先頭フレーム数。残りは訓練窓から除外する')
-    parser.add_argument('--episodes', default=128, type=int, help='学習エピソード数')
+    parser.add_argument('--train_frames_per_sequence', default=100, type=int, help='各系列で訓練に使用する先頭フレーム数。残りは訓練窓から除外する')
+    parser.add_argument('--episodes', default=256, type=int, help='学習エピソード数')
     parser.add_argument('--lr', default=1e-3, type=float, help='学習率')
     parser.add_argument('--deform', default=False, type=str2bool, help='変形モジュールをゆっくり学習するか')
     parser.add_argument('--loss_type', default='cd', type=str, help='幾何損失の種類')
@@ -2033,15 +2035,15 @@ def parse_pugan_args(parser, file_day, file_time):
         type=str,
         help='SparsePCGC互換canonical voxel座標の量子化方式。既定は round(xyz/voxel_size) 後に round(/posQuantscale) を行う',
     )
-    parser.add_argument('--sparsepcgc_psnr_resolution', default=1023, type=int, help='SparsePCGC lossy評価用PSNR resolution')
+    parser.add_argument('--sparsepcgc_psnr_resolution', default=1023, type=int, help='D1/D2 PSNRのpeak座標値（通常10-bitは1023、9-bitは511）。全dataset modeでは起動時の値を共通使用')
     parser.add_argument('--sparsepcgc_test_d2', default=False, type=str2bool, help='SparsePCGC lossy評価でD2を計算するか')
     parser.add_argument('--sparsepcgc_dense_scale_ae_list', default='1,0,1,0,1,0', type=str, help='SparsePCGC dense_lossy用AE scale list')
     parser.add_argument('--sparsepcgc_dense_scale_sr_list', default='0,1,1,2,2,3', type=str, help='SparsePCGC dense_lossy用SR scale list')
     parser.add_argument('--sparsepcgc_pos_quantscale_list', default='4', type=str, help='SparsePCGC sparse_lossy_gpcc用posQuantscale list')
     parser.add_argument('--sparsepcgc_scale_m', default=8, type=int, help='SparsePCGC dense lossyの有効m。既定8')
     parser.add_argument('--sparsepcgc_scale_ae', default=0, type=int, choices=[0, 1], help='mからAE/SRを決める際のAE scale。ana_den6と同じ既定0')
-    parser.add_argument('--sparsepcgc_scale_sr', default=None, type=int, help='SparsePCGC dense lossyのSR scale。未指定時はnative bit depth-m-AEから自動計算')
-    parser.add_argument('--sparsepcgc_native_bit_depth', default=0, type=int, help='m=bit_depth-(AE+SR)を計算するnative bit depth。0は8i/MVUB=10、UVG=9を自動選択')
+    parser.add_argument('--sparsepcgc_scale_sr', default=None, type=int, help='SparsePCGC dense lossyのSR scale。未指定時は起動時にnative bit depth-m-AEから一度だけ計算')
+    parser.add_argument('--sparsepcgc_native_bit_depth', default=0, type=int, help='m=bit_depth-(AE+SR)を計算するnative bit depth。0は起動時datasetから決め、全dataset mode中は固定')
     parser.add_argument('--heuristic_guidance_enabled', default=True, type=str2bool, help='ana_den6由来HeuristicをWhere/Amount/Actionのpriorとして使う')
     parser.add_argument(
         '--heuristic_guidance_network_only_inference',
@@ -3109,6 +3111,30 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--mail_sendmail_path', default='/usr/sbin/sendmail', type=str, help='sendmailコマンドのパス')
 
     args = parser.parse_args()
+    args.train_all_datasets = bool(getattr(args, "train_all_datasets", False))
+    raw_all_dataset_names = str(
+        getattr(args, "train_all_dataset_names", "8i,MVUB,UVG")
+    ).split(",")
+    canonical_dataset_names = {"8i": "8i", "mvub": "MVUB", "uvg": "UVG"}
+    normalized_dataset_names = []
+    for raw_name in raw_all_dataset_names:
+        key = raw_name.strip().lower()
+        if not key:
+            continue
+        if key not in canonical_dataset_names:
+            raise ValueError(
+                "--train_all_dataset_namesは8i,MVUB,UVGのみ指定できる: "
+                f"{raw_name}"
+            )
+        canonical_name = canonical_dataset_names[key]
+        if canonical_name not in normalized_dataset_names:
+            normalized_dataset_names.append(canonical_name)
+    if args.train_all_datasets and not normalized_dataset_names:
+        raise ValueError("--train_all_datasets=Trueだが対象datasetが空である")
+    args.train_all_dataset_names = tuple(normalized_dataset_names)
+    if args.train_all_datasets:
+        # model初期化もEpisode内の最初のdataset条件へ合わせる。
+        args.dataname = args.train_all_dataset_names[0]
     # ============================================================
     # Phase5:
     # 構造経路監査設定の正規化

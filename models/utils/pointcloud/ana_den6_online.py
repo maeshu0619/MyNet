@@ -688,6 +688,9 @@ def _load_exact_single_plan_teacher(
             "--scale-m", str(int(identity["scale_m"])),
             "--scale-ae", str(int(identity["scale_ae"])),
             "--scale-sr", str(int(identity["scale_sr"])),
+            "--native-resolution", str(int(getattr(
+                args, "sparsepcgc_psnr_resolution", 1023
+            ))),
             "--max-total-ratio", str(float(getattr(
                 args, "heuristic_guidance_online_max_total_ratio", 0.0099
             ))),

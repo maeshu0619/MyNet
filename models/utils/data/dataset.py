@@ -171,6 +171,29 @@ def clear_ply_cache():
     _PLY_CACHE_BYTES = 0
 
 
+def canonical_training_dataset_name(value):
+    key = str(value or "").strip().lower()
+    aliases = {"8i": "8i", "8ivslf": "8i", "mvub": "MVUB", "uvg": "UVG"}
+    if key not in aliases:
+        raise ValueError(f"未対応の訓練datasetである: {value}")
+    return aliases[key]
+
+
+def training_dataset_name_from_path(path):
+    """.../ground/<dataset>/<sequence>からdataset名を取得する。"""
+    resolved = Path(_resolve_data_path(path)).resolve()
+    parent_name = resolved.parent.name if resolved.is_dir() else resolved.parent.parent.name
+    return canonical_training_dataset_name(parent_name)
+
+
+def activate_training_dataset_context(args, dataset_name):
+    """入力dataset名だけを切り替え、圧縮条件はargsの共通設定を維持する。"""
+    canonical = canonical_training_dataset_name(dataset_name)
+    previous = str(getattr(args, "dataname", ""))
+    args.dataname = canonical
+    return previous != canonical
+
+
 class PlyDirDataset(torch.utils.data.Dataset):
     """
     - ディレクトリが渡された場合：
@@ -180,6 +203,7 @@ class PlyDirDataset(torch.utils.data.Dataset):
     """
     def __init__(self, args, path):
         path = _resolve_data_path(path)
+        self.training_dataset_name = training_dataset_name_from_path(path)
         self.use_cache = bool(getattr(args, "dataset_cache", True))
         self.cache_max_entries = max(int(getattr(args, "dataset_cache_max_entries", 64)), 0)
         self.cache_max_bytes = max(int(getattr(args, "dataset_cache_max_memory_mb", 1024)), 0) * 1024 * 1024

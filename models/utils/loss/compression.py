@@ -676,12 +676,25 @@ class CompressionLossMixin:
             codec_key = "draco"
         else:
             codec_key = "octattention"
-        if self.actual_encoder is None or getattr(self, "actual_encoder_codec_key", None) != codec_key:
+        if codec_key == "sparsepcgc":
+            encoder_runtime_key = (
+                codec_key,
+                str(getattr(args, "sparsepcgc_mode", "dense_lossy")),
+                int(getattr(args, "sparsepcgc_scale_m", 8)),
+                int(getattr(args, "sparsepcgc_scale_ae", 0)),
+                int(getattr(args, "sparsepcgc_scale_sr", 0)),
+                float(getattr(args, "sparsepcgc_voxel_size", 1.0)),
+                int(getattr(args, "sparsepcgc_pos_quantscale", 1)),
+                int(getattr(args, "sparsepcgc_psnr_resolution", 1023)),
+            )
+        else:
+            encoder_runtime_key = (codec_key,)
+        if self.actual_encoder is None or getattr(self, "actual_encoder_codec_key", None) != encoder_runtime_key:
             old_encoder = self.actual_encoder
             if old_encoder is not None and hasattr(old_encoder, "close"):
                 old_encoder.close()
             self.actual_encoder = build_actual_encoder(args, writer=self.writer)
-            self.actual_encoder_codec_key = codec_key
+            self.actual_encoder_codec_key = encoder_runtime_key
             if hasattr(self, "actual_gt_cache"):
                 self.actual_gt_cache.clear()
             if hasattr(self, "surrogate_target_cache"):
@@ -1182,7 +1195,10 @@ class CompressionLossMixin:
         return max(float(getattr(args, "qs", 1.0)), 1e-9)
 
     def _attach_octree_aux_stats(self, args, pts_3n, stats):
-        codec_name = str(stats.get("codec", getattr(self, "actual_encoder_codec_key", "octattention"))).strip().lower()
+        fallback_codec = getattr(self, "actual_encoder_codec_key", "octattention")
+        if isinstance(fallback_codec, tuple) and fallback_codec:
+            fallback_codec = fallback_codec[0]
+        codec_name = str(stats.get("codec", fallback_codec)).strip().lower()
         node_value = float(stats.get("node", 0.0))
         single_value = float(stats.get("single", -1.0))
         # SparsePCGC/G-PCC/Draco wrappers already return codec-side node and

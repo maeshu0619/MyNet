@@ -97,6 +97,7 @@ from models.utils.training.correlation_debug import *
 from models.utils.training.sparsepcgc_controls import *
 from models.utils.training.compression_primary_loss import *
 from models.utils.training.compression_primary_loss import (
+    _compression_primary_remaining_support_balance,
     _compression_primary_support_balance,
     monotonic_support_scale,
 )
@@ -145,7 +146,7 @@ STEP_GRAD_COLUMNS = [
     "param_name_sample",
 ]
 
-def _limit_training_seq_dirs(seq_dirs, args):
+def _limit_training_seq_dirs(seq_dirs, args, dataset_name=None):
     diagnostic_sequence = str(
         getattr(args, "network_k_diagnostic_sequence_name", "") or ""
     ).strip()
@@ -164,7 +165,12 @@ def _limit_training_seq_dirs(seq_dirs, args):
             raise ValueError("K Proposal診断系列を一意に特定できない")
         return selected
     # 8iは従来既定では先頭3シーケンスのみを使うが、argsで4つ全部へ切替可能にする。
-    if str(getattr(args, "dataname", "")).strip().lower() == "8i":
+    active_dataset = (
+        str(dataset_name).strip().lower()
+        if dataset_name is not None
+        else str(getattr(args, "dataname", "")).strip().lower()
+    )
+    if active_dataset == "8i":
         mode = str(getattr(args, "train_8i_sequence_mode", "first3")).strip().lower()
         if mode == "all4":
             return list(seq_dirs)
@@ -6018,7 +6024,8 @@ def fixed_full_cloud_validation_records(args, seq_datasets, max_frames):
     if records is not None:
         return tuple(records), False
     records = []
-    for _, dataset in seq_datasets:
+    records_by_dataset = OrderedDict()
+    for seq_dir, dataset in seq_datasets:
         source_files = list(
             getattr(dataset, "all_files", getattr(dataset, "files", ()))
         )
@@ -6026,11 +6033,41 @@ def fixed_full_cloud_validation_records(args, seq_datasets, max_frames):
         if train_limit > 0:
             source_files = source_files[:train_limit]
         for file_path in source_files:
-            records.append((dataset, str(Path(file_path).expanduser().resolve())))
-            if len(records) >= int(max_frames):
-                break
-        if len(records) >= int(max_frames):
+            record = (dataset, str(Path(file_path).expanduser().resolve()))
+            if bool(getattr(args, "train_all_datasets", False)):
+                dataset_name = getattr(
+                    dataset,
+                    "training_dataset_name",
+                    training_dataset_name_from_path(seq_dir),
+                )
+                records_by_dataset.setdefault(dataset_name, []).append(record)
+            else:
+                records.append(record)
+                if len(records) >= int(max_frames):
+                    break
+        if not bool(getattr(args, "train_all_datasets", False)) and len(records) >= int(max_frames):
             break
+    if bool(getattr(args, "train_all_datasets", False)):
+        # 先頭datasetだけで固定検証が埋まらないよう、dataset間をround-robinする。
+        cursors = {name: 0 for name in records_by_dataset}
+        ordered_names = [
+            name for name in getattr(args, "train_all_dataset_names", ())
+            if name in records_by_dataset
+        ]
+        while len(records) < int(max_frames):
+            progressed = False
+            for name in ordered_names:
+                index = cursors[name]
+                candidates = records_by_dataset[name]
+                if index >= len(candidates):
+                    continue
+                records.append(candidates[index])
+                cursors[name] += 1
+                progressed = True
+                if len(records) >= int(max_frames):
+                    break
+            if not progressed:
+                break
     records = tuple(records)
     setattr(args, "_fixed_full_cloud_validation_records", records)
     return records, True
@@ -6100,6 +6137,11 @@ def run_episode_full_cloud_validation(
             "_collect_structure_debug",
             "_collect_sparsepcgc_debug",
             "_den6_online_training_step_active",
+            "dataname",
+            "sparsepcgc_native_bit_depth",
+            "sparsepcgc_scale_sr",
+            "sparsepcgc_psnr_resolution",
+            "sparsepcgc_dense_scale_sr_list",
         )
     }
     model.eval()
@@ -6107,6 +6149,15 @@ def run_episode_full_cloud_validation(
         loss.surrogate_replay_max_entries = 0
     try:
         for dataset, file_path in fixed_records[:max_frames]:
+                if bool(getattr(args, "train_all_datasets", False)):
+                    activate_training_dataset_context(
+                        args,
+                        getattr(
+                            dataset,
+                            "training_dataset_name",
+                            training_dataset_name_from_path(file_path),
+                        ),
+                    )
                 args._current_input_file = str(Path(file_path).expanduser().resolve())
                 load_path = getattr(dataset, "load_path", None)
                 if not callable(load_path):

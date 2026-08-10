@@ -9,8 +9,35 @@ def train(model, args, loss, writer, plot, notifier=None):
     """基本情報"""
     set_seed(args.seed, deterministic=getattr(args, "deterministic", False)) # ランスシードを固定し、学習結果の再現性を確保する
     best_loss = float('inf') # 後続の計算・ログのため
-    raw_seq_dirs = collect_seq_dirs2(args.input_dir, dataset_name=args.dataname) # 入力ディレクトリから学習対象のシーケンスディレクトリ一覧を集める
-    seq_dirs = _limit_training_seq_dirs(raw_seq_dirs, args) # 8iだけ先頭3シーケンスに制限し、4つ目は使わない
+    if bool(getattr(args, "train_all_datasets", False)):
+        raw_seq_dirs = []
+        limited_by_dataset = []
+        for dataset_name in getattr(args, "train_all_dataset_names", ("8i", "MVUB", "UVG")):
+            dataset_seq_dirs = collect_seq_dirs2(
+                args.input_dir, dataset_name=dataset_name
+            )
+            raw_seq_dirs.extend(dataset_seq_dirs)
+            if not str(
+                getattr(args, "network_k_diagnostic_sequence_name", "") or ""
+            ).strip():
+                limited_by_dataset.extend(
+                    _limit_training_seq_dirs(
+                        dataset_seq_dirs, args, dataset_name=dataset_name
+                    )
+                )
+        if str(getattr(args, "network_k_diagnostic_sequence_name", "") or "").strip():
+            seq_dirs = _limit_training_seq_dirs(raw_seq_dirs, args)
+        else:
+            seq_dirs = limited_by_dataset
+        writer.write(
+            "AllDatasetTraining: enabled=True, order={}, sequences={}".format(
+                ">".join(getattr(args, "train_all_dataset_names", ())),
+                len(seq_dirs),
+            )
+        )
+    else:
+        raw_seq_dirs = collect_seq_dirs2(args.input_dir, dataset_name=args.dataname) # 入力ディレクトリから学習対象のシーケンスディレクトリ一覧を集める
+        seq_dirs = _limit_training_seq_dirs(raw_seq_dirs, args) # 8iだけ先頭3シーケンスに制限し、4つ目は使わない
     if (
         _episode_input_common_cache_enabled(args)
         and bool(getattr(args, "episode_input_common_cache_enable_dataset_cache", True))
@@ -22,10 +49,10 @@ def train(model, args, loss, writer, plot, notifier=None):
     if len(seq_dirs) != len(raw_seq_dirs):
         kept_names = ", ".join(os.path.basename(seq_dir) for seq_dir in seq_dirs)
         writer.write(
-            "8i training sequence limit applied: "
+            "Training sequence limit applied: "
             f"using {len(seq_dirs)} of {len(raw_seq_dirs)} sequence directories"
         )
-        writer.write(f"8i kept sequence dirs: {kept_names}")
+        writer.write(f"Kept sequence dirs: {kept_names}")
     seq_datasets = [(seq_dir, PlyDirDataset(args, seq_dir)) for seq_dir in seq_dirs] # 各シーケンス内のPLY点群ファイルを読み込むデータセットを作る
     single_plan_teacher_store = None
     if str(getattr(args, "heuristic_guidance_mode", "")).strip().lower() == "single_plan_student":
@@ -50,22 +77,28 @@ def train(model, args, loss, writer, plot, notifier=None):
             if str(getattr(
                 args, "single_plan_training_stage", "representation"
             )).strip().lower() in {"representation", "fast_distillation"}:
-                setting_id = (
-                    "native_vs{}_pq{}_ae{}_sr{}_m{}".format(
+                def _single_plan_setting_id(scale_sr):
+                    return (
+                        "native_vs{}_pq{}_ae{}_sr{}_m{}".format(
                         float(getattr(args, "sparsepcgc_voxel_size", 1.0)),
                         int(getattr(args, "sparsepcgc_pos_quantscale", 1)),
                         int(getattr(args, "sparsepcgc_scale_ae", 0)),
-                        int(getattr(args, "sparsepcgc_scale_sr", 2)),
+                        int(scale_sr),
                         int(getattr(args, "sparsepcgc_scale_m", 8)),
-                    ).replace("vs1.0", "vs1")
-                )
+                        ).replace("vs1.0", "vs1")
+                    )
+                setting_ids = {
+                    _single_plan_setting_id(
+                        int(getattr(args, "sparsepcgc_scale_sr", 2))
+                    )
+                }
                 cached_paths = set()
                 matching_state_ids = set()
                 for rows in single_plan_teacher_store.states.values():
                     if not rows:
                         continue
                     state = dict(rows[0].get("state_key") or {})
-                    if str(state.get("setting_id", "")) == setting_id:
+                    if str(state.get("setting_id", "")) in setting_ids:
                         cached_paths.add(os.path.realpath(str(state.get("input_file", ""))))
                         matching_state_ids.add(
                             "{}|{}".format(
@@ -124,7 +157,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                     "SinglePlanOfflineCoverage: stage={}, setting={}, frames={}, "
                     "uncached_frame_apply=0".format(
                         str(getattr(args, "single_plan_training_stage", "")),
-                        setting_id,
+                        ",".join(sorted(setting_ids)),
                         selected_file_count,
                     )
                 )
@@ -204,6 +237,10 @@ def train(model, args, loss, writer, plot, notifier=None):
     if str(getattr(args, "heuristic_guidance_mode", "")).strip().lower() not in {
         "ana_den6_online", "ana_den6_residual"
     }:
+        den6_prefetch_lookahead = 0
+    if bool(getattr(args, "train_all_datasets", False)):
+        # 非同期workerへ可変argsを渡すと、dataset切替と競合して別dataset名の
+        # cacheを作り得る。全dataset modeでは各Stepの同期cache lookupを使う。
         den6_prefetch_lookahead = 0
     if seq_datasets and den6_prefetch_lookahead > 0 and not k_all_actual_enabled:
         first_files = list(getattr(seq_datasets[0][1], "files", ()))[:den6_prefetch_lookahead]
@@ -420,8 +457,33 @@ def train(model, args, loss, writer, plot, notifier=None):
         episode_max_consecutive_nonfinite_grad_skips = 0
 
         for epoch, (seq_dir, dataset) in enumerate(seq_datasets): # Epoch開始
+            epoch_dataset_name = getattr(
+                dataset,
+                "training_dataset_name",
+                training_dataset_name_from_path(seq_dir),
+            )
+            dataset_context_changed = activate_training_dataset_context(
+                args, epoch_dataset_name
+            )
             writer.write(f"⦿⦿⦿ Epoch {epoch + 1}/{num_seq} : {seq_dir} ⦿⦿⦿")
-            sequence_name = os.path.basename(os.path.normpath(str(seq_dir)))
+            if dataset_context_changed:
+                writer.write(
+                    "TrainingDatasetContext: dataset={}, shared_codec=1, "
+                    "native_depth={}, AE={}, SR={}, m={}, resolution={}".format(
+                        args.dataname,
+                        int(getattr(args, "sparsepcgc_native_bit_depth", 0)),
+                        int(getattr(args, "sparsepcgc_scale_ae", 0)),
+                        int(getattr(args, "sparsepcgc_scale_sr", 0)),
+                        int(getattr(args, "sparsepcgc_scale_m", 0)),
+                        int(getattr(args, "sparsepcgc_psnr_resolution", 0)),
+                    )
+                )
+            sequence_basename = os.path.basename(os.path.normpath(str(seq_dir)))
+            sequence_name = (
+                f"{args.dataname}/{sequence_basename}"
+                if bool(getattr(args, "train_all_datasets", False))
+                else sequence_basename
+            )
             _record_memory(
                 "epoch_before_loader",
                 episode=episode + 1,

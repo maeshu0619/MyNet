@@ -932,8 +932,18 @@ def warmup_whole_cloud_caches(model, args, loss, seq_datasets, writer, use_cuda,
     warmup_start = time.time()
     stop_reason = None
 
+    original_dataset_name = str(getattr(args, "dataname", ""))
     with torch.inference_mode():
-        for _, dataset in seq_datasets:
+        for seq_dir, dataset in seq_datasets:
+            if bool(getattr(args, "train_all_datasets", False)):
+                activate_training_dataset_context(
+                    args,
+                    getattr(
+                        dataset,
+                        "training_dataset_name",
+                        training_dataset_name_from_path(seq_dir),
+                    ),
+                )
             for step, pts in enumerate(dataset):
                 if warmup_max_files > 0 and processed >= warmup_max_files:
                     stop_warmup = True
@@ -997,6 +1007,9 @@ def warmup_whole_cloud_caches(model, args, loss, seq_datasets, writer, use_cuda,
                     break
             if stop_warmup:
                 break
+
+    if bool(getattr(args, "train_all_datasets", False)) and original_dataset_name:
+        activate_training_dataset_context(args, original_dataset_name)
 
     if use_cuda:
         torch.cuda.empty_cache()

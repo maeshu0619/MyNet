@@ -4,6 +4,10 @@ import time
 import hashlib
 from contextlib import nullcontext
 import torch
+from ..data.dataset import (
+    activate_training_dataset_context,
+    training_dataset_name_from_path,
+)
 from ..training.correlation import format_corr
 from ..training.correlation_debug import *
 from ..training.sparsepcgc_controls import *
@@ -635,6 +639,11 @@ def run_surrogate_pretrain(
         "compression_surrogate_replay_batch": getattr(args, "compression_surrogate_replay_batch", 1),
         "compression_surrogate_replay_entries": getattr(args, "compression_surrogate_replay_entries", 0),
         "compression_surrogate_reuse_last_target": getattr(args, "compression_surrogate_reuse_last_target", True),
+        "dataname": getattr(args, "dataname", ""),
+        "sparsepcgc_native_bit_depth": getattr(args, "sparsepcgc_native_bit_depth", 0),
+        "sparsepcgc_scale_sr": getattr(args, "sparsepcgc_scale_sr", 0),
+        "sparsepcgc_psnr_resolution": getattr(args, "sparsepcgc_psnr_resolution", 0),
+        "sparsepcgc_dense_scale_sr_list": getattr(args, "sparsepcgc_dense_scale_sr_list", []),
     }
     corr_pairs = {}
     abs_error_history = []
@@ -682,6 +691,15 @@ def run_surrogate_pretrain(
         while completed_steps < steps and early_stop_reason is None:
             progressed = False
             for _seq_dir, dataset in seq_datasets:
+                if bool(getattr(args, "train_all_datasets", False)):
+                    activate_training_dataset_context(
+                        args,
+                        getattr(
+                            dataset,
+                            "training_dataset_name",
+                            training_dataset_name_from_path(_seq_dir),
+                        ),
+                    )
                 active_dataset = apply_epoch_file_window(dataset, args, pretrain_window_index) # 各系列の訓練領域から同じ位置のmax_files窓を選ぶ
                 loader = torch.utils.data.DataLoader(active_dataset, **loader_kwargs) # 窓選択後のDatasetをDataLoaderへ渡す
                 data_wait_t0 = time.perf_counter()

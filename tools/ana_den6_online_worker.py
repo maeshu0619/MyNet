@@ -91,6 +91,7 @@ def _build_den6_args(
     *,
     data: str,
     scale_m: int,
+    native_resolution: int,
     input_file: Path,
     output_root: Path,
     use_cpu: bool,
@@ -98,6 +99,7 @@ def _build_den6_args(
     argv = [
         "--data", str(data),
         "--m-values", str(int(scale_m)),
+        "--native-resolution", str(int(native_resolution)),
         "--output-root", str(output_root),
         "--dataset-input", str(input_file),
     ]
@@ -298,6 +300,12 @@ def main() -> int:
     parser.add_argument("--scale-m", required=True, type=int)
     parser.add_argument("--scale-ae", default=0, type=int)
     parser.add_argument("--scale-sr", required=True, type=int)
+    parser.add_argument(
+        "--native-resolution",
+        default=0,
+        type=int,
+        help="train側と共通の座標resolution。0ならden6のdataset既定値",
+    )
     parser.add_argument("--total-ratio", default=-1.0, type=float, help="0-1表記")
     parser.add_argument("--operation-shares", default="")
     parser.add_argument("--max-total-ratio", default=0.0099, type=float, help="候補poolを用意する最大総操作率")
@@ -351,6 +359,7 @@ def main() -> int:
         den5,
         data=cli.data,
         scale_m=int(cli.scale_m),
+        native_resolution=int(cli.native_resolution),
         input_file=input_file,
         output_root=output_root,
         use_cpu=bool(cli.cpu),
