@@ -7,12 +7,40 @@ from models.modules.single_plan_student import SinglePlanStudentPolicy
 from models.network import Network
 from models.utils.loss.single_plan_distillation import SinglePlanDistillationLoss
 from models.utils.training.compression_primary_loss import (
+    _compression_primary_remaining_support_balance,
     _compression_primary_support_balance,
     monotonic_support_scale,
 )
 
 
 class SinglePlanDistillationTest(unittest.TestCase):
+    def test_total_support_budget_preserves_gradient_and_caps_sum(self):
+        args = SimpleNamespace(compression_primary_total_support_target_ratio=0.40)
+        primary = torch.tensor(-10.0)
+        tail = torch.tensor(8.0, requires_grad=True)
+        balance = _compression_primary_remaining_support_balance(
+            args,
+            primary,
+            existing_support_mag=2.5,
+            new_support_value=tail,
+        )
+        # 全補助項の予算4.0のうち既存2.5を除いた1.5だけをtailへ許す。
+        self.assertAlmostEqual(balance["scale"], 1.5 / 8.0, places=7)
+        weighted = balance["scale"] * tail
+        self.assertAlmostEqual(2.5 + float(weighted.detach()), 4.0, places=7)
+        weighted.backward()
+        self.assertGreater(float(tail.grad.abs()), 0.0)
+
+    def test_total_support_budget_does_not_increase_small_tail(self):
+        args = SimpleNamespace(compression_primary_total_support_target_ratio=0.40)
+        balance = _compression_primary_remaining_support_balance(
+            args,
+            torch.tensor(-10.0),
+            existing_support_mag=1.0,
+            new_support_value=torch.tensor(2.0),
+        )
+        self.assertEqual(balance["scale"], 1.0)
+
     def test_shadow_distillation_is_bounded_by_primary_objective(self):
         """Shadow蒸留を残しつつ、圧縮主目的より大きい勾配支配を防ぐ。"""
         args = SimpleNamespace(

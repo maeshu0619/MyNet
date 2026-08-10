@@ -1045,7 +1045,11 @@ def run_surrogate_pretrain(
                         SURROGATE_PRETRAIN_COLUMNS,
                         row,
                     )
-                    if plot is not None and hasattr(plot, "record_surrogate_pretrain"):
+                    if (
+                        bool(getattr(args, "save_step_metric_csv", False))
+                        and plot is not None
+                        and hasattr(plot, "record_surrogate_pretrain")
+                    ):
                         plot.record_surrogate_pretrain(step_number, row)
 
                     if step_number in {1, 3} or (step_number % max(print_interval, 1) == 0):
@@ -1136,7 +1140,11 @@ def run_surrogate_pretrain(
             surrogate_param_norm=final_param_norm,
             surrogate_lr=optimizer_lrs(surrogate_optimizer),
         )
-        if plot is not None and hasattr(plot, "plot_surrogate_pretrain_curve"):
+        if (
+            bool(getattr(args, "save_step_metric_csv", False))
+            and plot is not None
+            and hasattr(plot, "plot_surrogate_pretrain_curve")
+        ):
             plot.plot_surrogate_pretrain_curve()
             writer.write(f"Saved surrogate pretrain plot/csv: {plot.save_dir}")
         if bool(getattr(args, "surrogate_pretrain_checkpoint", True)):

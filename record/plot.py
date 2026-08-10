@@ -58,9 +58,11 @@ class PlotMaker():
         self.step_loss_his = [[] for _ in range(self.num_loss)]
         self.epo_loss_his = [[] for _ in range(self.num_loss)]
         self.epi_loss_his = [[] for _ in range(self.num_loss)]
+        self.step100_loss_his = [[] for _ in range(self.num_loss)]
         self.step_x_his = []
         self.epo_x_his = []
         self.epi_x_his = []
+        self.step100_x_his = []
         # Point Edit図は実際の3操作だけを表示する。Amount診断やOracle値は
         # compression/operation metricsへ残し、Point Edit図へ混在させない。
         self.edit_keys = [
@@ -71,9 +73,11 @@ class PlotMaker():
         self.step_edit_his = [[] for _ in self.edit_keys]
         self.epo_edit_his = [[] for _ in self.edit_keys]
         self.epi_edit_his = [[] for _ in self.edit_keys]
+        self.step100_edit_his = [[] for _ in self.edit_keys]
         self.step_edit_x_his = []
         self.epo_edit_x_his = []
         self.epi_edit_x_his = []
+        self.step100_edit_x_his = []
         self._reset_edit_running("epo")
         self._reset_edit_running("epi")
         self.occupancy_keys = [
@@ -182,12 +186,19 @@ class PlotMaker():
         self.filename_step = f"{args.time}_step"
         self.filename_epo = f"{args.time}_epo"
         self.filename_epi = f"{args.time}_epi"
-        self.title_group = [[0, 1, 13], [2, 3, 4, 5, 8, 9], [14, 15, 16], [6, 10], [7, 11, 12]] # actual objective / policy / oracleを同じ圧縮グループに並べる
+        self.filename_step100 = f"{args.time}_100step"
+        # 指定された図だけを残す。metric自体はEpisode CSVとcheckpoint判定の
+        # 互換性のため削除せず、PNGへの配置だけを整理する。
+        self.title_group = [
+            [2, 3, 9, 8],
+            [0, 1, 6],
+            [13, 7],
+            [11, 12, 10],
+        ]
         self.group_title = [
-            "other", 
-            "compression", 
-            "surrogate",
-            "structure_attribution",
+            "compression",
+            "other",
+            "repair",
             "repair_policy",
         ]
         self.filename = [
@@ -213,16 +224,16 @@ class PlotMaker():
         self.title = [
             "Loss", 
             "Loss of Geometry", 
-            "Backward Surrogate / Proxy Delta (100*(Mine-GT)/GT)",
-            "Training Actual Objective Delta",
+            "Surrogate Compression Delta",
+            "Actual Compression Delta",
             "Policy Actual Delta",
             "Oracle Teacher Actual Delta",
             "Loss of Octree Cost Attribution",
             "Loss of Structure Repair Policy",
             "Loss of Single Child Nodes", 
             "Loss of Nodes", 
-            "Mean Single-Child Chain Attribution",
-            "Mean Low-Probability Occupancy Attribution",
+            "Mean Single-Child Attribution",
+            "Mean Low-Probability Attribution",
             "Mean Node-Count Attribution",
             "Loss of Structure Repair Actuator",
             "Surrogate Teacher Fit Loss (SmoothL1)",
@@ -256,6 +267,15 @@ class PlotMaker():
         self.episode_plot_skipped = 0
         self.step_plot_recorded = 0
         self._recent_metric_abs = [[] for _ in range(self.num_loss)]
+        self.step_average_window = max(
+            int(getattr(args, "plot_step_average_window", 100)), 1
+        )
+        self._step100_metric_sums = [0.0 for _ in range(self.num_loss)]
+        self._step100_metric_counts = [0 for _ in range(self.num_loss)]
+        self._step100_metric_steps = 0
+        self._step100_edit_sums = [0.0 for _ in self.edit_keys]
+        self._step100_edit_counts = [0 for _ in self.edit_keys]
+        self._step100_edit_steps = 0
         self._reset_plot_running("epo")
         self._reset_plot_running("epi")
 
@@ -375,6 +395,58 @@ class PlotMaker():
         x_history.append(int(x_value))
         self._append_list(loss_history, values)
 
+    def _accumulate_step100_metrics(self, values):
+        """重複しない100 Stepブロックをメモリ上だけで平均する。"""
+        for idx, value in enumerate(values):
+            if value is None:
+                continue
+            self._step100_metric_sums[idx] += float(value)
+            self._step100_metric_counts[idx] += 1
+        self._step100_metric_steps += 1
+        if self._step100_metric_steps < self.step_average_window:
+            return False
+        averages = [
+            (total / float(count)) if count > 0 else None
+            for total, count in zip(
+                self._step100_metric_sums, self._step100_metric_counts
+            )
+        ]
+        block_index = len(self.step100_x_his) + 1
+        self._append_history_entry(
+            self.step100_x_his, self.step100_loss_his, block_index, averages
+        )
+        self._step100_metric_sums = [0.0 for _ in range(self.num_loss)]
+        self._step100_metric_counts = [0 for _ in range(self.num_loss)]
+        self._step100_metric_steps = 0
+        return True
+
+    def _accumulate_step100_edits(self, values):
+        for idx, value in enumerate(values):
+            if value is None:
+                continue
+            self._step100_edit_sums[idx] += float(value)
+            self._step100_edit_counts[idx] += 1
+        self._step100_edit_steps += 1
+        if self._step100_edit_steps < self.step_average_window:
+            return False
+        averages = [
+            (total / float(count)) if count > 0 else None
+            for total, count in zip(
+                self._step100_edit_sums, self._step100_edit_counts
+            )
+        ]
+        block_index = len(self.step100_edit_x_his) + 1
+        self._append_edit_history_entry(
+            self.step100_edit_x_his,
+            self.step100_edit_his,
+            block_index,
+            averages,
+        )
+        self._step100_edit_sums = [0.0 for _ in self.edit_keys]
+        self._step100_edit_counts = [0 for _ in self.edit_keys]
+        self._step100_edit_steps = 0
+        return True
+
     def _normalized_metric_list(self, values):
         return [self._metric_float(value) for value in values]
 
@@ -463,30 +535,11 @@ class PlotMaker():
         }
 
         if mode == "step":
-            outlier_info = None
-            if bool(self.plot_skip_outlier_steps):
-                outlier_info = self._detect_step_outlier(numeric_values)
-            if outlier_info is not None:
-                self.step_plot_skipped += 1
-                info.update(
-                    {
-                        "recorded": False,
-                        "skipped": True,
-                        "reason": outlier_info["reason"],
-                        "metric_idx": outlier_info["metric_idx"],
-                        "metric_key": outlier_info["metric_key"],
-                        "value": outlier_info["value"],
-                        "threshold": outlier_info["threshold"],
-                    }
-                )
-                if "baseline" in outlier_info:
-                    info["baseline"] = outlier_info["baseline"]
-                return info
-
-            self._append_history_entry(self.step_x_his, self.step_loss_his, x_value, numeric_values)
-            self._accumulate_plot_running("epo", numeric_values)
+            # 生Step履歴は保存せず、Episode平均と100 Step平均だけへ渡す。
             self._accumulate_plot_running("epi", numeric_values)
-            self._update_recent_metric_history(numeric_values)
+            info["completed_100step_block"] = self._accumulate_step100_metrics(
+                numeric_values
+            )
             self.step_plot_recorded += 1
             return info
 
@@ -564,9 +617,8 @@ class PlotMaker():
         if mode == "step":
             values = self._normalize_edit_values(edit_stats)
             info["plot_values"] = values
-            self._append_edit_history_entry(self.step_edit_x_his, self.step_edit_his, x_value, values)
-            self._accumulate_edit_running("epo", values)
             self._accumulate_edit_running("epi", values)
+            info["completed_100step_block"] = self._accumulate_step100_edits(values)
             return info
         if mode == "epo":
             sums, counts, accepted_steps = self._edit_running_state("epo")
@@ -944,7 +996,15 @@ class PlotMaker():
                 pass
 
     def plot_loss_curve(self, epoORepi):
-        if epoORepi == "step":
+        write_csv = True
+        if epoORepi == "step100":
+            loss_history = self.step100_loss_his
+            x_history = self.step100_x_his
+            filename_front = self.filename_step100
+            xl = f"100-Step Block (1 = {self.step_average_window} Steps)"
+            x_label = "100step_block"
+            write_csv = False
+        elif epoORepi == "step":
             loss_history = self.step_loss_his
             x_history = self.step_x_his
             filename_front = self.filename_step
@@ -963,8 +1023,11 @@ class PlotMaker():
             xl = "Episode"
             x_label = "episode"
 
+        if not x_history:
+            return
         os.makedirs(self.save_dir, exist_ok=True)
-        self._write_csv(loss_history, x_history, filename_front, x_label)
+        if write_csv:
+            self._write_csv(loss_history, x_history, filename_front, x_label)
         plot_mod = _get_pyplot()
         if plot_mod is None:
             return
@@ -975,21 +1038,13 @@ class PlotMaker():
             if save_dir_full != "":
                 os.makedirs(save_dir_full, exist_ok=True)
 
-            is_compression_group = self.group_title[group_idx] == "compression"
-            axis_count = len(group) + (2 if is_compression_group else 0)
+            axis_count = len(group)
             fig, axes = plot_mod.subplots(axis_count, 1, figsize=(self.x_len, self.y_len * axis_count))
 
             if axis_count == 1:
                 axes = [axes]
 
-            axis_offset = 0
-            if is_compression_group:
-                # 従来のdelta比較と新しいratio表示を同じPNG内の別サブプロットに分ける。
-                self._plot_compression_compare_axis(axes[0], loss_history, x_history, xl)
-                self._plot_actual_ratio_axis(axes[1], loss_history, x_history, xl)
-                axis_offset = 2
-
-            for ax, loss_idx in zip(axes[axis_offset:], group):
+            for ax, loss_idx in zip(axes, group):
                 epochs = list(x_history)
                 self._plot_single_axis(ax, epochs, loss_history[loss_idx], loss_idx, xl)
 
@@ -999,7 +1054,15 @@ class PlotMaker():
 
 
     def plot_point_edit_curve(self, epoORepi):
-        if epoORepi == "step":
+        write_csv = True
+        if epoORepi == "step100":
+            edit_history = self.step100_edit_his
+            x_history = self.step100_edit_x_his
+            filename_front = self.filename_step100
+            xl = f"100-Step Block (1 = {self.step_average_window} Steps)"
+            x_label = "100step_block"
+            write_csv = False
+        elif epoORepi == "step":
             edit_history = self.step_edit_his
             x_history = self.step_edit_x_his
             filename_front = self.filename_step
@@ -1018,8 +1081,11 @@ class PlotMaker():
             xl = "Episode"
             x_label = "episode"
 
+        if not x_history:
+            return
         os.makedirs(self.save_dir, exist_ok=True)
-        self._write_edit_csv(edit_history, x_history, filename_front, x_label)
+        if write_csv:
+            self._write_edit_csv(edit_history, x_history, filename_front, x_label)
         plot_mod = _get_pyplot()
         if plot_mod is None:
             return

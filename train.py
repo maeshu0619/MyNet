@@ -243,7 +243,11 @@ def train(model, args, loss, writer, plot, notifier=None):
     """圧縮予測と実圧縮"""
     sparsepcgc_proxy_actual_pairs = [] # Sparse PCGCのProxy推定値と実測値のペアの保存
     codec_actual_metric_pairs = {} # Codex Proxy値とActual Codec値の対応保存
-    case_debug_path = init_case_debug_csv(args, plot, writer) # 圧縮効率が良い/悪いケースを後から分析するためのCSVの初期化
+    case_debug_path = (
+        init_case_debug_csv(args, plot, writer)
+        if bool(getattr(args, "save_step_metric_csv", False))
+        else None
+    ) # 詳細Step CSVを明示した場合だけGood/Bad caseを保存する
     case_debug_counts = {"good": 0, "bad": 0}
     metric_csv_paths = init_metric_csvs(args, plot, writer) # 圧縮メトリクス/点操作メトリクス/ChackPoint判定値などの書き込み
     if bool(getattr(args, "save_compression_metric_csv", True)):
@@ -257,7 +261,7 @@ def train(model, args, loss, writer, plot, notifier=None):
             writer,
             "FullCloudAmountSequenceSummaryCSV",
         )
-    if bool(getattr(args, "phase7_eval_summary", True)):
+    if bool(getattr(args, "save_step_metric_csv", False)) and bool(getattr(args, "phase7_eval_summary", True)):
         metric_csv_paths["phase7_eval_summary"] = _phase7_eval_summary_path(args, plot)
         init_csv_file(
             metric_csv_paths["phase7_eval_summary"],
@@ -267,8 +271,9 @@ def train(model, args, loss, writer, plot, notifier=None):
         )
     # 各損失項が各モジュール・点操作へ流す勾配量を記録するCSV
     step_grad_dir = getattr(plot, "save_dir", None) or getattr(args, "out_path", ".")
-    metric_csv_paths["step_grad"] = os.path.join(step_grad_dir, f"{args.time}_MyNetwork_step_grad.csv")
-    if bool(getattr(args, "step_grad_log", True)):
+    metric_csv_paths["step_grad"] = None
+    if bool(getattr(args, "save_step_metric_csv", False)) and bool(getattr(args, "step_grad_log", True)):
+        metric_csv_paths["step_grad"] = os.path.join(step_grad_dir, f"{args.time}_MyNetwork_step_grad.csv")
         init_csv_file(metric_csv_paths["step_grad"], STEP_GRAD_COLUMNS, writer, "StepGradCSV")
         writer.write(
             "StepGradCSVMode: "
@@ -276,7 +281,7 @@ def train(model, args, loss, writer, plot, notifier=None):
             f"interval={int(getattr(args, 'step_grad_log_interval', 1))}"
         )
     else:
-        writer.write(f"StepGradCSV: disabled path={metric_csv_paths['step_grad']}")
+        writer.write("StepGradCSV: disabled (Episode/100-Step plot mode)")
 
     """原因診断のためのログ"""
     memory_diagnostics_path = os.path.join(
@@ -370,6 +375,9 @@ def train(model, args, loss, writer, plot, notifier=None):
     # 候補そのものは保存せず、同一stateが次のθ領域へ進むための訪問回数だけを保持する。
     network_k_state_visit_counts = {}
     _record_memory("train_loop_start", global_step=global_train_step)
+    # 生の補助損失が下がった際にbalance係数を逆増幅すると、全体損失へ
+    # 改善が現れない。訓練中は一度締めた係数を再び大きくしない。
+    tail_support_balance_scale_state = float("nan")
     for episode in range(args.episodes): # Episode開始
         writer.write(f"◆◆◆ Episode {episode + 1} / {args.episodes} ◆◆◆")
         _record_memory(
@@ -430,7 +438,6 @@ def train(model, args, loss, writer, plot, notifier=None):
             if den6_prefetch_lookahead > 0:
                 prefetch_ana_den6_online_guidance(args, active_files[:den6_prefetch_lookahead])
             epoch_has_optimizer_step = False
-            epoch_metric_sums = None
             _record_memory(
                 "epoch_loader_ready",
                 episode=episode + 1,
@@ -2115,7 +2122,32 @@ def train(model, args, loss, writer, plot, notifier=None):
                         max_scale_name="compression_primary_tail_balance_max_scale",
                         disabled_reason="tail_balance_disabled",
                     )
-                    tail_support_scale = float(tail_balance["scale"])
+                    proposed_tail_support_scale = float(tail_balance["scale"])
+                    tail_primary_mag = tail_balance.get("primary_mag", None)
+                    tail_primary_is_valid = (
+                        tail_primary_mag is not None
+                        and math.isfinite(float(tail_primary_mag))
+                        and float(tail_primary_mag) > 1e-8
+                    )
+                    if tail_primary_is_valid:
+                        tail_support_balance_scale_state = monotonic_support_scale(
+                            tail_support_balance_scale_state,
+                            proposed_tail_support_scale,
+                        )
+                    tail_support_scale = (
+                        float(tail_support_balance_scale_state)
+                        if math.isfinite(float(tail_support_balance_scale_state))
+                        else proposed_tail_support_scale
+                    )
+                    total_support_balance = _compression_primary_remaining_support_balance(
+                        args,
+                        compression_support_anchor if torch.is_tensor(compression_support_anchor) else L,
+                        abs(float(cp_debug.get("cp_aux_block_scaled", 0.0)))
+                        if isinstance(cp_debug, dict) else 0.0,
+                        tail_support_scale * tail_support_raw,
+                        enabled=uses_actual_total_bit_objective(args),
+                    )
+                    tail_support_scale *= float(total_support_balance["scale"])
                     tail_support_scaled = tail_support_scale * tail_support_raw
                     L = L + tail_support_scaled
 
@@ -2138,7 +2170,16 @@ def train(model, args, loss, writer, plot, notifier=None):
                         cp_debug["cp_support_tail_raw"] = case_float(tail_support_raw, float("nan"))
                         cp_debug["cp_support_tail_scaled"] = case_float(tail_support_scaled, float("nan"))
                         cp_debug["cp_support_tail_scale"] = float(tail_support_scale)
+                        cp_debug["cp_support_tail_proposed_scale"] = float(
+                            proposed_tail_support_scale
+                        )
                         cp_debug["cp_support_tail_reason"] = str(tail_balance.get("reason", ""))
+                        cp_debug["cp_support_total_balance_reason"] = str(
+                            total_support_balance.get("reason", "")
+                        )
+                        cp_debug["cp_support_total_target_ratio"] = float(
+                            total_support_balance.get("target_ratio", float("nan"))
+                        )
                         cp_debug["cp_support_tail_target_ratio"] = (
                             float(tail_balance["target_ratio"])
                             if tail_balance.get("target_ratio", None) is not None
@@ -4127,7 +4168,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                 operation_metric_row = attach_grad_flow_to_operation_row(operation_metric_row, args) # backward後に得られた各操作headの勾配normをOperation CSV行へ反映する
                 if log_this_step and compact_step_text_log:
                     log_compact_step_grad(writer, step, num_steps, args)
-                if _phase7_should_save_eval_summary(args, global_train_step):
+                if bool(getattr(args, "save_step_metric_csv", False)) and _phase7_should_save_eval_summary(args, global_train_step):
                     phase7_eval_summary_row = _phase7_build_eval_summary_row(
                         args,
                         global_step=global_train_step,
@@ -4374,8 +4415,6 @@ def train(model, args, loss, writer, plot, notifier=None):
                 maybe_record_case_debug( args, writer, case_debug_path, case_debug_counts, global_step=global_train_step, episode=episode, epoch=epoch, step=step, file_path=file_path, comp_debug=comp_debug, structure_debug=structure_debug, edit_stats=train_edit_stats, L=L, L_geom=L_geom, L_com=L_com, L_actuator=L_actuator) # 圧縮改善が良いケース・悪いケースを条件に応じてCase Debag CSVへ保存
 
                 """損失ログの記録"""
-                if epoch_metric_sums is None:
-                    epoch_metric_sums = new_metric_sums(L.device, plot.num_loss) # Epoch内で初めのStepなら損失累積器を作る
                 surrogate_compression_metric = surrogate_compression_plot_metric(loss, L_com, L.device) # Surrogate予測の(Mine-GT)*100/GTを通常plotへ渡す
                 actual_compression_metric = actual_compression_plot_metric(loss, L.device) # 実codecで測った(Mine-GT)*100/GTを通常plotへ渡す
                 policy_actual_metric = policy_actual_compression_plot_metric(loss, L.device) # Network自身の最終出力actualを通常plotへ渡す
@@ -4397,7 +4436,6 @@ def train(model, args, loss, writer, plot, notifier=None):
                 actual_compression_ratio_metric = actual_compression_ratio_plot_metric(loss, L.device) # 実codecで測った100*Mine/GTを通常plotへ渡す
                 surrogate_metrics = surrogate_plot_metrics(loss) # Surrogate教師学習の誤差系列を通常plotへ渡す
                 metric_values = [ L, L_geom, surrogate_compression_metric, actual_compression_metric, policy_actual_metric, oracle_teacher_metric, L_attr, L_policy, loss_single, loss_nodes, Lp_out, La_fit, La_rep, L_actuator, *surrogate_metrics, actual_compression_ratio_metric] # plot列順にStep損失をまとめる
-                add_metric_sums( epoch_metric_sums, metric_values, L.device) # 現在Stepの損失値をEpoch累積器へ加算
                 if episode_metric_sums is None:
                     episode_metric_sums = new_metric_sums(L.device, plot.num_loss) # Episode内で初めのEpochなら損失累積器を作る
                 step_metric_values = metric_values # Step/Episode/Checkpointで同じ列順のmetricを使う
@@ -4419,9 +4457,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                         0.0,
                     )
                 plot.record_point_edits("step", global_train_step + 1, plot_edit_stats) # 点操作統計をCSVに記録
-                plot.record_occupancy_metrics("step", global_train_step + 1, compression_metric_row) # 図用の占有統計を保持する（詳細テキストログとは独立）
-                plot.record_voxel_collision_metrics("step", global_train_step + 1, compression_metric_row) # 図用のVoxel衝突統計を保持する
-                plot_step_info = plot.record_metrics("step", global_train_step + 1, step_metric_values) # Step単位の損失値をCSVに保存
+                plot.record_metrics("step", global_train_step + 1, step_metric_values) # Episode/100 Step平均だけをメモリ上で集計
                 if den6_online_full_cloud:
                     base_model_for_audit = model.module if hasattr(model, "module") else model
                     audit_voxel_state = getattr(base_model_for_audit, "last_actuator_voxel_state", {})
@@ -5146,42 +5182,7 @@ def train(model, args, loss, writer, plot, notifier=None):
             else:
                 writer.write("No successful optimizer step in this epoch; lr_scheduler.step() was skipped.")
 
-            """ログの記録"""
-            if epoch_metric_sums is not None: # このEpoch内でStep損失が1回以上累積されているか判定
-                epoch_avgs = metric_avgs_to_floats(epoch_metric_sums) # Epoch内で累積した損失合計を件数で割り、PythonのFloatリストへ変換
-                plot.epo_avg = epoch_avgs # 計算下Epoch平均損失をPlot管理機に保存
-                plot_epoch_info = plot.record_metrics("epo", global_epoch + 1, epoch_avgs) # Epoch単位の平均損失をPlot用CSVへ記録
-                log_plot_skip_epoch( writer, plot_epoch_info, global_epoch) # Epoch単位の平均損失をCSVに記録
-                writer.write(format_metric_summary("EpochAvg", plot.metric_keys, epoch_avgs))
-            epoch_edit_info = plot.record_point_edits("epo", global_epoch + 1) # Epoch内で記録されたStep単位の点編集統計を集計
-            plot.record_occupancy_metrics("epo", global_epoch + 1) # Epoch内の占有統計を図用に集計
-            plot.record_voxel_collision_metrics("epo", global_epoch + 1) # Epoch内のVoxel衝突統計を図用に集計
-            log_epoch_point_edit_average( writer, epoch_edit_info, global_epoch) # Epoch単位の点ん操作統計をログに記録
             global_epoch += 1
-            # Epochごとの図生成は通常の詳細Stepログ削減とは独立して残す。
-            _record_memory(
-                "epoch_before_plots",
-                episode=episode + 1,
-                epoch=epoch + 1,
-                global_step=global_train_step,
-                sample=sequence_name,
-            )
-            plot.plot_loss_curve("step")
-            plot.plot_loss_curve("epo")
-            plot.plot_point_edit_curve("step")
-            plot.plot_point_edit_curve("epo")
-            plot.plot_occupancy_curve("step")
-            plot.plot_occupancy_curve("epo")
-            plot.plot_voxel_collision_curve("step")
-            plot.plot_voxel_collision_curve("epo")
-            _record_memory(
-                "epoch_after_plots",
-                episode=episode + 1,
-                epoch=epoch + 1,
-                global_step=global_train_step,
-                sample=sequence_name,
-            )
-            writer.write(f"Saved step/epoch plots/csv: {plot.save_dir}")
             writer.flush()
         if episode_metric_sums is not None:
             plot.epi_avg = metric_avgs_to_floats(episode_metric_sums)
@@ -5191,8 +5192,6 @@ def train(model, args, loss, writer, plot, notifier=None):
             plot.epi_avg = [None for _ in range(plot.num_loss)]
         writer.write(format_metric_summary("EpisodeAvg", plot.metric_keys, plot.epi_avg))
         episode_edit_info = plot.record_point_edits("epi", episode + 1)
-        plot.record_occupancy_metrics("epi", episode + 1)
-        plot.record_voxel_collision_metrics("epi", episode + 1)
         log_episode_point_edit_average( writer, episode_edit_info, episode)
         _record_memory(
             "episode_before_plots",
@@ -5201,14 +5200,14 @@ def train(model, args, loss, writer, plot, notifier=None):
         )
         plot.plot_loss_curve("epi")
         plot.plot_point_edit_curve("epi")
-        plot.plot_occupancy_curve("epi")
-        plot.plot_voxel_collision_curve("epi")
+        plot.plot_loss_curve("step100")
+        plot.plot_point_edit_curve("step100")
         _record_memory(
             "episode_after_plots",
             episode=episode + 1,
             global_step=global_train_step,
         )
-        writer.write(f"Saved episode plots/csv: {plot.save_dir}")
+        writer.write(f"Saved episode CSV/plots and 100-step average plots: {plot.save_dir}")
         if _episode_input_common_cache_enabled(args):
             cache_summary = _episode_input_common_cache_summary(args)
             writer.write(

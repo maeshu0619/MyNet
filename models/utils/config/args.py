@@ -1863,6 +1863,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--compression_primary_tail_target_ratio', default=0.40, type=float, help='compression_primary終盤で加えるattr/policy/actuator/correction support blockを|main|に対してどこまで許すかの比率上限')
     parser.add_argument('--compression_primary_tail_balance_min_scale', default=0.0, type=float, help='compression_primary終盤support blockの最小scale')
     parser.add_argument('--compression_primary_tail_balance_max_scale', default=1.0, type=float, help='compression_primary終盤support blockの最大scale')
+    parser.add_argument('--compression_primary_total_support_target_ratio', default=0.40, type=float, help='compression_primaryの全support block合計を|main|に対して許す比率上限')
     parser.add_argument(
         '--compression_primary_proxy_grad_weight',
         default=0.02,
@@ -2939,6 +2940,8 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--max_saved_cases', default=64, type=int, help='good/bad case debug summaryの最大保存件数')
     parser.add_argument('--save_compression_metric_csv', default=True, type=str2bool, help='actual/surrogate/proxy圧縮metricを分離したstep CSVを保存する')
     parser.add_argument('--save_operation_metric_csv', default=True, type=str2bool, help='Add/Prune/Adjustのsoft/hard/effective統計step CSVを保存する')
+    parser.add_argument('--save_step_metric_csv', default=False, type=str2bool, help='詳細なStep単位CSVを保存するか。通常はEpisode CSVだけを保存する')
+    parser.add_argument('--plot_step_average_window', default=100, type=int, help='Step平均PNGの集計Step数。100なら横軸1目盛りが100 Step')
     parser.add_argument('--operation_dead_grad_warn_threshold', default=1e-12, type=float, help='operation branch/amount勾配が死んだとみなすnormしきい値')
     parser.add_argument('--operation_dead_grad_warn_patience', default=20, type=int, help='operation勾配が低い状態が何step続いたらwarningを出すか')
     parser.add_argument('--repair_add_ratio_floor', default=0.0, type=float, help='Add操作が完全に死なないための弱いratio下限。0で無効')
@@ -3452,6 +3455,7 @@ def parse_pugan_args(parser, file_day, file_time):
         "compression_primary_tail_target_ratio",
         "compression_primary_tail_balance_min_scale",
         "compression_primary_tail_balance_max_scale",
+        "compression_primary_total_support_target_ratio",
     ):
         setattr(args, _name, max(float(getattr(args, _name, 0.0)), 0.0))
     args.compression_primary_aux_balance_max_scale = max(
@@ -4174,6 +4178,10 @@ def parse_pugan_args(parser, file_day, file_time):
     args.plot_outlier_min_scale = max(float(getattr(args, "plot_outlier_min_scale", 0.0)), 0.0)
     args.save_compression_metric_csv = bool(getattr(args, "save_compression_metric_csv", True))
     args.save_operation_metric_csv = bool(getattr(args, "save_operation_metric_csv", True))
+    args.save_step_metric_csv = bool(getattr(args, "save_step_metric_csv", False))
+    args.plot_step_average_window = max(
+        int(getattr(args, "plot_step_average_window", 100)), 1
+    )
     args.save_checkpoint_metric_csv = bool(getattr(args, "save_checkpoint_metric_csv", True))
     args.checkpoint_geom_gate = bool(getattr(args, "checkpoint_geom_gate", True))
     args.checkpoint_safety_gate = bool(getattr(args, "checkpoint_safety_gate", True))

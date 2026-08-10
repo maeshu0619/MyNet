@@ -104,17 +104,20 @@ def init_metric_csvs(args, plot, writer):
         "full_cloud_amount_candidate_step": None,
     }
     os.makedirs(plot.save_dir, exist_ok=True)
+    save_step_csv = bool(getattr(args, "save_step_metric_csv", False))
     if bool(getattr(args, "save_compression_metric_csv", True)):
-        path = os.path.join(plot.save_dir, f"{args.time}_compression_metrics_step.csv")
-        init_csv_file(path, COMPRESSION_METRIC_COLUMNS, writer, "CompressionMetricCSV")
-        paths["compression_step"] = path
+        if save_step_csv:
+            path = os.path.join(plot.save_dir, f"{args.time}_compression_metrics_step.csv")
+            init_csv_file(path, COMPRESSION_METRIC_COLUMNS, writer, "CompressionMetricCSV")
+            paths["compression_step"] = path
         epi_path = os.path.join(plot.save_dir, f"{args.time}_compression_metrics_epi.csv")
         init_csv_file(epi_path, COMPRESSION_EPISODE_METRIC_COLUMNS, writer, "CompressionEpisodeMetricCSV")
         paths["compression_episode"] = epi_path
     if bool(getattr(args, "save_operation_metric_csv", True)):
-        path = os.path.join(plot.save_dir, f"{args.time}_operation_metrics_step.csv")
-        init_csv_file(path, OPERATION_METRIC_COLUMNS, writer, "OperationMetricCSV")
-        paths["operation_step"] = path
+        if save_step_csv:
+            path = os.path.join(plot.save_dir, f"{args.time}_operation_metrics_step.csv")
+            init_csv_file(path, OPERATION_METRIC_COLUMNS, writer, "OperationMetricCSV")
+            paths["operation_step"] = path
         epi_path = os.path.join(plot.save_dir, f"{args.time}_operation_metrics_epi.csv")
         init_csv_file(epi_path, OPERATION_EPISODE_METRIC_COLUMNS, writer, "OperationEpisodeMetricCSV")
         paths["operation_episode"] = epi_path
@@ -122,19 +125,19 @@ def init_metric_csvs(args, plot, writer):
         path = os.path.join(plot.save_dir, f"{args.time}_checkpoint_metrics_epi.csv")
         init_csv_file(path, CHECKPOINT_METRIC_COLUMNS, writer, "CheckpointMetricCSV")
         paths["checkpoint_episode"] = path
-    if int(getattr(args, "surrogate_pretrain_steps", 0)) > 0:
+    if save_step_csv and int(getattr(args, "surrogate_pretrain_steps", 0)) > 0:
         path = os.path.join(plot.save_dir, f"{args.time}_surrogate_pretrain_metrics_step.csv")
         init_csv_file(path, SURROGATE_PRETRAIN_COLUMNS, writer, "SurrogatePretrainMetricCSV")
         paths["surrogate_pretrain_step"] = path
-    if bool(getattr(args, "loss_grad_probe_enabled", False)):
+    if save_step_csv and bool(getattr(args, "loss_grad_probe_enabled", False)):
         path = os.path.join(plot.save_dir, f"{args.time}_step_grad.csv")
         init_csv_file(path, LOSS_GRAD_PROBE_COLUMNS, writer, "StepGradCSV")
         paths["loss_grad_probe"] = path
-    if bool(getattr(args, "sparsepcgc_algorithmic_proposal_selector", True)):
+    if save_step_csv and bool(getattr(args, "sparsepcgc_algorithmic_proposal_selector", True)):
         path = os.path.join(plot.save_dir, f"{args.time}_proposal_candidate_metrics_step.csv")
         init_csv_file(path, PROPOSAL_CANDIDATE_COLUMNS, writer, "ProposalCandidateMetricCSV")
         paths["proposal_candidate_step"] = path
-    if str(getattr(args, "sparsepcgc_training_mode", "subtree_selector")).strip().lower() == "full_cloud_amount":
+    if save_step_csv and str(getattr(args, "sparsepcgc_training_mode", "subtree_selector")).strip().lower() == "full_cloud_amount":
         path = os.path.join(plot.save_dir, f"{args.time}_full_cloud_amount_candidate_metrics_step.csv")
         init_csv_file(path, FULL_CLOUD_AMOUNT_CANDIDATE_COLUMNS, writer, "FullCloudAmountCandidateMetricCSV")
         paths["full_cloud_amount_candidate_step"] = path

@@ -151,6 +151,76 @@ def monotonic_support_scale(previous_scale, proposed_scale):
     return min(previous, proposed)
 
 
+def _compression_primary_remaining_support_balance(
+    args,
+    primary_value,
+    existing_support_mag,
+    new_support_value,
+    *,
+    enabled=True,
+    target_ratio_name="compression_primary_total_support_target_ratio",
+):
+    """補助項全体の予算内に収まるよう、後段の補助項だけを追加で抑える。"""
+    if not enabled:
+        return {
+            "scale": 1.0,
+            "reason": "total_support_balance_disabled",
+            "target_ratio": None,
+            "primary_mag": None,
+            "existing_support_mag": None,
+            "new_support_mag": None,
+            "remaining_budget_mag": None,
+        }
+    if not torch.is_tensor(primary_value) or not torch.is_tensor(new_support_value):
+        return {
+            "scale": 1.0,
+            "reason": "total_support_tensor_missing",
+            "target_ratio": None,
+            "primary_mag": None,
+            "existing_support_mag": None,
+            "new_support_mag": None,
+            "remaining_budget_mag": None,
+        }
+
+    target_ratio = max(float(getattr(args, target_ratio_name, 0.40)), 0.0)
+    primary_mag = float(torch.nan_to_num(
+        primary_value.detach().abs(), nan=0.0, posinf=0.0, neginf=0.0
+    ).cpu())
+    new_support_mag = float(torch.nan_to_num(
+        new_support_value.detach().abs(), nan=0.0, posinf=0.0, neginf=0.0
+    ).cpu())
+    existing_mag = max(float(existing_support_mag or 0.0), 0.0)
+    if not all(math.isfinite(value) for value in (
+        target_ratio, primary_mag, new_support_mag, existing_mag
+    )):
+        return {
+            "scale": 1.0,
+            "reason": "total_support_non_finite",
+            "target_ratio": float(target_ratio),
+            "primary_mag": None,
+            "existing_support_mag": None,
+            "new_support_mag": None,
+            "remaining_budget_mag": None,
+        }
+
+    remaining_budget = max(target_ratio * primary_mag - existing_mag, 0.0)
+    if new_support_mag <= 1e-12:
+        scale = 1.0
+        reason = "new_support_zero"
+    else:
+        scale = min(remaining_budget / new_support_mag, 1.0)
+        reason = "within_total_budget" if scale >= 1.0 else "capped_by_total_budget"
+    return {
+        "scale": float(scale),
+        "reason": str(reason),
+        "target_ratio": float(target_ratio),
+        "primary_mag": float(primary_mag),
+        "existing_support_mag": float(existing_mag),
+        "new_support_mag": float(new_support_mag),
+        "remaining_budget_mag": float(remaining_budget),
+    }
+
+
 def term_requires_grad(value):
     return bool(torch.is_tensor(value) and value.requires_grad)
 
