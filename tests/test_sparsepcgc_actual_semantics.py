@@ -729,6 +729,7 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
             "den6_online_policy_log_prob": policy_log_prob,
             "den6_online_policy_entropy": policy_log_prob.new_zeros(()),
             "den6_online_amount_log_prob": amount_log_prob,
+            "den6_online_geometry_amount_log_prob": amount_log_prob,
         }
         loss = network.discrete_policy_loss(
             torch.tensor(-4.0), geometry=torch.tensor(0.009)
@@ -1151,12 +1152,18 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         operation_gradients = torch.autograd.grad(
             residual_result[1]["policy_log_prob"],
             (add_ratio, prune_ratio, adjust_ratio),
+            retain_graph=True,
         )
         self.assertTrue(all(torch.isfinite(value).all() for value in operation_gradients))
         self.assertTrue(all(float(value.abs().sum()) > 0.0 for value in operation_gradients))
         self.assertEqual(
             len({round(float(value.reshape(-1)[0]), 7) for value in operation_gradients}),
             3,
+        )
+        self.assertAlmostEqual(
+            float(residual_result[1]["geometry_amount_log_prob"].detach()),
+            4.0 * float(residual_result[1]["amount_log_prob"].detach()),
+            places=6,
         )
 
         # 固定validationで許可されたresidual weight拡大により、同じPool内で

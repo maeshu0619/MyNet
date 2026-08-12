@@ -4918,6 +4918,8 @@ def _den6_online_grad_norms(model):
             getattr(actuator, "drop_amount_head", None),
             getattr(actuator, "add_amount_head", None),
             getattr(actuator, "move_amount_head", None),
+            getattr(actuator, "algorithmic_amount_selector_head", None),
+            getattr(actuator, "algorithmic_amount_residual_head", None),
         ),
         "den6_online_action_grad_norm": (
             getattr(actuator, "operation_gate_head", None),
@@ -5187,7 +5189,13 @@ def _balance_actual_operation_head_gradients(args, model, structure_debug=None):
             continue
 
         scale = float(target) / float(norm_before)
-        scale = min(max(scale, min_scale), max_scale)
+        if online_one_plan:
+            # 1-plan方策ではadvantageが0へ近づくこと自体が収束信号である。
+            # 小さい勾配まで毎Step targetへ増幅すると更新量が下がらず、Lossが
+            # 平坦・振動したままになるため、online経路は上限clipだけにする。
+            scale = min(scale, 1.0)
+        else:
+            scale = min(max(scale, min_scale), max_scale)
 
         for param in params:
             if param.grad is not None:
@@ -5215,6 +5223,8 @@ def _balance_actual_operation_head_gradients(args, model, structure_debug=None):
                 getattr(actuator, "drop_amount_head", None),
                 getattr(actuator, "add_amount_head", None),
                 getattr(actuator, "move_amount_head", None),
+                getattr(actuator, "algorithmic_amount_selector_head", None),
+                getattr(actuator, "algorithmic_amount_residual_head", None),
             ],
             "action": [
                 getattr(actuator, "operation_gate_head", None),
@@ -5240,7 +5250,8 @@ def _balance_actual_operation_head_gradients(args, model, structure_debug=None):
             if not math.isfinite(norm_before) or norm_before <= 1e-12:
                 debug[f"den6_online_{decision}_grad_balance_status"] = "zero_or_nonfinite"
                 continue
-            scale = min(max(default_target / norm_before, min_scale), max_scale)
+            # 収束時の微小advantageを強制的にnorm=1へ戻さず、爆発だけを抑える。
+            scale = min(default_target / norm_before, 1.0)
             for param in params:
                 param.grad.mul_(float(scale))
             debug[f"den6_online_{decision}_grad_norm_before_balance"] = norm_before

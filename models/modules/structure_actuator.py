@@ -3916,7 +3916,12 @@ class StructureRepairActuator(nn.Module):
             if selected_where_log_probs
             else action_ratio_stack.new_zeros(())
         )
-        amount_log_prob = torch.stack(amount_log_prob_terms).mean()
+        amount_log_prob_stack = torch.stack(amount_log_prob_terms)
+        # 既存の全体Policy lossの尺度は維持するため平均を残す。一方、Geometryから
+        # Amountへ信用を返す場合は、total/Add/Prune/Adjustという独立な4決定の
+        # 同時確率なので和を使う。平均だけではAmount信号が4分の1に薄まっていた。
+        amount_log_prob = amount_log_prob_stack.mean()
+        geometry_amount_log_prob = amount_log_prob_stack.sum()
         count_tensor = action_ratio_stack.new_tensor(
             [float(selected_counts[name]) for name in operations]
         )
@@ -4028,6 +4033,7 @@ class StructureRepairActuator(nn.Module):
             "policy_entropy": policy_entropy,
             "where_log_prob": where_log_prob,
             "amount_log_prob": amount_log_prob,
+            "geometry_amount_log_prob": geometry_amount_log_prob,
             "action_log_prob": action_log_prob,
         }
         plan_hash_payload = {
@@ -11851,6 +11857,10 @@ class StructureRepairActuator(nn.Module):
             ),
             "den6_online_amount_log_prob": exact_residual_plan_debug.get(
                 "amount_log_prob", single_amount_log_prob
+            ),
+            "den6_online_geometry_amount_log_prob": exact_residual_plan_debug.get(
+                "geometry_amount_log_prob",
+                exact_residual_plan_debug.get("amount_log_prob", single_amount_log_prob),
             ),
             "den6_online_action_log_prob": exact_residual_plan_debug.get(
                 "action_log_prob", single_action_log_prob

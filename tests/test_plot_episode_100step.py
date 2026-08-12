@@ -31,6 +31,33 @@ def _args(root, window=100):
 
 
 class EpisodeAndHundredStepPlotTest(unittest.TestCase):
+    def test_episode_dataset_weight_keeps_100step_chronological(self):
+        with tempfile.TemporaryDirectory() as root:
+            plot = PlotMaker(_args(root, window=2))
+            for step, value, weight in ((1, 1.0, 3.0), (2, 3.0, 1.0)):
+                metrics = [value] * plot.num_loss
+                plot.record_metrics(
+                    "step", step, metrics, episode_weight=weight
+                )
+                plot.record_point_edits(
+                    "step",
+                    step,
+                    {
+                        "added_ratio_percent": value,
+                        "deleted_ratio_percent": value,
+                        "adjusted_ratio_percent": value,
+                    },
+                    episode_weight=weight,
+                )
+            metric_info = plot.record_metrics(
+                "epi", 1, [0.0] * plot.num_loss
+            )
+            edit_info = plot.record_point_edits("epi", 1)
+            self.assertAlmostEqual(metric_info["plot_values"][0], 1.5)
+            self.assertAlmostEqual(edit_info["plot_values"][0], 1.5)
+            self.assertAlmostEqual(plot.step100_loss_his[0][0], 2.0)
+            self.assertAlmostEqual(plot.step100_edit_his[0][0], 2.0)
+
     def test_step_values_are_kept_only_as_episode_and_block_average(self):
         with tempfile.TemporaryDirectory() as root:
             plot = PlotMaker(_args(root))

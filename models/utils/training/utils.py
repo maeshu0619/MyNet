@@ -133,13 +133,14 @@ def metric_tensor(value, device):
     return torch.tensor(scalar, device=device, dtype=torch.float32)
 
 
-def add_metric_sums(metric_sums, values, device):
+def add_metric_sums(metric_sums, values, device, weight=1.0):
+    weight = max(float(weight), 0.0)
     for idx, value in enumerate(values):
         tensor = metric_tensor(value, device)
         if tensor is None:
             continue
-        metric_sums["sums"][idx] = metric_sums["sums"][idx] + tensor
-        metric_sums["counts"][idx] += 1
+        metric_sums["sums"][idx] = metric_sums["sums"][idx] + weight * tensor
+        metric_sums["counts"][idx] += weight
 
 
 def metric_avgs_to_floats(metric_sums, count=None):

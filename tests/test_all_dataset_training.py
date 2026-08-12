@@ -13,6 +13,7 @@ from models.utils.loss.compression import CompressionLossMixin
 from models.utils.pointcloud.ana_den6_online import _identity
 from models.utils.training.train_runtime import (
     _compression_primary_remaining_support_balance,
+    _balance_actual_operation_head_gradients,
 )
 
 
@@ -121,6 +122,49 @@ class AllDatasetTrainingTest(unittest.TestCase):
     def test_supported_dataset_aliases(self):
         self.assertEqual(canonical_training_dataset_name("mvub"), "MVUB")
         self.assertEqual(canonical_training_dataset_name("uvg"), "UVG")
+
+    def test_online_gradient_balance_never_amplifies_small_gradient(self):
+        """online方策では収束を示す微小勾配をnorm targetまで増幅しない。"""
+        import torch
+
+        class _Actuator(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.drop_head = torch.nn.Linear(1, 1, bias=False)
+                self.add_head = torch.nn.Linear(1, 1, bias=False)
+                self.add_voxel_head = torch.nn.Linear(1, 1, bias=False)
+                self.move_voxel_head = torch.nn.Linear(1, 1, bias=False)
+                self.drop_amount_head = torch.nn.Linear(1, 1, bias=False)
+                self.add_amount_head = torch.nn.Linear(1, 1, bias=False)
+                self.move_amount_head = torch.nn.Linear(1, 1, bias=False)
+                self.algorithmic_amount_selector_head = torch.nn.Linear(1, 1, bias=False)
+                self.algorithmic_amount_residual_head = torch.nn.Linear(1, 1, bias=False)
+                self.operation_gate_head = torch.nn.Linear(1, 1, bias=False)
+
+        class _Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.actuator = _Actuator()
+                self.policy_module = torch.nn.Linear(1, 1, bias=False)
+
+        model = _Model()
+        for parameter in model.parameters():
+            parameter.grad = torch.full_like(parameter, 0.01)
+        args = SimpleNamespace(
+            heuristic_guidance_mode="ana_den6_online",
+            repair_balance_operation_head_grads=True,
+            repair_operation_head_grad_target=1.0,
+            minimal_loss_objective=True,
+            repair_operation_head_grad_min_scale=1e-4,
+            repair_operation_head_grad_max_scale=1e5,
+        )
+        before = model.actuator.drop_amount_head.weight.grad.clone()
+        debug = _balance_actual_operation_head_gradients(args, model, {})
+        self.assertTrue(torch.equal(before, model.actuator.drop_amount_head.weight.grad))
+        self.assertEqual(debug["prune_amount_grad_balance_scale"], 1.0)
+        self.assertGreater(
+            debug["den6_online_amount_grad_norm_before_balance"], 0.0
+        )
 
 
 if __name__ == "__main__":

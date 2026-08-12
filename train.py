@@ -45,6 +45,26 @@ def train(model, args, loss, writer, plot, notifier=None):
     ):
         args.dataset_cache = True
     num_seq = len(seq_dirs)
+    all_dataset_sequence_counts = {}
+    all_dataset_gradient_weights = {}
+    if bool(getattr(args, "train_all_datasets", False)):
+        for seq_dir in seq_dirs:
+            dataset_key = training_dataset_name_from_path(seq_dir)
+            all_dataset_sequence_counts[dataset_key] = (
+                int(all_dataset_sequence_counts.get(dataset_key, 0)) + 1
+            )
+        dataset_count = max(len(all_dataset_sequence_counts), 1)
+        for dataset_key, sequence_count in all_dataset_sequence_counts.items():
+            all_dataset_gradient_weights[dataset_key] = (
+                float(num_seq) / float(dataset_count * max(sequence_count, 1))
+            )
+        writer.write(
+            "AllDatasetGradientBalance: enabled={}, sequence_counts={}, weights={}".format(
+                bool(getattr(args, "train_all_dataset_balance_gradients", True)),
+                all_dataset_sequence_counts,
+                {key: round(value, 6) for key, value in all_dataset_gradient_weights.items()},
+            )
+        )
     writer.write(f"Total seq directories: {num_seq}")
     if len(seq_dirs) != len(raw_seq_dirs):
         kept_names = ", ".join(os.path.basename(seq_dir) for seq_dir in seq_dirs)
@@ -461,6 +481,11 @@ def train(model, args, loss, writer, plot, notifier=None):
                 dataset,
                 "training_dataset_name",
                 training_dataset_name_from_path(seq_dir),
+            )
+            dataset_gradient_weight = (
+                float(all_dataset_gradient_weights.get(epoch_dataset_name, 1.0))
+                if bool(getattr(args, "train_all_dataset_balance_gradients", True))
+                else 1.0
             )
             dataset_context_changed = activate_training_dataset_context(
                 args, epoch_dataset_name
@@ -3251,6 +3276,22 @@ def train(model, args, loss, writer, plot, notifier=None):
                     comp_debug["operation_entropy_moving_avg"] = sum(operation_entropy_history) / float(max(len(operation_entropy_history), 1)) # 操作entropyの移動平均をCSVへ渡す
                 if train_edit_stats is None:
                     train_edit_stats = summarize_point_edits( input_xyz=input_xyz[:, :3, :], gen_pts=gen_pts, final_w=final_w, args=args) # 入力/出力点群を比較し、操作を計算
+                if bool(getattr(args, "train_all_datasets", False)):
+                    # forward値とEpisodeの実測Lossは変えず、sequence数が多い
+                    # datasetだけがoptimizerを支配しないようbackwardだけ補正する。
+                    # 8i/MVUB/UVGを各1/3の寄与にし、UVG固有のPrune 70% priorが
+                    # 全dataset共通Amount headを過度に引く問題を抑える。
+                    L = (
+                        L.detach()
+                        + float(dataset_gradient_weight) * (L - L.detach())
+                    )
+                    comp_debug["all_dataset_gradient_weight"] = float(
+                        dataset_gradient_weight
+                    )
+                    comp_debug["all_dataset_gradient_dataset"] = str(
+                        epoch_dataset_name
+                    )
+                    loss.last_compression_debug = comp_debug
                 # 念のため、未設定時はfull cloudへ戻す。
                 # 通常はStep開始時に設定され、Subtree学習時は選択Subtreeに差し替わる。
                 if voxel_collision_input_gt is None:
@@ -4501,7 +4542,12 @@ def train(model, args, loss, writer, plot, notifier=None):
                 if episode_metric_sums is None:
                     episode_metric_sums = new_metric_sums(L.device, plot.num_loss) # Episode内で初めのEpochなら損失累積器を作る
                 step_metric_values = metric_values # Step/Episode/Checkpointで同じ列順のmetricを使う
-                add_metric_sums(episode_metric_sums, step_metric_values, L.device) # 現在Stepの損失一覧
+                add_metric_sums(
+                    episode_metric_sums,
+                    step_metric_values,
+                    L.device,
+                    weight=dataset_gradient_weight,
+                ) # 全dataset modeではdataset均等重みでEpisode損失を集計する
                 accumulate_checkpoint_metrics( episode_checkpoint_sums, compression_metric_row, operation_metric_row, step_metric_values) # ChackPoint判定用メトリクス
                 if train_edit_stats is None:
                     train_edit_stats = summarize_point_edits( input_xyz=input_xyz[:, :3, :], gen_pts=gen_pts, final_w=final_w, args=args) # 点操作情報を計算
@@ -4518,8 +4564,18 @@ def train(model, args, loss, writer, plot, notifier=None):
                         "oracle_full_cloud_prune_ratio_percent",
                         0.0,
                     )
-                plot.record_point_edits("step", global_train_step + 1, plot_edit_stats) # 点操作統計をCSVに記録
-                plot.record_metrics("step", global_train_step + 1, step_metric_values) # Episode/100 Step平均だけをメモリ上で集計
+                plot.record_point_edits(
+                    "step",
+                    global_train_step + 1,
+                    plot_edit_stats,
+                    episode_weight=dataset_gradient_weight,
+                ) # Episode図はdataset均等、100-Step図は実時系列のまま集計する
+                plot.record_metrics(
+                    "step",
+                    global_train_step + 1,
+                    step_metric_values,
+                    episode_weight=dataset_gradient_weight,
+                ) # Episode図はdataset均等、100-Step図は実時系列のまま集計する
                 if den6_online_full_cloud:
                     base_model_for_audit = model.module if hasattr(model, "module") else model
                     audit_voxel_state = getattr(base_model_for_audit, "last_actuator_voxel_state", {})
