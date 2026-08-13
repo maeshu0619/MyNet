@@ -222,6 +222,29 @@ def setup_amp(model, args, writer):
     }
 
 
+def clip_model_gradients(model, max_norm):
+    """AMP/FP32の両経路で同じ勾配クリップを適用する。"""
+    max_norm = max(float(max_norm), 0.0)
+    parameters = [
+        parameter
+        for parameter in model.parameters()
+        if parameter.requires_grad and parameter.grad is not None
+    ]
+    debug = {
+        "train_grad_clip_max_norm": max_norm,
+        "train_grad_clip_parameter_count": len(parameters),
+        "train_grad_clip_applied": False,
+        "train_grad_total_norm_before_clip": 0.0,
+    }
+    if max_norm <= 0.0 or not parameters:
+        return debug
+    total_norm = torch.nn.utils.clip_grad_norm_(parameters, max_norm=max_norm)
+    total_norm_value = float(total_norm.detach().float().cpu())
+    debug["train_grad_total_norm_before_clip"] = total_norm_value
+    debug["train_grad_clip_applied"] = bool(total_norm_value > max_norm)
+    return debug
+
+
 def build_loader_kwargs(args, model, writer, use_cuda):
     loader_num_workers = use_memory_safe_loader_workers(args, model, writer)
 

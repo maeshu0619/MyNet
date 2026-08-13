@@ -3988,12 +3988,10 @@ def train(model, args, loss, writer, plot, notifier=None):
                         )
                         consecutive_amp_skips += 1
                     else:
-                        grad_clip = float(getattr(args, "train_grad_clip", 0.0)) # 勾配ノルムの上限値を設定から取得する
-                        if grad_clip > 0.0:
-                            torch.nn.utils.clip_grad_norm_(
-                                [p for p in model.parameters() if p.requires_grad],
-                                max_norm=grad_clip,
-                            )
+                        comp_debug.update(clip_model_gradients(
+                            model,
+                            getattr(args, "train_grad_clip", 0.0),
+                        ))
 
                         phase7_param_snapshot = None
                         if _phase7_param_update_enabled(args, global_train_step):
@@ -4104,7 +4102,11 @@ def train(model, args, loss, writer, plot, notifier=None):
                             f"episode={episode + 1}, epoch={epoch + 1}, step={step + 1}/{num_steps}"
                         )
                     else:
-                        grad_clip = float(getattr(args, "train_grad_clip", 0.0)) # 勾配クリップの上限値取得
+                        # SparsePCGC既定のFP32経路にもAMP経路と同じclipを適用する。
+                        comp_debug.update(clip_model_gradients(
+                            model,
+                            getattr(args, "train_grad_clip", 0.0),
+                        ))
                         phase7_param_snapshot = None
                         if _phase7_param_update_enabled(args, global_train_step):
                             phase7_param_snapshot = _phase7_take_param_snapshot(model)
@@ -4652,6 +4654,10 @@ def train(model, args, loss, writer, plot, notifier=None):
                         f", grad_norms_pre_decision_balance=(where={float(audit_compression.get('den6_online_where_grad_norm_before_balance', 0.0) or 0.0):.6g}, "
                         f"amount={float(audit_compression.get('den6_online_amount_grad_norm_before_balance', 0.0) or 0.0):.6g}, "
                         f"action={float(audit_compression.get('den6_online_action_grad_norm_before_balance', 0.0) or 0.0):.6g})"
+                        f", optimizer=(lr={optimizer_lrs_safe(optimizer)}, "
+                        f"clip_max={float(audit_compression.get('train_grad_clip_max_norm', 0.0) or 0.0):.6g}, "
+                        f"grad_before_clip={float(audit_compression.get('train_grad_total_norm_before_clip', 0.0) or 0.0):.6g}, "
+                        f"clip_applied={bool(audit_compression.get('train_grad_clip_applied', False))})"
                         f", policy=(objective={float(audit_compression.get('den6_online_policy_objective', 0.0) or 0.0):.6g}, "
                         f"baseline={float(audit_compression.get('den6_online_policy_objective_baseline', 0.0) or 0.0):.6g}, "
                         f"advantage={float(audit_compression.get('den6_online_policy_advantage', 0.0) or 0.0):.6g}, "

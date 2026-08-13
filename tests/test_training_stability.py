@@ -13,6 +13,7 @@ from models.utils.training.compression_primary_loss import (
     build_compression_primary_loss,
 )
 from models.utils.training.lr_control import step_scheduler_with_floor
+from models.utils.training.optim_amp import clip_model_gradients
 from models.utils.training.train_runtime import fixed_full_cloud_validation_records
 
 
@@ -270,6 +271,21 @@ class TrainingStabilityTest(unittest.TestCase):
         self.assertAlmostEqual(debug["cp_geom_block_raw"], 0.3, places=6)
         total.backward()
         self.assertGreater(float(geom.grad), 0.0)
+
+    def test_gradient_clip_is_shared_by_fp32_and_amp_paths(self):
+        model = torch.nn.Linear(1, 1, bias=False)
+        model.weight.grad = torch.full_like(model.weight, 20.0)
+        debug = clip_model_gradients(model, 10.0)
+        self.assertTrue(debug["train_grad_clip_applied"])
+        self.assertAlmostEqual(debug["train_grad_total_norm_before_clip"], 20.0)
+        self.assertLessEqual(float(model.weight.grad.norm()), 10.00001)
+
+    def test_disabled_gradient_clip_does_not_change_gradient(self):
+        model = torch.nn.Linear(1, 1, bias=False)
+        model.weight.grad = torch.full_like(model.weight, 20.0)
+        debug = clip_model_gradients(model, 0.0)
+        self.assertFalse(debug["train_grad_clip_applied"])
+        self.assertAlmostEqual(float(model.weight.grad.norm()), 20.0)
 
 
 if __name__ == "__main__":
