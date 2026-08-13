@@ -450,15 +450,14 @@ class PlotMaker():
     def _normalized_metric_list(self, values):
         return [self._metric_float(value) for value in values]
 
-    def _accumulate_plot_running(self, mode, values, weight=1.0):
+    def _accumulate_plot_running(self, mode, values):
         sums, counts, step_count = self._running_state(mode)
-        weight = max(float(weight), 0.0)
         has_any_value = False
         for idx, value in enumerate(values):
             if value is None:
                 continue
-            sums[idx] += weight * value
-            counts[idx] += weight
+            sums[idx] += value
+            counts[idx] += 1
             has_any_value = True
         if has_any_value:
             self._set_running_step_count(mode, step_count + 1)
@@ -525,7 +524,7 @@ class PlotMaker():
                     }
         return None
 
-    def record_metrics(self, mode, x_value, values, episode_weight=1.0):
+    def record_metrics(self, mode, x_value, values):
         numeric_values = self._normalized_metric_list(values)
         info = {
             "mode": mode,
@@ -537,9 +536,7 @@ class PlotMaker():
 
         if mode == "step":
             # 生Step履歴は保存せず、Episode平均と100 Step平均だけへ渡す。
-            self._accumulate_plot_running(
-                "epi", numeric_values, weight=episode_weight
-            )
+            self._accumulate_plot_running("epi", numeric_values)
             info["completed_100step_block"] = self._accumulate_step100_metrics(
                 numeric_values
             )
@@ -597,22 +594,19 @@ class PlotMaker():
         for idx, value in enumerate(values):
             edit_history[idx].append(self._metric_float(value))
 
-    def _accumulate_edit_running(self, mode, values, weight=1.0):
+    def _accumulate_edit_running(self, mode, values):
         sums, counts, step_count = self._edit_running_state(mode)
-        weight = max(float(weight), 0.0)
         has_any_value = False
         for idx, value in enumerate(values):
             if value is None:
                 continue
-            sums[idx] += weight * float(value)
-            counts[idx] += weight
+            sums[idx] += float(value)
+            counts[idx] += 1
             has_any_value = True
         if has_any_value:
             self._set_edit_running_step_count(mode, step_count + 1)
 
-    def record_point_edits(
-        self, mode, x_value, edit_stats=None, episode_weight=1.0
-    ):
+    def record_point_edits(self, mode, x_value, edit_stats=None):
         info = {
             "mode": mode,
             "x_value": int(x_value),
@@ -623,9 +617,7 @@ class PlotMaker():
         if mode == "step":
             values = self._normalize_edit_values(edit_stats)
             info["plot_values"] = values
-            self._accumulate_edit_running(
-                "epi", values, weight=episode_weight
-            )
+            self._accumulate_edit_running("epi", values)
             info["completed_100step_block"] = self._accumulate_step100_edits(values)
             return info
         if mode == "epo":

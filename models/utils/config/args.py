@@ -237,7 +237,6 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--dataname', default=dataname, type=str, help='データセットの名称')
     parser.add_argument('--train_all_datasets', default=True, type=str2bool, help='Trueなら共通のSparsePCGC設定のまま、1 Episode内で8i/MVUB/UVGを順番にすべて学習する')
     parser.add_argument('--train_all_dataset_names', default='8i,MVUB,UVG', type=str, help='train_all_datasetsで巡回するデータセット名（カンマ区切り）')
-    parser.add_argument('--train_all_dataset_balance_gradients', default=True, type=str2bool, help='全dataset訓練でsequence数の差を補正し、datasetごとの総勾配寄与を等しくする')
     parser.add_argument(
         '--dataset_name', '--datasetname',
         dest='dataset_name',
@@ -2467,9 +2466,9 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--heuristic_guidance_online_geometry_policy_weight',
-        default=0.50,
+        default=0.10,
         type=float,
-        help='圧縮改善を維持したplanのGeometry改善を離散Amountへ返す二次方策重み。独立Amount決定のlog-prob和へ適用する',
+        help='圧縮改善を維持したplanのGeometry改善を離散Amountへ返す二次方策重み',
     )
     parser.add_argument(
         '--heuristic_guidance_online_geometry_compression_tolerance',
@@ -3113,9 +3112,6 @@ def parse_pugan_args(parser, file_day, file_time):
 
     args = parser.parse_args()
     args.train_all_datasets = bool(getattr(args, "train_all_datasets", False))
-    args.train_all_dataset_balance_gradients = bool(
-        getattr(args, "train_all_dataset_balance_gradients", True)
-    )
     raw_all_dataset_names = str(
         getattr(args, "train_all_dataset_names", "8i,MVUB,UVG")
     ).split(",")

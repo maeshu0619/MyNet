@@ -519,14 +519,10 @@ class Network(nn.Module):
         geometry_guard_passed = False
         geometry_baseline_source = "unavailable"
         amount_log_prob = state.get("den6_online_amount_log_prob", None)
-        geometry_amount_log_prob = state.get(
-            "den6_online_geometry_amount_log_prob", amount_log_prob
-        )
         if (
             mode == "ana_den6_online"
             and torch.is_tensor(geometry)
             and torch.is_tensor(amount_log_prob)
-            and torch.is_tensor(geometry_amount_log_prob)
         ):
             geometry_baseline = getattr(
                 self, "_den6_online_geometry_baseline", None
@@ -584,12 +580,12 @@ class Network(nn.Module):
                         -geometry_clip, geometry_clip
                     )
                 geometry_policy_raw = (
-                    -geometry_advantage * geometry_amount_log_prob.float().mean()
+                    -geometry_advantage * amount_log_prob.float().mean()
                 )
                 geometry_weight = max(float(getattr(
                     self.args,
                     "heuristic_guidance_online_geometry_policy_weight",
-                    0.50,
+                    0.10,
                 )), 0.0)
                 geometry_policy_weighted = geometry_weight * geometry_policy_raw
                 policy_loss = policy_loss + geometry_policy_weighted
@@ -663,10 +659,6 @@ class Network(nn.Module):
             "geometry_policy_advantage": float(geometry_advantage.detach().cpu()),
             "geometry_policy_raw": float(geometry_policy_raw.detach().cpu()),
             "geometry_policy_weighted": float(geometry_policy_weighted.detach().cpu()),
-            "geometry_amount_log_prob": (
-                float(geometry_amount_log_prob.detach().float().mean().cpu())
-                if torch.is_tensor(geometry_amount_log_prob) else 0.0
-            ),
             "adaptive_amount_entropy_raw": float(adaptive_amount_entropy.detach().cpu()),
             "adaptive_amount_entropy_weighted": float(adaptive_amount_entropy_weighted.detach().cpu()),
             "baseline_ema_alpha": float(baseline_alpha),
@@ -4022,7 +4014,6 @@ class Network(nn.Module):
                 "den6_online_policy_entropy",
                 "den6_online_where_log_prob",
                 "den6_online_amount_log_prob",
-                "den6_online_geometry_amount_log_prob",
                 "den6_online_action_log_prob",
                 "network_only_direction_log_prob",
                 "network_only_direction_entropy",
