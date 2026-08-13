@@ -1168,9 +1168,9 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         drop_preference[0, 0, 0] = -10.0
         drop_preference[0, 0, 2] = 10.0
         drop_preference.requires_grad_()
-        actuator.args.heuristic_guidance_network_residual_weight = 0.05
+        actuator.args.heuristic_guidance_network_residual_weight = 0.01
         actuator.args.heuristic_guidance_network_residual_weight_max = 0.25
-        actuator.args._heuristic_guidance_network_residual_weight_current = 0.05
+        actuator.args._heuristic_guidance_network_residual_weight_current = 0.01
         low_autonomy = actuator._build_exact_den6_residual_plan(
             guidance,
             coords,

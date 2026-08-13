@@ -2568,19 +2568,19 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--heuristic_guidance_network_residual_weight',
-        default=0.05,
+        default=0.25,
         type=float,
-        help='den6 candidate rankへ加える局所Network残差の初期重み',
+        help='den6 Pool候補を再順位付けするNetwork utilityの初期重み。既定は残すHeuristic priorと同尺度',
     )
     parser.add_argument(
         '--heuristic_guidance_network_residual_weight_max',
-        default=0.25,
+        default=1.0,
         type=float,
         help='固定validation改善時に段階拡大するPool内Network再順位付け重みの上限',
     )
     parser.add_argument(
         '--heuristic_guidance_network_residual_weight_increment',
-        default=0.025,
+        default=0.05,
         type=float,
         help='固定validationがnew bestになったEpisodeごとのNetwork再順位付け重み増分',
     )
@@ -3904,14 +3904,14 @@ def parse_pugan_args(parser, file_day, file_time):
         float(getattr(args, "heuristic_guidance_final_where_weight", 0.25)), 0.0
     )
     args.heuristic_guidance_network_residual_weight = max(
-        float(getattr(args, "heuristic_guidance_network_residual_weight", 0.05)), 0.0
+        float(getattr(args, "heuristic_guidance_network_residual_weight", 0.25)), 0.0
     )
     args.heuristic_guidance_network_residual_weight_max = max(
-        float(getattr(args, "heuristic_guidance_network_residual_weight_max", 0.25)),
+        float(getattr(args, "heuristic_guidance_network_residual_weight_max", 1.0)),
         args.heuristic_guidance_network_residual_weight,
     )
     args.heuristic_guidance_network_residual_weight_increment = max(
-        float(getattr(args, "heuristic_guidance_network_residual_weight_increment", 0.025)),
+        float(getattr(args, "heuristic_guidance_network_residual_weight_increment", 0.05)),
         0.0,
     )
     args.heuristic_guidance_online_amount_residual_scale = min(max(

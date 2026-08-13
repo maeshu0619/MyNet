@@ -3753,19 +3753,19 @@ class StructureRepairActuator(nn.Module):
             add_pair_logits,
         )
         residual_weight_start = max(
-            float(getattr(self.args, "heuristic_guidance_network_residual_weight", 0.05)),
+            float(getattr(self.args, "heuristic_guidance_network_residual_weight", 0.25)),
             0.0,
         )
         residual_weight_max = max(
             float(getattr(
                 self.args,
                 "heuristic_guidance_network_residual_weight_max",
-                residual_weight_start,
+                1.0,
             )),
             residual_weight_start,
         )
         # 候補Actual比較は増やさず、固定validationで確認済みの範囲だけ
-        # Networkがden6 Pool全体を再順位付けできる。未設定時は従来0.05。
+        # Networkがden6 Pool全体を再順位付けできる。
         residual_weight = min(
             max(
                 float(getattr(
@@ -3783,6 +3783,13 @@ class StructureRepairActuator(nn.Module):
         gumbel_scale = max(float(
             getattr(self.args, "heuristic_guidance_online_gumbel_scale", 0.10)
         ), 0.0) * float(exploration_multiplier)
+        heuristic_prior_weight = (
+            1.0
+            if exact_anchor_active
+            else max(float(getattr(
+                self.args, "heuristic_guidance_final_where_weight", 0.25
+            )), 0.0)
+        )
         ordered_indices = {}
         static_compatible = {}
         candidate_log_probs = {}
@@ -3796,7 +3803,7 @@ class StructureRepairActuator(nn.Module):
             if not torch.is_tensor(rank_score):
                 return None
             logits = (
-                rank_score.float()
+                float(heuristic_prior_weight) * rank_score.float()
                 + float(candidate_policy_alpha) * residual_weight * network_scores[operation]
             )
             static_mask = mapping.get("static_compatible")
@@ -4112,6 +4119,7 @@ class StructureRepairActuator(nn.Module):
             "selected_candidate_ids": selected_ids,
             "residual_alpha": float(residual_alpha),
             "candidate_policy_alpha": float(candidate_policy_alpha),
+            "heuristic_candidate_prior_weight": float(heuristic_prior_weight),
             "where_residual_weight": float(residual_weight),
             "where_residual_weight_start": float(residual_weight_start),
             "where_residual_weight_max": float(residual_weight_max),
@@ -6213,6 +6221,10 @@ class StructureRepairActuator(nn.Module):
         # priorが消えてもNetwork単独で近いWhere選択を再現できるようにする。
         # ============================================================
         network_drop_logit_for_distill = learned_drop_logit
+        # Exact Poolの再順位付けには、Heuristic biasを混ぜる前のNetwork出力を使う。
+        # drop_probを渡すとHeuristic順位がNetwork residual側へ二重に入り、
+        # 見かけ上Network選択でも実質は同じ順位をなぞってしまう。
+        exact_network_drop_score = learned_drop_logit
         codec_prior_where_distill_loss = pts_xyz.new_zeros(())
         codec_prune_prior_logit_weight = max(
             float(getattr(self.args, "sparsepcgc_codec_prune_prior_logit_weight", 6.0)),
@@ -6896,6 +6908,7 @@ class StructureRepairActuator(nn.Module):
                 device=pts_xyz.device, dtype=pts_xyz.dtype
             )
         subtree_move_source_prob = torch.sigmoid(subtree_move_source_logit).clamp(0.0, 1.0)
+        exact_network_move_score = subtree_move_source_logit
         move_source_prior = torch.sigmoid(
             (
                 0.70 * p_comp
@@ -7230,6 +7243,7 @@ class StructureRepairActuator(nn.Module):
                 device=pts_xyz.device, dtype=pts_xyz.dtype
             )
         learned_move_direction_logits = move_logits
+        exact_network_move_logits = learned_move_direction_logits
 
         # Section5:
         # best_move_target_child_slotと一致するtarget方向を強める。
@@ -7738,6 +7752,7 @@ class StructureRepairActuator(nn.Module):
         fixed_add_valid_after_unique_count = 0
         selected_fixed_add_pair_count = 0
         exact_add_pair_logits = None
+        exact_network_add_pair_logits = None
         learned_add_logit = None
         learned_add_direction_logits = None
         exact_add_target_bias = None
@@ -7821,11 +7836,19 @@ class StructureRepairActuator(nn.Module):
                 op_name="add",
             )
             add_logit = self._voxel_mean_logits(add_logit, voxel_coords, voxel_cache=voxel_cache)
+            exact_network_add_source_logit = self._voxel_mean_logits(
+                learned_add_logit, voxel_coords, voxel_cache=voxel_cache
+            )
             add_voxel_logits = self._voxel_mean_logits(add_voxel_logits, voxel_coords, voxel_cache=voxel_cache)
             if network_only_codec_mode:
                 add_voxel_logits = network_only_policy_terms["direction_logits"][:, 0].to(
                     device=pts_xyz.device, dtype=pts_xyz.dtype
                 )
+            # source/directionともTeacher方向biasを足す前のNetwork値だけを
+            # candidate utilityへ変換する。Heuristicは下流の明示prior項だけに残す。
+            exact_network_add_pair_logits = (
+                add_voxel_logits + exact_network_add_source_logit
+            ).permute(0, 2, 1).contiguous()
             learned_add_direction_logits = add_voxel_logits
 
             if (
@@ -8475,10 +8498,10 @@ class StructureRepairActuator(nn.Module):
                 learned_add_ratio,
                 learned_drop_ratio,
                 learned_move_ratio,
-                drop_prob,
-                move_score,
-                move_logits,
-                exact_add_pair_logits,
+                exact_network_drop_score,
+                exact_network_move_score,
+                exact_network_move_logits,
+                exact_network_add_pair_logits,
                 algorithmic_amount_selector_logits,
                 algorithmic_amount_residual_raw,
             )
@@ -8600,10 +8623,10 @@ class StructureRepairActuator(nn.Module):
                 learned_add_ratio,
                 learned_drop_ratio,
                 learned_move_ratio,
-                drop_prob,
-                move_score,
-                move_logits,
-                exact_add_pair_logits,
+                exact_network_drop_score,
+                exact_network_move_score,
+                exact_network_move_logits,
+                exact_network_add_pair_logits,
                 algorithmic_amount_selector_logits,
                 algorithmic_amount_residual_raw,
             )

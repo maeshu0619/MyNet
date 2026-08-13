@@ -4648,6 +4648,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                         f"exploration=(active={bool(audit_plan.get('exploration_active', False))}, "
                         f"alternatives={bool(audit_plan.get('has_where_alternatives', False))}, "
                         f"candidate_alpha={float(audit_plan.get('candidate_policy_alpha', 0.0) or 0.0):.3f}, "
+                        f"heuristic_prior={float(audit_plan.get('heuristic_candidate_prior_weight', 0.0) or 0.0):.3f}, "
                         f"multiplier={float(audit_plan.get('exploration_multiplier', 0.0) or 0.0):.3f}, "
                         f"gumbel={float(audit_plan.get('effective_where_gumbel_scale', 0.0) or 0.0):.4f}), "
                         f"where_delta=(mean={float(audit_plan.get('delta_where_logit_mean', 0.0) or 0.0):.6g}, "

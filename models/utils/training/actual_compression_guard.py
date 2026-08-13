@@ -25,15 +25,15 @@ _RUNTIME_ARG_STATE_NAMES = (
 def update_network_autonomy_from_guard(args, guard_event):
     """固定validationが改善した時だけden6 Pool内のNetwork裁量を広げる。"""
     start = max(
-        float(getattr(args, "heuristic_guidance_network_residual_weight", 0.05)),
+        float(getattr(args, "heuristic_guidance_network_residual_weight", 0.25)),
         0.0,
     )
     maximum = max(
-        float(getattr(args, "heuristic_guidance_network_residual_weight_max", 0.25)),
+        float(getattr(args, "heuristic_guidance_network_residual_weight_max", 1.0)),
         start,
     )
     increment = max(
-        float(getattr(args, "heuristic_guidance_network_residual_weight_increment", 0.025)),
+        float(getattr(args, "heuristic_guidance_network_residual_weight_increment", 0.05)),
         0.0,
     )
     current = min(

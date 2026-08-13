@@ -210,9 +210,9 @@ def log_runtime_setup(writer, args):
     if str(getattr(args, "heuristic_guidance_mode", "")).strip().lower() == "ana_den6_online":
         writer.write(
             "Network Pool Autonomy: "
-            f"start={float(getattr(args, 'heuristic_guidance_network_residual_weight', 0.05)):.6g}, "
-            f"max={float(getattr(args, 'heuristic_guidance_network_residual_weight_max', 0.25)):.6g}, "
-            f"new_best_increment={float(getattr(args, 'heuristic_guidance_network_residual_weight_increment', 0.025)):.6g}, "
+            f"start={float(getattr(args, 'heuristic_guidance_network_residual_weight', 0.25)):.6g}, "
+            f"max={float(getattr(args, 'heuristic_guidance_network_residual_weight_max', 1.0)):.6g}, "
+            f"new_best_increment={float(getattr(args, 'heuristic_guidance_network_residual_weight_increment', 0.05)):.6g}, "
             "gate=fixed_full_cloud_validation"
         )
 
