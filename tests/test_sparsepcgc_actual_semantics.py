@@ -1167,6 +1167,7 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         drop_preference = torch.zeros((1, 1, coords.shape[-1]))
         drop_preference[0, 0, 0] = -10.0
         drop_preference[0, 0, 2] = 10.0
+        drop_preference.requires_grad_()
         actuator.args.heuristic_guidance_network_residual_weight = 0.05
         actuator.args.heuristic_guidance_network_residual_weight_max = 0.25
         actuator.args._heuristic_guidance_network_residual_weight_current = 0.05
@@ -1196,6 +1197,11 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         self.assertIn("p0", low_autonomy[1]["selected_candidate_ids"])
         self.assertIn("p1", high_autonomy[1]["selected_candidate_ids"])
         self.assertNotEqual(low_autonomy[1]["plan_hash"], high_autonomy[1]["plan_hash"])
+        where_gradient = torch.autograd.grad(
+            high_autonomy[1]["policy_log_prob"], drop_preference
+        )[0]
+        self.assertTrue(torch.isfinite(where_gradient).all())
+        self.assertGreater(float(where_gradient.abs().sum()), 0.0)
 
     def test_den6_anchor_amounts_are_operation_specific_at_step_zero(self):
         """8i m=8の0.25%を旧5% Prune候補で上書きしない。"""
@@ -1223,6 +1229,128 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         values["Prune"].backward()
         self.assertTrue(torch.isfinite(network_ratio.grad).all())
         self.assertGreater(float(network_ratio.grad.abs().sum()), 0.0)
+
+    def test_unique_plan_cache_still_explores_edit_unit_pool_after_exact_anchor(self):
+        """完成planが1個でも、余剰edit-unit候補があればWhere探索を止めない。"""
+        point_count = 500
+        coords = torch.stack(
+            [
+                torch.arange(point_count, dtype=torch.long),
+                torch.zeros(point_count, dtype=torch.long),
+                torch.zeros(point_count, dtype=torch.long),
+            ],
+            dim=0,
+        ).unsqueeze(0)
+        pools = {
+            "Add": [
+                {"candidate_id": "a0", "operation": "Add", "pool_rank": 0,
+                 "remove_coords": [], "add_coords": [[500, 0, 0]]},
+            ],
+            "Prune": [
+                {"candidate_id": "p0", "operation": "Prune", "pool_rank": 0,
+                 "remove_coords": [[0, 0, 0]], "add_coords": []},
+                {"candidate_id": "p1", "operation": "Prune", "pool_rank": 1,
+                 "remove_coords": [[2, 0, 0]], "add_coords": []},
+            ],
+            "Adjust": [
+                {"candidate_id": "m0", "operation": "Adjust", "pool_rank": 0,
+                 "remove_coords": [[1, 0, 0]], "add_coords": [[1, 1, 0]]},
+            ],
+        }
+        guidance = {
+            "exact_candidate_guidance": {
+                "source": "ana_den6_exact_unique_plan_online_v6",
+                "total_ratio": 0.0025,
+                "operation_shares": {"Add": 0.4, "Prune": 0.4, "Adjust": 0.2},
+                "operation_priority": ["Add", "Prune", "Adjust"],
+                "anchor_operation_counts": {"Add": 1, "Prune": 1, "Adjust": 1},
+                "heuristic_anchor_plan": {"candidate_ids": ["a0", "p0", "m0"]},
+                "operation_edit_units": pools,
+            },
+            "candidate_tensor_map": {
+                "Add": {
+                    "rank_score": torch.tensor([1.0]),
+                    "pool_rank": torch.tensor([0]),
+                    "static_compatible": torch.tensor([True]),
+                    "pair_candidate_index": torch.tensor([0]),
+                    "pair_source_index": torch.tensor([499]),
+                    "pair_direction_index": torch.tensor([0]),
+                },
+                "Prune": {
+                    "rank_score": torch.tensor([0.55, 0.45]),
+                    "pool_rank": torch.tensor([0, 1]),
+                    "static_compatible": torch.tensor([True, True]),
+                    "source_index": torch.tensor([0, 2]),
+                },
+                "Adjust": {
+                    "rank_score": torch.tensor([1.0]),
+                    "pool_rank": torch.tensor([0]),
+                    "static_compatible": torch.tensor([True]),
+                    "source_index": torch.tensor([1]),
+                    "direction_index": torch.tensor([0]),
+                },
+            },
+        }
+        actuator = StructureRepairActuator.__new__(StructureRepairActuator)
+        torch.nn.Module.__init__(actuator)
+        actuator.args = SimpleNamespace(
+            heuristic_guidance_mode="ana_den6_online",
+            _global_train_step=2,
+            _total_train_steps_estimate=100,
+            heuristic_guidance_anchor_steps=200,
+            heuristic_guidance_exact_anchor_steps=1,
+            heuristic_guidance_online_amount_log_sigma=0.0,
+            heuristic_guidance_online_amount_residual_scale=0.0,
+            heuristic_guidance_network_residual_weight=0.05,
+            heuristic_guidance_network_residual_weight_max=0.25,
+            _heuristic_guidance_network_residual_weight_current=0.05,
+            heuristic_guidance_online_where_temperature=0.75,
+            heuristic_guidance_online_gumbel_scale=1.0,
+            repair_exploration_fraction=1.0,
+        )
+        actuator.train()
+        selected_prune = set()
+        for seed in range(12):
+            torch.manual_seed(seed)
+            result = actuator._build_exact_den6_residual_plan(
+                guidance,
+                coords,
+                torch.tensor([[[0.0010]]]),
+                torch.tensor([[[0.0010]]]),
+                torch.tensor([[[0.0005]]]),
+                torch.zeros((1, 1, point_count)),
+                torch.zeros((1, 1, point_count)),
+                torch.zeros((1, 26, point_count)),
+                torch.zeros((1, point_count, 26)),
+            )
+            self.assertTrue(result[1]["unique_plan_cache_source"])
+            self.assertTrue(result[1]["has_where_alternatives"])
+            self.assertTrue(result[1]["exploration_active"])
+            self.assertEqual(result[1]["candidate_policy_alpha"], 1.0)
+            selected_prune.update(
+                candidate_id
+                for candidate_id in result[1]["selected_candidate_ids"]
+                if candidate_id.startswith("p")
+            )
+        self.assertEqual(selected_prune, {"p0", "p1"})
+        actuator.eval()
+        deterministic_hashes = set()
+        for seed in (3, 9):
+            torch.manual_seed(seed)
+            result = actuator._build_exact_den6_residual_plan(
+                guidance,
+                coords,
+                torch.tensor([[[0.0010]]]),
+                torch.tensor([[[0.0010]]]),
+                torch.tensor([[[0.0005]]]),
+                torch.zeros((1, 1, point_count)),
+                torch.zeros((1, 1, point_count)),
+                torch.zeros((1, 26, point_count)),
+                torch.zeros((1, point_count, 26)),
+            )
+            self.assertFalse(result[1]["exploration_active"])
+            deterministic_hashes.add(result[1]["plan_hash"])
+        self.assertEqual(len(deterministic_hashes), 1)
 
     def test_den6_online_amounts_remain_nonzero_after_old_200_step_boundary(self):
         """旧bootstrap境界を越えても3操作のAmount priorと勾配を消さない。"""

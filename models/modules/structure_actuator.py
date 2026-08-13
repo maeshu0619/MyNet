@@ -3374,12 +3374,17 @@ class StructureRepairActuator(nn.Module):
             return value - value.detach()
         lower = value.amin()
         upper = value.amax()
-        if float((upper - lower).detach().cpu()) <= 1e-12:
+        span = upper - lower
+        if float(span.detach().cpu()) <= 1e-12:
             # 初期化直後は全候補scoreが同値になりやすい。
             # forwardを0のまま保ちながら、selected log-probから各候補headへ
-            # 勾配が流れる中心化STEとして返す。
-            return value - value.mean()
-        return (value - lower) / (upper - lower).clamp_min(1e-12) - 0.5
+            # 独立した勾配が流れるSTEとして返す。
+            return value - value.detach()
+        # forward値は従来どおり[-0.5, 0.5]だが、min/max統計をbackwardへ
+        # 含めると、実際に選ばれやすい最大・最小候補の勾配が0になる。
+        # 正規化統計だけを固定し、候補headへpolicy勾配を通す。
+        center = (upper + lower).detach() * 0.5
+        return (value - center) / span.detach().clamp_min(1e-12)
 
     def _exact_den6_candidate_scores(
         self,
@@ -3550,11 +3555,23 @@ class StructureRepairActuator(nn.Module):
             "ana_den6_exact_unique_plan_online_v6",
             "ana_den6_exact_one_pattern_anchor_online_v6",
         }
+        anchor_counts_for_exploration = dict(
+            exact.get("anchor_operation_counts")
+            or dict(exact.get("heuristic_anchor_plan") or {}).get("operation_counts")
+            or {}
+        )
+        # unique_planは「Actualへ渡す完成planが1個」という意味であり、
+        # edit-unit Poolが1候補という意味ではない。reserve付きCacheに余剰候補が
+        # ある場合は、そのPool内でNetwork方策がWhereを探索できる。
+        has_where_alternatives = any(
+            len(pools[name]) > max(int(anchor_counts_for_exploration.get(name, 0)), 0)
+            for name in operations
+        )
         exploration_active = bool(
             online_mode
             and self.training
             and current_step >= exact_anchor_steps
-            and not unique_plan_mode
+            and has_where_alternatives
         )
         # cacheが一意plan由来でも、Amountは3つの独立分布として学習する。
         # unique_plan_modeでこれまで探索まで止めていたこともAmount grad=0の
@@ -3615,6 +3632,10 @@ class StructureRepairActuator(nn.Module):
             ) / amount_temperature
             learned_total_for_backward = learned_total
         exact_anchor_active = current_step < exact_anchor_steps
+        # hard Exact再生はexact_anchor_stepsだけで終わる。Where候補方策を
+        # Amount用200-Step移行係数へ連動させると、学習初期のNetwork residualと
+        # Gumbel探索がほぼ0になり、Heuristic順位の固定選択へ戻ってしまう。
+        candidate_policy_alpha = 0.0 if exact_anchor_active else 1.0
         if exact_anchor_active:
             selected_amount_bin = torch.argmin(
                 torch.abs(bin_tensor - float(prior_total_ratio))
@@ -3765,35 +3786,58 @@ class StructureRepairActuator(nn.Module):
         ordered_indices = {}
         static_compatible = {}
         candidate_log_probs = {}
+        candidate_probs = {}
         candidate_entropies = []
+        candidate_entropy_by_operation = {}
         combined_logits = {}
         for operation in operations:
             mapping = guidance.get("candidate_tensor_map", {}).get(operation, {})
             rank_score = mapping.get("rank_score")
             if not torch.is_tensor(rank_score):
                 return None
-            logits = rank_score.float() + residual_alpha * residual_weight * network_scores[operation]
-            combined_logits[operation] = logits
-            scaled_logits = logits / float(temperature)
-            log_probs = torch.log_softmax(scaled_logits, dim=0)
-            probs = torch.softmax(scaled_logits, dim=0)
-            candidate_log_probs[operation] = log_probs
-            candidate_entropies.append(-(probs * log_probs).sum())
+            logits = (
+                rank_score.float()
+                + float(candidate_policy_alpha) * residual_weight * network_scores[operation]
+            )
             static_mask = mapping.get("static_compatible")
             if (
                 torch.is_tensor(static_mask)
-                and int(static_mask.numel()) == int(scaled_logits.numel())
+                and int(static_mask.numel()) == int(logits.numel())
             ):
+                static_mask_device = static_mask.to(
+                    device=logits.device, dtype=torch.bool
+                ).reshape_as(logits)
+                if not bool(static_mask_device.any()):
+                    raise RuntimeError(
+                        f"ana_den6 onlineの{operation}候補に有効Voxelがない"
+                    )
+                policy_logits = logits.masked_fill(~static_mask_device, float("-inf"))
                 static_compatible[operation] = (
-                    static_mask.detach().to(device="cpu", dtype=torch.bool).tolist()
+                    static_mask_device.detach().to(device="cpu").tolist()
                 )
+            else:
+                policy_logits = logits
+            combined_logits[operation] = policy_logits
+            scaled_logits = policy_logits / float(temperature)
+            log_probs = torch.log_softmax(scaled_logits, dim=0)
+            probs = torch.softmax(scaled_logits, dim=0)
+            candidate_log_probs[operation] = log_probs
+            candidate_probs[operation] = probs
+            finite_policy = torch.isfinite(log_probs)
+            candidate_entropy = -(
+                probs[finite_policy] * log_probs[finite_policy]
+            ).sum()
+            candidate_entropies.append(candidate_entropy)
+            candidate_entropy_by_operation[operation] = candidate_entropy
             if exploration_active:
                 uniform = torch.rand_like(scaled_logits).clamp_(1e-8, 1.0 - 1e-8)
                 gumbel = -torch.log(-torch.log(uniform))
                 # anchor直後から全順位をGumbelで無作為化するとden6の-4% planを
-                # 即座に破壊する。Network移行率に合わせて小さく探索を広げる。
+                # 即座に破壊しないよう既存の小さいgumbel_scaleを使う。ただし、
+                # Where探索をAmount用anchor係数で再び0へ潰さない。
                 order_score = (
-                    scaled_logits + gumbel * float(gumbel_scale) * float(residual_alpha)
+                    scaled_logits
+                    + gumbel * float(gumbel_scale) * float(candidate_policy_alpha)
                 ).detach()
             else:
                 order_score = scaled_logits.detach()
@@ -3943,6 +3987,93 @@ class StructureRepairActuator(nn.Module):
         residual_changed_ratio = residual_changed_count / max(
             float(len(selected_id_set | anchor_ids_for_delta)), 1.0
         )
+        selected_indices_by_operation = {name: [] for name in operations}
+        for operation, candidate_index, _ in selected:
+            selected_indices_by_operation[operation].append(int(candidate_index))
+        candidate_pool_sizes = {name: len(pools[name]) for name in operations}
+        candidate_valid_counts = {
+            name: (
+                int(sum(bool(value) for value in static_compatible[name]))
+                if len(static_compatible.get(name, ())) == len(pools[name])
+                else len(pools[name])
+            )
+            for name in operations
+        }
+        candidate_duplicate_counts = {
+            name: (
+                len([
+                    candidate
+                    for candidate in pools[name]
+                    if str(candidate.get("candidate_id", ""))
+                ])
+                - len({
+                    str(candidate.get("candidate_id", ""))
+                    for candidate in pools[name]
+                    if str(candidate.get("candidate_id", ""))
+                })
+            )
+            for name in operations
+        }
+        selected_pool_rank_samples = {}
+        selected_candidate_indices = {}
+        heuristic_top1_selected = {}
+        candidate_entropy_values = {}
+        candidate_normalized_entropy = {}
+        candidate_max_probability = {}
+        candidate_top2_probability_gap = {}
+        selected_where_residual_terms = []
+        all_selected_rank_values = []
+        for operation in operations:
+            mapping = guidance.get("candidate_tensor_map", {}).get(operation, {})
+            pool_rank = mapping.get("pool_rank")
+            indices = selected_indices_by_operation[operation]
+            if torch.is_tensor(pool_rank) and int(pool_rank.numel()) == len(pools[operation]):
+                if indices:
+                    index_tensor = torch.as_tensor(indices, device=pool_rank.device, dtype=torch.long)
+                    # 選択VoxelごとのCPU同期を避け、操作単位で一括取得する。
+                    ranks = pool_rank.index_select(0, index_tensor).detach().cpu().tolist()
+                    ranks = [int(rank) for rank in ranks]
+                else:
+                    ranks = []
+            else:
+                ranks = list(indices)
+            selected_pool_rank_samples[operation] = ranks[:8]
+            selected_candidate_indices[operation] = int(indices[0]) if indices else -1
+            heuristic_top1_selected[operation] = bool(0 in ranks)
+            all_selected_rank_values.extend(float(rank) for rank in ranks)
+            entropy_value = float(
+                candidate_entropy_by_operation[operation].detach().cpu()
+            )
+            candidate_entropy_values[operation] = entropy_value
+            candidate_normalized_entropy[operation] = entropy_value / max(
+                math.log(max(candidate_valid_counts[operation], 2)), 1e-12
+            )
+            probs = candidate_probs[operation]
+            top_probability = torch.topk(probs, k=min(2, int(probs.numel()))).values
+            candidate_max_probability[operation] = float(top_probability[0].detach().cpu())
+            candidate_top2_probability_gap[operation] = float(
+                (top_probability[0] - top_probability[1]).detach().cpu()
+                if int(top_probability.numel()) > 1 else top_probability[0].detach().cpu()
+            )
+            for index in indices:
+                selected_where_residual_terms.append(
+                    float(candidate_policy_alpha)
+                    * float(residual_weight)
+                    * network_scores[operation][index]
+                )
+        where_residual_tensor = (
+            torch.stack(selected_where_residual_terms)
+            if selected_where_residual_terms
+            else action_ratio_stack.new_zeros((1,))
+        )
+        amount_delta_ratios = {
+            name: float(selected_counts[name]) / max(float(point_count), 1.0)
+            - float(prior_ratios[name])
+            for name in operations
+        }
+        amount_delta_tensor = action_ratio_stack.new_tensor(
+            [amount_delta_ratios[name] for name in operations]
+        )
         selected_total_ratio = sum(selected_counts.values()) / max(float(point_count), 1.0)
         selected_changed_ratio = (
             selected_counts["Add"] + selected_counts["Prune"] + 2 * selected_counts["Adjust"]
@@ -3980,11 +4111,39 @@ class StructureRepairActuator(nn.Module):
             "variant_index": 0,
             "selected_candidate_ids": selected_ids,
             "residual_alpha": float(residual_alpha),
+            "candidate_policy_alpha": float(candidate_policy_alpha),
             "where_residual_weight": float(residual_weight),
             "where_residual_weight_start": float(residual_weight_start),
             "where_residual_weight_max": float(residual_weight_max),
             "residual_changed_candidate_count": int(residual_changed_count),
             "residual_changed_candidate_ratio": float(residual_changed_ratio),
+            "unique_plan_cache_source": bool(unique_plan_mode),
+            "has_where_alternatives": bool(has_where_alternatives),
+            "candidate_pool_sizes": candidate_pool_sizes,
+            "candidate_valid_counts": candidate_valid_counts,
+            "candidate_duplicate_counts": candidate_duplicate_counts,
+            "selected_candidate_indices": selected_candidate_indices,
+            "selected_pool_rank_samples": selected_pool_rank_samples,
+            "selected_heuristic_rank_mean": (
+                float(sum(all_selected_rank_values) / len(all_selected_rank_values))
+                if all_selected_rank_values else 0.0
+            ),
+            "heuristic_top1_selected": heuristic_top1_selected,
+            "heuristic_top1_selected_rate": (
+                sum(float(value) for value in heuristic_top1_selected.values())
+                / float(len(operations))
+            ),
+            "candidate_entropy_by_operation": candidate_entropy_values,
+            "candidate_normalized_entropy": candidate_normalized_entropy,
+            "candidate_max_probability": candidate_max_probability,
+            "candidate_top2_probability_gap": candidate_top2_probability_gap,
+            "delta_where_logit_mean": float(where_residual_tensor.mean().detach().cpu()),
+            "delta_where_logit_std": float(
+                where_residual_tensor.std(unbiased=False).detach().cpu()
+            ),
+            "delta_where_logit_abs_max": float(
+                where_residual_tensor.abs().max().detach().cpu()
+            ),
             "anchor_phase": float(anchor_phase),
             "requested_counts": requested_counts,
             "amount_bin_index": int(selected_amount_bin.detach().cpu()),
@@ -4003,6 +4162,14 @@ class StructureRepairActuator(nn.Module):
                 name: float(operation_fine_means[name].detach().cpu())
                 for name in operations
             },
+            "delta_amount_ratios": amount_delta_ratios,
+            "delta_amount_mean": float(amount_delta_tensor.mean().detach().cpu()),
+            "delta_amount_std": float(
+                amount_delta_tensor.std(unbiased=False).detach().cpu()
+            ),
+            "delta_amount_abs_max": float(
+                amount_delta_tensor.abs().max().detach().cpu()
+            ),
             "operation_amount_log_probs": {
                 name: operation_fine_log_probs[name]
                 for name in operations

@@ -2516,7 +2516,7 @@ def parse_pugan_args(parser, file_day, file_time):
         '--heuristic_guidance_anchor_steps',
         default=200,
         type=int,
-        help='den6 Where/Amount/Action priorをNetwork主体へ連続移行するstep数。0で即時residual主体',
+        help='den6 Amount/Action priorをNetwork主体へ連続移行するstep数。Where候補探索はhard Exact anchor終了後に開始する',
     )
     parser.add_argument(
         '--heuristic_guidance_teacher_bootstrap_steps',
