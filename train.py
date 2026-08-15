@@ -796,7 +796,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                         autocast_ctx = torch.cuda.amp.autocast(dtype=amp_dtype, enabled=use_amp) if use_cuda else nullcontext()
                         grad_ctx = torch.no_grad() if full_cloud_anchor_no_grad else nullcontext()
                         saved_tensor_threshold_mb = float(getattr(
-                            args, "full_cloud_saved_tensor_cpu_offload_mb", 0.25
+                            args, "full_cloud_saved_tensor_cpu_offload_mb", 0.0
                         ))
                         model_saved_tensor_ctx = selective_saved_tensor_cpu_offload(
                             saved_tensor_threshold_mb,
@@ -5153,6 +5153,21 @@ def train(model, args, loss, writer, plot, notifier=None):
                     tail_support_scaled = None
                     compression_support_anchor = None
                     online_policy_loss = None
+                    # ana_den6_online の shadow/audit 用別名も同じ voxel_state と
+                    # autograd graph を参照する。model 側を解放しても train() の
+                    # 巨大な frame-local が残るため、ここで明示的に参照を切る。
+                    shadow_state = None
+                    shadow_debug = {}
+                    shadow_teacher = {}
+                    shadow_distill_raw = None
+                    shadow_distill = None
+                    shadow_balance = None
+                    source_state = None
+                    source_plan = {}
+                    audit_state = {}
+                    emulator_loss = None
+                    emulator_before = None
+                    emulator_parameters = None
                     prune_where_grad_terms = []
                     step_grad_loss_items = []
                     audit_voxel_state = {}
@@ -5191,9 +5206,27 @@ def train(model, args, loss, writer, plot, notifier=None):
                             f"count={int(offload_release['released_count'])}, "
                             f"mb={float(offload_release['released_bytes']) / (1024.0 ** 2):.3f}"
                         )
-                    if use_cuda and torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    _release_cpu_step_memory()
+                    # offload無効時は参照カウントによるTensor解放だけで十分であり、
+                    # gc.collect/malloc_trim/empty_cacheを毎Step呼ぶとallocatorの
+                    # 再確保と全device同期が発生する。低頻度の保守cleanupへまとめる。
+                    allocator_cleanup_interval = max(int(getattr(
+                        args, "training_allocator_cleanup_interval", 100
+                    )), 0)
+                    saved_tensor_offload_enabled = float(getattr(
+                        args, "full_cloud_saved_tensor_cpu_offload_mb", 0.0
+                    )) > 0.0
+                    allocator_cleanup_due = bool(
+                        saved_tensor_offload_enabled
+                        or global_train_step == 0
+                        or (
+                            allocator_cleanup_interval > 0
+                            and (global_train_step + 1) % allocator_cleanup_interval == 0
+                        )
+                    )
+                    if allocator_cleanup_due:
+                        if use_cuda and torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        _release_cpu_step_memory()
                     # 解放漏れが再発してもOS全体のRAMを食い切る前に停止する。
                     # 直近実走では約70MB/Stepが残り、最終的にSSHまで不通になった。
                     offload_after_cleanup = saved_tensor_offload_stats()
@@ -5721,6 +5754,9 @@ def main():
     parser = argparse.ArgumentParser(description='Training Arguments')
     parser.add_argument('--trainORtest', default="train", type=str, help='date')
     args = parse_pugan_args(parser, file_day, file_time)
+    # Network/optimizer生成前にseedを固定する。従来のtrain()冒頭だけでは
+    # 初期重みがrunごとに変わり、最適化前後の数値比較が成立しなかった。
+    set_seed(args.seed, deterministic=getattr(args, "deterministic", False))
     if bool(getattr(args, "print_phase7_recommended_commands", False)):
         _print_phase7_recommended_commands_and_exit()
         raise SystemExit(0)

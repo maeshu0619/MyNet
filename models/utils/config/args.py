@@ -3045,11 +3045,12 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--full_cloud_activation_checkpoint', default=True, type=str2bool, help='FP32精度を維持したままfull-cloud headの中間activationをbackward時に再計算してGPUメモリを削減する')
     parser.add_argument(
         '--full_cloud_saved_tensor_cpu_offload_mb',
-        default=0.25,
+        default=0.0,
         type=float,
-        help='full-cloud backward用saved Tensorを可逆CPU退避する最小サイズMB（0で無効）',
+        help='full-cloud backward用saved Tensorを可逆CPU退避する最小サイズMB（0で無効）。PyTorch 1.11では長時間実行時にCPU allocatorが増え続けるため既定は無効',
     )
     parser.add_argument('--full_cloud_saved_tensor_pin_memory', default=False, type=str2bool, help='save_on_cpu退避をpinned memoryに置くか。長時間学習では共有メモリ増加を避けるため既定False')
+    parser.add_argument('--training_allocator_cleanup_interval', default=100, type=int, help='saved-tensor offload無効時にgc/malloc_trim/CUDA empty_cacheを実行するStep間隔（0で定期実行なし）')
     parser.add_argument('--structure_neighbor_query_chunk', default=32768, type=int, help='26近傍occupancyを完全一致のまま分割検索する点数（小さいほど一時GPUメモリを削減）')
     parser.add_argument('--structure_fixed_cache_max_entries', default=64, type=int, help='固定GTの26近傍・parent分割CPUキャッシュ最大件数')
     parser.add_argument('--structure_fixed_cache_max_memory_mb', default=1024, type=int, help='固定GTの26近傍・parent分割CPUキャッシュ上限(MB)')
