@@ -102,6 +102,21 @@ def _optimizer_state_to_parameter_device(optimizer):
                 state_values[key] = value.to(device=parameter_device)
 
 
+def _load_trusted_checkpoint(path):
+    """Load a checkpoint written by this training run across PyTorch versions."""
+    try:
+        # PyTorch >= 2.6 defaults to weights_only=True.  Guard sidecars also
+        # contain optimizer/RNG state (including NumPy tuples), so an explicit
+        # trusted full load is required to make rollback complete.
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError as exc:
+        # PyTorch 1.10/1.11 does not expose the weights_only argument.  Keep the
+        # training environment compatible without hiding unrelated load errors.
+        if "weights_only" not in str(exc):
+            raise
+        return torch.load(path, map_location="cpu")
+
+
 def _save_training_state(model_path, runtime_state, args):
     """Actual guardで巻き戻す学習状態をsidecarへ保存する。"""
     runtime_state = runtime_state or {}
@@ -143,7 +158,7 @@ def _load_training_state(model_path, runtime_state, args):
     path = _training_state_path(model_path)
     if not os.path.exists(path):
         return False, path
-    payload = torch.load(path, map_location="cpu")
+    payload = _load_trusted_checkpoint(path)
     runtime_state = runtime_state or {}
     object_keys = (
         ("optimizer", "main_optimizer"),
@@ -227,7 +242,7 @@ def _extract_state_dict(payload):
 
 
 def _load_model_state(model, path):
-    payload = torch.load(path, map_location="cpu")
+    payload = _load_trusted_checkpoint(path)
     state = _extract_state_dict(payload)
     target = model.module if hasattr(model, "module") else model
     target.load_state_dict(state, strict=False)
@@ -239,7 +254,7 @@ def _load_surrogate_state(loss, model_path):
     sidecar_path = os.path.join(os.path.dirname(model_path), surrogate_sidecar_filename(os.path.basename(model_path)))
     if not os.path.exists(sidecar_path):
         return False
-    payload = torch.load(sidecar_path, map_location="cpu")
+    payload = _load_trusted_checkpoint(sidecar_path)
     surrogate = getattr(loss, "compression_surrogate", None)
     if surrogate is None:
         return False
