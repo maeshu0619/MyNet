@@ -12,6 +12,8 @@ from .utils_loss import (
 
 
 class GeometryLossMixin:
+    _fit_voxel_offset_cache = {}
+
     def _set_geometry_debug(self, **kwargs):
         self.last_geometry_debug = kwargs
 
@@ -41,12 +43,123 @@ class GeometryLossMixin:
     def _debug_requires_grad(value):
         return bool(torch.is_tensor(value) and value.requires_grad)
 
+    @classmethod
+    def _fit_voxel_offsets(cls, radius, device):
+        radius = max(int(radius), 1)
+        key = (str(device), radius)
+        cached = cls._fit_voxel_offset_cache.get(key)
+        if cached is None or cached.device != device:
+            axis = torch.arange(-radius, radius + 1, device=device, dtype=torch.int64)
+            cached = torch.cartesian_prod(axis, axis, axis).reshape(-1, 3).contiguous()
+            cls._fit_voxel_offset_cache[key] = cached
+        return cached
+
+    @classmethod
+    def _local_surface_normals_from_voxels(
+        cls,
+        initial_rows,
+        initial_xyz_rows,
+        anchor_indices,
+        radius=2,
+        min_neighbors=3,
+    ):
+        """Estimate normals only at addition anchors using local occupied voxels."""
+        count = int(anchor_indices.numel())
+        if count <= 0:
+            return initial_xyz_rows.new_zeros((0, 3)), torch.zeros(
+                (0,), device=initial_rows.device, dtype=torch.bool
+            )
+
+        offsets = cls._fit_voxel_offsets(radius, initial_rows.device)
+        anchors = initial_rows.index_select(0, anchor_indices)
+        queries = anchors.unsqueeze(1) + offsets.unsqueeze(0)
+        query_rows = queries.reshape(-1, 3)
+
+        minimum = torch.minimum(initial_rows.amin(dim=0), query_rows.amin(dim=0))
+        maximum = torch.maximum(initial_rows.amax(dim=0), query_rows.amax(dim=0))
+        span = (maximum - minimum + 1).to(dtype=torch.int64).clamp_min(1)
+
+        def encode(rows):
+            shifted = rows.to(dtype=torch.int64) - minimum
+            return (
+                shifted[:, 0] * span[1] * span[2]
+                + shifted[:, 1] * span[2]
+                + shifted[:, 2]
+            )
+
+        initial_keys = encode(initial_rows)
+        sorted_keys, order = torch.sort(initial_keys)
+        query_keys = encode(query_rows)
+        positions = torch.searchsorted(sorted_keys, query_keys)
+        in_bounds = positions < sorted_keys.numel()
+        safe_positions = positions.clamp(max=max(int(sorted_keys.numel()) - 1, 0))
+        occupied = in_bounds & sorted_keys.index_select(0, safe_positions).eq(query_keys)
+        neighbor_indices = order.index_select(0, safe_positions).reshape(count, -1)
+        occupied = occupied.reshape(count, -1)
+
+        neighbors = initial_xyz_rows.index_select(0, neighbor_indices.reshape(-1)).reshape(
+            count, -1, 3
+        )
+        weights = occupied.to(dtype=neighbors.dtype).unsqueeze(-1)
+        neighbor_count = weights.sum(dim=1).squeeze(-1)
+        centroid = (neighbors * weights).sum(dim=1) / neighbor_count.clamp_min(1.0).unsqueeze(-1)
+        centered = (neighbors - centroid.unsqueeze(1)) * weights
+        covariance = centered.transpose(1, 2).matmul(centered)
+
+        # M is only the number of additions (~0.1% of a frame), so these tiny
+        # 3x3 eigendecompositions are much cheaper than estimating normals for
+        # every GT point or launching another full-cloud kNN.
+        eigenvalues, eigenvectors = torch.linalg.eigh(covariance)
+        normals = torch.nn.functional.normalize(eigenvectors[:, :, 0], dim=1, eps=1e-12)
+        scale = covariance.abs().amax(dim=(1, 2)).clamp_min(1.0)
+        non_collinear = eigenvalues[:, 1] > (1e-8 * scale)
+        valid = (neighbor_count >= float(max(int(min_neighbors), 3))) & non_collinear
+        normals = torch.where(valid.unsqueeze(1), normals, torch.zeros_like(normals))
+        return normals.detach(), valid.detach()
+
+    @classmethod
+    def _added_point_to_plane_fit(
+        cls,
+        added_xyz,
+        initial_xyz,
+        initial_rows,
+        nearest_gt_indices,
+        radius=2,
+        min_neighbors=3,
+    ):
+        """Mean squared normal distance from added points to the GT surface."""
+        added_count = int(added_xyz.shape[-1])
+        if added_count <= 0:
+            return added_xyz.new_zeros(()), 0, 0
+
+        added_rows_xyz = added_xyz[0].transpose(0, 1)
+        gt_rows_xyz = initial_xyz[0].transpose(0, 1)
+        nearest = nearest_gt_indices.reshape(-1).to(
+            device=initial_rows.device, dtype=torch.long
+        )
+        with torch.no_grad():
+            normals, valid = cls._local_surface_normals_from_voxels(
+                initial_rows,
+                gt_rows_xyz.detach(),
+                nearest,
+                radius=radius,
+                min_neighbors=min_neighbors,
+            )
+        if not bool(valid.any().item()):
+            return added_xyz.new_zeros(()), added_count, 0
+        nearest_xyz = gt_rows_xyz.index_select(0, nearest)
+        displacement = added_rows_xyz - nearest_xyz
+        normal_distance = (displacement * normals.to(displacement)).sum(dim=1)
+        fit = normal_distance.square()[valid].mean()
+        return fit, added_count, int(valid.sum().item())
+
     @staticmethod
     def _fit_proxy_loss(gen_pts_f, gt_pts_f):
-        gen = gen_pts_f.transpose(1, 2).contiguous()
-        gt = gt_pts_f.transpose(1, 2).contiguous()
-        _, dist2, _, _ = chamfer_dist(gen, gt)
-        return dist2.mean()
+        # Without explicit actuator provenance, adjusted points cannot be
+        # distinguished from additions.  Returning zero is semantically safer
+        # than the previous gt->gen Chamfer term, which penalized removed GT
+        # points and was not an addition-fit loss at all.
+        return gen_pts_f.new_zeros(())
 
     @staticmethod
     def _sorted_membership(source_keys, target_keys):
@@ -130,9 +243,42 @@ class GeometryLossMixin:
 
         initial_keys, final_keys = self._voxel_keys(initial_rows, final_rows)
         removed_mask = ~self._sorted_membership(initial_keys, final_keys)
-        added_mask = ~self._sorted_membership(final_keys, initial_keys)
+        new_final_mask = ~self._sorted_membership(final_keys, initial_keys)
+        fit_add_mask = new_final_mask
+        explicit_add = state.get("voxel_edit_add_target_coords", None)
+        explicit_add_mask = state.get("voxel_edit_add_target_mask", None)
+        if torch.is_tensor(explicit_add):
+            explicit_add = explicit_add.detach().to(
+                device=gen_pts_f.device, dtype=torch.int64
+            )
+            if explicit_add.ndim == 3 and explicit_add.shape[0] == 1:
+                if explicit_add.shape[1] == 3:
+                    explicit_add_rows = explicit_add[0].transpose(0, 1)
+                elif explicit_add.shape[2] == 3:
+                    explicit_add_rows = explicit_add[0]
+                else:
+                    explicit_add_rows = None
+            else:
+                explicit_add_rows = None
+            if explicit_add_rows is not None:
+                if torch.is_tensor(explicit_add_mask):
+                    mask = explicit_add_mask.detach().to(
+                        device=gen_pts_f.device, dtype=torch.bool
+                    ).reshape(-1)
+                    if mask.numel() == explicit_add_rows.shape[0]:
+                        explicit_add_rows = explicit_add_rows[mask]
+                if explicit_add_rows.numel() > 0:
+                    final_fit_keys, explicit_add_keys = self._voxel_keys(
+                        final_rows, explicit_add_rows
+                    )
+                    fit_add_mask = (
+                        self._sorted_membership(final_fit_keys, explicit_add_keys)
+                        & new_final_mask
+                    )
+                else:
+                    fit_add_mask = torch.zeros_like(new_final_mask)
         removed_rows = initial_rows[removed_mask]
-        added_rows = final_rows[added_mask]
+        added_rows = final_rows[new_final_mask]
         initial_xyz = self._voxel_xyz(initial_rows, step, offset, gt_pts_f)
         final_xyz = self._voxel_xyz(final_rows, step, offset, gen_pts_f)
         # Voxel状態とLoss入力の順序・座標が一致するときだけ高速経路を使う。
@@ -147,10 +293,11 @@ class GeometryLossMixin:
 
         zero = gen_pts_f.new_zeros(())
         added_dist = gen_pts_f.new_empty((0,))
+        added_nn_idx = torch.empty((0,), device=gen_pts_f.device, dtype=torch.long)
         removed_dist = gen_pts_f.new_empty((0,))
         if added_rows.numel() > 0:
-            added_xyz = gen_pts_f[:, :, added_mask]
-            added_dist, _, _, _ = chamfer_dist(
+            added_xyz = gen_pts_f[:, :, new_final_mask]
+            added_dist, _, added_nn_idx, _ = chamfer_dist(
                 added_xyz.transpose(1, 2).contiguous(),
                 initial_xyz.transpose(1, 2).contiguous(),
             )
@@ -168,7 +315,15 @@ class GeometryLossMixin:
         added_sum = added_dist.sum() if added_dist.numel() > 0 else zero
         removed_sum = removed_dist.sum() if removed_dist.numel() > 0 else zero
         hard = added_sum / float(gen_count) + removed_sum / float(gt_count)
-        fit = removed_sum / float(gt_count)
+        fit_selector_in_new = fit_add_mask[new_final_mask]
+        fit, fit_added_count, fit_valid_normal_count = self._added_point_to_plane_fit(
+            gen_pts_f[:, :, fit_add_mask],
+            initial_xyz,
+            initial_rows,
+            added_nn_idx.reshape(-1)[fit_selector_in_new],
+            radius=int(getattr(args, "geometry_fit_normal_radius", 2)),
+            min_neighbors=int(getattr(args, "geometry_fit_min_neighbors", 3)),
+        )
 
         if final_w_f is None:
             surrogate = hard
@@ -178,7 +333,7 @@ class GeometryLossMixin:
             if weights.numel() != final_rows.shape[0]:
                 return None
             added_weighted = (
-                (added_dist.detach() * weights[added_mask]).sum()
+                (added_dist.detach() * weights[new_final_mask]).sum()
                 if added_dist.numel() > 0
                 else zero
             )
@@ -189,6 +344,8 @@ class GeometryLossMixin:
             "surrogate": surrogate,
             "weighted": weighted,
             "fit": fit,
+            "fit_added_count": int(fit_added_count),
+            "fit_valid_normal_count": int(fit_valid_normal_count),
             "removed_count": int(removed_rows.shape[0]),
             "added_count": int(added_rows.shape[0]),
         }
@@ -374,6 +531,17 @@ class GeometryLossMixin:
                 gt_points=int(gt_inlinear.shape[-1]),
                 sparse_added_points=(
                     int(sparse_edit["added_count"]) if sparse_edit is not None else None
+                ),
+                fit_added_points=(
+                    int(sparse_edit["fit_added_count"]) if sparse_edit is not None else 0
+                ),
+                fit_valid_normal_points=(
+                    int(sparse_edit["fit_valid_normal_count"]) if sparse_edit is not None else 0
+                ),
+                fit_mode=(
+                    "added_point_to_local_gt_plane"
+                    if sparse_edit is not None
+                    else "disabled_without_addition_provenance"
                 ),
                 sparse_removed_points=(
                     int(sparse_edit["removed_count"]) if sparse_edit is not None else None

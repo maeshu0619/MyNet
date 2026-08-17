@@ -3883,6 +3883,10 @@ class StructureRepairActuator(nn.Module):
         selected = []
         removes = set()
         adds = set()
+        # Fit loss is defined only on true Add operations.  ``adds`` also
+        # contains Adjust destinations, so preserve the operation provenance
+        # while the conflict-free plan is assembled.
+        true_add_targets = set()
         selected_counts = {name: 0 for name in operations}
         for operation in operation_order:
             for candidate_index in ordered_indices[operation]:
@@ -3904,6 +3908,8 @@ class StructureRepairActuator(nn.Module):
                 candidate_removes, candidate_adds = self._den6_candidate_coord_sets(candidate)
                 removes.update(candidate_removes)
                 adds.update(candidate_adds)
+                if operation == "Add":
+                    true_add_targets.update(candidate_adds)
                 selected.append((operation, candidate_index, candidate))
                 selected_counts[operation] += 1
 
@@ -4190,6 +4196,17 @@ class StructureRepairActuator(nn.Module):
             ),
             "removed_voxel_count": len(removes),
             "added_voxel_count": len(adds),
+            # Device tensor used by Geometry Fit; unlike the final-set
+            # difference, this excludes Adjust destinations by construction.
+            "selected_add_target_coords": (
+                torch.as_tensor(
+                    sorted(true_add_targets),
+                    device=source_rows.device,
+                    dtype=torch.long,
+                ).reshape(-1, 3).transpose(0, 1).contiguous().unsqueeze(0)
+                if true_add_targets
+                else source_rows.new_empty((1, 3, 0))
+            ),
             "ratio_fallback_applied": selected_counts != requested_counts,
             "selected_total_ratio": float(selected_total_ratio),
             "selected_changed_voxel_ratio": float(selected_changed_ratio),
@@ -8479,6 +8496,19 @@ class StructureRepairActuator(nn.Module):
                     external_executable_plan
                 )[0][0]
             external_executable_plan_applied = True
+            # [B,K=1,operation,slot,xyz] -> [B,xyz,slot].  Keep the
+            # accepted mask so padded/rejected Add proposals never enter Fit.
+            voxel_edit_add_target_coords = (
+                external_executable_plan.target_coord[:, 0, 1]
+                .transpose(1, 2)
+                .contiguous()
+                .detach()
+            )
+            voxel_edit_add_target_mask = (
+                external_executable_plan.accepted_mask[:, 0, 1]
+                .to(device=pts_xyz.device, dtype=torch.bool)
+                .detach()
+            )
         exact_den6_online = (
             str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower()
             == "ana_den6_online"
@@ -8508,6 +8538,18 @@ class StructureRepairActuator(nn.Module):
             if exact_plan_result is not None:
                 exact_plan_coords, exact_residual_plan_debug = exact_plan_result
                 exact_counts = exact_residual_plan_debug.get("selected_counts", {})
+                exact_add_targets = exact_residual_plan_debug.get(
+                    "selected_add_target_coords", None
+                )
+                if torch.is_tensor(exact_add_targets):
+                    voxel_edit_add_target_coords = exact_add_targets.detach().to(
+                        device=pts_xyz.device, dtype=torch.long
+                    )
+                    voxel_edit_add_target_mask = torch.ones(
+                        (B, int(voxel_edit_add_target_coords.shape[-1])),
+                        device=pts_xyz.device,
+                        dtype=torch.bool,
+                    )
                 voxel_edit_final_coords = exact_plan_coords
                 voxel_edit_final_weights = pts_xyz.new_ones((B, 1, int(exact_plan_coords.shape[-1])))
                 voxel_edit_valid_mask = torch.ones(
@@ -8633,6 +8675,18 @@ class StructureRepairActuator(nn.Module):
             if exact_plan_result is not None:
                 exact_plan_coords, exact_residual_plan_debug = exact_plan_result
                 exact_counts = exact_residual_plan_debug.get("selected_counts", {})
+                exact_add_targets = exact_residual_plan_debug.get(
+                    "selected_add_target_coords", None
+                )
+                if torch.is_tensor(exact_add_targets):
+                    voxel_edit_add_target_coords = exact_add_targets.detach().to(
+                        device=pts_xyz.device, dtype=torch.long
+                    )
+                    voxel_edit_add_target_mask = torch.ones(
+                        (B, int(voxel_edit_add_target_coords.shape[-1])),
+                        device=pts_xyz.device,
+                        dtype=torch.bool,
+                    )
                 voxel_edit_final_coords = exact_plan_coords
                 voxel_edit_final_weights = pts_xyz.new_ones(
                     (B, 1, int(exact_plan_coords.shape[-1]))
@@ -12135,6 +12189,10 @@ class StructureRepairActuator(nn.Module):
             "final_voxel_coords": voxel_edit_final_coords,
             "final_voxel_weights": voxel_edit_final_weights,
             "final_voxel_valid_mask": voxel_edit_valid_mask,
+            # Geometry Fit must distinguish true Add targets from Adjust
+            # destinations.  A final-vs-initial set difference contains both.
+            "voxel_edit_add_target_coords": voxel_edit_add_target_coords.detach(),
+            "voxel_edit_add_target_mask": voxel_edit_add_target_mask.detach(),
             "external_executable_plan_applied": bool(external_executable_plan_applied),
             "external_executable_plan_hash": str(external_executable_plan_hash),
             "voxel_step": voxel_step,

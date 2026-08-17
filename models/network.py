@@ -108,6 +108,20 @@ class Network(nn.Module):
             hidden_dim=hidden_dim,
             temperature=float(getattr(self.args, "repair_policy_temperature", 1.0)),
         )
+        self.direct_octree_structure_targets = bool(
+            getattr(self.args, "direct_octree_structure_targets", True)
+        )
+        if self.direct_octree_structure_targets:
+            # cause_targetsは入力Octreeから推論時にも同じ値を計算できる。
+            # checkpoint互換のためmodule自体は残すが、冗長な近似headと集約refineは
+            # forward/optimizerの双方から外す。
+            for module in (
+                self.cost_attributor,
+                self.policy_module,
+                self.cause_aggregator.refine,
+            ):
+                for parameter in module.parameters():
+                    parameter.requires_grad_(False)
         self.actuator = StructureRepairActuator( # 実際に点群に操作するモジュールの作成
             in_channels=structure_dim + len(CAUSE_NAMES) + len(POLICY_NAMES) + self.cause_aggregator.priority_dim,
             hidden_dim=int(getattr(self.args, "repair_actuator_hidden_dim", 64)),
@@ -2403,6 +2417,24 @@ class Network(nn.Module):
             dtype=dtype,
         )
 
+    def _direct_structure_scores(self, cause_targets):
+        """Octree原因教師をCostAttributionの予測分布と同じ表現へ変換する。"""
+        targets = torch.nan_to_num(
+            cause_targets,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).clamp_min(0.0)
+        weights = self._cause_weights(targets.device, targets.dtype).view(1, -1, 1)
+        weighted = targets * weights
+        mass = weighted.sum(dim=1, keepdim=True)
+        normalized = weighted / mass.clamp_min(1e-6)
+        uniform = torch.full_like(
+            normalized,
+            1.0 / max(int(normalized.shape[1]), 1),
+        )
+        return torch.where((mass > 1e-6).expand_as(normalized), normalized, uniform).detach()
+
     @staticmethod
     def _normalize_point_mask(mask, batch_size, num_points, device): # 点単位のマスクをBool Tensorに整形
         if mask is None:
@@ -2817,6 +2849,13 @@ class Network(nn.Module):
         guidance_mode = str(
             getattr(self.args, "heuristic_guidance_mode", "proxy_prior")
         ).strip().lower()
+        direct_structure_targets = bool(
+            getattr(
+                self.args,
+                "direct_octree_structure_targets",
+                getattr(self, "direct_octree_structure_targets", True),
+            )
+        )
         network_only_codec_mode = guidance_mode in {
             "network_only_codec_policy", "network_k_proposal_policy", "single_plan_student"
         }
@@ -3197,16 +3236,28 @@ class Network(nn.Module):
                 
                 """圧縮非効率原因推定器"""
                 cause_targets_b = structure_b["cause_targets"].to(device=pts_xyz.device, dtype=fused_feat_b.dtype) # 構造解析結果から原因教師を取り出し、DeviceとDtypeを合わせることで、原因推定損失の教師信号として扱う
-                cause_input_b = torch.cat([fused_feat_b, structure_feat_b], dim=1) # Encoder統合特徴と構造特徴をチャネル方向に結合
-                if timing_enabled:
-                    self._sync_if_cuda_tensor(pts_xyz)
-                    runtime_attr_start = time.time()
-                cause_scores_b, cause_logits_b = self.cost_attributor(cause_input_b) # 各点の圧縮非効率原因スコアとlogitsを推定
-                if timing_enabled:
-                    self._sync_if_cuda_tensor(pts_xyz)
-                    runtime_attr_end = time.time()
-                    runtime_attribution_total += runtime_attr_end - runtime_attr_start
-                    runtime_decision_start = time.time()
+                if direct_structure_targets:
+                    cause_scores_b = self._direct_structure_scores(cause_targets_b)
+                    cause_logits_b = None
+                    self.cost_attributor.debug_tensors = {
+                        "scores_requires_grad": False,
+                        "logits_requires_grad": False,
+                        "input_mode": "node_voxel" if node_voxel_input_state is not None else "point",
+                        "source": "direct_octree_targets",
+                    }
+                    if timing_enabled:
+                        runtime_decision_start = time.time()
+                else:
+                    cause_input_b = torch.cat([fused_feat_b, structure_feat_b], dim=1) # Encoder統合特徴と構造特徴をチャネル方向に結合
+                    if timing_enabled:
+                        self._sync_if_cuda_tensor(pts_xyz)
+                        runtime_attr_start = time.time()
+                    cause_scores_b, cause_logits_b = self.cost_attributor(cause_input_b) # 各点の圧縮非効率原因スコアとlogitsを推定
+                    if timing_enabled:
+                        self._sync_if_cuda_tensor(pts_xyz)
+                        runtime_attr_end = time.time()
+                        runtime_attribution_total += runtime_attr_end - runtime_attr_start
+                        runtime_decision_start = time.time()
                     
                 """原因スコア集約器"""
                 unit_keys_b = None if analysis_unit_keys is None else analysis_unit_keys[b:b + 1, :analysis_count]
@@ -3242,6 +3293,7 @@ class Network(nn.Module):
                     cause_scores=cause_scores_b,
                     cause_targets=cause_targets_b,
                     unit_keys=unit_keys_b,
+                    apply_learnable_refine=not direct_structure_targets,
                 )
                 aggregation_unit_modes.append(str(aggregated_b.get("unit_mode", "unknown")))
                 if isinstance(structure_b, dict):
@@ -3260,8 +3312,12 @@ class Network(nn.Module):
                 repair_priority_b = aggregated_b["priority"].to(device=pts_xyz.device, dtype=fused_feat_b.dtype) # DeviceとDtypeを合わせる
                 
                 """方策選択器"""
-                policy_input_b = torch.cat([fused_feat_b, structure_feat_b, subtree_scores_b, repair_priority_b], dim=1) # 統合特徴、構造特徴、原因スコア、修復優先度をチャネル方向に結合
-                policy_probs_b, policy_logits_b = self.policy_module(policy_input_b) # 各点又は各Repai Unitに対して修復操作の確率をLogitsを出す
+                if direct_structure_targets:
+                    policy_probs_b = self.policy_module.build_teacher(subtree_targets_b).detach()
+                    policy_logits_b = None
+                else:
+                    policy_input_b = torch.cat([fused_feat_b, structure_feat_b, subtree_scores_b, repair_priority_b], dim=1) # 統合特徴、構造特徴、原因スコア、修復優先度をチャネル方向に結合
+                    policy_probs_b, policy_logits_b = self.policy_module(policy_input_b) # 各点又は各Repai Unitに対して修復操作の確率をLogitsを出す
                 if timing_enabled:
                     self._sync_if_cuda_tensor(pts_xyz)
                     runtime_decision_end = time.time()
@@ -3310,7 +3366,7 @@ class Network(nn.Module):
                     compute_losses_b = self.training
                 else:
                     compute_losses_b = compute_internal_losses
-                if compute_losses_b:
+                if compute_losses_b and not direct_structure_targets:
                     analysis_mask_b = None
                     if analysis_selection_mask is not None:
                         analysis_mask_b = analysis_selection_mask[b:b + 1, :analysis_count]
@@ -3429,16 +3485,28 @@ class Network(nn.Module):
             structure_feat = structure["features"].to(device=pts_xyz.device, dtype=fused_feat.dtype)
             cause_targets = structure["cause_targets"].to(device=pts_xyz.device, dtype=fused_feat.dtype)
 
-            cause_input = torch.cat([fused_feat, structure_feat], dim=1)
-            if timing_enabled:
-                self._sync_if_cuda_tensor(pts_xyz)
-                runtime_attr_start = time.time()
-            cause_scores, cause_logits = self.cost_attributor(cause_input)
-            if timing_enabled:
-                self._sync_if_cuda_tensor(pts_xyz)
-                runtime_attr_end = time.time()
-                runtime_attribution_total += runtime_attr_end - runtime_attr_start
-                runtime_decision_start = time.time()
+            if direct_structure_targets:
+                cause_scores = self._direct_structure_scores(cause_targets)
+                cause_logits = None
+                self.cost_attributor.debug_tensors = {
+                    "scores_requires_grad": False,
+                    "logits_requires_grad": False,
+                    "input_mode": "node_voxel" if node_voxel_input_state is not None else "point",
+                    "source": "direct_octree_targets",
+                }
+                if timing_enabled:
+                    runtime_decision_start = time.time()
+            else:
+                cause_input = torch.cat([fused_feat, structure_feat], dim=1)
+                if timing_enabled:
+                    self._sync_if_cuda_tensor(pts_xyz)
+                    runtime_attr_start = time.time()
+                cause_scores, cause_logits = self.cost_attributor(cause_input)
+                if timing_enabled:
+                    self._sync_if_cuda_tensor(pts_xyz)
+                    runtime_attr_end = time.time()
+                    runtime_attribution_total += runtime_attr_end - runtime_attr_start
+                    runtime_decision_start = time.time()
                 
             # ============================================================
             # Phase4:
@@ -3501,6 +3569,7 @@ class Network(nn.Module):
                 cause_scores=cause_scores,
                 cause_targets=cause_targets,
                 unit_keys=unit_keys,
+                apply_learnable_refine=not direct_structure_targets,
             )
 
             structure["aggregation_unit_keys"] = unit_keys
@@ -3597,8 +3666,12 @@ class Network(nn.Module):
             subtree_scores = aggregated["scores"]
             subtree_targets = aggregated["targets"]
             repair_priority = aggregated["priority"].to(device=pts_xyz.device, dtype=fused_feat.dtype)
-            policy_input = torch.cat([fused_feat, structure_feat, subtree_scores, repair_priority], dim=1)
-            policy_probs, policy_logits = self.policy_module(policy_input)
+            if direct_structure_targets:
+                policy_probs = self.policy_module.build_teacher(subtree_targets).detach()
+                policy_logits = None
+            else:
+                policy_input = torch.cat([fused_feat, structure_feat, subtree_scores, repair_priority], dim=1)
+                policy_probs, policy_logits = self.policy_module(policy_input)
             if timing_enabled:
                 self._sync_if_cuda_tensor(pts_xyz)
                 runtime_decision_end = time.time()
@@ -3964,6 +4037,8 @@ class Network(nn.Module):
                 "final_voxel_coords",
                 "final_voxel_weights",
                 "final_voxel_valid_mask",
+                "voxel_edit_add_target_coords",
+                "voxel_edit_add_target_mask",
                 "voxel_step",
                 "voxel_offset",
                 "voxel_edit_mode",
@@ -4364,7 +4439,7 @@ class Network(nn.Module):
         """scaled final internal lossの計算"""
         if compute_internal_losses is None:
             compute_internal_losses = self.training
-        if compute_internal_losses:
+        if compute_internal_losses and not direct_structure_targets:
             if keep_sparse_path:
                 loss_attr = loss_attr_sparse * float(getattr(self.args, "loss_attr_scale", 1.0))
                 loss_policy = loss_policy_sparse * float(getattr(self.args, "loss_policy_scale", 1.0))
@@ -4578,6 +4653,12 @@ class Network(nn.Module):
                     ),
                     "phase4_cost_logits_requires_grad": bool(
                         getattr(self.cost_attributor, "debug_tensors", {}).get("logits_requires_grad", False)
+                    ),
+                    "direct_octree_structure_targets": bool(direct_structure_targets),
+                    "structure_control_source": (
+                        "direct_octree_targets"
+                        if direct_structure_targets
+                        else "learned_cost_attribution_and_policy"
                     ),
                     "phase4_cause_entropy": float(
                         getattr(self.cost_attributor, "debug_tensors", {}).get(

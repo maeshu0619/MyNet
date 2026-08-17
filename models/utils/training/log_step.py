@@ -582,6 +582,17 @@ def log_compact_step_summary(
         f"single={_fmt(loss_single)}, node={_fmt(loss_nodes)}, sparse={_fmt(sparse_raw)}, "
         f"attr={_fmt(L_attr)}, policy={_fmt(L_policy)}, act={_fmt(L_actuator)}]"
     )
+    if "fit" in geom_debug:
+        writer.write(
+            f"StepGeometry {step + 1}/{num_steps}: "
+            f"mode={geom_debug.get('mode', 'unknown')}, "
+            f"fit_mode={geom_debug.get('fit_mode', 'unknown')}, "
+            f"cd={_fmt(geom_debug.get('hard', float('nan')))}, "
+            f"fit={_fmt(geom_debug.get('fit', float('nan')))}, "
+            f"fit_weight={_fmt(geom_debug.get('fit_weight', float('nan')))}, "
+            f"added={int(geom_debug.get('fit_added_points', 0) or 0)}, "
+            f"valid_normals={int(geom_debug.get('fit_valid_normal_points', 0) or 0)}"
+        )
     if str(comp_debug.get("loss_mode", "")).strip().lower() == "compression_primary":
         writer.write(
             f"StepBalance {step + 1}/{num_steps}: "

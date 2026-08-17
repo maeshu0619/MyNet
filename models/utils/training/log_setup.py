@@ -59,6 +59,12 @@ def log_basic_setup(writer, args, file_day, file_time):
         f"geometry_use_d2={bool(getattr(args, 'geometry_use_d2', False))}"
     )
     writer.write(
+        "Structure Control: "
+        f"direct_octree_targets={bool(getattr(args, 'direct_octree_structure_targets', True))}, "
+        f"L_Attr_weight={float(getattr(args, 'w_attr', 0.0)):.6g}, "
+        f"L_Pol_weight={float(getattr(args, 'w_policy', 0.0)):.6g}"
+    )
+    writer.write(
         "Gradient Scale Groups: "
         f"prune_where_compression={float(getattr(args, 'grad_scale_prune_where_compression', 1.0)):.6g}, "
         f"prune_where_actuator={float(getattr(args, 'grad_scale_prune_where_actuator', 1.0)):.6g}, "

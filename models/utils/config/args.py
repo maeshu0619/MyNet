@@ -1806,6 +1806,12 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--attr_sparse_weight', default=1.0, type=float, help='sparse fragmentation原因教師の重み')
     parser.add_argument('--attr_outlier_weight', default=1.0, type=float, help='outlier原因教師の重み')
     parser.add_argument('--attr_shape_weight', default=0.75, type=float, help='形状保持原因教師の重み')
+    parser.add_argument(
+        '--direct_octree_structure_targets',
+        default=True,
+        type=str2bool,
+        help='推論時にも得られるOctree原因教師と決定論的方策を直接使い、冗長なL_Attr/L_Polと近似headを無効化する',
+    )
     parser.add_argument('--loss_attr_scale', default=0.05, type=float, help='原因分解損失の内部スケール')
     parser.add_argument('--loss_policy_scale', default=1.0, type=float, help='修復ポリシー損失の内部スケール')
     parser.add_argument('--loss_repair_scale', default=1.0, type=float, help='修復アクチュエータ損失の内部スケール')
@@ -1916,7 +1922,19 @@ def parse_pugan_args(parser, file_day, file_time):
         '--geometry_fit_weight',
         default=0.05,
         type=float,
-        help='幾何損失へ足す局所fit補助項の重み',
+        help='追加点からGT局所表面への法線方向二乗距離平均に掛ける重み',
+    )
+    parser.add_argument(
+        '--geometry_fit_normal_radius',
+        default=2,
+        type=int,
+        help='追加点Fit用のGT局所法線を推定するvoxel近傍半径',
+    )
+    parser.add_argument(
+        '--geometry_fit_min_neighbors',
+        default=3,
+        type=int,
+        help='追加点Fitで局所PCA法線を有効とする最小GT近傍数',
     )
     parser.add_argument(
         '--geometry_use_d2',
@@ -3441,10 +3459,26 @@ def parse_pugan_args(parser, file_day, file_time):
         args.w_actuator = float(args.w_dis)
     args.compression_loss_delta = bool(getattr(args, "compression_loss_delta", True))
     args.minimal_loss_objective = bool(getattr(args, "minimal_loss_objective", True))
+    args.direct_octree_structure_targets = bool(
+        getattr(args, "direct_octree_structure_targets", True)
+    )
     args.geometry_fit_weight = max(float(getattr(args, "geometry_fit_weight", 0.05)), 0.0)
+    args.geometry_fit_normal_radius = min(max(
+        int(getattr(args, "geometry_fit_normal_radius", 2)), 1
+    ), 4)
+    args.geometry_fit_min_neighbors = max(
+        int(getattr(args, "geometry_fit_min_neighbors", 3)), 3
+    )
     args.geometry_use_d2 = bool(getattr(args, "geometry_use_d2", False))
     args.w_attr = float(args.w_attr)
     args.w_policy = float(args.w_policy)
+    if args.direct_octree_structure_targets:
+        # cause_targetsは入力Octreeだけから訓練・推論の両方で同じ値を計算できる。
+        # 同じ値を近似する補助headを主損失へ残さない。
+        args.loss_attr_scale = 0.0
+        args.loss_policy_scale = 0.0
+        args.w_attr = 0.0
+        args.w_policy = 0.0
     args.w_actuator = float(args.w_actuator)
     args.w_prun = args.w_attr
     args.w_add = args.w_policy

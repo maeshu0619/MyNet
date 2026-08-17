@@ -55,7 +55,14 @@ class CauseDiagnosisAggregation(nn.Module):
         counts = torch.bincount(inverse, minlength=int(unique.numel()))
         return self._aggregate_with_inverse(values, inverse, counts)
 
-    def forward(self, pts_xyz, cause_scores, cause_targets, unit_keys=None):
+    def forward(
+        self,
+        pts_xyz,
+        cause_scores,
+        cause_targets,
+        unit_keys=None,
+        apply_learnable_refine=True,
+    ):
         unit_mode = "prebuilt"
         if unit_keys is None:
             if not bool(getattr(self.args, "allow_local_repair_unit_recompute", False)):
@@ -117,7 +124,11 @@ class CauseDiagnosisAggregation(nn.Module):
         targets = torch.stack(agg_targets, dim=0)
         priority = torch.stack(priorities, dim=0)
         refine_applied = False
-        if self.refine_enabled and scores.shape[1] == self.cause_dim:
+        if (
+            apply_learnable_refine
+            and self.refine_enabled
+            and scores.shape[1] == self.cause_dim
+        ):
             refine_input = torch.cat([scores, priority.to(dtype=scores.dtype).detach()], dim=1)
             refine_delta = self.refine(refine_input)
             refine_scale = max(float(getattr(self.args, "cause_aggregation_refine_scale", 0.10)), 0.0)

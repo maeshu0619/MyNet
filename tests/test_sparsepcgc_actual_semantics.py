@@ -1110,6 +1110,15 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         self.assertIsNotNone(result)
         final_coords, debug = result
         self.assertEqual(debug["selected_counts"], {"Add": 1, "Prune": 1, "Adjust": 1})
+        self.assertEqual(tuple(debug["selected_add_target_coords"].shape), (1, 3, 1))
+        selected_add = tuple(
+            int(value) for value in debug["selected_add_target_coords"][0, :, 0].tolist()
+        )
+        add_teacher = next(
+            row for row in debug["single_plan_shadow_teacher"]["candidates"]
+            if row["operation"] == "Add"
+        )
+        self.assertEqual(selected_add, tuple(add_teacher["add_coords"][0]))
         self.assertAlmostEqual(debug["amount_bin_ratio"], 0.005, places=9)
         self.assertEqual(_coord_hash(final_coords), _coord_hash(expected))
         expected_sorted = torch.unique(

@@ -38,6 +38,8 @@ class ExactSparseGeometryTest(unittest.TestCase):
                 "initial_voxel_coords": initial_rows.transpose(0, 1).unsqueeze(0),
                 "final_voxel_coords": final_rows.transpose(0, 1).unsqueeze(0),
                 "final_voxel_valid_mask": torch.ones((1, len(final_rows)), dtype=torch.bool),
+                "voxel_edit_add_target_coords": torch.tensor([[[2], [1], [0]]]),
+                "voxel_edit_add_target_mask": torch.ones((1, 1), dtype=torch.bool),
                 "voxel_restore_meta": {
                     "effective_qs_tensor": torch.ones((1, 1, 1)),
                     "global_offset_tensor": torch.zeros((1, 3, 1)),
@@ -56,6 +58,78 @@ class ExactSparseGeometryTest(unittest.TestCase):
         self.assertTrue(torch.allclose(sparse["hard"], expected, atol=1e-7, rtol=0.0))
         self.assertEqual(sparse["removed_count"], 2)
         self.assertEqual(sparse["added_count"], 2)
+        self.assertEqual(sparse["fit_added_count"], 1)
+
+    def test_fit_is_added_point_to_local_surface_normal_distance(self):
+        initial_rows = torch.tensor(
+            [[x, y, 0] for x in range(5) for y in range(5)],
+            dtype=torch.long,
+        )
+        added = torch.tensor([[2, 2, 2]], dtype=torch.long)
+        final_rows = torch.cat([initial_rows, added], dim=0)
+        gt = initial_rows.float().transpose(0, 1).unsqueeze(0)
+        gen = final_rows.float().transpose(0, 1).unsqueeze(0).requires_grad_(True)
+        args = SimpleNamespace(
+            heuristic_guidance_mode="ana_den6_online",
+            geometry_fit_normal_radius=2,
+            geometry_fit_min_neighbors=3,
+            _last_actuator_voxel_state={
+                "voxel_edit_state_enabled": True,
+                "initial_voxel_coords": initial_rows.transpose(0, 1).unsqueeze(0),
+                "final_voxel_coords": final_rows.transpose(0, 1).unsqueeze(0),
+                "final_voxel_valid_mask": torch.ones((1, len(final_rows)), dtype=torch.bool),
+                "voxel_edit_add_target_coords": added.transpose(0, 1).unsqueeze(0),
+                "voxel_edit_add_target_mask": torch.ones((1, 1), dtype=torch.bool),
+                "voxel_restore_meta": {
+                    "effective_qs_tensor": torch.ones((1, 1, 1)),
+                    "global_offset_tensor": torch.zeros((1, 3, 1)),
+                },
+            },
+        )
+        with mock.patch("models.utils.loss.geometry.chamfer_dist", _torch_chamfer):
+            sparse = _Geometry()._exact_sparse_edit_chamfer(args, gen, gt, final_w_f=None)
+        self.assertEqual(sparse["fit_added_count"], 1)
+        self.assertEqual(sparse["fit_valid_normal_count"], 1)
+        self.assertTrue(torch.allclose(sparse["fit"], torch.tensor(4.0), atol=1e-6))
+        sparse["fit"].backward()
+        self.assertAlmostEqual(float(gen.grad[0, 2, -1]), 4.0, places=5)
+        self.assertEqual(int(torch.count_nonzero(gen.grad[:, :, :-1])), 0)
+
+    def test_fit_ignores_tangential_addition_and_removed_points(self):
+        initial_rows = torch.tensor(
+            [[x, y, 0] for x in range(5) for y in range(5)],
+            dtype=torch.long,
+        )
+        # Remove one GT point and add one point along the same z=0 surface.
+        final_rows = torch.cat(
+            [initial_rows[1:], torch.tensor([[5, 2, 0]], dtype=torch.long)],
+            dim=0,
+        )
+        gt = initial_rows.float().transpose(0, 1).unsqueeze(0)
+        gen = final_rows.float().transpose(0, 1).unsqueeze(0)
+        args = SimpleNamespace(
+            heuristic_guidance_mode="ana_den6_online",
+            geometry_fit_normal_radius=2,
+            geometry_fit_min_neighbors=3,
+            _last_actuator_voxel_state={
+                "voxel_edit_state_enabled": True,
+                "initial_voxel_coords": initial_rows.transpose(0, 1).unsqueeze(0),
+                "final_voxel_coords": final_rows.transpose(0, 1).unsqueeze(0),
+                "final_voxel_valid_mask": torch.ones((1, len(final_rows)), dtype=torch.bool),
+                "voxel_edit_add_target_coords": torch.tensor([[[5], [2], [0]]]),
+                "voxel_edit_add_target_mask": torch.ones((1, 1), dtype=torch.bool),
+                "voxel_restore_meta": {
+                    "effective_qs_tensor": torch.ones((1, 1, 1)),
+                    "global_offset_tensor": torch.zeros((1, 3, 1)),
+                },
+            },
+        )
+        with mock.patch("models.utils.loss.geometry.chamfer_dist", _torch_chamfer):
+            sparse = _Geometry()._exact_sparse_edit_chamfer(args, gen, gt, final_w_f=None)
+        self.assertEqual(sparse["removed_count"], 1)
+        self.assertEqual(sparse["fit_added_count"], 1)
+        self.assertEqual(sparse["fit_valid_normal_count"], 1)
+        self.assertAlmostEqual(float(sparse["fit"]), 0.0, places=7)
 
 
 if __name__ == "__main__":
