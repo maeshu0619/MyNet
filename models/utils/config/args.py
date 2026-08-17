@@ -2430,9 +2430,9 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--heuristic_guidance_online_amount_bins',
-        default='0.00225,0.002375,0.0025,0.002625,0.00275',
+        default='0.0015,0.002,0.0025,0.00275,0.003',
         type=str,
-        help='Exact 0.25%%を中心にNetworkが微調整するtotal edit ratioの局所離散集合',
+        help='Exact 0.25%%を含み、Networkが実測Rate-Distortionで選ぶtotal edit ratioの離散集合',
     )
     parser.add_argument(
         '--heuristic_guidance_online_amount_residual_scale',
@@ -2445,6 +2445,12 @@ def parse_pugan_args(parser, file_day, file_time):
         default=0.35,
         type=float,
         help='離散Amount選択の温度',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_amount_gumbel_scale',
+        default=2.0,
+        type=float,
+        help='anchor後のAmount binを実際に比較するGumbel探索強度',
     )
     parser.add_argument(
         '--heuristic_guidance_online_policy_weight',
@@ -2484,13 +2490,13 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--heuristic_guidance_online_geometry_policy_weight',
-        default=0.10,
+        default=0.50,
         type=float,
-        help='圧縮改善を維持したplanのGeometry改善を離散Amountへ返す二次方策重み',
+        help='圧縮改善を維持したplanのGeometry改善を離散Amountへ返すRate-Distortion方策重み',
     )
     parser.add_argument(
         '--heuristic_guidance_online_geometry_compression_tolerance',
-        default=0.25,
+        default=0.05,
         type=float,
         help='Geometry方策更新を許可するActual圧縮率EMAからの悪化許容幅[percentage point]',
     )
@@ -2586,19 +2592,19 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--heuristic_guidance_network_residual_weight',
-        default=0.25,
+        default=0.05,
         type=float,
-        help='den6 Pool候補を再順位付けするNetwork utilityの初期重み。既定は残すHeuristic priorと同尺度',
+        help='den6 Pool候補を再順位付けするNetwork utilityの初期重み',
     )
     parser.add_argument(
         '--heuristic_guidance_network_residual_weight_max',
-        default=1.0,
+        default=0.50,
         type=float,
         help='固定validation改善時に段階拡大するPool内Network再順位付け重みの上限',
     )
     parser.add_argument(
         '--heuristic_guidance_network_residual_weight_increment',
-        default=0.05,
+        default=0.025,
         type=float,
         help='固定validationがnew bestになったEpisodeごとのNetwork再順位付け重み増分',
     )
@@ -2941,6 +2947,12 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--actual_compression_guard', default=True, type=str2bool, help='episode平均のfresh actual圧縮損失が悪化し続けたらbestへ戻してLRを下げる')
     parser.add_argument('--actual_guard_patience', default=2, type=int, help='actual圧縮悪化を何episode連続で許容するか')
     parser.add_argument('--actual_guard_tolerance', default=0.25, type=float, help='best actual圧縮損失から何percentage pointの悪化まで許容するか')
+    parser.add_argument(
+        '--actual_guard_autonomy_compression_target',
+        default=-3.5,
+        type=float,
+        help='Network候補再順位の裁量を広げる前に固定validationで必要なActual圧縮率[%%]',
+    )
     parser.add_argument('--actual_guard_decay_lr', default=False, type=str2bool, help='ActualCompressionGuard発火時にLRも下げるか。StepLRとの二重低下を避けるため既定False')
     parser.add_argument('--actual_guard_lr_decay', default=0.5, type=float, help='actual guard発動時のoptimizer LR倍率')
     parser.add_argument('--actual_guard_min_fresh', default=1, type=int, help='actual guardを判定する最低fresh actual計測数')
@@ -4000,6 +4012,10 @@ def parse_pugan_args(parser, file_day, file_time):
     args.heuristic_guidance_online_amount_log_sigma = min(max(
         float(getattr(args, "heuristic_guidance_online_amount_log_sigma", 0.08)), 0.0
     ), 0.50)
+    args.heuristic_guidance_online_amount_gumbel_scale = max(
+        float(getattr(args, "heuristic_guidance_online_amount_gumbel_scale", 2.0)),
+        0.0,
+    )
     args.heuristic_guidance_online_policy_weight = max(
         float(getattr(args, "heuristic_guidance_online_policy_weight", 0.1)), 0.0
     )
@@ -4177,7 +4193,17 @@ def parse_pugan_args(parser, file_day, file_time):
             args.repair_amount_target_mode = "none"
         if not _cli_option_was_provided("--sparsepcgc_algorithmic_amount_bins"):
             args.sparsepcgc_algorithmic_amount_bins = (
-                "0.00225,0.002375,0.0025,0.002625,0.00275"
+                "0.0015,0.002,0.0025,0.00275,0.003"
+            )
+        if not _cli_option_was_provided("--heuristic_guidance_online_amount_bins"):
+            args.heuristic_guidance_online_amount_bins = (
+                "0.0015,0.002,0.0025,0.00275,0.003"
+            )
+        if not _cli_option_was_provided("--sparsepcgc_full_cloud_amount_bins"):
+            # Exact-onlineのselector classと実行Amount binを1:1にする。
+            # class 0は既存のno-opで、Exact plan側では除外される。
+            args.sparsepcgc_full_cloud_amount_bins = (
+                "0.0," + str(args.heuristic_guidance_online_amount_bins)
             )
         if not _cli_option_was_provided("--sparsepcgc_algorithmic_amount_init_ratio"):
             args.sparsepcgc_algorithmic_amount_init_ratio = 0.0025
@@ -4765,6 +4791,9 @@ def parse_pugan_args(parser, file_day, file_time):
     args.actual_compression_guard = bool(getattr(args, "actual_compression_guard", True))
     args.actual_guard_patience = max(int(getattr(args, "actual_guard_patience", 2)), 1)
     args.actual_guard_tolerance = max(float(getattr(args, "actual_guard_tolerance", 0.25)), 0.0)
+    args.actual_guard_autonomy_compression_target = float(getattr(
+        args, "actual_guard_autonomy_compression_target", -3.5
+    ))
     args.actual_guard_decay_lr = bool(getattr(args, "actual_guard_decay_lr", False))
     args.actual_guard_lr_decay = min(max(float(getattr(args, "actual_guard_lr_decay", 0.5)), 0.0), 1.0)
     args.actual_guard_min_fresh = max(int(getattr(args, "actual_guard_min_fresh", 1)), 1)
@@ -5909,9 +5938,17 @@ def parse_pugan_args(parser, file_day, file_time):
             # 実測L_geomは約0.003であり、旧0.06ではpenaltyが常に0だった。
             args.cp_tau_geom = 0.0
         if not _cli_option_was_provided("--cp_lambda_geom"):
-            # L_geomを圧縮percentと同程度の補助尺度へ移す。support上限は
-            # compression_primary_aux_target_ratioが引き続き保証する。
-            args.cp_lambda_geom = 100.0
+            # Add-only point-to-plane Fit修正後の実測 L_geom約0.03 に対し、
+            # 主圧縮block約8--10の約15%を与える。
+            # support上限があるため圧縮主目的を逆転させない。
+            args.cp_lambda_geom = 50.0
+        if not _cli_option_was_provided("--checkpoint_geom_rel_factor"):
+            # 1.5倍では最新runの後半劣化(0.0040 -> 0.0060)を通した。
+            # checkpoint/rollbackの安全gateだけを絞り、実行Amount自体は制限しない。
+            args.checkpoint_geom_rel_factor = 1.20
+        if not _cli_option_was_provided("--actual_guard_tolerance"):
+            # best -3.6から-3.5を割る劣化まで見逃した旧0.25を縮める。
+            args.actual_guard_tolerance = 0.10
         if not _cli_option_was_provided("--train_full_cloud_actual_interval"):
             # Full-cloud SparsePCGC teacher is already supplied by the splice-based
             # actual oracle.  The no-grad full-cloud anchor only produced zero

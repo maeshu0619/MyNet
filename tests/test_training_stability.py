@@ -245,6 +245,77 @@ class TrainingStabilityTest(unittest.TestCase):
         self.assertAlmostEqual(second["current"], 0.10)
         capped = update_network_autonomy_from_guard(args, {"action": "new_best"})
         self.assertAlmostEqual(capped["current"], 0.10)
+        rolled_back = update_network_autonomy_from_guard(
+            args, {"action": "rollback", "rd_improved": False}
+        )
+        self.assertAlmostEqual(rolled_back["current"], 0.075)
+
+        # RDが改善しても固定圧縮目標未達では裁量を広げない。
+        args._heuristic_guidance_network_residual_weight_current = 0.05
+        held = update_network_autonomy_from_guard(
+            args,
+            {"action": "new_best", "rd_improved": True, "actual_delta": -3.49},
+        )
+        self.assertAlmostEqual(held["current"], 0.05)
+        self.assertFalse(held["compression_target_met"])
+
+    def test_guard_does_not_accept_geometry_unsafe_compression_best(self):
+        args = self._guard_args()
+        args.cp_lambda_geom = 50.0
+        args.cp_tau_geom = 0.0
+        model = torch.nn.Linear(2, 1)
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+        guard_state = {}
+        with TemporaryDirectory() as directory:
+            unsafe = apply_actual_compression_guard(
+                args=args,
+                model=model,
+                loss=_Loss(),
+                optimizer=optimizer,
+                writer=_Writer(),
+                guard_state=guard_state,
+                checkpoint_metrics={
+                    "checkpoint_eligible": False,
+                    "checkpoint_ineligible_reason": "fixed_validation_geometry_or_safety_failed",
+                    "checkpoint_actual_source": "full_cloud",
+                    "checkpoint_actual_delta": -4.0,
+                    "checkpoint_actual_count": 1,
+                    "full_cloud_val_geometry": 0.02,
+                    "full_cloud_val_fixed_objective": 4.0,
+                    "full_cloud_val_sample_signature": "fixed-set-a",
+                    "geometry_ok": False,
+                    "safety_ok": False,
+                },
+                ckpt_dir=directory,
+                episode=0,
+            )
+            self.assertNotEqual(unsafe["action"], "new_best")
+            self.assertTrue(unsafe["unsafe_candidate"])
+            self.assertIsNone(guard_state["best_path"])
+
+            safe = apply_actual_compression_guard(
+                args=args,
+                model=model,
+                loss=_Loss(),
+                optimizer=optimizer,
+                writer=_Writer(),
+                guard_state=guard_state,
+                checkpoint_metrics={
+                    "checkpoint_eligible": True,
+                    "checkpoint_actual_source": "full_cloud",
+                    "checkpoint_actual_delta": -3.8,
+                    "checkpoint_actual_count": 1,
+                    "full_cloud_val_geometry": 0.003,
+                    "full_cloud_val_fixed_objective": -2.6,
+                    "full_cloud_val_sample_signature": "fixed-set-a",
+                    "geometry_ok": True,
+                    "safety_ok": True,
+                },
+                ckpt_dir=directory,
+                episode=1,
+            )
+            self.assertEqual(safe["action"], "new_best")
+            self.assertTrue(safe["rd_improved"])
 
     def test_sparsepcgc_geometry_penalty_is_continuous(self):
         args = SimpleNamespace(

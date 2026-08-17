@@ -4918,6 +4918,10 @@ def _den6_online_grad_norms(model):
             getattr(actuator, "drop_amount_head", None),
             getattr(actuator, "add_amount_head", None),
             getattr(actuator, "move_amount_head", None),
+            # Exact onlineのcoarse AmountはNetwork側のfull-cloud selectorが
+            # 選ぶ。旧auditはこれを除外し、bin方策に勾配があっても
+            # amount=0と誤記録していた。
+            getattr(base_model, "full_cloud_amount_selector", None),
         ),
         "den6_online_action_grad_norm": (
             getattr(actuator, "operation_gate_head", None),
@@ -5215,6 +5219,7 @@ def _balance_actual_operation_head_gradients(args, model, structure_debug=None):
                 getattr(actuator, "drop_amount_head", None),
                 getattr(actuator, "add_amount_head", None),
                 getattr(actuator, "move_amount_head", None),
+                getattr(base_model, "full_cloud_amount_selector", None),
             ],
             "action": [
                 getattr(actuator, "operation_gate_head", None),

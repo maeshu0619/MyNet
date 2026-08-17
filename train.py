@@ -4650,7 +4650,8 @@ def train(model, args, loss, writer, plot, notifier=None):
                         f"candidate_alpha={float(audit_plan.get('candidate_policy_alpha', 0.0) or 0.0):.3f}, "
                         f"heuristic_prior={float(audit_plan.get('heuristic_candidate_prior_weight', 0.0) or 0.0):.3f}, "
                         f"multiplier={float(audit_plan.get('exploration_multiplier', 0.0) or 0.0):.3f}, "
-                        f"gumbel={float(audit_plan.get('effective_where_gumbel_scale', 0.0) or 0.0):.4f}), "
+                        f"where_gumbel={float(audit_plan.get('effective_where_gumbel_scale', 0.0) or 0.0):.4f}, "
+                        f"amount_gumbel={float(audit_plan.get('effective_amount_gumbel_scale', 0.0) or 0.0):.4f}), "
                         f"where_delta=(mean={float(audit_plan.get('delta_where_logit_mean', 0.0) or 0.0):.6g}, "
                         f"std={float(audit_plan.get('delta_where_logit_std', 0.0) or 0.0):.6g}, "
                         f"abs_max={float(audit_plan.get('delta_where_logit_abs_max', 0.0) or 0.0):.6g}), "
@@ -5407,8 +5408,15 @@ def train(model, args, loss, writer, plot, notifier=None):
             checkpoint_metrics["full_cloud_actual_count"] = int(full_cloud_val["count"])
             checkpoint_metrics["checkpoint_actual_delta"] = float(full_cloud_val["value"])
             checkpoint_metrics["checkpoint_actual_count"] = int(full_cloud_val["count"])
-            checkpoint_metrics["checkpoint_eligible"] = True
-            checkpoint_metrics["checkpoint_ineligible_reason"] = ""
+            # Actualがあることと、そのcheckpointがRate-Distortion上安全な
+            # ことは別である。旧コードはここでgeometry/safety gateを
+            # 無条件Trueに上書きし、幾何劣化checkpointを保存可能にしていた。
+            fixed_safety_ok = bool(checkpoint_metrics.get("safety_ok", True))
+            checkpoint_metrics["checkpoint_eligible"] = fixed_safety_ok
+            checkpoint_metrics["checkpoint_ineligible_reason"] = (
+                "" if fixed_safety_ok
+                else "fixed_validation_geometry_or_safety_failed"
+            )
         optimizer_success_ratio = episode_optimizer_step_count / float(max(episode_optimizer_total_count, 1))
         min_optimizer_success_ratio = float(getattr(args, "checkpoint_min_optimizer_step_ratio", 0.20))
         optimizer_success_ok = optimizer_success_ratio >= min_optimizer_success_ratio
@@ -5721,7 +5729,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                 f"episode={episode + 1}, guard_action={autonomy_event['action']}, "
                 f"where_residual_weight={autonomy_event['previous']:.6f}"
                 f"->{autonomy_event['current']:.6f}, "
-                f"maximum={autonomy_event['maximum']:.6f}"
+                f"maximum={autonomy_event['maximum']:.6f}, "
+                f"compression_target={autonomy_event['compression_target']:.6f}, "
+                f"target_met={autonomy_event['compression_target_met']}"
             )
         if guard_event:
             guard_event["global_step"] = global_train_step

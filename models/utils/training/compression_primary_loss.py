@@ -418,6 +418,15 @@ def build_compression_primary_loss(
     aux_block_scaled = aux_balance_scale * aux_block
     L = main_block + aux_block_scaled
     main_grad_scale = 1.0 / max(float(aux_balance_scale), 1e-12)
+    geom_active = case_float(as_scalar_loss_tensor(L_geom), 0.0) > float(
+        getattr(args, "cp_tau_geom", 0.0)
+    )
+    # ReLUのactive領域ではこれがdL/dL_geomの厳密な局所値。
+    # autograd.gradを追加実行せず、毎Stepの幾何勾配強度を監査できる。
+    geom_scalar_grad_scale = (
+        aux_balance_scale * sf_geom * float(getattr(args, "cp_lambda_geom", 1.0))
+        if geom_active else 0.0
+    )
 
     debug = {
         "loss_mode": "compression_primary",
@@ -433,6 +442,7 @@ def build_compression_primary_loss(
         "cp_geom_block_scaled": case_float(
             aux_balance_scale * geom_block, float("nan")
         ),
+        "cp_geom_scalar_grad_scale": float(geom_scalar_grad_scale),
         "cp_P_single": case_float(P_single, float("nan")),
         "cp_P_nodes": case_float(P_nodes, float("nan")),
         "cp_P_sparsepcgc": case_float(P_sparsepcgc, float("nan")),

@@ -203,6 +203,7 @@ def log_runtime_setup(writer, args):
         f"lr_decay_enabled={bool(getattr(args, 'actual_guard_decay_lr', False))}, "
         f"lr_decay_factor={float(getattr(args, 'actual_guard_lr_decay', 0.5)):.6g}, "
         f"restore_best={bool(getattr(args, 'actual_guard_restore_best', True))}, "
+        f"autonomy_compression_target={float(getattr(args, 'actual_guard_autonomy_compression_target', -3.5)):.6g}, "
         f"fixed_validation_only={bool(getattr(args, 'actual_guard_require_fixed_validation', True))}, "
         f"full_state_restore={bool(getattr(args, 'actual_guard_require_full_state_restore', True))}"
     )
@@ -216,10 +217,17 @@ def log_runtime_setup(writer, args):
     if str(getattr(args, "heuristic_guidance_mode", "")).strip().lower() == "ana_den6_online":
         writer.write(
             "Network Pool Autonomy: "
-            f"start={float(getattr(args, 'heuristic_guidance_network_residual_weight', 0.25)):.6g}, "
-            f"max={float(getattr(args, 'heuristic_guidance_network_residual_weight_max', 1.0)):.6g}, "
-            f"new_best_increment={float(getattr(args, 'heuristic_guidance_network_residual_weight_increment', 0.05)):.6g}, "
+            f"start={float(getattr(args, 'heuristic_guidance_network_residual_weight', 0.05)):.6g}, "
+            f"max={float(getattr(args, 'heuristic_guidance_network_residual_weight_max', 0.50)):.6g}, "
+            f"new_best_increment={float(getattr(args, 'heuristic_guidance_network_residual_weight_increment', 0.025)):.6g}, "
             "gate=fixed_full_cloud_validation"
+        )
+        writer.write(
+            "Network Amount RD Exploration: "
+            f"bins={str(getattr(args, 'heuristic_guidance_online_amount_bins', ''))}, "
+            f"temperature={float(getattr(args, 'heuristic_guidance_online_amount_temperature', 0.35)):.6g}, "
+            f"gumbel_scale={float(getattr(args, 'heuristic_guidance_online_amount_gumbel_scale', 2.0)):.6g}, "
+            f"geometry_policy_weight={float(getattr(args, 'heuristic_guidance_online_geometry_policy_weight', 0.50)):.6g}"
         )
 
 

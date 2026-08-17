@@ -23,17 +23,17 @@ _RUNTIME_ARG_STATE_NAMES = (
 
 
 def update_network_autonomy_from_guard(args, guard_event):
-    """固定validationが改善した時だけden6 Pool内のNetwork裁量を広げる。"""
+    """固定validationのRate-Distortionが改善した時だけ裁量を広げる。"""
     start = max(
-        float(getattr(args, "heuristic_guidance_network_residual_weight", 0.25)),
+        float(getattr(args, "heuristic_guidance_network_residual_weight", 0.05)),
         0.0,
     )
     maximum = max(
-        float(getattr(args, "heuristic_guidance_network_residual_weight_max", 1.0)),
+        float(getattr(args, "heuristic_guidance_network_residual_weight_max", 0.50)),
         start,
     )
     increment = max(
-        float(getattr(args, "heuristic_guidance_network_residual_weight_increment", 0.05)),
+        float(getattr(args, "heuristic_guidance_network_residual_weight_increment", 0.025)),
         0.0,
     )
     current = min(
@@ -51,11 +51,24 @@ def update_network_autonomy_from_guard(args, guard_event):
     previous = current
     # new_bestは同一固定frameで圧縮性能が改善した証拠である。候補Actualを
     # 増やさず、次EpisodeからPool全体の再順位付け幅を一段だけ広げる。
-    if action == "new_best":
+    rd_improved = bool((guard_event or {}).get("rd_improved", action == "new_best"))
+    actual_delta = (guard_event or {}).get("actual_delta", None)
+    compression_target = float(getattr(
+        args, "actual_guard_autonomy_compression_target", -3.5
+    ))
+    try:
+        compression_target_met = (
+            actual_delta is None or float(actual_delta) <= compression_target
+        )
+    except (TypeError, ValueError):
+        compression_target_met = False
+    if action == "new_best" and rd_improved and compression_target_met:
         current = min(current + increment, maximum)
     elif action == "rollback":
-        # 完全state restoreで保存時の裁量へ戻っている。念のため範囲だけ拘束する。
-        current = min(max(current, start), maximum)
+        # optimizer/RNGまで完全restoreすると同じ探索列を再生し、
+        # 最新runのように4 Episodeごとのrollback循環になる。
+        # hard planの操作量を制限せず、Network residualのみ一段戻す。
+        current = max(current - increment, start)
     setattr(args, "_heuristic_guidance_network_residual_weight_current", current)
     event = {
         "action": action or "none",
@@ -65,6 +78,9 @@ def update_network_autonomy_from_guard(args, guard_event):
         "maximum": float(maximum),
         "increment": float(increment),
         "changed": bool(abs(current - previous) > 1e-12),
+        "rd_improved": bool(rd_improved),
+        "compression_target": float(compression_target),
+        "compression_target_met": bool(compression_target_met),
     }
     if isinstance(guard_event, dict):
         guard_event["network_autonomy_previous"] = event["previous"]
@@ -324,8 +340,18 @@ def apply_actual_compression_guard(
         return None
     if not _is_actual_backend(args):
         return None
-    if not bool(checkpoint_metrics.get("checkpoint_eligible", True)):
-        reason = str(checkpoint_metrics.get("checkpoint_ineligible_reason") or "checkpoint_ineligible")
+    checkpoint_reason = str(
+        checkpoint_metrics.get("checkpoint_ineligible_reason") or ""
+    ).strip()
+    safety_only_ineligible = checkpoint_reason in {
+        "fixed_validation_geometry_or_safety_failed",
+        "fixed_validation_geometry_failed",
+    }
+    if (
+        not bool(checkpoint_metrics.get("checkpoint_eligible", True))
+        and not safety_only_ineligible
+    ):
+        reason = checkpoint_reason or "checkpoint_ineligible"
         if writer is not None and hasattr(writer, "write"):
             writer.write(
                 "ActualCompressionGuard: skipped "
@@ -357,9 +383,34 @@ def apply_actual_compression_guard(
     if actual_delta is None:
         return None
 
+    geometry_ok = bool(checkpoint_metrics.get("geometry_ok", True))
+    safety_ok = bool(checkpoint_metrics.get("safety_ok", geometry_ok))
+    candidate_safe = bool(geometry_ok and safety_ok)
+    fixed_objective = checkpoint_metrics.get("full_cloud_val_fixed_objective", None)
+    try:
+        fixed_objective = float(fixed_objective)
+        if not math.isfinite(fixed_objective):
+            fixed_objective = None
+    except (TypeError, ValueError):
+        fixed_objective = None
+    if fixed_objective is None:
+        geometry_value = checkpoint_metrics.get("full_cloud_val_geometry", None)
+        try:
+            geometry_value = float(geometry_value)
+        except (TypeError, ValueError):
+            geometry_value = None
+        fixed_objective = (
+            float(actual_delta)
+            + float(getattr(args, "cp_lambda_geom", 1.0))
+            * max(float(geometry_value) - float(getattr(args, "cp_tau_geom", 0.0)), 0.0)
+            if geometry_value is not None and math.isfinite(geometry_value)
+            else float(actual_delta)
+        )
+
     guard_state.setdefault("best_delta", float("inf"))
     guard_state.setdefault("best_path", None)
     guard_state.setdefault("bad_count", 0)
+    guard_state.setdefault("best_fixed_objective", float("inf"))
 
     if bool(getattr(args, "actual_guard_require_fixed_validation", True)):
         signature = str(
@@ -392,8 +443,11 @@ def apply_actual_compression_guard(
 
     episode_path = os.path.join(ckpt_dir, f"{episode}.pth")
     eps = max(float(getattr(args, "actual_guard_improvement_epsilon", 1e-6)), 0.0)
-    if actual_delta < float(guard_state["best_delta"]) - eps:
+    actual_improved = actual_delta < float(guard_state["best_delta"]) - eps
+    rd_improved = fixed_objective < float(guard_state["best_fixed_objective"]) - eps
+    if actual_improved and rd_improved and candidate_safe:
         guard_state["best_delta"] = actual_delta
+        guard_state["best_fixed_objective"] = float(fixed_objective)
         guard_state["best_path"] = episode_path
         guard_state["bad_count"] = 0
         training_state_path = _save_training_state(episode_path, runtime_state, args)
@@ -414,11 +468,15 @@ def apply_actual_compression_guard(
             "training_state_path": training_state_path,
             "training_state_saved": True,
             "bad_count": 0,
+            "geometry_ok": bool(geometry_ok),
+            "safety_ok": bool(safety_ok),
+            "fixed_objective": float(fixed_objective),
+            "rd_improved": True,
         }
 
     tolerance = max(float(getattr(args, "actual_guard_tolerance", 0.25)), 0.0)
     best_delta = float(guard_state["best_delta"])
-    if actual_delta <= best_delta + tolerance:
+    if actual_delta <= best_delta + tolerance and candidate_safe:
         guard_state["bad_count"] = 0
         return {
             "action": "within_tolerance",
@@ -427,6 +485,10 @@ def apply_actual_compression_guard(
             "actual_source": actual_source,
             "best_delta": best_delta,
             "bad_count": 0,
+            "geometry_ok": bool(geometry_ok),
+            "safety_ok": bool(safety_ok),
+            "fixed_objective": float(fixed_objective),
+            "rd_improved": False,
         }
 
     guard_state["bad_count"] = int(guard_state.get("bad_count", 0)) + 1
@@ -439,6 +501,11 @@ def apply_actual_compression_guard(
         "best_delta": best_delta,
         "bad_count": int(guard_state["bad_count"]),
         "patience": patience,
+        "geometry_ok": bool(geometry_ok),
+        "safety_ok": bool(safety_ok),
+        "fixed_objective": float(fixed_objective),
+        "rd_improved": False,
+        "unsafe_candidate": bool(not candidate_safe),
     }
     if guard_state["bad_count"] < patience:
         if writer is not None and hasattr(writer, "write"):

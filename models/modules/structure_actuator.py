@@ -3596,7 +3596,7 @@ class StructureRepairActuator(nn.Module):
         raw_bins = str(getattr(
             self.args,
             "heuristic_guidance_online_amount_bins",
-            "0.00225,0.002375,0.0025,0.002625,0.00275",
+            "0.0015,0.002,0.0025,0.00275,0.003",
         ))
         try:
             amount_bins = sorted({
@@ -3604,7 +3604,7 @@ class StructureRepairActuator(nn.Module):
                 for value in raw_bins.split(",") if value.strip()
             })
         except (TypeError, ValueError):
-            amount_bins = [0.00225, 0.002375, 0.0025, 0.002625, 0.00275]
+            amount_bins = [0.0015, 0.002, 0.0025, 0.00275, 0.003]
         if not amount_bins:
             raise RuntimeError("ana_den6 online Amount離散binが空である")
         bin_tensor = next(iter(ratio_tensors.values())).new_tensor(amount_bins)
@@ -3623,15 +3623,20 @@ class StructureRepairActuator(nn.Module):
                     f"selector={int(selector.numel())}, bins={int(bin_tensor.numel())}"
                 )
             amount_logits = selector.float() / amount_temperature
-            amount_prob = torch.softmax(amount_logits, dim=0)
-            learned_total_for_backward = (amount_prob * bin_tensor).sum()
         else:
             # 単体再生・legacy manifest用。通常trainでは上の既存Network headを使う。
             amount_logits = -torch.abs(
                 bin_tensor.log() - learned_total.log().reshape(1)
             ) / amount_temperature
-            learned_total_for_backward = learned_total
+        amount_log_probs = torch.log_softmax(amount_logits, dim=0)
+        amount_prob = amount_log_probs.exp()
+        learned_total_for_backward = (
+            (amount_prob * bin_tensor).sum()
+            if torch.is_tensor(amount_selector_logits)
+            else learned_total
+        )
         exact_anchor_active = current_step < exact_anchor_steps
+        effective_amount_gumbel_scale = 0.0
         # hard Exact再生はexact_anchor_stepsだけで終わる。Where候補方策を
         # Amount用200-Step移行係数へ連動させると、学習初期のNetwork residualと
         # Gumbel探索がほぼ0になり、Heuristic順位の固定選択へ戻ってしまう。
@@ -3640,12 +3645,24 @@ class StructureRepairActuator(nn.Module):
             selected_amount_bin = torch.argmin(
                 torch.abs(bin_tensor - float(prior_total_ratio))
             )
-        elif exploration_active:
+        elif amount_exploration_active:
             uniform = torch.rand_like(amount_logits).clamp_(1e-8, 1.0 - 1e-8)
             gumbel = -torch.log(-torch.log(uniform))
+            # 従来はanchor移行係数residual_alphaをGumbelにも掛けたため、
+            # 10,240 Stepすべてで中央binを選び、Amountが学習不能だった。
+            # hard anchorは上の分岐で完全再生済みなので、その後は
+            # 学習全体のexploration decayだけを使う。
+            amount_gumbel_scale = max(float(getattr(
+                self.args,
+                "heuristic_guidance_online_amount_gumbel_scale",
+                2.0,
+            )), 0.0)
+            effective_amount_gumbel_scale = (
+                float(amount_gumbel_scale) * float(exploration_multiplier)
+            )
             selected_amount_bin = torch.argmax(
                 amount_logits
-                + gumbel * float(residual_alpha) * float(exploration_multiplier)
+                + gumbel * float(effective_amount_gumbel_scale)
             )
         else:
             selected_amount_bin = torch.argmax(amount_logits)
@@ -3703,10 +3720,15 @@ class StructureRepairActuator(nn.Module):
             for name in operations
         }
         sampled_total_ratio = sum(sampled_ratio_tensors.values())
-        amount_log_prob_terms = [
-            torch.log_softmax(amount_logits, dim=0)[selected_amount_bin],
-            *[operation_fine_log_probs[name] for name in operations],
-        ]
+        amount_bin_log_prob = amount_log_probs[selected_amount_bin]
+        if exact_anchor_active:
+            # anchorのAmountはNetworkの選択ではなく教師planの強制再生。
+            # ここで圧縮改善creditを与えると、探索前に中央binへ
+            # selectorが固定されるため、forward値を保って勾配だけ無効化する。
+            amount_bin_log_prob = amount_bin_log_prob.detach()
+        amount_fine_log_prob = torch.stack([
+            operation_fine_log_probs[name] for name in operations
+        ]).mean()
         sampled_total_value = float(sampled_total_ratio.detach().cpu())
         if sampled_total_value > max_total_ratio:
             scale = max_total_ratio / max(sampled_total_value, 1e-12)
@@ -3973,7 +3995,9 @@ class StructureRepairActuator(nn.Module):
             if selected_where_log_probs
             else action_ratio_stack.new_zeros(())
         )
-        amount_log_prob = torch.stack(amount_log_prob_terms).mean()
+        # coarse selectorをoperation数+1で希釈しない。旧meanでは後半の
+        # fine exploration=0時に実質1/4となり、Geometry creditが消えていた。
+        amount_log_prob = amount_bin_log_prob + amount_fine_log_prob
         count_tensor = action_ratio_stack.new_tensor(
             [float(selected_counts[name]) for name in operations]
         )
@@ -3982,6 +4006,7 @@ class StructureRepairActuator(nn.Module):
         policy_log_prob = where_log_prob + amount_log_prob + action_log_prob
         policy_entropy = (
             torch.stack(candidate_entropies).mean()
+            + (-(amount_prob * torch.log(amount_prob.clamp_min(1e-12))).sum())
             + (-(action_probs * action_log_probs).sum())
         )
 
@@ -4216,10 +4241,15 @@ class StructureRepairActuator(nn.Module):
             "exploration_multiplier": float(exploration_multiplier),
             "effective_where_gumbel_scale": float(gumbel_scale),
             "effective_amount_log_sigma": float(fine_sigma),
+            "effective_amount_gumbel_scale": float(effective_amount_gumbel_scale),
             "policy_log_prob": policy_log_prob,
             "policy_entropy": policy_entropy,
             "where_log_prob": where_log_prob,
             "amount_log_prob": amount_log_prob,
+            "amount_bin_log_prob": amount_bin_log_prob,
+            "amount_bin_entropy": -(
+                amount_prob * torch.log(amount_prob.clamp_min(1e-12))
+            ).sum(),
             "action_log_prob": action_log_prob,
         }
         plan_hash_payload = {

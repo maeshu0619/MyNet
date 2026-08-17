@@ -1319,6 +1319,7 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         )
         actuator.train()
         selected_prune = set()
+        selected_amount_bins = set()
         for seed in range(12):
             torch.manual_seed(seed)
             result = actuator._build_exact_den6_residual_plan(
@@ -1331,6 +1332,7 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
                 torch.zeros((1, 1, point_count)),
                 torch.zeros((1, 26, point_count)),
                 torch.zeros((1, point_count, 26)),
+                torch.zeros((1, 6)),
             )
             self.assertTrue(result[1]["unique_plan_cache_source"])
             self.assertTrue(result[1]["has_where_alternatives"])
@@ -1341,7 +1343,11 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
                 for candidate_id in result[1]["selected_candidate_ids"]
                 if candidate_id.startswith("p")
             )
+            selected_amount_bins.add(result[1]["amount_bin_ratio"])
         self.assertEqual(selected_prune, {"p0", "p1"})
+        # anchor後のcoarse Amount探索にanchor移行係数を二重適用しない。
+        # 修正前はここが12回すべて0.0025だった。
+        self.assertGreater(len(selected_amount_bins), 1)
         actuator.eval()
         deterministic_hashes = set()
         for seed in (3, 9):
