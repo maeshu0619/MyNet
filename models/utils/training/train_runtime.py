@@ -120,6 +120,11 @@ from models.utils.training.actual_compression_guard import (
     apply_actual_compression_guard,
     update_network_autonomy_from_guard,
 )
+from models.utils.training.convergence_control import (
+    TrainingConvergenceMonitor,
+    convergence_episode_limit,
+    format_convergence_event,
+)
 from models.utils.training.for_better_logging import *
 from models.utils.training.train_flow import * # train loopのStage固定、全点群入力、圧縮目的合成、Epoch窓選択を使う
 from models.utils.training.loss_grad_probe import build_loss_grad_probe_rows, summarize_loss_grad_probe_rows

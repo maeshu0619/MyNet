@@ -5,6 +5,13 @@ import torch
 from models.utils.training.utils import uses_actual_total_bit_objective
 
 
+def backward_only_scaled_loss(loss_value, scale=1.0):
+    """forward値を0に保ち、指定倍率の勾配だけを合成する。"""
+    if not torch.is_tensor(loss_value):
+        raise TypeError("loss_value must be a Tensor")
+    return float(scale) * (loss_value - loss_value.detach())
+
+
 def resolve_compression_fixed_stage(args):
     # 圧縮損失を常に有効にするため、Episodeでdiagnosisへ切り替える二段階Stageを使わずjointに固定する。
     stage = str(getattr(args, "compression_fixed_stage", "joint")).strip().lower()

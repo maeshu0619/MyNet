@@ -1843,6 +1843,20 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--max_files', default=10, type=int, help='1系列の1Epochで読み込むフレーム数')
     parser.add_argument('--train_frames_per_sequence', default=100, type=int, help='各系列で訓練に使用する先頭フレーム数。残りは訓練窓から除外する')
     parser.add_argument('--episodes', default=256, type=int, help='学習エピソード数')
+    parser.add_argument('--train_until_converged', default=False, type=str2bool, help='Trueならepisodesを最低訓練長とし、固定検証で十分な収束証拠が得られるまで継続する')
+    parser.add_argument('--convergence_min_episodes', default=0, type=int, help='収束判定を始める最低Episode数。0なら--episodesを使う')
+    parser.add_argument('--convergence_max_episodes', default=384, type=int, help='収束制御の安全上限。未収束で到達した場合は正常終了にせずエラーにする')
+    parser.add_argument('--convergence_window_episodes', default=16, type=int, help='収束判定に使う直近Episode窓')
+    parser.add_argument('--convergence_patience_episodes', default=32, type=int, help='最低訓練長を越えた後、安定判定を連続して満たす必要があるEpisode数')
+    parser.add_argument('--convergence_guard_cooldown_episodes', default=16, type=int, help='Actual guard rollback後に収束判定を禁止するEpisode数')
+    parser.add_argument('--convergence_actual_compression_target', default=-3.5, type=float, help='収束に必要な固定検証Actual圧縮率[%%]')
+    parser.add_argument('--convergence_total_loss_slope_max', default=0.02, type=float, help='全体損失の許容絶対傾き/Episode')
+    parser.add_argument('--convergence_total_loss_half_delta_max', default=0.12, type=float, help='収束窓前半と後半の全体損失平均差の許容絶対値')
+    parser.add_argument('--convergence_compression_slope_max', default=0.01, type=float, help='圧縮主損失の許容絶対傾き/Episode')
+    parser.add_argument('--convergence_compression_half_delta_max', default=0.08, type=float, help='収束窓前半と後半の圧縮主損失平均差の許容絶対値')
+    parser.add_argument('--convergence_fixed_objective_slope_max', default=0.001, type=float, help='固定検証Rate-Distortion目的の許容絶対傾き/Episode')
+    parser.add_argument('--convergence_fixed_objective_half_delta_max', default=0.01, type=float, help='固定検証RDの収束窓前半・後半平均差の許容絶対値')
+    parser.add_argument('--convergence_geometry_relative_worsening_max', default=0.0025, type=float, help='固定検証幾何損失の収束窓前半比で許す悪化率')
     parser.add_argument('--lr', default=1e-3, type=float, help='学習率')
     parser.add_argument('--deform', default=False, type=str2bool, help='変形モジュールをゆっくり学習するか')
     parser.add_argument('--loss_type', default='cd', type=str, help='幾何損失の種類')
@@ -4789,6 +4803,27 @@ def parse_pugan_args(parser, file_day, file_time):
     args.actual_codec_fallback_to_proxy_on_error = bool(getattr(args, "actual_codec_fallback_to_proxy_on_error", False))
     args.skip_optimizer_on_actual_fallback = bool(getattr(args, "skip_optimizer_on_actual_fallback", True))
     args.actual_compression_guard = bool(getattr(args, "actual_compression_guard", True))
+    args.train_until_converged = bool(getattr(args, "train_until_converged", False))
+    args.convergence_min_episodes = max(int(getattr(args, "convergence_min_episodes", 0)), 0)
+    args.convergence_max_episodes = max(int(getattr(args, "convergence_max_episodes", 384)), 1)
+    args.convergence_window_episodes = max(int(getattr(args, "convergence_window_episodes", 16)), 4)
+    args.convergence_patience_episodes = max(int(getattr(args, "convergence_patience_episodes", 32)), 1)
+    args.convergence_guard_cooldown_episodes = max(int(getattr(args, "convergence_guard_cooldown_episodes", 16)), 0)
+    for _name in (
+        "convergence_total_loss_slope_max",
+        "convergence_total_loss_half_delta_max",
+        "convergence_compression_slope_max",
+        "convergence_compression_half_delta_max",
+        "convergence_fixed_objective_slope_max",
+        "convergence_fixed_objective_half_delta_max",
+        "convergence_geometry_relative_worsening_max",
+    ):
+        setattr(args, _name, max(float(getattr(args, _name)), 0.0))
+    convergence_minimum = max(args.convergence_min_episodes, int(args.episodes), 1)
+    if args.train_until_converged and args.convergence_max_episodes < convergence_minimum:
+        raise ValueError(
+            "--convergence_max_episodes must be >= max(--episodes, --convergence_min_episodes)"
+        )
     args.actual_guard_patience = max(int(getattr(args, "actual_guard_patience", 2)), 1)
     args.actual_guard_tolerance = max(float(getattr(args, "actual_guard_tolerance", 0.25)), 0.0)
     args.actual_guard_autonomy_compression_target = float(getattr(

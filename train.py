@@ -251,7 +251,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                 f"workers={int(getattr(args, 'heuristic_guidance_online_prefetch_workers', 0))}, "
                 f"lookahead={den6_prefetch_lookahead}, submitted={int(prefetch_state['submitted'])}"
             )
-    args._total_train_steps_estimate = max(int(getattr(args, "episodes", 1)), 1) * max(int(total_train_files), 1) # Episode数と点群ファイル数からそう学修Step数を概算
+    args._total_train_steps_estimate = max(int(getattr(args, "episodes", 1)), 1) * max(int(total_train_files), 1) # 最低Episode数から探索終了Stepを固定し、延長期間は決定論的な収束確認に使う
     if _episode_input_common_cache_enabled(args):
         setattr(args, "_episode_input_common_cache", OrderedDict())
         setattr(args, "_episode_input_common_cache_bytes", 0)
@@ -415,8 +415,23 @@ def train(model, args, loss, writer, plot, notifier=None):
     # 生の補助損失が下がった際にbalance係数を逆増幅すると、全体損失へ
     # 改善が現れない。訓練中は一度締めた係数を再び大きくしない。
     tail_support_balance_scale_state = float("nan")
-    for episode in range(args.episodes): # Episode開始
-        writer.write(f"◆◆◆ Episode {episode + 1} / {args.episodes} ◆◆◆")
+    convergence_monitor = TrainingConvergenceMonitor(args)
+    episode_limit = convergence_episode_limit(args)
+    completed_episodes = 0
+    convergence_reached = False
+    if convergence_monitor.enabled:
+        writer.write(
+            "ConvergenceControl: enabled=True, "
+            f"minimum={convergence_monitor.minimum_episodes}, "
+            f"window={convergence_monitor.window}, "
+            f"patience={convergence_monitor.patience}, maximum={episode_limit}"
+        )
+    for episode in range(episode_limit): # Episode開始
+        episode_denominator = (
+            f"minimum {convergence_monitor.minimum_episodes}, max {episode_limit}"
+            if convergence_monitor.enabled else str(args.episodes)
+        )
+        writer.write(f"◆◆◆ Episode {episode + 1} / {episode_denominator} ◆◆◆")
         _record_memory(
             "episode_start", episode=episode + 1, global_step=global_train_step
         )
@@ -2412,22 +2427,24 @@ def train(model, args, loss, writer, plot, notifier=None):
                             args, "single_plan_policy_gradient_weight", 0.0
                         )), 0.0)
                     elif heuristic_mode == "ana_den6_online":
-                        # 現在のforward係数0.1はLoss図をPolicyで支配しないため維持する。
-                        # backwardだけ063943時の実効係数1.0相当へ戻し、Actual/Geometryの
-                        # 相対評価をWhere/Amount/Actionへ十分に伝える。
+                        # Score-function損失のforward値は連続分布のsigmaに依存し、
+                        # 探索終了時にlog-densityの基準が変わる。その任意定数をRDの
+                        # Loss図へ混ぜず、backwardだけ従来と完全に同じ倍率で流す。
                         policy_backward_scale = max(float(getattr(
                             args,
                             "heuristic_guidance_online_policy_backward_scale",
                             10.0,
                         )), 0.0)
-                        online_policy_loss = (
-                            online_policy_loss.detach()
-                            + policy_backward_scale
-                            * (online_policy_loss - online_policy_loss.detach())
+                        online_policy_loss = backward_only_scaled_loss(
+                            online_policy_loss,
+                            policy_backward_scale,
                         )
                         compression_debug_terms[
                             "den6_online_policy_backward_scale"
                         ] = float(policy_backward_scale)
+                        compression_debug_terms[
+                            "den6_online_policy_forward_contribution"
+                        ] = 0.0
                         latest_policy_debug = dict(
                             getattr(loss, "last_compression_debug", {}) or {}
                         )
@@ -5742,15 +5759,46 @@ def train(model, args, loss, writer, plot, notifier=None):
             # guard_event["L_total"] = scalar_value(L) if "L" in locals() else None
             # guard_event["L_com"] = scalar_value(L_com) if "L_com" in locals() else None
             log_for_better_event( for_better_path, "actual_compression_guard", episode=episode, stage=current_stage, **guard_event)
+        convergence_event = convergence_monitor.update(
+            checkpoint_metrics=checkpoint_metrics,
+            guard_event=guard_event,
+            global_step=global_train_step,
+        )
+        if convergence_monitor.enabled:
+            writer.write(format_convergence_event(convergence_event))
+            log_for_better_event(
+                for_better_path,
+                "convergence_status",
+                episode=episode,
+                stage=current_stage,
+                **convergence_event,
+            )
         log_for_better_episode( for_better_path, args=args, episode=episode, stage=current_stage, checkpoint_metrics=checkpoint_metrics, compression_episode_metrics=compression_episode_metrics, operation_episode_metrics=operation_episode_metrics, best_trackers=best_trackers, model_path=model_path)
         if notifier is not None:
-            notifier.episode_finished( episode=episode + 1, total_episodes=args.episodes, loss_value=float(plot.epi_loss_return()), model_path=model_path, log_path=getattr(writer, "file_path", None))
+            notifier.episode_finished( episode=episode + 1, total_episodes=episode_limit, loss_value=float(plot.epi_loss_return()), model_path=model_path, log_path=getattr(writer, "file_path", None))
+        completed_episodes = episode + 1
+        if convergence_monitor.enabled and convergence_event.get("converged", False):
+            convergence_reached = True
+            writer.write(
+                "ConvergenceReached: "
+                f"episode={completed_episodes}, evidence="
+                f"{convergence_event['stable_episodes']}/{convergence_event['patience']}"
+            )
+            writer.flush()
+            break
     _record_memory(
         "train_complete",
-        episode=int(args.episodes),
+        episode=int(completed_episodes),
         global_step=global_train_step,
     )
     memory_diagnostics.close()
+    if convergence_monitor.enabled and not convergence_reached:
+        raise RuntimeError(
+            "ConvergenceControl reached --convergence_max_episodes without "
+            "satisfying the configured fixed-validation criteria; the run is "
+            "not reported as converged. Last status: "
+            + format_convergence_event(convergence_monitor.last_event)
+        )
     return best_loss
 
 

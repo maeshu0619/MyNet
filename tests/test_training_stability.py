@@ -14,6 +14,8 @@ from models.utils.training.compression_primary_loss import (
 )
 from models.utils.training.lr_control import step_scheduler_with_floor
 from models.utils.training.optim_amp import clip_model_gradients
+from models.utils.training.convergence_control import TrainingConvergenceMonitor
+from models.utils.training.train_flow import backward_only_scaled_loss
 from models.utils.training.train_runtime import fixed_full_cloud_validation_records
 
 
@@ -31,6 +33,98 @@ class _Loss:
 
 
 class TrainingStabilityTest(unittest.TestCase):
+    def test_backward_only_policy_term_preserves_gradient_and_zeroes_forward(self):
+        parameter = torch.tensor(2.0, requires_grad=True)
+        raw_policy_loss = parameter.square() + 3.0
+        neutral = backward_only_scaled_loss(raw_policy_loss, scale=10.0)
+        self.assertEqual(float(neutral.detach()), 0.0)
+        neutral.backward()
+        self.assertAlmostEqual(float(parameter.grad), 40.0)
+
+    def test_convergence_requires_post_minimum_stable_evidence(self):
+        args = SimpleNamespace(
+            train_until_converged=True,
+            episodes=4,
+            convergence_min_episodes=0,
+            convergence_window_episodes=4,
+            convergence_patience_episodes=3,
+            convergence_guard_cooldown_episodes=2,
+            convergence_actual_compression_target=-3.5,
+            convergence_total_loss_slope_max=0.02,
+            convergence_total_loss_half_delta_max=0.12,
+            convergence_compression_slope_max=0.01,
+            convergence_compression_half_delta_max=0.08,
+            convergence_fixed_objective_slope_max=0.001,
+            convergence_fixed_objective_half_delta_max=0.01,
+            convergence_geometry_relative_worsening_max=0.0025,
+            repair_exploration_fraction=0.9,
+            _total_train_steps_estimate=40,
+        )
+        monitor = TrainingConvergenceMonitor(args)
+        converged = []
+        for episode in range(1, 8):
+            event = monitor.update(
+                {
+                    "episode": episode,
+                    "total_loss": -10.0,
+                    "compression_loss_L_com": -11.0,
+                    "full_cloud_val_fixed_objective": -2.4,
+                    "full_cloud_val_actual_percent": -3.6,
+                    "full_cloud_val_geometry": 0.025,
+                    "full_cloud_val_sample_signature": "fixed-a",
+                    "optimizer_success_ok": True,
+                    "geometry_ok": True,
+                    "safety_ok": True,
+                },
+                guard_event={},
+                global_step=episode * 10,
+            )
+            converged.append(event["converged"])
+        self.assertFalse(any(converged[:6]))
+        self.assertTrue(converged[6])
+
+    def test_convergence_resets_after_level_shift(self):
+        args = SimpleNamespace(
+            train_until_converged=True,
+            episodes=1,
+            convergence_min_episodes=0,
+            convergence_window_episodes=4,
+            convergence_patience_episodes=2,
+            convergence_guard_cooldown_episodes=0,
+            convergence_actual_compression_target=-3.5,
+            convergence_total_loss_slope_max=0.02,
+            convergence_total_loss_half_delta_max=0.12,
+            convergence_compression_slope_max=0.01,
+            convergence_compression_half_delta_max=0.08,
+            convergence_fixed_objective_slope_max=0.001,
+            convergence_fixed_objective_half_delta_max=0.01,
+            convergence_geometry_relative_worsening_max=0.0025,
+            repair_exploration_fraction=0.0,
+            _total_train_steps_estimate=1,
+        )
+        monitor = TrainingConvergenceMonitor(args)
+        event = None
+        for episode, total_loss in enumerate((-10.0, -10.0, -10.0, -9.0), 1):
+            event = monitor.update(
+                {
+                    "episode": episode,
+                    "total_loss": total_loss,
+                    "compression_loss_L_com": -11.0,
+                    "full_cloud_val_fixed_objective": -2.4,
+                    "full_cloud_val_actual_percent": -3.6,
+                    "full_cloud_val_geometry": 0.025,
+                    "full_cloud_val_sample_signature": "fixed-a",
+                    "optimizer_success_ok": True,
+                    "geometry_ok": True,
+                    "safety_ok": True,
+                },
+                guard_event={},
+                global_step=episode,
+            )
+        self.assertFalse(event["stable_now"])
+        self.assertIn("total_loss_slope", event["reasons"])
+        self.assertEqual(event["stable_episodes"], 0)
+
     def _guard_args(self):
         return SimpleNamespace(
             compression_loss_backend="sparsepcgc_surrogate",
