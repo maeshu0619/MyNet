@@ -251,7 +251,17 @@ def train(model, args, loss, writer, plot, notifier=None):
                 f"workers={int(getattr(args, 'heuristic_guidance_online_prefetch_workers', 0))}, "
                 f"lookahead={den6_prefetch_lookahead}, submitted={int(prefetch_state['submitted'])}"
             )
-    args._total_train_steps_estimate = max(int(getattr(args, "episodes", 1)), 1) * max(int(total_train_files), 1) # 最低Episode数から探索終了Stepを固定し、延長期間は決定論的な収束確認に使う
+    args._total_train_steps_estimate = exploration_schedule_step_estimate(
+        args,
+        total_train_files,
+    )
+    writer.write(
+        "ExplorationSchedule: "
+        f"training_episodes={int(getattr(args, 'episodes', 1))}, "
+        f"schedule_episodes={int(getattr(args, 'exploration_schedule_episodes', 0)) or int(getattr(args, 'episodes', 1))}, "
+        f"fraction={float(getattr(args, 'repair_exploration_fraction', 0.0)):.6g}, "
+        f"anneal_steps={int(args._total_train_steps_estimate)}"
+    )
     if _episode_input_common_cache_enabled(args):
         setattr(args, "_episode_input_common_cache", OrderedDict())
         setattr(args, "_episode_input_common_cache_bytes", 0)

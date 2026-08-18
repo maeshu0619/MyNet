@@ -43,6 +43,14 @@ def convergence_episode_limit(args):
     return max(int(getattr(args, "convergence_max_episodes", minimum)), minimum)
 
 
+def exploration_schedule_step_estimate(args, total_train_files):
+    """総訓練長とは独立した探索カリキュラムのStep数を返す。"""
+    schedule_episodes = int(getattr(args, "exploration_schedule_episodes", 0))
+    if schedule_episodes <= 0:
+        schedule_episodes = int(getattr(args, "episodes", 1))
+    return max(schedule_episodes, 1) * max(int(total_train_files), 1)
+
+
 class TrainingConvergenceMonitor:
     """Rate-Distortionと訓練損失の安定を低コストに監視する。"""
 

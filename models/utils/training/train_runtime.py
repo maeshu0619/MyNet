@@ -123,6 +123,7 @@ from models.utils.training.actual_compression_guard import (
 from models.utils.training.convergence_control import (
     TrainingConvergenceMonitor,
     convergence_episode_limit,
+    exploration_schedule_step_estimate,
     format_convergence_event,
 )
 from models.utils.training.for_better_logging import *

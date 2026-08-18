@@ -1842,7 +1842,8 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--min_surrogate_lr', default=1e-6, type=float, help='Surrogate optimizerの学習率floor')
     parser.add_argument('--max_files', default=10, type=int, help='1系列の1Epochで読み込むフレーム数')
     parser.add_argument('--train_frames_per_sequence', default=100, type=int, help='各系列で訓練に使用する先頭フレーム数。残りは訓練窓から除外する')
-    parser.add_argument('--episodes', default=256, type=int, help='学習エピソード数')
+    parser.add_argument('--episodes', default=384, type=int, help='学習エピソード数')
+    parser.add_argument('--exploration_schedule_episodes', default=256, type=int, help='探索ノイズを減衰させる基準Episode数。総訓練長を延ばしても元のカリキュラム速度を保つ。0ならepisodesへ連動')
     parser.add_argument('--train_until_converged', default=False, type=str2bool, help='Trueならepisodesを最低訓練長とし、固定検証で十分な収束証拠が得られるまで継続する')
     parser.add_argument('--convergence_min_episodes', default=0, type=int, help='収束判定を始める最低Episode数。0なら--episodesを使う')
     parser.add_argument('--convergence_max_episodes', default=384, type=int, help='収束制御の安全上限。未収束で到達した場合は正常終了にせずエラーにする')
@@ -4804,6 +4805,9 @@ def parse_pugan_args(parser, file_day, file_time):
     args.skip_optimizer_on_actual_fallback = bool(getattr(args, "skip_optimizer_on_actual_fallback", True))
     args.actual_compression_guard = bool(getattr(args, "actual_compression_guard", True))
     args.train_until_converged = bool(getattr(args, "train_until_converged", False))
+    args.exploration_schedule_episodes = max(
+        int(getattr(args, "exploration_schedule_episodes", 256)), 0
+    )
     args.convergence_min_episodes = max(int(getattr(args, "convergence_min_episodes", 0)), 0)
     args.convergence_max_episodes = max(int(getattr(args, "convergence_max_episodes", 384)), 1)
     args.convergence_window_episodes = max(int(getattr(args, "convergence_window_episodes", 16)), 4)
@@ -4820,9 +4824,14 @@ def parse_pugan_args(parser, file_day, file_time):
     ):
         setattr(args, _name, max(float(getattr(args, _name)), 0.0))
     convergence_minimum = max(args.convergence_min_episodes, int(args.episodes), 1)
-    if args.train_until_converged and args.convergence_max_episodes < convergence_minimum:
+    if (
+        args.train_until_converged
+        and args.convergence_max_episodes
+        < convergence_minimum + args.convergence_patience_episodes
+    ):
         raise ValueError(
-            "--convergence_max_episodes must be >= max(--episodes, --convergence_min_episodes)"
+            "--convergence_max_episodes must leave at least "
+            "--convergence_patience_episodes after the minimum episode"
         )
     args.actual_guard_patience = max(int(getattr(args, "actual_guard_patience", 2)), 1)
     args.actual_guard_tolerance = max(float(getattr(args, "actual_guard_tolerance", 0.25)), 0.0)

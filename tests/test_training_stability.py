@@ -14,7 +14,10 @@ from models.utils.training.compression_primary_loss import (
 )
 from models.utils.training.lr_control import step_scheduler_with_floor
 from models.utils.training.optim_amp import clip_model_gradients
-from models.utils.training.convergence_control import TrainingConvergenceMonitor
+from models.utils.training.convergence_control import (
+    TrainingConvergenceMonitor,
+    exploration_schedule_step_estimate,
+)
 from models.utils.training.train_flow import backward_only_scaled_loss
 from models.utils.training.train_runtime import fixed_full_cloud_validation_records
 
@@ -33,6 +36,14 @@ class _Loss:
 
 
 class TrainingStabilityTest(unittest.TestCase):
+    def test_exploration_schedule_is_independent_from_extended_training_length(self):
+        args = SimpleNamespace(episodes=384, exploration_schedule_episodes=256)
+        self.assertEqual(exploration_schedule_step_estimate(args, 40), 256 * 40)
+
+    def test_zero_exploration_schedule_uses_legacy_episode_length(self):
+        args = SimpleNamespace(episodes=384, exploration_schedule_episodes=0)
+        self.assertEqual(exploration_schedule_step_estimate(args, 40), 384 * 40)
+
     def test_backward_only_policy_term_preserves_gradient_and_zeroes_forward(self):
         parameter = torch.tensor(2.0, requires_grad=True)
         raw_policy_loss = parameter.square() + 3.0
