@@ -2973,7 +2973,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--save_compression_metric_csv', default=True, type=str2bool, help='actual/surrogate/proxy圧縮metricを分離したstep CSVを保存する')
     parser.add_argument('--save_operation_metric_csv', default=True, type=str2bool, help='Add/Prune/Adjustのsoft/hard/effective統計step CSVを保存する')
     parser.add_argument('--save_step_metric_csv', default=False, type=str2bool, help='詳細なStep単位CSVを保存するか。通常はEpisode CSVだけを保存する')
-    parser.add_argument('--plot_step_average_window', default=1000, type=int, help='Step平均PNGの集計Step数。100なら横軸1目盛りが100 Step')
+    parser.add_argument('--plot_step_average_window', default=100, type=int, help='Step平均PNGの集計Step数。100なら横軸1目盛りが100 Step')
     parser.add_argument('--operation_dead_grad_warn_threshold', default=1e-12, type=float, help='operation branch/amount勾配が死んだとみなすnormしきい値')
     parser.add_argument('--operation_dead_grad_warn_patience', default=20, type=int, help='operation勾配が低い状態が何step続いたらwarningを出すか')
     parser.add_argument('--repair_add_ratio_floor', default=0.0, type=float, help='Add操作が完全に死なないための弱いratio下限。0で無効')
