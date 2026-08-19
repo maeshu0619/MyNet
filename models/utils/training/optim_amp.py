@@ -81,6 +81,19 @@ def build_optimizer_and_scheduler(model, args, writer):
         f"Trainable encoder params: {num_enc_trainable} "
         f"(expected={'0' if bool(getattr(args, 'encoder_0grad', True)) else '>0'})"
     )
+    adapter = getattr(model, "point_transformer_feature_adapter", None)
+    adapter_params = (
+        sum(parameter.numel() for parameter in adapter.parameters() if parameter.requires_grad)
+        if adapter is not None else 0
+    )
+    gate = getattr(model, "point_transformer_feature_gate", None)
+    gate_params = int(gate.numel()) if gate is not None and gate.requires_grad else 0
+    writer.write(
+        "PointTransformerFeatureLearning: frozen_encoder_params={}, "
+        "trainable_adapter_params={}, trainable_gate_params={}".format(
+            int(num_enc_trainable), int(adapter_params), int(gate_params)
+        )
+    )
 
     assert args.optim in ["adam", "sgd"]
 

@@ -630,6 +630,10 @@ def named_trainable_child_modules(base_model):
     actuator = _first_existing_module(base_model, "actuator", "disp_module")
     modules = [
         ("encoder", getattr(base_model, "encoder", None)),
+        (
+            "point_transformer_adapter",
+            getattr(base_model, "point_transformer_feature_adapter", None),
+        ),
         ("cost_attr", _first_existing_module(base_model, "cost_attributor", "prun_module")),
         ("repair_policy", _first_existing_module(base_model, "policy_module", "adding_module")),
         ("actuator", actuator),

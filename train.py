@@ -3730,7 +3730,6 @@ def train(model, args, loss, writer, plot, notifier=None):
                         if soft_proxy_debug_text:
                             writer.write(f"SoftProxyGradDebug: {soft_proxy_debug_text}")
                         if structure_debug:
-                            log_structure_debug( writer, structure_debug, step, num_steps)
                             write_structure_decision_debug( writer, f"StructureDecision step={step + 1}/{num_steps}", structure_debug)
                 if timing_enabled:
                     sync_for_timing(use_cuda)
@@ -4694,7 +4693,11 @@ def train(model, args, loss, writer, plot, notifier=None):
                         f"edited={float(audit_compression.get('gen_actual_bit', 0.0)):.1f})"
                         f", static_node_cache=(entries={int(static_node_cache.get('entries', 0) or 0)}, "
                         f"bytes={int(static_node_cache.get('bytes', 0) or 0)}, "
-                        f"working_set_bypassed={int(static_node_cache.get('working_set_bypassed', 0) or 0)})"
+                        f"working_set_bypassed={int(static_node_cache.get('working_set_bypassed', 0) or 0)}, "
+                        f"point_transformer_entries={int(static_node_cache.get('point_transformer_entries', 0) or 0)}, "
+                        f"point_transformer_bytes={int(static_node_cache.get('point_transformer_bytes', 0) or 0)}, "
+                        f"point_transformer_hits={int(static_node_cache.get('point_transformer_hits', 0) or 0)}, "
+                        f"point_transformer_misses={int(static_node_cache.get('point_transformer_misses', 0) or 0)})"
                         f", cuda_cache_released_before_actual="
                         f"{int(getattr(args, '_den6_online_cuda_cache_released_bytes', 0) or 0) / (1024 ** 2):.1f}MiB"
                         f", grad_norms=(where={float(audit_compression.get('den6_online_where_grad_norm', 0.0) or 0.0):.6g}, "
@@ -5074,8 +5077,6 @@ def train(model, args, loss, writer, plot, notifier=None):
                 else:
                     en_step = time.time()
                 if log_this_step:
-                    if not compact_step_text_log:
-                        log_point_edit_stats( writer, train_edit_stats, step, num_steps)
                     print( f"Epi{episode + 1}/Epo{epoch + 1}/Step{step + 1}:" f"{en_step-st_step:.4f}s   |   " f"{datetime.datetime.now().strftime('%Y/%m/%d %H:%M:%S')}")
                 amp_info["consecutive_amp_skips"] = int(consecutive_amp_skips)
                 full_cloud_meta_for_better = {
@@ -5899,6 +5900,18 @@ def main():
         # している。Stage 2/3と既存modeでは従来どおり固定する。
         p.requires_grad = not bool(getattr(args, "encoder_0grad", True))
     writer.write("RepKPU encoder loaded: repkpu_model/ckpt-best.pth")
+    writer.write(
+        "PointTransformerNodeFeatures: enabled={}, encoder_frozen={}, "
+        "bottleneck_dim={}, fusion=structure_residual, feature_scale={}, "
+        "coarse_max_points={}, cpu_cache={}".format(
+            bool(getattr(args, "point_transformer_node_features", True)),
+            bool(getattr(args, "encoder_0grad", True)),
+            int(getattr(args, "point_transformer_node_feature_dim", 8)),
+            float(getattr(args, "point_transformer_node_feature_scale", 0.25)),
+            int(getattr(args, "encoder_pre_downsample_max_points", 8192)),
+            bool(getattr(args, "point_transformer_feature_cache", True)),
+        )
+    )
     writer.write(f"SetupTiming: encoder_ckpt_load={time.time() - setup_ckpt_t0:.3f}s")
 
     # more_training=Trueなら、追加学習用checkpointからモデル全体のパラメータを読み込む

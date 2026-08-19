@@ -57,6 +57,10 @@ class Network(nn.Module):
         self.input_cache = OrderedDict()
         self._input_cache_bytes = 0
         self._input_cache_working_set_bypassed = 0
+        self.point_transformer_feature_cache = OrderedDict()
+        self._point_transformer_feature_cache_bytes = 0
+        self._point_transformer_feature_cache_hits = 0
+        self._point_transformer_feature_cache_misses = 0
         self.expected_input_cache_entries = 0 # 想定されるキャッシュ数を初期化
         self.debug_tensors = {} # デバッグ用のテンソルを保存
         self.last_structure_debug = {} # 直近Forward時の構造診断デバッグ情報を保存する辞書の初期化
@@ -99,6 +103,41 @@ class Network(nn.Module):
         fused_dim = int(getattr(self.args, "fused_feat_dim", getattr(self.args, "out_dim", 64))) # Encoderが出す統合特徴の次元数
         structure_dim = int(self.structure_analyzer.feature_dim) # Octree構造解析モジュールが出す構造特徴の次元数
         hidden_dim = int(getattr(self.args, "structure_hidden_dim", 96)) # 構造診断・方策選択モジュール内部の隠れ層次元
+        self.point_transformer_node_features = bool(
+            getattr(self.args, "point_transformer_node_features", True)
+        )
+        self.point_transformer_node_feature_dim = (
+            max(int(getattr(self.args, "point_transformer_node_feature_dim", 8)), 1)
+            if self.point_transformer_node_features
+            else 0
+        )
+        encoder_output_dim = int(getattr(self.args, "out_dim", fused_dim))
+        adapter_hidden = max(int(getattr(
+            self.args, "point_transformer_node_adapter_hidden", 32
+        )), 8)
+        if self.point_transformer_node_features:
+            # Point Transformerは高価なので最大8192点のcoarse表現だけを計算し、
+            # 小さな学習可能bottleneckを通した後にcanonical Voxelへ写像する。
+            # Adapterだけを学習することで、事前学習形状表現を壊さず操作決定へ渡す。
+            self.point_transformer_feature_adapter = nn.Sequential(
+                nn.Conv1d(encoder_output_dim, adapter_hidden, 1),
+                nn.SiLU(inplace=True),
+                nn.Conv1d(
+                    adapter_hidden,
+                    self.point_transformer_node_feature_dim,
+                    1,
+                ),
+                nn.Tanh(),
+            )
+            # 既存の全Voxel Headを拡幅せず、構造特徴の末尾部分へ小さな
+            # 学習可能residualとして注入する。初期値0.1なら構造priorを
+            # 保ったまま、圧縮/幾何勾配で形状特徴の寄与を増減できる。
+            self.point_transformer_feature_gate = nn.Parameter(torch.full(
+                (1, self.point_transformer_node_feature_dim, 1), 0.1
+            ))
+        else:
+            self.point_transformer_feature_adapter = None
+            self.register_parameter("point_transformer_feature_gate", None)
 
         """モジュールセットアップ"""
         self.cost_attributor = CostAttributionModule(in_channels=fused_dim + structure_dim, hidden_dim=hidden_dim) # 圧縮非効率の現認を推定するモジュールの作成
@@ -122,14 +161,14 @@ class Network(nn.Module):
             ):
                 for parameter in module.parameters():
                     parameter.requires_grad_(False)
-        self.actuator = StructureRepairActuator( # 実際に点群に操作するモジュールの作成
-            in_channels=structure_dim + len(CAUSE_NAMES) + len(POLICY_NAMES) + self.cause_aggregator.priority_dim,
-            hidden_dim=int(getattr(self.args, "repair_actuator_hidden_dim", 64)),
-            args=self.args,
-        )
         actuator_feature_dim = (
             structure_dim + len(CAUSE_NAMES) + len(POLICY_NAMES)
             + self.cause_aggregator.priority_dim
+        )
+        self.actuator = StructureRepairActuator( # 実際に点群に操作するモジュールの作成
+            in_channels=actuator_feature_dim,
+            hidden_dim=int(getattr(self.args, "repair_actuator_hidden_dim", 64)),
+            args=self.args,
         )
         self.network_only_codec_policy = NetworkOnlyCodecPolicy(
             in_channels=actuator_feature_dim,
@@ -181,7 +220,7 @@ class Network(nn.Module):
         if not isinstance(full_cloud_amount_bins, (list, tuple)) or not full_cloud_amount_bins:
             full_cloud_amount_bins = (0.0, 0.015, 0.021, 0.026, 0.031, 0.038, 0.044, 0.05)
         self.full_cloud_amount_selector = FullCloudAmountSelector(
-            feature_dim=structure_dim + len(CAUSE_NAMES) + len(POLICY_NAMES) + self.cause_aggregator.priority_dim,
+            feature_dim=actuator_feature_dim,
             hidden_dim=int(getattr(self.args, "sparsepcgc_full_cloud_amount_hidden_dim", 64)),
             amount_bin_count=len(full_cloud_amount_bins),
             init_bias_mode=str(
@@ -209,6 +248,18 @@ class Network(nn.Module):
             "max_entries": int(max_entries),
             "max_bytes": int(max_bytes),
             "working_set_bypassed": int(getattr(self, "_input_cache_working_set_bypassed", 0)),
+            "point_transformer_entries": int(len(getattr(
+                self, "point_transformer_feature_cache", {}
+            ))),
+            "point_transformer_bytes": int(getattr(
+                self, "_point_transformer_feature_cache_bytes", 0
+            )),
+            "point_transformer_hits": int(getattr(
+                self, "_point_transformer_feature_cache_hits", 0
+            )),
+            "point_transformer_misses": int(getattr(
+                self, "_point_transformer_feature_cache_misses", 0
+            )),
         }
 
     def set_expected_input_cache_entries(self, total_entries): # 想定されるキャッシュ件数を設定する関数
@@ -226,6 +277,13 @@ class Network(nn.Module):
     def clear_input_cache(self): # 入力キャッシュを空にする関数
         self.input_cache.clear()
         self._input_cache_bytes = 0
+
+    def clear_point_transformer_feature_cache(self):
+        """固定Encoderのcoarse特徴キャッシュだけを破棄する。"""
+        point_cache = getattr(self, "point_transformer_feature_cache", None)
+        if point_cache is not None:
+            point_cache.clear()
+        self._point_transformer_feature_cache_bytes = 0
 
     def release_step_transient_state(self):
         """Release tensors that are only needed until the current optimizer step.
@@ -257,6 +315,7 @@ class Network(nn.Module):
     def disable_input_cache(self): # 入力キャッシュを無効化する関数
         self.cache_enabled = False
         self.clear_input_cache()
+        self.clear_point_transformer_feature_cache()
 
     def _input_cache_limits(self):
         max_entries = max(int(getattr(self.args, "cache_max_entries", 0)), 0)
@@ -405,6 +464,203 @@ class Network(nn.Module):
             if isinstance(removed, dict):
                 self._input_cache_bytes -= int(removed.get("bytes", 0) or 0)
         self._input_cache_bytes = max(int(self._input_cache_bytes), 0)
+
+    def _point_transformer_cache_key(self, cache_key, source, batch_index, point_count):
+        if not cache_key:
+            return ""
+        return "|".join((
+            "frozen_point_transformer_node_v1",
+            str(cache_key),
+            str(source),
+            str(int(batch_index)),
+            str(int(point_count)),
+            str(getattr(self.args, "sparsepcgc_voxel_size", 1.0)),
+            str(getattr(self.args, "sparsepcgc_pos_quantscale", 1)),
+            str(getattr(self.args, "encoder_pre_downsample_max_points", 8192)),
+            str(getattr(self.args, "encoder_raw_downsample_factor", 10.0)),
+            str(getattr(self.args, "out_dim", 64)),
+        ))
+
+    def _get_point_transformer_feature_cache(self, key, device, dtype):
+        if not key or not bool(getattr(self.args, "point_transformer_feature_cache", True)):
+            return None
+        entry = self.point_transformer_feature_cache.get(key)
+        if not isinstance(entry, dict):
+            self._point_transformer_feature_cache_misses += 1
+            return None
+        self.point_transformer_feature_cache.move_to_end(key)
+        self._point_transformer_feature_cache_hits += 1
+        return {
+            "coarse_fused": entry["coarse_fused"].to(device=device, dtype=dtype),
+            "full_to_coarse_idx": entry["full_to_coarse_idx"].to(
+                device=device, dtype=torch.long
+            ),
+            "coarse_count": int(entry["coarse_count"]),
+        }
+
+    def _put_point_transformer_feature_cache(
+        self,
+        key,
+        coarse_fused,
+        full_to_coarse_idx,
+    ):
+        if (
+            not key
+            or not bool(getattr(self.args, "point_transformer_feature_cache", True))
+            or not bool(getattr(self.args, "encoder_0grad", True))
+        ):
+            return
+        max_entries = max(int(getattr(
+            self.args, "point_transformer_feature_cache_max_entries", 64
+        )), 0)
+        max_bytes = max(int(getattr(
+            self.args, "point_transformer_feature_cache_max_memory_mb", 512
+        )), 0) * 1024 * 1024
+        if max_entries <= 0 or max_bytes <= 0:
+            return
+        cached_feature = coarse_fused.detach().to(
+            device=torch.device("cpu"), dtype=torch.float16
+        ).contiguous()
+        cached_index = full_to_coarse_idx.detach().to(
+            device=torch.device("cpu"), dtype=torch.int32
+        ).contiguous()
+        entry_bytes = (
+            int(cached_feature.numel()) * int(cached_feature.element_size())
+            + int(cached_index.numel()) * int(cached_index.element_size())
+        )
+        if entry_bytes > max_bytes:
+            return
+        old = self.point_transformer_feature_cache.pop(key, None)
+        if isinstance(old, dict):
+            self._point_transformer_feature_cache_bytes -= int(old.get("bytes", 0))
+        self.point_transformer_feature_cache[key] = {
+            "coarse_fused": cached_feature,
+            "full_to_coarse_idx": cached_index,
+            "coarse_count": int(coarse_fused.shape[-1]),
+            "bytes": int(entry_bytes),
+        }
+        self._point_transformer_feature_cache_bytes += int(entry_bytes)
+        while self.point_transformer_feature_cache and (
+            len(self.point_transformer_feature_cache) > max_entries
+            or self._point_transformer_feature_cache_bytes > max_bytes
+        ):
+            _, removed = self.point_transformer_feature_cache.popitem(last=False)
+            self._point_transformer_feature_cache_bytes -= int(removed.get("bytes", 0))
+        self._point_transformer_feature_cache_bytes = max(
+            int(self._point_transformer_feature_cache_bytes), 0
+        )
+
+    def _adapt_point_transformer_features(self, frozen_features):
+        # 全体RMSだけを整える。チャネル平均を引くとPoint Transformerの
+        # global max-pool成分まで消えるため、局所・大域表現をともに残す。
+        rms = frozen_features.float().square().mean(
+            dim=(1, 2), keepdim=True
+        ).sqrt().clamp_min(1e-6)
+        normalized = (frozen_features / rms.to(frozen_features)).clamp(-8.0, 8.0)
+        scale = max(float(getattr(
+            self.args, "point_transformer_node_feature_scale", 0.25
+        )), 0.0)
+        return self.point_transformer_feature_adapter(normalized) * scale
+
+    def _point_transformer_features_for_nodes(
+        self,
+        node_xyz,
+        node_counts,
+        *,
+        coord_scale=None,
+        cache_key=None,
+        source="none",
+    ):
+        """固定Point Transformer特徴をcoarse点で計算しcanonical Nodeへ戻す。"""
+        if not self.point_transformer_node_features:
+            return node_xyz.new_zeros((node_xyz.shape[0], 0, node_xyz.shape[-1])), {
+                "used": False,
+                "reason": "disabled",
+            }
+        if self.point_transformer_feature_adapter is None:
+            raise RuntimeError("Point Transformer node feature adapter is missing")
+
+        scales = self._normalize_coord_scale(node_xyz, coord_scale)
+        output_rows = []
+        cache_hits = 0
+        coarse_counts = []
+        frozen_encoder = bool(getattr(self.args, "encoder_0grad", True))
+        cacheable_source = str(source).startswith("full_octree_context")
+        for batch_index in range(int(node_xyz.shape[0])):
+            valid_count = int(node_counts[batch_index]) if node_counts is not None else int(node_xyz.shape[-1])
+            valid_count = max(min(valid_count, int(node_xyz.shape[-1])), 1)
+            sample_xyz = node_xyz[batch_index, :, :valid_count]
+            feature_key = self._point_transformer_cache_key(
+                cache_key,
+                source,
+                batch_index,
+                valid_count,
+            ) if frozen_encoder and cacheable_source else ""
+            cached = self._get_point_transformer_feature_cache(
+                feature_key,
+                node_xyz.device,
+                node_xyz.dtype,
+            )
+            if cached is not None:
+                coarse_fused = cached["coarse_fused"]
+                full_to_coarse_idx = cached["full_to_coarse_idx"]
+                cache_hits += 1
+            else:
+                sparse_qs, sparse_quant_mode, sparse_pos_q = self._encoder_sparse_qs_mode_and_pos()
+                sparse_tensor = build_sparse_point_tensor_single(
+                    sample_xyz,
+                    scales[batch_index:batch_index + 1],
+                    max_points=int(getattr(self.args, "encoder_pre_downsample_max_points", 8192)),
+                    qs=sparse_qs,
+                    raw_downsample_factor=float(getattr(self.args, "encoder_raw_downsample_factor", 10.0)),
+                    voxel_scale=float(getattr(self.args, "encoder_pre_downsample_voxel_scale", 1.0)),
+                    growth=float(getattr(self.args, "encoder_pre_downsample_growth", 1.5)),
+                    max_iters=int(getattr(self.args, "encoder_pre_downsample_max_iters", 8)),
+                    quant_mode=sparse_quant_mode,
+                    pos_quantscale=sparse_pos_q,
+                )
+                encoder_xyz = sparse_tensor["coords_xyz"].unsqueeze(0)
+                encoder_feat = sparse_tensor["feat"].unsqueeze(0)
+                grad_enabled = not frozen_encoder
+                with torch.set_grad_enabled(grad_enabled):
+                    _, coarse_fused = self.encoder(encoder_xyz, feat=encoder_feat)
+                if frozen_encoder:
+                    coarse_fused = coarse_fused.detach()
+                full_to_coarse_idx = sparse_tensor["full_to_coarse_idx"].to(
+                    device=node_xyz.device, dtype=torch.long
+                )
+                self._put_point_transformer_feature_cache(
+                    feature_key,
+                    coarse_fused,
+                    full_to_coarse_idx,
+                )
+
+            coarse_counts.append(int(coarse_fused.shape[-1]))
+            adapted_coarse = self._adapt_point_transformer_features(coarse_fused)
+            mapped = adapted_coarse.index_select(2, full_to_coarse_idx.reshape(-1))
+            if valid_count < int(node_xyz.shape[-1]):
+                mapped = torch.cat((
+                    mapped,
+                    mapped.new_zeros((
+                        1,
+                        mapped.shape[1],
+                        int(node_xyz.shape[-1]) - valid_count,
+                    )),
+                ), dim=2)
+            output_rows.append(mapped)
+
+        output = torch.cat(output_rows, dim=0)
+        return output, {
+            "used": True,
+            "reason": "frozen_point_transformer_to_node",
+            "feature_dim": int(output.shape[1]),
+            "coarse_counts": tuple(coarse_counts),
+            "cache_hits_this_forward": int(cache_hits),
+            "cache_entries": int(len(self.point_transformer_feature_cache)),
+            "cache_bytes": int(self._point_transformer_feature_cache_bytes),
+            "encoder_frozen": bool(frozen_encoder),
+            "flows_to_actuator": True,
+        }
 
     # def warmup_frozen_input(self, pts_xyz, cache_key=None, coord_scale=None): # 旧実装で、固定入力特徴を事前計算してキャッシュするための関数
     #     return None
@@ -3131,6 +3387,64 @@ class Network(nn.Module):
         else:
             encode_state = self._encode(pts_xyz, coord_scale=coord_scale)
 
+        point_transformer_feature_debug = {
+            "used": False,
+            "reason": "disabled",
+            "feature_dim": 0,
+            "flows_to_actuator": False,
+        }
+        if self.point_transformer_node_features:
+            if node_voxel_input_state is not None:
+                point_transformer_decision_features, point_transformer_feature_debug = (
+                    self._point_transformer_features_for_nodes(
+                        pts_xyz,
+                        node_voxel_input_state.get("node_counts"),
+                        coord_scale=coord_scale,
+                        cache_key=cache_key,
+                        source=node_voxel_input_state.get("source", "none"),
+                    )
+                )
+            else:
+                # Point経路では既に同じPoint Transformerを通過済みなので再計算しない。
+                point_transformer_decision_features = self._adapt_point_transformer_features(
+                    encode_state["fused_feat"]
+                )
+                point_transformer_feature_debug = {
+                    "used": True,
+                    "reason": "existing_point_encoder_output",
+                    "feature_dim": int(point_transformer_decision_features.shape[1]),
+                    "coarse_counts": tuple(int(value) for value in encode_state.get("coarse_counts", ())),
+                    "cache_hits_this_forward": 0,
+                    "cache_entries": int(len(self.point_transformer_feature_cache)),
+                    "cache_bytes": int(self._point_transformer_feature_cache_bytes),
+                    "encoder_frozen": bool(getattr(self.args, "encoder_0grad", True)),
+                    "flows_to_actuator": True,
+                }
+        else:
+            point_transformer_decision_features = pts_xyz.new_zeros(
+                (pts_xyz.shape[0], 0, pts_xyz.shape[-1])
+            )
+
+        if node_voxel_input_state is not None:
+            self.last_encoder_debug = {
+                "enabled": True,
+                "mode": "voxel_node_plus_frozen_point_transformer",
+                "raw_points": [
+                    int(original_pts_xyz.shape[-1])
+                    for _ in range(int(pts_xyz.shape[0]))
+                ],
+                "analysis_points": [
+                    int(value.detach().cpu()) if torch.is_tensor(value) else int(value)
+                    for value in node_voxel_input_state["node_counts"]
+                ],
+                "feature_dim": int(node_voxel_input_state["node_features"].shape[1]),
+                "point_transformer": dict(point_transformer_feature_debug),
+            }
+        elif isinstance(self.last_encoder_debug, dict):
+            self.last_encoder_debug["point_transformer"] = dict(
+                point_transformer_feature_debug
+            )
+
         if timing_enabled:
             self._sync_if_cuda_tensor(pts_xyz)
             runtime_encode_end = time.time()
@@ -3711,10 +4025,47 @@ class Network(nn.Module):
         is_full_cloud_forward = octree_mode_text == "full_cloud"
 
         """点操作実行"""
+        if point_transformer_decision_features.shape[-1] != structure_feat_full.shape[-1]:
+            point_transformer_decision_features = self._propagate_encoder_features(
+                pts_xyz,
+                analysis_xyz,
+                point_transformer_decision_features,
+            )
+        if point_transformer_decision_features.shape[-1] != structure_feat_full.shape[-1]:
+            raise RuntimeError(
+                "Point Transformer feature count does not match actuator nodes: "
+                f"point={point_transformer_decision_features.shape[-1]}, "
+                f"actuator={structure_feat_full.shape[-1]}"
+            )
         actuator_input = torch.cat(
-            [structure_feat_full, subtree_scores_full, policy_probs_full, repair_priority_full],
+            [
+                structure_feat_full,
+                subtree_scores_full,
+                policy_probs_full,
+                repair_priority_full,
+            ],
             dim=1,
-        ) # 構造特徴、原因スコアなどをチャネル方向に結合
+        ) # 構造特徴、原因スコア、方策、優先度を結合
+        if self.point_transformer_node_feature_dim > 0:
+            fusion_end = int(structure_feat_full.shape[1])
+            fusion_start = fusion_end - int(self.point_transformer_node_feature_dim)
+            if fusion_start < 0:
+                raise RuntimeError(
+                    "Point Transformer residual dimension exceeds structure features"
+                )
+            gate = torch.tanh(self.point_transformer_feature_gate).to(
+                device=actuator_input.device,
+                dtype=actuator_input.dtype,
+            )
+            fused_slice = (
+                actuator_input[:, fusion_start:fusion_end, :]
+                + gate * point_transformer_decision_features
+            )
+            actuator_input = torch.cat((
+                actuator_input[:, :fusion_start, :],
+                fused_slice,
+                actuator_input[:, fusion_end:, :],
+            ), dim=1)
         network_only_policy_terms = None
         k_proposal_terms = None
         self.last_single_plan_student_terms = None
@@ -5189,6 +5540,27 @@ class Network(nn.Module):
 
         if isinstance(self.last_structure_debug, dict):
             self.last_structure_debug.update({
+                "point_transformer_features_used": bool(
+                    point_transformer_feature_debug.get("used", False)
+                ),
+                "point_transformer_features_flow_to_actuator": bool(
+                    point_transformer_feature_debug.get("flows_to_actuator", False)
+                ),
+                "point_transformer_feature_dim": int(
+                    point_transformer_feature_debug.get("feature_dim", 0)
+                ),
+                "point_transformer_feature_source": str(
+                    point_transformer_feature_debug.get("reason", "disabled")
+                ),
+                "point_transformer_feature_cache_hits": int(
+                    point_transformer_feature_debug.get("cache_hits_this_forward", 0)
+                ),
+                "point_transformer_feature_cache_entries": int(
+                    point_transformer_feature_debug.get("cache_entries", 0)
+                ),
+                "point_transformer_feature_cache_bytes": int(
+                    point_transformer_feature_debug.get("cache_bytes", 0)
+                ),
                 "fixed_structure_cache_hit": bool(
                     structure.get("fixed_structure_cache_hit", False)
                     if isinstance(structure, dict) else False

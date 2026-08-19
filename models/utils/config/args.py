@@ -357,6 +357,13 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--network_voxel_node_input', default=True, type=str2bool, help='Network入力を点群中心ではなくVoxel/Node中心にする')
     parser.add_argument('--network_voxel_node_fallback_point', default=False, type=str2bool, help='Node/Voxel入力情報が不足した場合に点群経路へfallbackする')
     parser.add_argument('--network_voxel_node_debug', default=False, type=str2bool, help='Node/Voxel入力経路のdebug情報を出す。通常学習ではGPU同期を避けるため既定False')
+    parser.add_argument('--point_transformer_node_features', default=True, type=str2bool, help='固定Point Transformerの形状特徴をVoxel/Nodeへ写像し、操作決定特徴へ追加する')
+    parser.add_argument('--point_transformer_node_feature_dim', default=8, type=int, help='操作決定へ渡す固定Point Transformer特徴のbottleneck次元')
+    parser.add_argument('--point_transformer_node_adapter_hidden', default=32, type=int, help='固定Point Transformer特徴を圧縮する学習可能Adapterの隠れ次元')
+    parser.add_argument('--point_transformer_node_feature_scale', default=0.25, type=float, help='正規化済みPoint Transformer特徴の初期スケール')
+    parser.add_argument('--point_transformer_feature_cache', default=True, type=str2bool, help='固定Point Transformerのcoarse特徴とVoxel対応をCPUへキャッシュする')
+    parser.add_argument('--point_transformer_feature_cache_max_entries', default=64, type=int, help='固定Point Transformer特徴CPUキャッシュの最大frame数')
+    parser.add_argument('--point_transformer_feature_cache_max_memory_mb', default=512, type=int, help='固定Point Transformer特徴CPUキャッシュの上限MB')
     parser.add_argument(
         '--full_cloud_anchor_allow_grad',
         default=False,
@@ -4154,7 +4161,8 @@ def parse_pugan_args(parser, file_day, file_time):
         args.loss_grad_probe_enabled = False
         args.step_grad_log = False
         args.compression_grad_probe = False
-        args.debug_grad_flow = False
+        if not _cli_option_was_provided("--debug_grad_flow"):
+            args.debug_grad_flow = False
         args.for_better_log = False
         args.enable_voxel_collision_log = False
         args.sparsepcgc_hard_debug_interval = 0
@@ -6459,6 +6467,27 @@ def parse_pugan_args(parser, file_day, file_time):
             f"(got {args.encoder_feature_propagation})"
         )
     args.encoder_feature_propagation_k = max(int(args.encoder_feature_propagation_k), 1)
+    args.point_transformer_node_features = bool(getattr(
+        args, "point_transformer_node_features", True
+    ))
+    args.point_transformer_node_feature_dim = max(int(getattr(
+        args, "point_transformer_node_feature_dim", 8
+    )), 1)
+    args.point_transformer_node_adapter_hidden = max(int(getattr(
+        args, "point_transformer_node_adapter_hidden", 32
+    )), 8)
+    args.point_transformer_node_feature_scale = max(float(getattr(
+        args, "point_transformer_node_feature_scale", 0.25
+    )), 0.0)
+    args.point_transformer_feature_cache = bool(getattr(
+        args, "point_transformer_feature_cache", True
+    ))
+    args.point_transformer_feature_cache_max_entries = max(int(getattr(
+        args, "point_transformer_feature_cache_max_entries", 64
+    )), 0)
+    args.point_transformer_feature_cache_max_memory_mb = max(int(getattr(
+        args, "point_transformer_feature_cache_max_memory_mb", 512
+    )), 0)
     args.allow_slow_knn_fallback = bool(getattr(args, "allow_slow_knn_fallback", False))
 
     args.patch_parallel_mode = str(args.patch_parallel_mode).strip().lower()
@@ -6953,7 +6982,8 @@ def parse_pugan_args(parser, file_day, file_time):
             args.loss_grad_probe_enabled = False
             args.step_grad_log = False
             args.compression_grad_probe = False
-            args.debug_grad_flow = False
+            if not _cli_option_was_provided("--debug_grad_flow"):
+                args.debug_grad_flow = False
             args.for_better_log = False
             args.enable_voxel_collision_log = False
             args.sparsepcgc_hard_debug_interval = 0
@@ -7030,7 +7060,8 @@ def parse_pugan_args(parser, file_day, file_time):
         args.loss_grad_probe_enabled = False
         args.step_grad_log = False
         args.compression_grad_probe = False
-        args.debug_grad_flow = False
+        if not _cli_option_was_provided("--debug_grad_flow"):
+            args.debug_grad_flow = False
         args.heuristic_guidance_online_prefetch_workers = 0
         args.compression_surrogate_replay_entries = 0
         args.compression_surrogate_replay_steps = 0
