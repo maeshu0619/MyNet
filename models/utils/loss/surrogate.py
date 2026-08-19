@@ -1173,6 +1173,10 @@ class SurrogateCompressionLossMixin:
                         ),
                         "worker_launch_count": int(stats_gen.get("sparsepcgc_worker_launch_count", 0)),
                         "worker_request_count": int(stats_gen.get("sparsepcgc_worker_request_count", 0)),
+                        "gpu_admission_wait_time": float(stats_gen.get("sparsepcgc_gpu_admission_wait_time", 0.0)),
+                        "cuda_oom_retries": int(stats_gen.get("sparsepcgc_cuda_oom_retries", 0)),
+                        "gpu_free_before_mb": float(stats_gen.get("sparsepcgc_gpu_free_before_mb", -1.0)),
+                        "gpu_free_after_mb": float(stats_gen.get("sparsepcgc_gpu_free_after_mb", -1.0)),
                     }
             if timing_enabled:
                 timing["actual_encode"] = time.time() - actual_t0

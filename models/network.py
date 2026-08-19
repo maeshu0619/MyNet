@@ -61,6 +61,7 @@ class Network(nn.Module):
         self._point_transformer_feature_cache_bytes = 0
         self._point_transformer_feature_cache_hits = 0
         self._point_transformer_feature_cache_misses = 0
+        self._point_transformer_feature_cache_working_set_bypassed = 0
         self.expected_input_cache_entries = 0 # 想定されるキャッシュ数を初期化
         self.debug_tensors = {} # デバッグ用のテンソルを保存
         self.last_structure_debug = {} # 直近Forward時の構造診断デバッグ情報を保存する辞書の初期化
@@ -259,6 +260,9 @@ class Network(nn.Module):
             )),
             "point_transformer_misses": int(getattr(
                 self, "_point_transformer_feature_cache_misses", 0
+            )),
+            "point_transformer_working_set_bypassed": int(getattr(
+                self, "_point_transformer_feature_cache_working_set_bypassed", 0
             )),
         }
 
@@ -529,6 +533,19 @@ class Network(nn.Module):
             + int(cached_index.numel()) * int(cached_index.element_size())
         )
         if entry_bytes > max_bytes:
+            return
+        expected_entries = max(int(getattr(
+            self, "expected_input_cache_entries", 0
+        )), 0)
+        effective_capacity = min(
+            int(max_entries), int(max_bytes // max(entry_bytes, 1))
+        )
+        # 通常学習は全frameを順番に1回ずつ通る。次Episodeまで全件を保持
+        # できないLRUにはhitがなく、数百MBを消費するだけなので保存しない。
+        if expected_entries > 0 and effective_capacity < expected_entries:
+            self._point_transformer_feature_cache_working_set_bypassed += 1
+            if self.point_transformer_feature_cache:
+                self.clear_point_transformer_feature_cache()
             return
         old = self.point_transformer_feature_cache.pop(key, None)
         if isinstance(old, dict):

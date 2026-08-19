@@ -798,6 +798,14 @@ class CompressionLossMixin:
             float(s.get("sparsepcgc_worker_roundtrip_time", 0.0))
             for s in stats_list
         )
+        total_gpu_admission_wait_time = sum(
+            float(s.get("sparsepcgc_gpu_admission_wait_time", 0.0))
+            for s in stats_list
+        )
+        total_cuda_oom_retries = sum(
+            int(s.get("sparsepcgc_cuda_oom_retries", 0))
+            for s in stats_list
+        )
         total_unique_coord = sum(int(s.get("unique_coord_count", s.get("point_count", 0))) for s in stats_list)
         max_octree_depth = max((int(s.get("octree_depth", 0)) for s in stats_list), default=0)
         total_leaf = sum(int(s.get("octree_leaf_count", s.get("point_count", 0))) for s in stats_list)
@@ -947,6 +955,16 @@ class CompressionLossMixin:
             "sparsepcgc_input_prepare_time": float(total_input_prepare_time),
             "sparsepcgc_ply_write_time": float(total_ply_write_time),
             "sparsepcgc_worker_roundtrip_time": float(total_worker_roundtrip_time),
+            "sparsepcgc_gpu_admission_wait_time": float(total_gpu_admission_wait_time),
+            "sparsepcgc_cuda_oom_retries": int(total_cuda_oom_retries),
+            "sparsepcgc_gpu_free_before_mb": min(
+                (float(s.get("sparsepcgc_gpu_free_before_mb", -1.0)) for s in stats_list),
+                default=-1.0,
+            ),
+            "sparsepcgc_gpu_free_after_mb": min(
+                (float(s.get("sparsepcgc_gpu_free_after_mb", -1.0)) for s in stats_list),
+                default=-1.0,
+            ),
             "per_batch": stats_list,
         }
         if exact_enabled:
@@ -1952,6 +1970,18 @@ class CompressionLossMixin:
             "actual_worker_roundtrip_time": float(
                 stats_gen.get("sparsepcgc_worker_roundtrip_time", 0.0)
             ),
+            "actual_gpu_admission_wait_time": float(
+                stats_gen.get("sparsepcgc_gpu_admission_wait_time", 0.0)
+            ),
+            "actual_cuda_oom_retries": int(
+                stats_gen.get("sparsepcgc_cuda_oom_retries", 0)
+            ),
+            "actual_gpu_free_before_mb": float(
+                stats_gen.get("sparsepcgc_gpu_free_before_mb", -1.0)
+            ),
+            "actual_gpu_free_after_mb": float(
+                stats_gen.get("sparsepcgc_gpu_free_after_mb", -1.0)
+            ),
             "actual_total_bits": gen_total_bit,
             "actual_raw_bits": gen_bit,
             "actual_objective_bits": objective_bit,
@@ -2032,6 +2062,10 @@ class CompressionLossMixin:
                 ),
                 "worker_launch_count": int(stats_gen.get("sparsepcgc_worker_launch_count", 0)),
                 "worker_request_count": int(stats_gen.get("sparsepcgc_worker_request_count", 0)),
+                "gpu_admission_wait_time": float(stats_gen.get("sparsepcgc_gpu_admission_wait_time", 0.0)),
+                "cuda_oom_retries": int(stats_gen.get("sparsepcgc_cuda_oom_retries", 0)),
+                "gpu_free_before_mb": float(stats_gen.get("sparsepcgc_gpu_free_before_mb", -1.0)),
+                "gpu_free_after_mb": float(stats_gen.get("sparsepcgc_gpu_free_after_mb", -1.0)),
             }
         self.last_compression_debug.update(exact_fallback_debug)
 

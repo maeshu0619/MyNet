@@ -59,6 +59,7 @@ def _network():
     network._point_transformer_feature_cache_bytes = 0
     network._point_transformer_feature_cache_hits = 0
     network._point_transformer_feature_cache_misses = 0
+    network._point_transformer_feature_cache_working_set_bypassed = 0
     network.input_cache = OrderedDict()
     network._input_cache_bytes = 0
     return network
@@ -113,6 +114,36 @@ class PointTransformerNodeFeatureTest(unittest.TestCase):
         self.assertEqual(network.encoder.calls, 1)
         self.assertEqual(third_debug["cache_hits_this_forward"], 1)
         self.assertTrue(torch.allclose(second.detach(), third.detach(), atol=2e-4, rtol=0.0))
+
+    def test_cache_is_bypassed_when_sequential_working_set_cannot_fit(self):
+        torch.manual_seed(5)
+        network = _network()
+        network.expected_input_cache_entries = 100
+        points = torch.stack((
+            torch.arange(16, dtype=torch.float32),
+            torch.zeros(16),
+            torch.zeros(16),
+        )).unsqueeze(0)
+        counts = torch.tensor([16])
+
+        network._point_transformer_features_for_nodes(
+            points,
+            counts,
+            cache_key="frame0.ply",
+            source="full_octree_context",
+        )
+        network._point_transformer_features_for_nodes(
+            points,
+            counts,
+            cache_key="frame0.ply",
+            source="full_octree_context",
+        )
+
+        self.assertEqual(network.encoder.calls, 2)
+        self.assertEqual(len(network.point_transformer_feature_cache), 0)
+        self.assertEqual(
+            network._point_transformer_feature_cache_working_set_bypassed, 2
+        )
 
 
 if __name__ == "__main__":

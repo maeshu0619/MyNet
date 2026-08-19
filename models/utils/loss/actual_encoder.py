@@ -371,6 +371,9 @@ class _SparsePCGCActualEncoder:
         self._worker_launch_count = 0
         self._worker_request_count = 0
         self._result_cache_hit_count = 0
+        self._gpu_admission_wait_count = 0
+        self._gpu_admission_wait_seconds = 0.0
+        self._cuda_oom_retry_count = 0
 
     def _repo_root(self):
         return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
@@ -493,6 +496,8 @@ class _SparsePCGCActualEncoder:
         if self._loaded:
             return
 
+        self._wait_for_cuda_capacity(reason="worker_init")
+
         cmd, sparse_root = self._worker_args()
         tmp_root = self.tmp_root or ("/dev/shm/mynet_sparsepcgc_teacher" if os.path.isdir("/dev/shm") else tempfile.gettempdir())
         os.makedirs(tmp_root, exist_ok=True)
@@ -537,6 +542,133 @@ class _SparsePCGCActualEncoder:
                 f"device={getattr(self.args, 'sparsepcgc_device', 'auto')}, "
                 f"python={' '.join(self._python_command())}, stderr={self._stderr_path}"
             )
+
+    def _cuda_worker_enabled(self):
+        device = str(getattr(self.args, "sparsepcgc_device", "auto")).strip().lower()
+        return device != "cpu" and torch.cuda.is_available()
+
+    def _cuda_free_mb(self):
+        if not self._cuda_worker_enabled():
+            return float("inf")
+        device_text = str(getattr(self.args, "sparsepcgc_device", "auto")).strip().lower()
+        device = None
+        if device_text.startswith("cuda:"):
+            try:
+                device = int(device_text.split(":", 1)[1])
+            except (TypeError, ValueError):
+                device = None
+        try:
+            free_bytes, _ = torch.cuda.mem_get_info(device)
+            return float(free_bytes) / (1024.0 ** 2)
+        except (AttributeError, RuntimeError, TypeError):
+            # 古いPyTorchでも通常のrequestは続行できる。OOM時のretryは別に残る。
+            return float("inf")
+
+    def _wait_for_cuda_capacity(self, reason):
+        minimum_mb = max(int(getattr(
+            self.args, "sparsepcgc_gpu_min_free_mb", 4096
+        )), 0)
+        if minimum_mb <= 0 or not self._cuda_worker_enabled():
+            return {
+                "wait_seconds": 0.0,
+                "free_before_mb": self._cuda_free_mb(),
+                "free_after_mb": self._cuda_free_mb(),
+            }
+
+        timeout = max(float(getattr(
+            self.args, "sparsepcgc_gpu_wait_timeout", 600.0
+        )), 0.0)
+        interval = max(float(getattr(
+            self.args, "sparsepcgc_gpu_wait_interval", 2.0
+        )), 0.1)
+        started = time.monotonic()
+        free_before = self._cuda_free_mb()
+        free_now = free_before
+        announced = False
+        while free_now < float(minimum_mb):
+            elapsed = time.monotonic() - started
+            if not announced and self.writer is not None and hasattr(self.writer, "write"):
+                self.writer.write(
+                    "SparsePCGCGPUAdmissionWait: reason={}, free_mb={:.1f}, "
+                    "required_mb={}, timeout_sec={:.1f}".format(
+                        str(reason), float(free_now), int(minimum_mb), float(timeout)
+                    )
+                )
+                announced = True
+            if elapsed >= timeout:
+                raise RuntimeError(
+                    "SparsePCGC teacher GPU admission timed out: "
+                    f"free={free_now:.1f}MiB, required={minimum_mb}MiB, "
+                    f"waited={elapsed:.1f}s. Another GPU process is occupying memory."
+                )
+            time.sleep(min(interval, max(timeout - elapsed, 0.1)))
+            free_now = self._cuda_free_mb()
+
+        waited = max(time.monotonic() - started, 0.0)
+        if announced:
+            self._gpu_admission_wait_count += 1
+            self._gpu_admission_wait_seconds += float(waited)
+            if self.writer is not None and hasattr(self.writer, "write"):
+                self.writer.write(
+                    "SparsePCGCGPUAdmissionReady: reason={}, waited={:.3f}s, "
+                    "free_mb={:.1f}".format(str(reason), float(waited), float(free_now))
+                )
+        return {
+            "wait_seconds": float(waited if announced else 0.0),
+            "free_before_mb": float(free_before),
+            "free_after_mb": float(free_now),
+        }
+
+    @staticmethod
+    def _response_is_cuda_oom(response):
+        if not isinstance(response, dict):
+            return False
+        if str(response.get("error_type", "")).strip().lower() == "cuda_oom":
+            return True
+        message = str(response.get("message", "")).lower()
+        return "cuda out of memory" in message
+
+    def _send_worker_request_with_oom_retry(self, request, output_dir):
+        admission = self._wait_for_cuda_capacity(reason="encode")
+        response, roundtrip = self._send_worker_request(request)
+        retries = 0
+        maximum_retries = max(int(getattr(
+            self.args, "sparsepcgc_oom_retry_count", 2
+        )), 0)
+        retry_wait = 0.0
+        while (
+            response.get("status") != "ok"
+            and self._response_is_cuda_oom(response)
+            and retries < maximum_retries
+        ):
+            retries += 1
+            self._cuda_oom_retry_count += 1
+            if self.writer is not None and hasattr(self.writer, "write"):
+                self.writer.write(
+                    "SparsePCGCCUDAOOMRetry: retry={}/{}, request_id={}, "
+                    "message={}".format(
+                        retries,
+                        maximum_retries,
+                        int(self._request_id),
+                        str(response.get("message", "")).splitlines()[0],
+                    )
+                )
+            retry_admission = self._wait_for_cuda_capacity(
+                reason=f"oom_retry_{retries}"
+            )
+            retry_wait += float(retry_admission.get("wait_seconds", 0.0))
+            if os.path.isdir(output_dir):
+                shutil.rmtree(output_dir, ignore_errors=True)
+            os.makedirs(output_dir, exist_ok=True)
+            retry_response, retry_roundtrip = self._send_worker_request(request)
+            response = retry_response
+            roundtrip += float(retry_roundtrip)
+        return response, float(roundtrip), {
+            "wait_seconds": float(admission.get("wait_seconds", 0.0)) + retry_wait,
+            "free_before_mb": float(admission.get("free_before_mb", float("inf"))),
+            "free_after_mb": float(admission.get("free_after_mb", float("inf"))),
+            "oom_retries": int(retries),
+        }
 
     def warmup(self):
         """Workerとcodec modelだけを初期化し、Step内の初回ロードをなくす。"""
@@ -861,6 +993,12 @@ class _SparsePCGCActualEncoder:
                 cached["sparsepcgc_input_prepare_time"] = float(input_prepare_time)
                 cached["sparsepcgc_ply_write_time"] = 0.0
                 cached["sparsepcgc_worker_roundtrip_time"] = 0.0
+                # 過去に実encodeした時のGPU待機/再試行値はcache内容に残り得る。
+                # cache hitではworkerを呼ばないため、当該Stepの計上は必ず0にする。
+                cached["sparsepcgc_gpu_admission_wait_time"] = 0.0
+                cached["sparsepcgc_cuda_oom_retries"] = 0
+                cached["sparsepcgc_gpu_free_before_mb"] = -1.0
+                cached["sparsepcgc_gpu_free_after_mb"] = -1.0
                 if remove_workspace_after:
                     shutil.rmtree(workspace, ignore_errors=True)
                 return cached
@@ -887,7 +1025,9 @@ class _SparsePCGCActualEncoder:
                     )
                 ),
             }
-            response, worker_roundtrip_time = self._send_worker_request(request)
+            response, worker_roundtrip_time, gpu_admission = (
+                self._send_worker_request_with_oom_retry(request, output_dir)
+            )
             ascii_fallback_used = False
             ascii_fallback_write_time = 0.0
             if (
@@ -899,8 +1039,21 @@ class _SparsePCGCActualEncoder:
                 # reader互換性だけが原因の場合に限り、同じfloat32座標をASCIIへ書き直して再試行する。
                 # worker/modelは再起動しないため、失敗時の追加コストを最小限にする。
                 ascii_fallback_write_time = self._write_ply_array(ply_path, pts_np, binary=False)
-                retry_response, retry_time = self._send_worker_request(request)
+                retry_response, retry_time, retry_gpu_admission = (
+                    self._send_worker_request_with_oom_retry(request, output_dir)
+                )
                 worker_roundtrip_time += float(retry_time)
+                gpu_admission["wait_seconds"] = float(
+                    gpu_admission.get("wait_seconds", 0.0)
+                ) + float(retry_gpu_admission.get("wait_seconds", 0.0))
+                gpu_admission["oom_retries"] = int(
+                    gpu_admission.get("oom_retries", 0)
+                ) + int(retry_gpu_admission.get("oom_retries", 0))
+                gpu_admission["free_after_mb"] = float(
+                    retry_gpu_admission.get(
+                        "free_after_mb", gpu_admission.get("free_after_mb", -1.0)
+                    )
+                )
                 response = retry_response
                 ascii_fallback_used = True
             if response.get("status") != "ok":
@@ -990,6 +1143,19 @@ class _SparsePCGCActualEncoder:
                 "sparsepcgc_input_prepare_time": float(input_prepare_time),
                 "sparsepcgc_ply_write_time": float(ply_write_time + ascii_fallback_write_time),
                 "sparsepcgc_worker_roundtrip_time": float(worker_roundtrip_time),
+                "sparsepcgc_gpu_admission_wait_time": float(
+                    gpu_admission.get("wait_seconds", 0.0)
+                ),
+                "sparsepcgc_gpu_free_before_mb": float(
+                    gpu_admission.get("free_before_mb", float("inf"))
+                ),
+                "sparsepcgc_gpu_free_after_mb": float(
+                    gpu_admission.get("free_after_mb", float("inf"))
+                ),
+                "sparsepcgc_cuda_oom_retries": int(
+                    gpu_admission.get("oom_retries", 0)
+                ),
+                "sparsepcgc_cuda_oom_retries_total": int(self._cuda_oom_retry_count),
                 "sparsepcgc_binary_ply_used": bool(used_binary_ply and not ascii_fallback_used),
                 "sparsepcgc_ascii_ply_fallback_used": bool(ascii_fallback_used),
                 "sparsepcgc_actual_result_cache_hit": False,

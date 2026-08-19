@@ -246,6 +246,8 @@ def log_codec_setup(writer, args):
             f"python={getattr(args, 'sparsepcgc_python', '') or '(auto)'}, "
             f"mode={getattr(args, 'sparsepcgc_mode', 'dense_lossless')}, "
             f"device={getattr(args, 'sparsepcgc_device', 'auto')}, "
+            f"gpu_min_free_mb={int(getattr(args, 'sparsepcgc_gpu_min_free_mb', 4096))}, "
+            f"oom_retries={int(getattr(args, 'sparsepcgc_oom_retry_count', 2))}, "
             f"match_qs={bool(getattr(args, 'sparsepcgc_match_qs', True))}, "
             f"voxel_size={float(getattr(args, 'sparsepcgc_voxel_size', 1.0))}, "
             f"pos_quantscale={int(getattr(args, 'sparsepcgc_pos_quantscale', 1))}, "

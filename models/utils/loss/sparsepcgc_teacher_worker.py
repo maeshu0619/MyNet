@@ -93,6 +93,25 @@ def _collect_cuda_stats(prefix: str = "sparsepcgc_worker") -> dict[str, Any]:
 
     return out
 
+
+def _is_cuda_oom(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return "cuda out of memory" in text or (
+        "out of memory" in text and "cuda" in traceback.format_exc().lower()
+    )
+
+
+def _recover_cuda_after_oom() -> None:
+    """失敗したrequestの一時Tensorとallocator blockだけを解放する。"""
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
 def _setup_protocol_stdout() -> None:
     global _PROTOCOL_OUT
     if _PROTOCOL_OUT is not None:
@@ -409,11 +428,16 @@ def main() -> int:
             if bool(request.get("exit_after_response", False)):
                 return 0
         except Exception as exc:
+            cuda_oom = _is_cuda_oom(exc)
+            if cuda_oom:
+                _recover_cuda_after_oom()
             _emit(
                 {
                     "status": "error",
                     "request_id": request_id,
                     "message": str(exc),
+                    "error_type": "cuda_oom" if cuda_oom else "encode_error",
+                    "retryable": bool(cuda_oom),
                     "traceback": traceback.format_exc(),
                 }
             )
