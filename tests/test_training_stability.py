@@ -148,6 +148,9 @@ class TrainingStabilityTest(unittest.TestCase):
             actual_guard_tolerance=0.01,
             actual_guard_patience=1,
             actual_guard_restore_best=True,
+            actual_guard_max_restores=1,
+            actual_guard_max_restore_age_episodes=16,
+            actual_guard_rebase_stale_best=True,
             actual_guard_decay_lr=False,
             actual_guard_lr_decay=0.5,
             min_main_lr=1e-6,
@@ -307,6 +310,55 @@ class TrainingStabilityTest(unittest.TestCase):
             )
             self.assertEqual(changed["action"], "skipped")
             self.assertEqual(changed["reason"], "fixed_validation_signature_changed")
+
+    def test_guard_does_not_restore_the_same_best_twice(self):
+        args = self._guard_args()
+        model = torch.nn.Linear(2, 1)
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+        guard_state = {}
+        with TemporaryDirectory() as directory:
+            torch.save(model.state_dict(), os.path.join(directory, "0.pth"))
+            first = apply_actual_compression_guard(
+                args=args, model=model, loss=_Loss(), optimizer=optimizer,
+                writer=_Writer(), guard_state=guard_state,
+                checkpoint_metrics={
+                    "checkpoint_eligible": True,
+                    "checkpoint_actual_source": "full_cloud",
+                    "checkpoint_actual_delta": -3.0,
+                    "checkpoint_actual_count": 1,
+                    "full_cloud_val_fixed_objective": -2.0,
+                    "full_cloud_val_sample_signature": "fixed-set-a",
+                },
+                ckpt_dir=directory, episode=0,
+                runtime_state={"optimizer": optimizer},
+            )
+            self.assertEqual(first["action"], "new_best")
+
+            # A local rebase must not silently re-arm another model restore.
+            for episode in (1, 2, 3):
+                torch.save(
+                    model.state_dict(), os.path.join(directory, f"{episode}.pth")
+                )
+                event = apply_actual_compression_guard(
+                    args=args, model=model, loss=_Loss(), optimizer=optimizer,
+                    writer=_Writer(), guard_state=guard_state,
+                    checkpoint_metrics={
+                        "checkpoint_eligible": True,
+                        "checkpoint_actual_source": "full_cloud",
+                        "checkpoint_actual_delta": -2.0 + 0.1 * episode,
+                        "checkpoint_actual_count": 1,
+                        "full_cloud_val_fixed_objective": -1.0 + 0.1 * episode,
+                        "full_cloud_val_sample_signature": "fixed-set-a",
+                    },
+                    ckpt_dir=directory, episode=episode,
+                    runtime_state={"optimizer": optimizer},
+                )
+                if episode == 1:
+                    self.assertEqual(event["action"], "rollback")
+                else:
+                    self.assertEqual(event["action"], "rebase_stale")
+                    self.assertEqual(event["reason"], "restore_budget_exhausted")
+                    self.assertEqual(event["restore_count"], 1)
 
     def test_disabled_scheduler_does_not_decay_emulator_lr(self):
         parameter = torch.nn.Parameter(torch.tensor(1.0))

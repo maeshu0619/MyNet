@@ -361,6 +361,9 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--point_transformer_node_feature_dim', default=8, type=int, help='操作決定へ渡す固定Point Transformer特徴のbottleneck次元')
     parser.add_argument('--point_transformer_node_adapter_hidden', default=32, type=int, help='固定Point Transformer特徴を圧縮する学習可能Adapterの隠れ次元')
     parser.add_argument('--point_transformer_node_feature_scale', default=0.25, type=float, help='正規化済みPoint Transformer特徴の初期スケール')
+    parser.add_argument('--point_transformer_feature_gate_max', default=0.25, type=float, help='構造特徴へ加えるPoint Transformer residual gateの上限。飽和による既存方策の上書きを防ぐ')
+    parser.add_argument('--point_transformer_feature_warmup_steps', default=2000, type=int, help='Point Transformer residualを0から所定gateまで滑らかに導入するStep数')
+    parser.add_argument('--point_transformer_feature_lr_scale', default=0.1, type=float, help='Point Transformer Adapter/Gate専用LRのmain LRに対する倍率')
     parser.add_argument('--point_transformer_feature_cache', default=True, type=str2bool, help='固定Point Transformerのcoarse特徴とVoxel対応をCPUへキャッシュする')
     parser.add_argument('--point_transformer_feature_cache_max_entries', default=64, type=int, help='固定Point Transformer特徴CPUキャッシュの最大frame数')
     parser.add_argument('--point_transformer_feature_cache_max_memory_mb', default=512, type=int, help='固定Point Transformer特徴CPUキャッシュの上限MB')
@@ -2985,6 +2988,9 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--actual_guard_restore_best', default=True, type=str2bool, help='actual guard発動時にbest episode checkpointへ戻す')
     parser.add_argument('--actual_guard_require_fixed_validation', default=True, type=str2bool, help='Trueなら同一full-cloud validationだけでguardを判定し、移動する訓練窓の平均ではrollbackしない')
     parser.add_argument('--actual_guard_require_full_state_restore', default=True, type=str2bool, help='Trueならmodelだけでなくoptimizer/scheduler/scalerも保存済みの場合だけrollbackする')
+    parser.add_argument('--actual_guard_max_restores', default=1, type=int, help='1訓練run中に重みを巻き戻す最大回数。周期的なrollbackを防ぐ。0なら巻き戻さない')
+    parser.add_argument('--actual_guard_max_restore_age_episodes', default=16, type=int, help='このEpisode数より古いbestへのrollbackを禁止する。0なら無制限')
+    parser.add_argument('--actual_guard_rebase_stale_best', default=True, type=str2bool, help='古すぎるbestでGuardが発火した場合、現Episodeを新しい局所Guard基準として継続する')
     parser.add_argument('--actual_guard_improvement_epsilon', default=1e-6, type=float, help='actual guardのbest更新に必要な最小改善幅')
     parser.add_argument('--checkpoint_actual_source', default='auto', type=str, help='actual checkpoint/guardの主指標(auto/fresh/full_cloud)')
     parser.add_argument('--checkpoint_full_cloud_min_count', default=1, type=int, help='full_cloud actualをcheckpoint主指標に使う最低件数')
@@ -4233,6 +4239,9 @@ def parse_pugan_args(parser, file_day, file_time):
                 "0.0," + str(args.heuristic_guidance_online_amount_bins)
             )
         if not _cli_option_was_provided("--sparsepcgc_algorithmic_amount_init_ratio"):
+            # 20260817の安定runと同じ初期中心を維持する。0.002へ直接
+            # 初期化すると離散Gumbel選択が別binへ固定されることを実測済み。
+            # これは初期biasのみで、Actual RD勾配による変更は妨げない。
             args.sparsepcgc_algorithmic_amount_init_ratio = 0.0025
             # actual Rateはden6と同じfull-cloud基準で毎Step確認する。
         # Add/Prune/Adjustを同時候補として残す。各操作量はHeuristic prior周辺でNetworkが微調整する。
@@ -4863,6 +4872,15 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     args.actual_guard_require_full_state_restore = bool(
         getattr(args, "actual_guard_require_full_state_restore", True)
+    )
+    args.actual_guard_max_restores = max(int(getattr(
+        args, "actual_guard_max_restores", 1
+    )), 0)
+    args.actual_guard_max_restore_age_episodes = max(int(
+        getattr(args, "actual_guard_max_restore_age_episodes", 16)
+    ), 0)
+    args.actual_guard_rebase_stale_best = bool(
+        getattr(args, "actual_guard_rebase_stale_best", True)
     )
     args.actual_guard_improvement_epsilon = max(float(getattr(args, "actual_guard_improvement_epsilon", 1e-6)), 0.0)
     args.checkpoint_actual_source = str(
@@ -6487,6 +6505,15 @@ def parse_pugan_args(parser, file_day, file_time):
     args.point_transformer_node_feature_scale = max(float(getattr(
         args, "point_transformer_node_feature_scale", 0.25
     )), 0.0)
+    args.point_transformer_feature_gate_max = min(max(float(getattr(
+        args, "point_transformer_feature_gate_max", 0.25
+    )), 0.0), 1.0)
+    args.point_transformer_feature_warmup_steps = max(int(getattr(
+        args, "point_transformer_feature_warmup_steps", 2000
+    )), 0)
+    args.point_transformer_feature_lr_scale = min(max(float(getattr(
+        args, "point_transformer_feature_lr_scale", 0.1
+    )), 0.0), 1.0)
     args.point_transformer_feature_cache = bool(getattr(
         args, "point_transformer_feature_cache", True
     ))

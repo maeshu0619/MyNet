@@ -30,6 +30,8 @@ def _network():
         point_transformer_node_features=True,
         point_transformer_node_feature_dim=8,
         point_transformer_node_feature_scale=0.25,
+        point_transformer_feature_gate_max=0.25,
+        point_transformer_feature_warmup_steps=100,
         point_transformer_feature_cache=True,
         point_transformer_feature_cache_max_entries=4,
         point_transformer_feature_cache_max_memory_mb=16,
@@ -45,6 +47,9 @@ def _network():
     )
     network.point_transformer_node_features = True
     network.point_transformer_node_feature_dim = 8
+    network.point_transformer_feature_gate = nn.Parameter(
+        torch.full((1, 8, 1), 0.1)
+    )
     network.point_transformer_feature_adapter = nn.Sequential(
         nn.Conv1d(64, 16, 1),
         nn.SiLU(inplace=True),
@@ -66,6 +71,22 @@ def _network():
 
 
 class PointTransformerNodeFeatureTest(unittest.TestCase):
+    def test_feature_gate_is_bounded_and_warmed_up_smoothly(self):
+        network = _network()
+        reference = torch.zeros(1, 16, 4)
+
+        network.args._global_train_step = 0
+        start_gate, start_warmup = network._point_transformer_fusion_gate(reference)
+        self.assertLess(start_warmup, 0.001)
+        self.assertLess(float(start_gate.detach().abs().max()), 0.001)
+
+        network.args._global_train_step = 99
+        with torch.no_grad():
+            network.point_transformer_feature_gate.fill_(10.0)
+        final_gate, final_warmup = network._point_transformer_fusion_gate(reference)
+        self.assertAlmostEqual(final_warmup, 1.0)
+        self.assertLessEqual(float(final_gate.detach().abs().max()), 0.25)
+
     def test_frozen_encoder_features_reach_trainable_node_adapter_and_cache(self):
         torch.manual_seed(5)
         network = _network()

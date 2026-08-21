@@ -5907,12 +5907,15 @@ def main():
     writer.write("RepKPU encoder loaded: repkpu_model/ckpt-best.pth")
     writer.write(
         "PointTransformerNodeFeatures: enabled={}, encoder_frozen={}, "
-        "bottleneck_dim={}, fusion=structure_residual, feature_scale={}, "
-        "coarse_max_points={}, cpu_cache={}".format(
+        "bottleneck_dim={}, fusion=bounded_warmup_structure_residual, feature_scale={}, "
+        "gate_max={}, warmup_steps={}, lr_scale={}, coarse_max_points={}, cpu_cache={}".format(
             bool(getattr(args, "point_transformer_node_features", True)),
             bool(getattr(args, "encoder_0grad", True)),
             int(getattr(args, "point_transformer_node_feature_dim", 8)),
             float(getattr(args, "point_transformer_node_feature_scale", 0.25)),
+            float(getattr(args, "point_transformer_feature_gate_max", 0.25)),
+            int(getattr(args, "point_transformer_feature_warmup_steps", 2000)),
+            float(getattr(args, "point_transformer_feature_lr_scale", 0.1)),
             int(getattr(args, "encoder_pre_downsample_max_points", 8192)),
             bool(getattr(args, "point_transformer_feature_cache", True)),
         )

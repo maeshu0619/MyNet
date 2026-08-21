@@ -120,16 +120,20 @@ class Network(nn.Module):
             # Point Transformerは高価なので最大8192点のcoarse表現だけを計算し、
             # 小さな学習可能bottleneckを通した後にcanonical Voxelへ写像する。
             # Adapterだけを学習することで、事前学習形状表現を壊さず操作決定へ渡す。
-            self.point_transformer_feature_adapter = nn.Sequential(
-                nn.Conv1d(encoder_output_dim, adapter_hidden, 1),
-                nn.SiLU(inplace=True),
-                nn.Conv1d(
-                    adapter_hidden,
-                    self.point_transformer_node_feature_dim,
-                    1,
-                ),
-                nn.Tanh(),
-            )
+            # Adapter追加が後段Actuatorの乱数初期値を変えないよう、CPU RNGを
+            # このblock内だけforkする。これでPoint Transformer有無の比較時も
+            # 既存方策headを同じ初期状態に保てる。
+            with torch.random.fork_rng(devices=[], enabled=True):
+                self.point_transformer_feature_adapter = nn.Sequential(
+                    nn.Conv1d(encoder_output_dim, adapter_hidden, 1),
+                    nn.SiLU(inplace=True),
+                    nn.Conv1d(
+                        adapter_hidden,
+                        self.point_transformer_node_feature_dim,
+                        1,
+                    ),
+                    nn.Tanh(),
+                )
             # 既存の全Voxel Headを拡幅せず、構造特徴の末尾部分へ小さな
             # 学習可能residualとして注入する。初期値0.1なら構造priorを
             # 保ったまま、圧縮/幾何勾配で形状特徴の寄与を増減できる。
@@ -578,6 +582,33 @@ class Network(nn.Module):
             self.args, "point_transformer_node_feature_scale", 0.25
         )), 0.0)
         return self.point_transformer_feature_adapter(normalized) * scale
+
+    def _point_transformer_fusion_gate(self, reference):
+        """Bound and smoothly introduce the trainable feature residual."""
+        if self.point_transformer_feature_gate is None:
+            return reference.new_zeros((1, 0, 1)), 0.0
+        maximum = min(max(float(getattr(
+            self.args, "point_transformer_feature_gate_max", 0.25
+        )), 0.0), 1.0)
+        if maximum <= 0.0:
+            return self.point_transformer_feature_gate.to(reference).mul(0.0), 0.0
+        raw_gate = self.point_transformer_feature_gate.to(
+            device=reference.device, dtype=reference.dtype
+        )
+        # raw=0.1の従来初期寄与はほぼ維持しつつ、学習が進んでもmaximumを
+        # 超えない滑らかなparameterizationにする。
+        bounded_gate = maximum * torch.tanh(raw_gate / maximum)
+        warmup_steps = max(int(getattr(
+            self.args, "point_transformer_feature_warmup_steps", 2000
+        )), 0)
+        global_step = getattr(self.args, "_global_train_step", None)
+        if warmup_steps > 0 and global_step is not None:
+            phase = min(max((float(global_step) + 1.0) / float(warmup_steps), 0.0), 1.0)
+            # smoothstepは開始・終了点の傾きが0なので、方策入力に段差を作らない。
+            warmup = phase * phase * (3.0 - 2.0 * phase)
+        else:
+            warmup = 1.0
+        return bounded_gate * float(warmup), float(warmup)
 
     def _point_transformer_features_for_nodes(
         self,
@@ -4070,9 +4101,8 @@ class Network(nn.Module):
                 raise RuntimeError(
                     "Point Transformer residual dimension exceeds structure features"
                 )
-            gate = torch.tanh(self.point_transformer_feature_gate).to(
-                device=actuator_input.device,
-                dtype=actuator_input.dtype,
+            gate, point_transformer_warmup = self._point_transformer_fusion_gate(
+                actuator_input
             )
             fused_slice = (
                 actuator_input[:, fusion_start:fusion_end, :]
@@ -4083,6 +4113,13 @@ class Network(nn.Module):
                 fused_slice,
                 actuator_input[:, fusion_end:, :],
             ), dim=1)
+            if bool(getattr(self.args, "network_voxel_node_debug", False)):
+                point_transformer_feature_debug["gate_abs_max"] = float(
+                    gate.detach().abs().max().cpu()
+                )
+                point_transformer_feature_debug["warmup"] = float(
+                    point_transformer_warmup
+                )
         network_only_policy_terms = None
         k_proposal_terms = None
         self.last_single_plan_student_terms = None

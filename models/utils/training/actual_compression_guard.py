@@ -409,6 +409,9 @@ def apply_actual_compression_guard(
 
     guard_state.setdefault("best_delta", float("inf"))
     guard_state.setdefault("best_path", None)
+    guard_state.setdefault("best_episode", None)
+    guard_state.setdefault("restored_best_path", None)
+    guard_state.setdefault("restore_count", 0)
     guard_state.setdefault("bad_count", 0)
     guard_state.setdefault("best_fixed_objective", float("inf"))
 
@@ -449,6 +452,8 @@ def apply_actual_compression_guard(
         guard_state["best_delta"] = actual_delta
         guard_state["best_fixed_objective"] = float(fixed_objective)
         guard_state["best_path"] = episode_path
+        guard_state["best_episode"] = int(episode)
+        guard_state["restored_best_path"] = None
         guard_state["bad_count"] = 0
         training_state_path = _save_training_state(episode_path, runtime_state, args)
         message = (
@@ -517,6 +522,89 @@ def apply_actual_compression_guard(
         return event
 
     best_path = guard_state.get("best_path")
+    best_episode = guard_state.get("best_episode")
+    if best_episode is None and best_path:
+        try:
+            best_episode = int(os.path.splitext(os.path.basename(best_path))[0])
+        except (TypeError, ValueError):
+            best_episode = None
+    restore_age = (
+        max(int(episode) - int(best_episode), 0)
+        if best_episode is not None else None
+    )
+    max_restore_age = max(int(getattr(
+        args, "actual_guard_max_restore_age_episodes", 16
+    )), 0)
+    already_restored = bool(
+        best_path
+        and str(guard_state.get("restored_best_path") or "") == str(best_path)
+    )
+    max_restores = max(int(getattr(args, "actual_guard_max_restores", 1)), 0)
+    restore_budget_exhausted = int(guard_state.get("restore_count", 0)) >= max_restores
+    restore_too_old = bool(
+        max_restore_age > 0
+        and restore_age is not None
+        and restore_age > max_restore_age
+    )
+    restore_blocked = bool(
+        restore_budget_exhausted or already_restored or restore_too_old
+    )
+    if restore_blocked:
+        # 古いbestへ戻しても探索schedule/global stepは現在のままであり、
+        # 20260820 runでは同じ4-Episode軌道を反復した。1つのbestは一度だけ
+        # recoveryに使い、その後は現在の安全な状態を局所基準へ更新する。
+        guard_state["bad_count"] = 0
+        if restore_budget_exhausted:
+            reason = "restore_budget_exhausted"
+        elif already_restored:
+            reason = "best_already_restored"
+        else:
+            reason = "best_too_old"
+        if (
+            candidate_safe
+            and bool(getattr(args, "actual_guard_rebase_stale_best", True))
+        ):
+            episode_path = os.path.join(ckpt_dir, f"{episode}.pth")
+            training_state_path = _save_training_state(
+                episode_path, runtime_state, args
+            )
+            guard_state["best_delta"] = float(actual_delta)
+            guard_state["best_fixed_objective"] = float(fixed_objective)
+            guard_state["best_path"] = episode_path
+            guard_state["best_episode"] = int(episode)
+            guard_state["restored_best_path"] = None
+            event.update({
+                "action": "rebase_stale",
+                "reason": reason,
+                "restore_age_episodes": restore_age,
+                "restore_count": int(guard_state.get("restore_count", 0)),
+                "max_restores": max_restores,
+                "max_restore_age_episodes": max_restore_age,
+                "best_delta": float(actual_delta),
+                "best_path": episode_path,
+                "training_state_path": training_state_path,
+                "training_state_saved": True,
+                "bad_count": 0,
+            })
+        else:
+            event.update({
+                "action": "stale_guard_hold",
+                "reason": reason,
+                "restore_age_episodes": restore_age,
+                "restore_count": int(guard_state.get("restore_count", 0)),
+                "max_restores": max_restores,
+                "max_restore_age_episodes": max_restore_age,
+                "bad_count": 0,
+            })
+        if writer is not None and hasattr(writer, "write"):
+            writer.write(
+                "ActualCompressionGuard: "
+                f"{event['action']} episode={episode + 1}, reason={reason}, "
+                f"restore_age={restore_age}, max_restore_age={max_restore_age}, "
+                f"actual_delta={actual_delta:.6f}"
+            )
+        return event
+
     restored = False
     surrogate_restored = False
     training_state_restored = False
@@ -536,6 +624,8 @@ def apply_actual_compression_guard(
                 clear_input_cache()
             model.train()
             restored = True
+            guard_state["restored_best_path"] = str(best_path)
+            guard_state["restore_count"] = int(guard_state.get("restore_count", 0)) + 1
 
     global_step = int(getattr(args, "_global_train_step", 0))
     old_lrs = optimizer_lrs_safe(optimizer)

@@ -62,6 +62,24 @@ def build_optimizer_and_scheduler(model, args, writer):
     other_params = [parameter for parameter in other_params if id(parameter) not in k_param_ids]
     deform_params = [parameter for parameter in deform_params if id(parameter) not in k_param_ids]
 
+    point_feature_names = {
+        name for name in named_trainable
+        if name.startswith("point_transformer_feature_adapter.")
+        or name == "point_transformer_feature_gate"
+    }
+    point_feature_params = [
+        named_trainable[name] for name in sorted(point_feature_names)
+    ]
+    point_feature_param_ids = {id(parameter) for parameter in point_feature_params}
+    other_params = [
+        parameter for parameter in other_params
+        if id(parameter) not in point_feature_param_ids
+    ]
+    deform_params = [
+        parameter for parameter in deform_params
+        if id(parameter) not in point_feature_param_ids
+    ]
+
     single_names = {
         name for name in named_trainable
         if "single_plan_student." in name
@@ -120,6 +138,12 @@ def build_optimizer_and_scheduler(model, args, writer):
                 "lr": args.lr * float(getattr(args, "single_plan_student_lr_scale", 1.0)),
                 "name": "single_plan_student",
             })
+        if point_feature_params:
+            groups.append({
+                "params": point_feature_params,
+                "lr": args.lr * float(getattr(args, "point_transformer_feature_lr_scale", 0.1)),
+                "name": "point_transformer_feature",
+            })
         optimizer = optim.Adam(groups, lr=args.lr, weight_decay=args.weight_decay)
     else:
         args.lr = args.lr * 100
@@ -144,6 +168,12 @@ def build_optimizer_and_scheduler(model, args, writer):
                 "params": single_params,
                 "lr": args.lr * float(getattr(args, "single_plan_student_lr_scale", 1.0)),
                 "name": "single_plan_student",
+            })
+        if point_feature_params:
+            groups.append({
+                "params": point_feature_params,
+                "lr": args.lr * float(getattr(args, "point_transformer_feature_lr_scale", 0.1)),
+                "name": "point_transformer_feature",
             })
         optimizer = optim.SGD(
             groups,
