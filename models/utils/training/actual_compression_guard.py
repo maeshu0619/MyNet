@@ -19,6 +19,7 @@ _RUNTIME_ARG_STATE_NAMES = (
     "_sparsepcgc_full_cloud_sequence_amount_memory",
     "_sparsepcgc_full_cloud_sequence_baseline_memory",
     "_heuristic_guidance_network_residual_weight_current",
+    "_actual_guard_autonomy_best_delta",
 )
 
 
@@ -62,8 +63,27 @@ def update_network_autonomy_from_guard(args, guard_event):
         )
     except (TypeError, ValueError):
         compression_target_met = False
-    if action == "new_best" and rd_improved and compression_target_met:
+    minimum_improvement = max(float(getattr(
+        args, "actual_guard_autonomy_min_improvement", 0.01
+    )), 0.0)
+    autonomy_best_delta = getattr(args, "_actual_guard_autonomy_best_delta", None)
+    try:
+        meaningful_improvement = bool(
+            actual_delta is None
+            or autonomy_best_delta is None
+            or float(actual_delta) <= float(autonomy_best_delta) - minimum_improvement
+        )
+    except (TypeError, ValueError):
+        meaningful_improvement = False
+    if (
+        action == "new_best"
+        and rd_improved
+        and compression_target_met
+        and meaningful_improvement
+    ):
         current = min(current + increment, maximum)
+        if actual_delta is not None:
+            setattr(args, "_actual_guard_autonomy_best_delta", float(actual_delta))
     elif action == "rollback":
         # optimizer/RNGまで完全restoreすると同じ探索列を再生し、
         # 最新runのように4 Episodeごとのrollback循環になる。
@@ -81,6 +101,8 @@ def update_network_autonomy_from_guard(args, guard_event):
         "rd_improved": bool(rd_improved),
         "compression_target": float(compression_target),
         "compression_target_met": bool(compression_target_met),
+        "minimum_improvement": float(minimum_improvement),
+        "meaningful_improvement": bool(meaningful_improvement),
     }
     if isinstance(guard_event, dict):
         guard_event["network_autonomy_previous"] = event["previous"]

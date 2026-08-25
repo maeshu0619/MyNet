@@ -20,6 +20,7 @@ from models.utils.training.convergence_control import (
 )
 from models.utils.training.train_flow import backward_only_scaled_loss
 from models.utils.training.train_runtime import fixed_full_cloud_validation_records
+from models.modules.structure_actuator import smooth_exploration_phase
 
 
 class _Writer:
@@ -43,6 +44,36 @@ class TrainingStabilityTest(unittest.TestCase):
     def test_zero_exploration_schedule_uses_legacy_episode_length(self):
         args = SimpleNamespace(episodes=384, exploration_schedule_episodes=0)
         self.assertEqual(exploration_schedule_step_estimate(args, 40), 384 * 40)
+
+    def test_auto_exploration_schedule_tracks_convergence_limit(self):
+        args = SimpleNamespace(
+            episodes=256,
+            exploration_schedule_episodes=0,
+            train_until_converged=True,
+            convergence_min_episodes=256,
+            convergence_max_episodes=384,
+        )
+        self.assertEqual(exploration_schedule_step_estimate(args, 40), 384 * 40)
+
+    def test_exploration_tail_lands_without_a_slope_jump(self):
+        fraction = 0.9
+        tail = 0.25
+        boundary = fraction * (1.0 - tail)
+        epsilon = 1e-5
+        left_slope = (
+            smooth_exploration_phase(boundary, fraction, tail)
+            - smooth_exploration_phase(boundary - epsilon, fraction, tail)
+        ) / epsilon
+        right_slope = (
+            smooth_exploration_phase(boundary + epsilon, fraction, tail)
+            - smooth_exploration_phase(boundary, fraction, tail)
+        ) / epsilon
+        end_slope = (
+            smooth_exploration_phase(fraction, fraction, tail)
+            - smooth_exploration_phase(fraction - epsilon, fraction, tail)
+        ) / epsilon
+        self.assertAlmostEqual(left_slope, right_slope, places=3)
+        self.assertAlmostEqual(end_slope, 0.0, places=3)
 
     def test_backward_only_policy_term_preserves_gradient_and_zeroes_forward(self):
         parameter = torch.tensor(2.0, requires_grad=True)
@@ -415,6 +446,28 @@ class TrainingStabilityTest(unittest.TestCase):
         )
         self.assertAlmostEqual(held["current"], 0.05)
         self.assertFalse(held["compression_target_met"])
+
+    def test_network_autonomy_ignores_sub_noise_improvements(self):
+        args = SimpleNamespace(
+            heuristic_guidance_network_residual_weight=0.05,
+            heuristic_guidance_network_residual_weight_max=0.15,
+            heuristic_guidance_network_residual_weight_increment=0.025,
+            actual_guard_autonomy_compression_target=-3.5,
+            actual_guard_autonomy_min_improvement=0.01,
+        )
+        first = update_network_autonomy_from_guard(
+            args, {"action": "new_best", "rd_improved": True, "actual_delta": -3.60}
+        )
+        tiny = update_network_autonomy_from_guard(
+            args, {"action": "new_best", "rd_improved": True, "actual_delta": -3.605}
+        )
+        accumulated = update_network_autonomy_from_guard(
+            args, {"action": "new_best", "rd_improved": True, "actual_delta": -3.611}
+        )
+        self.assertAlmostEqual(first["current"], 0.075)
+        self.assertAlmostEqual(tiny["current"], 0.075)
+        self.assertFalse(tiny["meaningful_improvement"])
+        self.assertAlmostEqual(accumulated["current"], 0.10)
 
     def test_guard_does_not_accept_geometry_unsafe_compression_best(self):
         args = self._guard_args()

@@ -87,6 +87,24 @@ class PointTransformerNodeFeatureTest(unittest.TestCase):
         self.assertAlmostEqual(final_warmup, 1.0)
         self.assertLessEqual(float(final_gate.detach().abs().max()), 0.25)
 
+    def test_auto_warmup_tracks_the_exploration_curriculum(self):
+        network = _network()
+        network.args.point_transformer_feature_gate_max = 0.10
+        network.args.point_transformer_feature_warmup_steps = 0
+        network.args._total_train_steps_estimate = 10240
+        network.args.repair_exploration_fraction = 0.9
+        reference = torch.zeros(1, 16, 4)
+
+        network.args._global_train_step = 1999
+        early_gate, early_warmup = network._point_transformer_fusion_gate(reference)
+        self.assertLess(early_warmup, 0.15)
+        self.assertLess(float(early_gate.detach().abs().max()), 0.015)
+
+        network.args._global_train_step = 9215
+        final_gate, final_warmup = network._point_transformer_fusion_gate(reference)
+        self.assertAlmostEqual(final_warmup, 1.0)
+        self.assertLessEqual(float(final_gate.detach().abs().max()), 0.10)
+
     def test_frozen_encoder_features_reach_trainable_node_adapter_and_cache(self):
         torch.manual_seed(5)
         network = _network()

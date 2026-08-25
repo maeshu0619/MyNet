@@ -588,7 +588,7 @@ class Network(nn.Module):
         if self.point_transformer_feature_gate is None:
             return reference.new_zeros((1, 0, 1)), 0.0
         maximum = min(max(float(getattr(
-            self.args, "point_transformer_feature_gate_max", 0.25
+            self.args, "point_transformer_feature_gate_max", 0.10
         )), 0.0), 1.0)
         if maximum <= 0.0:
             return self.point_transformer_feature_gate.to(reference).mul(0.0), 0.0
@@ -598,9 +598,19 @@ class Network(nn.Module):
         # raw=0.1の従来初期寄与はほぼ維持しつつ、学習が進んでもmaximumを
         # 超えない滑らかなparameterizationにする。
         bounded_gate = maximum * torch.tanh(raw_gate / maximum)
-        warmup_steps = max(int(getattr(
-            self.args, "point_transformer_feature_warmup_steps", 2000
+        configured_warmup_steps = max(int(getattr(
+            self.args, "point_transformer_feature_warmup_steps", 0
         )), 0)
+        if configured_warmup_steps > 0:
+            warmup_steps = configured_warmup_steps
+        else:
+            total_steps = max(int(getattr(
+                self.args, "_total_train_steps_estimate", 1
+            )), 1)
+            exploration_fraction = min(max(float(getattr(
+                self.args, "repair_exploration_fraction", 1.0
+            )), 0.0), 1.0)
+            warmup_steps = max(int(round(total_steps * exploration_fraction)), 1)
         global_step = getattr(self.args, "_global_train_step", None)
         if warmup_steps > 0 and global_step is not None:
             phase = min(max((float(global_step) + 1.0) / float(warmup_steps), 0.0), 1.0)

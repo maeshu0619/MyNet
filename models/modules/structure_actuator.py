@@ -19,6 +19,26 @@ from .executable_voxel_plan import (
     scatter_amax_1d_compat_,
 )
 
+
+def smooth_exploration_phase(progress, fraction, tail_fraction=0.25):
+    """Linear curriculum with a C2-smooth landing at zero exploration."""
+    fraction = min(max(float(fraction), 0.0), 1.0)
+    if fraction <= 0.0:
+        return 1.0
+    normalized = min(max(float(progress) / fraction, 0.0), 1.0)
+    tail = min(max(float(tail_fraction), 0.0), 1.0)
+    if tail <= 0.0 or normalized <= 1.0 - tail:
+        return normalized
+    # multiplier=1-phaseを、線形部の値・1階・2階微分を保ったまま
+    # 終端で値・1階・2階微分が0になるquinticへ接続する。
+    x = (normalized - (1.0 - tail)) / tail
+    tail_multiplier_unit = (
+        1.0 - x - 4.0 * x ** 3 + 7.0 * x ** 4 - 3.0 * x ** 5
+    )
+    multiplier = tail * max(tail_multiplier_unit, 0.0)
+    return min(max(1.0 - multiplier, 0.0), 1.0)
+
+
 class StructureRepairActuator(nn.Module):
     """Apply small geometry-preserving movements that realize repair policies.
 
@@ -2889,7 +2909,11 @@ class StructureRepairActuator(nn.Module):
         total_steps = max(int(getattr(self.args, "_total_train_steps_estimate", 0)), 1)
         step = min(max(int(getattr(self.args, "_global_train_step", 0)), 0), total_steps)
         progress = min(float(step) / float(max(total_steps, 1)), 1.0)
-        return min(progress / fraction, 1.0)
+        return smooth_exploration_phase(
+            progress,
+            fraction,
+            getattr(self.args, "repair_exploration_smooth_tail_fraction", 0.25),
+        )
 
     def _annealed_value(self, start_name, end_name, default_start=0.0, default_end=0.0):
         start = float(getattr(self.args, start_name, default_start))

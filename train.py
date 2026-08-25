@@ -255,11 +255,16 @@ def train(model, args, loss, writer, plot, notifier=None):
         args,
         total_train_files,
     )
+    effective_exploration_episodes = max(
+        int(math.ceil(float(args._total_train_steps_estimate) / float(max(total_train_files, 1)))),
+        1,
+    )
     writer.write(
         "ExplorationSchedule: "
         f"training_episodes={int(getattr(args, 'episodes', 1))}, "
-        f"schedule_episodes={int(getattr(args, 'exploration_schedule_episodes', 0)) or int(getattr(args, 'episodes', 1))}, "
+        f"schedule_episodes={effective_exploration_episodes}, "
         f"fraction={float(getattr(args, 'repair_exploration_fraction', 0.0)):.6g}, "
+        f"smooth_tail={float(getattr(args, 'repair_exploration_smooth_tail_fraction', 0.25)):.6g}, "
         f"anneal_steps={int(args._total_train_steps_estimate)}"
     )
     if _episode_input_common_cache_enabled(args):
@@ -5913,8 +5918,8 @@ def main():
             bool(getattr(args, "encoder_0grad", True)),
             int(getattr(args, "point_transformer_node_feature_dim", 8)),
             float(getattr(args, "point_transformer_node_feature_scale", 0.25)),
-            float(getattr(args, "point_transformer_feature_gate_max", 0.25)),
-            int(getattr(args, "point_transformer_feature_warmup_steps", 2000)),
+            float(getattr(args, "point_transformer_feature_gate_max", 0.10)),
+            int(getattr(args, "point_transformer_feature_warmup_steps", 0)),
             float(getattr(args, "point_transformer_feature_lr_scale", 0.1)),
             int(getattr(args, "encoder_pre_downsample_max_points", 8192)),
             bool(getattr(args, "point_transformer_feature_cache", True)),

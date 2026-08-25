@@ -361,8 +361,8 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--point_transformer_node_feature_dim', default=8, type=int, help='操作決定へ渡す固定Point Transformer特徴のbottleneck次元')
     parser.add_argument('--point_transformer_node_adapter_hidden', default=32, type=int, help='固定Point Transformer特徴を圧縮する学習可能Adapterの隠れ次元')
     parser.add_argument('--point_transformer_node_feature_scale', default=0.25, type=float, help='正規化済みPoint Transformer特徴の初期スケール')
-    parser.add_argument('--point_transformer_feature_gate_max', default=0.25, type=float, help='構造特徴へ加えるPoint Transformer residual gateの上限。飽和による既存方策の上書きを防ぐ')
-    parser.add_argument('--point_transformer_feature_warmup_steps', default=2000, type=int, help='Point Transformer residualを0から所定gateまで滑らかに導入するStep数')
+    parser.add_argument('--point_transformer_feature_gate_max', default=0.10, type=float, help='構造特徴へ加えるPoint Transformer residual gateの上限。既存のOctree方策特徴を上書きしない範囲に保つ')
+    parser.add_argument('--point_transformer_feature_warmup_steps', default=0, type=int, help='Point Transformer residualのwarmup Step数。0なら探索schedule全体へ自動追従する')
     parser.add_argument('--point_transformer_feature_lr_scale', default=0.1, type=float, help='Point Transformer Adapter/Gate専用LRのmain LRに対する倍率')
     parser.add_argument('--point_transformer_feature_cache', default=True, type=str2bool, help='固定Point Transformerのcoarse特徴とVoxel対応をCPUへキャッシュする')
     parser.add_argument('--point_transformer_feature_cache_max_entries', default=64, type=int, help='固定Point Transformer特徴CPUキャッシュの最大frame数')
@@ -1622,6 +1622,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--add_noop_keep_threshold', default=0.5, type=float, help='このkeep確率未満の点は追加基点から除外する')
     parser.add_argument('--repair_add_weight_mode', default='hard', type=str, help='追加点のfinal_wをhard/softのどちらで作るか')
     parser.add_argument('--repair_exploration_fraction', default=1.0, type=float, help='全学習stepのうちadd/drop探索ノイズを残す割合')
+    parser.add_argument('--repair_exploration_smooth_tail_fraction', default=0.25, type=float, help='探索減衰末尾を傾き0へ滑らかにつなぐ割合。0なら従来の線形clip')
     parser.add_argument('--repair_add_candidate_ratio_start', default=0.0, type=float, help='探索初期の追加候補割合(0ならmax_add_ratio)')
     parser.add_argument('--repair_add_candidate_ratio_end', default=0.0, type=float, help='探索終了後の追加候補割合(0ならmax_add_ratio)')
     parser.add_argument('--repair_add_score_noise_start', default=0.0, type=float, help='探索初期に追加位置logitへ入れるGumbelノイズ量')
@@ -1853,7 +1854,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--max_files', default=10, type=int, help='1系列の1Epochで読み込むフレーム数')
     parser.add_argument('--train_frames_per_sequence', default=100, type=int, help='各系列で訓練に使用する先頭フレーム数。残りは訓練窓から除外する')
     parser.add_argument('--episodes', default=384, type=int, help='学習エピソード数')
-    parser.add_argument('--exploration_schedule_episodes', default=256, type=int, help='探索ノイズを減衰させる基準Episode数。総訓練長を延ばしても元のカリキュラム速度を保つ。0ならepisodesへ連動')
+    parser.add_argument('--exploration_schedule_episodes', default=256, type=int, help='探索ノイズを減衰させる基準Episode数。良好runの前半カリキュラムを維持し、終端だけsmooth tailで接続する。0なら最大訓練長へ連動')
     parser.add_argument('--train_until_converged', default=False, type=str2bool, help='Trueならepisodesを最低訓練長とし、固定検証で十分な収束証拠が得られるまで継続する')
     parser.add_argument('--convergence_min_episodes', default=0, type=int, help='収束判定を始める最低Episode数。0なら--episodesを使う')
     parser.add_argument('--convergence_max_episodes', default=384, type=int, help='収束制御の安全上限。未収束で到達した場合は正常終了にせずエラーにする')
@@ -2982,6 +2983,7 @@ def parse_pugan_args(parser, file_day, file_time):
         type=float,
         help='Network候補再順位の裁量を広げる前に固定validationで必要なActual圧縮率[%%]',
     )
+    parser.add_argument('--actual_guard_autonomy_min_improvement', default=0.01, type=float, help='候補再順位付け裁量を一段広げるのに必要な、前回拡張時からの固定Actual圧縮率改善幅[percentage point]')
     parser.add_argument('--actual_guard_decay_lr', default=False, type=str2bool, help='ActualCompressionGuard発火時にLRも下げるか。StepLRとの二重低下を避けるため既定False')
     parser.add_argument('--actual_guard_lr_decay', default=0.5, type=float, help='actual guard発動時のoptimizer LR倍率')
     parser.add_argument('--actual_guard_min_fresh', default=1, type=int, help='actual guardを判定する最低fresh actual計測数')
@@ -4202,6 +4204,11 @@ def parse_pugan_args(parser, file_day, file_time):
             args.more_training = False
     if args.heuristic_guidance_enabled and compress_key == "sparsepcgc":
         if args.heuristic_guidance_mode in {"ana_den6_online", "ana_den6_residual"}:
+            if not _cli_option_was_provided("--heuristic_guidance_network_residual_weight_max"):
+                # 20260817の安定runは0.15で最終-3.8付近へ到達した。一方、
+                # 20260822 runは0.325まで拡張して候補順位が崩れたため、
+                # 明示指定がない場合だけ実測済みの安全域を上限にする。
+                args.heuristic_guidance_network_residual_weight_max = 0.15
             # den6 Amountは全点群比0.05%～0.25%級である。旧3%/5%初期値を混入させない。
             profile_amounts = {
                 ("8i", 8): (0.0010, 0.0010, 0.0005),
@@ -4863,6 +4870,9 @@ def parse_pugan_args(parser, file_day, file_time):
     args.actual_guard_autonomy_compression_target = float(getattr(
         args, "actual_guard_autonomy_compression_target", -3.5
     ))
+    args.actual_guard_autonomy_min_improvement = max(float(getattr(
+        args, "actual_guard_autonomy_min_improvement", 0.01
+    )), 0.0)
     args.actual_guard_decay_lr = bool(getattr(args, "actual_guard_decay_lr", False))
     args.actual_guard_lr_decay = min(max(float(getattr(args, "actual_guard_lr_decay", 0.5)), 0.0), 1.0)
     args.actual_guard_min_fresh = max(int(getattr(args, "actual_guard_min_fresh", 1)), 1)
@@ -6506,10 +6516,10 @@ def parse_pugan_args(parser, file_day, file_time):
         args, "point_transformer_node_feature_scale", 0.25
     )), 0.0)
     args.point_transformer_feature_gate_max = min(max(float(getattr(
-        args, "point_transformer_feature_gate_max", 0.25
+        args, "point_transformer_feature_gate_max", 0.10
     )), 0.0), 1.0)
     args.point_transformer_feature_warmup_steps = max(int(getattr(
-        args, "point_transformer_feature_warmup_steps", 2000
+        args, "point_transformer_feature_warmup_steps", 0
     )), 0)
     args.point_transformer_feature_lr_scale = min(max(float(getattr(
         args, "point_transformer_feature_lr_scale", 0.1
@@ -6786,6 +6796,9 @@ def parse_pugan_args(parser, file_day, file_time):
     if args.repair_add_weight_mode not in {"hard", "soft"}:
         raise ValueError("--repair_add_weight_mode must be hard or soft")
     args.repair_exploration_fraction = min(max(float(getattr(args, "repair_exploration_fraction", 0.0)), 0.0), 1.0)
+    args.repair_exploration_smooth_tail_fraction = min(max(float(getattr(
+        args, "repair_exploration_smooth_tail_fraction", 0.25
+    )), 0.0), 1.0)
     args.repair_add_candidate_ratio_start = max(float(getattr(args, "repair_add_candidate_ratio_start", 0.0)), 0.0)
     args.repair_add_candidate_ratio_end = max(float(getattr(args, "repair_add_candidate_ratio_end", 0.0)), 0.0)
     args.repair_add_score_noise_start = max(float(getattr(args, "repair_add_score_noise_start", 0.0)), 0.0)

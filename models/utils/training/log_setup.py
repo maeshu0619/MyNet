@@ -223,6 +223,7 @@ def log_runtime_setup(writer, args):
             f"start={float(getattr(args, 'heuristic_guidance_network_residual_weight', 0.05)):.6g}, "
             f"max={float(getattr(args, 'heuristic_guidance_network_residual_weight_max', 0.50)):.6g}, "
             f"new_best_increment={float(getattr(args, 'heuristic_guidance_network_residual_weight_increment', 0.025)):.6g}, "
+            f"min_actual_improvement={float(getattr(args, 'actual_guard_autonomy_min_improvement', 0.01)):.6g}, "
             "gate=fixed_full_cloud_validation"
         )
         writer.write(

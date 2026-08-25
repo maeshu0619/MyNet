@@ -44,10 +44,10 @@ def convergence_episode_limit(args):
 
 
 def exploration_schedule_step_estimate(args, total_train_files):
-    """総訓練長とは独立した探索カリキュラムのStep数を返す。"""
+    """明示固定されていなければ実際の最大訓練長へ探索を追従させる。"""
     schedule_episodes = int(getattr(args, "exploration_schedule_episodes", 0))
     if schedule_episodes <= 0:
-        schedule_episodes = int(getattr(args, "episodes", 1))
+        schedule_episodes = convergence_episode_limit(args)
     return max(schedule_episodes, 1) * max(int(total_train_files), 1)
 
 
