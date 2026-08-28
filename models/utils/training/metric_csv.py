@@ -133,6 +133,13 @@ def plot_learning_evidence_curve(checkpoint_path, train_episode_path):
 
     import matplotlib.pyplot as plt
 
+    def rolling_mean(values, window=16):
+        result = []
+        for index in range(len(values)):
+            start = max(index - int(window) + 1, 0)
+            result.append(sum(values[start:index + 1]) / float(index - start + 1))
+        return result
+
     output_path = checkpoint_path.replace(
         "_checkpoint_metrics_epi.csv", "_learning_evidence.png"
     )
@@ -140,8 +147,16 @@ def plot_learning_evidence_curve(checkpoint_path, train_episode_path):
     axes[0].plot(
         episodes,
         stochastic_train,
-        label="Stochastic train plan (exploration affected)",
-        alpha=0.75,
+        label="Stochastic train plan (raw)",
+        alpha=0.25,
+        linewidth=1.0,
+    )
+    axes[0].plot(
+        episodes,
+        rolling_mean(stochastic_train),
+        label="Stochastic train plan (16-episode mean)",
+        alpha=0.9,
+        linewidth=1.8,
     )
     axes[0].plot(
         episodes,

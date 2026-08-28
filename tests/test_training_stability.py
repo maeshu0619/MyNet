@@ -20,7 +20,11 @@ from models.utils.training.convergence_control import (
 )
 from models.utils.training.train_flow import backward_only_scaled_loss
 from models.utils.training.train_runtime import fixed_full_cloud_validation_records
-from models.modules.structure_actuator import smooth_exploration_phase
+from models.modules.structure_actuator import (
+    StructureRepairActuator,
+    policy_exploration_multiplier,
+    smooth_exploration_phase,
+)
 
 
 class _Writer:
@@ -74,6 +78,69 @@ class TrainingStabilityTest(unittest.TestCase):
         ) / epsilon
         self.assertAlmostEqual(left_slope, right_slope, places=3)
         self.assertAlmostEqual(end_slope, 0.0, places=3)
+
+    def test_constant_policy_exploration_does_not_change_with_training_phase(self):
+        values = [
+            policy_exploration_multiplier(
+                training=True,
+                schedule_mode="constant",
+                constant_multiplier=0.25,
+                annealed_phase=phase,
+            )
+            for phase in (0.0, 0.5, 0.99, 1.0)
+        ]
+        self.assertEqual(values, [0.25, 0.25, 0.25, 0.25])
+
+    def test_policy_exploration_is_disabled_during_evaluation(self):
+        self.assertEqual(
+            policy_exploration_multiplier(
+                training=False,
+                schedule_mode="constant",
+                constant_multiplier=0.25,
+                annealed_phase=0.0,
+            ),
+            0.0,
+        )
+
+    def test_annealed_policy_exploration_remains_available_for_ablation(self):
+        self.assertAlmostEqual(
+            policy_exploration_multiplier(
+                training=True,
+                schedule_mode="annealed",
+                constant_multiplier=0.25,
+                annealed_phase=0.6,
+            ),
+            0.4,
+        )
+
+    def test_constant_exact_online_phase_also_freezes_legacy_random_mix(self):
+        actuator = StructureRepairActuator.__new__(StructureRepairActuator)
+        torch.nn.Module.__init__(actuator)
+        actuator.args = SimpleNamespace(
+            heuristic_guidance_mode="ana_den6_online",
+            repair_policy_exploration_mode="constant",
+            repair_policy_exploration_constant_multiplier=0.25,
+            repair_exploration_fraction=0.9,
+            repair_exploration_smooth_tail_fraction=0.25,
+            _exploration_schedule_steps_estimate=1000,
+            _total_train_steps_estimate=1000,
+            _global_train_step=0,
+        )
+        actuator.train()
+        phases = []
+        values = []
+        for step in (0, 500, 999):
+            actuator.args._global_train_step = step
+            phases.append(actuator._behavior_exploration_phase())
+            actuator.args.noise_start = 0.10
+            actuator.args.noise_end = 0.02
+            values.append(actuator._annealed_value("noise_start", "noise_end"))
+        self.assertEqual(phases, [0.75, 0.75, 0.75])
+        self.assertEqual([round(value, 6) for value in values], [0.04, 0.04, 0.04])
+
+        actuator.eval()
+        self.assertEqual(actuator._behavior_exploration_phase(), 1.0)
+        self.assertAlmostEqual(actuator._annealed_value("noise_start", "noise_end"), 0.02)
 
     def test_backward_only_policy_term_preserves_gradient_and_zeroes_forward(self):
         parameter = torch.tensor(2.0, requires_grad=True)

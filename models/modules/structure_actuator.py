@@ -39,6 +39,20 @@ def smooth_exploration_phase(progress, fraction, tail_fraction=0.25):
     return min(max(1.0 - multiplier, 0.0), 1.0)
 
 
+def policy_exploration_multiplier(
+    *, training, schedule_mode, constant_multiplier, annealed_phase
+):
+    """Resolve behavior-policy noise without coupling metrics to wall-clock time."""
+    if not bool(training):
+        return 0.0
+    mode = str(schedule_mode).strip().lower()
+    if mode == "constant":
+        return min(max(float(constant_multiplier), 0.0), 1.0)
+    if mode == "annealed":
+        return min(max(1.0 - float(annealed_phase), 0.0), 1.0)
+    raise ValueError("repair_policy_exploration_mode must be constant or annealed")
+
+
 class StructureRepairActuator(nn.Module):
     """Apply small geometry-preserving movements that realize repair policies.
 
@@ -2901,7 +2915,7 @@ class StructureRepairActuator(nn.Module):
         return torch.nan_to_num(scale, nan=0.0, posinf=0.0, neginf=0.0)
 
     def _exploration_phase(self):
-        if not self.training:
+        if not bool(getattr(self, "training", False)):
             return 1.0
         fraction = min(max(float(getattr(self.args, "repair_exploration_fraction", 0.0)), 0.0), 1.0)
         if fraction <= 0.0:
@@ -2921,10 +2935,35 @@ class StructureRepairActuator(nn.Module):
             getattr(self.args, "repair_exploration_smooth_tail_fraction", 0.25),
         )
 
+    def _behavior_exploration_phase(self):
+        """Phase used by every stochastic component of the executed policy."""
+        annealed_phase = self._exploration_phase()
+        exact_online = (
+            str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower()
+            == "ana_den6_online"
+        )
+        schedule_mode = str(getattr(
+            self.args, "repair_policy_exploration_mode", "constant"
+        )).strip().lower()
+        if exact_online and schedule_mode == "constant":
+            multiplier = policy_exploration_multiplier(
+                training=bool(getattr(self, "training", False)),
+                schedule_mode=schedule_mode,
+                constant_multiplier=getattr(
+                    self.args, "repair_policy_exploration_constant_multiplier", 0.25
+                ),
+                annealed_phase=annealed_phase,
+            )
+            return 1.0 - float(multiplier)
+        return annealed_phase
+
     def _annealed_value(self, start_name, end_name, default_start=0.0, default_end=0.0):
         start = float(getattr(self.args, start_name, default_start))
         end = float(getattr(self.args, end_name, default_end))
-        phase = self._exploration_phase()
+        # ana_den6_onlineの実行方策には専用Gumbelだけでなく、旧汎用経路の
+        # Amount/gate random mixも入力される。片方だけ一定化すると、後者の
+        # 減衰が依然としてtrain Actualを時刻で改善させるため、同じ一定phaseを使う。
+        phase = self._behavior_exploration_phase()
         return start + (end - start) * phase
 
     @staticmethod
@@ -3611,13 +3650,24 @@ class StructureRepairActuator(nn.Module):
             and self.training
             and current_step >= exact_anchor_steps
         )
-        # 探索は学習全期間で一定にせず、repair_exploration_fractionまで
-        # 線形に減衰させる。eval時は常に0で決定論的にする。
+        # Exact-onlineのActual値は実行plan自体の値である。Gumbel強度を
+        # 時刻だけで下げると、Networkが改善しなくてもtrain Actualが
+        # 下がる。通常は一定のbehavior探索を使い、収束は探索なし
+        # fixed validationで判定する。annealedは従来比較実験にだけ残す。
         module_is_training = bool(getattr(self, "training", False))
-        exploration_multiplier = (
-            max(0.0, 1.0 - float(self._exploration_phase()))
-            if module_is_training
-            else 0.0
+        exploration_mode = str(getattr(
+            self.args, "repair_policy_exploration_mode", "constant"
+        )).strip().lower()
+        annealed_phase = (
+            self._exploration_phase() if exploration_mode == "annealed" else 0.0
+        )
+        exploration_multiplier = policy_exploration_multiplier(
+            training=module_is_training,
+            schedule_mode=exploration_mode,
+            constant_multiplier=getattr(
+                self.args, "repair_policy_exploration_constant_multiplier", 0.25
+            ),
+            annealed_phase=annealed_phase,
         )
 
         # AmountはStep 0でden6 Exact値へ固定し、その後はNetwork値をden6で
@@ -4268,7 +4318,9 @@ class StructureRepairActuator(nn.Module):
             "one_pattern_only": True,
             "exploration_active": bool(exploration_active),
             "amount_exploration_active": bool(amount_exploration_active),
+            "exploration_mode": str(exploration_mode),
             "exploration_multiplier": float(exploration_multiplier),
+            "behavior_exploration_phase": float(1.0 - exploration_multiplier),
             "effective_where_gumbel_scale": float(gumbel_scale),
             "effective_amount_log_sigma": float(fine_sigma),
             "effective_amount_gumbel_scale": float(effective_amount_gumbel_scale),
@@ -4499,7 +4551,7 @@ class StructureRepairActuator(nn.Module):
         if candidate_ratio_override is None:
             start = float(getattr(self.args, "repair_add_candidate_ratio_start", 0.0)) or max_ratio
             end = float(getattr(self.args, "repair_add_candidate_ratio_end", 0.0)) or max_ratio
-            phase = self._exploration_phase()
+            phase = self._behavior_exploration_phase()
             candidate_ratio = start + (end - start) * phase
         else:
             candidate_ratio = float(candidate_ratio_override)

@@ -1621,8 +1621,10 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--repair_local_guard_weight', default=0.0, type=float, help='形状保持原因が強い局所点の削除/移動を抑える正則化')
     parser.add_argument('--add_noop_keep_threshold', default=0.5, type=float, help='このkeep確率未満の点は追加基点から除外する')
     parser.add_argument('--repair_add_weight_mode', default='hard', type=str, help='追加点のfinal_wをhard/softのどちらで作るか')
-    parser.add_argument('--repair_exploration_fraction', default=1.0, type=float, help='全学習stepのうちadd/drop探索ノイズを残す割合')
+    parser.add_argument('--repair_exploration_fraction', default=1.0, type=float, help='annealedモードで全学習stepのうち探索ノイズを残す割合')
     parser.add_argument('--repair_exploration_smooth_tail_fraction', default=0.25, type=float, help='探索減衰末尾を傾き0へ滑らかにつなぐ割合。0なら従来の線形clip')
+    parser.add_argument('--repair_policy_exploration_mode', default='constant', choices=['constant', 'annealed'], help='Exact-online離散方策の探索強度。constantは時刻による見かけの圧縮改善を防ぎ、annealedは従来ablation用')
+    parser.add_argument('--repair_policy_exploration_constant_multiplier', default=0.25, type=float, help='constant時のWhere/Amount/Fineおよび旧汎用random-mixの残存倍率。eval時の確率ノイズは常に0')
     parser.add_argument('--repair_add_candidate_ratio_start', default=0.0, type=float, help='探索初期の追加候補割合(0ならmax_add_ratio)')
     parser.add_argument('--repair_add_candidate_ratio_end', default=0.0, type=float, help='探索終了後の追加候補割合(0ならmax_add_ratio)')
     parser.add_argument('--repair_add_score_noise_start', default=0.0, type=float, help='探索初期に追加位置logitへ入れるGumbelノイズ量')
@@ -6798,6 +6800,14 @@ def parse_pugan_args(parser, file_day, file_time):
     args.repair_exploration_fraction = min(max(float(getattr(args, "repair_exploration_fraction", 0.0)), 0.0), 1.0)
     args.repair_exploration_smooth_tail_fraction = min(max(float(getattr(
         args, "repair_exploration_smooth_tail_fraction", 0.25
+    )), 0.0), 1.0)
+    args.repair_policy_exploration_mode = str(getattr(
+        args, "repair_policy_exploration_mode", "constant"
+    )).strip().lower()
+    if args.repair_policy_exploration_mode not in {"constant", "annealed"}:
+        raise ValueError("--repair_policy_exploration_mode must be constant or annealed")
+    args.repair_policy_exploration_constant_multiplier = min(max(float(getattr(
+        args, "repair_policy_exploration_constant_multiplier", 0.25
     )), 0.0), 1.0)
     args.repair_add_candidate_ratio_start = max(float(getattr(args, "repair_add_candidate_ratio_start", 0.0)), 0.0)
     args.repair_add_candidate_ratio_end = max(float(getattr(args, "repair_add_candidate_ratio_end", 0.0)), 0.0)

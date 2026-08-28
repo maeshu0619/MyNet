@@ -265,10 +265,21 @@ def train(model, args, loss, writer, plot, notifier=None):
         int(math.ceil(float(args._exploration_schedule_steps_estimate) / float(max(total_train_files, 1)))),
         1,
     )
+    policy_exploration_mode = str(getattr(
+        args, "repair_policy_exploration_mode", "constant"
+    )).strip().lower()
+    policy_constant_multiplier = float(getattr(
+        args, "repair_policy_exploration_constant_multiplier", 0.25
+    ))
     writer.write(
         "ExplorationSchedule: "
         f"training_episodes={int(getattr(args, 'episodes', 1))}, "
         f"schedule_episodes={effective_exploration_episodes}, "
+        f"policy_mode={policy_exploration_mode}, "
+        f"policy_constant_multiplier={policy_constant_multiplier:.6g}, "
+        f"anneal_active={policy_exploration_mode == 'annealed'}, "
+        f"constant_legacy_phase="
+        f"{(1.0 - policy_constant_multiplier) if policy_exploration_mode == 'constant' else 'n/a'}, "
         f"fraction={float(getattr(args, 'repair_exploration_fraction', 0.0)):.6g}, "
         f"smooth_tail={float(getattr(args, 'repair_exploration_smooth_tail_fraction', 0.25)):.6g}, "
         f"anneal_steps={int(args._exploration_schedule_steps_estimate)}, "
@@ -4688,7 +4699,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                         f"alternatives={bool(audit_plan.get('has_where_alternatives', False))}, "
                         f"candidate_alpha={float(audit_plan.get('candidate_policy_alpha', 0.0) or 0.0):.3f}, "
                         f"heuristic_prior={float(audit_plan.get('heuristic_candidate_prior_weight', 0.0) or 0.0):.3f}, "
+                        f"mode={str(audit_plan.get('exploration_mode', ''))}, "
                         f"multiplier={float(audit_plan.get('exploration_multiplier', 0.0) or 0.0):.3f}, "
+                        f"legacy_phase={float(audit_plan.get('behavior_exploration_phase', 1.0) or 0.0):.3f}, "
                         f"where_gumbel={float(audit_plan.get('effective_where_gumbel_scale', 0.0) or 0.0):.4f}, "
                         f"amount_gumbel={float(audit_plan.get('effective_amount_gumbel_scale', 0.0) or 0.0):.4f}), "
                         f"where_delta=(mean={float(audit_plan.get('delta_where_logit_mean', 0.0) or 0.0):.6g}, "
