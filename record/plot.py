@@ -930,7 +930,7 @@ class PlotMaker():
         handles = []
         series = [
             ("Surrogate", loss_history[surrogate_idx], "tab:blue"),
-            ("TrainObjective", loss_history[actual_idx], "tab:orange"),
+            ("StochasticTrainObjective", loss_history[actual_idx], "tab:orange"),
         ]
         if policy_idx is not None:
             series.append(("PolicyActual", loss_history[policy_idx], "tab:green"))
@@ -948,7 +948,7 @@ class PlotMaker():
         ax.axhline(0.0, color="black", linewidth=0.7, alpha=0.4)
         ax.set_xlabel(xl)
         ax.set_ylabel("Delta [%]")
-        ax.set_title("Surrogate / Train Objective / Policy / Oracle Delta")
+        ax.set_title("Exploration-affected training metrics (use fixed validation as learning evidence)")
         if handles:
             ax.legend(handles=handles, loc="best")
         ax.grid(True, alpha=0.35)

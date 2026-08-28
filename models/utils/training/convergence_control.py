@@ -70,13 +70,6 @@ class TrainingConvergenceMonitor:
         self.converged = False
         self.last_event = {}
 
-    def _exploration_finished(self, global_step):
-        total_steps = max(int(getattr(self.args, "_total_train_steps_estimate", 0)), 1)
-        fraction = min(max(float(getattr(
-            self.args, "repair_exploration_fraction", 0.0
-        )), 0.0), 1.0)
-        return int(global_step) >= int(math.ceil(total_steps * fraction))
-
     def update(self, checkpoint_metrics, guard_event, global_step):
         if not self.enabled:
             return {"enabled": False, "converged": False}
@@ -89,8 +82,10 @@ class TrainingConvergenceMonitor:
 
         record = {
             "episode": episode,
-            "total_loss": _finite(metrics.get("total_loss")),
-            "compression": _finite(metrics.get("compression_loss_L_com")),
+            # train loss/compressionはGumbel探索付きplanの値であり、ノイズの
+            # 減衰だけで低下する。診断用に保存はするが収束証拠には使わない。
+            "train_total_loss": _finite(metrics.get("total_loss")),
+            "train_compression": _finite(metrics.get("compression_loss_L_com")),
             "fixed_objective": _finite(metrics.get("full_cloud_val_fixed_objective")),
             "fixed_actual": _finite(metrics.get("full_cloud_val_actual_percent")),
             "fixed_geometry": _finite(metrics.get("full_cloud_val_geometry")),
@@ -110,16 +105,14 @@ class TrainingConvergenceMonitor:
         # 必ず要求する。収束した直後に固定長で終了する問題を防ぐ。
         if episode <= self.minimum_episodes:
             reasons.append("post_minimum_evidence")
-        if not self._exploration_finished(global_step):
-            reasons.append("exploration_active")
         if len(self.history) < self.window:
             reasons.append("window_not_full")
 
         recent = self.history[-self.window:]
-        required = (
-            "total_loss", "compression", "fixed_objective",
-            "fixed_actual", "fixed_geometry",
-        )
+        # model.eval()・同一フレーム集合・探索なしの3指標だけで収束を
+        # 判定する。これにより、探索スケジュールが終了した時刻と
+        # Networkが収束した時刻を混同しない。
+        required = ("fixed_objective", "fixed_actual", "fixed_geometry")
         for name in required:
             if len(recent) < self.window or any(row[name] is None for row in recent):
                 reasons.append(f"missing_{name}")
@@ -158,22 +151,6 @@ class TrainingConvergenceMonitor:
                     _mean(values[half:]) - _mean(values[:half])
                 )
 
-            if abs(stats["total_loss_slope"]) > float(getattr(
-                self.args, "convergence_total_loss_slope_max", 0.02
-            )):
-                reasons.append("total_loss_slope")
-            if abs(stats["total_loss_half_delta"]) > float(getattr(
-                self.args, "convergence_total_loss_half_delta_max", 0.12
-            )):
-                reasons.append("total_loss_level")
-            if abs(stats["compression_slope"]) > float(getattr(
-                self.args, "convergence_compression_slope_max", 0.01
-            )):
-                reasons.append("compression_slope")
-            if abs(stats["compression_half_delta"]) > float(getattr(
-                self.args, "convergence_compression_half_delta_max", 0.08
-            )):
-                reasons.append("compression_level")
             if abs(stats["fixed_objective_slope"]) > float(getattr(
                 self.args, "convergence_fixed_objective_slope_max", 0.001
             )):
@@ -226,7 +203,7 @@ def format_convergence_event(event):
         f"{int(event.get('patience', 0))}, "
         f"converged={bool(event.get('converged', False))}, "
         f"reasons={','.join(event.get('reasons') or ('none',))}, "
-        f"total_slope={stats.get('total_loss_slope', float('nan')):.6g}, "
+        f"fixed_actual_slope={stats.get('fixed_actual_slope', float('nan')):.6g}, "
         f"fixed_rd_slope={stats.get('fixed_objective_slope', float('nan')):.6g}, "
         f"geometry_rel_worsening={stats.get('fixed_geometry_relative_worsening', float('nan')):.6g}"
     )

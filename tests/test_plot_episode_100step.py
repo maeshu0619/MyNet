@@ -1,9 +1,13 @@
+import csv
 import os
 import tempfile
 import unittest
 from types import SimpleNamespace
 
-from models.utils.training.metric_csv import init_metric_csvs
+from models.utils.training.metric_csv import (
+    init_metric_csvs,
+    plot_learning_evidence_curve,
+)
 from record.plot import PlotMaker
 
 
@@ -106,6 +110,30 @@ class EpisodeAndHundredStepPlotTest(unittest.TestCase):
             self.assertFalse(any("voxel_collision" in name for name in names))
             self.assertFalse(any("_step_metrics.csv" in name for name in names))
             self.assertFalse(any("_epo_" in name for name in names))
+
+    def test_learning_evidence_plot_compares_train_and_fixed_validation(self):
+        with tempfile.TemporaryDirectory() as root:
+            checkpoint_path = os.path.join(root, "unit_checkpoint_metrics_epi.csv")
+            train_path = os.path.join(root, "unit_epi_metrics.csv")
+            with open(checkpoint_path, "w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=(
+                    "episode", "full_cloud_val_actual_percent",
+                    "full_cloud_val_fixed_objective",
+                ))
+                writer.writeheader()
+                writer.writerow({
+                    "episode": 1,
+                    "full_cloud_val_actual_percent": -3.6,
+                    "full_cloud_val_fixed_objective": -2.4,
+                })
+            with open(train_path, "w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=("episode", "actual_compression"))
+                writer.writeheader()
+                writer.writerow({"episode": 1, "actual_compression": -2.0})
+
+            output = plot_learning_evidence_curve(checkpoint_path, train_path)
+            self.assertEqual(output, os.path.join(root, "unit_learning_evidence.png"))
+            self.assertTrue(os.path.exists(output))
 
 
 if __name__ == "__main__":

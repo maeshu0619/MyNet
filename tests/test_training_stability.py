@@ -125,7 +125,7 @@ class TrainingStabilityTest(unittest.TestCase):
         self.assertFalse(any(converged[:6]))
         self.assertTrue(converged[6])
 
-    def test_convergence_resets_after_level_shift(self):
+    def test_convergence_resets_after_fixed_validation_level_shift(self):
         args = SimpleNamespace(
             train_until_converged=True,
             episodes=1,
@@ -146,13 +146,13 @@ class TrainingStabilityTest(unittest.TestCase):
         )
         monitor = TrainingConvergenceMonitor(args)
         event = None
-        for episode, total_loss in enumerate((-10.0, -10.0, -10.0, -9.0), 1):
+        for episode, fixed_objective in enumerate((-2.4, -2.4, -2.4, -2.2), 1):
             event = monitor.update(
                 {
                     "episode": episode,
-                    "total_loss": total_loss,
+                    "total_loss": -10.0,
                     "compression_loss_L_com": -11.0,
-                    "full_cloud_val_fixed_objective": -2.4,
+                    "full_cloud_val_fixed_objective": fixed_objective,
                     "full_cloud_val_actual_percent": -3.6,
                     "full_cloud_val_geometry": 0.025,
                     "full_cloud_val_sample_signature": "fixed-a",
@@ -164,8 +164,44 @@ class TrainingStabilityTest(unittest.TestCase):
                 global_step=episode,
             )
         self.assertFalse(event["stable_now"])
-        self.assertIn("total_loss_slope", event["reasons"])
+        self.assertIn("fixed_objective_slope", event["reasons"])
         self.assertEqual(event["stable_episodes"], 0)
+
+    def test_stochastic_train_level_shift_is_not_convergence_evidence(self):
+        args = SimpleNamespace(
+            train_until_converged=True,
+            episodes=1,
+            convergence_min_episodes=0,
+            convergence_window_episodes=4,
+            convergence_patience_episodes=1,
+            convergence_guard_cooldown_episodes=0,
+            convergence_actual_compression_target=-3.5,
+            convergence_fixed_objective_slope_max=0.001,
+            convergence_fixed_objective_half_delta_max=0.01,
+            convergence_geometry_relative_worsening_max=0.0025,
+        )
+        monitor = TrainingConvergenceMonitor(args)
+        event = None
+        for episode, train_compression in enumerate((-2.0, -2.2, -3.2, -3.8), 1):
+            event = monitor.update(
+                {
+                    "episode": episode,
+                    "total_loss": train_compression * 3.0,
+                    "compression_loss_L_com": train_compression,
+                    "full_cloud_val_fixed_objective": -2.4,
+                    "full_cloud_val_actual_percent": -3.6,
+                    "full_cloud_val_geometry": 0.025,
+                    "full_cloud_val_sample_signature": "fixed-a",
+                    "optimizer_success_ok": True,
+                    "geometry_ok": True,
+                    "safety_ok": True,
+                },
+                guard_event={},
+                global_step=episode,
+            )
+        self.assertTrue(event["stable_now"])
+        self.assertTrue(event["converged"])
+        self.assertNotIn("compression_slope", event["reasons"])
 
     def _guard_args(self):
         return SimpleNamespace(

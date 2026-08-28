@@ -251,12 +251,18 @@ def train(model, args, loss, writer, plot, notifier=None):
                 f"workers={int(getattr(args, 'heuristic_guidance_online_prefetch_workers', 0))}, "
                 f"lookahead={den6_prefetch_lookahead}, submitted={int(prefetch_state['submitted'])}"
             )
-    args._total_train_steps_estimate = exploration_schedule_step_estimate(
-        args,
-        total_train_files,
+    # 実際の訓練長と探索curriculumの長さを分離する。従来は
+    # _total_train_steps_estimateに旧固定256 Episodeを入れたため、384
+    # Episode訓練でもEpisode 230付近でGumbelが0になり、学習と無関係に
+    # train Actualだけが急低下していた。
+    args._total_train_steps_estimate = (
+        convergence_episode_limit(args) * max(int(total_train_files), 1)
+    )
+    args._exploration_schedule_steps_estimate = exploration_schedule_step_estimate(
+        args, total_train_files
     )
     effective_exploration_episodes = max(
-        int(math.ceil(float(args._total_train_steps_estimate) / float(max(total_train_files, 1)))),
+        int(math.ceil(float(args._exploration_schedule_steps_estimate) / float(max(total_train_files, 1)))),
         1,
     )
     writer.write(
@@ -265,7 +271,9 @@ def train(model, args, loss, writer, plot, notifier=None):
         f"schedule_episodes={effective_exploration_episodes}, "
         f"fraction={float(getattr(args, 'repair_exploration_fraction', 0.0)):.6g}, "
         f"smooth_tail={float(getattr(args, 'repair_exploration_smooth_tail_fraction', 0.25)):.6g}, "
-        f"anneal_steps={int(args._total_train_steps_estimate)}"
+        f"anneal_steps={int(args._exploration_schedule_steps_estimate)}, "
+        f"total_train_steps={int(args._total_train_steps_estimate)}, "
+        f"source={'explicit' if int(getattr(args, 'exploration_schedule_episodes', 0)) > 0 else 'training_limit'}"
     )
     if _episode_input_common_cache_enabled(args):
         setattr(args, "_episode_input_common_cache", OrderedDict())
@@ -5547,6 +5555,12 @@ def train(model, args, loss, writer, plot, notifier=None):
             writer.write(f"FixedValidationPlot: {fixed_validation_plot}")
         compression_episode_metrics = finalize_compression_episode_metrics( episode, current_stage, episode_compression_sums)
         append_csv_row( metric_csv_paths.get("compression_episode"), COMPRESSION_EPISODE_METRIC_COLUMNS, compression_episode_metrics)
+        learning_evidence_plot = plot_learning_evidence_curve(
+            metric_csv_paths.get("checkpoint_episode"),
+            os.path.join(plot.save_dir, f"{args.time}_epi_metrics.csv"),
+        )
+        if learning_evidence_plot:
+            writer.write(f"LearningEvidencePlot: {learning_evidence_plot}")
         if episode_sequence_summary:
             for seq_summary in episode_sequence_summary.values():
                 current_sequence_memory_best = _sparsepcgc_full_cloud_sequence_amount_best(

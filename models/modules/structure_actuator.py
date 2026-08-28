@@ -2906,7 +2906,13 @@ class StructureRepairActuator(nn.Module):
         fraction = min(max(float(getattr(self.args, "repair_exploration_fraction", 0.0)), 0.0), 1.0)
         if fraction <= 0.0:
             return 1.0
-        total_steps = max(int(getattr(self.args, "_total_train_steps_estimate", 0)), 1)
+        # 実訓練長と探索horizonは別の概念である。明示的に旧固定
+        # horizonを指定したablationだけそれを使い、通常は実訓練長に追従する。
+        total_steps = max(int(getattr(
+            self.args,
+            "_exploration_schedule_steps_estimate",
+            getattr(self.args, "_total_train_steps_estimate", 0),
+        )), 1)
         step = min(max(int(getattr(self.args, "_global_train_step", 0)), 0), total_steps)
         progress = min(float(step) / float(max(total_steps, 1)), 1.0)
         return smooth_exploration_phase(

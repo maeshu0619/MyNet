@@ -91,6 +91,78 @@ def plot_fixed_validation_curve(path):
     return output_path
 
 
+def plot_learning_evidence_curve(checkpoint_path, train_episode_path):
+    """Exploration付きtrain値と決定論的固定validationを同一図で比較する。"""
+    if not checkpoint_path or not train_episode_path:
+        return None
+    if not os.path.exists(checkpoint_path) or not os.path.exists(train_episode_path):
+        return None
+
+    train_by_episode = {}
+    with open(train_episode_path, newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            try:
+                episode = int(row.get("episode", ""))
+                value = float(row.get("actual_compression", ""))
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value):
+                train_by_episode[episode] = value
+
+    episodes = []
+    stochastic_train = []
+    fixed_actual = []
+    fixed_objective = []
+    with open(checkpoint_path, newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            try:
+                episode = int(row.get("episode", ""))
+                actual = float(row.get("full_cloud_val_actual_percent", ""))
+                objective = float(row.get("full_cloud_val_fixed_objective", ""))
+                train_value = float(train_by_episode[episode])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not all(math.isfinite(value) for value in (actual, objective, train_value)):
+                continue
+            episodes.append(episode)
+            stochastic_train.append(train_value)
+            fixed_actual.append(actual)
+            fixed_objective.append(objective)
+    if not episodes:
+        return None
+
+    import matplotlib.pyplot as plt
+
+    output_path = checkpoint_path.replace(
+        "_checkpoint_metrics_epi.csv", "_learning_evidence.png"
+    )
+    figure, axes = plt.subplots(2, 1, figsize=(9, 7), sharex=True)
+    axes[0].plot(
+        episodes,
+        stochastic_train,
+        label="Stochastic train plan (exploration affected)",
+        alpha=0.75,
+    )
+    axes[0].plot(
+        episodes,
+        fixed_actual,
+        label="Deterministic fixed validation (learning evidence)",
+        linewidth=2.0,
+    )
+    axes[0].set_ylabel("Actual compression delta [%]")
+    axes[0].grid(True, alpha=0.3)
+    axes[0].legend()
+    axes[1].plot(episodes, fixed_objective, label="Deterministic fixed RD objective")
+    axes[1].set_xlabel("Episode")
+    axes[1].set_ylabel("Lower is better")
+    axes[1].grid(True, alpha=0.3)
+    axes[1].legend()
+    figure.tight_layout()
+    figure.savefig(output_path, dpi=160)
+    plt.close(figure)
+    return output_path
+
+
 def init_metric_csvs(args, plot, writer):
     paths = {
         "compression_step": None,
