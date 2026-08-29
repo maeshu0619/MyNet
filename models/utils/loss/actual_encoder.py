@@ -584,6 +584,32 @@ class _SparsePCGCActualEncoder:
         started = time.monotonic()
         free_before = self._cuda_free_mb()
         free_now = free_before
+        requested_device = str(
+            getattr(self.args, "sparsepcgc_device", "auto")
+        ).strip().lower()
+        if (
+            str(reason) == "worker_init"
+            and requested_device == "auto"
+            and bool(getattr(self.args, "sparsepcgc_auto_cpu_fallback", True))
+            and free_now < float(minimum_mb)
+        ):
+            # autoは「利用可能な実行先を選ぶ」指定であり、混雑GPUを10分待って
+            # 失敗する指定ではない。worker生成前ならdeviceを書き換えるだけで
+            # 同じSparsePCGC codec/重み/量子化設定をCPUで安全に実行できる。
+            self.args.sparsepcgc_device = "cpu"
+            if self.writer is not None and hasattr(self.writer, "write"):
+                self.writer.write(
+                    "SparsePCGCAutoCPUFallback: reason={}, free_mb={:.1f}, "
+                    "required_mb={}, requested_device=auto, selected_device=cpu".format(
+                        str(reason), float(free_now), int(minimum_mb)
+                    )
+                )
+            return {
+                "wait_seconds": 0.0,
+                "free_before_mb": float(free_before),
+                "free_after_mb": float("inf"),
+                "auto_cpu_fallback": True,
+            }
         announced = False
         while free_now < float(minimum_mb):
             elapsed = time.monotonic() - started

@@ -16,6 +16,7 @@ class SparsePCGCOOMRecoveryTest(unittest.TestCase):
             sparsepcgc_gpu_wait_timeout=10.0,
             sparsepcgc_gpu_wait_interval=0.1,
             sparsepcgc_oom_retry_count=2,
+            sparsepcgc_auto_cpu_fallback=False,
         )
         encoder.writer = Mock()
         encoder._request_id = 0
@@ -36,6 +37,32 @@ class SparsePCGCOOMRecoveryTest(unittest.TestCase):
         self.assertEqual(result["free_after_mb"], 5120.0)
         self.assertEqual(encoder._gpu_admission_wait_count, 1)
         self.assertGreaterEqual(encoder.writer.write.call_count, 2)
+
+    def test_auto_device_falls_back_to_cpu_before_worker_launch(self):
+        encoder = self._encoder()
+        encoder.args.sparsepcgc_auto_cpu_fallback = True
+        encoder._cuda_worker_enabled = Mock(return_value=True)
+        encoder._cuda_free_mb = Mock(return_value=704.7)
+
+        result = encoder._wait_for_cuda_capacity("worker_init")
+
+        self.assertEqual(encoder.args.sparsepcgc_device, "cpu")
+        self.assertTrue(result["auto_cpu_fallback"])
+        self.assertEqual(result["wait_seconds"], 0.0)
+        encoder.writer.write.assert_called_once()
+
+    def test_explicit_cuda_does_not_silently_fall_back_to_cpu(self):
+        encoder = self._encoder()
+        encoder.args.sparsepcgc_device = "cuda"
+        encoder.args.sparsepcgc_auto_cpu_fallback = True
+        encoder._cuda_worker_enabled = Mock(return_value=True)
+        encoder._cuda_free_mb = Mock(side_effect=[704.7, 5120.0])
+
+        with patch("models.utils.loss.actual_encoder.time.sleep", return_value=None):
+            result = encoder._wait_for_cuda_capacity("worker_init")
+
+        self.assertEqual(encoder.args.sparsepcgc_device, "cuda")
+        self.assertEqual(result["free_after_mb"], 5120.0)
 
     def test_cuda_oom_retries_the_identical_request_without_proxy_fallback(self):
         encoder = self._encoder()

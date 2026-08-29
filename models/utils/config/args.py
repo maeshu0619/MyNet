@@ -2040,6 +2040,12 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--sparsepcgc_omp_threads', default=12, type=int, help='SparsePCGC workerのOMP thread数')
     parser.add_argument('--sparsepcgc_worker_cpu_trim_interval', default=16, type=int, help='永続workerの解放済みCPU領域をOSへ返すrequest間隔（0で無効）')
     parser.add_argument('--sparsepcgc_gpu_min_free_mb', default=4096, type=int, help='CUDA teacherへrequestを送るために必要なGPU全体の空き容量MB。競合時は値を変えず待機する')
+    parser.add_argument(
+        '--sparsepcgc_auto_cpu_fallback',
+        default=True,
+        type=str2bool,
+        help='device=autoでworker起動時のGPU空き容量が不足する場合、待機せずCPU teacherへ切り替える',
+    )
     parser.add_argument('--sparsepcgc_gpu_wait_timeout', default=600.0, type=float, help='SparsePCGC CUDA teacherの空きGPU待機上限秒')
     parser.add_argument('--sparsepcgc_gpu_wait_interval', default=2.0, type=float, help='SparsePCGC CUDA teacherの空きGPU確認間隔秒')
     parser.add_argument('--sparsepcgc_oom_retry_count', default=2, type=int, help='SparsePCGC teacherがCUDA OOMになった場合に同じ点群を再実行する回数')
@@ -4906,6 +4912,9 @@ def parse_pugan_args(parser, file_day, file_time):
     args.sparsepcgc_actual_result_cache_max_entries = max(int(getattr(args, "sparsepcgc_actual_result_cache_max_entries", 256)), 1)
     args.sparsepcgc_omp_threads = max(int(getattr(args, "sparsepcgc_omp_threads", 12)), 1)
     args.sparsepcgc_gpu_min_free_mb = max(int(getattr(args, "sparsepcgc_gpu_min_free_mb", 4096)), 0)
+    args.sparsepcgc_auto_cpu_fallback = bool(
+        getattr(args, "sparsepcgc_auto_cpu_fallback", True)
+    )
     args.sparsepcgc_gpu_wait_timeout = max(float(getattr(args, "sparsepcgc_gpu_wait_timeout", 600.0)), 0.0)
     args.sparsepcgc_gpu_wait_interval = max(float(getattr(args, "sparsepcgc_gpu_wait_interval", 2.0)), 0.1)
     args.sparsepcgc_oom_retry_count = max(int(getattr(args, "sparsepcgc_oom_retry_count", 2)), 0)
