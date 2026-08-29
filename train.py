@@ -3358,6 +3358,24 @@ def train(model, args, loss, writer, plot, notifier=None):
                         comp_debug["optimizer_skip_reason"] = skip_optimizer_reason
                         loss.last_compression_debug = comp_debug
 
+                    elif (
+                        heuristic_mode == "ana_den6_online"
+                        and isinstance(
+                            getattr(base_model, "last_actuator_voxel_state", None), dict
+                        )
+                        and bool(dict(
+                            getattr(base_model, "last_actuator_voxel_state", {}).get(
+                                "ana_den6_exact_residual_plan_debug", {}
+                            ) or {}
+                        ).get("anchor_policy_credit_disabled", False))
+                    ):
+                        # このplanはHeuristic exact anchorでありNetwork sampleではない。
+                        # 方策log-probだけでなくSurrogate/Geometry STEも含めてmain
+                        # optimizerを止め、Actual値はframe baseline校正だけに使う。
+                        skip_optimizer_reason = "den6_exact_heuristic_anchor_calibration"
+                        comp_debug["optimizer_skip_reason"] = skip_optimizer_reason
+                        loss.last_compression_debug = comp_debug
+
                     elif ( bool(getattr(args, "skip_optimizer_on_actual_fallback", True)) and bool(comp_debug.get("actual_codec_fallback_to_proxy", False))):
                         skip_optimizer_reason = "actual_codec_fallback_to_proxy"
                         comp_debug["optimizer_skip_reason"] = skip_optimizer_reason
@@ -3947,6 +3965,12 @@ def train(model, args, loss, writer, plot, notifier=None):
                             f"node_count={int(locals().get('full_cloud_anchor_node_count', 0))}, "
                             f"node_count_source={str(locals().get('full_cloud_anchor_node_count_source', ''))}, "
                             f"grad_node_limit={int(getattr(args, 'full_cloud_anchor_grad_node_limit', 50000))}"
+                        )
+                    elif skip_optimizer_reason == "den6_exact_heuristic_anchor_calibration":
+                        writer.write(
+                            "Skipped main optimizer on the Heuristic exact anchor; "
+                            "its Actual value initializes the frame baseline but is not "
+                            "credited to Network decision heads."
                         )
                 elif not total_loss_finite:
                     skip_optimizer_reason = "non_finite_total_loss"
@@ -4629,7 +4653,21 @@ def train(model, args, loss, writer, plot, notifier=None):
                             ("Action", "den6_online_action_grad_norm_before_balance"),
                             ("Surrogate", "surrogate_grad_norm"),
                         ):
-                            if float(audit_compression.get(debug_name, 0.0) or 0.0) <= 0.0:
+                            # With gradient balancing explicitly disabled there is no
+                            # ``*_before_balance`` field.  The direct head audit is
+                            # the same pre-clip gradient and must be used instead of
+                            # reporting a false dead-gradient invariant failure.
+                            direct_name = {
+                                "Where": "den6_online_where_grad_norm",
+                                "Amount": "den6_online_amount_grad_norm",
+                                "Action": "den6_online_action_grad_norm",
+                                "Surrogate": "surrogate_grad_norm",
+                            }[head_name]
+                            measured = audit_compression.get(
+                                debug_name,
+                                audit_compression.get(direct_name, 0.0),
+                            )
+                            if float(measured or 0.0) <= 0.0:
                                 online_invariant_failures.append(f"{head_name}_grad<=0")
                     if online_invariant_failures:
                         raise RuntimeError(
@@ -4695,6 +4733,10 @@ def train(model, args, loss, writer, plot, notifier=None):
                         f"normalized_entropy={dict(audit_plan.get('candidate_normalized_entropy') or {})}, "
                         f"max_probability={dict(audit_plan.get('candidate_max_probability') or {})}, "
                         f"top2_gap={dict(audit_plan.get('candidate_top2_probability_gap') or {})}), "
+                        f"score_audit={dict(audit_plan.get('score_audit') or {})}, "
+                        f"deterministic_top1_changed=(by_op={dict(audit_plan.get('deterministic_top1_changed') or {})}, "
+                        f"rate={float(audit_plan.get('deterministic_top1_changed_rate', 0.0) or 0.0):.3f}), "
+                        f"where_gumbel_audit={dict(audit_plan.get('where_gumbel_audit') or {})}, "
                         f"exploration=(active={bool(audit_plan.get('exploration_active', False))}, "
                         f"alternatives={bool(audit_plan.get('has_where_alternatives', False))}, "
                         f"candidate_alpha={float(audit_plan.get('candidate_policy_alpha', 0.0) or 0.0):.3f}, "
@@ -4734,6 +4776,11 @@ def train(model, args, loss, writer, plot, notifier=None):
                         f", grad_norms=(where={float(audit_compression.get('den6_online_where_grad_norm', 0.0) or 0.0):.6g}, "
                         f"amount={float(audit_compression.get('den6_online_amount_grad_norm', 0.0) or 0.0):.6g}, "
                         f"action={float(audit_compression.get('den6_online_action_grad_norm', 0.0) or 0.0):.6g}, "
+                        f"candidate_where={float(audit_compression.get('den6_online_candidate_where_grad_norm', 0.0) or 0.0):.6g}, "
+                        f"amount_selector={float(audit_compression.get('den6_online_amount_selector_grad_norm', 0.0) or 0.0):.6g}, "
+                        f"amount_fine={float(audit_compression.get('den6_online_amount_fine_grad_norm', 0.0) or 0.0):.6g}, "
+                        f"gate_head={float(audit_compression.get('den6_online_gate_head_grad_norm', 0.0) or 0.0):.6g}, "
+                        f"shared_amount_residual={float(audit_compression.get('den6_online_shared_amount_residual_grad_norm', 0.0) or 0.0):.6g}, "
                         f"surrogate={float(audit_compression.get('surrogate_grad_norm', 0.0) or 0.0):.6g})"
                         f", grad_norms_pre_decision_balance=(where={float(audit_compression.get('den6_online_where_grad_norm_before_balance', 0.0) or 0.0):.6g}, "
                         f"amount={float(audit_compression.get('den6_online_amount_grad_norm_before_balance', 0.0) or 0.0):.6g}, "

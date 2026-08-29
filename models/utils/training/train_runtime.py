@@ -4928,10 +4928,31 @@ def _den6_online_grad_norms(model):
             # 選ぶ。旧auditはこれを除外し、bin方策に勾配があっても
             # amount=0と誤記録していた。
             getattr(base_model, "full_cloud_amount_selector", None),
+            getattr(actuator, "algorithmic_amount_selector_head", None),
         ),
         "den6_online_action_grad_norm": (
             getattr(actuator, "operation_gate_head", None),
             getattr(base_model, "policy_module", None),
+        ),
+        "den6_online_candidate_where_grad_norm": (
+            getattr(actuator, "drop_head", None),
+            getattr(actuator, "add_head", None),
+            getattr(actuator, "add_voxel_head", None),
+            getattr(actuator, "move_voxel_head", None),
+        ),
+        "den6_online_amount_selector_grad_norm": (
+            getattr(actuator, "algorithmic_amount_selector_head", None),
+        ),
+        "den6_online_amount_fine_grad_norm": (
+            getattr(actuator, "drop_amount_head", None),
+            getattr(actuator, "add_amount_head", None),
+            getattr(actuator, "move_amount_head", None),
+        ),
+        "den6_online_gate_head_grad_norm": (
+            getattr(actuator, "operation_gate_head", None),
+        ),
+        "den6_online_shared_amount_residual_grad_norm": (
+            getattr(actuator, "algorithmic_amount_residual_head", None),
         ),
     }
     norm_squares = []
@@ -5137,6 +5158,64 @@ def _balance_actual_operation_head_gradients(args, model, structure_debug=None):
         "move_where": ("move", [getattr(actuator, "move_voxel_head", None)]),
         "move_amount": ("move", [getattr(actuator, "move_amount_head", None)]),
     }
+
+    if online_one_plan:
+        # Policy-gradientのnormにはadvantageの大きさが含まれる。従来の
+        # target norm正規化は微小勾配まで毎Step増幅し、収束後も更新を
+        # 止めなかった。ここでは上限clipだけを行い、小さい勾配は保つ。
+        max_norm = max(float(getattr(
+            args, "repair_online_decision_grad_max_norm", 1.0
+        )), 0.0)
+        decision_groups = {
+            "where": [
+                getattr(actuator, "drop_head", None),
+                getattr(actuator, "add_head", None),
+                getattr(actuator, "add_voxel_head", None),
+                getattr(actuator, "move_voxel_head", None),
+            ],
+            "amount": [
+                getattr(actuator, "drop_amount_head", None),
+                getattr(actuator, "add_amount_head", None),
+                getattr(actuator, "move_amount_head", None),
+                getattr(actuator, "algorithmic_amount_selector_head", None),
+            ],
+            "action": [
+                getattr(actuator, "operation_gate_head", None),
+                getattr(base_model, "policy_module", None),
+            ],
+        }
+        for decision, modules in decision_groups.items():
+            params = []
+            seen = set()
+            for module in modules:
+                if module is None:
+                    continue
+                for param in module.parameters():
+                    if param.grad is None or id(param) in seen:
+                        continue
+                    seen.add(id(param))
+                    params.append(param)
+            if not params:
+                debug[f"den6_online_{decision}_grad_balance_status"] = "no_grad"
+                continue
+            norm_sq = sum(
+                torch.sum(torch.nan_to_num(param.grad.detach().float()) ** 2)
+                for param in params
+            )
+            norm_before = float(torch.sqrt(norm_sq).detach().cpu())
+            debug[f"den6_online_{decision}_grad_norm_before_balance"] = norm_before
+            if max_norm > 0.0 and math.isfinite(norm_before) and norm_before > max_norm:
+                scale = max_norm / max(norm_before, 1e-12)
+                for param in params:
+                    param.grad.mul_(float(scale))
+                norm_after = max_norm
+                status = "clipped"
+            else:
+                norm_after = norm_before
+                status = "preserved"
+            debug[f"den6_online_{decision}_grad_norm_after_balance"] = float(norm_after)
+            debug[f"den6_online_{decision}_grad_balance_status"] = status
+        return debug
 
     min_scale = max(
         float(getattr(args, "repair_operation_head_grad_min_scale", 1e-4)),

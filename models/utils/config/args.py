@@ -700,6 +700,12 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--repair_operation_head_grad_target', default=1.0, type=float)
     parser.add_argument('--repair_operation_head_grad_min_scale', default=1e-4, type=float)
     parser.add_argument('--repair_operation_head_grad_max_scale', default=100000.0, type=float)
+    parser.add_argument(
+        '--repair_online_decision_grad_max_norm',
+        default=1.0,
+        type=float,
+        help='ana_den6_onlineのWhere/Amount/Action別grad上限。小さい勾配は増幅せず、大きい決定headだけclipする',
+    )
     parser.add_argument('--sparsepcgc_codec_prune_prior', default=True, type=str2bool)
     parser.add_argument(
         '--sparsepcgc_codec_prune_prior_block_size',
@@ -2516,9 +2522,9 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--heuristic_guidance_online_advantage_clip',
-        default=2.0,
+        default=5.0,
         type=float,
-        help='single-proposal Actual policy advantageの絶対値上限',
+        help='single-proposal Actual policy advantageの絶対値上限。初見frameの有効planを同一値へ飽和させない範囲',
     )
     parser.add_argument(
         '--heuristic_guidance_online_geometry_policy_weight',
@@ -2573,6 +2579,12 @@ def parse_pugan_args(parser, file_day, file_time):
         default=200,
         type=int,
         help='den6 Amount/Action priorをNetwork主体へ連続移行するstep数。Where候補探索はhard Exact anchor終了後に開始する',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_amount_expansion',
+        default=4.0,
+        type=float,
+        help='ana_den6_online Amount priorに対する固定residual探索幅。時刻依存ではなく全期間同じ範囲を使う',
     )
     parser.add_argument(
         '--heuristic_guidance_teacher_bootstrap_steps',
@@ -2639,6 +2651,18 @@ def parse_pugan_args(parser, file_day, file_time):
         default=0.025,
         type=float,
         help='固定validationがnew bestになったEpisodeごとのNetwork再順位付け重み増分',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_network_score_scale',
+        default=1.0,
+        type=float,
+        help='候補Network raw scoreを固定尺度で校正するtanh scale。frame内min-maxによる微小差の強制増幅を避ける',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_network_score_init_std',
+        default=0.001,
+        type=float,
+        help='ana_den6_online候補評価headの最終層初期化標準偏差。0なら旧zero初期化',
     )
     parser.add_argument(
         '--heuristic_guidance_outside_pool_logit_penalty',
@@ -3962,6 +3986,10 @@ def parse_pugan_args(parser, file_day, file_time):
         int(getattr(args, "heuristic_guidance_anchor_steps", 200)),
         0,
     )
+    args.heuristic_guidance_amount_expansion = max(
+        float(getattr(args, "heuristic_guidance_amount_expansion", 4.0)),
+        1.0,
+    )
     args.heuristic_guidance_teacher_bootstrap_steps = max(
         int(getattr(args, "heuristic_guidance_teacher_bootstrap_steps", 0)),
         0,
@@ -3995,6 +4023,14 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     args.heuristic_guidance_network_residual_weight_increment = max(
         float(getattr(args, "heuristic_guidance_network_residual_weight_increment", 0.05)),
+        0.0,
+    )
+    args.heuristic_guidance_network_score_scale = max(
+        float(getattr(args, "heuristic_guidance_network_score_scale", 1.0)),
+        1e-6,
+    )
+    args.heuristic_guidance_network_score_init_std = max(
+        float(getattr(args, "heuristic_guidance_network_score_init_std", 0.001)),
         0.0,
     )
     args.heuristic_guidance_online_amount_residual_scale = min(max(
@@ -4071,7 +4107,7 @@ def parse_pugan_args(parser, file_day, file_time):
         float(getattr(args, "heuristic_guidance_online_reward_scale", 1.0)), 0.0
     )
     args.heuristic_guidance_online_advantage_clip = max(
-        float(getattr(args, "heuristic_guidance_online_advantage_clip", 2.0)), 0.0
+        float(getattr(args, "heuristic_guidance_online_advantage_clip", 5.0)), 0.0
     )
     args.heuristic_guidance_online_grad_audit = bool(
         getattr(args, "heuristic_guidance_online_grad_audit", False)
@@ -4200,17 +4236,55 @@ def parse_pugan_args(parser, file_day, file_time):
         args.compression_surrogate_refresh_interval = 1
         args.heuristic_guidance_online_prefetch_workers = 0
         args.batch_size = 1
+        if not _cli_option_was_provided("--heuristic_guidance_final_where_weight"):
+            # Heuristicはedit-unit Poolの生成・妥当性filterまでを担当する。
+            # 実測ではw_H=0.25でA/Bが同一、0でActualが-0.79まで崩れた。
+            # 0.005では候補集合を39.7%変更しつつActual=-3.469を保てたため、
+            # codec-safe Pool内の弱い構造priorとしてこの境界値だけを残す。
+            args.heuristic_guidance_final_where_weight = 0.005
+        if not _cli_option_was_provided("--heuristic_guidance_exact_anchor_steps"):
+            # exact anchor planはNetworkが選んだplanではない。方策項だけdetachしても
+            # Surrogate/GeometryのSTEがdecision headを更新し、実測で次Stepを
+            # -3.59から-1.67へ壊したため、通常trainは最初からNetwork planを実行する。
+            # Step 1はframe baselineをActualで一度だけ校正し、train.py側で
+            # main optimizerを意図的にskipする。Step 2以降はNetwork planだけを
+            # 更新対象にする（Heuristic-only Aの性能をNetworkへ帰属しない）。
+            args.heuristic_guidance_exact_anchor_steps = 1
+        if not _cli_option_was_provided("--heuristic_guidance_online_gumbel_scale"):
+            # w_H=0.005時の旧Gumbel std≈0.032は候補集合の84.3%を無作為化し、
+            # base=0.01でも73.3%を変更した。Poolから約2,000件を同時選ぶtop-kでは
+            # score stdと同程度のnoiseでも順位交換が過大になるため、候補集合の
+            # 構造を保つ1/10（係数0.00025）へ校正する。
+            args.heuristic_guidance_online_gumbel_scale = 0.001
+        if not _cli_option_was_provided("--repair_online_decision_grad_max_norm"):
+            # 同一frame監査の自然なWhere norm=0.11--0.22に対し、Amount/gateは
+            # 84--933まで達した。小勾配を増幅せず、突出headだけ同じ桁へ制限する。
+            args.repair_online_decision_grad_max_norm = 0.25
         # 旧5% Prune等で学習したheadを自動読込するとonline residual初期値を汚す。
         # 明示指定時だけ再開を許可し、既定は新しい方策headから開始する。
         if not _cli_option_was_provided("--more_training"):
             args.more_training = False
     if args.heuristic_guidance_enabled and compress_key == "sparsepcgc":
         if args.heuristic_guidance_mode in {"ana_den6_online", "ana_den6_residual"}:
+            if (
+                args.heuristic_guidance_mode == "ana_den6_online"
+                and not _cli_option_was_provided("--heuristic_guidance_anchor_steps")
+            ):
+                # hard anchorはexact_anchor_steps=1が担当する。別の200-Step
+                # residual rampを重ねると同じNetwork出力の実行量が時刻で変わる。
+                args.heuristic_guidance_anchor_steps = 0
+            if not _cli_option_was_provided("--heuristic_guidance_network_residual_weight"):
+                # 20260817の安定runで確認済みの0.15を固定上限として使う。
+                # scoreは固定尺度校正後、学習したraw差に比例して効くため、
+                # Episode依存の重み段階変更は不要である。
+                args.heuristic_guidance_network_residual_weight = 0.15
             if not _cli_option_was_provided("--heuristic_guidance_network_residual_weight_max"):
                 # 20260817の安定runは0.15で最終-3.8付近へ到達した。一方、
                 # 20260822 runは0.325まで拡張して候補順位が崩れたため、
                 # 明示指定がない場合だけ実測済みの安全域を上限にする。
                 args.heuristic_guidance_network_residual_weight_max = 0.15
+            if not _cli_option_was_provided("--heuristic_guidance_network_residual_weight_increment"):
+                args.heuristic_guidance_network_residual_weight_increment = 0.0
             # den6 Amountは全点群比0.05%～0.25%級である。旧3%/5%初期値を混入させない。
             profile_amounts = {
                 ("8i", 8): (0.0010, 0.0010, 0.0005),
@@ -5024,6 +5098,10 @@ def parse_pugan_args(parser, file_day, file_time):
     args.repair_operation_head_grad_max_scale = max(
         float(getattr(args, "repair_operation_head_grad_max_scale", 100000.0)),
         args.repair_operation_head_grad_min_scale,
+    )
+    args.repair_online_decision_grad_max_norm = max(
+        float(getattr(args, "repair_online_decision_grad_max_norm", 1.0)),
+        0.0,
     )
     args.sparsepcgc_codec_prune_prior = bool(
         getattr(args, "sparsepcgc_codec_prune_prior", False)

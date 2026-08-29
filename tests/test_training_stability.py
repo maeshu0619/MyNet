@@ -19,7 +19,10 @@ from models.utils.training.convergence_control import (
     exploration_schedule_step_estimate,
 )
 from models.utils.training.train_flow import backward_only_scaled_loss
-from models.utils.training.train_runtime import fixed_full_cloud_validation_records
+from models.utils.training.train_runtime import (
+    _balance_actual_operation_head_gradients,
+    fixed_full_cloud_validation_records,
+)
 from models.modules.structure_actuator import (
     StructureRepairActuator,
     policy_exploration_multiplier,
@@ -41,6 +44,73 @@ class _Loss:
 
 
 class TrainingStabilityTest(unittest.TestCase):
+    def test_candidate_score_fixed_scale_does_not_amplify_tiny_span(self):
+        actuator = StructureRepairActuator.__new__(StructureRepairActuator)
+        torch.nn.Module.__init__(actuator)
+        actuator.args = SimpleNamespace(heuristic_guidance_network_score_scale=1.0)
+        tiny = torch.tensor([0.0010, 0.0015, 0.0020], requires_grad=True)
+        calibrated = actuator._normalize_candidate_network_score(tiny)
+        self.assertLess(float(calibrated.detach().abs().max()), 0.001)
+        calibrated.sum().backward()
+        self.assertTrue(torch.isfinite(tiny.grad).all())
+
+    def test_candidate_score_unmapped_entries_are_neutral(self):
+        actuator = StructureRepairActuator.__new__(StructureRepairActuator)
+        torch.nn.Module.__init__(actuator)
+        actuator.args = SimpleNamespace(heuristic_guidance_network_score_scale=1.0)
+        raw = torch.tensor([-2.0, -1.0, 0.0])
+        scored = torch.tensor([True, True, False])
+        calibrated = actuator._normalize_candidate_network_score(raw, scored)
+        self.assertAlmostEqual(float(calibrated[2]), 0.0, places=7)
+
+    def test_online_decision_balance_only_clips_large_gradient(self):
+        class _Actuator(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.drop_head = torch.nn.Linear(1, 1, bias=False)
+                self.add_head = torch.nn.Linear(1, 1, bias=False)
+                self.add_voxel_head = torch.nn.Linear(1, 1, bias=False)
+                self.move_voxel_head = torch.nn.Linear(1, 1, bias=False)
+                self.drop_amount_head = torch.nn.Linear(1, 1, bias=False)
+                self.add_amount_head = torch.nn.Linear(1, 1, bias=False)
+                self.move_amount_head = torch.nn.Linear(1, 1, bias=False)
+                self.algorithmic_amount_selector_head = torch.nn.Linear(1, 1, bias=False)
+                self.operation_gate_head = torch.nn.Linear(1, 1, bias=False)
+
+        class _Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.actuator = _Actuator()
+                self.policy_module = torch.nn.Linear(1, 1, bias=False)
+
+        model = _Model()
+        for parameter in model.parameters():
+            parameter.grad = torch.zeros_like(parameter)
+        model.actuator.drop_head.weight.grad.fill_(0.2)
+        model.actuator.algorithmic_amount_selector_head.weight.grad.fill_(100.0)
+        model.actuator.operation_gate_head.weight.grad.fill_(0.01)
+        debug = _balance_actual_operation_head_gradients(
+            SimpleNamespace(
+                repair_balance_operation_head_grads=True,
+                heuristic_guidance_mode="ana_den6_online",
+                repair_operation_head_grad_target=1.0,
+                grad_scale_operation_amount=200.0,
+                minimal_loss_objective=True,
+                repair_online_decision_grad_max_norm=1.0,
+            ),
+            model,
+            {},
+        )
+        self.assertEqual(debug["den6_online_where_grad_balance_status"], "preserved")
+        self.assertEqual(debug["den6_online_amount_grad_balance_status"], "clipped")
+        self.assertEqual(debug["den6_online_action_grad_balance_status"], "preserved")
+        self.assertAlmostEqual(float(model.actuator.drop_head.weight.grad.norm()), 0.2, places=6)
+        self.assertAlmostEqual(
+            float(model.actuator.algorithmic_amount_selector_head.weight.grad.norm()),
+            1.0,
+            places=6,
+        )
+
     def test_exploration_schedule_is_independent_from_extended_training_length(self):
         args = SimpleNamespace(episodes=384, exploration_schedule_episodes=256)
         self.assertEqual(exploration_schedule_step_estimate(args, 40), 256 * 40)
