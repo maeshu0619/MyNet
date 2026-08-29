@@ -21,6 +21,8 @@ from models.utils.training.convergence_control import (
 from models.utils.training.train_flow import backward_only_scaled_loss
 from models.utils.training.train_runtime import (
     _balance_actual_operation_head_gradients,
+    _capture_den6_policy_only_gradients,
+    _restore_den6_policy_only_gradients,
     fixed_full_cloud_validation_records,
 )
 from models.modules.structure_actuator import (
@@ -733,6 +735,25 @@ class TrainingStabilityTest(unittest.TestCase):
         self.assertTrue(debug["train_grad_clip_applied"])
         self.assertAlmostEqual(debug["train_grad_total_norm_before_clip"], 20.0)
         self.assertLessEqual(float(model.weight.grad.norm()), 10.00001)
+
+    def test_den6_policy_gradient_isolation_removes_unrelated_ste_gradient(self):
+        head = torch.nn.Linear(1, 1, bias=False)
+        with torch.no_grad():
+            head.weight.fill_(2.0)
+        model = SimpleNamespace(actuator=SimpleNamespace(drop_head=head))
+        value = head(torch.ones(1, 1)).sum()
+        policy_loss = value.square()
+        snapshot = _capture_den6_policy_only_gradients(policy_loss, model)
+        (policy_grad,) = torch.autograd.grad(
+            policy_loss, (head.weight,), retain_graph=True
+        )
+        (policy_loss + 100.0 * value).backward()
+        self.assertNotAlmostEqual(
+            float(head.weight.grad), float(policy_grad), places=4
+        )
+        debug = _restore_den6_policy_only_gradients(snapshot)
+        self.assertTrue(debug["den6_policy_only_gradient_isolation"])
+        self.assertAlmostEqual(float(head.weight.grad), float(policy_grad), places=6)
 
     def test_disabled_gradient_clip_does_not_change_gradient(self):
         model = torch.nn.Linear(1, 1, bias=False)

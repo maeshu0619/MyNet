@@ -5038,6 +5038,79 @@ def _format_soft_proxy_debug(args):
     return ", ".join(parts)
 
 
+def _den6_online_decision_parameters(model):
+    """Return the exact-online heads whose hard decisions need score-function grads."""
+    base_model = model.module if hasattr(model, "module") else model
+    actuator = getattr(base_model, "actuator", None)
+    if actuator is None:
+        return []
+    modules = (
+        getattr(actuator, "drop_head", None),
+        getattr(actuator, "add_head", None),
+        getattr(actuator, "add_voxel_head", None),
+        getattr(actuator, "subtree_move_source_head", None),
+        getattr(actuator, "move_voxel_head", None),
+        getattr(actuator, "drop_amount_head", None),
+        getattr(actuator, "add_amount_head", None),
+        getattr(actuator, "move_amount_head", None),
+        getattr(actuator, "algorithmic_amount_selector_head", None),
+        getattr(actuator, "operation_gate_head", None),
+    )
+    params = []
+    seen = set()
+    for module in modules:
+        if module is None:
+            continue
+        for param in module.parameters():
+            if not param.requires_grad or id(param) in seen:
+                continue
+            seen.add(id(param))
+            params.append(param)
+    return params
+
+
+def _capture_den6_policy_only_gradients(policy_loss, model):
+    """Capture only Actual score-function gradients before the joint backward."""
+    if not torch.is_tensor(policy_loss) or not policy_loss.requires_grad:
+        return []
+    params = _den6_online_decision_parameters(model)
+    if not params:
+        return []
+    # The Where path uses torch.utils.checkpoint.  autograd.grad(inputs=...)
+    # is incompatible with the re-entrant checkpoint used by this project,
+    # so perform a normal retained backward, snapshot the decision heads, and
+    # clear all temporary grads before the joint objective backward.
+    policy_loss.backward(retain_graph=True)
+    snapshot = [
+        (param, None if param.grad is None else param.grad.detach().clone())
+        for param in params
+    ]
+    if hasattr(model, "zero_grad"):
+        model.zero_grad(set_to_none=True)
+    else:
+        for param in params:
+            param.grad = None
+    return snapshot
+
+
+def _restore_den6_policy_only_gradients(snapshot):
+    """Remove unrelated STE gradients from hard decision heads after backward."""
+    restored = 0
+    cleared = 0
+    for param, grad in snapshot or ():
+        if grad is None:
+            param.grad = None
+            cleared += 1
+        else:
+            param.grad = grad.to(device=param.device, dtype=param.dtype)
+            restored += 1
+    return {
+        "den6_policy_only_gradient_isolation": bool(snapshot),
+        "den6_policy_only_gradient_restored_params": int(restored),
+        "den6_policy_only_gradient_cleared_params": int(cleared),
+    }
+
+
 def _balance_actual_operation_head_gradients(args, model, structure_debug=None):
     """
     Operation head の optimizer.step 直前の実勾配を調整する。

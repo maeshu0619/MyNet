@@ -4239,9 +4239,10 @@ def parse_pugan_args(parser, file_day, file_time):
         if not _cli_option_was_provided("--heuristic_guidance_final_where_weight"):
             # Heuristicはedit-unit Poolの生成・妥当性filterまでを担当する。
             # 実測ではw_H=0.25でA/Bが同一、0でActualが-0.79まで崩れた。
-            # 0.005では候補集合を39.7%変更しつつActual=-3.469を保てたため、
-            # codec-safe Pool内の弱い構造priorとしてこの境界値だけを残す。
-            args.heuristic_guidance_final_where_weight = 0.005
+            # 0.01では候補集合を32.1%変更しつつHeuristic-onlyと同じActualを
+            # 保てた。一方0.005の15-Step後Dは-3.072まで悪化したため採用せず、
+            # codec-safe Pool内の弱い構造priorとして実測安全境界を残す。
+            args.heuristic_guidance_final_where_weight = 0.01
         if not _cli_option_was_provided("--heuristic_guidance_exact_anchor_steps"):
             # exact anchor planはNetworkが選んだplanではない。方策項だけdetachしても
             # Surrogate/GeometryのSTEがdecision headを更新し、実測で次Stepを
@@ -4257,9 +4258,10 @@ def parse_pugan_args(parser, file_day, file_time):
             # 構造を保つ1/10（係数0.00025）へ校正する。
             args.heuristic_guidance_online_gumbel_scale = 0.001
         if not _cli_option_was_provided("--repair_online_decision_grad_max_norm"):
-            # 同一frame監査の自然なWhere norm=0.11--0.22に対し、Amount/gateは
-            # 84--933まで達した。小勾配を増幅せず、突出headだけ同じ桁へ制限する。
-            args.repair_online_decision_grad_max_norm = 0.25
+            # STE混入を除いた純Actual方策のWhere norm=0.0049--0.0119に対し、
+            # Amount/gateは1023--1615/114--178だった。小勾配を増幅せず、
+            # 突出headだけWhereと同じ桁へ制限する。
+            args.repair_online_decision_grad_max_norm = 0.01
         # 旧5% Prune等で学習したheadを自動読込するとonline residual初期値を汚す。
         # 明示指定時だけ再開を許可し、既定は新しい方策headから開始する。
         if not _cli_option_was_provided("--more_training"):

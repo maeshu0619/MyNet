@@ -502,6 +502,7 @@ def train(model, args, loss, writer, plot, notifier=None):
         episode_sequence_summary = OrderedDict()
         episode_optimizer_total_count = 0
         episode_optimizer_step_count = 0
+        episode_intentional_calibration_skip_count = 0
         episode_nonfinite_grad_skip_count = 0
         episode_max_consecutive_nonfinite_grad_skips = 0
 
@@ -570,6 +571,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                 if emulator_optimizer is not None:
                     emulator_optimizer.zero_grad(set_to_none=True)
                 emulator_loss = None
+                den6_policy_only_grad_snapshot = None
                 file_path = active_dataset.files[step]
                 _record_memory(
                     "step_after_data_load",
@@ -2473,6 +2475,36 @@ def train(model, args, loss, writer, plot, notifier=None):
                             online_policy_loss,
                             policy_backward_scale,
                         )
+                        # Exact planのhard argsort/int化にはSurrogate/Geometryの
+                        # pathwise勾配は対応しない。Actual score-function項だけを
+                        # decision head用に保存し、joint backward後に復元する。
+                        den6_policy_only_grad_snapshot = (
+                            _capture_den6_policy_only_gradients(
+                                online_policy_loss, model
+                            )
+                        )
+                        captured_policy_norm_sq = sum(
+                            float(torch.sum(grad.detach().float() ** 2).cpu())
+                            for _, grad in den6_policy_only_grad_snapshot
+                            if torch.is_tensor(grad)
+                        )
+                        compression_debug_terms[
+                            "den6_policy_only_capture_param_count"
+                        ] = int(len(den6_policy_only_grad_snapshot))
+                        compression_debug_terms[
+                            "den6_policy_only_capture_grad_norm"
+                        ] = math.sqrt(max(captured_policy_norm_sq, 0.0))
+                        policy_param_names = {
+                            id(param): name for name, param in model.named_parameters()
+                        }
+                        compression_debug_terms[
+                            "den6_policy_only_nonzero_names"
+                        ] = ",".join(
+                            policy_param_names.get(id(param), "?")
+                            for param, grad in den6_policy_only_grad_snapshot
+                            if torch.is_tensor(grad)
+                            and bool(torch.any(grad.detach() != 0).item())
+                        )
                         compression_debug_terms[
                             "den6_online_policy_backward_scale"
                         ] = float(policy_backward_scale)
@@ -3984,6 +4016,10 @@ def train(model, args, loss, writer, plot, notifier=None):
                     amp_info["scale_before"] = scale_before # AMP Debug情報に更新前ぉssSacleを保存
                     scaler.scale(L).backward() # LをAMP用にスケーリングしてから逆伝播
                     scaler.unscale_(optimizer) # Optimizer内の勾配を元のスケールへ戻す
+                    if den6_online_full_cloud:
+                        comp_debug.update(_restore_den6_policy_only_gradients(
+                            den6_policy_only_grad_snapshot
+                        ))
                     operation_grad_balance_debug = _balance_actual_operation_head_gradients(
                         args,
                         model,
@@ -4122,6 +4158,10 @@ def train(model, args, loss, writer, plot, notifier=None):
                                     writer.write( "float16 AMP overflow persisted; disabled AMP and continue in float32.")
                 else:
                     L.backward() # 通常の勾配を流す
+                    if den6_online_full_cloud:
+                        comp_debug.update(_restore_den6_policy_only_gradients(
+                            den6_policy_only_grad_snapshot
+                        ))
                     operation_grad_balance_debug = _balance_actual_operation_head_gradients(
                         args,
                         model,
@@ -4213,6 +4253,8 @@ def train(model, args, loss, writer, plot, notifier=None):
                         episode_max_consecutive_nonfinite_grad_skips,
                         consecutive_nonfinite_grad_skips,
                     )
+                elif skip_optimizer_reason == "den6_exact_heuristic_anchor_calibration":
+                    episode_intentional_calibration_skip_count += 1
                 optimizer_success_ratio = episode_optimizer_step_count / float(max(episode_optimizer_total_count, 1))
                 if last_nonfinite_grad_summary:
                     comp_debug["nonfinite_grad_bad_element_count"] = int(last_nonfinite_grad_summary.get("bad_element_count", 0))
@@ -4650,7 +4692,6 @@ def train(model, args, loss, writer, plot, notifier=None):
                         for head_name, debug_name in (
                             ("Where", "den6_online_where_grad_norm_before_balance"),
                             ("Amount", "den6_online_amount_grad_norm_before_balance"),
-                            ("Action", "den6_online_action_grad_norm_before_balance"),
                             ("Surrogate", "surrogate_grad_norm"),
                         ):
                             # With gradient balancing explicitly disabled there is no
@@ -4673,6 +4714,17 @@ def train(model, args, loss, writer, plot, notifier=None):
                         raise RuntimeError(
                             "ana_den6 one-plan invariant violation: "
                             + ", ".join(online_invariant_failures)
+                            + "; policy_isolation="
+                            + str({
+                                key: audit_compression.get(key)
+                                for key in (
+                                    "den6_policy_only_capture_param_count",
+                                    "den6_policy_only_capture_grad_norm",
+                                    "den6_policy_only_gradient_restored_params",
+                                    "den6_policy_only_gradient_cleared_params",
+                                    "den6_policy_only_nonzero_names",
+                                )
+                            })
                         )
                     audit_phase_timing = {}
                     if timing_enabled:
@@ -5523,7 +5575,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                 "" if fixed_safety_ok
                 else "fixed_validation_geometry_or_safety_failed"
             )
-        optimizer_success_ratio = episode_optimizer_step_count / float(max(episode_optimizer_total_count, 1))
+        optimizer_success_ratio = (
+            episode_optimizer_step_count + episode_intentional_calibration_skip_count
+        ) / float(max(episode_optimizer_total_count, 1))
         min_optimizer_success_ratio = float(getattr(args, "checkpoint_min_optimizer_step_ratio", 0.20))
         optimizer_success_ok = optimizer_success_ratio >= min_optimizer_success_ratio
         nonfinite_consecutive_ok = episode_max_consecutive_nonfinite_grad_skips < 2
@@ -5583,6 +5637,9 @@ def train(model, args, loss, writer, plot, notifier=None):
             {
                 "optimizer_step_count": int(episode_optimizer_step_count),
                 "optimizer_total_step_count": int(episode_optimizer_total_count),
+                "intentional_calibration_skip_count": int(
+                    episode_intentional_calibration_skip_count
+                ),
                 "optimizer_step_success_ratio": float(optimizer_success_ratio),
                 "optimizer_success_ok": bool(optimizer_success_ok),
                 "episode_nonfinite_grad_skip_count": int(episode_nonfinite_grad_skip_count),
