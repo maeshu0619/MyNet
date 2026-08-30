@@ -3,6 +3,7 @@ import json
 import math
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import torch
@@ -38,6 +39,79 @@ class CompressionLossMixin:
         guard["edited_encode_count"] = int(guard.get("edited_encode_count", 0)) + 1
         self._den6_online_actual_step_guard = guard
         return True
+
+    def start_cpu_actual_encode_prefetch(self, args, xyz, final_w=None):
+        """Start the one edited CPU codec request while CUDA geometry runs.
+
+        The point tensor is copied before submission, so the worker thread
+        never touches CUDA.  This changes only scheduling: the same
+        ``_encode_actual_batch`` implementation and request guard are used.
+        """
+        if str(getattr(args, "sparsepcgc_device", "auto")).strip().lower() != "cpu":
+            return False
+        if not torch.is_tensor(xyz) or int(xyz.shape[0]) != 1:
+            return False
+        pending = getattr(self, "_cpu_actual_encode_prefetch", None)
+        if isinstance(pending, dict):
+            future = pending.get("future")
+            if future is not None and not future.done():
+                raise RuntimeError("previous CPU actual encode prefetch is still running")
+            self._cpu_actual_encode_prefetch = None
+
+        self._guard_den6_online_edited_actual_encode(args)
+        # Perform the CUDA transfer on the training thread before overlap.
+        # The CPU tensor is exactly the float32 tensor previously produced in
+        # _encode_actual_batch, not a quantized or approximate representation.
+        xyz_cpu = xyz.detach().to(device="cpu", dtype=torch.float32).contiguous()
+        final_w_cpu = (
+            None
+            if final_w is None
+            else final_w.detach().to(device="cpu", dtype=torch.float32).contiguous()
+        )
+        executor = getattr(self, "_cpu_actual_encode_executor", None)
+        if executor is None:
+            executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="mynet-actual-codec"
+            )
+            self._cpu_actual_encode_executor = executor
+        future = executor.submit(
+            self._encode_actual_batch, args, xyz_cpu, final_w_cpu
+        )
+        self._cpu_actual_encode_prefetch = {
+            "step": int(getattr(args, "_global_train_step", 0)),
+            "point_count": int(xyz_cpu.shape[-1]),
+            "started_at": time.time(),
+            "future": future,
+        }
+        return True
+
+    def consume_cpu_actual_encode_prefetch(self, args, xyz):
+        """Return a matching prefetched result, or ``None`` if none exists."""
+        pending = getattr(self, "_cpu_actual_encode_prefetch", None)
+        if not isinstance(pending, dict):
+            return None
+        expected_step = int(getattr(args, "_global_train_step", 0))
+        expected_points = int(xyz.shape[-1]) if torch.is_tensor(xyz) else -1
+        if (
+            int(pending.get("step", -1)) != expected_step
+            or int(pending.get("point_count", -1)) != expected_points
+        ):
+            raise RuntimeError(
+                "CPU actual encode prefetch does not match the current step/cloud: "
+                f"prefetch_step={pending.get('step')}, step={expected_step}, "
+                f"prefetch_points={pending.get('point_count')}, points={expected_points}"
+            )
+        self._cpu_actual_encode_prefetch = None
+        wait_started = time.time()
+        result = dict(pending["future"].result())
+        result["sparsepcgc_cpu_overlap_used"] = True
+        result["sparsepcgc_cpu_overlap_wait_time"] = float(
+            time.time() - wait_started
+        )
+        result["sparsepcgc_cpu_overlap_elapsed_time"] = float(
+            time.time() - float(pending.get("started_at", wait_started))
+        )
+        return result
 
     def _store_compression_terms(self, **terms):
         self.last_compression_terms = dict(terms)

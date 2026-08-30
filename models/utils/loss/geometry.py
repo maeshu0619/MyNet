@@ -88,13 +88,27 @@ class GeometryLossMixin:
             )
 
         initial_keys = encode(initial_rows)
-        sorted_keys, order = torch.sort(initial_keys)
+        # canonical/full-cloud voxel rows and the exact edited plan are
+        # already emitted in collision-free key order.  Sorting the entire
+        # frame again here (typically ~0.7M keys) was redundant.  Keep the
+        # monotonicity check and the old sort as a fallback so arbitrary
+        # callers retain exactly the previous result.
+        keys_already_sorted = cls._keys_are_nondecreasing(initial_keys)
+        if keys_already_sorted:
+            sorted_keys = initial_keys
+            order = None
+        else:
+            sorted_keys, order = torch.sort(initial_keys)
         query_keys = encode(query_rows)
         positions = torch.searchsorted(sorted_keys, query_keys)
         in_bounds = positions < sorted_keys.numel()
         safe_positions = positions.clamp(max=max(int(sorted_keys.numel()) - 1, 0))
         occupied = in_bounds & sorted_keys.index_select(0, safe_positions).eq(query_keys)
-        neighbor_indices = order.index_select(0, safe_positions).reshape(count, -1)
+        neighbor_indices = (
+            safe_positions
+            if order is None
+            else order.index_select(0, safe_positions)
+        ).reshape(count, -1)
         occupied = occupied.reshape(count, -1)
 
         neighbors = initial_xyz_rows.index_select(0, neighbor_indices.reshape(-1)).reshape(
@@ -162,11 +176,26 @@ class GeometryLossMixin:
         return gen_pts_f.new_zeros(())
 
     @staticmethod
-    def _sorted_membership(source_keys, target_keys):
+    def _keys_are_nondecreasing(keys):
+        """Return whether a 1-D key tensor can be consumed by searchsorted."""
+        if int(keys.numel()) < 2:
+            return True
+        return bool(torch.all(keys[1:] >= keys[:-1]).item())
+
+    @classmethod
+    def _sorted_membership(cls, source_keys, target_keys):
         """sourceの各keyがtargetに存在するかをTorch 1.11互換で返す。"""
         if target_keys.numel() == 0:
             return torch.zeros_like(source_keys, dtype=torch.bool)
-        target_sorted = torch.sort(target_keys).values
+        # Most full-cloud paths already provide lexicographically ordered
+        # unique voxels.  A linear monotonicity check is much lighter than an
+        # O(N log N) sort and does not allocate another full-cloud key tensor.
+        # Unsorted inputs still execute the original implementation.
+        target_sorted = (
+            target_keys
+            if cls._keys_are_nondecreasing(target_keys)
+            else torch.sort(target_keys).values
+        )
         positions = torch.searchsorted(target_sorted, source_keys)
         in_bounds = positions < target_sorted.numel()
         safe = positions.clamp(max=max(int(target_sorted.numel()) - 1, 0))

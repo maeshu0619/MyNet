@@ -154,7 +154,8 @@ def log_runtime_setup(writer, args):
     writer.write(
         f"Runtime Tradeoff: k={args.k}, encoder_query_chunk={args.encoder_query_chunk}, "
         f"structure_geo_max_points={args.structure_geo_max_points}, "
-        f"knn_backend={getattr(args, 'knn_backend', 'pointops_cuda')}"
+        f"knn_backend={getattr(args, 'knn_backend', 'pointops_cuda')}, "
+        f"full_cloud_head_chunk={int(getattr(args, 'full_cloud_head_chunk_size', 131072))}"
     )
     writer.write(
         "Point Edit Count Thresholds: "

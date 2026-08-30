@@ -956,6 +956,56 @@ def train(model, args, loss, writer, plot, notifier=None):
                             ),
                         )
 
+                        # CPU SparsePCGC and CUDA geometry use independent
+                        # resources.  Start the same single edited-codec
+                        # request now and consume it below after geometry.
+                        # CUDA teacher is deliberately excluded to avoid
+                        # increasing GPU contention or peak memory.
+                        prefetched_gen_xyz_for_actual = None
+                        prefetched_voxel_actual_debug = None
+                        cpu_actual_overlap_started = False
+                        cpu_actual_overlap_enabled = bool(
+                            getattr(args, "sparsepcgc_cpu_actual_overlap", True)
+                            and str(getattr(args, "sparsepcgc_device", "auto")).strip().lower() == "cpu"
+                            and str(getattr(args, "compression_loss_backend", "")).strip().lower()
+                            == "sparsepcgc_surrogate"
+                            and bool(one_plan_full_cloud)
+                            and bool(refresh_actual_gen)
+                            and stage_factors["com"] != 0.0
+                            and not single_plan_cache_only_stage
+                            and not k_all_actual_enabled
+                        )
+                        if cpu_actual_overlap_enabled:
+                            (
+                                prefetched_gen_xyz_for_actual,
+                                prefetched_voxel_actual_debug,
+                            ) = _select_actual_gen_xyz_from_voxel_state(
+                                args,
+                                writer,
+                                model,
+                                gen_xyz,
+                                prefix="VoxelRestoredActual[full_cloud_anchor]",
+                                canonical_context=full_cloud_canonical_context,
+                            )
+                            prefetched_voxel_state_used = bool(
+                                isinstance(prefetched_voxel_actual_debug, dict)
+                                and prefetched_voxel_actual_debug.get("used", False)
+                                and not prefetched_voxel_actual_debug.get("fallback", False)
+                            )
+                            prefetch_final_w = (
+                                None if prefetched_voxel_state_used else final_w_for_loss
+                            )
+                            cpu_actual_overlap_started = bool(
+                                loss.start_cpu_actual_encode_prefetch(
+                                    args,
+                                    prefetched_gen_xyz_for_actual,
+                                    final_w=prefetch_final_w,
+                                )
+                            )
+                        step_timing_breakdown["cpu_actual_overlap_started"] = float(
+                            cpu_actual_overlap_started
+                        )
+
                         with loss_grad_ctx, autocast_ctx, loss_saved_tensor_ctx:
                             """形状損失の計算"""
                             geometry_t0 = time.time()
@@ -1034,14 +1084,18 @@ def train(model, args, loss, writer, plot, notifier=None):
                             """圧縮損失の計算"""
                             if stage_factors["com"] != 0.0 and not single_plan_cache_only_stage:
                                 compression_t0 = time.time()
-                                gen_xyz_for_actual, voxel_restored_actual_debug = _select_actual_gen_xyz_from_voxel_state(
-                                    args,
-                                    writer,
-                                    model,
-                                    gen_xyz,
-                                    prefix="VoxelRestoredActual[full_cloud_anchor]",
-                                    canonical_context=full_cloud_canonical_context,
-                                )
+                                if cpu_actual_overlap_started:
+                                    gen_xyz_for_actual = prefetched_gen_xyz_for_actual
+                                    voxel_restored_actual_debug = prefetched_voxel_actual_debug
+                                else:
+                                    gen_xyz_for_actual, voxel_restored_actual_debug = _select_actual_gen_xyz_from_voxel_state(
+                                        args,
+                                        writer,
+                                        model,
+                                        gen_xyz,
+                                        prefix="VoxelRestoredActual[full_cloud_anchor]",
+                                        canonical_context=full_cloud_canonical_context,
+                                    )
 
                                 full_cloud_voxel_state_used = bool(
                                     isinstance(voxel_restored_actual_debug, dict)
@@ -4812,7 +4866,10 @@ def train(model, args, loss, writer, plot, notifier=None):
                         f"oom_retries={int(actual_audit.get('cuda_oom_retries', 0) or 0)}, "
                         f"gpu_free={float(actual_audit.get('gpu_free_before_mb', -1.0) or -1.0):.1f}->"
                         f"{float(actual_audit.get('gpu_free_after_mb', -1.0) or -1.0):.1f}MiB, "
-                        f"edited_cache_hit={bool(actual_audit.get('edited_result_cache_hit', False))})"
+                        f"edited_cache_hit={bool(actual_audit.get('edited_result_cache_hit', False))}, "
+                        f"cpu_overlap={bool(actual_audit.get('cpu_overlap_used', False))}, "
+                        f"cpu_overlap_wait={float(actual_audit.get('cpu_overlap_wait_time', 0.0) or 0.0):.3f}s, "
+                        f"cpu_overlap_elapsed={float(actual_audit.get('cpu_overlap_elapsed_time', 0.0) or 0.0):.3f}s)"
                         f", codec_bits=(baseline={float(audit_compression.get('gt_actual_bit', 0.0)):.1f}, "
                         f"edited={float(audit_compression.get('gen_actual_bit', 0.0)):.1f})"
                         f", static_node_cache=(entries={int(static_node_cache.get('entries', 0) or 0)}, "

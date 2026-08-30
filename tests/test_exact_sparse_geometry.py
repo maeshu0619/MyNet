@@ -19,6 +19,21 @@ class _Geometry(GeometryLossMixin):
 
 
 class ExactSparseGeometryTest(unittest.TestCase):
+    def test_membership_sorted_fast_path_matches_sort_fallback(self):
+        source = torch.tensor([0, 1, 2, 7, 9, 11], dtype=torch.long)
+        sorted_target = torch.tensor([1, 2, 4, 7, 10], dtype=torch.long)
+        unsorted_target = sorted_target[torch.tensor([3, 0, 4, 2, 1])]
+        expected = torch.tensor([False, True, True, True, False, False])
+
+        self.assertTrue(_Geometry._keys_are_nondecreasing(sorted_target))
+        self.assertFalse(_Geometry._keys_are_nondecreasing(unsorted_target))
+        self.assertTrue(torch.equal(
+            _Geometry._sorted_membership(source, sorted_target), expected
+        ))
+        self.assertTrue(torch.equal(
+            _Geometry._sorted_membership(source, unsorted_target), expected
+        ))
+
     def test_sparse_edit_chamfer_equals_full_chamfer(self):
         initial_rows = torch.tensor([
             [0, 0, 0], [1, 0, 0], [2, 0, 0],

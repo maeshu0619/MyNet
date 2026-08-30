@@ -1155,11 +1155,15 @@ class SurrogateCompressionLossMixin:
                     in {"ana_den6_online", "network_only_codec_policy", "network_k_proposal_policy", "single_plan_student"}
                     and bool(getattr(args, "_den6_online_training_step_active", False))
                 )
-                if den6_online_train:
-                    if int(actual_xyz.shape[0]) != 1:
-                        raise RuntimeError("ana_den6_onlineは1 Step = 1 edited actual encodeのためbatch_size=1が必要")
-                    self._guard_den6_online_edited_actual_encode(args)
-                stats_gen = self._encode_actual_batch(args, actual_xyz, final_w=actual_final_w)
+                if den6_online_train and int(actual_xyz.shape[0]) != 1:
+                    raise RuntimeError("ana_den6_onlineは1 Step = 1 edited actual encodeのためbatch_size=1が必要")
+                stats_gen = self.consume_cpu_actual_encode_prefetch(args, actual_xyz)
+                if stats_gen is None:
+                    if den6_online_train:
+                        self._guard_den6_online_edited_actual_encode(args)
+                    stats_gen = self._encode_actual_batch(
+                        args, actual_xyz, final_w=actual_final_w
+                    )
                 current_gen_actual_encode_time = float(
                     stats_gen.get("encode_time", 0.0)
                 )
@@ -1177,6 +1181,15 @@ class SurrogateCompressionLossMixin:
                         "cuda_oom_retries": int(stats_gen.get("sparsepcgc_cuda_oom_retries", 0)),
                         "gpu_free_before_mb": float(stats_gen.get("sparsepcgc_gpu_free_before_mb", -1.0)),
                         "gpu_free_after_mb": float(stats_gen.get("sparsepcgc_gpu_free_after_mb", -1.0)),
+                        "cpu_overlap_used": bool(
+                            stats_gen.get("sparsepcgc_cpu_overlap_used", False)
+                        ),
+                        "cpu_overlap_wait_time": float(
+                            stats_gen.get("sparsepcgc_cpu_overlap_wait_time", 0.0)
+                        ),
+                        "cpu_overlap_elapsed_time": float(
+                            stats_gen.get("sparsepcgc_cpu_overlap_elapsed_time", 0.0)
+                        ),
                     }
             if timing_enabled:
                 timing["actual_encode"] = time.time() - actual_t0

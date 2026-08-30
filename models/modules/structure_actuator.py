@@ -245,27 +245,49 @@ class StructureRepairActuator(nn.Module):
         )
 
     def _run_large_head(self, head, features):
-        """Run a point-wise head without retaining its hidden FP32 maps.
+        """Run a point-wise head without a full-cloud hidden FP32 map.
 
-        Non-reentrant checkpointing preserves the exact forward arithmetic and
-        recomputes only the head during backward.  Hard plans, candidate pools,
-        losses, and dtypes are unchanged.
+        These heads contain only 1x1 convolutions and point-wise activations, so
+        splitting the point dimension preserves their forward computation.
+        Checkpointing bounds saved activations during backward; chunking also
+        bounds the live forward activation which checkpointing alone cannot
+        reduce.  A preallocated output avoids a second full-sized ``cat`` copy.
         """
-        enabled = bool(
+        checkpoint_enabled = bool(
             self.training
             and getattr(self.args, "full_cloud_activation_checkpoint", True)
             and str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower()
             in {"ana_den6_online", "network_only_codec_policy", "network_k_proposal_policy", "single_plan_student"}
         )
-        if enabled:
-            dummy = features.new_zeros((), requires_grad=True)
-            return checkpoint(
-                lambda value, _dummy: head(value),
-                features,
-                dummy,
-                use_reentrant=True,
-            )
-        return head(features)
+        chunk_size = max(int(getattr(self.args, "full_cloud_head_chunk_size", 131072)), 0)
+
+        def _run(point_features):
+            if checkpoint_enabled:
+                # The dummy keeps re-entrant checkpointing valid even when the
+                # upstream full-cloud feature extractor is intentionally frozen.
+                dummy = point_features.new_zeros((), requires_grad=True)
+                return checkpoint(
+                    lambda value, _dummy: head(value),
+                    point_features,
+                    dummy,
+                    use_reentrant=True,
+                )
+            return head(point_features)
+
+        point_count = int(features.shape[-1])
+        if chunk_size <= 0 or point_count <= chunk_size:
+            return _run(features)
+
+        output = None
+        for start in range(0, point_count, chunk_size):
+            end = min(start + chunk_size, point_count)
+            chunk_output = _run(features[..., start:end])
+            if output is None:
+                output = chunk_output.new_empty((*chunk_output.shape[:-1], point_count))
+            # Keep this assignment under autograd: CopySlices joins every chunk's
+            # graph without retaining a list of outputs or making a full cat copy.
+            output[..., start:end] = chunk_output
+        return output
 
     def _child_slot_target_mask(self, voxel_coords, octree_context):
         # 1. octree_cubtree.pyで作った厳密maskがあればそれを使う

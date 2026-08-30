@@ -2038,6 +2038,12 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--sparsepcgc_actual_result_cache', default=True, type=str2bool, help='同一Voxel集合・同一codec設定のactual結果をprocess内LRU cacheで再利用するか')
     parser.add_argument('--sparsepcgc_actual_result_cache_max_entries', default=256, type=int, help='SparsePCGC actual結果LRU cacheの最大件数')
     parser.add_argument('--sparsepcgc_omp_threads', default=12, type=int, help='SparsePCGC workerのOMP thread数')
+    parser.add_argument(
+        '--sparsepcgc_cpu_actual_overlap',
+        default=True,
+        type=str2bool,
+        help='CPU teacherの1回の実符号化とGPU幾何損失を重ねる。CUDA teacherでは常に無効',
+    )
     parser.add_argument('--sparsepcgc_worker_cpu_trim_interval', default=16, type=int, help='永続workerの解放済みCPU領域をOSへ返すrequest間隔（0で無効）')
     parser.add_argument('--sparsepcgc_gpu_min_free_mb', default=4096, type=int, help='CUDA teacherへrequestを送るために必要なGPU全体の空き容量MB。競合時は値を変えず待機する')
     parser.add_argument(
@@ -3139,6 +3145,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--use_amp', default=True, type=str2bool, help='混合精度学習を使うか')
     parser.add_argument('--amp_dtype', default='auto', type=str, help='AMPのデータ型')
     parser.add_argument('--full_cloud_activation_checkpoint', default=True, type=str2bool, help='FP32精度を維持したままfull-cloud headの中間activationをbackward時に再計算してGPUメモリを削減する')
+    parser.add_argument('--full_cloud_head_chunk_size', default=131072, type=int, help='点単位full-cloud headを厳密分割する最大点数（0で無効、小さいほどforwardピークGPUメモリを削減）')
     parser.add_argument(
         '--full_cloud_saved_tensor_cpu_offload_mb',
         default=0.0,
@@ -4911,6 +4918,9 @@ def parse_pugan_args(parser, file_day, file_time):
     args.sparsepcgc_actual_result_cache = bool(getattr(args, "sparsepcgc_actual_result_cache", True))
     args.sparsepcgc_actual_result_cache_max_entries = max(int(getattr(args, "sparsepcgc_actual_result_cache_max_entries", 256)), 1)
     args.sparsepcgc_omp_threads = max(int(getattr(args, "sparsepcgc_omp_threads", 12)), 1)
+    args.sparsepcgc_cpu_actual_overlap = bool(
+        getattr(args, "sparsepcgc_cpu_actual_overlap", True)
+    )
     args.sparsepcgc_gpu_min_free_mb = max(int(getattr(args, "sparsepcgc_gpu_min_free_mb", 4096)), 0)
     args.sparsepcgc_auto_cpu_fallback = bool(
         getattr(args, "sparsepcgc_auto_cpu_fallback", True)
