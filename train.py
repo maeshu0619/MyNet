@@ -169,9 +169,10 @@ def train(model, args, loss, writer, plot, notifier=None):
             )
     elif str(getattr(args, "heuristic_guidance_mode", "")).strip().lower() == "ana_den6_online":
         writer.write(
-            "TrainingPerformanceContract: applied_plan=den6_exact_rank_plus_network_residual, "
-            "actual_source=heuristic_teacher_plan, network_only_performance=0, "
-            "deployment_checkpoint_eligible=0"
+            "TrainingPerformanceContract: heuristic_role=candidate_pool_and_weak_prior, "
+            "applied_plan=network_ranked_candidate_pool_plus_learned_residual, "
+            "actual_source=network_selected_plan, exploration_role=behavior_only, "
+            f"diagnostic_exact_anchor_steps={int(getattr(args, 'heuristic_guidance_exact_anchor_steps', 0))}"
         )
     k_proposal_teacher_store = None
     k_offline_path = str(getattr(args, "network_k_offline_dataset", "") or "").strip()
@@ -4815,6 +4816,8 @@ def train(model, args, loss, writer, plot, notifier=None):
                         f"amount_mode={str(audit_plan.get('amount_mode', ''))}, "
                         f"amount_bin_ratio={float(audit_plan.get('amount_bin_ratio', 0.0) or 0.0):.7f}, "
                         f"amount_fine_log_residual={float(audit_plan.get('amount_fine_log_residual', 0.0) or 0.0):.7f}, "
+                        f"amount_bin_prob={list(audit_plan.get('amount_bin_probabilities') or [])}, "
+                        f"amount_logit_scale={float(audit_plan.get('amount_logit_calibration_scale', 1.0) or 0.0):.6g}, "
                         f"operation_amount_log_residuals={dict(audit_plan.get('operation_amount_log_residuals') or {})}, "
                         f"operation_amount_mean_log_residuals={dict(audit_plan.get('operation_amount_mean_log_residuals') or {})}, "
                         f"amount_total_ratio={float(audit_plan.get('amount_total_ratio_before_count', 0.0) or 0.0):.7f}, "
@@ -4832,6 +4835,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                         f"candidate=(pool={dict(audit_plan.get('candidate_pool_sizes') or {})}, "
                         f"valid={dict(audit_plan.get('candidate_valid_counts') or {})}, "
                         f"duplicate={dict(audit_plan.get('candidate_duplicate_counts') or {})}, "
+                        f"rank_range={dict(audit_plan.get('candidate_pool_rank_ranges') or {})}, "
                         f"selected_index={dict(audit_plan.get('selected_candidate_indices') or {})}, "
                         f"rank_mean={float(audit_plan.get('selected_heuristic_rank_mean', 0.0) or 0.0):.3f}, "
                         f"top1_rate={float(audit_plan.get('heuristic_top1_selected_rate', 0.0) or 0.0):.3f}, "
@@ -4840,6 +4844,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                         f"max_probability={dict(audit_plan.get('candidate_max_probability') or {})}, "
                         f"top2_gap={dict(audit_plan.get('candidate_top2_probability_gap') or {})}), "
                         f"score_audit={dict(audit_plan.get('score_audit') or {})}, "
+                        f"topk_audit={dict(audit_plan.get('topk_audit') or {})}, "
                         f"deterministic_top1_changed=(by_op={dict(audit_plan.get('deterministic_top1_changed') or {})}, "
                         f"rate={float(audit_plan.get('deterministic_top1_changed_rate', 0.0) or 0.0):.3f}), "
                         f"where_gumbel_audit={dict(audit_plan.get('where_gumbel_audit') or {})}, "
@@ -4852,6 +4857,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                         f"legacy_phase={float(audit_plan.get('behavior_exploration_phase', 1.0) or 0.0):.3f}, "
                         f"where_gumbel={float(audit_plan.get('effective_where_gumbel_scale', 0.0) or 0.0):.4f}, "
                         f"amount_gumbel={float(audit_plan.get('effective_amount_gumbel_scale', 0.0) or 0.0):.4f}), "
+                        f"gate_prob={dict(audit_plan.get('operation_gate_probabilities') or {})}, "
                         f"where_delta=(mean={float(audit_plan.get('delta_where_logit_mean', 0.0) or 0.0):.6g}, "
                         f"std={float(audit_plan.get('delta_where_logit_std', 0.0) or 0.0):.6g}, "
                         f"abs_max={float(audit_plan.get('delta_where_logit_abs_max', 0.0) or 0.0):.6g}), "

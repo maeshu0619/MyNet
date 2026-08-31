@@ -2497,6 +2497,12 @@ def parse_pugan_args(parser, file_day, file_time):
         help='離散Amount選択の温度',
     )
     parser.add_argument(
+        '--heuristic_guidance_online_amount_logit_std_cap',
+        default=0.35,
+        type=float,
+        help='Amount bin logitsの候補内標準偏差上限。argmax順位を変えずsoftmax飽和を防ぐ。0で無効',
+    )
+    parser.add_argument(
         '--heuristic_guidance_online_amount_gumbel_scale',
         default=2.0,
         type=float,
@@ -2630,9 +2636,9 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--heuristic_guidance_exact_anchor_steps',
-        default=1,
+        default=0,
         type=int,
-        help='先頭何stepのhard full-cloud voxel集合をden6 anchorと完全一致させるか。soft Network経路の勾配は維持する',
+        help='診断時に先頭何stepをden6完成planと完全一致させるか。通常訓練は0でNetwork方策を最初から実行する',
     )
     parser.add_argument(
         '--heuristic_guidance_final_prior_strength',
@@ -2657,6 +2663,12 @@ def parse_pugan_args(parser, file_day, file_time):
         default=0.50,
         type=float,
         help='固定validation改善時に段階拡大するPool内Network再順位付け重みの上限',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_network_to_heuristic_std_cap',
+        default=1.0,
+        type=float,
+        help='候補set内でNetwork score標準偏差をHeuristic成分の何倍まで許すか。0で上限制御なし',
     )
     parser.add_argument(
         '--heuristic_guidance_network_residual_weight_increment',
@@ -4018,7 +4030,7 @@ def parse_pugan_args(parser, file_day, file_time):
         int(getattr(args, "heuristic_guidance_distill_max_direction_sources", 4096)), 1
     )
     args.heuristic_guidance_exact_anchor_steps = max(
-        int(getattr(args, "heuristic_guidance_exact_anchor_steps", 1)),
+        int(getattr(args, "heuristic_guidance_exact_anchor_steps", 0)),
         0,
     )
     args.heuristic_guidance_final_prior_strength = min(max(
@@ -4034,6 +4046,9 @@ def parse_pugan_args(parser, file_day, file_time):
         float(getattr(args, "heuristic_guidance_network_residual_weight_max", 1.0)),
         args.heuristic_guidance_network_residual_weight,
     )
+    args.heuristic_guidance_network_to_heuristic_std_cap = max(float(getattr(
+        args, "heuristic_guidance_network_to_heuristic_std_cap", 1.0
+    )), 0.0)
     args.heuristic_guidance_network_residual_weight_increment = max(
         float(getattr(args, "heuristic_guidance_network_residual_weight_increment", 0.05)),
         0.0,
@@ -4101,6 +4116,9 @@ def parse_pugan_args(parser, file_day, file_time):
         float(getattr(args, "heuristic_guidance_online_amount_gumbel_scale", 2.0)),
         0.0,
     )
+    args.heuristic_guidance_online_amount_logit_std_cap = max(float(getattr(
+        args, "heuristic_guidance_online_amount_logit_std_cap", 0.35
+    )), 0.0)
     args.heuristic_guidance_online_policy_weight = max(
         float(getattr(args, "heuristic_guidance_online_policy_weight", 0.1)), 0.0
     )
@@ -4257,13 +4275,10 @@ def parse_pugan_args(parser, file_day, file_time):
             # codec-safe Pool内の弱い構造priorとして実測安全境界を残す。
             args.heuristic_guidance_final_where_weight = 0.01
         if not _cli_option_was_provided("--heuristic_guidance_exact_anchor_steps"):
-            # exact anchor planはNetworkが選んだplanではない。方策項だけdetachしても
-            # Surrogate/GeometryのSTEがdecision headを更新し、実測で次Stepを
-            # -3.59から-1.67へ壊したため、通常trainは最初からNetwork planを実行する。
-            # Step 1はframe baselineをActualで一度だけ校正し、train.py側で
-            # main optimizerを意図的にskipする。Step 2以降はNetwork planだけを
-            # 更新対象にする（Heuristic-only Aの性能をNetworkへ帰属しない）。
-            args.heuristic_guidance_exact_anchor_steps = 1
+            # 完成済みden6 planを通常trainのStep 1へ混ぜると、そのActual値が
+            # 未学習Networkの性能として記録される。anchorはA/B監査用の明示的な
+            # opt-inに限定し、通常trainは最初からPoolをNetworkで再順位付けする。
+            args.heuristic_guidance_exact_anchor_steps = 0
         if not _cli_option_was_provided("--heuristic_guidance_online_gumbel_scale"):
             # w_H=0.005時の旧Gumbel std≈0.032は候補集合の84.3%を無作為化し、
             # base=0.01でも73.3%を変更した。Poolから約2,000件を同時選ぶtop-kでは

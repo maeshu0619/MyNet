@@ -35,6 +35,7 @@ from models.utils.pointcloud.ana_den6_reference import (
     attach_ana_den6_reference_anchor,
 )
 from models.utils.pointcloud.ana_den6_online import attach_ana_den6_online_guidance
+from tools.ana_den6_online_worker import _compact_online_shortlist
 
 
 class _ActualCodecFixture(CompressionLossMixin):
@@ -418,6 +419,7 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
                 "total_ratio": 0.0025,
                 "operation_shares": {"Add": 0.4, "Prune": 0.4, "Adjust": 0.2},
                 "operation_priority": ["Prune", "Add", "Adjust"],
+                "shortlist_policy": "anchor_plus_stratified_rank_v1",
                 "operation_candidate_shortlists": {
                     "Add": [{**edit, "candidate_id": "A0", "operation": "Add", "remove_coords": [], "add_coords": [[2, 0, 0]]}],
                     "Prune": [edit],
@@ -1094,6 +1096,7 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         actuator.args = SimpleNamespace(
             _global_train_step=0,
             heuristic_guidance_anchor_steps=200,
+            heuristic_guidance_exact_anchor_steps=1,
             heuristic_guidance_network_residual_weight=0.5,
         )
         result = actuator._build_exact_den6_residual_plan(
@@ -1142,6 +1145,7 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         add_ratio = torch.tensor([[[0.0018]]], requires_grad=True)
         prune_ratio = torch.tensor([[[0.0007]]], requires_grad=True)
         adjust_ratio = torch.tensor([[[0.0003]]], requires_grad=True)
+        gate_logits = torch.tensor([[[0.2], [-0.1], [0.4]]], requires_grad=True)
         residual_result = actuator._build_exact_den6_residual_plan(
             guidance,
             coords,
@@ -1152,6 +1156,8 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
             torch.zeros((1, 1, coords.shape[-1])),
             torch.zeros((1, 26, coords.shape[-1])),
             torch.zeros((1, coords.shape[-1], 26)),
+            None,
+            gate_logits,
         )
         self.assertIsNotNone(residual_result)
         operation_residuals = residual_result[1]["operation_amount_mean_log_residuals"]
@@ -1159,13 +1165,18 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         self.assertEqual(len({round(value, 7) for value in operation_residuals.values()}), 3)
         operation_gradients = torch.autograd.grad(
             residual_result[1]["policy_log_prob"],
-            (add_ratio, prune_ratio, adjust_ratio),
+            (add_ratio, prune_ratio, adjust_ratio, gate_logits),
         )
         self.assertTrue(all(torch.isfinite(value).all() for value in operation_gradients))
         self.assertTrue(all(float(value.abs().sum()) > 0.0 for value in operation_gradients))
         self.assertEqual(
-            len({round(float(value.reshape(-1)[0]), 7) for value in operation_gradients}),
+            len({round(float(value.reshape(-1)[0]), 7) for value in operation_gradients[:3]}),
             3,
+        )
+        self.assertNotEqual(float(residual_result[1]["action_log_prob"].detach()), 0.0)
+        self.assertEqual(
+            set(residual_result[1]["operation_gate_probabilities"]),
+            {"Add", "Prune", "Adjust"},
         )
 
         # 固定validationで許可されたresidual weight拡大により、同じPool内で
@@ -1174,11 +1185,13 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         prune_map["rank_score"] = torch.tensor([0.55, 0.45])
         prune_map["source_index"] = torch.tensor([0, 2], dtype=torch.long)
         drop_preference = torch.zeros((1, 1, coords.shape[-1]))
-        drop_preference[0, 0, 0] = -10.0
-        drop_preference[0, 0, 2] = 10.0
+        # tanh固定scaleの飽和域外で順位反転と勾配を同時に検証する。
+        drop_preference[0, 0, 0] = -2.0
+        drop_preference[0, 0, 2] = 2.0
         drop_preference.requires_grad_()
         actuator.args.heuristic_guidance_network_residual_weight = 0.01
         actuator.args.heuristic_guidance_network_residual_weight_max = 0.25
+        actuator.args.heuristic_guidance_network_to_heuristic_std_cap = 0.0
         actuator.args._heuristic_guidance_network_residual_weight_current = 0.01
         low_autonomy = actuator._build_exact_den6_residual_plan(
             guidance,
@@ -1218,6 +1231,7 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         actuator.args = SimpleNamespace(
             _global_train_step=0,
             heuristic_guidance_anchor_steps=200,
+            heuristic_guidance_exact_anchor_steps=1,
             heuristic_guidance_amount_residual_fraction=0.50,
             heuristic_guidance_amount_min_residual=0.0001,
             heuristic_guidance_amount_grad_scale=1.0,
@@ -1238,6 +1252,62 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         values["Prune"].backward()
         self.assertTrue(torch.isfinite(network_ratio.grad).all())
         self.assertGreater(float(network_ratio.grad.abs().sum()), 0.0)
+
+    def test_den6_normal_training_uses_network_amount_at_step_zero(self):
+        """anchor=0ではStep 0にも教師Amountをhard forwardへ混ぜない。"""
+        actuator = StructureRepairActuator.__new__(StructureRepairActuator)
+        actuator.args = SimpleNamespace(
+            heuristic_guidance_mode="ana_den6_online",
+            _global_train_step=0,
+            heuristic_guidance_exact_anchor_steps=0,
+            heuristic_guidance_amount_expansion=4.0,
+        )
+        guidance = {"amount_prior": {"Prune": 0.0010}}
+        network_ratio = torch.tensor([[[0.25]]], requires_grad=True)
+        value = actuator._apply_heuristic_amount_guidance(
+            network_ratio, guidance, "Prune", 0.30
+        )
+        self.assertNotAlmostEqual(float(value.detach()), 0.0010, places=7)
+        value.backward()
+        self.assertGreater(float(network_ratio.grad.abs().sum()), 0.0)
+
+    def test_den6_shortlist_keeps_anchor_and_samples_deep_ranks(self):
+        pool = [
+            {"candidate_id": f"p{index}", "pool_rank": index}
+            for index in range(40)
+        ]
+        shortlist = _compact_online_shortlist(pool, {"p0", "p3"}, 10)
+        ids = {row["candidate_id"] for row in shortlist}
+        ranks = [int(row["pool_rank"]) for row in shortlist]
+        self.assertEqual(len(shortlist), 10)
+        self.assertTrue({"p0", "p3"}.issubset(ids))
+        self.assertGreaterEqual(max(ranks), 35)
+
+    def test_den6_add_candidate_uses_negative_raw_logits_without_zero_collapse(self):
+        actuator = StructureRepairActuator.__new__(StructureRepairActuator)
+        actuator.args = SimpleNamespace(heuristic_guidance_network_score_scale=1.0)
+        guidance = {"candidate_tensor_map": {
+            "Add": {
+                "rank_score": torch.tensor([1.0, 0.5]),
+                "pair_candidate_index": torch.tensor([0, 1]),
+                "pair_source_index": torch.tensor([0, 1]),
+                "pair_direction_index": torch.tensor([0, 0]),
+            },
+            "Prune": {"rank_score": torch.tensor([])},
+            "Adjust": {"rank_score": torch.tensor([])},
+        }}
+        add_logits = torch.full((1, 2, 26), -9.0)
+        add_logits[0, 0, 0] = -4.0
+        add_logits[0, 1, 0] = -2.0
+        _, raw = actuator._exact_den6_candidate_scores(
+            guidance,
+            torch.zeros((1, 1, 2)),
+            torch.zeros((1, 1, 2)),
+            torch.zeros((1, 26, 2)),
+            add_logits,
+            return_raw=True,
+        )
+        self.assertTrue(torch.equal(raw["Add"], torch.tensor([-4.0, -2.0])))
 
     def test_unique_plan_cache_still_explores_edit_unit_pool_after_exact_anchor(self):
         """完成planが1個でも、余剰edit-unit候補があればWhere探索を止めない。"""

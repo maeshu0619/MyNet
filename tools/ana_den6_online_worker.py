@@ -203,11 +203,21 @@ def _compact_online_shortlist(
     selected_ids: set[str],
     limit: int,
 ) -> list[dict[str, Any]]:
-    """Step 0の選択候補を必ず残し、rank近傍だけをonline residual用に保持する。"""
+    """Anchorを残しつつ同じ件数で深い順位帯も含むNetwork候補Poolを作る。"""
     selected = [item for item in pool if str(item.get("candidate_id", "")) in selected_ids]
     if len(selected) != len(selected_ids) or len(selected) > int(limit):
         raise RuntimeError("online shortlistが初期den6 planを完全に保持できない")
     keep_ids = {str(item.get("candidate_id", "")) for item in selected}
+    remaining = max(int(limit) - len(keep_ids), 0)
+    # 旧実装は先頭limit件だけを保持したため、数千候補あっても全てが
+    # Heuristic Top帯の同質候補だった。保持件数とStep時のGPU costは変えず、
+    # build済み順位全域から等間隔に採り、Networkが質の差を学べるPoolにする。
+    if remaining > 0 and pool:
+        denominator = max(remaining - 1, 1)
+        for slot in range(remaining):
+            rank = int(round(slot * (len(pool) - 1) / denominator))
+            keep_ids.add(str(pool[rank].get("candidate_id", "")))
+    # anchorとの重複で不足した場合だけ上位から埋める。
     for item in pool:
         if len(keep_ids) >= int(limit):
             break
@@ -622,7 +632,10 @@ def main() -> int:
         # 1つのplanを作るために必要な候補だけを生成する。旧既定8192件×3操作は、
         # 約1900 actionの一意planに対して過剰だった。衝突回避用に25%だけ内部余裕を持つ。
         configured_limit = max(int(cli.full_pool_limit_per_operation), 0)
-        build_reserve = max(float(cli.compact_reserve_factor), 1.25)
+        # runtimeで保持する件数はcompact_reserve_factorのまま、候補生成時だけ
+        # 2倍の順位深度を見てstratified shortlistを作る。Actual encode回数と
+        # 毎Stepのtensor数は増やさない。
+        build_reserve = max(float(cli.compact_reserve_factor) * 2.0, 1.25)
         # 先行操作との衝突により、件数の少ないAdjustでも元順位を深く読む。
         # そのため操作別countではなく3操作中の最大countを共通基準にする。
         common_required = max(
@@ -738,6 +751,7 @@ def main() -> int:
                 full_serialized_pools if bool(cli.persist_full_pools) else None
             ),
             "shortlist_limits": shortlist_limits,
+            "shortlist_policy": "anchor_plus_stratified_rank_v1",
             "full_pool_counts": {name: len(full_serialized_pools[name]) for name in OPERATIONS},
             "pool_diagnostics": diagnostics,
             "initial_heuristic_plan": initial_plan,

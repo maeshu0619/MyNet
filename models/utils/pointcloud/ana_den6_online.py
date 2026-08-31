@@ -436,7 +436,7 @@ def _load_exact_single_plan_teacher(
     )), 1.0), 4.0)
 
     exact_identity_key = "|".join((
-            "exact_single_plan_teacher_v8",
+            "exact_single_plan_teacher_v9_stratified",
             str(identity["input_sha256"]),
             str(identity["dataset"]),
             str(identity["setting_id"]),
@@ -492,6 +492,8 @@ def _load_exact_single_plan_teacher(
             continue
         if str(candidate.get("source", "")) not in allowed_sources:
             continue
+        if str(candidate.get("shortlist_policy", "")) != "anchor_plus_stratified_rank_v1":
+            continue
         if str(candidate.get("input_sha256", "")) != str(identity["input_sha256"]):
             continue
         candidate_setting = str(candidate.get("setting_id", ""))
@@ -533,13 +535,22 @@ def _load_exact_single_plan_teacher(
         teacher["operation_edit_units"] = dict(edit_units)
         teacher["heuristic_anchor_plan"] = dict(anchor_plan)
         teacher["legacy_den6_source"] = str(candidate.get("source", ""))
+        # Downstream formula contract remains v8; the cache identity/policy above
+        # independently invalidates旧top-prefix shortlist.
         teacher["source"] = "ana_den6_exact_single_plan_teacher_online_v8"
         teacher["proposal_policy"] = "one_where_amount_action_per_step"
         teacher["full_plan_candidate_count"] = 1
         teacher["actual_candidate_encode_count"] = 0
         teacher["cache_path"] = str(path)
+        cache_stat = path.stat()
         teacher["cache_signature"] = hashlib.sha256(
-            (str(path.resolve()) + "|" + str(identity["input_sha256"])).encode("utf-8")
+            "|".join((
+                str(path.resolve()),
+                str(identity["input_sha256"]),
+                str(candidate.get("shortlist_policy", "")),
+                str(int(cache_stat.st_size)),
+                str(int(cache_stat.st_mtime_ns)),
+            )).encode("utf-8")
         ).hexdigest()
         store_memory(path, teacher)
         if bool(getattr(args, "_ana_den6_online_fresh_build_load", False)):
