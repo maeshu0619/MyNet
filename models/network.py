@@ -834,6 +834,24 @@ class Network(nn.Module):
         policy_core_raw = -advantage * log_prob.float().mean()
         policy_core_weighted = weight * policy_core_raw
         policy_loss = policy_core_weighted
+        candidate_local_credit = state.get(
+            "den6_online_candidate_local_credit_loss", None
+        )
+        candidate_local_credit_weighted = objective.new_zeros(())
+        if (
+            mode == "ana_den6_online"
+            and torch.is_tensor(candidate_local_credit)
+            and candidate_local_credit.requires_grad
+        ):
+            local_weight = max(float(getattr(
+                self.args,
+                "heuristic_guidance_online_candidate_local_credit_weight",
+                1.0,
+            )), 0.0)
+            candidate_local_credit_weighted = (
+                float(local_weight) * candidate_local_credit.float().mean()
+            )
+            policy_loss = policy_loss + candidate_local_credit_weighted
         entropy_raw = entropy.float().mean() if torch.is_tensor(entropy) else objective.new_zeros(())
         entropy_weighted = -entropy_weight * entropy_raw
         if torch.is_tensor(entropy):
@@ -980,6 +998,12 @@ class Network(nn.Module):
             "entropy": float(entropy.detach().float().mean().cpu()) if torch.is_tensor(entropy) else 0.0,
             "policy_core_raw": float(policy_core_raw.detach().cpu()),
             "policy_core_weighted": float(policy_core_weighted.detach().cpu()),
+            "candidate_local_credit_raw": float(
+                candidate_local_credit.detach().float().mean().cpu()
+            ) if torch.is_tensor(candidate_local_credit) else 0.0,
+            "candidate_local_credit_weighted": float(
+                candidate_local_credit_weighted.detach().cpu()
+            ),
             "entropy_raw": float(entropy_raw.detach().cpu()),
             "entropy_weighted": float(entropy_weighted.detach().cpu()),
             "geometry_policy_guard_passed": bool(geometry_guard_passed),
@@ -4505,6 +4529,7 @@ class Network(nn.Module):
                 "den6_online_where_log_prob",
                 "den6_online_amount_log_prob",
                 "den6_online_action_log_prob",
+                "den6_online_candidate_local_credit_loss",
                 "network_only_direction_log_prob",
                 "network_only_direction_entropy",
                 "network_only_total_ratio_raw",

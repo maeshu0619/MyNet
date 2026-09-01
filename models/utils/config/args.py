@@ -2515,6 +2515,12 @@ def parse_pugan_args(parser, file_day, file_time):
         help='actual結果からWhere/Amount/Actionへ返すpolicy-gradient損失重み。主損失を支配しないよう既定値は0.1',
     )
     parser.add_argument(
+        '--heuristic_guidance_online_candidate_local_credit_weight',
+        default=1.0,
+        type=float,
+        help='既存codec-context/geometry attributionから作るcandidate-local RD損失重み。Actual encode回数は増やさない',
+    )
+    parser.add_argument(
         '--heuristic_guidance_online_policy_backward_scale',
         default=10.0,
         type=float,
@@ -4121,6 +4127,14 @@ def parse_pugan_args(parser, file_day, file_time):
     )), 0.0)
     args.heuristic_guidance_online_policy_weight = max(
         float(getattr(args, "heuristic_guidance_online_policy_weight", 0.1)), 0.0
+    )
+    args.heuristic_guidance_online_candidate_local_credit_weight = max(
+        float(getattr(
+            args,
+            "heuristic_guidance_online_candidate_local_credit_weight",
+            1.0,
+        )),
+        0.0,
     )
     args.heuristic_guidance_online_policy_backward_scale = max(
         float(getattr(

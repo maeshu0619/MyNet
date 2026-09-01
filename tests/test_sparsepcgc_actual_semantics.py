@@ -1179,7 +1179,7 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
             {"Add", "Prune", "Adjust"},
         )
 
-        # 固定validationで許可されたresidual weight拡大により、同じPool内で
+        # Network-primary rankingは旧autonomy外部重みに依存せず、同じPool内で
         # den6順位差をNetwork scoreが逆転できることを確認する。
         prune_map = guidance["candidate_tensor_map"]["Prune"]
         prune_map["rank_score"] = torch.tensor([0.55, 0.45])
@@ -1189,6 +1189,7 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         drop_preference[0, 0, 0] = -2.0
         drop_preference[0, 0, 2] = 2.0
         drop_preference.requires_grad_()
+        prune_gate = torch.tensor([[[5.0], [-5.0], [-5.0]]])
         actuator.args.heuristic_guidance_network_residual_weight = 0.01
         actuator.args.heuristic_guidance_network_residual_weight_max = 0.25
         actuator.args.heuristic_guidance_network_to_heuristic_std_cap = 0.0
@@ -1203,6 +1204,8 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
             torch.zeros((1, 1, coords.shape[-1])),
             torch.zeros((1, 26, coords.shape[-1])),
             torch.zeros((1, coords.shape[-1], 26)),
+            None,
+            prune_gate,
         )
         actuator.args._heuristic_guidance_network_residual_weight_current = 0.25
         high_autonomy = actuator._build_exact_den6_residual_plan(
@@ -1215,10 +1218,12 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
             torch.zeros((1, 1, coords.shape[-1])),
             torch.zeros((1, 26, coords.shape[-1])),
             torch.zeros((1, coords.shape[-1], 26)),
+            None,
+            prune_gate,
         )
-        self.assertIn("p0", low_autonomy[1]["selected_candidate_ids"])
+        self.assertIn("p1", low_autonomy[1]["selected_candidate_ids"])
         self.assertIn("p1", high_autonomy[1]["selected_candidate_ids"])
-        self.assertNotEqual(low_autonomy[1]["plan_hash"], high_autonomy[1]["plan_hash"])
+        self.assertEqual(low_autonomy[1]["plan_hash"], high_autonomy[1]["plan_hash"])
         where_gradient = torch.autograd.grad(
             high_autonomy[1]["policy_log_prob"], drop_preference
         )[0]
@@ -1414,7 +1419,9 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
                 if candidate_id.startswith("p")
             )
             selected_amount_bins.add(result[1]["amount_bin_ratio"])
-        self.assertEqual(selected_prune, {"p0", "p1"})
+        # Score-relative exploration does not deliberately select a clearly
+        # lower-valued candidate merely because training is early.
+        self.assertEqual(selected_prune, {"p0"})
         # anchor後のcoarse Amount探索にanchor移行係数を二重適用しない。
         # 修正前はここが12回すべて0.0025だった。
         self.assertGreater(len(selected_amount_bins), 1)

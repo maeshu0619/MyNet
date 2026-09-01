@@ -3429,13 +3429,18 @@ class StructureRepairActuator(nn.Module):
     
     @staticmethod
     def _den6_allocate_counts(total_budget, shares):
-        """ana_den6._allocate_countsと同じ端数処理で3操作へbudgetを配分する。"""
+        """Allocate an integer budget while allowing an operation to be zero.
+
+        A non-empty total plan is still guaranteed, but Add/Prune/Adjust are no
+        longer forced to appear once each.  This is required for the learned
+        operation gate to causally control the executed operation mix.
+        """
         operations = ("Add", "Prune", "Adjust")
-        total_budget = max(int(total_budget), len(operations))
+        total_budget = max(int(total_budget), 1)
         raw = {name: total_budget * float(shares[name]) for name in operations}
-        counts = {name: max(1, int(math.floor(raw[name]))) for name in operations}
+        counts = {name: max(0, int(math.floor(raw[name]))) for name in operations}
         while sum(counts.values()) > total_budget:
-            reducible = [name for name in operations if counts[name] > 1]
+            reducible = [name for name in operations if counts[name] > 0]
             if not reducible:
                 break
             name = min(reducible, key=lambda key: (raw[key] - math.floor(raw[key]), counts[key]))
@@ -3647,16 +3652,16 @@ class StructureRepairActuator(nn.Module):
         max_changed_ratio = min(max(float(
             getattr(self.args, "heuristic_guidance_online_max_changed_ratio", 0.0099)
         ), 0.0), 0.0099)
-        # Add/Prune/Adjustを最低1件ずつ含めるには3操作・4変更cellが必要である。
-        # 小点群で1%未満を破る暗黙fallbackは行わず、条件矛盾として停止する。
-        if online_mode and int(math.floor(point_count * max_total_ratio)) < 3:
+        # A plan needs at least one executable edit, but individual operation
+        # families may be zero because their counts are owned by the Gate.
+        if online_mode and int(math.floor(point_count * max_total_ratio)) < 1:
             raise RuntimeError(
-                "ana_den6 onlineで3操作を維持しつつ総操作率1%未満にできない: "
+                "ana_den6 onlineで1操作を維持しつつ総操作率1%未満にできない: "
                 f"voxel_count={point_count}, max_total_ratio={max_total_ratio}"
             )
-        if online_mode and int(math.floor(point_count * max_changed_ratio)) < 4:
+        if online_mode and int(math.floor(point_count * max_changed_ratio)) < 1:
             raise RuntimeError(
-                "ana_den6 onlineでAdd/Prune/Adjustを維持しつつ変更Voxel率1%未満にできない: "
+                "ana_den6 onlineで1操作を維持しつつ変更Voxel率1%未満にできない: "
                 f"voxel_count={point_count}, max_changed_ratio={max_changed_ratio}"
             )
 
@@ -3777,25 +3782,32 @@ class StructureRepairActuator(nn.Module):
                     f"selector={int(selector.numel())}, bins={int(bin_tensor.numel())}"
                 )
             amount_logits_uncalibrated = selector.float() / amount_temperature
-            # shared backboneの1回の更新でbin logitsが飽和すると、後続
-            # Stepのselector勾配が消えて同じbinに固定される。候補内の
-            # scaleだけをdetached係数で上限校正し、argmax順位と全binの
-            # 勾配経路は保つ。特定binやActual結果は参照しない。
+            # Softmax is shift invariant, so remove the unidentifiable common
+            # offset.  Bound the *forward logits* differentiably rather than
+            # multiplying by a detached inverse std: the old calibration kept
+            # the probabilities finite but still let the selector parameter
+            # norm grow from 4.85 to 98.7.
+            amount_logits_centered = (
+                amount_logits_uncalibrated - amount_logits_uncalibrated.mean()
+            )
             amount_logit_calibration_scale = 1.0
             amount_logit_std_cap = max(float(getattr(
                 self.args, "heuristic_guidance_online_amount_logit_std_cap", 0.35
             )), 0.0)
-            if amount_logit_std_cap > 0.0 and int(amount_logits_uncalibrated.numel()) > 1:
-                amount_logit_std = float(
-                    amount_logits_uncalibrated.detach().std(unbiased=False).cpu()
+            if amount_logit_std_cap > 0.0:
+                amount_logits = amount_logit_std_cap * torch.tanh(
+                    amount_logits_centered / amount_logit_std_cap
                 )
-                if amount_logit_std > amount_logit_std_cap:
-                    amount_logit_calibration_scale = (
-                        amount_logit_std_cap / amount_logit_std
-                    )
-            amount_logits = (
-                amount_logits_uncalibrated * float(amount_logit_calibration_scale)
-            )
+            else:
+                amount_logits = amount_logits_centered
+            uncalibrated_std = float(
+                amount_logits_centered.detach().std(unbiased=False).cpu()
+            ) if int(amount_logits_centered.numel()) > 1 else 0.0
+            calibrated_std = float(
+                amount_logits.detach().std(unbiased=False).cpu()
+            ) if int(amount_logits.numel()) > 1 else 0.0
+            if uncalibrated_std > 0.0:
+                amount_logit_calibration_scale = calibrated_std / uncalibrated_std
         else:
             # 単体再生・legacy manifest用。通常trainでは上の既存Network headを使う。
             amount_logits = -torch.abs(
@@ -3886,13 +3898,41 @@ class StructureRepairActuator(nn.Module):
                 fine_log_prob = fine_mean.new_zeros(())
             operation_fine_samples[name] = fine_sample
             operation_fine_log_probs[name] = fine_log_prob
+
+        # The operation gate must precede requested_counts.  Heuristic shares
+        # are a safety prior; centered Network logits are a learnable residual
+        # that can override that prior without an Episode-dependent handoff.
+        prior_share_tensor = coarse_total_ratio.new_tensor([
+            prior_shares[name] / prior_share_sum for name in operations
+        ]).clamp_min(torch.finfo(coarse_total_ratio.dtype).eps)
+        if torch.is_tensor(operation_gate_logits) and int(operation_gate_logits.numel()) >= 3:
+            # gate head order: Prune/Add/Adjust; den6 order: Add/Prune/Adjust.
+            gate_logits_flat = operation_gate_logits.float().reshape(
+                operation_gate_logits.shape[0], 3, -1
+            ).mean(dim=(0, 2))
+            gate_logits_den6 = torch.stack([
+                gate_logits_flat[1], gate_logits_flat[0], gate_logits_flat[2]
+            ])
+            gate_residual = gate_logits_den6 - gate_logits_den6.mean()
+            gate_combined_logits = prior_share_tensor.log() + gate_residual
+            gate_log_probs = torch.log_softmax(gate_combined_logits, dim=0)
+            gate_probs = gate_log_probs.exp()
+        else:
+            gate_combined_logits = prior_share_tensor.log()
+            gate_log_probs = torch.log_softmax(gate_combined_logits, dim=0)
+            gate_probs = gate_log_probs.exp()
+        # Exact anchor is a measurement-only replay.  It must retain its cached
+        # counts and must not give the Network credit for the heuristic plan.
+        operation_share_for_plan = (
+            prior_share_tensor if exact_anchor_active else gate_probs
+        )
         sampled_ratio_tensors = {
             name: (
                 coarse_total_ratio
-                * coarse_total_ratio.new_tensor(prior_shares[name] / prior_share_sum)
+                * operation_share_for_plan[index]
                 * torch.exp(operation_fine_samples[name])
             )
-            for name in operations
+            for index, name in enumerate(operations)
         }
         sampled_total_ratio = sum(sampled_ratio_tensors.values())
         amount_bin_log_prob = amount_log_probs[selected_amount_bin]
@@ -3911,7 +3951,11 @@ class StructureRepairActuator(nn.Module):
                 name: value * float(scale) for name, value in sampled_ratio_tensors.items()
             }
             sampled_total_ratio = sum(sampled_ratio_tensors.values())
-        sampled_total_value = max(float(sampled_total_ratio.detach().cpu()), 3.0 / float(point_count))
+        minimum_plan_count = len(operations) if exact_anchor_active else 1
+        sampled_total_value = max(
+            float(sampled_total_ratio.detach().cpu()),
+            float(minimum_plan_count) / float(point_count),
+        )
         sampled_total_value = min(sampled_total_value, max_total_ratio)
 
         shares_value = {
@@ -3919,18 +3963,30 @@ class StructureRepairActuator(nn.Module):
             / max(sampled_total_value, 1e-12)
             for name in operations
         }
-        total_budget = max(3, int(math.ceil(float(point_count) * sampled_total_value)))
-        total_budget = min(total_budget, max(int(math.floor(point_count * max_total_ratio)), 3))
+        total_budget = max(
+            minimum_plan_count,
+            int(math.ceil(float(point_count) * sampled_total_value)),
+        )
+        total_budget = min(
+            total_budget,
+            max(int(math.floor(point_count * max_total_ratio)), minimum_plan_count),
+        )
         requested_counts = self._den6_allocate_counts(total_budget, shares_value)
         for name in operations:
-            requested_counts[name] = min(max(int(requested_counts[name]), 1), len(pools[name]))
+            requested_counts[name] = min(max(int(requested_counts[name]), 0), len(pools[name]))
 
         # Adjustはremove+addの2 cellを変えるため、変更Voxel cell比も1%未満に制限する。
-        max_changed_cells = max(int(math.floor(point_count * max_changed_ratio)), 3)
+        minimum_changed_cells = 4 if exact_anchor_active else 1
+        max_changed_cells = max(
+            int(math.floor(point_count * max_changed_ratio)), minimum_changed_cells
+        )
         def changed_cells(counts):
             return int(counts["Add"] + counts["Prune"] + 2 * counts["Adjust"])
         while changed_cells(requested_counts) > max_changed_cells:
-            reducible = [name for name in operations if requested_counts[name] > 1]
+            reducible = [
+                name for name in operations
+                if requested_counts[name] > (1 if exact_anchor_active else 0)
+            ]
             if not reducible:
                 break
             operation = max(
@@ -3950,37 +4006,18 @@ class StructureRepairActuator(nn.Module):
             add_pair_logits,
             return_raw=True,
         )
-        residual_weight_start = max(
-            float(getattr(self.args, "heuristic_guidance_network_residual_weight", 0.25)),
-            0.0,
-        )
-        residual_weight_max = max(
-            float(getattr(
-                self.args,
-                "heuristic_guidance_network_residual_weight_max",
-                1.0,
-            )),
-            residual_weight_start,
-        )
-        # 候補Actual比較は増やさず、固定validationで確認済みの範囲だけ
-        # Networkがden6 Pool全体を再順位付けできる。
-        residual_weight = min(
-            max(
-                float(getattr(
-                    self.args,
-                    "_heuristic_guidance_network_residual_weight_current",
-                    residual_weight_start,
-                )),
-                residual_weight_start,
-            ),
-            residual_weight_max,
-        )
+        # Network scores already have a bounded, operation-local calibration.
+        # A second 0.15 multiplier and a heuristic-std cap made the heuristic
+        # scale the final authority.  Unit Network scale is used for ranking;
+        # the legacy fields remain as audit aliases only.
+        residual_weight_start = 1.0
+        residual_weight_max = 1.0
+        residual_weight = 1.0
         temperature = max(float(
             getattr(self.args, "heuristic_guidance_online_where_temperature", 0.75)
         ), 0.05)
-        gumbel_scale = max(float(
-            getattr(self.args, "heuristic_guidance_online_gumbel_scale", 0.10)
-        ), 0.0) * float(exploration_multiplier)
+        gumbel_scale_ratio = max(float(exploration_multiplier), 0.0)
+        gumbel_scales = []
         heuristic_prior_weight = (
             1.0
             if exact_anchor_active
@@ -4000,6 +4037,9 @@ class StructureRepairActuator(nn.Module):
         gumbel_audit = {}
         topk_audit = {}
         network_terms = {}
+        candidate_local_losses = []
+        candidate_utility_correlations = {}
+        candidate_utility_audit = {}
 
         def _score_stats(value):
             finite = value.detach().float()[torch.isfinite(value.detach().float())]
@@ -4019,23 +4059,9 @@ class StructureRepairActuator(nn.Module):
                 return None
             heuristic_term = float(heuristic_prior_weight) * rank_score.float()
             network_term_uncalibrated = (
-                float(candidate_policy_alpha)
-                * float(residual_weight)
-                * network_scores[operation]
+                float(candidate_policy_alpha) * network_scores[operation]
             )
             calibration_scale = 1.0
-            std_cap = max(float(getattr(
-                self.args, "heuristic_guidance_network_to_heuristic_std_cap", 1.0
-            )), 0.0)
-            if std_cap > 0.0 and int(network_term_uncalibrated.numel()) > 1:
-                heuristic_std_tensor = heuristic_term.detach().float().std(unbiased=False)
-                network_std_tensor = network_term_uncalibrated.detach().float().std(unbiased=False)
-                heuristic_std_value = float(heuristic_std_tensor.cpu())
-                network_std_value = float(network_std_tensor.cpu())
-                if network_std_value > heuristic_std_value * std_cap > 0.0:
-                    calibration_scale = (
-                        heuristic_std_value * std_cap / network_std_value
-                    )
             network_term = network_term_uncalibrated * float(calibration_scale)
             network_terms[operation] = network_term
             logits = heuristic_term + network_term
@@ -4057,6 +4083,40 @@ class StructureRepairActuator(nn.Module):
                 )
             else:
                 policy_logits = logits
+            utility_target = mapping.get("local_utility_target")
+            if (
+                torch.is_tensor(utility_target)
+                and int(utility_target.numel()) == int(policy_logits.numel())
+            ):
+                utility_target = utility_target.to(
+                    device=policy_logits.device, dtype=policy_logits.dtype
+                )
+                local_valid = torch.isfinite(policy_logits) & torch.isfinite(utility_target)
+                if bool(local_valid.any()):
+                    local_prediction = network_scores[operation][local_valid]
+                    local_target = 0.5 * torch.tanh(utility_target[local_valid])
+                    candidate_local_losses.append(
+                        torch.nn.functional.smooth_l1_loss(
+                            local_prediction, local_target.detach()
+                        )
+                    )
+                    pred_centered = local_prediction.detach().float()
+                    pred_centered = pred_centered - pred_centered.mean()
+                    target_centered = local_target.detach().float()
+                    target_centered = target_centered - target_centered.mean()
+                    denominator = (
+                        pred_centered.square().sum().sqrt()
+                        * target_centered.square().sum().sqrt()
+                    )
+                    candidate_utility_correlations[operation] = (
+                        float((pred_centered * target_centered).sum().cpu())
+                        / max(float(denominator.cpu()), 1e-12)
+                    )
+                    candidate_utility_audit[operation] = {
+                        "target": _score_stats(local_target),
+                        "prediction": _score_stats(local_prediction),
+                        "valid_count": int(local_valid.sum().detach().cpu()),
+                    }
             combined_logits[operation] = policy_logits
             valid_for_top1 = torch.isfinite(policy_logits)
             heuristic_for_top1 = heuristic_term.masked_fill(
@@ -4126,15 +4186,21 @@ class StructureRepairActuator(nn.Module):
             if exploration_active:
                 uniform = torch.rand_like(scaled_logits).clamp_(1e-8, 1.0 - 1e-8)
                 gumbel = -torch.log(-torch.log(uniform))
-                # anchor直後から全順位をGumbelで無作為化するとden6の-4% planを
-                # 即座に破壊しないよう既存の小さいgumbel_scaleを使う。ただし、
-                # Where探索をAmount用anchor係数で再び0へ潰さない。
+                finite_scaled = scaled_logits.detach()[
+                    torch.isfinite(scaled_logits.detach())
+                ]
+                score_std = (
+                    float(finite_scaled.std(unbiased=False).cpu())
+                    if int(finite_scaled.numel()) > 1 else 0.0
+                )
+                operation_gumbel_scale = score_std * float(gumbel_scale_ratio)
+                gumbel_scales.append(operation_gumbel_scale)
                 order_score = (
                     scaled_logits
-                    + gumbel * float(gumbel_scale) * float(candidate_policy_alpha)
+                    + gumbel * float(operation_gumbel_scale)
                 ).detach()
                 gumbel_audit[operation] = _score_stats(
-                    gumbel * float(gumbel_scale) * float(candidate_policy_alpha)
+                    gumbel * float(operation_gumbel_scale)
                 )
             else:
                 order_score = scaled_logits.detach()
@@ -4150,13 +4216,34 @@ class StructureRepairActuator(nn.Module):
                 order_tensor = torch.argsort(order_score - tie_break * 1e-12, descending=True)
             ordered_indices[operation] = order_tensor.cpu().tolist()
 
-        # operation order/6 variantはden6内部のplan構築結果であり、Networkの
-        # 独立Actionにはしない。cacheに保存されたpriorityを全Stepで再利用する。
+        candidate_local_loss = (
+            torch.stack(candidate_local_losses).mean()
+            if candidate_local_losses
+            else next(iter(network_scores.values())).new_zeros(())
+        )
+        gumbel_scale = (
+            sum(gumbel_scales) / float(len(gumbel_scales))
+            if gumbel_scales else 0.0
+        )
+
+        # Gate share controls conflict priority as well as requested counts.
+        # The cached heuristic order remains only a deterministic tie-break.
         priority = tuple(exact.get("operation_priority") or operations)
         if set(priority) != set(operations):
             priority = operations
         action_ratio_stack = torch.stack([sampled_ratio_tensors[name] for name in operations])
-        operation_order = priority
+        priority_index = {name: index for index, name in enumerate(priority)}
+        operation_order = (
+            priority
+            if exact_anchor_active
+            else tuple(sorted(
+                operations,
+                key=lambda name: (
+                    -float(gate_probs[operations.index(name)].detach().cpu()),
+                    priority_index[name],
+                ),
+            ))
+        )
 
         # 1Stepにつき、この1回の順序・1回の候補sampleから1planだけを構築する。
         # 初回候補写像時にGT occupied適合性を厳密に保存済みなら、100万Voxelを
@@ -4205,9 +4292,9 @@ class StructureRepairActuator(nn.Module):
                 selected_counts[operation] += 1
 
         # 衝突で要求数に届かなくても別pattern探索は行わず、同じsample内の到達planを使う。
-        if any(selected_counts[name] <= 0 for name in operations):
+        if sum(selected_counts.values()) <= 0:
             raise RuntimeError(
-                "ana_den6 onlineの1sample planでAdd/Prune/Adjustのいずれかを1件も選べない: "
+                "ana_den6 onlineの1sample planで有効候補を1件も選べない: "
                 f"requested={requested_counts}, selected={selected_counts}"
             )
 
@@ -4267,29 +4354,107 @@ class StructureRepairActuator(nn.Module):
         # coarse selectorをoperation数+1で希釈しない。旧meanでは後半の
         # fine exploration=0時に実質1/4となり、Geometry creditが消えていた。
         amount_log_prob = amount_bin_log_prob + amount_fine_log_prob
-        # 3操作を候補Poolから消すhard gateには戻さないが、Network gateは
-        # 実際に選ばれた操作配分へ直接creditを受ける。旧実装の定数0では
-        # gate headはWhere/Amountの偶発的な経路にしか学習信号を持たなかった。
-        action_entropy = action_ratio_stack.new_zeros(())
-        if torch.is_tensor(operation_gate_logits) and int(operation_gate_logits.numel()) >= 3:
-            # gate headの順序はPrune/Add/Adjust、den6の順序はAdd/Prune/Adjust。
-            gate_logits_flat = operation_gate_logits.float().reshape(
-                operation_gate_logits.shape[0], 3, -1
-            ).mean(dim=(0, 2))
-            gate_logits_den6 = torch.stack([
-                gate_logits_flat[1], gate_logits_flat[0], gate_logits_flat[2]
+        # ``gate_probs`` already caused requested_counts above.  Its log-prob
+        # now describes the executed allocation instead of post-hoc imitation.
+        selected_share = gate_probs.new_tensor([
+            float(selected_counts[name]) for name in operations
+        ])
+        selected_share = selected_share / selected_share.sum().clamp_min(1.0)
+        action_log_prob = (selected_share.detach() * gate_log_probs).sum()
+        action_entropy = -(gate_probs * gate_log_probs).sum()
+
+        # Cross-operation local utility is computed from the same cached rate
+        # attribution and geometry risk, standardized over all operation pools.
+        # This supplies low-variance Gate and Amount credit without any extra
+        # SparsePCGC encode.
+        local_rate_by_op = {}
+        local_geometry_by_op = {}
+        for name in operations:
+            mapping = guidance.get("candidate_tensor_map", {}).get(name, {})
+            rate_value = mapping.get("local_rate_benefit")
+            geometry_value = mapping.get("local_geometry_risk")
+            if torch.is_tensor(rate_value) and torch.is_tensor(geometry_value):
+                local_rate_by_op[name] = rate_value.to(
+                    device=gate_probs.device, dtype=gate_probs.dtype
+                )
+                local_geometry_by_op[name] = geometry_value.to(
+                    device=gate_probs.device, dtype=gate_probs.dtype
+                )
+        operation_local_loss = gate_probs.new_zeros(())
+        amount_local_loss = gate_probs.new_zeros(())
+        operation_utility_target = gate_probs.detach()
+        amount_utility_target = amount_prob.detach()
+        if len(local_rate_by_op) == len(operations):
+            all_rate = torch.cat([local_rate_by_op[name] for name in operations])
+            all_geometry = torch.cat([
+                local_geometry_by_op[name] for name in operations
             ])
-            gate_log_probs = torch.log_softmax(gate_logits_den6, dim=0)
-            gate_probs = gate_log_probs.exp()
-            selected_share = gate_probs.new_tensor([
-                float(selected_counts[name]) for name in operations
-            ])
-            selected_share = selected_share / selected_share.sum().clamp_min(1.0)
-            action_log_prob = (selected_share.detach() * gate_log_probs).sum()
-            action_entropy = -(gate_probs * gate_log_probs).sum()
-        else:
-            gate_probs = action_ratio_stack.detach()
-            action_log_prob = action_ratio_stack.new_zeros(())
+
+            def _global_standardize(value):
+                centered = value - value.mean()
+                return centered / centered.square().mean().sqrt().clamp_min(
+                    torch.finfo(value.dtype).eps
+                )
+
+            rate_z = _global_standardize(all_rate)
+            geometry_z = _global_standardize(all_geometry)
+            global_utility = rate_z - geometry_z
+            utility_by_op = {}
+            offset = 0
+            operation_values = []
+            for name in operations:
+                count = int(local_rate_by_op[name].numel())
+                values = global_utility[offset:offset + count]
+                offset += count
+                utility_by_op[name] = values
+                # log-mean-exp is a smooth, size-invariant summary of the
+                # useful tail of each pool; no top-k magic threshold is used.
+                operation_values.append(
+                    torch.logsumexp(values, dim=0) - math.log(max(count, 1))
+                )
+            operation_values = torch.stack(operation_values)
+            operation_utility_target = torch.softmax(
+                operation_values.detach(), dim=0
+            )
+            operation_local_loss = -(
+                operation_utility_target * gate_log_probs
+            ).sum()
+
+            utility_prefix_sum = {
+                name: torch.sort(
+                    utility_by_op[name], descending=True
+                ).values.cumsum(dim=0)
+                for name in operations
+            }
+            bin_values = []
+            target_share_dict = {
+                name: float(operation_utility_target[index].cpu())
+                for index, name in enumerate(operations)
+            }
+            for ratio_value in bin_tensor.detach().cpu().tolist():
+                bin_budget = max(1, int(math.ceil(point_count * float(ratio_value))))
+                bin_counts = self._den6_allocate_counts(
+                    bin_budget, target_share_dict
+                )
+                utility_sum = operation_values.new_zeros(())
+                for name in operations:
+                    take = min(bin_counts[name], int(utility_by_op[name].numel()))
+                    if take > 0:
+                        utility_sum = utility_sum + utility_prefix_sum[name][take - 1]
+                bin_values.append(utility_sum)
+            bin_values = torch.stack(bin_values)
+            bin_values = _global_standardize(bin_values)
+            amount_utility_target = torch.softmax(bin_values.detach(), dim=0)
+            amount_local_loss = -(
+                amount_utility_target * amount_log_probs
+            ).sum()
+
+        local_credit_terms = [candidate_local_loss]
+        if operation_local_loss.requires_grad:
+            local_credit_terms.append(operation_local_loss)
+        if amount_local_loss.requires_grad:
+            local_credit_terms.append(amount_local_loss)
+        candidate_local_credit_loss = torch.stack(local_credit_terms).mean()
         policy_log_prob = where_log_prob + amount_log_prob + action_log_prob
         policy_entropy = (
             torch.stack(candidate_entropies).mean()
@@ -4433,18 +4598,22 @@ class StructureRepairActuator(nn.Module):
                 static_compatibility_available
             ),
             "candidate_actual_encode_count": 0,
-            "proposal_source": "den6_exact_rank_plus_network_residual",
+            "proposal_source": "den6_pool_network_primary_local_rd_credit",
             "performance_source": (
                 "exact_teacher_anchor"
                 if exact_anchor_active
-                else "heuristic_rank_plus_network_residual"
+                else "network_value_with_weak_heuristic_prior"
             ),
             "network_only_performance": False,
             "teacher_bootstrap_active": bool(exact.get("teacher_bootstrap_active", False)),
             "selected_action_index": -1,
-            "selected_action_mask": [1, 1, 1],
-            "selected_action_count": 3,
-            "action_policy_role": "network_gate_allocates_mandatory_candidate_families",
+            "selected_action_mask": [
+                int(selected_counts[name] > 0) for name in operations
+            ],
+            "selected_action_count": sum(
+                int(selected_counts[name] > 0) for name in operations
+            ),
+            "action_policy_role": "network_gate_causally_allocates_operation_counts",
             "shared_amount_residual_used": False,
             "selected_counts": selected_counts,
             "selected_amount_ratios": {
@@ -4480,6 +4649,19 @@ class StructureRepairActuator(nn.Module):
                 / float(len(operations))
             ),
             "score_audit": score_audit,
+            "candidate_local_credit_loss": candidate_local_credit_loss,
+            "candidate_ranking_local_loss": candidate_local_loss,
+            "operation_local_loss": operation_local_loss,
+            "amount_local_loss": amount_local_loss,
+            "candidate_utility_correlation": candidate_utility_correlations,
+            "candidate_utility_audit": candidate_utility_audit,
+            "operation_utility_target": {
+                name: float(operation_utility_target[index].detach().cpu())
+                for index, name in enumerate(operations)
+            },
+            "amount_utility_target": [
+                float(value) for value in amount_utility_target.detach().cpu().tolist()
+            ],
             "topk_audit": topk_audit,
             "deterministic_top1_changed": deterministic_top1_changed,
             "deterministic_top1_changed_rate": (
@@ -4580,6 +4762,13 @@ class StructureRepairActuator(nn.Module):
                 name: float(gate_probs[index].detach().cpu())
                 for index, name in enumerate(operations)
             },
+            "operation_gate_selected_shares": {
+                name: float(selected_share[index].detach().cpu())
+                for index, name in enumerate(operations)
+            },
+            "operation_gate_share_l1_error": float(
+                (gate_probs.detach() - selected_share.detach()).abs().mean().cpu()
+            ),
         }
         plan_hash_payload = {
             "candidate_ids": selected_ids,
@@ -12457,6 +12646,9 @@ class StructureRepairActuator(nn.Module):
             ),
             "den6_online_action_log_prob": exact_residual_plan_debug.get(
                 "action_log_prob", single_action_log_prob
+            ),
+            "den6_online_candidate_local_credit_loss": exact_residual_plan_debug.get(
+                "candidate_local_credit_loss", pts_xyz.new_zeros(())
             ),
             "network_only_direction_log_prob": exact_residual_plan_debug.get(
                 "direction_log_prob", single_direction_log_prob
