@@ -21,7 +21,10 @@ from models.modules.heuristic_guidance import (
     resolve_profile,
 )
 from models.modules.octree_structure import OctreeStructureAnalysis
-from models.modules.structure_actuator import StructureRepairActuator
+from models.modules.structure_actuator import (
+    StructureRepairActuator,
+    candidate_listwise_local_credit,
+)
 from models.network import Network
 from models.utils.loss.compression import CompressionLossMixin
 from models.utils.loss.sparsepcgc_teacher_worker import (
@@ -116,6 +119,17 @@ class _EveryStepFixture(CompressionLossMixin):
 
 
 class SparsePCGCActualSemanticsTest(unittest.TestCase):
+    def test_candidate_listwise_credit_prefers_utility_order(self):
+        target = torch.tensor([-1.0, 0.0, 2.0])
+        aligned = torch.tensor([-0.5, 0.0, 0.5], requires_grad=True)
+        reversed_score = torch.tensor([0.5, 0.0, -0.5])
+        aligned_loss = candidate_listwise_local_credit(aligned, target)
+        reversed_loss = candidate_listwise_local_credit(reversed_score, target)
+        self.assertLess(float(aligned_loss.detach()), float(reversed_loss))
+        aligned_loss.backward()
+        self.assertTrue(torch.isfinite(aligned.grad).all())
+        self.assertGreater(float(aligned.grad.abs().sum()), 0.0)
+
     def test_den6_candidate_local_proxy_uses_complete_codec_gain(self):
         exact = {
             "operation_candidate_shortlists": {

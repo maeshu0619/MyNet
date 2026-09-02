@@ -53,6 +53,28 @@ def policy_exploration_multiplier(
     raise ValueError("repair_policy_exploration_mode must be constant or annealed")
 
 
+def candidate_listwise_local_credit(prediction, utility_target):
+    """Train one operation pool from relative, non-heuristic RD utility."""
+    prediction = prediction.float().reshape(-1)
+    utility_target = utility_target.detach().float().reshape(-1)
+    if int(prediction.numel()) != int(utility_target.numel()):
+        raise ValueError("candidate prediction/target size mismatch")
+    if int(prediction.numel()) <= 1:
+        return prediction.sum() * 0.0
+    target_centered = utility_target - utility_target.mean()
+    target_scale = target_centered.square().mean().sqrt().clamp_min(
+        torch.finfo(target_centered.dtype).eps
+    )
+    target_prob = torch.softmax(target_centered / target_scale, dim=0)
+    prediction_log_prob = torch.log_softmax(prediction, dim=0)
+    return torch.sum(
+        target_prob * (
+            torch.log(target_prob.clamp_min(torch.finfo(target_prob.dtype).tiny))
+            - prediction_log_prob
+        )
+    )
+
+
 class StructureRepairActuator(nn.Module):
     """Apply small geometry-preserving movements that realize repair policies.
 
@@ -4138,8 +4160,8 @@ class StructureRepairActuator(nn.Module):
                     local_prediction = candidate_value_score[local_valid]
                     local_target = 0.5 * torch.tanh(utility_target[local_valid])
                     candidate_local_losses.append(
-                        torch.nn.functional.smooth_l1_loss(
-                            local_prediction, local_target.detach()
+                        candidate_listwise_local_credit(
+                            local_prediction, local_target
                         )
                     )
                     pred_centered = local_prediction.detach().float()
