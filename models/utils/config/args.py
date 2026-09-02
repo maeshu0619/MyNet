@@ -2521,6 +2521,27 @@ def parse_pugan_args(parser, file_day, file_time):
         help='既存codec-context/geometry attributionから作るcandidate-local RD損失重み。Actual encode回数は増やさない',
     )
     parser.add_argument(
+        '--heuristic_guidance_online_global_actual_credit_weight',
+        default=0.05,
+        type=float,
+        help=(
+            'composite planのActual scalarをcandidate-local creditへ加える補正重み。'
+            '1候補ずつのActual教師ではないため低分散local教師より弱くする'
+        ),
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_decision_lr_scale',
+        default=0.1,
+        type=float,
+        help='Exact-online candidate/Where/Gate headのmain LRに対する固定倍率',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_amount_lr_scale',
+        default=0.01,
+        type=float,
+        help='初期飽和を防ぐExact-online Amount selector/fine headのmain LRに対する固定倍率',
+    )
+    parser.add_argument(
         '--heuristic_guidance_online_policy_backward_scale',
         default=10.0,
         type=float,
@@ -4136,6 +4157,20 @@ def parse_pugan_args(parser, file_day, file_time):
         )),
         0.0,
     )
+    args.heuristic_guidance_online_global_actual_credit_weight = max(
+        float(getattr(
+            args,
+            "heuristic_guidance_online_global_actual_credit_weight",
+            0.05,
+        )),
+        0.0,
+    )
+    args.heuristic_guidance_online_decision_lr_scale = max(float(getattr(
+        args, "heuristic_guidance_online_decision_lr_scale", 0.1
+    )), 0.0)
+    args.heuristic_guidance_online_amount_lr_scale = max(float(getattr(
+        args, "heuristic_guidance_online_amount_lr_scale", 0.01
+    )), 0.0)
     args.heuristic_guidance_online_policy_backward_scale = max(
         float(getattr(
             args, "heuristic_guidance_online_policy_backward_scale", 10.0

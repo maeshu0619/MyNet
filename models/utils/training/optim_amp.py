@@ -62,6 +62,58 @@ def build_optimizer_and_scheduler(model, args, writer):
     other_params = [parameter for parameter in other_params if id(parameter) not in k_param_ids]
     deform_params = [parameter for parameter in deform_params if id(parameter) not in k_param_ids]
 
+    # Exact-online hard decision heads were previously in the 1e-3 main
+    # group.  One optimizer step expanded Add raw-score std 0.129->0.696 and
+    # the legacy Amount selector eventually grew 4.85->98.7 in norm.  Use
+    # constant (non-Episode-scheduled) LR groups; Amount receives the smaller
+    # rate because its measured pre-clip gradient was orders of magnitude
+    # larger than candidate Where.
+    online_mode = (
+        str(getattr(args, "heuristic_guidance_mode", "")).strip().lower()
+        == "ana_den6_online"
+    )
+    online_amount_tokens = (
+        "actuator.drop_amount_head.",
+        "actuator.add_amount_head.",
+        "actuator.move_amount_head.",
+        "actuator.algorithmic_amount_selector_head.",
+        "actuator.algorithmic_amount_residual_head.",
+    )
+    online_decision_tokens = (
+        "actuator.drop_head.",
+        "actuator.add_head.",
+        "actuator.add_voxel_head.",
+        "actuator.subtree_move_source_head.",
+        "actuator.move_voxel_head.",
+        "actuator.operation_gate_head.",
+    )
+    online_amount_names = {
+        name for name in named_trainable
+        if online_mode and any(token in name for token in online_amount_tokens)
+    }
+    online_decision_names = {
+        name for name in named_trainable
+        if online_mode and any(token in name for token in online_decision_tokens)
+    }
+    online_amount_params = [
+        named_trainable[name] for name in sorted(online_amount_names)
+    ]
+    online_decision_params = [
+        named_trainable[name] for name in sorted(online_decision_names)
+    ]
+    online_param_ids = {
+        id(parameter)
+        for parameter in (*online_amount_params, *online_decision_params)
+    }
+    other_params = [
+        parameter for parameter in other_params
+        if id(parameter) not in online_param_ids
+    ]
+    deform_params = [
+        parameter for parameter in deform_params
+        if id(parameter) not in online_param_ids
+    ]
+
     point_feature_names = {
         name for name in named_trainable
         if name.startswith("point_transformer_feature_adapter.")
@@ -144,6 +196,22 @@ def build_optimizer_and_scheduler(model, args, writer):
                 "lr": args.lr * float(getattr(args, "point_transformer_feature_lr_scale", 0.1)),
                 "name": "point_transformer_feature",
             })
+        if online_decision_params:
+            groups.append({
+                "params": online_decision_params,
+                "lr": args.lr * float(getattr(
+                    args, "heuristic_guidance_online_decision_lr_scale", 0.1
+                )),
+                "name": "den6_online_decision",
+            })
+        if online_amount_params:
+            groups.append({
+                "params": online_amount_params,
+                "lr": args.lr * float(getattr(
+                    args, "heuristic_guidance_online_amount_lr_scale", 0.01
+                )),
+                "name": "den6_online_amount",
+            })
         optimizer = optim.Adam(groups, lr=args.lr, weight_decay=args.weight_decay)
     else:
         args.lr = args.lr * 100
@@ -174,6 +242,22 @@ def build_optimizer_and_scheduler(model, args, writer):
                 "params": point_feature_params,
                 "lr": args.lr * float(getattr(args, "point_transformer_feature_lr_scale", 0.1)),
                 "name": "point_transformer_feature",
+            })
+        if online_decision_params:
+            groups.append({
+                "params": online_decision_params,
+                "lr": args.lr * float(getattr(
+                    args, "heuristic_guidance_online_decision_lr_scale", 0.1
+                )),
+                "name": "den6_online_decision",
+            })
+        if online_amount_params:
+            groups.append({
+                "params": online_amount_params,
+                "lr": args.lr * float(getattr(
+                    args, "heuristic_guidance_online_amount_lr_scale", 0.01
+                )),
+                "name": "den6_online_amount",
             })
         optimizer = optim.SGD(
             groups,

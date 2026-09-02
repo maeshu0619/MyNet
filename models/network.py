@@ -831,8 +831,48 @@ class Network(nn.Module):
 
         weight = max(float(getattr(self.args, "heuristic_guidance_online_policy_weight", 1.0)), 0.0)
         entropy_weight = max(float(getattr(self.args, "heuristic_guidance_online_entropy_weight", 0.001)), 0.0)
-        policy_core_raw = -advantage * log_prob.float().mean()
-        policy_core_weighted = weight * policy_core_raw
+        # train.py keeps a legacy score-function-only backward multiplier.
+        # Candidate-local credit is already calibrated, and the one scalar
+        # Actual result describes the whole composite plan rather than any
+        # individual candidate.  On the measured repeated-frame run the
+        # uncalibrated composite term produced Amount/Where pre-clip norms
+        # 8918/6.24 while local credit was about 42/0.2, so clipping preserved
+        # almost only the high-variance global direction.  Cancel the legacy
+        # multiplier here and retain Actual only as a weak global correction.
+        policy_backward_scale = max(float(getattr(
+            self.args,
+            "heuristic_guidance_online_policy_backward_scale",
+            1.0,
+        )), 1.0)
+        global_actual_credit_weight = (
+            max(float(getattr(
+                self.args,
+                "heuristic_guidance_online_global_actual_credit_weight",
+                0.05,
+            )), 0.0)
+            if mode == "ana_den6_online" else 1.0
+        )
+        # A first-seen frame/sequence has only the no-op reference.  Its one
+        # composite Actual scalar can say that the plan as a whole compresses,
+        # but cannot identify which of thousands of candidates caused it.
+        # Reinforcing every sampled candidate in that situation produced a
+        # measured utility-correlation flip from near zero to negative after
+        # one update.  Initialize the Actual baseline on first sight and apply
+        # the global policy correction only once a comparative frame/sequence
+        # baseline exists.  Candidate-local RD credit remains active from the
+        # first step, and Actual correction remains active on revisits.
+        global_credit_available = bool(baseline_seen or sequence_baseline_seen)
+        policy_core_raw = (
+            -advantage * log_prob.float().mean()
+            if global_credit_available
+            else 0.0 * log_prob.float().mean()
+        )
+        policy_core_weighted = (
+            weight
+            * float(global_actual_credit_weight)
+            * policy_core_raw
+            / float(policy_backward_scale)
+        )
         policy_loss = policy_core_weighted
         candidate_local_credit = state.get(
             "den6_online_candidate_local_credit_loss", None
@@ -848,12 +888,22 @@ class Network(nn.Module):
                 "heuristic_guidance_online_candidate_local_credit_weight",
                 1.0,
             )), 0.0)
+            # train.py applies the existing score-function backward multiplier
+            # to the combined policy tensor.  Local differentiable credit is
+            # already normalized and must not inherit that REINFORCE-only
+            # amplification, so cancel it here exactly.
             candidate_local_credit_weighted = (
-                float(local_weight) * candidate_local_credit.float().mean()
+                float(local_weight)
+                * candidate_local_credit.float().mean()
+                / float(policy_backward_scale)
             )
             policy_loss = policy_loss + candidate_local_credit_weighted
         entropy_raw = entropy.float().mean() if torch.is_tensor(entropy) else objective.new_zeros(())
-        entropy_weighted = -entropy_weight * entropy_raw
+        entropy_weighted = (
+            -entropy_weight * entropy_raw / float(policy_backward_scale)
+            if mode == "ana_den6_online"
+            else -entropy_weight * entropy_raw
+        )
         if torch.is_tensor(entropy):
             policy_loss = policy_loss + entropy_weighted
         # hard整数化されたExact Amountは通常のGeometry lossから微分できない。
@@ -934,6 +984,10 @@ class Network(nn.Module):
                     0.10,
                 )), 0.0)
                 geometry_policy_weighted = geometry_weight * geometry_policy_raw
+                if mode == "ana_den6_online":
+                    geometry_policy_weighted = (
+                        geometry_policy_weighted / float(policy_backward_scale)
+                    )
                 policy_loss = policy_loss + geometry_policy_weighted
             if geometry_guard_passed:
                 updated_geometry = (
@@ -993,6 +1047,8 @@ class Network(nn.Module):
             "objective_baseline_source": str(baseline_source),
             "objective_sequence_baseline": float(updated_sequence),
             "objective_effective_baseline": float(effective_baseline_t.detach().cpu()),
+            "global_actual_credit_available": bool(global_credit_available),
+            "global_actual_credit_weight": float(global_actual_credit_weight),
             "advantage": float(advantage.detach().cpu()),
             "log_prob": float(log_prob.detach().float().mean().cpu()),
             "entropy": float(entropy.detach().float().mean().cpu()) if torch.is_tensor(entropy) else 0.0,

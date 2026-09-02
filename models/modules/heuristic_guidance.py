@@ -389,7 +389,7 @@ def _rank_value(rank: int, pool_size: int) -> float:
 
 
 def _candidate_local_proxy_tensors(
-    exact: Mapping[str, Any], operation: str, like: torch.Tensor
+    exact: Mapping[str, Any], operation: str, like: torch.Tensor, args: Any
 ) -> Dict[str, torch.Tensor]:
     """Create a cache-derived, per-candidate RD target without codec calls.
 
@@ -417,14 +417,21 @@ def _candidate_local_proxy_tensors(
     geometry_values = []
     for candidate in pool:
         candidate = candidate if isinstance(candidate, Mapping) else {}
-        # These fields are produced by the existing codec-context attribution.
-        # Positive rate means an expected bit saving; risks are costs.
-        rate = (
-            float(candidate.get("fixed_context_gain_bits", 0.0) or 0.0)
-            - float(candidate.get("expected_new_descendant_bits", 0.0) or 0.0)
-            - float(candidate.get("neighbor_bit_risk", 0.0) or 0.0)
-        )
+        # ``optimistic_gain_bits`` is the existing codec attribution that
+        # already includes fixed-context, descendant/new-symbol and mask
+        # effects.  The previous local target rebuilt only part of that value
+        # and then subtracted neighbor risk as if it were a measured bit cost;
+        # on the fixed audit frame this inverted Adjust ordering (r=-0.629).
+        # Treat context risk as uncertainty in the denominator, matching its
+        # meaning in the probe without copying heuristic score/rank itself.
         affected = max(int(candidate.get("affected_voxel_cells", 1) or 1), 1)
+        optimistic_gain = max(float(
+            candidate.get("optimistic_gain_bits", 0.0) or 0.0
+        ), 0.0)
+        context_risk = max(float(
+            candidate.get("neighbor_bit_risk", 0.0) or 0.0
+        ), 0.0)
+        rate = optimistic_gain / (float(affected) + context_risk)
         geometry = float(candidate.get("geometry_cost", 0.0) or 0.0) / float(affected)
         rate_values.append(rate if math.isfinite(rate) else 0.0)
         geometry_values.append(geometry if math.isfinite(geometry) else 0.0)
@@ -441,15 +448,24 @@ def _candidate_local_proxy_tensors(
         scale = centered.square().mean().sqrt()
         return centered / scale.clamp_min(torch.finfo(value.dtype).eps)
 
+    # Reuse the already configured RD support ratio rather than introducing a
+    # curve-fitting constant.  It is fixed throughout training and therefore
+    # cannot manufacture an Episode-dependent trend.
+    geometry_weight = max(float(getattr(
+        args, "compression_primary_aux_target_ratio", 0.25
+    )), 0.0)
     return {
         "local_rate_benefit": rate,
         "local_geometry_risk": geometry,
-        "local_utility_target": _standardize(rate) - _standardize(geometry),
+        "local_utility_target": (
+            _standardize(rate)
+            - float(geometry_weight) * _standardize(geometry)
+        ),
     }
 
 
 def _attach_candidate_local_proxy(
-    guidance: Dict[str, Any], exact: Mapping[str, Any], like: torch.Tensor
+    guidance: Dict[str, Any], exact: Mapping[str, Any], like: torch.Tensor, args: Any
 ) -> Dict[str, Any]:
     """Attach local-credit tensors to freshly built and legacy disk caches."""
     tensor_map = guidance.get("candidate_tensor_map")
@@ -459,7 +475,7 @@ def _attach_candidate_local_proxy(
         mapping = tensor_map.get(operation)
         if not isinstance(mapping, dict):
             continue
-        proxy = _candidate_local_proxy_tensors(exact, operation, like)
+        proxy = _candidate_local_proxy_tensors(exact, operation, like, args)
         rank_score = mapping.get("rank_score")
         expected = int(rank_score.numel()) if torch.is_tensor(rank_score) else 0
         actual = int(proxy["local_utility_target"].numel())
@@ -536,7 +552,7 @@ def _exact_den6_guidance(
             _EXACT_GUIDANCE_CPU_CACHE.move_to_end(cpu_cache_key)
             restored = _guidance_tensor_tree(cached_cpu, like.device)
             restored["exact_candidate_guidance"] = exact
-            restored = _attach_candidate_local_proxy(restored, exact, like)
+            restored = _attach_candidate_local_proxy(restored, exact, like, args)
             restored["cpu_tensor_cache_hit"] = True
             restored["disk_tensor_cache_hit"] = False
             _EXACT_GUIDANCE_CACHE[cache_key] = restored
@@ -552,7 +568,7 @@ def _exact_den6_guidance(
         )
         restored = _guidance_tensor_tree(disk_guidance, like.device)
         restored["exact_candidate_guidance"] = exact
-        restored = _attach_candidate_local_proxy(restored, exact, like)
+        restored = _attach_candidate_local_proxy(restored, exact, like, args)
         restored["cpu_tensor_cache_hit"] = False
         restored["disk_tensor_cache_hit"] = True
         _EXACT_GUIDANCE_CACHE[cache_key] = restored
@@ -835,7 +851,7 @@ def _exact_den6_guidance(
         "cpu_tensor_cache_hit": False,
         "disk_tensor_cache_hit": False,
     }
-    guidance = _attach_candidate_local_proxy(guidance, exact, like)
+    guidance = _attach_candidate_local_proxy(guidance, exact, like, args)
     cpu_guidance = _store_exact_guidance_cpu(
         cpu_cache_key, guidance, exact, args
     )

@@ -128,6 +128,11 @@ class StructureRepairActuator(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv1d(hidden_dim, 1, 1),
         )
+        # Per-operation gate for the cache-derived local RD candidate feature.
+        # It is a Network parameter (not a fixed heuristic weight): tanh(0)
+        # makes the fresh policy exactly unchanged, then local/Actual credit
+        # can strengthen, suppress, or reverse it independently by operation.
+        self.candidate_local_utility_gate_logits = nn.Parameter(torch.zeros(3))
         # Pruneの実行量をActuator特徴から推定し、削除割合も学習対象にする。
         self.drop_amount_head = nn.Conv1d(in_channels, 1, 1)
         algorithmic_amount_bins = self._algorithmic_amount_bin_values_from_args(args)
@@ -3913,7 +3918,19 @@ class StructureRepairActuator(nn.Module):
             gate_logits_den6 = torch.stack([
                 gate_logits_flat[1], gate_logits_flat[0], gate_logits_flat[2]
             ])
-            gate_residual = gate_logits_den6 - gate_logits_den6.mean()
+            # ``_learned_operation_gates`` represents independent sigmoid
+            # gates on the configured +/-logit_scale (normally 6).  Feeding
+            # that full scale into a three-way softmax made a single update
+            # move Add share 0.40 -> 0.918.  Convert it to a dimensionless
+            # bounded log-share residual using that existing scale.  The
+            # Network can still override the prior (up to exp(2) pairwise
+            # odds), while the first optimizer step cannot saturate the mix.
+            gate_logit_scale = max(float(getattr(
+                self.args, "repair_operation_gate_logit_scale", 6.0
+            )), 1e-6)
+            gate_residual = (
+                gate_logits_den6 - gate_logits_den6.mean()
+            ) / float(gate_logit_scale)
             gate_combined_logits = prior_share_tensor.log() + gate_residual
             gate_log_probs = torch.log_softmax(gate_combined_logits, dim=0)
             gate_probs = gate_log_probs.exp()
@@ -4037,6 +4054,7 @@ class StructureRepairActuator(nn.Module):
         gumbel_audit = {}
         topk_audit = {}
         network_terms = {}
+        candidate_value_scores = {}
         candidate_local_losses = []
         candidate_utility_correlations = {}
         candidate_utility_audit = {}
@@ -4057,9 +4075,34 @@ class StructureRepairActuator(nn.Module):
             rank_score = mapping.get("rank_score")
             if not torch.is_tensor(rank_score):
                 return None
+            utility_target = mapping.get("local_utility_target")
+            local_feature = None
+            if (
+                torch.is_tensor(utility_target)
+                and int(utility_target.numel()) == int(rank_score.numel())
+            ):
+                local_feature = 0.5 * torch.tanh(utility_target.to(
+                    device=rank_score.device, dtype=rank_score.dtype
+                )).detach()
+            operation_index = operations.index(operation)
+            local_gate_logits = getattr(
+                self, "candidate_local_utility_gate_logits", None
+            )
+            local_feature_gate = (
+                torch.tanh(local_gate_logits[operation_index])
+                if torch.is_tensor(local_gate_logits)
+                else rank_score.new_zeros(())
+            )
+            candidate_value_score = network_scores[operation]
+            if torch.is_tensor(local_feature):
+                candidate_value_score = (
+                    candidate_value_score
+                    + local_feature_gate * local_feature
+                )
+            candidate_value_scores[operation] = candidate_value_score
             heuristic_term = float(heuristic_prior_weight) * rank_score.float()
             network_term_uncalibrated = (
-                float(candidate_policy_alpha) * network_scores[operation]
+                float(candidate_policy_alpha) * candidate_value_score
             )
             calibration_scale = 1.0
             network_term = network_term_uncalibrated * float(calibration_scale)
@@ -4083,7 +4126,6 @@ class StructureRepairActuator(nn.Module):
                 )
             else:
                 policy_logits = logits
-            utility_target = mapping.get("local_utility_target")
             if (
                 torch.is_tensor(utility_target)
                 and int(utility_target.numel()) == int(policy_logits.numel())
@@ -4093,7 +4135,7 @@ class StructureRepairActuator(nn.Module):
                 )
                 local_valid = torch.isfinite(policy_logits) & torch.isfinite(utility_target)
                 if bool(local_valid.any()):
-                    local_prediction = network_scores[operation][local_valid]
+                    local_prediction = candidate_value_score[local_valid]
                     local_target = 0.5 * torch.tanh(utility_target[local_valid])
                     candidate_local_losses.append(
                         torch.nn.functional.smooth_l1_loss(
@@ -4166,6 +4208,7 @@ class StructureRepairActuator(nn.Module):
                 "network_weighted": _score_stats(network_term),
                 "combined": _score_stats(policy_logits),
                 "calibration_scale": float(calibration_scale),
+                "local_utility_gate": float(local_feature_gate.detach().cpu()),
             }
             heuristic_std = score_audit[operation]["heuristic"]["std"]
             network_std = score_audit[operation]["network_weighted"]["std"]
@@ -4449,18 +4492,24 @@ class StructureRepairActuator(nn.Module):
                 amount_utility_target * amount_log_probs
             ).sum()
 
-        local_credit_terms = [candidate_local_loss]
-        if operation_local_loss.requires_grad:
-            local_credit_terms.append(operation_local_loss)
-        if amount_local_loss.requires_grad:
-            local_credit_terms.append(amount_local_loss)
-        candidate_local_credit_loss = torch.stack(local_credit_terms).mean()
+        # Candidate targets are standardized only inside the same operation,
+        # where their codec attribution is comparable.  Add/Prune/Adjust use
+        # different edit semantics and candidate-pool distributions; treating
+        # their raw proxy tails as a cross-operation teacher produced a
+        # measured Add target of 0.763 and worsened fixed Actual after two
+        # Episodes.  Keep the cross-operation/Amount estimates as diagnostics,
+        # but do not backpropagate that uncalibrated comparison.  Gate and
+        # Amount remain causally connected to requested_counts and receive the
+        # comparable repeated-frame Actual correction instead.
+        candidate_local_credit_loss = candidate_local_loss
         policy_log_prob = where_log_prob + amount_log_prob + action_log_prob
-        policy_entropy = (
-            torch.stack(candidate_entropies).mean()
-            + (-(amount_prob * torch.log(amount_prob.clamp_min(1e-12))).sum())
-            + action_entropy
-        )
+        # Exploration entropy belongs to candidate selection.  Including Gate
+        # and Amount here changed an unseen frame's deterministic operation
+        # share from 0.4/0.4/0.2 toward uniform before any comparable Actual
+        # outcome existed.  Amount already has Gumbel sampling and Gate is
+        # trained from repeated-frame Actual credit, so neither needs an
+        # artificial uniform target.
+        policy_entropy = torch.stack(candidate_entropies).mean()
         if exact_anchor_active:
             # hard anchorの実行planはHeuristicが強制したものであり、Networkの
             # sampleではない。Actual値はframe baseline初期化に使うが、その

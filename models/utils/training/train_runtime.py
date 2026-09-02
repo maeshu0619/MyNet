@@ -5058,6 +5058,15 @@ def _den6_online_decision_parameters(model):
     )
     params = []
     seen = set()
+    local_utility_gate = getattr(
+        actuator, "candidate_local_utility_gate_logits", None
+    )
+    if (
+        torch.is_tensor(local_utility_gate)
+        and local_utility_gate.requires_grad
+    ):
+        seen.add(id(local_utility_gate))
+        params.append(local_utility_gate)
     for module in modules:
         if module is None:
             continue

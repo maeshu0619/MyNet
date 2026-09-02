@@ -116,6 +116,40 @@ class _EveryStepFixture(CompressionLossMixin):
 
 
 class SparsePCGCActualSemanticsTest(unittest.TestCase):
+    def test_den6_candidate_local_proxy_uses_complete_codec_gain(self):
+        exact = {
+            "operation_candidate_shortlists": {
+                "Adjust": [
+                    {
+                        "optimistic_gain_bits": 12.0,
+                        "neighbor_bit_risk": 1.0,
+                        "geometry_cost": 0.2,
+                        "affected_voxel_cells": 2,
+                    },
+                    {
+                        "optimistic_gain_bits": 2.0,
+                        "neighbor_bit_risk": 1.0,
+                        "geometry_cost": 0.2,
+                        "affected_voxel_cells": 2,
+                    },
+                ]
+            }
+        }
+        proxy = heuristic_guidance_module._candidate_local_proxy_tensors(
+            exact,
+            "Adjust",
+            torch.zeros((), dtype=torch.float32),
+            SimpleNamespace(compression_primary_aux_target_ratio=0.25),
+        )
+        self.assertGreater(
+            float(proxy["local_rate_benefit"][0]),
+            float(proxy["local_rate_benefit"][1]),
+        )
+        self.assertGreater(
+            float(proxy["local_utility_target"][0]),
+            float(proxy["local_utility_target"][1]),
+        )
+
     def test_worker_does_not_repeat_encoder_cuda_cleanup(self):
         self.assertTrue(_encoder_reported_cuda_cleanup({
             "cuda_after_cleanup_reserved_gb": 0.0
@@ -657,6 +691,21 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
                 heuristic_guidance_online_entropy_weight=0.0,
             )
             network._den6_online_objective_baseline = __import__("collections").OrderedDict()
+            # The first observation only initializes the comparable Actual
+            # baseline.  It must not reinforce every candidate in a single
+            # composite plan against the unrelated no-op value.
+            warm_log_prob = torch.tensor(0.0, requires_grad=True)
+            network.last_actuator_voxel_state = {
+                "den6_online_policy_log_prob": warm_log_prob,
+                "den6_online_policy_entropy": warm_log_prob.new_zeros(()),
+            }
+            warm_loss = network.discrete_policy_loss(torch.tensor(-2.0))
+            warm_loss.backward()
+            self.assertEqual(float(warm_log_prob.grad), 0.0)
+            self.assertFalse(
+                network.last_discrete_policy_debug["global_actual_credit_available"]
+            )
+
             log_prob = torch.tensor(0.0, requires_grad=True)
             network.last_actuator_voxel_state = {
                 "den6_online_policy_log_prob": log_prob,
@@ -664,12 +713,15 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
             }
             loss = network.discrete_policy_loss(torch.tensor(float(objective)))
             loss.backward()
+            self.assertTrue(
+                network.last_discrete_policy_debug["global_actual_credit_available"]
+            )
             return float(log_prob.grad)
 
         # Gradient descent subtracts grad: improvement must increase log-prob,
         # while a worse actual compression result must decrease it.
-        self.assertLess(gradient_for_objective(-1.0), 0.0)
-        self.assertGreater(gradient_for_objective(1.0), 0.0)
+        self.assertLess(gradient_for_objective(-3.0), 0.0)
+        self.assertGreater(gradient_for_objective(-1.0), 0.0)
 
     def test_den6_online_policy_uses_per_input_best_actual_baseline(self):
         network = Network.__new__(Network)
@@ -696,9 +748,10 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
             network.discrete_policy_loss(torch.tensor(float(objective))).backward()
             return float(log_prob.grad)
 
-        self.assertLess(gradient(-4.0), 0.0)   # no-op 0%より改善
-        self.assertGreater(gradient(-3.0), 0.0)  # 過去最良-4%より悪化
-        self.assertLess(gradient(-4.5), 0.0)   # 過去最良を更新
+        # 初見Actualは比較対象を作るだけでglobal scalar creditを流さない。
+        self.assertEqual(gradient(-4.0), 0.0)
+        self.assertGreater(gradient(-3.0), 0.0)  # 過去EMAより悪化
+        self.assertLess(gradient(-4.5), 0.0)   # 過去EMAより改善
 
     def test_den6_geometry_credit_updates_amount_only_inside_compression_guard(self):
         """圧縮改善を保ったGeometry改善だけを離散Amountへ返す。"""
