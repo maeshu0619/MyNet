@@ -65,14 +65,24 @@ def candidate_listwise_local_credit(prediction, utility_target):
     target_scale = target_centered.square().mean().sqrt().clamp_min(
         torch.finfo(target_centered.dtype).eps
     )
-    target_prob = torch.softmax(target_centered / target_scale, dim=0)
-    prediction_log_prob = torch.log_softmax(prediction, dim=0)
-    return torch.sum(
+    target_z = target_centered / target_scale
+    target_prob = torch.softmax(target_z, dim=0)
+    prediction_centered = prediction - prediction.mean().detach()
+    prediction_log_prob = torch.log_softmax(prediction_centered, dim=0)
+    listwise = torch.sum(
         target_prob * (
             torch.log(target_prob.clamp_min(torch.finfo(target_prob.dtype).tiny))
             - prediction_log_prob
         )
     )
+    # bounded final scoreと同じ範囲のrobust regressionを併用する。KLだけでは
+    # 数千candidateのtargetもほぼ一様となり、相関が低くても勾配が小さい。
+    # Heuristic rankではなくrate/geometry utilityそのものを教師にする。
+    regression_target = 0.5 * torch.tanh(target_z)
+    regression = torch.nn.functional.smooth_l1_loss(
+        prediction_centered, regression_target
+    )
+    return listwise + regression
 
 
 class StructureRepairActuator(nn.Module):
@@ -3513,7 +3523,9 @@ class StructureRepairActuator(nn.Module):
             return False
         return True
 
-    def _normalize_candidate_network_score(self, value, scored_mask=None):
+    def _normalize_candidate_network_score(
+        self, value, scored_mask=None, *, return_audit=False
+    ):
         value = torch.nan_to_num(value.float(), nan=0.0, posinf=0.0, neginf=0.0)
         if torch.is_tensor(scored_mask) and int(scored_mask.numel()) == int(value.numel()):
             scored_mask = scored_mask.to(device=value.device, dtype=torch.bool)
@@ -3521,15 +3533,46 @@ class StructureRepairActuator(nn.Module):
                 neutral = value[scored_mask].mean().detach()
                 value = torch.where(scored_mask, value, neutral)
         if value.numel() <= 1:
-            return value - value.detach()
-        # frame内min-maxはraw差が1e-6でも常に[-0.5, 0.5]へ拡大し、
-        # 未学習ノイズと学習済みscoreを区別できない。biasだけを除き、
-        # 全frame共通の固定scaleで有界化する。
+            result = value - value.detach()
+            audit = {
+                "pool_std": 0.0,
+                "normalization_scale": 1.0,
+                "temperature": 1.0,
+                "tanh_input_abs_max": 0.0,
+                "saturation_rate": 0.0,
+            }
+            return (result, audit) if return_audit else result
+        # 固定scaleだけでraw scoreをtanhへ入れると、学習後半にheadの
+        # magnitudeだけが増えて候補の大半が+/-0.5へ飽和する。候補pool内の
+        # detached RMSを尺度として使えば、raw順位と勾配経路を保ったまま、
+        # magnitude driftを最終rankingから分離できる。scale floorは従来の
+        # 固定scaleなので、未学習時の微小な差を[-0.5, 0.5]へ増幅しない。
         center = value.mean().detach()
-        scale = max(float(getattr(
+        fixed_scale = max(float(getattr(
             self.args, "heuristic_guidance_network_score_scale", 1.0
         )), 1e-6)
-        return 0.5 * torch.tanh((value - center) / float(scale))
+        centered = value - center
+        pool_std = centered.detach().square().mean().sqrt()
+        scale = torch.maximum(
+            pool_std,
+            pool_std.new_tensor(float(fixed_scale)),
+        )
+        temperature = max(float(getattr(
+            self.args, "heuristic_guidance_network_score_temperature", 1.0
+        )), 1e-6)
+        tanh_input = centered / scale / float(temperature)
+        result = 0.5 * torch.tanh(tanh_input)
+        # |x|>=3ではtanh微分が1%未満になるため、実効的な飽和率として記録する。
+        audit = {
+            "pool_std": float(pool_std.cpu()),
+            "normalization_scale": float(scale.cpu()),
+            "temperature": float(temperature),
+            "tanh_input_abs_max": float(tanh_input.detach().abs().amax().cpu()),
+            "saturation_rate": float(
+                tanh_input.detach().abs().ge(3.0).float().mean().cpu()
+            ),
+        }
+        return (result, audit) if return_audit else result
 
     def _exact_den6_candidate_scores(
         self,
@@ -3545,6 +3588,7 @@ class StructureRepairActuator(nn.Module):
         maps = guidance.get("candidate_tensor_map", {}) if isinstance(guidance, dict) else {}
         output = {}
         raw_output = {}
+        normalization_audit = {}
         for operation in ("Add", "Prune", "Adjust"):
             mapping = maps.get(operation, {}) if isinstance(maps, dict) else {}
             rank_score = mapping.get("rank_score")
@@ -3627,11 +3671,15 @@ class StructureRepairActuator(nn.Module):
                 neutral = network_score[scored_mask].mean().detach()
                 network_score = torch.where(scored_mask, network_score, neutral)
             raw_output[operation] = network_score
-            output[operation] = self._normalize_candidate_network_score(
-                network_score, scored_mask=scored_mask
+            output[operation], normalization_audit[operation] = (
+                self._normalize_candidate_network_score(
+                    network_score,
+                    scored_mask=scored_mask,
+                    return_audit=True,
+                )
             )
         if return_raw:
-            return output, raw_output
+            return output, raw_output, normalization_audit
         return output
 
     def _build_exact_den6_residual_plan(
@@ -3919,7 +3967,15 @@ class StructureRepairActuator(nn.Module):
                 fine_distribution = torch.distributions.Normal(
                     fine_mean, fine_mean.new_tensor(max(fine_sigma, 1e-6))
                 )
-                fine_log_prob = fine_distribution.log_prob(fine_sample.detach())
+                fine_log_prob_raw = fine_distribution.log_prob(fine_sample.detach())
+                # Normal score-functionのmean勾配は1/sigmaで発散する。forwardの
+                # log-prob値は変えず、backwardだけsigma倍して標準化すると、
+                # exploration幅とは独立な有限分散のFine residual更新になる。
+                fine_log_prob = (
+                    fine_log_prob_raw.detach()
+                    + float(fine_sigma)
+                    * (fine_log_prob_raw - fine_log_prob_raw.detach())
+                )
             else:
                 fine_sample = fine_mean
                 fine_log_prob = fine_mean.new_zeros(())
@@ -4037,7 +4093,11 @@ class StructureRepairActuator(nn.Module):
             )
             requested_counts[operation] -= 1
 
-        network_scores, raw_network_scores = self._exact_den6_candidate_scores(
+        (
+            network_scores,
+            raw_network_scores,
+            network_score_normalization_audit,
+        ) = self._exact_den6_candidate_scores(
             guidance,
             drop_score,
             move_score,
@@ -4098,29 +4158,12 @@ class StructureRepairActuator(nn.Module):
             if not torch.is_tensor(rank_score):
                 return None
             utility_target = mapping.get("local_utility_target")
-            local_feature = None
-            if (
-                torch.is_tensor(utility_target)
-                and int(utility_target.numel()) == int(rank_score.numel())
-            ):
-                local_feature = 0.5 * torch.tanh(utility_target.to(
-                    device=rank_score.device, dtype=rank_score.dtype
-                )).detach()
-            operation_index = operations.index(operation)
-            local_gate_logits = getattr(
-                self, "candidate_local_utility_gate_logits", None
-            )
-            local_feature_gate = (
-                torch.tanh(local_gate_logits[operation_index])
-                if torch.is_tensor(local_gate_logits)
-                else rank_score.new_zeros(())
-            )
+            # local utilityは教師であり、同じ値を最終scoreへ直接加えると
+            # candidate_local_utility_gateだけが1へ飽和するshortcutになる。
+            # 最終rankingにはNetwork headの予測だけを使い、proxyは下の
+            # listwise/regression creditを通じてNetwork parameterへ学習させる。
+            local_feature_gate = rank_score.new_zeros(())
             candidate_value_score = network_scores[operation]
-            if torch.is_tensor(local_feature):
-                candidate_value_score = (
-                    candidate_value_score
-                    + local_feature_gate * local_feature
-                )
             candidate_value_scores[operation] = candidate_value_score
             heuristic_term = float(heuristic_prior_weight) * rank_score.float()
             network_term_uncalibrated = (
@@ -4158,7 +4201,7 @@ class StructureRepairActuator(nn.Module):
                 local_valid = torch.isfinite(policy_logits) & torch.isfinite(utility_target)
                 if bool(local_valid.any()):
                     local_prediction = candidate_value_score[local_valid]
-                    local_target = 0.5 * torch.tanh(utility_target[local_valid])
+                    local_target = utility_target[local_valid]
                     candidate_local_losses.append(
                         candidate_listwise_local_credit(
                             local_prediction, local_target
@@ -4181,6 +4224,43 @@ class StructureRepairActuator(nn.Module):
                         "prediction": _score_stats(local_prediction),
                         "valid_count": int(local_valid.sum().detach().cpu()),
                     }
+                    rate_target = mapping.get("local_rate_benefit")
+                    geometry_target = mapping.get("local_geometry_risk")
+                    if torch.is_tensor(rate_target):
+                        candidate_utility_audit[operation]["rate"] = _score_stats(
+                            rate_target.to(local_prediction.device)[local_valid]
+                        )
+                    if torch.is_tensor(geometry_target):
+                        candidate_utility_audit[operation]["geometry"] = _score_stats(
+                            geometry_target.to(local_prediction.device)[local_valid]
+                        )
+                    valid_count_for_rank = int(local_prediction.numel())
+                    if valid_count_for_rank > 1:
+                        prediction_rank = torch.argsort(torch.argsort(
+                            local_prediction.detach().float()
+                        )).float()
+                        target_rank = torch.argsort(torch.argsort(
+                            local_target.detach().float()
+                        )).float()
+                        prediction_rank = prediction_rank - prediction_rank.mean()
+                        target_rank = target_rank - target_rank.mean()
+                        rank_denominator = (
+                            prediction_rank.square().sum().sqrt()
+                            * target_rank.square().sum().sqrt()
+                        ).clamp_min(1e-12)
+                        candidate_utility_audit[operation]["spearman"] = float(
+                            ((prediction_rank * target_rank).sum() / rank_denominator).cpu()
+                        )
+                        utility_k = min(8, valid_count_for_rank)
+                        prediction_top = set(torch.topk(
+                            local_prediction.detach(), utility_k
+                        ).indices.cpu().tolist())
+                        target_top = set(torch.topk(
+                            local_target.detach(), utility_k
+                        ).indices.cpu().tolist())
+                        candidate_utility_audit[operation]["topk_overlap"] = (
+                            len(prediction_top & target_top) / float(utility_k)
+                        )
             combined_logits[operation] = policy_logits
             valid_for_top1 = torch.isfinite(policy_logits)
             heuristic_for_top1 = heuristic_term.masked_fill(
@@ -4231,6 +4311,9 @@ class StructureRepairActuator(nn.Module):
                 "combined": _score_stats(policy_logits),
                 "calibration_scale": float(calibration_scale),
                 "local_utility_gate": float(local_feature_gate.detach().cpu()),
+                "normalization": dict(
+                    network_score_normalization_audit.get(operation, {})
+                ),
             }
             heuristic_std = score_audit[operation]["heuristic"]["std"]
             network_std = score_audit[operation]["network_weighted"]["std"]
@@ -4429,9 +4512,10 @@ class StructureRepairActuator(nn.Module):
         action_entropy = -(gate_probs * gate_log_probs).sum()
 
         # Cross-operation local utility is computed from the same cached rate
-        # attribution and geometry risk, standardized over all operation pools.
-        # This supplies low-variance Gate and Amount credit without any extra
-        # SparsePCGC encode.
+        # attribution and geometry risk.  Each pool contributes one
+        # probability-weighted robust expectation, so a large pool or one
+        # outlier cannot make Prune the automatic winner.  The global Actual
+        # score-function correction remains active on repeated frames.
         local_rate_by_op = {}
         local_geometry_by_op = {}
         for name in operations:
@@ -4448,82 +4532,101 @@ class StructureRepairActuator(nn.Module):
         operation_local_loss = gate_probs.new_zeros(())
         amount_local_loss = gate_probs.new_zeros(())
         operation_utility_target = gate_probs.detach()
+        operation_utility_raw_target = gate_probs.detach()
+        operation_utility_confidence = 0.0
         amount_utility_target = amount_prob.detach()
+        operation_rate_summary = gate_probs.new_zeros((len(operations),))
+        operation_geometry_summary = gate_probs.new_zeros((len(operations),))
         if len(local_rate_by_op) == len(operations):
-            all_rate = torch.cat([local_rate_by_op[name] for name in operations])
-            all_geometry = torch.cat([
-                local_geometry_by_op[name] for name in operations
+            def _robust_policy_expectation(value, probability):
+                value = value.float().reshape(-1)
+                probability = probability.detach().float().reshape(-1)
+                finite = torch.isfinite(value) & torch.isfinite(probability)
+                value = value[finite]
+                probability = probability[finite]
+                if int(value.numel()) == 0:
+                    return gate_probs.new_zeros(())
+                center = value.median()
+                mad = (value - center).abs().median() * 1.4826
+                rms = (value - center).square().mean().sqrt()
+                scale = torch.where(
+                    mad > torch.finfo(value.dtype).eps, mad, rms
+                ).clamp_min(torch.finfo(value.dtype).eps)
+                robust_value = value.clamp(
+                    center - 5.0 * scale, center + 5.0 * scale
+                )
+                probability = probability.clamp_min(0.0)
+                probability = probability / probability.sum().clamp_min(
+                    torch.finfo(probability.dtype).eps
+                )
+                return (probability * robust_value).sum().to(gate_probs.dtype)
+
+            operation_rate_summary = torch.stack([
+                _robust_policy_expectation(
+                    local_rate_by_op[name], candidate_probs[name]
+                ) for name in operations
+            ])
+            operation_geometry_summary = torch.stack([
+                _robust_policy_expectation(
+                    local_geometry_by_op[name], candidate_probs[name]
+                ) for name in operations
             ])
 
-            def _global_standardize(value):
+            def _standardize_operations(value):
                 centered = value - value.mean()
                 return centered / centered.square().mean().sqrt().clamp_min(
                     torch.finfo(value.dtype).eps
                 )
 
-            rate_z = _global_standardize(all_rate)
-            geometry_z = _global_standardize(all_geometry)
-            global_utility = rate_z - geometry_z
-            utility_by_op = {}
-            offset = 0
-            operation_values = []
-            for name in operations:
-                count = int(local_rate_by_op[name].numel())
-                values = global_utility[offset:offset + count]
-                offset += count
-                utility_by_op[name] = values
-                # log-mean-exp is a smooth, size-invariant summary of the
-                # useful tail of each pool; no top-k magic threshold is used.
-                operation_values.append(
-                    torch.logsumexp(values, dim=0) - math.log(max(count, 1))
-                )
-            operation_values = torch.stack(operation_values)
-            operation_utility_target = torch.softmax(
-                operation_values.detach(), dim=0
+            geometry_weight = max(float(getattr(
+                self.args, "compression_primary_aux_target_ratio", 0.25
+            )), 0.0)
+            operation_values = (
+                _standardize_operations(operation_rate_summary)
+                - float(geometry_weight)
+                * _standardize_operations(operation_geometry_summary)
+            )
+            gate_target_temperature = max(float(getattr(
+                self.args, "repair_operation_gate_temperature", 1.0
+            )), 1e-6)
+            operation_utility_raw_target = torch.softmax(
+                operation_values.detach() / float(gate_target_temperature), dim=0
+            )
+            # The local proxy is useful for comparing candidates, but its
+            # operation-level aggregation is not trustworthy before the
+            # learned candidate scores agree with that utility.  Driving the
+            # Gate directly toward a sharp proxy target caused a fresh model
+            # to move from the 0.4/0.4/0.2 prior to an Add-dominated plan in
+            # only 80 steps.  Blend by the *measured* positive candidate-value
+            # correlation instead.  This is data/learning dependent (not an
+            # Episode schedule), and it keeps the heuristic share only as an
+            # uncertainty prior that the Network can increasingly override.
+            correlation_values = gate_probs.new_tensor([
+                max(float(candidate_utility_correlations.get(name, 0.0)), 0.0)
+                for name in operations
+            ]).clamp_(0.0, 1.0)
+            operation_utility_confidence = float(
+                correlation_values.mean().detach().cpu()
+            )
+            operation_utility_target = (
+                (1.0 - float(operation_utility_confidence))
+                * prior_share_tensor.detach()
+                + float(operation_utility_confidence)
+                * operation_utility_raw_target
             )
             operation_local_loss = -(
                 operation_utility_target * gate_log_probs
             ).sum()
 
-            utility_prefix_sum = {
-                name: torch.sort(
-                    utility_by_op[name], descending=True
-                ).values.cumsum(dim=0)
-                for name in operations
-            }
-            bin_values = []
-            target_share_dict = {
-                name: float(operation_utility_target[index].cpu())
-                for index, name in enumerate(operations)
-            }
-            for ratio_value in bin_tensor.detach().cpu().tolist():
-                bin_budget = max(1, int(math.ceil(point_count * float(ratio_value))))
-                bin_counts = self._den6_allocate_counts(
-                    bin_budget, target_share_dict
-                )
-                utility_sum = operation_values.new_zeros(())
-                for name in operations:
-                    take = min(bin_counts[name], int(utility_by_op[name].numel()))
-                    if take > 0:
-                        utility_sum = utility_sum + utility_prefix_sum[name][take - 1]
-                bin_values.append(utility_sum)
-            bin_values = torch.stack(bin_values)
-            bin_values = _global_standardize(bin_values)
-            amount_utility_target = torch.softmax(bin_values.detach(), dim=0)
-            amount_local_loss = -(
-                amount_utility_target * amount_log_probs
-            ).sum()
-
-        # Candidate targets are standardized only inside the same operation,
-        # where their codec attribution is comparable.  Add/Prune/Adjust use
-        # different edit semantics and candidate-pool distributions; treating
-        # their raw proxy tails as a cross-operation teacher produced a
-        # measured Add target of 0.763 and worsened fixed Actual after two
-        # Episodes.  Keep the cross-operation/Amount estimates as diagnostics,
-        # but do not backpropagate that uncalibrated comparison.  Gate and
-        # Amount remain causally connected to requested_counts and receive the
-        # comparable repeated-frame Actual correction instead.
-        candidate_local_credit_loss = candidate_local_loss
+        operation_local_weight = max(float(getattr(
+            self.args,
+            "heuristic_guidance_online_operation_local_credit_weight",
+            1.0,
+        )), 0.0)
+        candidate_local_credit_loss = (
+            candidate_local_loss
+            + float(operation_local_weight) * operation_local_loss
+        )
         policy_log_prob = where_log_prob + amount_log_prob + action_log_prob
         # Exploration entropy belongs to candidate selection.  Including Gate
         # and Amount here changed an unseen frame's deterministic operation
@@ -4730,6 +4833,19 @@ class StructureRepairActuator(nn.Module):
                 name: float(operation_utility_target[index].detach().cpu())
                 for index, name in enumerate(operations)
             },
+            "operation_utility_raw_target": {
+                name: float(operation_utility_raw_target[index].detach().cpu())
+                for index, name in enumerate(operations)
+            },
+            "operation_utility_confidence": float(operation_utility_confidence),
+            "operation_rate_summary": {
+                name: float(operation_rate_summary[index].detach().cpu())
+                for index, name in enumerate(operations)
+            },
+            "operation_geometry_summary": {
+                name: float(operation_geometry_summary[index].detach().cpu())
+                for index, name in enumerate(operations)
+            },
             "amount_utility_target": [
                 float(value) for value in amount_utility_target.detach().cpu().tolist()
             ],
@@ -4768,6 +4884,7 @@ class StructureRepairActuator(nn.Module):
                     for name in operations
                 ]).mean().detach().cpu()
             ),
+            "amount_fine_score_gradient_scale": float(fine_sigma),
             "operation_amount_log_residuals": {
                 name: float(operation_fine_samples[name].detach().cpu())
                 for name in operations

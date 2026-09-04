@@ -264,11 +264,23 @@ def build_optimizer_and_scheduler(model, args, writer):
             lr=args.lr,
         )
 
-    scheduler_steplr = optim.lr_scheduler.StepLR(
-        optimizer,
-        step_size=args.lr_decay_step,
-        gamma=args.gamma,
-    )
+    if str(getattr(args, "lr_scheduler_mode", "step")).strip().lower() == "plateau":
+        scheduler_steplr = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=float(args.gamma),
+            patience=max(int(getattr(args, "lr_plateau_patience", 30)) - 1, 0),
+            threshold=max(float(getattr(args, "lr_plateau_min_delta", 0.04)), 0.0),
+            threshold_mode="abs",
+            cooldown=max(int(getattr(args, "lr_plateau_cooldown", 15)), 0),
+            min_lr=float(getattr(args, "min_main_lr", 1e-5)),
+        )
+    else:
+        scheduler_steplr = optim.lr_scheduler.StepLR(
+            optimizer,
+            step_size=args.lr_decay_step,
+            gamma=args.gamma,
+        )
 
     writer.write(
         "OptimizerGroups: "
@@ -300,11 +312,23 @@ def build_emulator_optimizer_and_scheduler(model, args, writer):
         optimizer = optim.Adam(parameters, lr=lr, weight_decay=float(args.weight_decay))
     else:
         optimizer = optim.SGD(parameters, lr=lr)
-    scheduler = optim.lr_scheduler.StepLR(
-        optimizer,
-        step_size=args.lr_decay_step,
-        gamma=args.gamma,
-    )
+    if str(getattr(args, "lr_scheduler_mode", "step")).strip().lower() == "plateau":
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=float(args.gamma),
+            patience=max(int(getattr(args, "lr_plateau_patience", 30)) - 1, 0),
+            threshold=max(float(getattr(args, "lr_plateau_min_delta", 0.04)), 0.0),
+            threshold_mode="abs",
+            cooldown=max(int(getattr(args, "lr_plateau_cooldown", 15)), 0),
+            min_lr=float(getattr(args, "min_main_lr", 1e-5)),
+        )
+    else:
+        scheduler = optim.lr_scheduler.StepLR(
+            optimizer,
+            step_size=args.lr_decay_step,
+            gamma=args.gamma,
+        )
     writer.write(
         "FastHeuristicEmulatorOptimizer: "
         f"separate=True, lr={lr:.6g}, params={len(parameters)}"

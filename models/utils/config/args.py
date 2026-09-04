@@ -1857,6 +1857,19 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--gamma', default=0.5, type=float, help='学習率減衰の係数')
     parser.add_argument('--lr_decay_step', default=24, type=int, help='学習率を減衰させるステップ間隔')
     parser.add_argument('--lr_scheduler_enabled', default=False, type=str2bool, help='TrueならEpoch単位のStepLRを使う。SparsePCGCではLR崩壊防止のため既定でFalse')
+    parser.add_argument(
+        '--lr_scheduler_mode', default='step', choices=['step', 'plateau'],
+        help='stepは従来StepLR、plateauはraw deterministic fixed RD停滞時だけLRを下げる',
+    )
+    parser.add_argument(
+        '--lr_plateau_patience', default=30, type=int,
+        help='fixed RD best更新なしでLRを下げるEpisode数（8iの15-Episode窓を2周期待つ）',
+    )
+    parser.add_argument(
+        '--lr_plateau_min_delta', default=0.04, type=float,
+        help='fixed RD best更新と認める絶対差。最新run終盤の差分robust SD約0.035より大きくする',
+    )
+    parser.add_argument('--lr_plateau_cooldown', default=15, type=int)
     parser.add_argument('--min_main_lr', default=1e-5, type=float, help='main optimizerの学習率floor')
     parser.add_argument('--min_surrogate_lr', default=1e-6, type=float, help='Surrogate optimizerの学習率floor')
     parser.add_argument('--max_files', default=10, type=int, help='1系列の1Epochで読み込むフレーム数')
@@ -2467,6 +2480,15 @@ def parse_pugan_args(parser, file_day, file_time):
         help='den6候補pool内Gumbel-TopK探索の温度',
     )
     parser.add_argument(
+        '--heuristic_guidance_network_score_temperature',
+        default=1.0,
+        type=float,
+        help=(
+            'candidate pool内RMSで正規化したNetwork scoreをbounded transformへ'
+            '入れる温度。Episode非依存でraw magnitude driftによる飽和を防ぐ'
+        ),
+    )
+    parser.add_argument(
         '--heuristic_guidance_online_gumbel_scale',
         default=0.10,
         type=float,
@@ -2519,6 +2541,15 @@ def parse_pugan_args(parser, file_day, file_time):
         default=1.0,
         type=float,
         help='既存codec-context/geometry attributionから作るcandidate-local RD損失重み。Actual encode回数は増やさない',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_operation_local_credit_weight',
+        default=1.0,
+        type=float,
+        help=(
+            'cache済みrate/geometry attributionをoperation単位へrobust集約し、'
+            'Gateへ返す低分散creditの重み。Actual encode回数は増やさない'
+        ),
     )
     parser.add_argument(
         '--heuristic_guidance_online_global_actual_credit_weight',
@@ -4084,6 +4115,9 @@ def parse_pugan_args(parser, file_day, file_time):
         float(getattr(args, "heuristic_guidance_network_score_scale", 1.0)),
         1e-6,
     )
+    args.heuristic_guidance_network_score_temperature = max(float(getattr(
+        args, "heuristic_guidance_network_score_temperature", 1.0
+    )), 1e-6)
     args.heuristic_guidance_network_score_init_std = max(
         float(getattr(args, "heuristic_guidance_network_score_init_std", 0.001)),
         0.0,
@@ -4157,6 +4191,11 @@ def parse_pugan_args(parser, file_day, file_time):
         )),
         0.0,
     )
+    args.heuristic_guidance_online_operation_local_credit_weight = max(float(getattr(
+        args,
+        "heuristic_guidance_online_operation_local_credit_weight",
+        1.0,
+    )), 0.0)
     args.heuristic_guidance_online_global_actual_credit_weight = max(
         float(getattr(
             args,
@@ -4961,6 +5000,12 @@ def parse_pugan_args(parser, file_day, file_time):
     )), 0.0)
     args.profile_interval = max(int(getattr(args, "profile_interval", 100)), 1)
     args.lr_scheduler_enabled = bool(getattr(args, "lr_scheduler_enabled", False))
+    args.lr_scheduler_mode = str(getattr(args, "lr_scheduler_mode", "step")).strip().lower()
+    if args.lr_scheduler_mode not in {"step", "plateau"}:
+        raise ValueError("lr_scheduler_mode must be step or plateau")
+    args.lr_plateau_patience = max(int(getattr(args, "lr_plateau_patience", 30)), 1)
+    args.lr_plateau_min_delta = max(float(getattr(args, "lr_plateau_min_delta", 0.04)), 0.0)
+    args.lr_plateau_cooldown = max(int(getattr(args, "lr_plateau_cooldown", 15)), 0)
     args.min_main_lr = max(float(getattr(args, "min_main_lr", 1e-5)), 0.0)
     args.min_surrogate_lr = max(float(getattr(args, "min_surrogate_lr", 1e-6)), 0.0)
     # SparsePCGC hard統計は重いため、既定ではprofile間隔と同じ頻度に制限する。
@@ -7156,6 +7201,10 @@ def parse_pugan_args(parser, file_day, file_time):
         if not _cli_option_was_provided("--repair_operation_gate_random_mix_end"):
             args.repair_operation_gate_random_mix_end = 0.0
         if args.heuristic_guidance_mode == "ana_den6_online":
+            if not _cli_option_was_provided("--lr_scheduler_enabled"):
+                args.lr_scheduler_enabled = True
+            if not _cli_option_was_provided("--lr_scheduler_mode"):
+                args.lr_scheduler_mode = "plateau"
             # Exact den6順位＋Network residualを既定とする。GT-onlyへ黙って
             # 劣化させず、未知frameは初回だけExact cacheを構築する。
             args.sparsepcgc_codec_prune_prior = False

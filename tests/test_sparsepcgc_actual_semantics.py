@@ -1371,7 +1371,7 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         add_logits = torch.full((1, 2, 26), -9.0)
         add_logits[0, 0, 0] = -4.0
         add_logits[0, 1, 0] = -2.0
-        _, raw = actuator._exact_den6_candidate_scores(
+        _, raw, _ = actuator._exact_den6_candidate_scores(
             guidance,
             torch.zeros((1, 1, 2)),
             torch.zeros((1, 1, 2)),

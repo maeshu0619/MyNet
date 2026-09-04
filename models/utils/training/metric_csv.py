@@ -133,11 +133,23 @@ def plot_learning_evidence_curve(checkpoint_path, train_episode_path):
 
     import matplotlib.pyplot as plt
 
-    def rolling_mean(values, window=16):
+    def rolling_mean(values, window=20):
         result = []
         for index in range(len(values)):
             start = max(index - int(window) + 1, 0)
             result.append(sum(values[start:index + 1]) / float(index - start + 1))
+        return result
+
+    def rolling_std(values, window=20):
+        result = []
+        for index in range(len(values)):
+            start = max(index - int(window) + 1, 0)
+            current = values[start:index + 1]
+            mean = sum(current) / float(len(current))
+            result.append(math.sqrt(
+                sum((value - mean) ** 2 for value in current)
+                / float(max(len(current), 1))
+            ))
         return result
 
     output_path = checkpoint_path.replace(
@@ -154,14 +166,31 @@ def plot_learning_evidence_curve(checkpoint_path, train_episode_path):
     axes[0].plot(
         episodes,
         rolling_mean(stochastic_train),
-        label="Stochastic train plan (16-episode mean)",
+        label="Stochastic train plan (20-episode / 800-step mean)",
         alpha=0.9,
         linewidth=1.8,
+    )
+    train_mean = rolling_mean(stochastic_train)
+    train_std = rolling_std(stochastic_train)
+    axes[0].fill_between(
+        episodes,
+        [mean - std for mean, std in zip(train_mean, train_std)],
+        [mean + std for mean, std in zip(train_mean, train_std)],
+        color="tab:blue",
+        alpha=0.10,
+        label="Train rolling variability (+/-1 std)",
     )
     axes[0].plot(
         episodes,
         fixed_actual,
-        label="Deterministic fixed validation (learning evidence)",
+        label="Deterministic fixed validation (raw)",
+        alpha=0.35,
+        linewidth=1.0,
+    )
+    axes[0].plot(
+        episodes,
+        rolling_mean(fixed_actual),
+        label="Deterministic fixed validation (20-episode mean)",
         linewidth=2.0,
     )
     axes[0].set_ylabel("Actual compression delta [%]")

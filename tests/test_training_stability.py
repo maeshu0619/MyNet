@@ -13,6 +13,7 @@ from models.utils.training.compression_primary_loss import (
     build_compression_primary_loss,
 )
 from models.utils.training.lr_control import step_scheduler_with_floor
+from models.utils.training.checkpointing import save_episode_checkpoint
 from models.utils.training.optim_amp import clip_model_gradients
 from models.utils.training.convergence_control import (
     TrainingConvergenceMonitor,
@@ -45,6 +46,12 @@ class _Loss:
     surrogate_optimizer = None
 
 
+class _Plot:
+    @staticmethod
+    def epi_loss_return():
+        return 1.0
+
+
 class TrainingStabilityTest(unittest.TestCase):
     def test_candidate_score_fixed_scale_does_not_amplify_tiny_span(self):
         actuator = StructureRepairActuator.__new__(StructureRepairActuator)
@@ -64,6 +71,28 @@ class TrainingStabilityTest(unittest.TestCase):
         scored = torch.tensor([True, True, False])
         calibrated = actuator._normalize_candidate_network_score(raw, scored)
         self.assertAlmostEqual(float(calibrated[2]), 0.0, places=7)
+
+    def test_candidate_score_pool_scale_prevents_large_raw_saturation(self):
+        actuator = StructureRepairActuator.__new__(StructureRepairActuator)
+        torch.nn.Module.__init__(actuator)
+        actuator.args = SimpleNamespace(
+            heuristic_guidance_network_score_scale=1.0,
+            heuristic_guidance_network_score_temperature=1.0,
+        )
+        raw = torch.tensor(
+            [-120000.0, -60000.0, 0.0, 60000.0, 120000.0],
+            requires_grad=True,
+        )
+        calibrated, audit = actuator._normalize_candidate_network_score(
+            raw, return_audit=True
+        )
+        self.assertTrue(torch.equal(
+            torch.argsort(raw.detach()), torch.argsort(calibrated.detach())
+        ))
+        self.assertEqual(audit["saturation_rate"], 0.0)
+        self.assertGreater(audit["normalization_scale"], 1.0)
+        calibrated.sum().backward()
+        self.assertTrue(torch.isfinite(raw.grad).all())
 
     def test_online_decision_balance_only_clips_large_gradient(self):
         class _Actuator(torch.nn.Module):
@@ -575,6 +604,72 @@ class TrainingStabilityTest(unittest.TestCase):
         self.assertFalse(event["scheduler_stepped"])
         self.assertAlmostEqual(optimizer.param_groups[0]["lr"], 0.1)
 
+    def test_plateau_scheduler_requires_finite_fixed_rd_metric(self):
+        parameter = torch.nn.Parameter(torch.tensor(1.0))
+        optimizer = torch.optim.Adam([parameter], lr=0.1)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=0.5, patience=0
+        )
+        args = SimpleNamespace(
+            lr_scheduler_enabled=True,
+            lr_scheduler_mode="plateau",
+            min_main_lr=0.0,
+        )
+        skipped = step_scheduler_with_floor(
+            scheduler, optimizer, args, metric=None
+        )
+        self.assertFalse(skipped["scheduler_stepped"])
+        step_scheduler_with_floor(scheduler, optimizer, args, metric=1.0)
+        reduced = step_scheduler_with_floor(scheduler, optimizer, args, metric=1.1)
+        self.assertTrue(reduced["scheduler_stepped"])
+        self.assertAlmostEqual(optimizer.param_groups[0]["lr"], 0.05)
+
+    def test_best_pth_uses_deterministic_fixed_rd_objective(self):
+        model = torch.nn.Linear(1, 1, bias=False)
+        args = SimpleNamespace(compression_loss_backend="sparsepcgc_actual")
+        trackers = {}
+        with TemporaryDirectory() as directory:
+            with torch.no_grad():
+                model.weight.fill_(1.0)
+            _, _, trackers = save_episode_checkpoint(
+                model, directory, _Plot(), _Writer(), 0, float("inf"),
+                args=args,
+                stage="joint",
+                checkpoint_metrics={
+                    "total_loss": 1.0,
+                    "checkpoint_actual_source": "full_cloud",
+                    "checkpoint_actual_delta": -3.0,
+                    "checkpoint_actual_count": 5,
+                    "full_cloud_val_actual_count": 5,
+                    "full_cloud_val_fixed_objective": -2.0,
+                    "checkpoint_eligible": True,
+                    "geometry_ok": True,
+                    "safety_ok": True,
+                },
+                best_trackers=trackers,
+            )
+            with torch.no_grad():
+                model.weight.fill_(2.0)
+            _, _, trackers = save_episode_checkpoint(
+                model, directory, _Plot(), _Writer(), 1, 0.0,
+                args=args,
+                stage="joint",
+                checkpoint_metrics={
+                    "total_loss": 0.5,
+                    "checkpoint_actual_source": "full_cloud",
+                    "checkpoint_actual_delta": -3.5,
+                    "checkpoint_actual_count": 5,
+                    "full_cloud_val_actual_count": 5,
+                    "full_cloud_val_fixed_objective": -1.5,
+                    "checkpoint_eligible": True,
+                    "geometry_ok": True,
+                    "safety_ok": True,
+                },
+                best_trackers=trackers,
+            )
+            best = torch.load(os.path.join(directory, "best.pth"), map_location="cpu")
+            self.assertAlmostEqual(float(best["weight"]), 1.0)
+            self.assertEqual(trackers["best_pth_source"], "best_fixed_rd")
     def test_fixed_validation_records_ignore_moving_training_window(self):
         dataset = SimpleNamespace(
             all_files=["/tmp/frame_0001.ply", "/tmp/frame_0002.ply", "/tmp/frame_0003.ply"],

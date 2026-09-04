@@ -4851,7 +4851,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                         f"corr={dict(audit_plan.get('candidate_utility_correlation') or {})}, "
                         f"target={dict(audit_plan.get('candidate_utility_audit') or {})}), "
                         f"operation_local=(loss={case_float(audit_plan.get('operation_local_loss', 0.0), 0.0):.6g}, "
-                        f"target={dict(audit_plan.get('operation_utility_target') or {})}), "
+                        f"target={dict(audit_plan.get('operation_utility_target') or {})}, "
+                        f"raw_target={dict(audit_plan.get('operation_utility_raw_target') or {})}, "
+                        f"confidence={float(audit_plan.get('operation_utility_confidence', 0.0) or 0.0):.6g}), "
                         f"amount_local=(loss={case_float(audit_plan.get('amount_local_loss', 0.0), 0.0):.6g}, "
                         f"target={list(audit_plan.get('amount_utility_target') or [])}), "
                         f"topk_audit={dict(audit_plan.get('topk_audit') or {})}, "
@@ -5511,7 +5513,11 @@ def train(model, args, loss, writer, plot, notifier=None):
                     return
 
             """lr scheduler"""
-            if epoch_has_optimizer_step:
+            if (
+                epoch_has_optimizer_step
+                and str(getattr(args, "lr_scheduler_mode", "step")).strip().lower()
+                != "plateau"
+            ):
                 scheduler_event = step_scheduler_with_floor( scheduler_steplr, optimizer, args, writer=writer, global_epoch=global_epoch + 1, global_step=global_train_step) # StepLRを進める場合でもLR floorを必ず適用する
                 if emulator_scheduler is not None and emulator_optimizer is not None:
                     # main schedulerと同じ有効フラグを通す。従来はここだけ毎Epoch
@@ -5536,7 +5542,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                 scheduler_event["current_lr_main"] = optimizer_lrs_safe(optimizer)
                 scheduler_event["current_lr_surrogate"] = optimizer_lrs_safe(getattr(loss, "surrogate_optimizer", None))
                 log_for_better_event( for_better_path, "scheduler_lr_step", **scheduler_event)
-            else:
+            elif not epoch_has_optimizer_step:
                 writer.write("No successful optimizer step in this epoch; lr_scheduler.step() was skipped.")
 
             global_epoch += 1
@@ -5607,6 +5613,61 @@ def train(model, args, loss, writer, plot, notifier=None):
         checkpoint_metrics["full_cloud_val_sample_signature"] = str(
             full_cloud_val.get("sample_signature") or ""
         )
+        # Plateau schedulerはmoving train窓や平滑plotではなく、同一frame・
+        # explorationなしのraw deterministic fixed RDだけをEpisodeごとに見る。
+        # 固定EpisodeでのLR変更ではなく、実性能が2 dataset周期停滞した場合だけ
+        # 次Episode以降の更新幅を縮める。
+        if (
+            episode_optimizer_step_count > 0
+            and str(getattr(args, "lr_scheduler_mode", "step")).strip().lower()
+            == "plateau"
+        ):
+            plateau_metric = finite_float_or_none(
+                full_cloud_val.get("fixed_objective")
+            )
+            scheduler_event = step_scheduler_with_floor(
+                scheduler_steplr,
+                optimizer,
+                args,
+                metric=plateau_metric,
+                writer=writer,
+                global_epoch=global_epoch,
+                global_step=global_train_step,
+            )
+            if emulator_scheduler is not None and emulator_optimizer is not None:
+                emulator_event = step_scheduler_with_floor(
+                    emulator_scheduler,
+                    emulator_optimizer,
+                    args,
+                    metric=plateau_metric,
+                    writer=writer,
+                    global_epoch=global_epoch,
+                    global_step=global_train_step,
+                )
+                scheduler_event["emulator_scheduler_stepped"] = bool(
+                    emulator_event.get("scheduler_stepped", False)
+                )
+                scheduler_event["current_lr_emulator"] = optimizer_lrs_safe(
+                    emulator_optimizer
+                )
+            if scheduler_event.get("scheduler_stepped"):
+                scheduler_step_count += 1
+            scheduler_event["scheduler_step_count"] = scheduler_step_count
+            scheduler_event["current_lr_main"] = optimizer_lrs_safe(optimizer)
+            scheduler_event["current_lr_surrogate"] = optimizer_lrs_safe(
+                getattr(loss, "surrogate_optimizer", None)
+            )
+            log_for_better_event(
+                for_better_path,
+                "scheduler_fixed_rd_plateau_step",
+                **scheduler_event,
+            )
+            writer.write(
+                "FixedRDPlateauScheduler: "
+                f"metric={plateau_metric}, lrs={scheduler_event['current_lr_main']}, "
+                f"patience={int(getattr(args, 'lr_plateau_patience', 30))}, "
+                f"min_delta={float(getattr(args, 'lr_plateau_min_delta', 0.04)):.6g}"
+            )
         fixed_validation_geometry = finite_float_or_none(
             full_cloud_val.get("geometry_value")
         )

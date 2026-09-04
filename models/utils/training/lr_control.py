@@ -1,3 +1,6 @@
+import math
+
+
 def optimizer_lrs_safe(optimizer):
     if optimizer is None:  # Optimizerが無い場合は空のLR一覧を返す
         return []  # ログ側でNA扱いにできるよう空リストにする
@@ -35,7 +38,10 @@ def apply_optimizer_lr_floor(optimizer, args, *, label="main", writer=None, glob
     }
 
 
-def step_scheduler_with_floor(scheduler, optimizer, args, *, writer=None, global_epoch=None, global_step=None):
+def step_scheduler_with_floor(
+    scheduler, optimizer, args, *, metric=None, writer=None,
+    global_epoch=None, global_step=None
+):
     enabled = bool(getattr(args, "lr_scheduler_enabled", False))  # StepLRを使う設定か確認する
     before = optimizer_lrs_safe(optimizer)  # scheduler前のLR一覧を記録する
     event = {
@@ -45,9 +51,23 @@ def step_scheduler_with_floor(scheduler, optimizer, args, *, writer=None, global
         "lr_floor_applied": False,  # scheduler後floor適用の有無を初期化する
         "scheduler_disabled": not enabled,  # schedulerが設定で止まっているか保存する
     }
+    mode = str(getattr(args, "lr_scheduler_mode", "step")).strip().lower()
+    event["scheduler_mode"] = mode
+    event["scheduler_metric"] = metric
     if enabled and scheduler is not None:  # scheduler有効かつ実体がある場合だけstepする
-        scheduler.step()  # Epoch単位のStepLRを1回進める
-        event["scheduler_stepped"] = True  # scheduler実行済みとして記録する
+        if mode == "plateau":
+            try:
+                metric_value = float(metric)
+            except (TypeError, ValueError):
+                metric_value = float("nan")
+            if math.isfinite(metric_value):
+                scheduler.step(metric_value)
+                event["scheduler_stepped"] = True
+            else:
+                event["scheduler_skip_reason"] = "missing_nonfinite_fixed_rd_metric"
+        else:
+            scheduler.step()  # Epoch単位のStepLRを1回進める
+            event["scheduler_stepped"] = True  # scheduler実行済みとして記録する
     after_scheduler = optimizer_lrs_safe(optimizer)  # scheduler直後のLR一覧を取得する
     floor_event = apply_optimizer_lr_floor(
         optimizer,

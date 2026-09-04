@@ -56,6 +56,7 @@ def _ensure_best_trackers(best_trackers, best_loss):
     best_trackers.setdefault("loss_by_stage", {})
     best_trackers.setdefault("actual_candidate", float("inf"))
     best_trackers.setdefault("actual_improved", float("inf"))
+    best_trackers.setdefault("fixed_rd_objective", float("inf"))
     best_trackers.setdefault("actual_by_stage", {})
     best_trackers.setdefault("has_actual_candidate", False)
     best_trackers.setdefault("has_actual_improved", False)
@@ -115,6 +116,15 @@ def save_episode_checkpoint(
         current_loss = plot.epi_loss_return()
     stage_name = str(stage or checkpoint_metrics.get("stage") or "unknown").strip().lower() or "unknown"
     actual_backend = _is_actual_backend(args) if args is not None else False
+    fixed_rd_objective = _finite_float(
+        checkpoint_metrics.get("full_cloud_val_fixed_objective"), None
+    )
+    fixed_rd_count = int(
+        checkpoint_metrics.get("full_cloud_val_actual_count") or 0
+    )
+    fixed_rd_available = bool(
+        actual_backend and fixed_rd_objective is not None and fixed_rd_count > 0
+    )
     checkpoint_updates = []
     not_updated_reasons = []
 
@@ -167,7 +177,7 @@ def save_episode_checkpoint(
                 f"{actual_source}_actual_delta={actual_delta:.6f}, actual_count={actual_count}, "
                 f"geom_ok={geometry_ok}, safety_ok={safety_ok}"
             )
-            if not best_trackers["has_actual_improved"]:
+            if not best_trackers["has_actual_improved"] and not fixed_rd_available:
                 model_path = _save_state_dict(model, ckpt_dir, "best.pth", loss=loss)
                 best_trackers["best_pth_source"] = "best_actual_delta_candidate"
         else:
@@ -189,13 +199,15 @@ def save_episode_checkpoint(
             best_trackers["actual_improved"] = actual_delta
             best_trackers["has_actual_improved"] = True
             model_path = _save_state_dict(model, ckpt_dir, "best_actual_delta_improved.pth", loss=loss)
-            model_path = _save_state_dict(model, ckpt_dir, "best.pth", loss=loss)
-            best_trackers["best_pth_source"] = "best_actual_delta_improved"
+            if not fixed_rd_available:
+                model_path = _save_state_dict(model, ckpt_dir, "best.pth", loss=loss)
+                best_trackers["best_pth_source"] = "best_actual_delta_improved"
             checkpoint_updates.append("best_actual_delta_improved")
             writer.write(
                 f"New improved actual-delta best at episode {episode + 1}, "
                 f"{actual_source}_actual_delta={actual_delta:.6f}, actual_count={actual_count}, "
-                "path=best_actual_delta_improved.pth and best.pth"
+                "path=best_actual_delta_improved.pth"
+                + (" (best.pth selected by fixed RD)" if fixed_rd_available else " and best.pth")
             )
         else:
             if actual_delta >= 0.0 or actual_delta >= best_trackers["actual_improved"]:
@@ -225,6 +237,27 @@ def save_episode_checkpoint(
             checkpoint_updates.append("fallback")
         else:
             not_updated_reasons.append("fallback_not_allowed")
+    # Actual単独bestとRate-Distortion bestを分ける。full-cloud fixed RDが
+    # 存在するrunでは、正式なbest.pthは同一frame・explorationなしの
+    # objectiveでのみ更新し、後続のActual単独改善で上書きしない。
+    if fixed_rd_available:
+        if not checkpoint_eligible:
+            not_updated_reasons.append("fixed_rd_checkpoint_ineligible")
+        elif fixed_rd_objective < best_trackers["fixed_rd_objective"]:
+            best_trackers["fixed_rd_objective"] = fixed_rd_objective
+            model_path = _save_state_dict(
+                model, ckpt_dir, "best_fixed_rd.pth", loss=loss
+            )
+            model_path = _save_state_dict(model, ckpt_dir, "best.pth", loss=loss)
+            best_trackers["best_pth_source"] = "best_fixed_rd"
+            checkpoint_updates.append("best_fixed_rd")
+            writer.write(
+                f"New deterministic fixed-RD best at episode {episode + 1}, "
+                f"fixed_objective={fixed_rd_objective:.6f}, count={fixed_rd_count}, "
+                "path=best_fixed_rd.pth and best.pth"
+            )
+        else:
+            not_updated_reasons.append("fixed_rd_not_improved")
     if not checkpoint_updates and not not_updated_reasons:
         not_updated_reasons.append("actual_not_improved" if actual_backend else "loss_not_improved")
     surrogate_abs_error = _finite_float(checkpoint_metrics.get("surrogate_abs_bit_error"), None) # Surrogate保存判定用の平均abs errorを取り出す

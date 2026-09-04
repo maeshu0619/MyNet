@@ -444,9 +444,17 @@ def _candidate_local_proxy_tensors(
     def _standardize(value: torch.Tensor) -> torch.Tensor:
         if int(value.numel()) <= 1:
             return torch.zeros_like(value)
-        centered = value - value.mean()
-        scale = centered.square().mean().sqrt()
-        return centered / scale.clamp_min(torch.finfo(value.dtype).eps)
+        # codec attributionには局所context由来の長い裾がある。mean/stdだけでは
+        # 1候補の外れ値がpool全体の教師順位差を潰すため、median/MADで校正し、
+        # MADが退化したときだけRMSへ戻す。5 MADのwinsorizationは順位を保ち、
+        # candidateごとのActual encodeを増やさない。
+        center = value.median()
+        centered = value - center
+        mad_scale = centered.abs().median() * 1.4826
+        rms_scale = centered.square().mean().sqrt()
+        eps = torch.finfo(value.dtype).eps
+        scale = torch.where(mad_scale > eps, mad_scale, rms_scale).clamp_min(eps)
+        return (centered / scale).clamp(-5.0, 5.0)
 
     # Reuse the already configured RD support ratio rather than introducing a
     # curve-fitting constant.  It is fixed throughout training and therefore
