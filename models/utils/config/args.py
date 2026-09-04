@@ -7205,6 +7205,14 @@ def parse_pugan_args(parser, file_day, file_time):
                 args.lr_scheduler_enabled = True
             if not _cli_option_was_provided("--lr_scheduler_mode"):
                 args.lr_scheduler_mode = "plateau"
+            # Validation bestは別checkpointとして保持し、訓練中のparameter/
+            # optimizer stateは巻き戻さない。旧guard rollbackはE30などで
+            # 学習軌跡そのものを飛ばし、plateau schedulerとbest model selection
+            # の役割とも重複していた。明示CLI指定は診断実験用に尊重する。
+            if not _cli_option_was_provided("--actual_guard_restore_best"):
+                args.actual_guard_restore_best = False
+            if not _cli_option_was_provided("--actual_guard_max_restores"):
+                args.actual_guard_max_restores = 0
             # Exact den6順位＋Network residualを既定とする。GT-onlyへ黙って
             # 劣化させず、未知frameは初回だけExact cacheを構築する。
             args.sparsepcgc_codec_prune_prior = False

@@ -4749,6 +4749,17 @@ def train(model, args, loss, writer, plot, notifier=None):
                             ("Amount", "den6_online_amount_grad_norm_before_balance"),
                             ("Surrogate", "surrogate_grad_norm"),
                         ):
+                            # 初見sequence/frameでは比較用Actual baselineがまだ無く、
+                            # Amountのglobal score-function creditを意図的に発生させない。
+                            # candidate-local Where教師は存在するためWhereは検査を続け、
+                            # Amountはbaseline確立後だけ非ゼロを契約とする。
+                            if (
+                                head_name == "Amount"
+                                and not bool(audit_plan.get(
+                                    "policy_global_available", False
+                                ))
+                            ):
+                                continue
                             # With gradient balancing explicitly disabled there is no
                             # ``*_before_balance`` field.  The direct head audit is
                             # the same pre-clip gradient and must be used instead of
@@ -4914,6 +4925,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                         f", grad_norms_pre_decision_balance=(where={float(audit_compression.get('den6_online_where_grad_norm_before_balance', 0.0) or 0.0):.6g}, "
                         f"amount={float(audit_compression.get('den6_online_amount_grad_norm_before_balance', 0.0) or 0.0):.6g}, "
                         f"action={float(audit_compression.get('den6_online_action_grad_norm_before_balance', 0.0) or 0.0):.6g})"
+                        f", grad_norms_post_decision_balance=(where={float(audit_compression.get('den6_online_where_grad_norm_after_balance', 0.0) or 0.0):.6g}, "
+                        f"amount={float(audit_compression.get('den6_online_amount_grad_norm_after_balance', 0.0) or 0.0):.6g}, "
+                        f"action={float(audit_compression.get('den6_online_action_grad_norm_after_balance', 0.0) or 0.0):.6g})"
                         f", optimizer=(lr={optimizer_lrs_safe(optimizer)}, "
                         f"clip_max={float(audit_compression.get('train_grad_clip_max_norm', 0.0) or 0.0):.6g}, "
                         f"grad_before_clip={float(audit_compression.get('train_grad_total_norm_before_clip', 0.0) or 0.0):.6g}, "
