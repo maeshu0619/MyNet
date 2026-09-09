@@ -1135,12 +1135,12 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
             "anchor_operation_counts": {"Add": 1, "Prune": 1, "Adjust": 1},
             "final_voxel_hash": _coord_hash(expected),
             "ranked_candidate_pools": {
-                "Add": [{"candidate_id": "a0", "operation": "Add", "pool_rank": 0, "remove_coords": [], "add_coords": [[2, 0, 1]]}],
+                "Add": [{"candidate_id": "a0", "operation": "Add", "pool_rank": 0, "remove_coords": [], "add_coords": [[2, 0, 1]], "optimistic_gain_bits": 1.0, "geometry_cost": 0.2}],
                 "Prune": [
-                    {"candidate_id": "p0", "operation": "Prune", "pool_rank": 0, "remove_coords": [[0, 0, 0]], "add_coords": []},
-                    {"candidate_id": "p1", "operation": "Prune", "pool_rank": 1, "remove_coords": [[0, 1, 0]], "add_coords": []},
+                    {"candidate_id": "p0", "operation": "Prune", "pool_rank": 0, "remove_coords": [[0, 0, 0]], "add_coords": [], "optimistic_gain_bits": 4.0, "geometry_cost": 0.1},
+                    {"candidate_id": "p1", "operation": "Prune", "pool_rank": 1, "remove_coords": [[0, 1, 0]], "add_coords": [], "optimistic_gain_bits": 1.0, "geometry_cost": 1.0},
                 ],
-                "Adjust": [{"candidate_id": "m0", "operation": "Adjust", "pool_rank": 0, "remove_coords": [[1, 0, 0]], "add_coords": [[2, 0, 0]]}],
+                "Adjust": [{"candidate_id": "m0", "operation": "Adjust", "pool_rank": 0, "remove_coords": [[1, 0, 0]], "add_coords": [[2, 0, 0]], "optimistic_gain_bits": 2.0, "geometry_cost": 0.5}],
             },
         }
         like = torch.zeros((1, 1, coords.shape[-1]), dtype=torch.float32)
@@ -1212,6 +1212,9 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         add_ratio = torch.tensor([[[0.0018]]], requires_grad=True)
         prune_ratio = torch.tensor([[[0.0007]]], requires_grad=True)
         adjust_ratio = torch.tensor([[[0.0003]]], requires_grad=True)
+        residual_drop_preference = torch.zeros(
+            (1, 1, coords.shape[-1]), requires_grad=True
+        )
         gate_logits = torch.tensor([[[0.2], [-0.1], [0.4]]], requires_grad=True)
         residual_result = actuator._build_exact_den6_residual_plan(
             guidance,
@@ -1219,7 +1222,7 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
             add_ratio,
             prune_ratio,
             adjust_ratio,
-            torch.zeros((1, 1, coords.shape[-1])),
+            residual_drop_preference,
             torch.zeros((1, 1, coords.shape[-1])),
             torch.zeros((1, 26, coords.shape[-1])),
             torch.zeros((1, coords.shape[-1], 26)),
@@ -1233,6 +1236,7 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         operation_gradients = torch.autograd.grad(
             residual_result[1]["policy_log_prob"],
             (add_ratio, prune_ratio, adjust_ratio, gate_logits),
+            retain_graph=True,
         )
         self.assertTrue(all(torch.isfinite(value).all() for value in operation_gradients))
         self.assertTrue(all(float(value.abs().sum()) > 0.0 for value in operation_gradients))
@@ -1245,9 +1249,27 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
             set(residual_result[1]["operation_gate_probabilities"]),
             {"Add", "Prune", "Adjust"},
         )
+        # 復元したcandidate/operation/Amount local creditは、1回の
+        # composite Actualとは別に各decision headへ直接勾配を返す。
+        local_credit_gradients = torch.autograd.grad(
+            residual_result[1]["candidate_local_credit_loss"],
+            (
+                residual_drop_preference,
+                add_ratio,
+                prune_ratio,
+                adjust_ratio,
+                gate_logits,
+            ),
+        )
+        self.assertTrue(all(
+            torch.isfinite(value).all() for value in local_credit_gradients
+        ))
+        self.assertTrue(all(
+            float(value.abs().sum()) > 0.0 for value in local_credit_gradients
+        ))
 
-        # Network-primary rankingは旧autonomy外部重みに依存せず、同じPool内で
-        # den6順位差をNetwork scoreが逆転できることを確認する。
+        # bounded residual rankingは小さい補正ではden6順位を保ち、十分な
+        # Network差が学習されたときには同じPool内で順位を逆転できる。
         prune_map = guidance["candidate_tensor_map"]["Prune"]
         prune_map["rank_score"] = torch.tensor([0.55, 0.45])
         prune_map["source_index"] = torch.tensor([0, 2], dtype=torch.long)
@@ -1274,7 +1296,7 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
             None,
             prune_gate,
         )
-        actuator.args._heuristic_guidance_network_residual_weight_current = 0.25
+        actuator.args._heuristic_guidance_network_residual_weight_current = 0.15
         high_autonomy = actuator._build_exact_den6_residual_plan(
             guidance,
             coords,
@@ -1288,9 +1310,9 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
             None,
             prune_gate,
         )
-        self.assertIn("p1", low_autonomy[1]["selected_candidate_ids"])
+        self.assertIn("p0", low_autonomy[1]["selected_candidate_ids"])
         self.assertIn("p1", high_autonomy[1]["selected_candidate_ids"])
-        self.assertEqual(low_autonomy[1]["plan_hash"], high_autonomy[1]["plan_hash"])
+        self.assertNotEqual(low_autonomy[1]["plan_hash"], high_autonomy[1]["plan_hash"])
         where_gradient = torch.autograd.grad(
             high_autonomy[1]["policy_log_prob"], drop_preference
         )[0]

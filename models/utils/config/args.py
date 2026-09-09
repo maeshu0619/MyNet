@@ -1874,7 +1874,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--min_surrogate_lr', default=1e-6, type=float, help='Surrogate optimizerの学習率floor')
     parser.add_argument('--max_files', default=10, type=int, help='1系列の1Epochで読み込むフレーム数')
     parser.add_argument('--train_frames_per_sequence', default=100, type=int, help='各系列で訓練に使用する先頭フレーム数。残りは訓練窓から除外する')
-    parser.add_argument('--episodes', default=384, type=int, help='学習エピソード数')
+    parser.add_argument('--episodes', default=382, type=int, help='学習エピソード数')
     parser.add_argument('--exploration_schedule_episodes', default=0, type=int, help='探索ノイズの減衰基準Episode数。0なら実際の最大訓練長へ連動し、訓練延長時に旧固定長で探索が途中終了することを防ぐ')
     parser.add_argument('--train_until_converged', default=False, type=str2bool, help='Trueならepisodesを最低訓練長とし、固定検証で十分な収束証拠が得られるまで継続する')
     parser.add_argument('--convergence_min_episodes', default=0, type=int, help='収束判定を始める最低Episode数。0なら--episodesを使う')
@@ -4356,12 +4356,9 @@ def parse_pugan_args(parser, file_day, file_time):
         args.heuristic_guidance_online_prefetch_workers = 0
         args.batch_size = 1
         if not _cli_option_was_provided("--heuristic_guidance_final_where_weight"):
-            # Heuristicはedit-unit Poolの生成・妥当性filterまでを担当する。
-            # 実測ではw_H=0.25でA/Bが同一、0でActualが-0.79まで崩れた。
-            # 0.01では候補集合を32.1%変更しつつHeuristic-onlyと同じActualを
-            # 保てた。一方0.005の15-Step後Dは-3.072まで悪化したため採用せず、
-            # codec-safe Pool内の弱い構造priorとして実測安全境界を残す。
-            args.heuristic_guidance_final_where_weight = 0.01
+            # den6順位を基準尺度として保持し、Networkは下の固定0.15幅の
+            # bounded residualとして補正する。Episode依存の権限移行は行わない。
+            args.heuristic_guidance_final_where_weight = 1.0
         if not _cli_option_was_provided("--heuristic_guidance_exact_anchor_steps"):
             # 完成済みden6 planを通常trainのStep 1へ混ぜると、そのActual値が
             # 未学習Networkの性能として記録される。anchorはA/B監査用の明示的な
@@ -4374,10 +4371,10 @@ def parse_pugan_args(parser, file_day, file_time):
             # 構造を保つ1/10（係数0.00025）へ校正する。
             args.heuristic_guidance_online_gumbel_scale = 0.001
         if not _cli_option_was_provided("--repair_online_decision_grad_max_norm"):
-            # STE混入を除いた純Actual方策のWhere norm=0.0049--0.0119に対し、
-            # Amount/gateは1023--1615/114--178だった。小勾配を増幅せず、
-            # 突出headだけWhereと同じ桁へ制限する。
-            args.repair_online_decision_grad_max_norm = 0.01
+            # 004957後半の実測normはWhere≈0.049, Amount≈6.54,
+            # Action≈0.297であった。0.01上限は有効信号まで消したため、
+            # 小勾配を増幅せず、1を超えるspikeだけをclipする。
+            args.repair_online_decision_grad_max_norm = 1.0
         # 旧5% Prune等で学習したheadを自動読込するとonline residual初期値を汚す。
         # 明示指定時だけ再開を許可し、既定は新しい方策headから開始する。
         if not _cli_option_was_provided("--more_training"):
