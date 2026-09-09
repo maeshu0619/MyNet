@@ -4356,9 +4356,9 @@ def parse_pugan_args(parser, file_day, file_time):
         args.heuristic_guidance_online_prefetch_workers = 0
         args.batch_size = 1
         if not _cli_option_was_provided("--heuristic_guidance_final_where_weight"):
-            # den6順位を基準尺度として保持し、Networkは下の固定0.15幅の
-            # bounded residualとして補正する。Episode依存の権限移行は行わない。
-            args.heuristic_guidance_final_where_weight = 1.0
+            # 004957と停滞runの初回score auditはともに0.01で完全一致した。
+            # 差は後段creditにあるため、実績のある弱いpool順位priorを維持する。
+            args.heuristic_guidance_final_where_weight = 0.01
         if not _cli_option_was_provided("--heuristic_guidance_exact_anchor_steps"):
             # 完成済みden6 planを通常trainのStep 1へ混ぜると、そのActual値が
             # 未学習Networkの性能として記録される。anchorはA/B監査用の明示的な
@@ -4389,15 +4389,11 @@ def parse_pugan_args(parser, file_day, file_time):
                 # residual rampを重ねると同じNetwork出力の実行量が時刻で変わる。
                 args.heuristic_guidance_anchor_steps = 0
             if not _cli_option_was_provided("--heuristic_guidance_network_residual_weight"):
-                # 20260817の安定runで確認済みの0.15を固定上限として使う。
-                # scoreは固定尺度校正後、学習したraw差に比例して効くため、
-                # Episode依存の重み段階変更は不要である。
-                args.heuristic_guidance_network_residual_weight = 0.15
+                # 004957で実際に候補順位へ使われた実効Network係数は1.0である。
+                # pool内RMS+tanhにより値域は既にboundedであり、時間scheduleは不要。
+                args.heuristic_guidance_network_residual_weight = 1.0
             if not _cli_option_was_provided("--heuristic_guidance_network_residual_weight_max"):
-                # 20260817の安定runは0.15で最終-3.8付近へ到達した。一方、
-                # 20260822 runは0.325まで拡張して候補順位が崩れたため、
-                # 明示指定がない場合だけ実測済みの安全域を上限にする。
-                args.heuristic_guidance_network_residual_weight_max = 0.15
+                args.heuristic_guidance_network_residual_weight_max = 1.0
             if not _cli_option_was_provided("--heuristic_guidance_network_residual_weight_increment"):
                 args.heuristic_guidance_network_residual_weight_increment = 0.0
             # den6 Amountは全点群比0.05%～0.25%級である。旧3%/5%初期値を混入させない。

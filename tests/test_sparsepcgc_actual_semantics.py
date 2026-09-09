@@ -1249,24 +1249,14 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
             set(residual_result[1]["operation_gate_probabilities"]),
             {"Add", "Prune", "Adjust"},
         )
-        # 復元したcandidate/operation/Amount local creditは、1回の
-        # composite Actualとは別に各decision headへ直接勾配を返す。
-        local_credit_gradients = torch.autograd.grad(
+        # local creditは比較可能な同一operation内candidateだけを学習する。
+        # Gate/Amount/Fineは上の実行plan policy_log_probから学習する。
+        local_credit_gradient = torch.autograd.grad(
             residual_result[1]["candidate_local_credit_loss"],
-            (
-                residual_drop_preference,
-                add_ratio,
-                prune_ratio,
-                adjust_ratio,
-                gate_logits,
-            ),
-        )
-        self.assertTrue(all(
-            torch.isfinite(value).all() for value in local_credit_gradients
-        ))
-        self.assertTrue(all(
-            float(value.abs().sum()) > 0.0 for value in local_credit_gradients
-        ))
+            residual_drop_preference,
+        )[0]
+        self.assertTrue(torch.isfinite(local_credit_gradient).all())
+        self.assertGreater(float(local_credit_gradient.abs().sum()), 0.0)
 
         # bounded residual rankingは小さい補正ではden6順位を保ち、十分な
         # Network差が学習されたときには同じPool内で順位を逆転できる。
@@ -1280,9 +1270,10 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         drop_preference.requires_grad_()
         prune_gate = torch.tensor([[[5.0], [-5.0], [-5.0]]])
         actuator.args.heuristic_guidance_network_residual_weight = 0.01
-        actuator.args.heuristic_guidance_network_residual_weight_max = 0.25
+        actuator.args.heuristic_guidance_network_residual_weight_max = 1.0
+        actuator.args.heuristic_guidance_final_where_weight = 0.01
         actuator.args.heuristic_guidance_network_to_heuristic_std_cap = 0.0
-        actuator.args._heuristic_guidance_network_residual_weight_current = 0.01
+        actuator.args._heuristic_guidance_network_residual_weight_current = 0.0
         low_autonomy = actuator._build_exact_den6_residual_plan(
             guidance,
             coords,
@@ -1296,7 +1287,7 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
             None,
             prune_gate,
         )
-        actuator.args._heuristic_guidance_network_residual_weight_current = 0.15
+        actuator.args._heuristic_guidance_network_residual_weight_current = 1.0
         high_autonomy = actuator._build_exact_den6_residual_plan(
             guidance,
             coords,

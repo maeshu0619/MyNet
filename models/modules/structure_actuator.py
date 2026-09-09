@@ -4095,12 +4095,12 @@ class StructureRepairActuator(nn.Module):
             add_pair_logits,
             return_raw=True,
         )
-        # den6は安全で有望な候補Poolとその基準順位を与え、Networkは固定幅の
-        # bounded residualで順位を補正する。重みはEpisodeでは変えず、既存の
-        # residual設定（既定0.15）を使う。これにより未学習headがPool全体を
-        # 無条件に並べ替えることも、Heuristicが最終回答を固定することも避ける。
+        # den6は安全で有望な候補Poolを与え、Networkがpool内の最終順位を
+        # 決める。004957と停滞runは初回の実効score式まで同一だったため、
+        # Network-primary化を停滞原因とみなして弱めない。pool内RMS+tanhで
+        # Network補正自体はboundedに保ち、Heuristic順位は弱いpriorとして残す。
         residual_weight_start = max(float(getattr(
-            self.args, "heuristic_guidance_network_residual_weight", 0.15
+            self.args, "heuristic_guidance_network_residual_weight", 1.0
         )), 0.0)
         residual_weight_max = max(float(getattr(
             self.args,
@@ -4118,7 +4118,7 @@ class StructureRepairActuator(nn.Module):
         gumbel_scale_ratio = max(float(exploration_multiplier), 0.0)
         gumbel_scales = []
         heuristic_prior_weight = max(float(getattr(
-            self.args, "heuristic_guidance_final_where_weight", 1.0
+            self.args, "heuristic_guidance_final_where_weight", 0.01
         )), 0.0)
         ordered_indices = {}
         static_compatible = {}
@@ -4509,10 +4509,9 @@ class StructureRepairActuator(nn.Module):
         action_log_prob = (selected_share.detach() * gate_log_probs).sum()
         action_entropy = -(gate_probs * gate_log_probs).sum()
 
-        # 004957で使われたcross-operation/Amount local creditを復元する。
-        # 同じcache済みrate attributionとgeometry riskのみを使うため、
-        # candidate別Actual encodeは増えない。Global Actual correctionは
-        # composite plan全体の実codec教師として別経路に残る。
+        # 004957と同じcross-operation/Amount診断値を算出する。
+        # operation間ではproxy尺度が比較不能なので下ではbackwardに混ぜず、
+        # candidate別Actual encodeを増やさない監査情報として保持する。
         local_rate_by_op = {}
         local_geometry_by_op = {}
         for name in operations:
@@ -4607,12 +4606,13 @@ class StructureRepairActuator(nn.Module):
                 amount_utility_target * amount_log_probs
             ).sum()
 
-        local_credit_terms = [candidate_local_loss]
-        if operation_local_loss.requires_grad:
-            local_credit_terms.append(operation_local_loss)
-        if amount_local_loss.requires_grad:
-            local_credit_terms.append(amount_local_loss)
-        candidate_local_credit_loss = torch.stack(local_credit_terms).mean()
+        # Add/Prune/Adjustはedit semanticsとproxy分布が異なり、pool間の
+        # raw tailを直接教師にすると初回でもAdd target=0.763へ偏る。
+        # 004957ではこれらを診断値だけに留め、同一operation pool内で比較可能な
+        # candidate listwise creditだけをbackwardした。Gate/Amount/Fineは
+        # forwardのrequested_countsへ因果接続されたpolicy_log_probを介して、
+        # repeated-frame Actual correction（AmountはGeometry correctionも）を受ける。
+        candidate_local_credit_loss = candidate_local_loss
         policy_log_prob = where_log_prob + amount_log_prob + action_log_prob
         # Exploration entropy belongs to candidate selection.  Including Gate
         # and Amount here changed an unseen frame's deterministic operation
@@ -4758,11 +4758,11 @@ class StructureRepairActuator(nn.Module):
                 static_compatibility_available
             ),
             "candidate_actual_encode_count": 0,
-            "proposal_source": "den6_pool_heuristic_prior_bounded_network_residual",
+            "proposal_source": "den6_pool_network_primary_local_rd_credit",
             "performance_source": (
                 "exact_teacher_anchor"
                 if exact_anchor_active
-                else "heuristic_rank_plus_bounded_network_residual"
+                else "network_value_with_weak_heuristic_prior"
             ),
             "network_only_performance": False,
             "teacher_bootstrap_active": bool(exact.get("teacher_bootstrap_active", False)),
