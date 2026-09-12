@@ -2735,6 +2735,17 @@ def parse_pugan_args(parser, file_day, file_time):
         help='固定validationがnew bestになったEpisodeごとのNetwork再順位付け重み増分',
     )
     parser.add_argument(
+        '--heuristic_guidance_network_confidence_mode',
+        default='rd_alignment',
+        choices=['none', 'rd_alignment', 'prior_only'],
+        help=(
+            'den6候補に対するNetwork補正のforward強度。rd_alignmentは'
+            'candidate-local RD教師とのPearson/Spearman一致度から毎入力で決め、'
+            'Episode番号には依存しない。prior_onlyはNetwork influence OFFの'
+            '同条件ablation専用'
+        ),
+    )
+    parser.add_argument(
         '--heuristic_guidance_network_score_scale',
         default=1.0,
         type=float,
@@ -4356,9 +4367,10 @@ def parse_pugan_args(parser, file_day, file_time):
         args.heuristic_guidance_online_prefetch_workers = 0
         args.batch_size = 1
         if not _cli_option_was_provided("--heuristic_guidance_final_where_weight"):
-            # 004957と停滞runの初回score auditはともに0.01で完全一致した。
-            # 差は後段creditにあるため、実績のある弱いpool順位priorを維持する。
-            args.heuristic_guidance_final_where_weight = 0.01
+            # 20260911の同一seed E1比較ではH=1,N=0がfixed RD=-2.063、
+            # H=1,N=0.15が-1.985、H=.01,N=1が+0.183であった。
+            # 未学習Networkがden6順位を壊さないようpriorを基準尺度で残す。
+            args.heuristic_guidance_final_where_weight = 1.0
         if not _cli_option_was_provided("--heuristic_guidance_exact_anchor_steps"):
             # 完成済みden6 planを通常trainのStep 1へ混ぜると、そのActual値が
             # 未学習Networkの性能として記録される。anchorはA/B監査用の明示的な
@@ -4389,8 +4401,8 @@ def parse_pugan_args(parser, file_day, file_time):
                 # residual rampを重ねると同じNetwork出力の実行量が時刻で変わる。
                 args.heuristic_guidance_anchor_steps = 0
             if not _cli_option_was_provided("--heuristic_guidance_network_residual_weight"):
-                # 004957で実際に候補順位へ使われた実効Network係数は1.0である。
-                # pool内RMS+tanhにより値域は既にboundedであり、時間scheduleは不要。
+                # 最大補正能力は残すが、実効値は各入力のRD alignment confidenceを
+                # 掛けて決める。したがってEpisode依存の権限移行は生じない。
                 args.heuristic_guidance_network_residual_weight = 1.0
             if not _cli_option_was_provided("--heuristic_guidance_network_residual_weight_max"):
                 args.heuristic_guidance_network_residual_weight_max = 1.0

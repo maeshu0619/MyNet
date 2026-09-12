@@ -5297,6 +5297,56 @@ def _balance_actual_operation_head_gradients(args, model, structure_debug=None):
                 status = "preserved"
             debug[f"den6_online_{decision}_grad_norm_after_balance"] = float(norm_after)
             debug[f"den6_online_{decision}_grad_balance_status"] = status
+            # Keep the legacy summary fields consistent with the actual
+            # post-balance gradients printed by Den6OnlineAudit.
+            debug[f"den6_online_{decision}_grad_norm"] = float(norm_after)
+
+        # Record the exact sub-head norms from the same actuator instance used
+        # above.  The older generic audit occasionally resolved a wrapper
+        # rather than this live actuator and printed zeros even though the
+        # grouped Where/Amount/Action norms were non-zero.  These values are
+        # diagnostics only; gradients and optimizer updates are unchanged.
+        detail_groups = {
+            "den6_online_candidate_where_grad_norm": [
+                getattr(actuator, "drop_head", None),
+                getattr(actuator, "add_head", None),
+                getattr(actuator, "add_voxel_head", None),
+                getattr(actuator, "move_voxel_head", None),
+            ],
+            "den6_online_amount_selector_grad_norm": [
+                getattr(actuator, "algorithmic_amount_selector_head", None),
+            ],
+            "den6_online_amount_fine_grad_norm": [
+                getattr(actuator, "drop_amount_head", None),
+                getattr(actuator, "add_amount_head", None),
+                getattr(actuator, "move_amount_head", None),
+            ],
+            "den6_online_gate_head_grad_norm": [
+                getattr(actuator, "operation_gate_head", None),
+            ],
+            "den6_online_shared_amount_residual_grad_norm": [
+                getattr(actuator, "algorithmic_amount_residual_head", None),
+            ],
+        }
+        for key, modules in detail_groups.items():
+            params = []
+            seen = set()
+            for module in modules:
+                if module is None:
+                    continue
+                for param in module.parameters():
+                    if param.grad is None or id(param) in seen:
+                        continue
+                    seen.add(id(param))
+                    params.append(param)
+            if params:
+                norm_sq = sum(
+                    torch.sum(torch.nan_to_num(param.grad.detach().float()) ** 2)
+                    for param in params
+                )
+                debug[key] = float(torch.sqrt(norm_sq).detach().cpu())
+            else:
+                debug[key] = 0.0
         return debug
 
     min_scale = max(

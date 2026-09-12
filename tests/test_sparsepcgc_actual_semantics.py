@@ -794,16 +794,20 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         )
         amount_log_prob = torch.tensor(0.0, requires_grad=True)
         policy_log_prob = torch.tensor(0.0, requires_grad=True)
+        action_log_prob = torch.tensor(0.0, requires_grad=True)
         network.last_actuator_voxel_state = {
             "den6_online_policy_log_prob": policy_log_prob,
             "den6_online_policy_entropy": policy_log_prob.new_zeros(()),
             "den6_online_amount_log_prob": amount_log_prob,
+            "den6_online_action_log_prob": action_log_prob,
         }
         loss = network.discrete_policy_loss(
             torch.tensor(-4.0), geometry=torch.tensor(0.009)
         )
         amount_grad = torch.autograd.grad(loss, amount_log_prob, retain_graph=True)[0]
+        action_grad = torch.autograd.grad(loss, action_log_prob, retain_graph=True)[0]
         self.assertLess(float(amount_grad), 0.0)
+        self.assertLess(float(action_grad), 0.0)
         self.assertTrue(network.last_discrete_policy_debug["geometry_policy_guard_passed"])
 
         rejected_amount_log_prob = torch.tensor(0.0, requires_grad=True)
@@ -1273,6 +1277,9 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         actuator.args.heuristic_guidance_network_residual_weight_max = 1.0
         actuator.args.heuristic_guidance_final_where_weight = 0.01
         actuator.args.heuristic_guidance_network_to_heuristic_std_cap = 0.0
+        # このblockはresidual自体の順位変更能力を検証するablationである。
+        # RD alignment confidenceの契約は下の専用testで分離して確認する。
+        actuator.args.heuristic_guidance_network_confidence_mode = "none"
         actuator.args._heuristic_guidance_network_residual_weight_current = 0.0
         low_autonomy = actuator._build_exact_den6_residual_plan(
             guidance,
@@ -1309,6 +1316,39 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         )[0]
         self.assertTrue(torch.isfinite(where_gradient).all())
         self.assertGreater(float(where_gradient.abs().sum()), 0.0)
+
+    def test_candidate_rd_alignment_confidence_rejects_misordered_scores(self):
+        actuator = StructureRepairActuator.__new__(StructureRepairActuator)
+        actuator.args = SimpleNamespace(
+            heuristic_guidance_network_confidence_mode="rd_alignment"
+        )
+        target = torch.tensor([-1.0, -0.25, 0.25, 1.0])
+        guidance = {"candidate_tensor_map": {
+            name: {"local_utility_target": target}
+            for name in ("Add", "Prune", "Adjust")
+        }}
+        aligned = {name: target.clone().requires_grad_()
+                   for name in ("Add", "Prune", "Adjust")}
+        confidence, audit = actuator._candidate_rd_alignment_confidence(
+            guidance, aligned
+        )
+        self.assertTrue(all(float(value) > 0.99 for value in confidence.values()))
+        self.assertTrue(all(value["spearman"] > 0.99 for value in audit.values()))
+
+        reversed_scores = {name: (-target).clone().requires_grad_()
+                           for name in ("Add", "Prune", "Adjust")}
+        confidence, audit = actuator._candidate_rd_alignment_confidence(
+            guidance, reversed_scores
+        )
+        self.assertTrue(all(float(value) == 0.0 for value in confidence.values()))
+        self.assertTrue(all(value["spearman"] < -0.99 for value in audit.values()))
+
+        actuator.args.heuristic_guidance_network_confidence_mode = "prior_only"
+        confidence, audit = actuator._candidate_rd_alignment_confidence(
+            guidance, aligned
+        )
+        self.assertTrue(all(float(value) == 0.0 for value in confidence.values()))
+        self.assertTrue(all(value["confidence"] == 0.0 for value in audit.values()))
 
     def test_den6_anchor_amounts_are_operation_specific_at_step_zero(self):
         """8i m=8の0.25%を旧5% Prune候補で上書きしない。"""

@@ -169,8 +169,8 @@ def train(model, args, loss, writer, plot, notifier=None):
             )
     elif str(getattr(args, "heuristic_guidance_mode", "")).strip().lower() == "ana_den6_online":
         writer.write(
-            "TrainingPerformanceContract: heuristic_role=candidate_pool_and_weak_prior, "
-            "applied_plan=network_ranked_candidate_pool_plus_learned_residual, "
+            "TrainingPerformanceContract: heuristic_role=candidate_pool_and_safety_prior, "
+            "applied_plan=prior_plus_rd_aligned_bounded_network_residual, "
             "actual_source=network_selected_plan, exploration_role=behavior_only, "
             f"diagnostic_exact_anchor_steps={int(getattr(args, 'heuristic_guidance_exact_anchor_steps', 0))}"
         )
@@ -4081,7 +4081,11 @@ def train(model, args, loss, writer, plot, notifier=None):
                         structure_debug,
                     )
                     comp_debug.update(operation_grad_balance_debug)
-                    if den6_online_full_cloud and _den6_online_grad_audit_enabled(args, global_train_step):
+                    if (
+                        den6_online_full_cloud
+                        and _den6_online_grad_audit_enabled(args, global_train_step)
+                        and "den6_online_candidate_where_grad_norm" not in comp_debug
+                    ):
                         comp_debug.update(_den6_online_grad_norms(model))
                     # Phase7-4:
                     # unscale後の実gradを対象にsanity checkする。
@@ -4223,7 +4227,11 @@ def train(model, args, loss, writer, plot, notifier=None):
                         structure_debug,
                     )
                     comp_debug.update(operation_grad_balance_debug)
-                    if den6_online_full_cloud and _den6_online_grad_audit_enabled(args, global_train_step):
+                    if (
+                        den6_online_full_cloud
+                        and _den6_online_grad_audit_enabled(args, global_train_step)
+                        and "den6_online_candidate_where_grad_norm" not in comp_debug
+                    ):
                         comp_debug.update(_den6_online_grad_norms(model))
                     # Phase7-4:
                     # backward直後の実gradを対象にsanity checkする。
@@ -4834,6 +4842,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                         f"amount_total_ratio={float(audit_plan.get('amount_total_ratio_before_count', 0.0) or 0.0):.7f}, "
                         f"residual_alpha={float(audit_plan.get('residual_alpha', 0.0)):.6f}, "
                         f"where_residual_weight={float(audit_plan.get('where_residual_weight', 0.0) or 0.0):.6f}, "
+                        f"network_confidence=(mode={audit_plan.get('network_confidence_mode', '')}, "
+                        f"plan={float(audit_plan.get('network_plan_confidence', 0.0) or 0.0):.6f}, "
+                        f"by_op={dict(audit_plan.get('network_confidence_by_operation') or {})}), "
                         f"policy_baseline_source={str(audit_compression.get('den6_online_policy_objective_baseline_source', ''))}, "
                         f"policy_baseline={float(audit_compression.get('den6_online_policy_objective_baseline', 0.0) or 0.0):.6f}, "
                         f"policy_advantage={float(audit_compression.get('den6_online_policy_advantage', 0.0) or 0.0):.6f}, "

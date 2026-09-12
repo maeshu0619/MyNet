@@ -3672,6 +3672,92 @@ class StructureRepairActuator(nn.Module):
             return output, raw_output, normalization_audit
         return output
 
+    def _candidate_rd_alignment_confidence(self, guidance, network_scores):
+        """Measure whether learned ranking agrees with the local RD teacher.
+
+        The confidence is computed independently for each operation and each
+        input pool.  It is detached: it controls only how much of an already
+        learned residual reaches the hard forward plan, while the listwise
+        local loss remains fully differentiable even when confidence is zero.
+        Requiring both value and rank correlation prevents a large but
+        misordered score from gaining control of the actuator.
+        """
+        mode = str(getattr(
+            self.args, "heuristic_guidance_network_confidence_mode", "rd_alignment"
+        )).strip().lower()
+        operations = ("Add", "Prune", "Adjust")
+        if mode == "none":
+            one = next(iter(network_scores.values())).new_tensor(1.0)
+            return (
+                {name: one for name in operations},
+                {name: {"pearson": 1.0, "spearman": 1.0, "confidence": 1.0}
+                 for name in operations},
+            )
+        if mode == "prior_only":
+            zero = next(iter(network_scores.values())).new_tensor(0.0)
+            return (
+                {name: zero for name in operations},
+                {name: {"pearson": 0.0, "spearman": 0.0, "confidence": 0.0}
+                 for name in operations},
+            )
+        if mode != "rd_alignment":
+            raise ValueError(
+                "heuristic_guidance_network_confidence_mode must be "
+                "none, rd_alignment, or prior_only"
+            )
+
+        tensor_map = guidance.get("candidate_tensor_map", {})
+        confidences = {}
+        audit = {}
+        for name in operations:
+            prediction = network_scores[name]
+            mapping = tensor_map.get(name, {}) if isinstance(tensor_map, dict) else {}
+            utility = mapping.get("local_utility_target") if isinstance(mapping, dict) else None
+            pearson = 0.0
+            spearman = 0.0
+            valid_count = 0
+            if torch.is_tensor(utility) and int(utility.numel()) == int(prediction.numel()):
+                target = 0.5 * torch.tanh(utility.to(
+                    device=prediction.device, dtype=prediction.dtype
+                ))
+                valid = torch.isfinite(prediction) & torch.isfinite(target)
+                valid_count = int(valid.sum().detach().cpu())
+                if valid_count > 1:
+                    pred = prediction.detach().float()[valid]
+                    tgt = target.detach().float()[valid]
+                    pred_centered = pred - pred.mean()
+                    target_centered = tgt - tgt.mean()
+                    denominator = (
+                        pred_centered.square().sum().sqrt()
+                        * target_centered.square().sum().sqrt()
+                    ).clamp_min(1e-12)
+                    pearson = float(
+                        ((pred_centered * target_centered).sum() / denominator).cpu()
+                    )
+                    pred_rank = torch.argsort(torch.argsort(pred)).float()
+                    target_rank = torch.argsort(torch.argsort(tgt)).float()
+                    pred_rank = pred_rank - pred_rank.mean()
+                    target_rank = target_rank - target_rank.mean()
+                    rank_denominator = (
+                        pred_rank.square().sum().sqrt()
+                        * target_rank.square().sum().sqrt()
+                    ).clamp_min(1e-12)
+                    spearman = float(
+                        ((pred_rank * target_rank).sum() / rank_denominator).cpu()
+                    )
+            # A residual receives authority only to the degree supported by
+            # both its value calibration and ordering.  No fitted threshold,
+            # target compression value, or Episode-dependent state is used.
+            confidence_value = min(max(min(pearson, spearman), 0.0), 1.0)
+            confidences[name] = prediction.new_tensor(confidence_value)
+            audit[name] = {
+                "pearson": float(pearson),
+                "spearman": float(spearman),
+                "confidence": float(confidence_value),
+                "valid_count": int(valid_count),
+            }
+        return confidences, audit
+
     def _build_exact_den6_residual_plan(
         self,
         guidance,
@@ -3814,6 +3900,32 @@ class StructureRepairActuator(nn.Module):
             annealed_phase=annealed_phase,
         )
 
+        # Compute candidate scores once, before Amount/Gate, so the same
+        # per-input evidence controls every Network residual in the plan.
+        (
+            network_scores,
+            raw_network_scores,
+            network_score_normalization_audit,
+        ) = self._exact_den6_candidate_scores(
+            guidance,
+            drop_score,
+            move_score,
+            move_logits,
+            add_pair_logits,
+            return_raw=True,
+        )
+        network_confidence_by_operation, network_confidence_audit = (
+            self._candidate_rd_alignment_confidence(guidance, network_scores)
+        )
+        network_plan_confidence = torch.stack([
+            network_confidence_by_operation[name] for name in operations
+        ]).mean().detach()
+
+        def _confidence_forward_full_backward(residual):
+            """Scale hard forward authority but keep the residual trainable."""
+            forward_value = residual * network_plan_confidence
+            return forward_value.detach() + residual - residual.detach()
+
         # AmountはStep 0でden6 Exact値へ固定し、その後はNetwork値をden6で
         # 実際に比較したtotal-ratio集合へSTE量子化する。連続量の無制限探索や
         # operation別hard overrideには戻さない。
@@ -3860,11 +3972,17 @@ class StructureRepairActuator(nn.Module):
                 self.args, "heuristic_guidance_online_amount_logit_std_cap", 0.35
             )), 0.0)
             if amount_logit_std_cap > 0.0:
-                amount_logits = amount_logit_std_cap * torch.tanh(
+                network_amount_logits = amount_logit_std_cap * torch.tanh(
                     amount_logits_centered / amount_logit_std_cap
                 )
             else:
-                amount_logits = amount_logits_centered
+                network_amount_logits = amount_logits_centered
+            prior_amount_logits = -torch.abs(
+                bin_tensor.log() - bin_tensor.new_tensor(prior_total_ratio).log()
+            ) / amount_temperature
+            amount_logits = prior_amount_logits + _confidence_forward_full_backward(
+                network_amount_logits - prior_amount_logits
+            )
             uncalibrated_std = float(
                 amount_logits_centered.detach().std(unbiased=False).cpu()
             ) if int(amount_logits_centered.numel()) > 1 else 0.0
@@ -3950,7 +4068,7 @@ class StructureRepairActuator(nn.Module):
         operation_fine_samples = {}
         operation_fine_log_probs = {}
         for name in operations:
-            fine_mean = operation_fine_means[name]
+            fine_mean = _confidence_forward_full_backward(operation_fine_means[name])
             if amount_exploration_active and fine_sigma > 0.0:
                 fine_noise = torch.randn_like(fine_mean).detach()
                 fine_sample = fine_mean + float(fine_sigma) * fine_noise
@@ -3996,9 +4114,10 @@ class StructureRepairActuator(nn.Module):
             gate_logit_scale = max(float(getattr(
                 self.args, "repair_operation_gate_logit_scale", 6.0
             )), 1e-6)
-            gate_residual = (
+            gate_residual_raw = (
                 gate_logits_den6 - gate_logits_den6.mean()
             ) / float(gate_logit_scale)
+            gate_residual = _confidence_forward_full_backward(gate_residual_raw)
             gate_combined_logits = prior_share_tensor.log() + gate_residual
             gate_log_probs = torch.log_softmax(gate_combined_logits, dim=0)
             gate_probs = gate_log_probs.exp()
@@ -4083,22 +4202,9 @@ class StructureRepairActuator(nn.Module):
             )
             requested_counts[operation] -= 1
 
-        (
-            network_scores,
-            raw_network_scores,
-            network_score_normalization_audit,
-        ) = self._exact_den6_candidate_scores(
-            guidance,
-            drop_score,
-            move_score,
-            move_logits,
-            add_pair_logits,
-            return_raw=True,
-        )
-        # den6は安全で有望な候補Poolを与え、Networkがpool内の最終順位を
-        # 決める。004957と停滞runは初回の実効score式まで同一だったため、
-        # Network-primary化を停滞原因とみなして弱めない。pool内RMS+tanhで
-        # Network補正自体はboundedに保ち、Heuristic順位は弱いpriorとして残す。
+        # den6順位を安全な基準とし、candidate-local RD順位を実際に学習した
+        # operationだけNetworkが上書きする。confidenceは入力依存であり、
+        # Episode番号やtrain/validation履歴による権限scheduleではない。
         residual_weight_start = max(float(getattr(
             self.args, "heuristic_guidance_network_residual_weight", 1.0
         )), 0.0)
@@ -4156,13 +4262,14 @@ class StructureRepairActuator(nn.Module):
             utility_target = mapping.get("local_utility_target")
             # local utilityは教師であり、最終scoreへ直接加えない。Networkは
             # この非Heuristic RD順位を学習し、そのbounded residualだけが実行順位へ効く。
-            local_feature_gate = rank_score.new_zeros(())
+            local_feature_gate = network_confidence_by_operation[operation]
             candidate_value_score = network_scores[operation]
             candidate_value_scores[operation] = candidate_value_score
             heuristic_term = float(heuristic_prior_weight) * rank_score.float()
             network_term_uncalibrated = (
                 float(candidate_policy_alpha)
                 * float(residual_weight)
+                * local_feature_gate
                 * candidate_value_score
             )
             calibration_scale = 1.0
@@ -4758,11 +4865,11 @@ class StructureRepairActuator(nn.Module):
                 static_compatibility_available
             ),
             "candidate_actual_encode_count": 0,
-            "proposal_source": "den6_pool_network_primary_local_rd_credit",
+            "proposal_source": "den6_pool_confidence_bounded_network_residual",
             "performance_source": (
                 "exact_teacher_anchor"
                 if exact_anchor_active
-                else "network_value_with_weak_heuristic_prior"
+                else "heuristic_prior_plus_rd_aligned_network_residual"
             ),
             "network_only_performance": False,
             "teacher_bootstrap_active": bool(exact.get("teacher_bootstrap_active", False)),
@@ -4789,6 +4896,15 @@ class StructureRepairActuator(nn.Module):
             "where_residual_weight": float(residual_weight),
             "where_residual_weight_start": float(residual_weight_start),
             "where_residual_weight_max": float(residual_weight_max),
+            "network_confidence_mode": str(getattr(
+                self.args, "heuristic_guidance_network_confidence_mode", "rd_alignment"
+            )),
+            "network_confidence_by_operation": {
+                name: float(network_confidence_by_operation[name].cpu())
+                for name in operations
+            },
+            "network_plan_confidence": float(network_plan_confidence.cpu()),
+            "network_confidence_audit": network_confidence_audit,
             "residual_changed_candidate_count": int(residual_changed_count),
             "residual_changed_candidate_ratio": float(residual_changed_ratio),
             "unique_plan_cache_source": bool(unique_plan_mode),

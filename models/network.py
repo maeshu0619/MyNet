@@ -906,15 +906,17 @@ class Network(nn.Module):
         )
         if torch.is_tensor(entropy):
             policy_loss = policy_loss + entropy_weighted
-        # hard整数化されたExact Amountは通常のGeometry lossから微分できない。
-        # 圧縮改善を保つplanだけに限定し、実測Geometryの改善をAmount方策へ
-        # 二次的に返す。操作量を減らす方向そのものは固定しない。
+        # hard整数化されたExact Amount/Fineとoperation Gateは通常のGeometry
+        # lossから微分できない。圧縮改善を保つplanだけに限定し、実測Geometry
+        # の改善を両方の方策へ返す。Whereはcandidate-local RD教師ですでに
+        # geometry riskを受けるため、同じglobal scalarを重ねて高分散化しない。
         geometry_policy_raw = objective.new_zeros(())
         geometry_policy_weighted = objective.new_zeros(())
         geometry_advantage = objective.new_zeros(())
         geometry_guard_passed = False
         geometry_baseline_source = "unavailable"
         amount_log_prob = state.get("den6_online_amount_log_prob", None)
+        action_log_prob = state.get("den6_online_action_log_prob", None)
         if (
             mode == "ana_den6_online"
             and torch.is_tensor(geometry)
@@ -975,9 +977,12 @@ class Network(nn.Module):
                     geometry_advantage = geometry_advantage.clamp(
                         -geometry_clip, geometry_clip
                     )
-                geometry_policy_raw = (
-                    -geometry_advantage * amount_log_prob.float().mean()
-                )
+                geometry_policy_log_probs = [amount_log_prob.float().mean()]
+                if torch.is_tensor(action_log_prob) and action_log_prob.requires_grad:
+                    geometry_policy_log_probs.append(action_log_prob.float().mean())
+                geometry_policy_raw = -geometry_advantage * torch.stack(
+                    geometry_policy_log_probs
+                ).mean()
                 geometry_weight = max(float(getattr(
                     self.args,
                     "heuristic_guidance_online_geometry_policy_weight",
