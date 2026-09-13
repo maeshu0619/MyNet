@@ -1907,6 +1907,15 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument('--compression_primary_warmup_steps', default=0, type=int, help='compression_primaryでw_comを滑らかに上げるstep数(0で無効)')
     parser.add_argument('--cp_lambda_geom', default=1.0, type=float, help='compression_primaryのgeometry safety penalty重み')
+    parser.add_argument(
+        '--rd_geometry_weight_multiplier',
+        default=1.25,
+        type=float,
+        help=(
+            'SparsePCGC online方策のGeometry重要度を、従来RD設定に対して共通に'
+            '倍率調整する。candidate-local、global policy、fixed RDで同じ倍率を使う'
+        ),
+    )
     parser.add_argument('--cp_lambda_single', default=0.05, type=float, help='compression_primaryのsingle-child safety penalty重み')
     parser.add_argument('--cp_lambda_nodes', default=0.03, type=float, help='compression_primaryのnode safety penalty重み')
     parser.add_argument('--cp_lambda_actuator', default=0.05, type=float, help='compression_primaryのactuator safety penalty重み')
@@ -2543,6 +2552,21 @@ def parse_pugan_args(parser, file_day, file_time):
         help='既存codec-context/geometry attributionから作るcandidate-local RD損失重み。Actual encode回数は増やさない',
     )
     parser.add_argument(
+        '--heuristic_guidance_online_candidate_pairwise_weight',
+        default=0.0,
+        type=float,
+        help=(
+            'RD utility差が明確な候補対へ与えるpairwise順位損失重み。'
+            '5-Episode ablationでHeuristic順位を過剰に崩したため既定は無効'
+        ),
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_candidate_pairwise_max_pairs',
+        default=256,
+        type=int,
+        help='candidate pairwise順位損失でoperationごとに使う上限pair数',
+    )
+    parser.add_argument(
         '--heuristic_guidance_online_operation_local_credit_weight',
         default=1.0,
         type=float,
@@ -2743,6 +2767,15 @@ def parse_pugan_args(parser, file_day, file_time):
             'candidate-local RD教師とのPearson/Spearman一致度から毎入力で決め、'
             'Episode番号には依存しない。prior_onlyはNetwork influence OFFの'
             '同条件ablation専用'
+        ),
+    )
+    parser.add_argument(
+        '--heuristic_guidance_network_confidence_floor',
+        default=0.05,
+        type=float,
+        help=(
+            'rd_alignment時に許すbounded Network補正の最小割合。'
+            'prior_only ablationでは常に0で、Episodeには依存しない'
         ),
     )
     parser.add_argument(
@@ -4178,6 +4211,21 @@ def parse_pugan_args(parser, file_day, file_time):
     args.heuristic_guidance_online_where_temperature = max(
         float(getattr(args, "heuristic_guidance_online_where_temperature", 0.75)), 0.05
     )
+    args.heuristic_guidance_online_candidate_pairwise_weight = max(
+        float(getattr(args, "heuristic_guidance_online_candidate_pairwise_weight", 0.0)),
+        0.0,
+    )
+    args.heuristic_guidance_online_candidate_pairwise_max_pairs = max(
+        int(getattr(args, "heuristic_guidance_online_candidate_pairwise_max_pairs", 256)),
+        0,
+    )
+    args.heuristic_guidance_network_confidence_floor = min(max(
+        float(getattr(args, "heuristic_guidance_network_confidence_floor", 0.05)),
+        0.0,
+    ), 0.25)
+    args.rd_geometry_weight_multiplier = min(max(
+        float(getattr(args, "rd_geometry_weight_multiplier", 1.25)), 0.0
+    ), 4.0)
     args.heuristic_guidance_online_gumbel_scale = max(
         float(getattr(args, "heuristic_guidance_online_gumbel_scale", 0.10)), 0.0
     )
@@ -6244,7 +6292,13 @@ def parse_pugan_args(parser, file_day, file_time):
             # Add-only point-to-plane Fit修正後の実測 L_geom約0.03 に対し、
             # 主圧縮block約8--10の約15%を与える。
             # support上限があるため圧縮主目的を逆転させない。
-            args.cp_lambda_geom = 50.0
+            args.cp_lambda_geom = 50.0 * float(args.rd_geometry_weight_multiplier)
+        if not _cli_option_was_provided("--heuristic_guidance_online_geometry_policy_weight"):
+            # Candidate-local、global policy、fixed validationでGeometryの
+            # 相対的重要度を同じ倍率だけ上げ、別々の目的へ乖離させない。
+            args.heuristic_guidance_online_geometry_policy_weight = (
+                0.50 * float(args.rd_geometry_weight_multiplier)
+            )
         if not _cli_option_was_provided("--checkpoint_geom_rel_factor"):
             # 1.5倍では最新runの後半劣化(0.0040 -> 0.0060)を通した。
             # checkpoint/rollbackの安全gateだけを絞り、実行Amount自体は制限しない。

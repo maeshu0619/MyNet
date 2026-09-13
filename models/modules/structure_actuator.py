@@ -75,6 +75,39 @@ def candidate_listwise_local_credit(prediction, utility_target):
     )
 
 
+def candidate_pairwise_local_credit(prediction, utility_target, max_pairs=256):
+    """Prefer clearly better local-RD candidates without targeting entropy.
+
+    Only the opposite tails of the measured utility ordering are paired.  The
+    target is detached and no heuristic rank is used.  This complements the
+    listwise distribution loss when a large candidate pool makes every
+    individual soft target probability very small.
+    """
+    prediction = prediction.float().reshape(-1)
+    utility_target = utility_target.detach().float().reshape(-1)
+    if int(prediction.numel()) != int(utility_target.numel()):
+        raise ValueError("candidate prediction/target size mismatch")
+    pair_count = min(max(int(max_pairs), 0), int(prediction.numel()) // 2)
+    if pair_count <= 0:
+        return prediction.sum() * 0.0
+    ordered = torch.argsort(utility_target)
+    lower = ordered[:pair_count]
+    upper = ordered[-pair_count:].flip(0)
+    target_gap = (utility_target[upper] - utility_target[lower]).clamp_min(0.0)
+    valid = torch.isfinite(target_gap) & (target_gap > 0.0)
+    if not bool(valid.any()):
+        return prediction.sum() * 0.0
+    target_gap = target_gap[valid]
+    predicted_gap = prediction[upper[valid]] - prediction[lower[valid]]
+    # Larger, unambiguous RD gaps receive more credit, but normalize by the
+    # observed pool scale so candidate count and codec scale do not change the
+    # effective loss weight.
+    weights = (target_gap / target_gap.mean().clamp_min(
+        torch.finfo(target_gap.dtype).eps
+    )).clamp(max=4.0)
+    return (weights * torch.nn.functional.softplus(-predicted_gap)).mean()
+
+
 class StructureRepairActuator(nn.Module):
     """Apply small geometry-preserving movements that realize repair policies.
 
@@ -3458,12 +3491,14 @@ class StructureRepairActuator(nn.Module):
     def _den6_allocate_counts(total_budget, shares):
         """Allocate an integer budget while allowing an operation to be zero.
 
-        A non-empty total plan is still guaranteed, but Add/Prune/Adjust are no
-        longer forced to appear once each.  This is required for the learned
-        operation gate to causally control the executed operation mix.
+        A positive budget produces a non-empty plan, while an explicit zero
+        budget is the learned no-op.  Add/Prune/Adjust are not forced to appear
+        once each, so the operation gate causally controls the executed mix.
         """
         operations = ("Add", "Prune", "Adjust")
-        total_budget = max(int(total_budget), 1)
+        total_budget = max(int(total_budget), 0)
+        if total_budget == 0:
+            return {name: 0 for name in operations}
         raw = {name: total_budget * float(shares[name]) for name in operations}
         counts = {name: max(0, int(math.floor(raw[name]))) for name in operations}
         while sum(counts.values()) > total_budget:
@@ -3748,11 +3783,25 @@ class StructureRepairActuator(nn.Module):
             # A residual receives authority only to the degree supported by
             # both its value calibration and ordering.  No fitted threshold,
             # target compression value, or Episode-dependent state is used.
-            confidence_value = min(max(min(pearson, spearman), 0.0), 1.0)
+            alignment_value = min(max(min(pearson, spearman), 0.0), 1.0)
+            # A zero floor made an initially imperfect head unable to alter even
+            # adjacent den6 ranks in the executed plan, although its local RD
+            # loss was learning.  Keep only a small, bounded residual corridor;
+            # confidence still supplies the remaining authority.  The explicit
+            # prior_only ablation above remains exactly zero.
+            confidence_floor = min(max(float(getattr(
+                self.args, "heuristic_guidance_network_confidence_floor", 0.05
+            )), 0.0), 0.25)
+            confidence_value = (
+                confidence_floor
+                + (1.0 - confidence_floor) * alignment_value
+            )
             confidences[name] = prediction.new_tensor(confidence_value)
             audit[name] = {
                 "pearson": float(pearson),
                 "spearman": float(spearman),
+                "alignment": float(alignment_value),
+                "confidence_floor": float(confidence_floor),
                 "confidence": float(confidence_value),
                 "valid_count": int(valid_count),
             }
@@ -3943,16 +3992,19 @@ class StructureRepairActuator(nn.Module):
             amount_bins = [0.0015, 0.002, 0.0025, 0.00275, 0.003]
         if not amount_bins:
             raise RuntimeError("ana_den6 online Amount離散binが空である")
-        bin_tensor = next(iter(ratio_tensors.values())).new_tensor(amount_bins)
+        positive_bin_tensor = next(iter(ratio_tensors.values())).new_tensor(amount_bins)
+        # The selector head was created with one extra class for no-op, but the
+        # online path used to discard it.  Preserve the measured den6 positive
+        # bins and restore class 0 as an executable zero-edit decision.
+        bin_tensor = torch.cat([
+            positive_bin_tensor.new_zeros((1,)), positive_bin_tensor
+        ])
         learned_total = sum(ratio_tensors.values()).clamp(1e-9, max_total_ratio)
         amount_temperature = max(float(getattr(
             self.args, "heuristic_guidance_online_amount_temperature", 0.35
         )), 0.05)
         if torch.is_tensor(amount_selector_logits):
             selector = amount_selector_logits.reshape(amount_selector_logits.shape[0], -1)[0]
-            # class 0は旧Amount selectorのno-opである。Exact den6経路では
-            # 0収束を許さず、正のden6離散binだけを学習対象にする。
-            selector = selector[1:]
             if int(selector.numel()) != int(bin_tensor.numel()):
                 raise RuntimeError(
                     "ana_den6 Amount selectorと離散bin数が一致しない: "
@@ -3977,9 +4029,17 @@ class StructureRepairActuator(nn.Module):
                 )
             else:
                 network_amount_logits = amount_logits_centered
-            prior_amount_logits = -torch.abs(
-                bin_tensor.log() - bin_tensor.new_tensor(prior_total_ratio).log()
+            positive_prior_logits = -torch.abs(
+                positive_bin_tensor.log()
+                - positive_bin_tensor.new_tensor(prior_total_ratio).log()
             ) / amount_temperature
+            # No-op starts below every positive den6 bin, so the untrained
+            # policy keeps the strong heuristic plan.  It can nevertheless be
+            # promoted by learned Actual-RD credit; no Episode schedule or
+            # target operation ratio is involved.
+            prior_amount_logits = torch.cat([
+                positive_prior_logits.amin().reshape(1), positive_prior_logits
+            ])
             amount_logits = prior_amount_logits + _confidence_forward_full_backward(
                 network_amount_logits - prior_amount_logits
             )
@@ -3993,9 +4053,12 @@ class StructureRepairActuator(nn.Module):
                 amount_logit_calibration_scale = calibrated_std / uncalibrated_std
         else:
             # 単体再生・legacy manifest用。通常trainでは上の既存Network headを使う。
-            amount_logits = -torch.abs(
-                bin_tensor.log() - learned_total.log().reshape(1)
+            positive_amount_logits = -torch.abs(
+                positive_bin_tensor.log() - learned_total.log().reshape(1)
             ) / amount_temperature
+            amount_logits = torch.cat([
+                positive_amount_logits.amin().reshape(1), positive_amount_logits
+            ])
             amount_logits_uncalibrated = amount_logits
             amount_logit_calibration_scale = 1.0
         amount_log_probs = torch.log_softmax(amount_logits, dim=0)
@@ -4012,8 +4075,8 @@ class StructureRepairActuator(nn.Module):
         # Gumbel探索がほぼ0になり、Heuristic順位の固定選択へ戻ってしまう。
         candidate_policy_alpha = 0.0 if exact_anchor_active else 1.0
         if exact_anchor_active:
-            selected_amount_bin = torch.argmin(
-                torch.abs(bin_tensor - float(prior_total_ratio))
+            selected_amount_bin = 1 + torch.argmin(
+                torch.abs(positive_bin_tensor - float(prior_total_ratio))
             )
         elif amount_exploration_active:
             uniform = torch.rand_like(amount_logits).clamp_(1e-8, 1.0 - 1e-8)
@@ -4041,9 +4104,13 @@ class StructureRepairActuator(nn.Module):
         # Exact planとは別の要求数になる。anchor中のhard forwardだけはworkerの
         # total_ratioをそのまま再生し、anchor終了後だけNetworkの離散binを使う。
         hard_total = (
-            bin_tensor.new_tensor(float(prior_total_ratio))
+            positive_bin_tensor.new_tensor(float(prior_total_ratio))
             if exact_anchor_active
             else bin_tensor[selected_amount_bin]
+        )
+        no_op_selected = bool(
+            (not exact_anchor_active)
+            and int(selected_amount_bin.detach().cpu()) == 0
         )
         coarse_total_ratio = (
             hard_total.detach()
@@ -4148,6 +4215,10 @@ class StructureRepairActuator(nn.Module):
         amount_fine_log_prob = torch.stack([
             operation_fine_log_probs[name] for name in operations
         ]).mean()
+        if no_op_selected:
+            # Fine and Gate do not cause the zero-edit action.  Do not assign
+            # them score-function credit for an action they did not execute.
+            amount_fine_log_prob = amount_fine_log_prob.detach() * 0.0
         sampled_total_value = float(sampled_total_ratio.detach().cpu())
         if sampled_total_value > max_total_ratio:
             scale = max_total_ratio / max(sampled_total_value, 1e-12)
@@ -4155,7 +4226,9 @@ class StructureRepairActuator(nn.Module):
                 name: value * float(scale) for name, value in sampled_ratio_tensors.items()
             }
             sampled_total_ratio = sum(sampled_ratio_tensors.values())
-        minimum_plan_count = len(operations) if exact_anchor_active else 1
+        minimum_plan_count = (
+            len(operations) if exact_anchor_active else (0 if no_op_selected else 1)
+        )
         sampled_total_value = max(
             float(sampled_total_ratio.detach().cpu()),
             float(minimum_plan_count) / float(point_count),
@@ -4180,7 +4253,7 @@ class StructureRepairActuator(nn.Module):
             requested_counts[name] = min(max(int(requested_counts[name]), 0), len(pools[name]))
 
         # Adjustはremove+addの2 cellを変えるため、変更Voxel cell比も1%未満に制限する。
-        minimum_changed_cells = 4 if exact_anchor_active else 1
+        minimum_changed_cells = 4 if exact_anchor_active else minimum_plan_count
         max_changed_cells = max(
             int(math.floor(point_count * max_changed_ratio)), minimum_changed_cells
         )
@@ -4240,6 +4313,12 @@ class StructureRepairActuator(nn.Module):
         network_terms = {}
         candidate_value_scores = {}
         candidate_local_losses = []
+        candidate_pairwise_losses = []
+        candidate_pairwise_weight = max(float(getattr(
+            self.args,
+            "heuristic_guidance_online_candidate_pairwise_weight",
+            0.0,
+        )), 0.0)
         candidate_utility_correlations = {}
         candidate_utility_audit = {}
 
@@ -4312,6 +4391,18 @@ class StructureRepairActuator(nn.Module):
                             local_prediction, local_target
                         )
                     )
+                    if candidate_pairwise_weight > 0.0:
+                        candidate_pairwise_losses.append(
+                            candidate_pairwise_local_credit(
+                                local_prediction,
+                                local_target,
+                                max_pairs=getattr(
+                                    self.args,
+                                    "heuristic_guidance_online_candidate_pairwise_max_pairs",
+                                    256,
+                                ),
+                            )
+                        )
                     pred_centered = local_prediction.detach().float()
                     pred_centered = pred_centered - pred_centered.mean()
                     target_centered = local_target.detach().float()
@@ -4474,6 +4565,11 @@ class StructureRepairActuator(nn.Module):
             if candidate_local_losses
             else next(iter(network_scores.values())).new_zeros(())
         )
+        candidate_pairwise_loss = (
+            torch.stack(candidate_pairwise_losses).mean()
+            if candidate_pairwise_losses
+            else next(iter(network_scores.values())).new_zeros(())
+        )
         gumbel_scale = (
             sum(gumbel_scales) / float(len(gumbel_scales))
             if gumbel_scales else 0.0
@@ -4545,7 +4641,7 @@ class StructureRepairActuator(nn.Module):
                 selected_counts[operation] += 1
 
         # 衝突で要求数に届かなくても別pattern探索は行わず、同じsample内の到達planを使う。
-        if sum(selected_counts.values()) <= 0:
+        if sum(selected_counts.values()) <= 0 and not no_op_selected:
             raise RuntimeError(
                 "ana_den6 onlineの1sample planで有効候補を1件も選べない: "
                 f"requested={requested_counts}, selected={selected_counts}"
@@ -4613,7 +4709,11 @@ class StructureRepairActuator(nn.Module):
             float(selected_counts[name]) for name in operations
         ])
         selected_share = selected_share / selected_share.sum().clamp_min(1.0)
-        action_log_prob = (selected_share.detach() * gate_log_probs).sum()
+        action_log_prob = (
+            (selected_share.detach() * gate_log_probs).sum()
+            if not no_op_selected
+            else gate_log_probs.sum().detach() * 0.0
+        )
         action_entropy = -(gate_probs * gate_log_probs).sum()
 
         # 004957と同じcross-operation/Amount診断値を算出する。
@@ -4654,7 +4754,8 @@ class StructureRepairActuator(nn.Module):
 
             global_utility = (
                 _global_standardize(all_rate)
-                - _global_standardize(all_geometry)
+                - float(getattr(self.args, "rd_geometry_weight_multiplier", 1.25))
+                * _global_standardize(all_geometry)
             )
             utility_by_op = {}
             offset = 0
@@ -4697,7 +4798,7 @@ class StructureRepairActuator(nn.Module):
             }
             bin_values = []
             for ratio_value in bin_tensor.detach().cpu().tolist():
-                bin_budget = max(1, int(math.ceil(point_count * float(ratio_value))))
+                bin_budget = max(0, int(math.ceil(point_count * float(ratio_value))))
                 bin_counts = self._den6_allocate_counts(
                     bin_budget, target_share_dict
                 )
@@ -4719,7 +4820,10 @@ class StructureRepairActuator(nn.Module):
         # candidate listwise creditだけをbackwardした。Gate/Amount/Fineは
         # forwardのrequested_countsへ因果接続されたpolicy_log_probを介して、
         # repeated-frame Actual correction（AmountはGeometry correctionも）を受ける。
-        candidate_local_credit_loss = candidate_local_loss
+        candidate_local_credit_loss = (
+            candidate_local_loss
+            + float(candidate_pairwise_weight) * candidate_pairwise_loss
+        )
         policy_log_prob = where_log_prob + amount_log_prob + action_log_prob
         # Exploration entropy belongs to candidate selection.  Including Gate
         # and Amount here changed an unseen frame's deterministic operation
@@ -4927,6 +5031,8 @@ class StructureRepairActuator(nn.Module):
             "score_audit": score_audit,
             "candidate_local_credit_loss": candidate_local_credit_loss,
             "candidate_ranking_local_loss": candidate_local_loss,
+            "candidate_pairwise_local_loss": candidate_pairwise_loss,
+            "candidate_pairwise_local_weight": float(candidate_pairwise_weight),
             "operation_local_loss": operation_local_loss,
             "amount_local_loss": amount_local_loss,
             "candidate_utility_correlation": candidate_utility_correlations,
@@ -4973,6 +5079,7 @@ class StructureRepairActuator(nn.Module):
             "requested_counts": requested_counts,
             "amount_bin_index": int(selected_amount_bin.detach().cpu()),
             "amount_bin_ratio": float(hard_total.detach().cpu()),
+            "no_op_selected": bool(no_op_selected),
             "amount_bin_probabilities": [
                 float(value) for value in amount_prob.detach().cpu().tolist()
             ],

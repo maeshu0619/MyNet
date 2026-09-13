@@ -457,6 +457,8 @@ def _candidate_local_proxy_tensors(
     # cannot manufacture an Episode-dependent trend.
     geometry_weight = max(float(getattr(
         args, "compression_primary_aux_target_ratio", 0.25
+    )), 0.0) * max(float(getattr(
+        args, "rd_geometry_weight_multiplier", 1.25
     )), 0.0)
     return {
         "local_rate_benefit": rate,

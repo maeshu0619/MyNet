@@ -4738,15 +4738,28 @@ def train(model, args, loss, writer, plot, notifier=None):
                         audit_compression.get("den6_online_edited_actual_encode_count", 0),
                     ) or 0) != 1:
                         online_invariant_failures.append("edited_actual_encode_count!=1")
-                    if list(audit_plan.get("selected_action_mask", [])) != [1, 1, 1]:
-                        online_invariant_failures.append("selected_action_mask!=[1,1,1]")
                     selected_counts = dict(audit_plan.get("selected_counts") or {})
                     selected_amounts = dict(audit_plan.get("selected_amount_ratios") or {})
-                    for operation in ("Prune", "Add", "Adjust"):
-                        if int(selected_counts.get(operation, 0) or 0) <= 0:
-                            online_invariant_failures.append(f"{operation}_count<=0")
-                        if float(selected_amounts.get(operation, 0.0) or 0.0) <= 0.0:
-                            online_invariant_failures.append(f"{operation}_amount<=0")
+                    selected_mask = list(audit_plan.get("selected_action_mask", []))
+                    no_op_selected = bool(audit_plan.get("no_op_selected", False))
+                    if len(selected_mask) != 3:
+                        online_invariant_failures.append("selected_action_mask_size!=3")
+                    for index, operation in enumerate(("Add", "Prune", "Adjust")):
+                        count_value = int(selected_counts.get(operation, 0) or 0)
+                        amount_value = float(selected_amounts.get(operation, 0.0) or 0.0)
+                        if count_value < 0 or amount_value < 0.0:
+                            online_invariant_failures.append(f"{operation}_negative")
+                        if index < len(selected_mask) and int(selected_mask[index]) != int(count_value > 0):
+                            online_invariant_failures.append(f"{operation}_mask_mismatch")
+                    selected_total_count = sum(
+                        int(selected_counts.get(operation, 0) or 0)
+                        for operation in ("Add", "Prune", "Adjust")
+                    )
+                    if no_op_selected:
+                        if selected_total_count != 0:
+                            online_invariant_failures.append("no_op_with_nonzero_count")
+                    elif selected_total_count <= 0:
+                        online_invariant_failures.append("non_noop_empty_plan")
                     # Exact anchor中はhard forwardがTeacherそのものなので方策grad=0が正しい。
                     # anchor後も、明示的なgrad auditを有効にしたStepだけ同期して検査する。
                     anchor_active = str(audit_plan.get("performance_source", "")) == "exact_teacher_anchor"
@@ -4834,6 +4847,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                         f"operation_order={str(audit_plan.get('operation_order', ''))}, "
                         f"amount_mode={str(audit_plan.get('amount_mode', ''))}, "
                         f"amount_bin_ratio={float(audit_plan.get('amount_bin_ratio', 0.0) or 0.0):.7f}, "
+                        f"no_op={bool(audit_plan.get('no_op_selected', False))}, "
                         f"amount_fine_log_residual={float(audit_plan.get('amount_fine_log_residual', 0.0) or 0.0):.7f}, "
                         f"amount_bin_prob={list(audit_plan.get('amount_bin_probabilities') or [])}, "
                         f"amount_logit_scale={float(audit_plan.get('amount_logit_calibration_scale', 1.0) or 0.0):.6g}, "
@@ -4869,6 +4883,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                         f"top2_gap={dict(audit_plan.get('candidate_top2_probability_gap') or {})}), "
                         f"score_audit={dict(audit_plan.get('score_audit') or {})}, "
                         f"candidate_local=(loss={case_float(audit_plan.get('candidate_ranking_local_loss', 0.0), 0.0):.6g}, "
+                        f"pairwise={case_float(audit_plan.get('candidate_pairwise_local_loss', 0.0), 0.0):.6g}, "
                         f"total={case_float(audit_plan.get('candidate_local_credit_loss', 0.0), 0.0):.6g}, "
                         f"corr={dict(audit_plan.get('candidate_utility_correlation') or {})}, "
                         f"target={dict(audit_plan.get('candidate_utility_audit') or {})}), "

@@ -24,6 +24,7 @@ from models.modules.octree_structure import OctreeStructureAnalysis
 from models.modules.structure_actuator import (
     StructureRepairActuator,
     candidate_listwise_local_credit,
+    candidate_pairwise_local_credit,
 )
 from models.network import Network
 from models.utils.loss.compression import CompressionLossMixin
@@ -119,12 +120,31 @@ class _EveryStepFixture(CompressionLossMixin):
 
 
 class SparsePCGCActualSemanticsTest(unittest.TestCase):
+    def test_den6_zero_budget_is_an_explicit_noop(self):
+        counts = StructureRepairActuator._den6_allocate_counts(
+            0, {"Add": 0.4, "Prune": 0.4, "Adjust": 0.2}
+        )
+        self.assertEqual(counts, {"Add": 0, "Prune": 0, "Adjust": 0})
+
     def test_candidate_listwise_credit_prefers_utility_order(self):
         target = torch.tensor([-1.0, 0.0, 2.0])
         aligned = torch.tensor([-0.5, 0.0, 0.5], requires_grad=True)
         reversed_score = torch.tensor([0.5, 0.0, -0.5])
         aligned_loss = candidate_listwise_local_credit(aligned, target)
         reversed_loss = candidate_listwise_local_credit(reversed_score, target)
+        self.assertLess(float(aligned_loss.detach()), float(reversed_loss))
+        aligned_loss.backward()
+        self.assertTrue(torch.isfinite(aligned.grad).all())
+        self.assertGreater(float(aligned.grad.abs().sum()), 0.0)
+
+    def test_candidate_pairwise_credit_prefers_clear_rd_order(self):
+        target = torch.tensor([-2.0, -0.2, 0.1, 1.5])
+        aligned = torch.tensor([-0.5, -0.1, 0.1, 0.5], requires_grad=True)
+        reversed_score = -aligned.detach()
+        aligned_loss = candidate_pairwise_local_credit(aligned, target, max_pairs=2)
+        reversed_loss = candidate_pairwise_local_credit(
+            reversed_score, target, max_pairs=2
+        )
         self.assertLess(float(aligned_loss.detach()), float(reversed_loss))
         aligned_loss.backward()
         self.assertTrue(torch.isfinite(aligned.grad).all())
@@ -1340,7 +1360,7 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         confidence, audit = actuator._candidate_rd_alignment_confidence(
             guidance, reversed_scores
         )
-        self.assertTrue(all(float(value) == 0.0 for value in confidence.values()))
+        self.assertTrue(all(abs(float(value) - 0.05) < 1e-6 for value in confidence.values()))
         self.assertTrue(all(value["spearman"] < -0.99 for value in audit.values()))
 
         actuator.args.heuristic_guidance_network_confidence_mode = "prior_only"
