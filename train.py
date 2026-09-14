@@ -4890,9 +4890,16 @@ def train(model, args, loss, writer, plot, notifier=None):
                         f"operation_local=(loss={case_float(audit_plan.get('operation_local_loss', 0.0), 0.0):.6g}, "
                         f"target={dict(audit_plan.get('operation_utility_target') or {})}, "
                         f"raw_target={dict(audit_plan.get('operation_utility_raw_target') or {})}, "
-                        f"confidence={float(audit_plan.get('operation_utility_confidence', 0.0) or 0.0):.6g}), "
+                        f"confidence={float(audit_plan.get('operation_utility_confidence', 0.0) or 0.0):.6g}, "
+                        f"aggregation_agreement={float(audit_plan.get('operation_utility_aggregation_agreement', 0.0) or 0.0):.6g}), "
                         f"amount_local=(loss={case_float(audit_plan.get('amount_local_loss', 0.0), 0.0):.6g}, "
-                        f"target={list(audit_plan.get('amount_utility_target') or [])}), "
+                        f"target={list(audit_plan.get('amount_utility_target') or [])}, "
+                        f"confidence={float(audit_plan.get('amount_utility_confidence', 0.0) or 0.0):.6g}), "
+                        f"fine_local=(loss={case_float(audit_plan.get('fine_local_loss', 0.0), 0.0):.6g}, "
+                        f"confidence={float(audit_plan.get('fine_utility_confidence', 0.0) or 0.0):.6g}), "
+                        f"local_credit_weighted=(operation={float(audit_compression.get('den6_online_policy_operation_local_credit_weighted', 0.0) or 0.0):.6g}, "
+                        f"amount={float(audit_compression.get('den6_online_policy_amount_local_credit_weighted', 0.0) or 0.0):.6g}, "
+                        f"fine={float(audit_compression.get('den6_online_policy_fine_local_credit_weighted', 0.0) or 0.0):.6g}), "
                         f"topk_audit={dict(audit_plan.get('topk_audit') or {})}, "
                         f"deterministic_top1_changed=(by_op={dict(audit_plan.get('deterministic_top1_changed') or {})}, "
                         f"rate={float(audit_plan.get('deterministic_top1_changed_rate', 0.0) or 0.0):.3f}), "
@@ -5705,8 +5712,8 @@ def train(model, args, loss, writer, plot, notifier=None):
             writer.write(
                 "FixedRDPlateauScheduler: "
                 f"metric={plateau_metric}, lrs={scheduler_event['current_lr_main']}, "
-                f"patience={int(getattr(args, 'lr_plateau_patience', 30))}, "
-                f"min_delta={float(getattr(args, 'lr_plateau_min_delta', 0.04)):.6g}"
+                f"patience={int(getattr(args, 'lr_plateau_patience', 60))}, "
+                f"min_delta={float(getattr(args, 'lr_plateau_min_delta', 0.02)):.6g}"
             )
         fixed_validation_geometry = finite_float_or_none(
             full_cloud_val.get("geometry_value")

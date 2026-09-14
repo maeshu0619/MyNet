@@ -898,6 +898,48 @@ class Network(nn.Module):
                 / float(policy_backward_scale)
             )
             policy_loss = policy_loss + candidate_local_credit_weighted
+        local_plan_credit_debug = {}
+        for state_name, arg_name, debug_name in (
+            (
+                "den6_online_operation_local_credit_loss",
+                "heuristic_guidance_online_operation_local_credit_weight",
+                "operation_local_credit",
+            ),
+            (
+                "den6_online_amount_local_credit_loss",
+                "heuristic_guidance_online_amount_local_credit_weight",
+                "amount_local_credit",
+            ),
+            (
+                "den6_online_fine_local_credit_loss",
+                "heuristic_guidance_online_fine_local_credit_weight",
+                "fine_local_credit",
+            ),
+        ):
+            local_term = state.get(state_name, None)
+            local_weight = max(float(getattr(self.args, arg_name, 0.0)), 0.0)
+            weighted_term = objective.new_zeros(())
+            if (
+                mode == "ana_den6_online"
+                and local_weight > 0.0
+                and torch.is_tensor(local_term)
+                and local_term.requires_grad
+            ):
+                # The outer multiplier belongs to score-function credit.  Keep
+                # normalized differentiable local targets at their configured
+                # effective weights, as for candidate-local credit above.
+                weighted_term = (
+                    float(local_weight) * local_term.float().mean()
+                    / float(policy_backward_scale)
+                )
+                policy_loss = policy_loss + weighted_term
+            local_plan_credit_debug[f"{debug_name}_raw"] = (
+                float(local_term.detach().float().mean().cpu())
+                if torch.is_tensor(local_term) else 0.0
+            )
+            local_plan_credit_debug[f"{debug_name}_weighted"] = float(
+                weighted_term.detach().cpu()
+            )
         entropy_raw = entropy.float().mean() if torch.is_tensor(entropy) else objective.new_zeros(())
         entropy_weighted = (
             -entropy_weight * entropy_raw / float(policy_backward_scale)
@@ -1065,6 +1107,7 @@ class Network(nn.Module):
             "candidate_local_credit_weighted": float(
                 candidate_local_credit_weighted.detach().cpu()
             ),
+            **local_plan_credit_debug,
             "entropy_raw": float(entropy_raw.detach().cpu()),
             "entropy_weighted": float(entropy_weighted.detach().cpu()),
             "geometry_policy_guard_passed": bool(geometry_guard_passed),
@@ -4591,6 +4634,9 @@ class Network(nn.Module):
                 "den6_online_amount_log_prob",
                 "den6_online_action_log_prob",
                 "den6_online_candidate_local_credit_loss",
+                "den6_online_operation_local_credit_loss",
+                "den6_online_amount_local_credit_loss",
+                "den6_online_fine_local_credit_loss",
                 "network_only_direction_log_prob",
                 "network_only_direction_entropy",
                 "network_only_total_ratio_raw",

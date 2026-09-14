@@ -3646,10 +3646,29 @@ class StructureRepairActuator(nn.Module):
                         & direction.ge(0) & direction.lt(move_logits.shape[1])
                     )
                     if bool(valid.any().item()):
-                        direction_prob = torch.softmax(move_logits.float(), dim=1)
+                        # Preserve direction differences without exposing the
+                        # candidate ranker to an unbounded raw logit.  The first
+                        # ablation used the centered logit directly: Adjust raw
+                        # std reached 96.8 within 200 steps and worsened fixed
+                        # RD.  Detached pool scaling keeps its ordering while a
+                        # bounded transform prevents that magnitude feedback.
+                        direction_logit = move_logits.float()
+                        direction_logit = (
+                            direction_logit
+                            - direction_logit.mean(dim=1, keepdim=True)
+                        )
+                        direction_scale = torch.maximum(
+                            direction_logit.detach().square().mean(
+                                dim=1, keepdim=True
+                            ).sqrt(),
+                            direction_logit.new_tensor(1.0),
+                        )
+                        direction_residual = 0.5 * torch.tanh(
+                            direction_logit / direction_scale
+                        )
                         network_score[valid] = (
                             move_score[0, 0].index_select(0, source[valid]).float()
-                            + direction_prob[0, direction[valid], source[valid]]
+                            + direction_residual[0, direction[valid], source[valid]]
                         )
                         scored_mask[valid] = True
             else:
@@ -4457,6 +4476,31 @@ class StructureRepairActuator(nn.Module):
                         candidate_utility_audit[operation]["topk_overlap"] = (
                             len(prediction_top & target_top) / float(utility_k)
                         )
+                        pair_count = min(
+                            max(int(getattr(
+                                self.args,
+                                "heuristic_guidance_online_candidate_pairwise_max_pairs",
+                                256,
+                            )), 0),
+                            valid_count_for_rank // 2,
+                        )
+                        if pair_count > 0:
+                            target_order = torch.argsort(local_target.detach())
+                            lower = target_order[:pair_count]
+                            upper = target_order[-pair_count:].flip(0)
+                            target_gap = (
+                                local_target.detach()[upper]
+                                - local_target.detach()[lower]
+                            )
+                            clear = torch.isfinite(target_gap) & target_gap.gt(0.0)
+                            if bool(clear.any()):
+                                predicted_gap = (
+                                    local_prediction.detach()[upper[clear]]
+                                    - local_prediction.detach()[lower[clear]]
+                                )
+                                candidate_utility_audit[operation]["pairwise_accuracy"] = float(
+                                    predicted_gap.gt(0.0).float().mean().cpu()
+                                )
             combined_logits[operation] = policy_logits
             valid_for_top1 = torch.isfinite(policy_logits)
             heuristic_for_top1 = heuristic_term.masked_fill(
@@ -4716,9 +4760,9 @@ class StructureRepairActuator(nn.Module):
         )
         action_entropy = -(gate_probs * gate_log_probs).sum()
 
-        # 004957と同じcross-operation/Amount診断値を算出する。
-        # operation間ではproxy尺度が比較不能なので下ではbackwardに混ぜず、
-        # candidate別Actual encodeを増やさない監査情報として保持する。
+        # Candidate-local attributionからGate/Amount/Fine用の低分散RD教師を
+        # 作る。rateとgeometryは別々に同一集合内で標準化してからcandidate
+        # local lossと同じ係数で合成し、Heuristic rankは教師に使わない。
         local_rate_by_op = {}
         local_geometry_by_op = {}
         for name in operations:
@@ -4734,10 +4778,14 @@ class StructureRepairActuator(nn.Module):
                 )
         operation_local_loss = gate_probs.new_zeros(())
         amount_local_loss = gate_probs.new_zeros(())
+        fine_local_loss = gate_probs.new_zeros(())
         operation_utility_target = gate_probs.detach()
         operation_utility_raw_target = gate_probs.detach()
         operation_utility_confidence = 1.0
+        operation_utility_aggregation_agreement = 1.0
         amount_utility_target = amount_prob.detach()
+        amount_utility_confidence = 1.0
+        fine_utility_confidence = 1.0
         operation_rate_summary = gate_probs.new_zeros((len(operations),))
         operation_geometry_summary = gate_probs.new_zeros((len(operations),))
         if len(local_rate_by_op) == len(operations):
@@ -4752,74 +4800,177 @@ class StructureRepairActuator(nn.Module):
                     torch.finfo(value.dtype).eps
                 )
 
+            local_geometry_weight = (
+                max(float(getattr(
+                    self.args, "compression_primary_aux_target_ratio", 0.25
+                )), 0.0)
+                * max(float(getattr(
+                    self.args, "rd_geometry_weight_multiplier", 1.25
+                )), 0.0)
+            )
             global_utility = (
                 _global_standardize(all_rate)
-                - float(getattr(self.args, "rd_geometry_weight_multiplier", 1.25))
-                * _global_standardize(all_geometry)
+                - float(local_geometry_weight) * _global_standardize(all_geometry)
             )
             utility_by_op = {}
             offset = 0
             operation_values = []
+            operation_reference_values = []
             for name in operations:
                 count = int(local_rate_by_op[name].numel())
                 values = global_utility[offset:offset + count]
                 offset += count
                 utility_by_op[name] = values
+                # The tail-sensitive summary keeps useful operation-level
+                # signal.  Its confidence is validated below against the
+                # outlier-insensitive mean-RD summary, so an optimistic Prune
+                # outlier cannot obtain authority on its own.
                 operation_values.append(
-                    torch.logsumexp(values, dim=0) - math.log(max(count, 1))
+                    torch.logsumexp(values, dim=0)
+                    - math.log(max(count, 1))
+                )
+                # A second, outlier-insensitive summary is not the training
+                # target; it only tells us whether the operation conclusion is
+                # supported by average per-cell RD in the original proxy unit.
+                operation_reference_values.append(
+                    (local_rate_by_op[name] - float(local_geometry_weight)
+                     * local_geometry_by_op[name]).mean()
                 )
             operation_values = torch.stack(operation_values)
+            operation_reference_values = torch.stack(operation_reference_values)
             operation_rate_summary = torch.stack([
                 local_rate_by_op[name].mean() for name in operations
             ])
             operation_geometry_summary = torch.stack([
                 local_geometry_by_op[name].mean() for name in operations
             ])
-            operation_utility_raw_target = torch.softmax(
+            operation_utility_target = torch.softmax(
                 operation_values.detach(), dim=0
             )
-            operation_utility_target = operation_utility_raw_target
-            operation_local_loss = -(
+            operation_utility_raw_target = torch.softmax(
+                operation_reference_values.detach(), dim=0
+            )
+            # A local proxy can rank candidates reliably while carrying very
+            # little information about the cross-operation allocation.  Do
+            # not let a nearly uniform target override the one-per-step
+            # Actual RD correction.  Normalized entropy provides a detached,
+            # data-dependent confidence without an Episode schedule or a
+            # target operation ratio.
+            def _target_information_confidence(probability):
+                probability = probability.detach().float().clamp_min(
+                    torch.finfo(torch.float32).tiny
+                )
+                if int(probability.numel()) <= 1:
+                    return 0.0
+                entropy = -(probability * probability.log()).sum()
+                maximum_entropy = math.log(int(probability.numel()))
+                return min(max(
+                    1.0 - float(entropy.cpu()) / max(maximum_entropy, 1e-12),
+                    0.0,
+                ), 1.0)
+
+            operation_utility_confidence = _target_information_confidence(
+                operation_utility_target
+            )
+            target_centered = operation_utility_target.float()
+            target_centered = target_centered - target_centered.mean()
+            reference_centered = operation_utility_raw_target.float()
+            reference_centered = reference_centered - reference_centered.mean()
+            aggregation_denominator = (
+                target_centered.square().sum().sqrt()
+                * reference_centered.square().sum().sqrt()
+            ).clamp_min(torch.finfo(target_centered.dtype).eps)
+            operation_utility_aggregation_agreement = float(
+                ((target_centered * reference_centered).sum()
+                 / aggregation_denominator).clamp(min=0.0, max=1.0).cpu()
+            )
+            operation_utility_confidence *= float(
+                operation_utility_aggregation_agreement
+            )
+            operation_local_loss = float(operation_utility_confidence) * -(
                 operation_utility_target * gate_log_probs
             ).sum()
 
-            # 各total-ratio binで、operation utilityに従って配分した上位候補の
-            # 累積utilityを比較する。全binを同じ1 scalar rewardで扱わず、
-            # Amount selectorへ候補局所情報から直接creditを返す。
-            utility_prefix_sum = {
-                name: torch.sort(
-                    utility_by_op[name], descending=True
-                ).values.cumsum(dim=0)
-                for name in operations
-            }
+            # Aggregate rate and geometry in their own proxy units before
+            # normalizing across amount bins.  Summing already standardized
+            # candidate utility made every extra candidate positive and
+            # structurally favored the largest bin.  Zero is the no-edit RD.
             target_share_dict = {
                 name: float(operation_utility_target[index].cpu())
                 for index, name in enumerate(operations)
             }
-            bin_values = []
+            bin_rate_values = []
+            bin_geometry_values = []
             for ratio_value in bin_tensor.detach().cpu().tolist():
                 bin_budget = max(0, int(math.ceil(point_count * float(ratio_value))))
                 bin_counts = self._den6_allocate_counts(
                     bin_budget, target_share_dict
                 )
-                utility_sum = operation_values.new_zeros(())
+                rate_sum = operation_values.new_zeros(())
+                geometry_sum = operation_values.new_zeros(())
                 for name in operations:
                     take = min(bin_counts[name], int(utility_by_op[name].numel()))
                     if take > 0:
-                        utility_sum = utility_sum + utility_prefix_sum[name][take - 1]
-                bin_values.append(utility_sum)
-            bin_values = _global_standardize(torch.stack(bin_values))
+                        top_index = torch.topk(utility_by_op[name], k=take).indices
+                        rate_sum = rate_sum + local_rate_by_op[name].index_select(
+                            0, top_index
+                        ).sum()
+                        geometry_sum = geometry_sum + local_geometry_by_op[name].index_select(
+                            0, top_index
+                        ).sum()
+                bin_rate_values.append(rate_sum)
+                bin_geometry_values.append(geometry_sum)
+            bin_values = (
+                _global_standardize(torch.stack(bin_rate_values))
+                - float(local_geometry_weight)
+                * _global_standardize(torch.stack(bin_geometry_values))
+            )
             amount_utility_target = torch.softmax(bin_values.detach(), dim=0)
-            amount_local_loss = -(
+            amount_utility_confidence = _target_information_confidence(
+                amount_utility_target
+            )
+            amount_local_loss = float(amount_utility_confidence) * -(
                 amount_utility_target * amount_log_probs
             ).sum()
 
-        # Add/Prune/Adjustはedit semanticsとproxy分布が異なり、pool間の
-        # raw tailを直接教師にすると初回でもAdd target=0.763へ偏る。
-        # 004957ではこれらを診断値だけに留め、同一operation pool内で比較可能な
-        # candidate listwise creditだけをbackwardした。Gate/Amount/Fineは
-        # forwardのrequested_countsへ因果接続されたpolicy_log_probを介して、
-        # repeated-frame Actual correction（AmountはGeometry correctionも）を受ける。
+            # Fine heads refine the three operation amounts inside the coarse
+            # bin.  Their bounded residual target uses the same RD operation
+            # distribution; global Actual credit still supplies plan bias.
+            target_total_ratio = (
+                amount_utility_target.detach() * bin_tensor.detach()
+            ).sum().clamp_min(1e-9)
+            fine_targets = []
+            fine_predictions = []
+            for index, name in enumerate(operations):
+                target_ratio = (
+                    target_total_ratio * operation_utility_target[index].detach()
+                ).clamp_min(1e-9)
+                prior_ratio = operation_fine_means[name].new_tensor(
+                    prior_ratios[name]
+                ).clamp_min(1e-9)
+                target_log_residual = torch.tanh(
+                    torch.log(target_ratio / prior_ratio)
+                ) * float(amount_beta)
+                fine_targets.append(target_log_residual)
+                fine_predictions.append(operation_fine_means[name])
+            # Fine residuals inherit both decisions.  They receive strong
+            # local supervision only when the proxy distinguishes both the
+            # operation allocation and the total amount; otherwise global
+            # Actual RD remains their unbiased teacher.
+            fine_utility_confidence = (
+                float(operation_utility_confidence)
+                * float(amount_utility_confidence)
+            )
+            fine_local_loss = float(fine_utility_confidence) * torch.nn.functional.smooth_l1_loss(
+                torch.stack(fine_predictions),
+                torch.stack(fine_targets).detach(),
+                beta=max(float(amount_beta) * 0.25, 1e-3),
+            )
+
+        # Candidate-local credit learns Where ranking inside each operation.
+        # Cross-operation Gate/Amount/Fine targets above use one shared RD
+        # coefficient and are returned separately for conservative weighting;
+        # the repeated-frame Actual correction remains the global teacher.
         candidate_local_credit_loss = (
             candidate_local_loss
             + float(candidate_pairwise_weight) * candidate_pairwise_loss
@@ -5035,6 +5186,7 @@ class StructureRepairActuator(nn.Module):
             "candidate_pairwise_local_weight": float(candidate_pairwise_weight),
             "operation_local_loss": operation_local_loss,
             "amount_local_loss": amount_local_loss,
+            "fine_local_loss": fine_local_loss,
             "candidate_utility_correlation": candidate_utility_correlations,
             "candidate_utility_audit": candidate_utility_audit,
             "operation_utility_target": {
@@ -5046,6 +5198,11 @@ class StructureRepairActuator(nn.Module):
                 for index, name in enumerate(operations)
             },
             "operation_utility_confidence": float(operation_utility_confidence),
+            "operation_utility_aggregation_agreement": float(
+                operation_utility_aggregation_agreement
+            ),
+            "amount_utility_confidence": float(amount_utility_confidence),
+            "fine_utility_confidence": float(fine_utility_confidence),
             "operation_rate_summary": {
                 name: float(operation_rate_summary[index].detach().cpu())
                 for index, name in enumerate(operations)
@@ -13046,6 +13203,15 @@ class StructureRepairActuator(nn.Module):
             ),
             "den6_online_candidate_local_credit_loss": exact_residual_plan_debug.get(
                 "candidate_local_credit_loss", pts_xyz.new_zeros(())
+            ),
+            "den6_online_operation_local_credit_loss": exact_residual_plan_debug.get(
+                "operation_local_loss", pts_xyz.new_zeros(())
+            ),
+            "den6_online_amount_local_credit_loss": exact_residual_plan_debug.get(
+                "amount_local_loss", pts_xyz.new_zeros(())
+            ),
+            "den6_online_fine_local_credit_loss": exact_residual_plan_debug.get(
+                "fine_local_loss", pts_xyz.new_zeros(())
             ),
             "network_only_direction_log_prob": exact_residual_plan_debug.get(
                 "direction_log_prob", single_direction_log_prob

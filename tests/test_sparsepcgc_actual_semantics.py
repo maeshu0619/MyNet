@@ -757,6 +757,48 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         self.assertLess(gradient_for_objective(-3.0), 0.0)
         self.assertGreater(gradient_for_objective(-1.0), 0.0)
 
+    def test_den6_plan_local_rd_credit_reaches_gate_amount_and_fine(self):
+        """Plan-local auxiliary terms are connected without the REINFORCE multiplier."""
+        network = Network.__new__(Network)
+        torch.nn.Module.__init__(network)
+        network.args = SimpleNamespace(
+            heuristic_guidance_mode="ana_den6_online",
+            _current_input_file="local-credit-fixture.ply",
+            sparsepcgc_scale_ae=0,
+            sparsepcgc_scale_sr=2,
+            sparsepcgc_scale_m=8,
+            heuristic_guidance_online_policy_backward_scale=10.0,
+            heuristic_guidance_online_policy_weight=0.0,
+            heuristic_guidance_online_entropy_weight=0.0,
+            heuristic_guidance_online_operation_local_credit_weight=0.10,
+            heuristic_guidance_online_amount_local_credit_weight=0.05,
+            heuristic_guidance_online_fine_local_credit_weight=0.05,
+        )
+        network._den6_online_objective_baseline = __import__(
+            "collections"
+        ).OrderedDict()
+        policy = torch.tensor(0.0, requires_grad=True)
+        gate = torch.tensor(1.0, requires_grad=True)
+        amount = torch.tensor(1.0, requires_grad=True)
+        fine = torch.tensor(1.0, requires_grad=True)
+        network.last_actuator_voxel_state = {
+            "den6_online_policy_log_prob": policy,
+            "den6_online_policy_entropy": policy.new_zeros(()),
+            "den6_online_operation_local_credit_loss": gate.square(),
+            "den6_online_amount_local_credit_loss": amount.square(),
+            "den6_online_fine_local_credit_loss": fine.square(),
+        }
+        loss = network.discrete_policy_loss(torch.tensor(-2.0))
+        loss.backward()
+        self.assertAlmostEqual(float(gate.grad), 0.02, places=7)
+        self.assertAlmostEqual(float(amount.grad), 0.01, places=7)
+        self.assertAlmostEqual(float(fine.grad), 0.01, places=7)
+        self.assertEqual(float(policy.grad), 0.0)
+        debug = network.last_discrete_policy_debug
+        self.assertGreater(debug["operation_local_credit_weighted"], 0.0)
+        self.assertGreater(debug["amount_local_credit_weighted"], 0.0)
+        self.assertGreater(debug["fine_local_credit_weighted"], 0.0)
+
     def test_den6_online_policy_uses_per_input_best_actual_baseline(self):
         network = Network.__new__(Network)
         torch.nn.Module.__init__(network)
@@ -1273,14 +1315,50 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
             set(residual_result[1]["operation_gate_probabilities"]),
             {"Add", "Prune", "Adjust"},
         )
-        # local creditは比較可能な同一operation内candidateだけを学習する。
-        # Gate/Amount/Fineは上の実行plan policy_log_probから学習する。
+        # Where/Gate/Amount/Fineのlocal RD creditが、それぞれ対応する
+        # differentiable headへ有限かつ非ゼロのgradientを返す。
         local_credit_gradient = torch.autograd.grad(
             residual_result[1]["candidate_local_credit_loss"],
             residual_drop_preference,
+            retain_graph=True,
         )[0]
         self.assertTrue(torch.isfinite(local_credit_gradient).all())
         self.assertGreater(float(local_credit_gradient.abs().sum()), 0.0)
+        amount_selector_logits = torch.zeros((1, 6), requires_grad=True)
+        local_result = actuator._build_exact_den6_residual_plan(
+            guidance,
+            coords,
+            add_ratio,
+            prune_ratio,
+            adjust_ratio,
+            residual_drop_preference,
+            torch.zeros((1, 1, coords.shape[-1])),
+            torch.zeros((1, 26, coords.shape[-1])),
+            torch.zeros((1, coords.shape[-1], 26)),
+            amount_selector_logits,
+            gate_logits,
+        )
+        self.assertIsNotNone(local_result)
+        gate_local_gradient = torch.autograd.grad(
+            local_result[1]["operation_local_loss"],
+            gate_logits,
+            retain_graph=True,
+        )[0]
+        amount_local_gradient = torch.autograd.grad(
+            local_result[1]["amount_local_loss"],
+            amount_selector_logits,
+            retain_graph=True,
+        )[0]
+        fine_local_gradients = torch.autograd.grad(
+            local_result[1]["fine_local_loss"],
+            (add_ratio, prune_ratio, adjust_ratio),
+        )
+        self.assertTrue(torch.isfinite(gate_local_gradient).all())
+        self.assertGreater(float(gate_local_gradient.abs().sum()), 0.0)
+        self.assertTrue(torch.isfinite(amount_local_gradient).all())
+        self.assertGreater(float(amount_local_gradient.abs().sum()), 0.0)
+        self.assertTrue(all(torch.isfinite(value).all() for value in fine_local_gradients))
+        self.assertTrue(all(float(value.abs().sum()) > 0.0 for value in fine_local_gradients))
 
         # bounded residual rankingは小さい補正ではden6順位を保ち、十分な
         # Network差が学習されたときには同じPool内で順位を逆転できる。

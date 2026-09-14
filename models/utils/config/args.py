@@ -1862,12 +1862,12 @@ def parse_pugan_args(parser, file_day, file_time):
         help='stepは従来StepLR、plateauはraw deterministic fixed RD停滞時だけLRを下げる',
     )
     parser.add_argument(
-        '--lr_plateau_patience', default=30, type=int,
-        help='fixed RD best更新なしでLRを下げるEpisode数（8iの15-Episode窓を2周期待つ）',
+        '--lr_plateau_patience', default=60, type=int,
+        help='fixed RD best更新なしでLRを下げるEpisode数（8iの15-Episode窓を4周期待つ）',
     )
     parser.add_argument(
-        '--lr_plateau_min_delta', default=0.04, type=float,
-        help='fixed RD best更新と認める絶対差。最新run終盤の差分robust SD約0.035より大きくする',
+        '--lr_plateau_min_delta', default=0.02, type=float,
+        help='fixed RD best更新と認める絶対差。0.04ではE41の実改善を無視してE46で早期減衰したため半減',
     )
     parser.add_argument('--lr_plateau_cooldown', default=15, type=int)
     parser.add_argument('--min_main_lr', default=1e-5, type=float, help='main optimizerの学習率floor')
@@ -2553,11 +2553,11 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--heuristic_guidance_online_candidate_pairwise_weight',
-        default=0.0,
+        default=0.01,
         type=float,
         help=(
             'RD utility差が明確な候補対へ与えるpairwise順位損失重み。'
-            '5-Episode ablationでHeuristic順位を過剰に崩したため既定は無効'
+            '明確な上下tailだけを使い、listwiseが数千候補へ拡散するのを補助する'
         ),
     )
     parser.add_argument(
@@ -2568,12 +2568,24 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--heuristic_guidance_online_operation_local_credit_weight',
-        default=1.0,
+        default=0.02,
         type=float,
         help=(
             'cache済みrate/geometry attributionをoperation単位へrobust集約し、'
             'Gateへ返す低分散creditの重み。Actual encode回数は増やさない'
         ),
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_amount_local_credit_weight',
+        default=0.05,
+        type=float,
+        help='rate/geometryをbin別に集約したAmount local RD credit重み',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_fine_local_credit_weight',
+        default=0.005,
+        type=float,
+        help='operation別RD targetから作るFine amount residual credit重み',
     )
     parser.add_argument(
         '--heuristic_guidance_online_global_actual_credit_weight',
@@ -4212,7 +4224,7 @@ def parse_pugan_args(parser, file_day, file_time):
         float(getattr(args, "heuristic_guidance_online_where_temperature", 0.75)), 0.05
     )
     args.heuristic_guidance_online_candidate_pairwise_weight = max(
-        float(getattr(args, "heuristic_guidance_online_candidate_pairwise_weight", 0.0)),
+        float(getattr(args, "heuristic_guidance_online_candidate_pairwise_weight", 0.01)),
         0.0,
     )
     args.heuristic_guidance_online_candidate_pairwise_max_pairs = max(
@@ -4253,7 +4265,13 @@ def parse_pugan_args(parser, file_day, file_time):
     args.heuristic_guidance_online_operation_local_credit_weight = max(float(getattr(
         args,
         "heuristic_guidance_online_operation_local_credit_weight",
-        1.0,
+        0.02,
+    )), 0.0)
+    args.heuristic_guidance_online_amount_local_credit_weight = max(float(getattr(
+        args, "heuristic_guidance_online_amount_local_credit_weight", 0.05
+    )), 0.0)
+    args.heuristic_guidance_online_fine_local_credit_weight = max(float(getattr(
+        args, "heuristic_guidance_online_fine_local_credit_weight", 0.005
     )), 0.0)
     args.heuristic_guidance_online_global_actual_credit_weight = max(
         float(getattr(
@@ -5056,8 +5074,8 @@ def parse_pugan_args(parser, file_day, file_time):
     args.lr_scheduler_mode = str(getattr(args, "lr_scheduler_mode", "step")).strip().lower()
     if args.lr_scheduler_mode not in {"step", "plateau"}:
         raise ValueError("lr_scheduler_mode must be step or plateau")
-    args.lr_plateau_patience = max(int(getattr(args, "lr_plateau_patience", 30)), 1)
-    args.lr_plateau_min_delta = max(float(getattr(args, "lr_plateau_min_delta", 0.04)), 0.0)
+    args.lr_plateau_patience = max(int(getattr(args, "lr_plateau_patience", 60)), 1)
+    args.lr_plateau_min_delta = max(float(getattr(args, "lr_plateau_min_delta", 0.02)), 0.0)
     args.lr_plateau_cooldown = max(int(getattr(args, "lr_plateau_cooldown", 15)), 0)
     args.min_main_lr = max(float(getattr(args, "min_main_lr", 1e-5)), 0.0)
     args.min_surrogate_lr = max(float(getattr(args, "min_surrogate_lr", 1e-6)), 0.0)
