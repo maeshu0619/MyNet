@@ -3769,6 +3769,7 @@ class StructureRepairActuator(nn.Module):
             utility = mapping.get("local_utility_target") if isinstance(mapping, dict) else None
             pearson = 0.0
             spearman = 0.0
+            pairwise_accuracy = 0.5
             valid_count = 0
             if torch.is_tensor(utility) and int(utility.numel()) == int(prediction.numel()):
                 target = 0.5 * torch.tanh(utility.to(
@@ -3799,6 +3800,18 @@ class StructureRepairActuator(nn.Module):
                     spearman = float(
                         ((pred_rank * target_rank).sum() / rank_denominator).cpu()
                     )
+                    pair_count = min(256, valid_count // 2)
+                    if pair_count > 0:
+                        target_order = torch.argsort(tgt)
+                        lower = target_order[:pair_count]
+                        upper = target_order[-pair_count:].flip(0)
+                        target_gap = tgt[upper] - tgt[lower]
+                        clear = torch.isfinite(target_gap) & target_gap.gt(0.0)
+                        if bool(clear.any()):
+                            predicted_gap = pred[upper[clear]] - pred[lower[clear]]
+                            pairwise_accuracy = float(
+                                predicted_gap.gt(0.0).float().mean().cpu()
+                            )
             # A residual receives authority only to the degree supported by
             # both its value calibration and ordering.  No fitted threshold,
             # target compression value, or Episode-dependent state is used.
@@ -3815,16 +3828,49 @@ class StructureRepairActuator(nn.Module):
                 confidence_floor
                 + (1.0 - confidence_floor) * alignment_value
             )
+            pairwise_evidence = min(max(
+                2.0 * (float(pairwise_accuracy) - 0.5), 0.0
+            ), 1.0)
+            # Whole-pool rank agreement and clear-tail pair accuracy are
+            # detached observations of learned RD ranking quality.  Neither
+            # contains an Episode counter nor a target compression value.
+            ranking_quality = 0.5 * (alignment_value + pairwise_evidence)
             confidences[name] = prediction.new_tensor(confidence_value)
             audit[name] = {
                 "pearson": float(pearson),
                 "spearman": float(spearman),
+                "pairwise_accuracy": float(pairwise_accuracy),
                 "alignment": float(alignment_value),
+                "ranking_quality": float(ranking_quality),
+                "uncertainty": float(1.0 - ranking_quality),
                 "confidence_floor": float(confidence_floor),
                 "confidence": float(confidence_value),
                 "valid_count": int(valid_count),
             }
         return confidences, audit
+
+    def _learning_adaptive_exploration_factor(self, confidence_audit, operation=None):
+        """Contract exploration only when the Network demonstrates RD ranking skill."""
+        floor = min(max(float(getattr(
+            self.args,
+            "heuristic_guidance_exploration_min_fraction",
+            0.25,
+        )), 0.0), 1.0)
+        if operation is None:
+            rows = [
+                value for value in confidence_audit.values()
+                if isinstance(value, dict)
+            ] if isinstance(confidence_audit, dict) else []
+        else:
+            value = confidence_audit.get(operation, {}) \
+                if isinstance(confidence_audit, dict) else {}
+            rows = [value] if isinstance(value, dict) else []
+        qualities = [
+            min(max(float(row.get("ranking_quality", 0.0)), 0.0), 1.0)
+            for row in rows
+        ]
+        quality = sum(qualities) / float(len(qualities)) if qualities else 0.0
+        return float(floor + (1.0 - floor) * (1.0 - quality))
 
     def _build_exact_den6_residual_plan(
         self,
@@ -3988,6 +4034,15 @@ class StructureRepairActuator(nn.Module):
         network_plan_confidence = torch.stack([
             network_confidence_by_operation[name] for name in operations
         ]).mean().detach()
+        plan_exploration_factor = self._learning_adaptive_exploration_factor(
+            network_confidence_audit
+        )
+        operation_exploration_factors = {
+            name: self._learning_adaptive_exploration_factor(
+                network_confidence_audit, name
+            )
+            for name in operations
+        }
 
         def _confidence_forward_full_backward(residual):
             """Scale hard forward authority but keep the residual trainable."""
@@ -4110,7 +4165,9 @@ class StructureRepairActuator(nn.Module):
                 2.0,
             )), 0.0)
             effective_amount_gumbel_scale = (
-                float(amount_gumbel_scale) * float(exploration_multiplier)
+                float(amount_gumbel_scale)
+                * float(exploration_multiplier)
+                * float(plan_exploration_factor)
             )
             selected_amount_bin = torch.argmax(
                 amount_logits
@@ -4142,7 +4199,7 @@ class StructureRepairActuator(nn.Module):
         # 同じ残差として現れ、Actual方策勾配も個別headへ届かなかった。
         # shared residual headはlegacy経路用に残すが、Exact online Amountには
         # 使用しない。totalは離散bin、内訳は3つのAmount headが担当する。
-        fine_sigma = max(float(getattr(
+        fine_sigma_base = max(float(getattr(
             self.args, "heuristic_guidance_online_amount_log_sigma", 0.08
         )), 0.0) * float(residual_alpha) * float(exploration_multiplier)
         operation_fine_means = {
@@ -4155,6 +4212,10 @@ class StructureRepairActuator(nn.Module):
         operation_fine_log_probs = {}
         for name in operations:
             fine_mean = _confidence_forward_full_backward(operation_fine_means[name])
+            fine_sigma = (
+                float(fine_sigma_base)
+                * float(operation_exploration_factors[name])
+            )
             if amount_exploration_active and fine_sigma > 0.0:
                 fine_noise = torch.randn_like(fine_mean).detach()
                 fine_sample = fine_mean + float(fine_sigma) * fine_noise
@@ -4313,7 +4374,9 @@ class StructureRepairActuator(nn.Module):
         temperature = max(float(
             getattr(self.args, "heuristic_guidance_online_where_temperature", 0.75)
         ), 0.05)
-        gumbel_scale_ratio = max(float(exploration_multiplier), 0.0)
+        configured_where_gumbel_scale = max(float(getattr(
+            self.args, "heuristic_guidance_online_gumbel_scale", 1.0
+        )), 0.0)
         gumbel_scales = []
         heuristic_prior_weight = max(float(getattr(
             self.args, "heuristic_guidance_final_where_weight", 0.01
@@ -4327,6 +4390,12 @@ class StructureRepairActuator(nn.Module):
         combined_logits = {}
         score_audit = {}
         deterministic_top1_changed = {}
+        exploration_top1_changed = {}
+        exploration_heuristic_top1_selected = {}
+        exploration_selection_change_rates = {}
+        exploration_support_sizes = {}
+        exploration_support_reserve_factors = {}
+        exploration_support_masks = {}
         gumbel_audit = {}
         topk_audit = {}
         network_terms = {}
@@ -4581,27 +4650,135 @@ class StructureRepairActuator(nn.Module):
                     float(finite_scaled.std(unbiased=False).cpu())
                     if int(finite_scaled.numel()) > 1 else 0.0
                 )
-                operation_gumbel_scale = score_std * float(gumbel_scale_ratio)
+                operation_gumbel_scale = (
+                    score_std
+                    * float(configured_where_gumbel_scale)
+                    * float(exploration_multiplier)
+                    * float(operation_exploration_factors[operation])
+                )
                 gumbel_scales.append(operation_gumbel_scale)
-                order_score = (
+                # Sample only among candidates that the current behavior
+                # score regards as plausible.  The online shortlist reserve
+                # is the upper bound at low ranking quality; as measured RD
+                # ranking improves, the support contracts toward the number
+                # actually requested while retaining a non-zero reserve.
+                configured_reserve = max(float(getattr(
+                    self.args,
+                    "heuristic_guidance_online_compact_reserve_factor",
+                    4.0,
+                )), 1.0)
+                adaptive_reserve = (
+                    1.0
+                    + (configured_reserve - 1.0)
+                    * float(operation_exploration_factors[operation])
+                )
+                finite_indices = torch.nonzero(
+                    torch.isfinite(scaled_logits), as_tuple=False
+                ).reshape(-1)
+                valid_count_for_support = int(finite_indices.numel())
+                requested_for_support = max(int(requested_counts[operation]), 1)
+                support_count = min(
+                    valid_count_for_support,
+                    max(
+                        requested_for_support,
+                        int(math.ceil(requested_for_support * adaptive_reserve)),
+                    ),
+                )
+                support_indices = torch.topk(
+                    scaled_logits, k=max(support_count, 1)
+                ).indices
+                support_mask = torch.zeros_like(scaled_logits, dtype=torch.bool)
+                support_mask[support_indices] = True
+                sampled_support_score = (
                     scaled_logits
                     + gumbel * float(operation_gumbel_scale)
+                ).masked_fill(~support_mask, float("-inf")).detach()
+                deterministic_remainder_score = scaled_logits.masked_fill(
+                    support_mask, float("-inf")
                 ).detach()
+                exploration_support_sizes[operation] = int(support_count)
+                exploration_support_reserve_factors[operation] = float(
+                    adaptive_reserve
+                )
+                exploration_support_masks[operation] = support_mask
                 gumbel_audit[operation] = _score_stats(
-                    gumbel * float(operation_gumbel_scale)
+                    (gumbel * float(operation_gumbel_scale))[support_mask]
                 )
             else:
-                order_score = scaled_logits.detach()
+                sampled_support_score = scaled_logits.detach()
+                deterministic_remainder_score = scaled_logits.new_full(
+                    scaled_logits.shape, float("-inf")
+                )
+                support_mask = torch.isfinite(scaled_logits)
+                exploration_support_sizes[operation] = int(support_mask.sum().cpu())
+                exploration_support_reserve_factors[operation] = 1.0
+                exploration_support_masks[operation] = support_mask
                 gumbel_audit[operation] = _score_stats(
                     scaled_logits.new_zeros(scaled_logits.shape)
                 )
+            deterministic_top_index = int(
+                torch.argmax(scaled_logits).detach().cpu()
+            )
+            behavior_top_index = int(
+                torch.argmax(sampled_support_score).detach().cpu()
+            )
+            heuristic_top_index = int(
+                torch.argmax(heuristic_for_top1).detach().cpu()
+            )
+            exploration_top1_changed[operation] = bool(
+                behavior_top_index != deterministic_top_index
+            )
+            exploration_heuristic_top1_selected[operation] = bool(
+                behavior_top_index == heuristic_top_index
+            )
             try:
-                order_tensor = torch.argsort(order_score, descending=True, stable=True)
+                support_order = torch.argsort(
+                    sampled_support_score, descending=True, stable=True
+                )
+                remainder_order = torch.argsort(
+                    deterministic_remainder_score, descending=True, stable=True
+                )
             except TypeError:
                 tie_break = torch.arange(
-                    order_score.numel(), device=order_score.device, dtype=order_score.dtype
+                    scaled_logits.numel(), device=scaled_logits.device,
+                    dtype=scaled_logits.dtype
                 )
-                order_tensor = torch.argsort(order_score - tie_break * 1e-12, descending=True)
+                support_order = torch.argsort(
+                    sampled_support_score - tie_break * 1e-12, descending=True
+                )
+                remainder_order = torch.argsort(
+                    deterministic_remainder_score - tie_break * 1e-12,
+                    descending=True,
+                )
+            support_order = support_order[
+                torch.isfinite(sampled_support_score[support_order])
+            ]
+            remainder_order = remainder_order[
+                torch.isfinite(deterministic_remainder_score[remainder_order])
+            ]
+            # Top-1 alone overstates exploration for a composite plan that
+            # selects hundreds of candidates.  Audit the pre-conflict selected
+            # set as well: 0 means the stochastic behavior plan equals the
+            # deterministic policy set, 1 means it is entirely different.
+            audit_selection_count = min(
+                max(int(requested_counts[operation]), 0),
+                int(valid_for_top1.sum().detach().cpu()),
+            )
+            if audit_selection_count > 0:
+                deterministic_selection = set(torch.topk(
+                    scaled_logits, k=audit_selection_count
+                ).indices.detach().cpu().tolist())
+                behavior_selection = set(
+                    support_order[:audit_selection_count].detach().cpu().tolist()
+                )
+                exploration_selection_change_rates[operation] = (
+                    1.0
+                    - len(deterministic_selection & behavior_selection)
+                    / float(audit_selection_count)
+                )
+            else:
+                exploration_selection_change_rates[operation] = 0.0
+            order_tensor = torch.cat([support_order, remainder_order], dim=0)
             ordered_indices[operation] = order_tensor.cpu().tolist()
 
         candidate_local_loss = (
@@ -5048,6 +5225,8 @@ class StructureRepairActuator(nn.Module):
         selected_pool_rank_samples = {}
         selected_candidate_indices = {}
         heuristic_top1_selected = {}
+        selected_outside_heuristic_budget_rates = {}
+        selected_outside_exploration_support_rates = {}
         candidate_entropy_values = {}
         candidate_normalized_entropy = {}
         candidate_max_probability = {}
@@ -5071,6 +5250,16 @@ class StructureRepairActuator(nn.Module):
             selected_pool_rank_samples[operation] = ranks[:8]
             selected_candidate_indices[operation] = int(indices[0]) if indices else -1
             heuristic_top1_selected[operation] = bool(0 in ranks)
+            heuristic_budget = max(int(requested_counts[operation]), 1)
+            selected_outside_heuristic_budget_rates[operation] = (
+                sum(int(rank) >= heuristic_budget for rank in ranks)
+                / float(max(len(ranks), 1))
+            )
+            support_mask = exploration_support_masks[operation].detach().cpu()
+            selected_outside_exploration_support_rates[operation] = (
+                sum(not bool(support_mask[int(index)]) for index in indices)
+                / float(max(len(indices), 1))
+            )
             all_selected_rank_values.extend(float(rank) for rank in ranks)
             entropy_value = float(
                 candidate_entropy_by_operation[operation].detach().cpu()
@@ -5179,6 +5368,12 @@ class StructureRepairActuator(nn.Module):
                 sum(float(value) for value in heuristic_top1_selected.values())
                 / float(len(operations))
             ),
+            "selected_outside_heuristic_budget_rate": (
+                selected_outside_heuristic_budget_rates
+            ),
+            "selected_outside_exploration_support_rate": (
+                selected_outside_exploration_support_rates
+            ),
             "score_audit": score_audit,
             "candidate_local_credit_loss": candidate_local_credit_loss,
             "candidate_ranking_local_loss": candidate_local_loss,
@@ -5220,6 +5415,24 @@ class StructureRepairActuator(nn.Module):
                 sum(float(value) for value in deterministic_top1_changed.values())
                 / float(len(operations))
             ),
+            "exploration_top1_changed": exploration_top1_changed,
+            "exploration_top1_changed_rate": (
+                sum(float(value) for value in exploration_top1_changed.values())
+                / float(len(operations))
+            ),
+            "exploration_heuristic_top1_selected": (
+                exploration_heuristic_top1_selected
+            ),
+            "exploration_selection_change_rate": (
+                exploration_selection_change_rates
+            ),
+            "learning_adaptive_exploration": True,
+            "plan_exploration_factor": float(plan_exploration_factor),
+            "operation_exploration_factors": operation_exploration_factors,
+            "exploration_support_sizes": exploration_support_sizes,
+            "exploration_support_reserve_factors": (
+                exploration_support_reserve_factors
+            ),
             "where_gumbel_audit": gumbel_audit,
             "candidate_entropy_by_operation": candidate_entropy_values,
             "candidate_normalized_entropy": candidate_normalized_entropy,
@@ -5250,7 +5463,13 @@ class StructureRepairActuator(nn.Module):
                     for name in operations
                 ]).mean().detach().cpu()
             ),
-            "amount_fine_score_gradient_scale": float(fine_sigma),
+            "amount_fine_score_gradient_scale": (
+                sum(
+                    float(fine_sigma_base)
+                    * float(operation_exploration_factors[name])
+                    for name in operations
+                ) / float(len(operations))
+            ),
             "operation_amount_log_residuals": {
                 name: float(operation_fine_samples[name].detach().cpu())
                 for name in operations
@@ -5300,7 +5519,12 @@ class StructureRepairActuator(nn.Module):
             "exploration_multiplier": float(exploration_multiplier),
             "behavior_exploration_phase": float(1.0 - exploration_multiplier),
             "effective_where_gumbel_scale": float(gumbel_scale),
-            "effective_amount_log_sigma": float(fine_sigma),
+            "effective_amount_log_sigma": float(fine_sigma_base),
+            "effective_amount_log_sigma_by_operation": {
+                name: float(fine_sigma_base)
+                * float(operation_exploration_factors[name])
+                for name in operations
+            },
             "effective_amount_gumbel_scale": float(effective_amount_gumbel_scale),
             "policy_log_prob": policy_log_prob,
             "policy_entropy": policy_entropy,

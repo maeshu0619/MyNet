@@ -2499,9 +2499,18 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--heuristic_guidance_online_gumbel_scale',
-        default=0.10,
+        default=1.0,
         type=float,
-        help='1plan内edit-unit順位探索のGumbel強度。Network移行率を掛けて徐々に有効化する',
+        help='combined score標準偏差に対するWhere Gumbel探索倍率。Episodeには依存しない',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_exploration_min_fraction',
+        default=0.25,
+        type=float,
+        help=(
+            'RD順位学習後にも残す探索倍率の下限。実効探索はcandidate順位品質に応じて'
+            'この値まで自然に縮小し、Episode番号には依存しない'
+        ),
     )
     parser.add_argument(
         '--heuristic_guidance_online_amount_log_sigma',
@@ -4239,8 +4248,11 @@ def parse_pugan_args(parser, file_day, file_time):
         float(getattr(args, "rd_geometry_weight_multiplier", 1.25)), 0.0
     ), 4.0)
     args.heuristic_guidance_online_gumbel_scale = max(
-        float(getattr(args, "heuristic_guidance_online_gumbel_scale", 0.10)), 0.0
+        float(getattr(args, "heuristic_guidance_online_gumbel_scale", 1.0)), 0.0
     )
+    args.heuristic_guidance_exploration_min_fraction = min(max(float(getattr(
+        args, "heuristic_guidance_exploration_min_fraction", 0.25
+    )), 0.0), 1.0)
     args.heuristic_guidance_online_amount_log_sigma = min(max(
         float(getattr(args, "heuristic_guidance_online_amount_log_sigma", 0.08)), 0.0
     ), 0.50)
@@ -4443,11 +4455,10 @@ def parse_pugan_args(parser, file_day, file_time):
             # opt-inに限定し、通常trainは最初からPoolをNetworkで再順位付けする。
             args.heuristic_guidance_exact_anchor_steps = 0
         if not _cli_option_was_provided("--heuristic_guidance_online_gumbel_scale"):
-            # w_H=0.005時の旧Gumbel std≈0.032は候補集合の84.3%を無作為化し、
-            # base=0.01でも73.3%を変更した。Poolから約2,000件を同時選ぶtop-kでは
-            # score stdと同程度のnoiseでも順位交換が過大になるため、候補集合の
-            # 構造を保つ1/10（係数0.00025）へ校正する。
-            args.heuristic_guidance_online_gumbel_scale = 0.001
+            # 明示倍率1.0は従来のcombined-score std基準の初期挙動を保つ。
+            # 実効探索はcandidate順位学習品質によってのみ縮小し、Episode依存の
+            # annealは行わない。
+            args.heuristic_guidance_online_gumbel_scale = 1.0
         if not _cli_option_was_provided("--repair_online_decision_grad_max_norm"):
             # 004957後半の実測normはWhere≈0.049, Amount≈6.54,
             # Action≈0.297であった。0.01上限は有効信号まで消したため、

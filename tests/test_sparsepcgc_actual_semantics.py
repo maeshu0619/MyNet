@@ -1448,6 +1448,36 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         self.assertTrue(all(float(value) == 0.0 for value in confidence.values()))
         self.assertTrue(all(value["confidence"] == 0.0 for value in audit.values()))
 
+    def test_learning_adaptive_exploration_tracks_ranking_quality_not_episode(self):
+        actuator = StructureRepairActuator.__new__(StructureRepairActuator)
+        actuator.args = SimpleNamespace(
+            heuristic_guidance_exploration_min_fraction=0.25,
+            _global_train_step=999999,
+        )
+        unlearned = {
+            name: {"ranking_quality": 0.0}
+            for name in ("Add", "Prune", "Adjust")
+        }
+        learned = {
+            name: {"ranking_quality": 1.0}
+            for name in ("Add", "Prune", "Adjust")
+        }
+        self.assertAlmostEqual(
+            actuator._learning_adaptive_exploration_factor(unlearned), 1.0
+        )
+        self.assertAlmostEqual(
+            actuator._learning_adaptive_exploration_factor(learned), 0.25
+        )
+        actuator.args._global_train_step = 0
+        self.assertAlmostEqual(
+            actuator._learning_adaptive_exploration_factor(learned), 0.25
+        )
+        mixed = dict(learned)
+        mixed["Adjust"] = {"ranking_quality": 0.0}
+        self.assertAlmostEqual(
+            actuator._learning_adaptive_exploration_factor(mixed, "Adjust"), 1.0
+        )
+
     def test_den6_anchor_amounts_are_operation_specific_at_step_zero(self):
         """8i m=8の0.25%を旧5% Prune候補で上書きしない。"""
         actuator = StructureRepairActuator.__new__(StructureRepairActuator)
