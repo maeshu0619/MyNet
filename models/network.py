@@ -69,6 +69,9 @@ class Network(nn.Module):
         self.last_actuator_soft_terms = {} # 直近Forward時の微分可能な点操作proxyを保存する辞書
         self.last_runtime_timing = {} # 直近Forward時の実行時間計測結果を保存する辞書を初期化
         self._den6_online_objective_baseline = OrderedDict()
+        # Previous executed sets are retained per frame so one Actual encode
+        # can supervise only candidates exchanged by consecutive plans.
+        self._den6_online_actual_plan_memory = OrderedDict()
         self._den6_online_geometry_baseline = OrderedDict()
         self.last_discrete_policy_debug = {}
         self.last_k_proposal_terms = None
@@ -898,6 +901,152 @@ class Network(nn.Module):
                 / float(policy_backward_scale)
             )
             policy_loss = policy_loss + candidate_local_credit_weighted
+
+        # One codec result describes the complete plan, but consecutive plans
+        # for the *same frame* reveal which candidate set was exchanged.  Give
+        # Actual supervision only to those changed candidates: when the new
+        # plan improves, its inserted set should outrank the removed set; when
+        # it worsens, the preference is reversed.  This is deliberately not
+        # applied across frames and does not evaluate candidates individually.
+        actual_set_contrast_raw = objective.new_zeros(())
+        actual_set_contrast_weighted = objective.new_zeros(())
+        actual_set_contrast_operations = 0
+        actual_set_contrast_pairs = 0
+        actual_set_contrast_evidence = 0.0
+        actual_set_incumbent_updated = False
+        plan_debug = state.get("ana_den6_exact_residual_plan_debug", {})
+        score_tensors = (
+            plan_debug.get("_actual_credit_network_scores", {})
+            if isinstance(plan_debug, dict) else {}
+        )
+        candidate_ids_by_operation = (
+            plan_debug.get("_actual_credit_candidate_ids", {})
+            if isinstance(plan_debug, dict) else {}
+        )
+        selected_ids_by_operation = (
+            plan_debug.get("_actual_credit_selected_ids", {})
+            if isinstance(plan_debug, dict) else {}
+        )
+        plan_memory = getattr(self, "_den6_online_actual_plan_memory", None)
+        if plan_memory is None:
+            plan_memory = OrderedDict()
+            self._den6_online_actual_plan_memory = plan_memory
+        previous_plan = plan_memory.get(cache_key)
+        current_objective_value = float(objective.detach().cpu())
+        if (
+            mode == "ana_den6_online"
+            and isinstance(previous_plan, dict)
+            and isinstance(score_tensors, dict)
+            and isinstance(candidate_ids_by_operation, dict)
+            and isinstance(selected_ids_by_operation, dict)
+        ):
+            # Candidate-local supervision already contains both rate proxy and
+            # geometry risk.  This contrast supplies the orthogonal correction
+            # from the real codec rate; adding geometry here too measurably
+            # double-counted it in the controlled comparison.
+            actual_delta = float(previous_plan.get("objective", 0.0)) - current_objective_value
+            scale_floor = max(
+                abs(float(previous_plan.get("objective", 0.0)))
+                * max(float(getattr(
+                    self.args,
+                    "heuristic_guidance_online_actual_set_relative_scale",
+                    0.02,
+                )), 0.0),
+                1e-8,
+            )
+            actual_set_contrast_evidence = min(abs(actual_delta) / scale_floor, 1.0)
+            preference_sign = 1.0 if actual_delta > 0.0 else -1.0
+            temperature = max(float(getattr(
+                self.args,
+                "heuristic_guidance_online_actual_set_temperature",
+                0.25,
+            )), 1e-4)
+            max_candidates = max(int(getattr(
+                self.args,
+                "heuristic_guidance_online_actual_set_max_candidates",
+                128,
+            )), 1)
+            contrast_terms = []
+            previous_selected = previous_plan.get("selected", {})
+            for operation in ("Add", "Prune", "Adjust"):
+                scores = score_tensors.get(operation)
+                ids = candidate_ids_by_operation.get(operation, ())
+                if not torch.is_tensor(scores) or not scores.requires_grad:
+                    continue
+                if len(ids) != int(scores.numel()):
+                    continue
+                current_set = set(selected_ids_by_operation.get(operation, ()))
+                previous_set = set(previous_selected.get(operation, ()))
+                current_only = current_set - previous_set
+                previous_only = previous_set - current_set
+                if not current_only or not previous_only:
+                    continue
+                id_to_index = {str(value): index for index, value in enumerate(ids)}
+                current_indices = [
+                    id_to_index[value] for value in sorted(current_only)
+                    if value in id_to_index
+                ][:max_candidates]
+                previous_indices = [
+                    id_to_index[value] for value in sorted(previous_only)
+                    if value in id_to_index
+                ][:max_candidates]
+                if not current_indices or not previous_indices:
+                    continue
+                current_mean = scores.reshape(-1).index_select(
+                    0, torch.as_tensor(current_indices, device=scores.device)
+                ).mean()
+                previous_mean = scores.reshape(-1).index_select(
+                    0, torch.as_tensor(previous_indices, device=scores.device)
+                ).mean()
+                contrast_terms.append(torch.nn.functional.softplus(
+                    -float(preference_sign)
+                    * (current_mean - previous_mean)
+                    / float(temperature)
+                ))
+                actual_set_contrast_operations += 1
+                actual_set_contrast_pairs += min(
+                    len(current_indices), len(previous_indices)
+                )
+            if contrast_terms and actual_set_contrast_evidence > 0.0:
+                actual_set_contrast_raw = torch.stack(contrast_terms).mean()
+                contrast_weight = max(float(getattr(
+                    self.args,
+                    "heuristic_guidance_online_actual_set_credit_weight",
+                    0.10,
+                )), 0.0)
+                actual_set_contrast_weighted = (
+                    float(contrast_weight)
+                    * float(actual_set_contrast_evidence)
+                    * actual_set_contrast_raw
+                    / float(policy_backward_scale)
+                )
+                policy_loss = policy_loss + actual_set_contrast_weighted
+        if isinstance(selected_ids_by_operation, dict):
+            # Retain the best *executed training plan* for this frame as the
+            # comparison incumbent.  A worse exploratory sample must not
+            # replace the teacher for the next visit and cause a random walk.
+            # This memory never selects an inference action and contains no
+            # candidate-wise codec oracle result.
+            should_update_incumbent = (
+                not isinstance(previous_plan, dict)
+                or current_objective_value
+                < float(previous_plan.get("objective", float("inf")))
+            )
+            if should_update_incumbent:
+                plan_memory[cache_key] = {
+                    "objective": current_objective_value,
+                    "selected": {
+                        name: tuple(
+                            str(value)
+                            for value in selected_ids_by_operation.get(name, ())
+                        )
+                        for name in ("Add", "Prune", "Adjust")
+                    },
+                }
+                actual_set_incumbent_updated = True
+            plan_memory.move_to_end(cache_key)
+            while len(plan_memory) > 4096:
+                plan_memory.popitem(last=False)
         local_plan_credit_debug = {}
         for state_name, arg_name, debug_name in (
             (
@@ -1097,6 +1246,14 @@ class Network(nn.Module):
             "global_actual_credit_available": bool(global_credit_available),
             "global_actual_credit_weight": float(global_actual_credit_weight),
             "advantage": float(advantage.detach().cpu()),
+            "actual_set_contrast_raw": float(actual_set_contrast_raw.detach().cpu()),
+            "actual_set_contrast_weighted": float(
+                actual_set_contrast_weighted.detach().cpu()
+            ),
+            "actual_set_contrast_operations": int(actual_set_contrast_operations),
+            "actual_set_contrast_pairs": int(actual_set_contrast_pairs),
+            "actual_set_contrast_evidence": float(actual_set_contrast_evidence),
+            "actual_set_incumbent_updated": bool(actual_set_incumbent_updated),
             "log_prob": float(log_prob.detach().float().mean().cpu()),
             "entropy": float(entropy.detach().float().mean().cpu()) if torch.is_tensor(entropy) else 0.0,
             "policy_core_raw": float(policy_core_raw.detach().cpu()),

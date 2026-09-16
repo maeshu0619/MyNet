@@ -5547,6 +5547,21 @@ class StructureRepairActuator(nn.Module):
             "operation_gate_share_l1_error": float(
                 (gate_probs.detach() - selected_share.detach()).abs().mean().cpu()
             ),
+            # Internal differentiable state for same-frame Actual set
+            # comparison.  These values are consumed after the single
+            # composite codec encode and are not candidate codec evaluations.
+            "_actual_credit_network_scores": network_scores,
+            "_actual_credit_candidate_ids": {
+                name: [str(candidate.get("candidate_id", "")) for candidate in pools[name]]
+                for name in operations
+            },
+            "_actual_credit_selected_ids": {
+                name: [
+                    str(pools[name][index].get("candidate_id", ""))
+                    for index in selected_indices_by_operation[name]
+                ]
+                for name in operations
+            },
         }
         plan_hash_payload = {
             "candidate_ids": selected_ids,

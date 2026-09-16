@@ -2606,6 +2606,32 @@ def parse_pugan_args(parser, file_day, file_time):
         ),
     )
     parser.add_argument(
+        '--heuristic_guidance_online_actual_set_credit_weight',
+        default=0.50,
+        type=float,
+        help=(
+            '同一frameの連続planで入れ替わったcandidate集合に返すActual順位credit重み'
+        ),
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_actual_set_relative_scale',
+        default=0.02,
+        type=float,
+        help='候補集合Actual差の信頼度を正規化する前回Actual絶対値に対する比率',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_actual_set_temperature',
+        default=0.25,
+        type=float,
+        help='入れ替えcandidate集合のActual pairwise preference温度',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_actual_set_max_candidates',
+        default=128,
+        type=int,
+        help='operationごとにActual集合比較へ使う最大candidate数',
+    )
+    parser.add_argument(
         '--heuristic_guidance_online_decision_lr_scale',
         default=0.1,
         type=float,
@@ -4290,6 +4316,22 @@ def parse_pugan_args(parser, file_day, file_time):
             args,
             "heuristic_guidance_online_global_actual_credit_weight",
             0.05,
+        )),
+        0.0,
+    )
+    args.heuristic_guidance_online_actual_set_credit_weight = max(
+        float(getattr(
+            args,
+            "heuristic_guidance_online_actual_set_credit_weight",
+            0.50,
+        )),
+        0.0,
+    )
+    args.heuristic_guidance_online_actual_set_relative_scale = max(
+        float(getattr(
+            args,
+            "heuristic_guidance_online_actual_set_relative_scale",
+            0.02,
         )),
         0.0,
     )

@@ -829,6 +829,91 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         self.assertGreater(gradient(-3.0), 0.0)  # 過去EMAより悪化
         self.assertLess(gradient(-4.5), 0.0)   # 過去EMAより改善
 
+    def test_den6_same_frame_actual_credit_ranks_only_exchanged_candidates(self):
+        """A better revisited plan promotes its new candidate over the removed one."""
+        network = Network.__new__(Network)
+        torch.nn.Module.__init__(network)
+        network.args = SimpleNamespace(
+            heuristic_guidance_mode="ana_den6_online",
+            _current_input_file="/dataset/loot/frame_0001.ply",
+            sparsepcgc_scale_ae=0,
+            sparsepcgc_scale_sr=2,
+            sparsepcgc_scale_m=8,
+            heuristic_guidance_online_policy_weight=1.0,
+            heuristic_guidance_online_entropy_weight=0.0,
+            heuristic_guidance_online_reward_ema=0.1,
+            heuristic_guidance_online_policy_backward_scale=10.0,
+            heuristic_guidance_online_global_actual_credit_weight=0.0,
+            heuristic_guidance_online_actual_set_credit_weight=0.1,
+            heuristic_guidance_online_actual_set_relative_scale=0.02,
+            heuristic_guidance_online_actual_set_temperature=0.25,
+            heuristic_guidance_online_actual_set_max_candidates=128,
+            heuristic_guidance_online_advantage_clip=2.0,
+        )
+        network._den6_online_objective_baseline = __import__(
+            "collections"
+        ).OrderedDict()
+        network._den6_online_actual_plan_memory = __import__(
+            "collections"
+        ).OrderedDict()
+
+        first_score = torch.tensor([0.0, 0.0], requires_grad=True)
+        first_log_prob = torch.tensor(0.0, requires_grad=True)
+        network.last_actuator_voxel_state = {
+            "den6_online_policy_log_prob": first_log_prob,
+            "den6_online_policy_entropy": first_log_prob.new_zeros(()),
+            "ana_den6_exact_residual_plan_debug": {
+                "_actual_credit_network_scores": {"Add": first_score},
+                "_actual_credit_candidate_ids": {"Add": ["old", "new"]},
+                "_actual_credit_selected_ids": {"Add": ["old"]},
+            },
+        }
+        network.discrete_policy_loss(torch.tensor(-3.0))
+
+        second_score = torch.tensor([0.0, 0.0], requires_grad=True)
+        second_log_prob = torch.tensor(0.0, requires_grad=True)
+        network.last_actuator_voxel_state = {
+            "den6_online_policy_log_prob": second_log_prob,
+            "den6_online_policy_entropy": second_log_prob.new_zeros(()),
+            "ana_den6_exact_residual_plan_debug": {
+                "_actual_credit_network_scores": {"Add": second_score},
+                "_actual_credit_candidate_ids": {"Add": ["old", "new"]},
+                "_actual_credit_selected_ids": {"Add": ["new"]},
+            },
+        }
+        loss = network.discrete_policy_loss(torch.tensor(-3.2))
+        gradient = torch.autograd.grad(loss, second_score)[0]
+        self.assertGreater(float(gradient[0]), 0.0)
+        self.assertLess(float(gradient[1]), 0.0)
+        self.assertEqual(
+            network.last_discrete_policy_debug["actual_set_contrast_operations"], 1
+        )
+        self.assertEqual(
+            network.last_discrete_policy_debug["actual_set_contrast_pairs"], 1
+        )
+        self.assertTrue(
+            network.last_discrete_policy_debug["actual_set_incumbent_updated"]
+        )
+
+        third_score = torch.tensor([0.0, 0.0], requires_grad=True)
+        third_log_prob = torch.tensor(0.0, requires_grad=True)
+        network.last_actuator_voxel_state = {
+            "den6_online_policy_log_prob": third_log_prob,
+            "den6_online_policy_entropy": third_log_prob.new_zeros(()),
+            "ana_den6_exact_residual_plan_debug": {
+                "_actual_credit_network_scores": {"Add": third_score},
+                "_actual_credit_candidate_ids": {"Add": ["old", "new"]},
+                "_actual_credit_selected_ids": {"Add": ["old"]},
+            },
+        }
+        worse_loss = network.discrete_policy_loss(torch.tensor(-3.1))
+        worse_gradient = torch.autograd.grad(worse_loss, third_score)[0]
+        self.assertGreater(float(worse_gradient[0]), 0.0)
+        self.assertLess(float(worse_gradient[1]), 0.0)
+        self.assertFalse(
+            network.last_discrete_policy_debug["actual_set_incumbent_updated"]
+        )
+
     def test_den6_geometry_credit_updates_amount_only_inside_compression_guard(self):
         """圧縮改善を保ったGeometry改善だけを離散Amountへ返す。"""
         network = Network.__new__(Network)
