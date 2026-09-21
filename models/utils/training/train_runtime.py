@@ -4919,6 +4919,7 @@ def _den6_online_grad_norms(model):
             getattr(actuator, "add_head", None),
             getattr(actuator, "add_voxel_head", None),
             getattr(actuator, "move_voxel_head", None),
+            getattr(actuator, "den6_candidate_actor", None),
         ),
         "den6_online_amount_grad_norm": (
             getattr(actuator, "drop_amount_head", None),
@@ -4939,6 +4940,7 @@ def _den6_online_grad_norms(model):
             getattr(actuator, "add_head", None),
             getattr(actuator, "add_voxel_head", None),
             getattr(actuator, "move_voxel_head", None),
+            getattr(actuator, "den6_candidate_actor", None),
         ),
         "den6_online_amount_selector_grad_norm": (
             getattr(actuator, "algorithmic_amount_selector_head", None),
@@ -4953,6 +4955,12 @@ def _den6_online_grad_norms(model):
         ),
         "den6_online_shared_amount_residual_grad_norm": (
             getattr(actuator, "algorithmic_amount_residual_head", None),
+        ),
+        "den6_online_candidate_critic_grad_norm": (
+            getattr(actuator, "den6_candidate_critic", None),
+        ),
+        "den6_online_plan_critic_grad_norm": (
+            getattr(actuator, "den6_plan_critic", None),
         ),
     }
     norm_squares = []
@@ -5055,6 +5063,9 @@ def _den6_online_decision_parameters(model):
         getattr(actuator, "move_amount_head", None),
         getattr(actuator, "algorithmic_amount_selector_head", None),
         getattr(actuator, "operation_gate_head", None),
+        getattr(actuator, "den6_candidate_actor", None),
+        getattr(actuator, "den6_candidate_critic", None),
+        getattr(actuator, "den6_plan_critic", None),
     )
     params = []
     seen = set()

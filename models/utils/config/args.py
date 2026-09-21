@@ -2453,6 +2453,54 @@ def parse_pugan_args(parser, file_day, file_time):
         help='Exact anchor件数に対して保持するden6 edit-unit順位の倍率。既定4.0でNetworkが順位を学べる余地を残す',
     )
     parser.add_argument(
+        '--heuristic_guidance_online_selection_mode',
+        default='actor_critic',
+        choices=['actor_critic', 'prior_residual'],
+        help=(
+            'ana_den6_onlineの候補選択。actor_criticはHeuristic順位を最終scoreへ'
+            '加えず、安全pool内をNetwork Actor/Criticで直接選ぶ。prior_residualは'
+            '従来のHeuristic順位+Network残差比較用'
+        ),
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_actor_hidden_dim', default=32, type=int,
+        help='unordered safe candidate poolを選択するActor/Criticの中間次元',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_actor_critic_distill_weight',
+        default=0.10,
+        type=float,
+        help='local RD Critic順位をActorへ伝える補助損失。Heuristic順位は教師にしない',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_plan_critic_weight', default=0.10, type=float,
+        help='1 Step 1 Actual encodeのRDをplan Criticへ回帰する損失重み',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_critic_lr_scale', default=0.10, type=float,
+        help='candidate/plan Critic専用のmain LR倍率',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_plan_critic_replay_entries', default=512, type=int,
+        help='Actual RD plan replayの最大件数。点群やcodec出力は保持せずcompact特徴だけを保存',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_plan_critic_replay_batch', default=32, type=int,
+        help='1 Stepでplan Criticへ再利用する過去Actual plan数',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_edit_tiebreak_weight', default=0.0, type=float,
+        help='同等RD時だけ少数編集を選ぶActual RD objectiveの微小tie-break係数。0で無効',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_factorized_exploration', default=True, type=str2bool,
+        help='1 StepでWhere/Amount/Gate/Fineの一群だけを探索してActual creditを識別可能にする',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_factorized_ucb_scale', default=0.25, type=float,
+        help='decision groupの不確実性へ加えるcoverage UCB係数。Episode番号には依存しない',
+    )
+    parser.add_argument(
         '--heuristic_guidance_online_memory_entries',
         default=64,
         type=int,

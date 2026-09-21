@@ -745,6 +745,42 @@ class Network(nn.Module):
         if not torch.is_tensor(log_prob) or not log_prob.requires_grad:
             return reward.new_zeros(())
         objective = torch.nan_to_num(reward.float().mean(), nan=0.0, posinf=1e3, neginf=-1e3)
+        selection_mode = str(getattr(
+            self.args,
+            "heuristic_guidance_online_selection_mode",
+            # Missing on old checkpoints/tests: keep legacy policy semantics.
+            # Current args explicitly opt into actor_critic.
+            "prior_residual",
+        )).strip().lower()
+        actor_critic_selection = bool(
+            mode == "ana_den6_online" and selection_mode == "actor_critic"
+        )
+        geometry_objective_for_rd = (
+            torch.nan_to_num(
+                geometry.float().mean(), nan=0.0, posinf=1e3, neginf=0.0
+            )
+            if torch.is_tensor(geometry)
+            else objective.new_zeros(())
+        )
+        geometry_penalty = torch.relu(
+            geometry_objective_for_rd
+            - geometry_objective_for_rd.new_tensor(float(getattr(
+                self.args, "cp_tau_geom", 0.0
+            )))
+        )
+        changed_ratio = state.get(
+            "den6_online_actor_critic_changed_ratio", objective.new_zeros(())
+        )
+        if not torch.is_tensor(changed_ratio):
+            changed_ratio = objective.new_tensor(float(changed_ratio))
+        actor_rd_target = (
+            objective.detach()
+            + max(float(getattr(self.args, "cp_lambda_geom", 1.0)), 0.0)
+            * geometry_penalty.detach()
+            + max(float(getattr(
+                self.args, "heuristic_guidance_online_edit_tiebreak_weight", 0.0
+            )), 0.0) * changed_ratio.detach().float().mean()
+        )
         input_file = str(getattr(self.args, "_current_input_file", ""))
         cache_key = "|".join((
             input_file,
@@ -800,6 +836,23 @@ class Network(nn.Module):
         # side; zero remains neutral while any worsening plan is penalized.
         effective_baseline_t = torch.minimum(previous_t, previous_t.new_zeros(()))
         advantage = (effective_baseline_t - objective.detach()) * float(reward_scale)
+        plan_critic_value = state.get(
+            "den6_online_actor_critic_plan_value", objective.new_zeros(())
+        )
+        plan_critic_log_variance = state.get(
+            "den6_online_actor_critic_plan_log_variance", objective.new_zeros(())
+        )
+        plan_feature = state.get(
+            "den6_online_actor_critic_plan_feature", None
+        )
+        if actor_critic_selection and torch.is_tensor(plan_critic_value):
+            # J is minimized.  A positive advantage means the executed plan is
+            # better than the Critic expectation and its Actor probability
+            # should increase.
+            advantage = (
+                plan_critic_value.detach().float().mean()
+                - actor_rd_target.detach()
+            ) * float(reward_scale)
         if advantage_clip > 0.0:
             advantage = advantage.clamp(-advantage_clip, advantage_clip)
         # Use an EMA state baseline, not best-so-far.  A single lucky codec
@@ -864,7 +917,11 @@ class Network(nn.Module):
         # the global policy correction only once a comparative frame/sequence
         # baseline exists.  Candidate-local RD credit remains active from the
         # first step, and Actual correction remains active on revisits.
-        global_credit_available = bool(baseline_seen or sequence_baseline_seen)
+        global_credit_available = bool(
+            actor_critic_selection
+            or baseline_seen
+            or sequence_baseline_seen
+        )
         policy_core_raw = (
             -advantage * log_prob.float().mean()
             if global_credit_available
@@ -877,6 +934,160 @@ class Network(nn.Module):
             / float(policy_backward_scale)
         )
         policy_loss = policy_core_weighted
+        plan_critic_loss_raw = objective.new_zeros(())
+        plan_critic_loss_weighted = objective.new_zeros(())
+        plan_critic_replay_loss = objective.new_zeros(())
+        replay_count = 0
+        plan_critic_replay_pearson = 0.0
+        plan_critic_replay_spearman = 0.0
+        if (
+            actor_critic_selection
+            and torch.is_tensor(plan_critic_value)
+            and plan_critic_value.requires_grad
+            and torch.is_tensor(plan_feature)
+            and int(plan_feature.numel()) == 18
+        ):
+            log_variance = plan_critic_log_variance.float().mean().clamp(-8.0, 8.0)
+            critic_error = plan_critic_value.float().mean() - actor_rd_target.detach()
+            critic_uncertainty = torch.exp(0.5 * log_variance)
+            plan_critic_loss_raw = (
+                torch.nn.functional.smooth_l1_loss(
+                    plan_critic_value.float().mean(),
+                    actor_rd_target.detach(),
+                    beta=0.25,
+                )
+                + 0.1 * torch.nn.functional.smooth_l1_loss(
+                    critic_uncertainty,
+                    (critic_error.detach().abs() + 0.05).clamp(max=10.0),
+                    beta=0.25,
+                )
+            )
+            replay = getattr(self, "_den6_actor_critic_replay", None)
+            if replay is None:
+                replay = []
+                self._den6_actor_critic_replay = replay
+            replay_batch = max(int(getattr(
+                self.args,
+                "heuristic_guidance_online_plan_critic_replay_batch",
+                32,
+            )), 0)
+            if replay and replay_batch > 0:
+                rows = replay[-min(len(replay), replay_batch):]
+                replay_features = torch.stack([
+                    (row["plan_feature"] if isinstance(row, dict) else row[0]).to(
+                        device=objective.device, dtype=torch.float32
+                    )
+                    for row in rows
+                ])
+                replay_targets = objective.new_tensor(
+                    [
+                        float(row["actual_rd"] if isinstance(row, dict) else row[1])
+                        for row in rows
+                    ], dtype=torch.float32
+                )
+                replay_output = self.actuator.den6_plan_critic(replay_features)
+                replay_mean = replay_output[:, 0]
+                replay_log_variance = replay_output[:, 1].clamp(-8.0, 8.0)
+                replay_error = replay_mean - replay_targets
+                replay_uncertainty = torch.exp(0.5 * replay_log_variance)
+                plan_critic_replay_loss = (
+                    torch.nn.functional.smooth_l1_loss(
+                        replay_mean, replay_targets, beta=0.25
+                    )
+                    + 0.1 * torch.nn.functional.smooth_l1_loss(
+                        replay_uncertainty,
+                        (replay_error.detach().abs() + 0.05).clamp(max=10.0),
+                        beta=0.25,
+                    )
+                )
+                replay_count = len(rows)
+                if replay_count > 1:
+                    replay_mean_detached = replay_mean.detach().float()
+                    replay_target_detached = replay_targets.detach().float()
+                    pred_centered = (
+                        replay_mean_detached - replay_mean_detached.mean()
+                    )
+                    target_centered = (
+                        replay_target_detached - replay_target_detached.mean()
+                    )
+                    correlation_denominator = (
+                        pred_centered.square().sum().sqrt()
+                        * target_centered.square().sum().sqrt()
+                    ).clamp_min(1e-12)
+                    plan_critic_replay_pearson = float((
+                        (pred_centered * target_centered).sum()
+                        / correlation_denominator
+                    ).cpu())
+                    pred_rank = torch.argsort(torch.argsort(
+                        replay_mean_detached
+                    )).float()
+                    target_rank = torch.argsort(torch.argsort(
+                        replay_target_detached
+                    )).float()
+                    pred_rank = pred_rank - pred_rank.mean()
+                    target_rank = target_rank - target_rank.mean()
+                    rank_denominator = (
+                        pred_rank.square().sum().sqrt()
+                        * target_rank.square().sum().sqrt()
+                    ).clamp_min(1e-12)
+                    plan_critic_replay_spearman = float((
+                        (pred_rank * target_rank).sum() / rank_denominator
+                    ).cpu())
+            critic_weight = max(float(getattr(
+                self.args,
+                "heuristic_guidance_online_plan_critic_weight",
+                0.10,
+            )), 0.0)
+            plan_critic_loss_weighted = float(critic_weight) * (
+                plan_critic_loss_raw + plan_critic_replay_loss
+            )
+            policy_loss = policy_loss + plan_critic_loss_weighted
+            plan_debug_for_replay = state.get(
+                "ana_den6_exact_residual_plan_debug", {}
+            )
+            if not isinstance(plan_debug_for_replay, dict):
+                plan_debug_for_replay = {}
+            replay.append({
+                # Compact selected-action context.  Full point clouds and
+                # bitstreams are intentionally not retained.
+                "plan_feature": plan_feature.detach().float().cpu(),
+                "selected_candidate_ids": tuple(
+                    str(value) for value in plan_debug_for_replay.get(
+                        "selected_candidate_ids", ()
+                    )
+                ),
+                "selected_counts": dict(
+                    plan_debug_for_replay.get("selected_counts", {})
+                ),
+                "factorized_group": str(plan_debug_for_replay.get(
+                    "factorized_exploration_group", "none"
+                )),
+                "behavior_log_probability": float(
+                    log_prob.detach().float().mean().cpu()
+                ),
+                "operation": dict(plan_debug_for_replay.get(
+                    "operation_gate_selected_shares", {}
+                )),
+                "amount": float(plan_debug_for_replay.get(
+                    "amount_total_ratio_before_count", 0.0
+                )),
+                "fine": float(plan_debug_for_replay.get(
+                    "amount_fine_log_residual", 0.0
+                )),
+                "no_op": bool(plan_debug_for_replay.get(
+                    "no_op_selected", False
+                )),
+                "actual_rate": float(objective.detach().cpu()),
+                "geometry": float(geometry_objective_for_rd.detach().cpu()),
+                "actual_rd": float(actor_rd_target.detach().cpu()),
+            })
+            replay_capacity = max(int(getattr(
+                self.args,
+                "heuristic_guidance_online_plan_critic_replay_entries",
+                512,
+            )), 1)
+            if len(replay) > replay_capacity:
+                del replay[:-replay_capacity]
         candidate_local_credit = state.get(
             "den6_online_candidate_local_credit_loss", None
         )
@@ -932,7 +1143,9 @@ class Network(nn.Module):
             plan_memory = OrderedDict()
             self._den6_online_actual_plan_memory = plan_memory
         previous_plan = plan_memory.get(cache_key)
-        current_objective_value = float(objective.detach().cpu())
+        current_objective_value = float(
+            (actor_rd_target if actor_critic_selection else objective.detach()).cpu()
+        )
         if (
             mode == "ana_den6_online"
             and isinstance(previous_plan, dict)
@@ -1110,6 +1323,7 @@ class Network(nn.Module):
         action_log_prob = state.get("den6_online_action_log_prob", None)
         if (
             mode == "ana_den6_online"
+            and not actor_critic_selection
             and torch.is_tensor(geometry)
             and torch.is_tensor(amount_log_prob)
         ):
@@ -1258,6 +1472,22 @@ class Network(nn.Module):
             "entropy": float(entropy.detach().float().mean().cpu()) if torch.is_tensor(entropy) else 0.0,
             "policy_core_raw": float(policy_core_raw.detach().cpu()),
             "policy_core_weighted": float(policy_core_weighted.detach().cpu()),
+            "selection_mode": str(selection_mode),
+            "actor_rd_target": float(actor_rd_target.detach().cpu()),
+            "plan_critic_value": float(
+                plan_critic_value.detach().float().mean().cpu()
+            ) if torch.is_tensor(plan_critic_value) else 0.0,
+            "plan_critic_uncertainty": float(
+                torch.exp(0.5 * plan_critic_log_variance.detach().float().mean()).cpu()
+            ) if torch.is_tensor(plan_critic_log_variance) else 0.0,
+            "plan_critic_loss_raw": float(plan_critic_loss_raw.detach().cpu()),
+            "plan_critic_replay_loss": float(plan_critic_replay_loss.detach().cpu()),
+            "plan_critic_loss_weighted": float(
+                plan_critic_loss_weighted.detach().cpu()
+            ),
+            "plan_critic_replay_count": int(replay_count),
+            "plan_critic_replay_pearson": float(plan_critic_replay_pearson),
+            "plan_critic_replay_spearman": float(plan_critic_replay_spearman),
             "candidate_local_credit_raw": float(
                 candidate_local_credit.detach().float().mean().cpu()
             ) if torch.is_tensor(candidate_local_credit) else 0.0,
@@ -4794,6 +5024,10 @@ class Network(nn.Module):
                 "den6_online_operation_local_credit_loss",
                 "den6_online_amount_local_credit_loss",
                 "den6_online_fine_local_credit_loss",
+                "den6_online_actor_critic_plan_feature",
+                "den6_online_actor_critic_plan_value",
+                "den6_online_actor_critic_plan_log_variance",
+                "den6_online_actor_critic_changed_ratio",
                 "network_only_direction_log_prob",
                 "network_only_direction_entropy",
                 "network_only_total_ratio_raw",

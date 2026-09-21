@@ -86,6 +86,11 @@ def build_optimizer_and_scheduler(model, args, writer):
         "actuator.subtree_move_source_head.",
         "actuator.move_voxel_head.",
         "actuator.operation_gate_head.",
+        "actuator.den6_candidate_actor.",
+    )
+    online_critic_tokens = (
+        "actuator.den6_candidate_critic.",
+        "actuator.den6_plan_critic.",
     )
     online_amount_names = {
         name for name in named_trainable
@@ -95,15 +100,24 @@ def build_optimizer_and_scheduler(model, args, writer):
         name for name in named_trainable
         if online_mode and any(token in name for token in online_decision_tokens)
     }
+    online_critic_names = {
+        name for name in named_trainable
+        if online_mode and any(token in name for token in online_critic_tokens)
+    }
     online_amount_params = [
         named_trainable[name] for name in sorted(online_amount_names)
     ]
     online_decision_params = [
         named_trainable[name] for name in sorted(online_decision_names)
     ]
+    online_critic_params = [
+        named_trainable[name] for name in sorted(online_critic_names)
+    ]
     online_param_ids = {
         id(parameter)
-        for parameter in (*online_amount_params, *online_decision_params)
+        for parameter in (
+            *online_amount_params, *online_decision_params, *online_critic_params
+        )
     }
     other_params = [
         parameter for parameter in other_params
@@ -212,6 +226,14 @@ def build_optimizer_and_scheduler(model, args, writer):
                 )),
                 "name": "den6_online_amount",
             })
+        if online_critic_params:
+            groups.append({
+                "params": online_critic_params,
+                "lr": args.lr * float(getattr(
+                    args, "heuristic_guidance_online_critic_lr_scale", 0.10
+                )),
+                "name": "den6_online_critic",
+            })
         optimizer = optim.Adam(groups, lr=args.lr, weight_decay=args.weight_decay)
     else:
         args.lr = args.lr * 100
@@ -258,6 +280,14 @@ def build_optimizer_and_scheduler(model, args, writer):
                     args, "heuristic_guidance_online_amount_lr_scale", 0.01
                 )),
                 "name": "den6_online_amount",
+            })
+        if online_critic_params:
+            groups.append({
+                "params": online_critic_params,
+                "lr": args.lr * float(getattr(
+                    args, "heuristic_guidance_online_critic_lr_scale", 0.10
+                )),
+                "name": "den6_online_critic",
             })
         optimizer = optim.SGD(
             groups,

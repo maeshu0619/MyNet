@@ -183,6 +183,45 @@ class StructureRepairActuator(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv1d(hidden_dim, 1, 1),
         )
+        # Exact-online Actor/Critic.  Heuristicは候補の安全性と入力特徴だけを
+        # 与え、最終順位には直接加えない。candidate featureは
+        # [point-head value, heuristic feature, rate proxy, geometry risk,
+        #  operation one-hot(3)] の7次元である。
+        actor_hidden = max(int(getattr(
+            self.args, "heuristic_guidance_online_actor_hidden_dim", 32
+        )), 8)
+        self.den6_candidate_actor = nn.Sequential(
+            nn.Linear(7, actor_hidden),
+            nn.SiLU(inplace=True),
+            nn.Linear(actor_hidden, 1),
+        )
+        self.den6_candidate_critic = nn.Sequential(
+            nn.Linear(7, actor_hidden),
+            nn.SiLU(inplace=True),
+            nn.Linear(actor_hidden, 2),
+        )
+        # selected candidate集合、operation share、Amount、No-opから
+        # composite Actual RDを予測する。出力は(mean, log-variance)。
+        self.den6_plan_critic = nn.Sequential(
+            nn.Linear(18, actor_hidden),
+            nn.SiLU(inplace=True),
+            nn.Linear(actor_hidden, actor_hidden),
+            nn.SiLU(inplace=True),
+            nn.Linear(actor_hidden, 2),
+        )
+        # Actor is deliberately not bootstrapped with the heuristic/proxy
+        # ordering.  A small ordinary initialization breaks exact ties inside
+        # the already safety-filtered pool; local RD and Actual feedback must
+        # teach the ordering itself.
+        nn.init.normal_(self.den6_candidate_actor[-1].weight, mean=0.0, std=0.01)
+        nn.init.zeros_(self.den6_candidate_actor[-1].bias)
+        nn.init.zeros_(self.den6_candidate_critic[-1].weight)
+        nn.init.zeros_(self.den6_candidate_critic[-1].bias)
+        nn.init.constant_(self.den6_candidate_critic[-1].bias[1], 0.0)
+        nn.init.zeros_(self.den6_plan_critic[-1].weight)
+        nn.init.zeros_(self.den6_plan_critic[-1].bias)
+        self._den6_factorized_group_counts = {}
+        self._den6_factorized_group_uncertainty = {}
         # Per-operation gate for the cache-derived local RD candidate feature.
         # It is a Network parameter (not a fixed heuristic weight): tanh(0)
         # makes the fresh policy exactly unchanged, then local/Actual credit
@@ -245,6 +284,22 @@ class StructureRepairActuator(nn.Module):
         nn.init.constant_(self.algorithmic_amount_selector_head[-1].bias[0], -1.0)
         if 0 <= init_selector_class < int(self.algorithmic_amount_selector_head[-1].bias.numel()):
             nn.init.constant_(self.algorithmic_amount_selector_head[-1].bias[init_selector_class], 1.0)
+        if (
+            str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower()
+            == "ana_den6_online"
+            and str(getattr(
+                self.args, "heuristic_guidance_online_selection_mode", "prior_residual"
+            )).strip().lower() == "actor_critic"
+            and algorithmic_amount_bins
+        ):
+            # Safe initialization only: after construction these are ordinary
+            # Actor parameters.  No Heuristic amount is added during forward.
+            actor_init_class = 1 + len(algorithmic_amount_bins) // 2
+            nn.init.zeros_(self.algorithmic_amount_selector_head[-1].bias)
+            nn.init.constant_(self.algorithmic_amount_selector_head[-1].bias[0], -0.5)
+            nn.init.constant_(
+                self.algorithmic_amount_selector_head[-1].bias[actor_init_class], 0.5
+            )
         nn.init.zeros_(self.algorithmic_amount_residual_head.weight)
         nn.init.zeros_(self.algorithmic_amount_residual_head.bias)
         # onlineのAmountはden6 profileに対するresidualである。初期weightの乱数が
@@ -276,6 +331,22 @@ class StructureRepairActuator(nn.Module):
         nn.init.constant_(self.operation_gate_head[-1].bias[0], init_gate_bias[0])
         nn.init.constant_(self.operation_gate_head[-1].bias[1], init_gate_bias[1])
         nn.init.constant_(self.operation_gate_head[-1].bias[2], init_gate_bias[2])
+        if (
+            str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower()
+            == "ana_den6_online"
+            and str(getattr(
+                self.args, "heuristic_guidance_online_selection_mode", "prior_residual"
+            )).strip().lower() == "actor_critic"
+        ):
+            # head order is Prune/Add/Adjust.  This is a trainable safe
+            # initialization, not a forward-time Heuristic prior.
+            initial_share = self.operation_gate_head[-1].bias.new_tensor((0.4, 0.4, 0.2))
+            gate_scale = max(float(getattr(
+                self.args, "repair_operation_gate_logit_scale", 6.0
+            )), 1e-6)
+            self.operation_gate_head[-1].bias.data.copy_(
+                float(gate_scale) * initial_share.log()
+            )
         init_subtree_move = min(
             max(float(getattr(self.args, "repair_subtree_move_source_init_prob", 0.02)), 1e-4),
             1.0 - 1e-4,
@@ -3872,6 +3943,112 @@ class StructureRepairActuator(nn.Module):
         quality = sum(qualities) / float(len(qualities)) if qualities else 0.0
         return float(floor + (1.0 - floor) * (1.0 - quality))
 
+    @staticmethod
+    def _den6_standardize_candidate_feature(value):
+        value = value.float().reshape(-1)
+        if int(value.numel()) <= 1:
+            return value * 0.0
+        centered = value - value.mean()
+        return centered / centered.square().mean().sqrt().clamp_min(
+            torch.finfo(centered.dtype).eps
+        )
+
+    def _den6_actor_critic_candidate_values(
+        self, mapping, base_network_score, operation_index
+    ):
+        """Evaluate an unordered safe candidate pool without rank fusion.
+
+        ``rank_score`` is an input feature whose coefficient is learned; it is
+        never added to the final policy logit.  Rate/geometry are cheap GT
+        codec-context features, not candidate Actual encode results.
+        """
+        count = int(base_network_score.numel())
+        if count <= 0:
+            empty = base_network_score.reshape(-1)
+            return empty, empty, empty, empty.new_empty((0, 7))
+
+        def _feature(name):
+            value = mapping.get(name)
+            if not torch.is_tensor(value) or int(value.numel()) != count:
+                return base_network_score.new_zeros((count,))
+            return value.to(
+                device=base_network_score.device,
+                dtype=base_network_score.dtype,
+            ).reshape(-1)
+
+        rank_feature = self._den6_standardize_candidate_feature(
+            _feature("rank_score")
+        )
+        rate_feature = self._den6_standardize_candidate_feature(
+            _feature("local_rate_benefit")
+        )
+        geometry_feature = self._den6_standardize_candidate_feature(
+            _feature("local_geometry_risk")
+        )
+        base_feature = self._den6_standardize_candidate_feature(
+            base_network_score
+        )
+        operation_one_hot = base_network_score.new_zeros((count, 3))
+        operation_one_hot[:, int(operation_index)] = 1.0
+        features = torch.cat((
+            base_feature.reshape(-1, 1),
+            rank_feature.reshape(-1, 1),
+            rate_feature.reshape(-1, 1),
+            geometry_feature.reshape(-1, 1),
+            operation_one_hot,
+        ), dim=1)
+        actor_residual = self.den6_candidate_actor(features).reshape(-1)
+        critic_output = self.den6_candidate_critic(features)
+        # Rate/geometry proxy values are observations, not action scores.  In
+        # particular, do not add their hand-written combination to Q here:
+        # doing so made a fresh Critic correlate ~1.0 with the local target and
+        # recreated a fixed ranking under a different name.
+        critic_mean = critic_output[:, 0]
+        critic_uncertainty = torch.nn.functional.softplus(
+            critic_output[:, 1]
+        ).clamp_min(1e-4)
+        # Actor alone owns behavior.  Critic Q trains it through the explicit
+        # distillation/policy losses below, never by being injected into the
+        # forward ranking.
+        actor_logit = actor_residual
+        return actor_logit, critic_mean, critic_uncertainty, features
+
+    def _select_den6_factorized_exploration_group(self, confidence_audit):
+        """Choose one uncertain decision group without an Episode schedule."""
+        groups = ("AddWhere", "PruneWhere", "AdjustWhere", "Amount", "Gate", "Fine")
+        if not bool(getattr(self, "training", False)):
+            return "none"
+        if not bool(getattr(
+            self.args, "heuristic_guidance_online_factorized_exploration", True
+        )):
+            return "all"
+        scale = max(float(getattr(
+            self.args, "heuristic_guidance_online_factorized_ucb_scale", 0.25
+        )), 0.0)
+        counts = self._den6_factorized_group_counts
+        remembered = self._den6_factorized_group_uncertainty
+        total = sum(int(counts.get(name, 0)) for name in groups)
+        scores = {}
+        for name in groups:
+            if name.endswith("Where") and name in remembered:
+                uncertainty = float(remembered[name])
+            elif name.endswith("Where"):
+                operation = name[:-5]
+                row = confidence_audit.get(operation, {}) \
+                    if isinstance(confidence_audit, dict) else {}
+                uncertainty = float(row.get("uncertainty", 1.0))
+            else:
+                uncertainty = float(remembered.get(name, 1.0))
+            coverage = math.sqrt(
+                math.log(float(total) + 2.0) / float(int(counts.get(name, 0)) + 1)
+            )
+            scores[name] = min(max(uncertainty, 0.0), 1.0) + float(scale) * coverage
+        # Stable order is used only to break exact UCB ties; after selection the
+        # count changes, so initially unknown groups are covered in turn.
+        selected = max(groups, key=lambda name: (scores[name], -groups.index(name)))
+        counts[selected] = int(counts.get(selected, 0)) + 1
+        return selected
+
     def _build_exact_den6_residual_plan(
         self,
         guidance,
@@ -4034,6 +4211,22 @@ class StructureRepairActuator(nn.Module):
         network_plan_confidence = torch.stack([
             network_confidence_by_operation[name] for name in operations
         ]).mean().detach()
+        selection_mode = str(getattr(
+            self.args,
+            "heuristic_guidance_online_selection_mode",
+            # Missing on old checkpoints/tests: retain their prior-residual
+            # forward contract.  The current CLI explicitly selects the new
+            # Actor/Critic path.
+            "prior_residual",
+        )).strip().lower()
+        actor_critic_selection = selection_mode == "actor_critic"
+        factorized_exploration_group = (
+            self._select_den6_factorized_exploration_group(
+                network_confidence_audit
+            )
+            if actor_critic_selection and exploration_active
+            else "all" if exploration_active else "none"
+        )
         plan_exploration_factor = self._learning_adaptive_exploration_factor(
             network_confidence_audit
         )
@@ -4114,9 +4307,14 @@ class StructureRepairActuator(nn.Module):
             prior_amount_logits = torch.cat([
                 positive_prior_logits.amin().reshape(1), positive_prior_logits
             ])
-            amount_logits = prior_amount_logits + _confidence_forward_full_backward(
-                network_amount_logits - prior_amount_logits
-            )
+            if actor_critic_selection:
+                # Direct Actor decision.  The safe prior was used only to
+                # initialize the trainable selector bias in __init__.
+                amount_logits = network_amount_logits
+            else:
+                amount_logits = prior_amount_logits + _confidence_forward_full_backward(
+                    network_amount_logits - prior_amount_logits
+                )
             uncalibrated_std = float(
                 amount_logits_centered.detach().std(unbiased=False).cpu()
             ) if int(amount_logits_centered.numel()) > 1 else 0.0
@@ -4152,7 +4350,10 @@ class StructureRepairActuator(nn.Module):
             selected_amount_bin = 1 + torch.argmin(
                 torch.abs(positive_bin_tensor - float(prior_total_ratio))
             )
-        elif amount_exploration_active:
+        elif amount_exploration_active and (
+            not actor_critic_selection
+            or factorized_exploration_group in {"all", "Amount"}
+        ):
             uniform = torch.rand_like(amount_logits).clamp_(1e-8, 1.0 - 1e-8)
             gumbel = -torch.log(-torch.log(uniform))
             # 従来はanchor移行係数residual_alphaをGumbelにも掛けたため、
@@ -4216,7 +4417,14 @@ class StructureRepairActuator(nn.Module):
                 float(fine_sigma_base)
                 * float(operation_exploration_factors[name])
             )
-            if amount_exploration_active and fine_sigma > 0.0:
+            if (
+                amount_exploration_active
+                and fine_sigma > 0.0
+                and (
+                    not actor_critic_selection
+                    or factorized_exploration_group in {"all", "Fine"}
+                )
+            ):
                 fine_noise = torch.randn_like(fine_mean).detach()
                 fine_sample = fine_mean + float(fine_sigma) * fine_noise
                 fine_distribution = torch.distributions.Normal(
@@ -4264,10 +4472,29 @@ class StructureRepairActuator(nn.Module):
             gate_residual_raw = (
                 gate_logits_den6 - gate_logits_den6.mean()
             ) / float(gate_logit_scale)
-            gate_residual = _confidence_forward_full_backward(gate_residual_raw)
-            gate_combined_logits = prior_share_tensor.log() + gate_residual
+            if actor_critic_selection:
+                gate_combined_logits = gate_residual_raw
+            else:
+                gate_residual = _confidence_forward_full_backward(gate_residual_raw)
+                gate_combined_logits = prior_share_tensor.log() + gate_residual
             gate_log_probs = torch.log_softmax(gate_combined_logits, dim=0)
-            gate_probs = gate_log_probs.exp()
+            if (
+                actor_critic_selection
+                and exploration_active
+                and factorized_exploration_group in {"all", "Gate"}
+            ):
+                uniform_gate = torch.rand_like(gate_combined_logits).clamp_(
+                    1e-8, 1.0 - 1e-8
+                )
+                gate_gumbel = -torch.log(-torch.log(uniform_gate))
+                gate_behavior_logits = gate_combined_logits + (
+                    gate_gumbel
+                    * float(exploration_multiplier)
+                    * float(plan_exploration_factor)
+                )
+                gate_probs = torch.softmax(gate_behavior_logits, dim=0)
+            else:
+                gate_probs = gate_log_probs.exp()
         else:
             gate_combined_logits = prior_share_tensor.log()
             gate_log_probs = torch.log_softmax(gate_combined_logits, dim=0)
@@ -4402,6 +4629,12 @@ class StructureRepairActuator(nn.Module):
         candidate_value_scores = {}
         candidate_local_losses = []
         candidate_pairwise_losses = []
+        candidate_critic_losses = []
+        candidate_actor_critic_losses = []
+        candidate_actor_logits = {}
+        candidate_critic_values = {}
+        candidate_critic_uncertainties = {}
+        candidate_actor_features = {}
         candidate_pairwise_weight = max(float(getattr(
             self.args,
             "heuristic_guidance_online_candidate_pairwise_weight",
@@ -4421,28 +4654,56 @@ class StructureRepairActuator(nn.Module):
                 "std": float(finite.std(unbiased=False).cpu()),
             }
 
-        for operation in operations:
+        for operation_index, operation in enumerate(operations):
             mapping = guidance.get("candidate_tensor_map", {}).get(operation, {})
             rank_score = mapping.get("rank_score")
             if not torch.is_tensor(rank_score):
                 return None
             utility_target = mapping.get("local_utility_target")
-            # local utilityは教師であり、最終scoreへ直接加えない。Networkは
-            # この非Heuristic RD順位を学習し、そのbounded residualだけが実行順位へ効く。
+            # local utility is a non-Actual RD teacher.  In actor_critic mode
+            # Heuristic rank is only one input feature and is never added to
+            # the final action logit.
             local_feature_gate = network_confidence_by_operation[operation]
-            candidate_value_score = network_scores[operation]
-            candidate_value_scores[operation] = candidate_value_score
+            base_network_score = network_scores[operation]
             heuristic_term = float(heuristic_prior_weight) * rank_score.float()
-            network_term_uncalibrated = (
-                float(candidate_policy_alpha)
-                * float(residual_weight)
-                * local_feature_gate
-                * candidate_value_score
-            )
             calibration_scale = 1.0
-            network_term = network_term_uncalibrated * float(calibration_scale)
-            network_terms[operation] = network_term
-            logits = heuristic_term + network_term
+            if actor_critic_selection:
+                (
+                    actor_logit,
+                    critic_value,
+                    critic_uncertainty,
+                    actor_features,
+                ) = self._den6_actor_critic_candidate_values(
+                    mapping, base_network_score, operation_index
+                )
+                candidate_actor_logits[operation] = actor_logit
+                candidate_critic_values[operation] = critic_value
+                candidate_critic_uncertainties[operation] = critic_uncertainty
+                candidate_actor_features[operation] = actor_features
+                if self.training:
+                    self._den6_factorized_group_uncertainty[
+                        f"{operation}Where"
+                    ] = min(max(float(
+                        critic_uncertainty.detach().mean().cpu()
+                    ), 0.0), 1.0)
+                candidate_value_score = actor_logit
+                candidate_value_scores[operation] = actor_logit
+                network_term_uncalibrated = actor_logit
+                network_term = actor_logit
+                network_terms[operation] = actor_logit
+                logits = actor_logit
+            else:
+                candidate_value_score = base_network_score
+                candidate_value_scores[operation] = candidate_value_score
+                network_term_uncalibrated = (
+                    float(candidate_policy_alpha)
+                    * float(residual_weight)
+                    * local_feature_gate
+                    * candidate_value_score
+                )
+                network_term = network_term_uncalibrated * float(calibration_scale)
+                network_terms[operation] = network_term
+                logits = heuristic_term + network_term
             static_mask = mapping.get("static_compatible")
             if (
                 torch.is_tensor(static_mask)
@@ -4479,6 +4740,32 @@ class StructureRepairActuator(nn.Module):
                             local_prediction, local_target
                         )
                     )
+                    if actor_critic_selection:
+                        critic_prediction = candidate_critic_values[operation][local_valid]
+                        critic_uncertainty = candidate_critic_uncertainties[operation][local_valid]
+                        critic_error = critic_prediction - local_target
+                        critic_regression = torch.nn.functional.smooth_l1_loss(
+                            critic_prediction,
+                            local_target,
+                            beta=0.25,
+                        )
+                        uncertainty_target = (
+                            critic_error.detach().abs() + 0.05
+                        ).clamp(max=2.0)
+                        critic_calibration = torch.nn.functional.smooth_l1_loss(
+                            critic_uncertainty,
+                            uncertainty_target,
+                            beta=0.25,
+                        )
+                        candidate_critic_losses.append(
+                            critic_regression + 0.1 * critic_calibration
+                        )
+                        candidate_actor_critic_losses.append(
+                            candidate_listwise_local_credit(
+                                local_prediction,
+                                critic_prediction.detach(),
+                            )
+                        )
                     if candidate_pairwise_weight > 0.0:
                         candidate_pairwise_losses.append(
                             candidate_pairwise_local_credit(
@@ -4620,6 +4907,18 @@ class StructureRepairActuator(nn.Module):
                 "combined": _score_stats(policy_logits),
                 "calibration_scale": float(calibration_scale),
                 "local_utility_gate": float(local_feature_gate.detach().cpu()),
+                "selection_mode": str(selection_mode),
+                "actor_logit": _score_stats(
+                    candidate_actor_logits.get(operation, network_term)
+                ),
+                "critic_value": _score_stats(
+                    candidate_critic_values.get(operation, candidate_value_score)
+                ),
+                "critic_uncertainty": _score_stats(
+                    candidate_critic_uncertainties.get(
+                        operation, candidate_value_score.new_zeros(candidate_value_score.shape)
+                    )
+                ),
                 "normalization": dict(
                     network_score_normalization_audit.get(operation, {})
                 ),
@@ -4640,7 +4939,16 @@ class StructureRepairActuator(nn.Module):
             ).sum()
             candidate_entropies.append(candidate_entropy)
             candidate_entropy_by_operation[operation] = candidate_entropy
-            if exploration_active:
+            operation_exploration_active = bool(
+                exploration_active
+                and (
+                    not actor_critic_selection
+                    or factorized_exploration_group in {
+                        "all", f"{operation}Where"
+                    }
+                )
+            )
+            if operation_exploration_active:
                 uniform = torch.rand_like(scaled_logits).clamp_(1e-8, 1.0 - 1e-8)
                 gumbel = -torch.log(-torch.log(uniform))
                 finite_scaled = scaled_logits.detach()[
@@ -4650,12 +4958,25 @@ class StructureRepairActuator(nn.Module):
                     float(finite_scaled.std(unbiased=False).cpu())
                     if int(finite_scaled.numel()) > 1 else 0.0
                 )
-                operation_gumbel_scale = (
-                    score_std
-                    * float(configured_where_gumbel_scale)
-                    * float(exploration_multiplier)
-                    * float(operation_exploration_factors[operation])
-                )
+                if actor_critic_selection:
+                    uncertainty_scale = float(
+                        candidate_critic_uncertainties[operation]
+                        .detach().mean().cpu()
+                    )
+                    operation_gumbel_scale = (
+                        max(score_std, 1e-3)
+                        * max(uncertainty_scale, 1e-3)
+                        * float(configured_where_gumbel_scale)
+                        * float(exploration_multiplier)
+                        * float(operation_exploration_factors[operation])
+                    )
+                else:
+                    operation_gumbel_scale = (
+                        score_std
+                        * float(configured_where_gumbel_scale)
+                        * float(exploration_multiplier)
+                        * float(operation_exploration_factors[operation])
+                    )
                 gumbel_scales.append(operation_gumbel_scale)
                 # Sample only among candidates that the current behavior
                 # score regards as plausible.  The online shortlist reserve
@@ -4791,6 +5112,16 @@ class StructureRepairActuator(nn.Module):
             if candidate_pairwise_losses
             else next(iter(network_scores.values())).new_zeros(())
         )
+        candidate_critic_loss = (
+            torch.stack(candidate_critic_losses).mean()
+            if candidate_critic_losses
+            else next(iter(network_scores.values())).new_zeros(())
+        )
+        candidate_actor_critic_loss = (
+            torch.stack(candidate_actor_critic_losses).mean()
+            if candidate_actor_critic_losses
+            else next(iter(network_scores.values())).new_zeros(())
+        )
         gumbel_scale = (
             sum(gumbel_scales) / float(len(gumbel_scales))
             if gumbel_scales else 0.0
@@ -4914,13 +5245,24 @@ class StructureRepairActuator(nn.Module):
         final_coords = final_rows.transpose(0, 1).contiguous().unsqueeze(0)
 
         selected_where_log_probs = []
+        selected_where_log_probs_by_operation = {name: [] for name in operations}
         for operation, candidate_index, _ in selected:
-            selected_where_log_probs.append(candidate_log_probs[operation][candidate_index])
+            selected_log_prob = candidate_log_probs[operation][candidate_index]
+            selected_where_log_probs.append(selected_log_prob)
+            selected_where_log_probs_by_operation[operation].append(selected_log_prob)
         where_log_prob = (
             torch.stack(selected_where_log_probs).mean()
             if selected_where_log_probs
             else action_ratio_stack.new_zeros(())
         )
+        where_log_prob_by_operation = {
+            name: (
+                torch.stack(selected_where_log_probs_by_operation[name]).mean()
+                if selected_where_log_probs_by_operation[name]
+                else action_ratio_stack.new_zeros(())
+            )
+            for name in operations
+        }
         # coarse selectorをoperation数+1で希釈しない。旧meanでは後半の
         # fine exploration=0時に実質1/4となり、Geometry creditが消えていた。
         amount_log_prob = amount_bin_log_prob + amount_fine_log_prob
@@ -5151,15 +5493,38 @@ class StructureRepairActuator(nn.Module):
         candidate_local_credit_loss = (
             candidate_local_loss
             + float(candidate_pairwise_weight) * candidate_pairwise_loss
+            + candidate_critic_loss
+            + max(float(getattr(
+                self.args,
+                "heuristic_guidance_online_actor_critic_distill_weight",
+                0.10,
+            )), 0.0) * candidate_actor_critic_loss
         )
-        policy_log_prob = where_log_prob + amount_log_prob + action_log_prob
+        if actor_critic_selection and factorized_exploration_group != "all":
+            if factorized_exploration_group.endswith("Where"):
+                explored_operation = factorized_exploration_group[:-5]
+                policy_log_prob = where_log_prob_by_operation[explored_operation]
+            elif factorized_exploration_group == "Amount":
+                policy_log_prob = amount_bin_log_prob
+            elif factorized_exploration_group == "Gate":
+                policy_log_prob = action_log_prob
+            elif factorized_exploration_group == "Fine":
+                policy_log_prob = amount_fine_log_prob
+            else:
+                policy_log_prob = where_log_prob + amount_log_prob + action_log_prob
+        else:
+            policy_log_prob = where_log_prob + amount_log_prob + action_log_prob
         # Exploration entropy belongs to candidate selection.  Including Gate
         # and Amount here changed an unseen frame's deterministic operation
         # share from 0.4/0.4/0.2 toward uniform before any comparable Actual
         # outcome existed.  Amount already has Gumbel sampling and Gate is
         # trained from repeated-frame Actual credit, so neither needs an
         # artificial uniform target.
-        policy_entropy = torch.stack(candidate_entropies).mean()
+        if actor_critic_selection and factorized_exploration_group.endswith("Where"):
+            entropy_operation = factorized_exploration_group[:-5]
+            policy_entropy = candidate_entropy_by_operation[entropy_operation]
+        else:
+            policy_entropy = torch.stack(candidate_entropies).mean()
         if exact_anchor_active:
             # hard anchorの実行planはHeuristicが強制したものであり、Networkの
             # sampleではない。Actual値はframe baseline初期化に使うが、その
@@ -5296,6 +5661,66 @@ class StructureRepairActuator(nn.Module):
         selected_changed_ratio = (
             selected_counts["Add"] + selected_counts["Prune"] + 2 * selected_counts["Adjust"]
         ) / max(float(point_count), 1.0)
+        plan_feature_parts = []
+        if actor_critic_selection:
+            for name in operations:
+                indices = selected_indices_by_operation[name]
+                if indices:
+                    index_tensor = torch.as_tensor(
+                        indices,
+                        device=candidate_critic_values[name].device,
+                        dtype=torch.long,
+                    )
+                    selected_q = candidate_critic_values[name].index_select(
+                        0, index_tensor
+                    )
+                    selected_features = candidate_actor_features[name].index_select(
+                        0, index_tensor
+                    )
+                    plan_feature_parts.extend((
+                        selected_q.mean(),
+                        selected_q.std(unbiased=False),
+                        selected_features[:, 2].mean(),
+                        selected_features[:, 3].mean(),
+                    ))
+                else:
+                    plan_feature_parts.extend(
+                        action_ratio_stack.new_zeros(()) for _ in range(4)
+                    )
+            plan_feature_parts.extend(gate_probs.reshape(-1).unbind())
+            plan_feature_parts.extend((
+                action_ratio_stack.new_tensor(float(selected_total_ratio)),
+                hard_total.reshape(()),
+                action_ratio_stack.new_tensor(float(no_op_selected)),
+            ))
+            plan_feature = torch.stack(tuple(plan_feature_parts)).float()
+            if int(plan_feature.numel()) != 18:
+                raise RuntimeError(
+                    f"den6 Actor/Critic plan feature size mismatch: {int(plan_feature.numel())}"
+                )
+            plan_critic_output = self.den6_plan_critic(
+                plan_feature.reshape(1, -1)
+            ).reshape(-1)
+            plan_critic_mean = plan_critic_output[0]
+            plan_critic_log_variance = plan_critic_output[1].clamp(-8.0, 8.0)
+            if self.training:
+                amount_entropy_value = float((
+                    -(amount_prob.detach() * amount_log_probs.detach()).sum()
+                    / max(math.log(max(int(amount_prob.numel()), 2)), 1e-12)
+                ).cpu())
+                gate_entropy_value = float((
+                    -(gate_probs.detach() * gate_probs.detach().clamp_min(1e-12).log()).sum()
+                    / max(math.log(len(operations)), 1e-12)
+                ).cpu())
+                self._den6_factorized_group_uncertainty.update({
+                    "Amount": min(max(amount_entropy_value, 0.0), 1.0),
+                    "Gate": min(max(gate_entropy_value, 0.0), 1.0),
+                    "Fine": min(max(float(plan_exploration_factor), 0.0), 1.0),
+                })
+        else:
+            plan_feature = action_ratio_stack.new_zeros((18,))
+            plan_critic_mean = action_ratio_stack.new_zeros(())
+            plan_critic_log_variance = action_ratio_stack.new_zeros(())
         debug = {
             "plan_count": 1,
             "pool_reference_count": 1,
@@ -5309,10 +5734,16 @@ class StructureRepairActuator(nn.Module):
                 static_compatibility_available
             ),
             "candidate_actual_encode_count": 0,
-            "proposal_source": "den6_pool_confidence_bounded_network_residual",
+            "proposal_source": (
+                "den6_unordered_safe_pool_actor_critic"
+                if actor_critic_selection
+                else "den6_pool_confidence_bounded_network_residual"
+            ),
             "performance_source": (
                 "exact_teacher_anchor"
                 if exact_anchor_active
+                else "network_actor_critic_no_rank_fusion"
+                if actor_critic_selection
                 else "heuristic_prior_plus_rd_aligned_network_residual"
             ),
             "network_only_performance": False,
@@ -5336,6 +5767,11 @@ class StructureRepairActuator(nn.Module):
             "selected_candidate_ids": selected_ids,
             "residual_alpha": float(residual_alpha),
             "candidate_policy_alpha": float(candidate_policy_alpha),
+            "selection_mode": str(selection_mode),
+            "factorized_exploration_group": str(factorized_exploration_group),
+            "factorized_exploration_counts": dict(
+                getattr(self, "_den6_factorized_group_counts", {})
+            ),
             "heuristic_candidate_prior_weight": float(heuristic_prior_weight),
             "where_residual_weight": float(residual_weight),
             "where_residual_weight_start": float(residual_weight_start),
@@ -5378,6 +5814,8 @@ class StructureRepairActuator(nn.Module):
             "candidate_local_credit_loss": candidate_local_credit_loss,
             "candidate_ranking_local_loss": candidate_local_loss,
             "candidate_pairwise_local_loss": candidate_pairwise_loss,
+            "candidate_critic_local_loss": candidate_critic_loss,
+            "candidate_actor_critic_distill_loss": candidate_actor_critic_loss,
             "candidate_pairwise_local_weight": float(candidate_pairwise_weight),
             "operation_local_loss": operation_local_loss,
             "amount_local_loss": amount_local_loss,
@@ -5562,6 +6000,12 @@ class StructureRepairActuator(nn.Module):
                 ]
                 for name in operations
             },
+            "_actor_critic_plan_feature": plan_feature,
+            "_actor_critic_plan_value": plan_critic_mean,
+            "_actor_critic_plan_log_variance": plan_critic_log_variance,
+            "_actor_critic_selected_changed_ratio": action_ratio_stack.new_tensor(
+                float(selected_changed_ratio)
+            ),
         }
         plan_hash_payload = {
             "candidate_ids": selected_ids,
@@ -13451,6 +13895,18 @@ class StructureRepairActuator(nn.Module):
             ),
             "den6_online_fine_local_credit_loss": exact_residual_plan_debug.get(
                 "fine_local_loss", pts_xyz.new_zeros(())
+            ),
+            "den6_online_actor_critic_plan_feature": exact_residual_plan_debug.get(
+                "_actor_critic_plan_feature", pts_xyz.new_zeros((18,))
+            ),
+            "den6_online_actor_critic_plan_value": exact_residual_plan_debug.get(
+                "_actor_critic_plan_value", pts_xyz.new_zeros(())
+            ),
+            "den6_online_actor_critic_plan_log_variance": exact_residual_plan_debug.get(
+                "_actor_critic_plan_log_variance", pts_xyz.new_zeros(())
+            ),
+            "den6_online_actor_critic_changed_ratio": exact_residual_plan_debug.get(
+                "_actor_critic_selected_changed_ratio", pts_xyz.new_zeros(())
             ),
             "network_only_direction_log_prob": exact_residual_plan_debug.get(
                 "direction_log_prob", single_direction_log_prob
