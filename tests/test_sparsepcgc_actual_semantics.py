@@ -973,12 +973,13 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         self.assertIsNone(rejected_grad)
         self.assertFalse(network.last_discrete_policy_debug["geometry_policy_guard_passed"])
 
-    def test_den6_sequence_baseline_credits_new_frames_immediately(self):
-        """未知frameが続いてもsequence EMAでActualとGeometryを比較する。"""
+    def test_den6_new_frame_does_not_receive_cross_frame_policy_credit(self):
+        """未知frameの難易度差をActorの行動creditとして扱わない。"""
         network = Network.__new__(Network)
         torch.nn.Module.__init__(network)
         network.args = SimpleNamespace(
             heuristic_guidance_mode="ana_den6_online",
+            heuristic_guidance_online_selection_mode="actor_critic",
             _current_input_file="/dataset/longdress/frame_0001.ply",
             sparsepcgc_scale_ae=0,
             sparsepcgc_scale_sr=2,
@@ -1001,6 +1002,10 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
             "den6_online_policy_log_prob": first_policy,
             "den6_online_policy_entropy": first_policy.new_zeros(()),
             "den6_online_amount_log_prob": first_amount,
+            "ana_den6_exact_residual_plan_debug": {
+                "factorized_exploration_group": "Gate",
+                "network_plan_confidence": 0.5,
+            },
         }
         network.discrete_policy_loss(
             torch.tensor(-4.0), geometry=torch.tensor(0.010)
@@ -1013,27 +1018,35 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
             "den6_online_policy_log_prob": second_policy,
             "den6_online_policy_entropy": second_policy.new_zeros(()),
             "den6_online_amount_log_prob": second_amount,
+            "ana_den6_exact_residual_plan_debug": {
+                "factorized_exploration_group": "Amount",
+                "network_plan_confidence": 0.5,
+            },
         }
         second = network.discrete_policy_loss(
             torch.tensor(-4.0), geometry=torch.tensor(0.009)
         )
-        amount_grad = torch.autograd.grad(second, second_amount)[0]
-        self.assertLess(float(amount_grad), 0.0)
+        policy_grad = torch.autograd.grad(second, second_policy)[0]
+        self.assertEqual(float(policy_grad), 0.0)
         self.assertEqual(
             network.last_discrete_policy_debug["objective_baseline_source"],
-            "sequence",
+            "frame_factor_unseen",
+        )
+        self.assertFalse(
+            network.last_discrete_policy_debug["global_actual_credit_available"]
         )
         self.assertEqual(
             network.last_discrete_policy_debug["geometry_policy_baseline_source"],
-            "sequence",
+            "unavailable",
         )
 
-    def test_den6_sequence_baseline_reverses_gradient_for_worse_new_frame(self):
-        """同一sequenceの未出frameでもActualの良化・悪化を同じ正例にしない。"""
+    def test_den6_exact_frame_baseline_reverses_gradient_on_revisit(self):
+        """Actual RD creditは同一frame再訪時の良化・悪化だけを識別する。"""
         network = Network.__new__(Network)
         torch.nn.Module.__init__(network)
         network.args = SimpleNamespace(
             heuristic_guidance_mode="ana_den6_online",
+            heuristic_guidance_online_selection_mode="actor_critic",
             _current_input_file="/dataset/loot/frame_0001.ply",
             sparsepcgc_scale_ae=0,
             sparsepcgc_scale_sr=2,
@@ -1049,28 +1062,160 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         network.last_actuator_voxel_state = {
             "den6_online_policy_log_prob": torch.tensor(0.0, requires_grad=True),
             "den6_online_policy_entropy": torch.tensor(0.0),
+            "ana_den6_exact_residual_plan_debug": {
+                "factorized_exploration_group": "Gate",
+                "network_plan_confidence": 1.0,
+            },
         }
         network.discrete_policy_loss(torch.tensor(-4.0))
 
+        # First visit to another frame only initializes its RD baseline.
         network.args._current_input_file = "/dataset/loot/frame_0002.ply"
+        unseen_log_prob = torch.tensor(0.0, requires_grad=True)
+        network.last_actuator_voxel_state = {
+            "den6_online_policy_log_prob": unseen_log_prob,
+            "den6_online_policy_entropy": unseen_log_prob.new_zeros(()),
+            "ana_den6_exact_residual_plan_debug": {
+                "factorized_exploration_group": "Amount",
+                "network_plan_confidence": 1.0,
+            },
+        }
+        unseen_loss = network.discrete_policy_loss(torch.tensor(-3.0))
+        unseen_grad = torch.autograd.grad(unseen_loss, unseen_log_prob)[0]
+        self.assertEqual(float(unseen_grad), 0.0)
+
+        # A worse plan on the exact same frame must reduce its probability.
         worse_log_prob = torch.tensor(0.0, requires_grad=True)
         network.last_actuator_voxel_state = {
             "den6_online_policy_log_prob": worse_log_prob,
             "den6_online_policy_entropy": worse_log_prob.new_zeros(()),
+            "ana_den6_exact_residual_plan_debug": {
+                "factorized_exploration_group": "Amount",
+                "network_plan_confidence": 1.0,
+            },
         }
-        worse_loss = network.discrete_policy_loss(torch.tensor(-3.0))
+        worse_loss = network.discrete_policy_loss(torch.tensor(-2.0))
         worse_grad = torch.autograd.grad(worse_loss, worse_log_prob)[0]
 
-        network.args._current_input_file = "/dataset/loot/frame_0003.ply"
+        # Likewise, improving the first frame must increase its probability.
+        network.args._current_input_file = "/dataset/loot/frame_0001.ply"
         better_log_prob = torch.tensor(0.0, requires_grad=True)
         network.last_actuator_voxel_state = {
             "den6_online_policy_log_prob": better_log_prob,
             "den6_online_policy_entropy": better_log_prob.new_zeros(()),
+            "ana_den6_exact_residual_plan_debug": {
+                "factorized_exploration_group": "Gate",
+                "network_plan_confidence": 1.0,
+            },
         }
         better_loss = network.discrete_policy_loss(torch.tensor(-5.0))
         better_grad = torch.autograd.grad(better_loss, better_log_prob)[0]
         self.assertGreater(float(worse_grad), 0.0)
         self.assertLess(float(better_grad), 0.0)
+
+    def test_den6_actual_baseline_isolated_by_factorized_group(self):
+        """同一frameでも別decision groupの変化をGate等へ誤帰属しない。"""
+        network = Network.__new__(Network)
+        torch.nn.Module.__init__(network)
+        network.args = SimpleNamespace(
+            heuristic_guidance_mode="ana_den6_online",
+            heuristic_guidance_online_selection_mode="actor_critic",
+            _current_input_file="/dataset/longdress/frame_0001.ply",
+            sparsepcgc_scale_ae=0,
+            sparsepcgc_scale_sr=2,
+            sparsepcgc_scale_m=8,
+            heuristic_guidance_online_policy_weight=1.0,
+            heuristic_guidance_online_entropy_weight=0.0,
+            heuristic_guidance_online_reward_scale=1.0,
+            heuristic_guidance_online_advantage_clip=10.0,
+            heuristic_guidance_online_reward_ema=0.1,
+        )
+        network._den6_online_objective_baseline = __import__(
+            "collections"
+        ).OrderedDict()
+
+        def policy_loss(value, group):
+            log_prob = torch.tensor(0.0, requires_grad=True)
+            network.last_actuator_voxel_state = {
+                "den6_online_policy_log_prob": log_prob,
+                "den6_online_policy_entropy": log_prob.new_zeros(()),
+                "ana_den6_exact_residual_plan_debug": {
+                    "factorized_exploration_group": group,
+                },
+            }
+            loss = network.discrete_policy_loss(torch.tensor(float(value)))
+            return torch.autograd.grad(loss, log_prob)[0]
+
+        self.assertEqual(float(policy_loss(-3.0, "Gate")), 0.0)
+        # Amount must not compare itself with the previous Gate sample.
+        self.assertEqual(float(policy_loss(-2.0, "Amount")), 0.0)
+        # The next Gate sample has a causal, same-group baseline.
+        self.assertGreater(float(policy_loss(-2.0, "Gate")), 0.0)
+        self.assertEqual(
+            network.last_discrete_policy_debug["objective_baseline_source"],
+            "frame_factor",
+        )
+
+    def test_den6_same_sequence_factor_receives_confidence_scaled_actual_credit(self):
+        """別frameでも同一系列・同一decisionだけを弱いActual補正に使う。"""
+        network = Network.__new__(Network)
+        torch.nn.Module.__init__(network)
+        network.args = SimpleNamespace(
+            heuristic_guidance_mode="ana_den6_online",
+            heuristic_guidance_online_selection_mode="actor_critic",
+            _current_input_file="/dataset/longdress/frame_0001.ply",
+            sparsepcgc_scale_ae=0,
+            sparsepcgc_scale_sr=2,
+            sparsepcgc_scale_m=8,
+            heuristic_guidance_online_policy_weight=1.0,
+            heuristic_guidance_online_entropy_weight=0.0,
+            heuristic_guidance_online_reward_scale=1.0,
+            heuristic_guidance_online_advantage_clip=10.0,
+            heuristic_guidance_online_reward_ema=0.1,
+            heuristic_guidance_online_geometry_policy_weight=0.0,
+        )
+        network._den6_online_objective_baseline = __import__(
+            "collections"
+        ).OrderedDict()
+
+        def policy_grad(value, frame, confidence):
+            network.args._current_input_file = (
+                f"/dataset/longdress/frame_{frame:04d}.ply"
+            )
+            log_prob = torch.tensor(0.0, requires_grad=True)
+            network.last_actuator_voxel_state = {
+                "den6_online_policy_log_prob": log_prob,
+                "den6_online_policy_entropy": log_prob.new_zeros(()),
+                "ana_den6_exact_residual_plan_debug": {
+                    "factorized_exploration_group": "Gate",
+                    "network_plan_confidence": confidence,
+                },
+            }
+            loss = network.discrete_policy_loss(torch.tensor(float(value)))
+            return torch.autograd.grad(loss, log_prob)[0]
+
+        self.assertEqual(float(policy_grad(-3.0, 1, 0.25)), 0.0)
+        low_confidence = policy_grad(-2.0, 2, 0.25)
+        self.assertGreater(float(low_confidence), 0.0)
+        self.assertEqual(
+            network.last_discrete_policy_debug["objective_baseline_source"],
+            "sequence_factor",
+        )
+
+        # A fresh network with the same observations but twice the confidence
+        # must receive twice the Actor correction, without changing Actual RD.
+        other = Network.__new__(Network)
+        torch.nn.Module.__init__(other)
+        other.args = SimpleNamespace(**vars(network.args))
+        other._den6_online_objective_baseline = __import__(
+            "collections"
+        ).OrderedDict()
+        network = other
+        self.assertEqual(float(policy_grad(-3.0, 1, 0.50)), 0.0)
+        high_confidence = policy_grad(-2.0, 2, 0.50)
+        self.assertAlmostEqual(
+            float(high_confidence), 2.0 * float(low_confidence), places=6
+        )
 
     def test_reproduction_reference_matches_saved_mvub_plan(self):
         path = Path(__file__).resolve().parents[1] / "tools" / "ana_den6_reproduce.py"
@@ -1409,7 +1554,13 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         )[0]
         self.assertTrue(torch.isfinite(local_credit_gradient).all())
         self.assertGreater(float(local_credit_gradient.abs().sum()), 0.0)
-        amount_selector_logits = torch.zeros((1, 6), requires_grad=True)
+        # Zero-vs-edit is supervised by Actual RD, not by the local proxy.
+        # This tiny fixture maps every positive ratio to the same one-candidate
+        # plan, so the proxy correctly has no Amount information and must not
+        # manufacture a gradient from the zero class.
+        amount_selector_logits = torch.tensor(
+            [[0.0, -0.4, -0.2, 0.0, 0.2, 0.4]], requires_grad=True
+        )
         local_result = actuator._build_exact_den6_residual_plan(
             guidance,
             coords,
@@ -1441,9 +1592,14 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(gate_local_gradient).all())
         self.assertGreater(float(gate_local_gradient.abs().sum()), 0.0)
         self.assertTrue(torch.isfinite(amount_local_gradient).all())
-        self.assertGreater(float(amount_local_gradient.abs().sum()), 0.0)
+        self.assertAlmostEqual(float(amount_local_gradient[0, 0]), 0.0, places=7)
+        self.assertAlmostEqual(
+            float(amount_local_gradient[0, 1:].abs().sum()), 0.0, places=7
+        )
         self.assertTrue(all(torch.isfinite(value).all() for value in fine_local_gradients))
-        self.assertTrue(all(float(value.abs().sum()) > 0.0 for value in fine_local_gradients))
+        self.assertTrue(all(
+            float(value.abs().sum()) == 0.0 for value in fine_local_gradients
+        ))
 
         # bounded residual rankingは小さい補正ではden6順位を保ち、十分な
         # Network差が学習されたときには同じPool内で順位を逆転できる。

@@ -788,6 +788,24 @@ class Network(nn.Module):
             str(getattr(self.args, "sparsepcgc_scale_sr", 0)),
             str(getattr(self.args, "sparsepcgc_scale_m", 8)),
         ))
+        plan_debug_state = state.get("ana_den6_exact_residual_plan_debug", {})
+        if not isinstance(plan_debug_state, dict):
+            plan_debug_state = {}
+        factorized_group = str(
+            plan_debug_state.get("factorized_exploration_group", "none")
+        )
+        # A comparison across different factorized decision groups cannot
+        # identify which decision caused the Actual RD change.  The 081832
+        # replay proved that a generic frame EMA still credited Gate for
+        # changes made by Where/Amount and drove Adjust to 75%.  Keep one EMA
+        # per exact frame *and* explored group.  A weaker sequence-level EMA
+        # is also separated by group below so previously unseen frames still
+        # obtain normalized Actual feedback without cross-head attribution.
+        # This uses no extra codec encode and is independent of Episode number.
+        policy_baseline_key = (
+            f"{cache_key}|factor={factorized_group}"
+            if actor_critic_selection else cache_key
+        )
         normalized_input_file = input_file.replace("\\", "/")
         sequence_name = (
             normalized_input_file.rsplit("/", 1)[0]
@@ -800,25 +818,37 @@ class Network(nn.Module):
             str(getattr(self.args, "sparsepcgc_scale_sr", 0)),
             str(getattr(self.args, "sparsepcgc_scale_m", 8)),
         ))
+        policy_sequence_key = (
+            f"{sequence_key}|factor={factorized_group}"
+            if actor_critic_selection else sequence_key
+        )
         sequence_objective_baseline = getattr(
             self, "_den6_online_sequence_objective_baseline", None
         )
         if sequence_objective_baseline is None:
             sequence_objective_baseline = OrderedDict()
             self._den6_online_sequence_objective_baseline = sequence_objective_baseline
-        baseline_seen = cache_key in self._den6_online_objective_baseline
-        sequence_baseline_seen = sequence_key in sequence_objective_baseline
+        baseline_seen = policy_baseline_key in self._den6_online_objective_baseline
+        sequence_baseline_seen = policy_sequence_key in sequence_objective_baseline
         if baseline_seen:
-            previous = self._den6_online_objective_baseline[cache_key]
-            baseline_source = "frame"
+            previous = self._den6_online_objective_baseline[policy_baseline_key]
+            baseline_source = (
+                "frame_factor" if actor_critic_selection else "frame"
+            )
         elif sequence_baseline_seen:
-            # 最初の数百Stepは未知frameが続くため、frame EMAだけでは毎回
-            # no-op 0%基準になりActualの良し悪しを区別できない。
-            previous = sequence_objective_baseline[sequence_key]
-            baseline_source = "sequence"
+            previous = sequence_objective_baseline[policy_sequence_key]
+            baseline_source = (
+                "sequence_factor" if actor_critic_selection else "sequence"
+            )
         else:
             previous = 0.0
-            baseline_source = "noop"
+            # Different frames have different intrinsic codec difficulty.
+            # The first observation for each sequence/group initializes its
+            # baseline; later unseen frames compare only against that same
+            # sequence and same explored decision group.
+            baseline_source = (
+                "frame_factor_unseen" if actor_critic_selection else "frame_unseen"
+            )
         previous_t = objective.new_tensor(float(previous))
         # objectiveはActual圧縮率[%]で、小さいほど良い。baselineより小さい時に
         # 今回の唯一のplanの選択確率を増やす。±1%未満の信号が他損失に埋もれない
@@ -829,13 +859,15 @@ class Network(nn.Module):
         advantage_clip = max(
             float(getattr(self.args, "heuristic_guidance_online_advantage_clip", 2.0)), 0.0
         )
-        # Compression objective convention: negative is improvement.  A
-        # positive (worsening) EMA must never make a zero-bit-change plan look
-        # successful, otherwise the Actor is explicitly trained toward the
-        # observed 0% collapse.  Use the EMA only after it is on the improving
-        # side; zero remains neutral while any worsening plan is penalized.
+        # RD objective convention: smaller is better.  The EMA compares the
+        # same rate+geometry quantity as the Actor target; comparing Critic RD
+        # against a rate-only EMA gave Gate/Amount contradictory credit.
         effective_baseline_t = torch.minimum(previous_t, previous_t.new_zeros(()))
-        advantage = (effective_baseline_t - objective.detach()) * float(reward_scale)
+        ema_advantage = (
+            effective_baseline_t
+            - (actor_rd_target.detach() if actor_critic_selection else objective.detach())
+        ) * float(reward_scale)
+        advantage = ema_advantage
         plan_critic_value = state.get(
             "den6_online_actor_critic_plan_value", objective.new_zeros(())
         )
@@ -845,21 +877,22 @@ class Network(nn.Module):
         plan_feature = state.get(
             "den6_online_actor_critic_plan_feature", None
         )
-        if actor_critic_selection and torch.is_tensor(plan_critic_value):
-            # J is minimized.  A positive advantage means the executed plan is
-            # better than the Critic expectation and its Actor probability
-            # should increase.
-            advantage = (
-                plan_critic_value.detach().float().mean()
-                - actor_rd_target.detach()
-            ) * float(reward_scale)
+        # The Plan Critic is trained and audited, but is not an Actor baseline.
+        # Its replay correlation is dominated by frame difficulty and does not
+        # prove action-conditional calibration.  Run 074549 showed positive
+        # Critic advantage while Adjust rose 0.29 -> 0.74 and Actual worsened.
+        # Actual EMA, isolated by factorized group, is the global Actor
+        # comparison; the Critic remains an audit/training target only.
+        plan_critic_policy_confidence = 0.0
         if advantage_clip > 0.0:
             advantage = advantage.clamp(-advantage_clip, advantage_clip)
         # Use an EMA state baseline, not best-so-far.  A single lucky codec
         # quantisation event must not make every subsequent exploratory plan
         # negative-advantage forever; that failure mode collapsed Amount to
         # zero after the first -1 byte event.
-        objective_value = float(objective.detach().cpu())
+        objective_value = float(
+            (actor_rd_target.detach() if actor_critic_selection else objective.detach()).cpu()
+        )
         baseline_alpha = min(max(
             float(getattr(self.args, "heuristic_guidance_online_reward_ema", 0.10)),
             1e-4,
@@ -868,20 +901,20 @@ class Network(nn.Module):
             (1.0 - baseline_alpha) * float(previous) + baseline_alpha * objective_value
             if baseline_seen else objective_value
         )
-        self._den6_online_objective_baseline[cache_key] = float(updated)
-        self._den6_online_objective_baseline.move_to_end(cache_key)
+        self._den6_online_objective_baseline[policy_baseline_key] = float(updated)
+        self._den6_online_objective_baseline.move_to_end(policy_baseline_key)
         while len(self._den6_online_objective_baseline) > 4096:
             self._den6_online_objective_baseline.popitem(last=False)
         previous_sequence = float(sequence_objective_baseline.get(
-            sequence_key, objective_value
+            policy_sequence_key, objective_value
         ))
         updated_sequence = (
             (1.0 - baseline_alpha) * previous_sequence
             + baseline_alpha * objective_value
             if sequence_baseline_seen else objective_value
         )
-        sequence_objective_baseline[sequence_key] = float(updated_sequence)
-        sequence_objective_baseline.move_to_end(sequence_key)
+        sequence_objective_baseline[policy_sequence_key] = float(updated_sequence)
+        sequence_objective_baseline.move_to_end(policy_sequence_key)
         while len(sequence_objective_baseline) > 128:
             sequence_objective_baseline.popitem(last=False)
 
@@ -917,13 +950,26 @@ class Network(nn.Module):
         # the global policy correction only once a comparative frame/sequence
         # baseline exists.  Candidate-local RD credit remains active from the
         # first step, and Actual correction remains active on revisits.
-        global_credit_available = bool(
-            actor_critic_selection
-            or baseline_seen
-            or sequence_baseline_seen
+        global_credit_available = bool(baseline_seen or sequence_baseline_seen)
+        # Cross-frame deltas remain noisier than exact-frame comparisons even
+        # after percent/RD normalization.  In Actor/Critic mode grant Actual
+        # score-function authority only in proportion to the independently
+        # measured candidate-RD alignment.  This is learning-state dependent,
+        # not Episode dependent, and the confidence floor in the actuator
+        # keeps a non-zero learning path.
+        global_credit_confidence = (
+            min(max(float(plan_debug_state.get(
+                "network_plan_confidence",
+                getattr(
+                    self.args,
+                    "heuristic_guidance_network_confidence_floor",
+                    0.05,
+                ),
+            )), 0.0), 1.0)
+            if actor_critic_selection else 1.0
         )
         policy_core_raw = (
-            -advantage * log_prob.float().mean()
+            -float(global_credit_confidence) * advantage * log_prob.float().mean()
             if global_credit_available
             else 0.0 * log_prob.float().mean()
         )
@@ -1033,6 +1079,26 @@ class Network(nn.Module):
                     plan_critic_replay_spearman = float((
                         (pred_rank * target_rank).sum() / rank_denominator
                     ).cpu())
+            # Critic authority is based on measured replay ordering, not an
+            # Episode schedule.  Both linear and rank correlation must be
+            # positive; a short replay receives proportionally less trust.
+            replay_coverage = min(
+                float(replay_count) / float(max(replay_batch, 1)), 1.0
+            )
+            instant_critic_quality = (
+                replay_coverage
+                * min(
+                    max(float(plan_critic_replay_pearson), 0.0),
+                    max(float(plan_critic_replay_spearman), 0.0),
+                )
+            )
+            previous_critic_quality = min(max(float(getattr(
+                self, "_den6_plan_critic_policy_confidence", 0.0
+            )), 0.0), 1.0)
+            self._den6_plan_critic_policy_confidence = (
+                0.9 * previous_critic_quality
+                + 0.1 * min(max(instant_critic_quality, 0.0), 1.0)
+            )
             critic_weight = max(float(getattr(
                 self.args,
                 "heuristic_guidance_online_plan_critic_weight",
@@ -1455,9 +1521,11 @@ class Network(nn.Module):
             "objective": float(objective.detach().cpu()),
             "objective_baseline": float(previous),
             "objective_baseline_source": str(baseline_source),
+            "objective_baseline_factorized_group": str(factorized_group),
             "objective_sequence_baseline": float(updated_sequence),
             "objective_effective_baseline": float(effective_baseline_t.detach().cpu()),
             "global_actual_credit_available": bool(global_credit_available),
+            "global_actual_credit_confidence": float(global_credit_confidence),
             "global_actual_credit_weight": float(global_actual_credit_weight),
             "advantage": float(advantage.detach().cpu()),
             "actual_set_contrast_raw": float(actual_set_contrast_raw.detach().cpu()),
@@ -1488,6 +1556,9 @@ class Network(nn.Module):
             "plan_critic_replay_count": int(replay_count),
             "plan_critic_replay_pearson": float(plan_critic_replay_pearson),
             "plan_critic_replay_spearman": float(plan_critic_replay_spearman),
+            "plan_critic_policy_confidence": float(
+                plan_critic_policy_confidence
+            ),
             "candidate_local_credit_raw": float(
                 candidate_local_credit.detach().float().mean().cpu()
             ) if torch.is_tensor(candidate_local_credit) else 0.0,

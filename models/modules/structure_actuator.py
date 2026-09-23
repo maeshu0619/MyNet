@@ -4042,7 +4042,17 @@ class StructureRepairActuator(nn.Module):
             coverage = math.sqrt(
                 math.log(float(total) + 2.0) / float(int(counts.get(name, 0)) + 1)
             )
-            scores[name] = min(max(uncertainty, 0.0), 1.0) + float(scale) * coverage
+            # The old order ``uncertainty + scale * coverage`` let a
+            # high-entropy Amount head monopolise the group indefinitely:
+            # in the 220604 run no Where group was sampled after E5.  Coverage
+            # is the UCB exploration guarantee, whereas uncertainty is only a
+            # learned preference between similarly covered groups.  Keeping
+            # coverage unscaled makes every non-zero decision group revisit
+            # possible without an Episode schedule; ``scale`` now controls
+            # how strongly measured uncertainty biases that fair coverage.
+            scores[name] = coverage + float(scale) * min(
+                max(uncertainty, 0.0), 1.0
+            )
         # Stable order is used only to break exact UCB ties; after selection the
         # count changes, so initially unknown groups are covered in turn.
         selected = max(groups, key=lambda name: (scores[name], -groups.index(name)))
@@ -4308,9 +4318,18 @@ class StructureRepairActuator(nn.Module):
                 positive_prior_logits.amin().reshape(1), positive_prior_logits
             ])
             if actor_critic_selection:
-                # Direct Actor decision.  The safe prior was used only to
-                # initialize the trainable selector bias in __init__.
-                amount_logits = network_amount_logits
+                # Amount is a plan-level decision observed only through one
+                # composite Actual result.  Giving an uncalibrated head full
+                # forward authority made it jump to the largest bin when the
+                # input-frame distribution changed, even while its local RD
+                # target was ambiguous.  Keep the codec-derived safe amount
+                # as a prior and grant forward authority according to the
+                # measured candidate-RD alignment.  The STE helper preserves
+                # the full Network gradient, so this is not a time schedule or
+                # a fixed Amount target.
+                amount_logits = prior_amount_logits + _confidence_forward_full_backward(
+                    network_amount_logits - prior_amount_logits
+                )
             else:
                 amount_logits = prior_amount_logits + _confidence_forward_full_backward(
                     network_amount_logits - prior_amount_logits
@@ -4472,11 +4491,17 @@ class StructureRepairActuator(nn.Module):
             gate_residual_raw = (
                 gate_logits_den6 - gate_logits_den6.mean()
             ) / float(gate_logit_scale)
-            if actor_critic_selection:
-                gate_combined_logits = gate_residual_raw
-            else:
-                gate_residual = _confidence_forward_full_backward(gate_residual_raw)
-                gate_combined_logits = prior_share_tensor.log() + gate_residual
+            # Candidate Where remains an unordered-pool Actor decision, but
+            # Gate allocates a *composite* plan and has no candidate-wise
+            # Actual counterfactual.  Using the raw Gate MLP directly caused
+            # the measured E6 distribution shift 0.40/0.36/0.24 ->
+            # 0.13/0.12/0.75 although the local RD target assigned Adjust only
+            # about 4%.  Use the safe operation share as a forward prior and
+            # scale only the Network residual by measured RD alignment.  Full
+            # backward authority is retained by the STE helper; no Episode or
+            # requested operation-ratio schedule is introduced.
+            gate_residual = _confidence_forward_full_backward(gate_residual_raw)
+            gate_combined_logits = prior_share_tensor.log() + gate_residual
             gate_log_probs = torch.log_softmax(gate_combined_logits, dim=0)
             if (
                 actor_critic_selection
@@ -5444,12 +5469,28 @@ class StructureRepairActuator(nn.Module):
                 - float(local_geometry_weight)
                 * _global_standardize(torch.stack(bin_geometry_values))
             )
-            amount_utility_target = torch.softmax(bin_values.detach(), dim=0)
+            # Local codec attribution can rank *edited* Amount bins, but it
+            # does not observe the Actual no-edit counterfactual.  Including
+            # the zero bin in this proxy softmax assigned it about 3% forever
+            # and explicitly trained the Network away from No-op.  Rank only
+            # positive bins here; the zero-vs-edit decision is learned from
+            # the one-per-step Actual RD policy signal below.  This neither
+            # rewards No-op nor imposes an operation-count target.
+            positive_amount_utility_target = torch.softmax(
+                bin_values.detach()[1:], dim=0
+            )
+            amount_utility_target = torch.cat((
+                positive_amount_utility_target.new_zeros((1,)),
+                positive_amount_utility_target,
+            ))
             amount_utility_confidence = _target_information_confidence(
-                amount_utility_target
+                positive_amount_utility_target
+            )
+            positive_amount_log_probs = torch.log_softmax(
+                amount_logits[1:], dim=0
             )
             amount_local_loss = float(amount_utility_confidence) * -(
-                amount_utility_target * amount_log_probs
+                positive_amount_utility_target * positive_amount_log_probs
             ).sum()
 
             # Fine heads refine the three operation amounts inside the coarse

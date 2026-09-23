@@ -2498,7 +2498,7 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--heuristic_guidance_online_factorized_ucb_scale', default=0.25, type=float,
-        help='decision groupの不確実性へ加えるcoverage UCB係数。Episode番号には依存しない',
+        help='coverage UCBに加えるdecision group不確実性の係数。Episode番号には依存しない',
     )
     parser.add_argument(
         '--heuristic_guidance_online_memory_entries',
