@@ -1099,6 +1099,9 @@ class Network(nn.Module):
                 0.9 * previous_critic_quality
                 + 0.1 * min(max(instant_critic_quality, 0.0), 1.0)
             )
+            plan_critic_policy_confidence = float(
+                self._den6_plan_critic_policy_confidence
+            )
             critic_weight = max(float(getattr(
                 self.args,
                 "heuristic_guidance_online_plan_critic_weight",
@@ -1300,6 +1303,32 @@ class Network(nn.Module):
                     / float(policy_backward_scale)
                 )
                 policy_loss = policy_loss + actual_set_contrast_weighted
+        # Exploration may contract only after the behavior policy has produced
+        # a different candidate set on the *same frame* and Actual SparsePCGC
+        # has compared it with the incumbent.  Use a replay-sized EMA so one
+        # lucky comparison cannot terminate exploration.  This is evidence
+        # dependent and contains no Episode counter or target loss value.
+        actuator_for_evidence = getattr(self, "actuator", None)
+        if actual_set_contrast_operations > 0 and actuator_for_evidence is not None:
+            comparison_capacity = max(int(getattr(
+                self.args,
+                "heuristic_guidance_online_plan_critic_replay_entries",
+                512,
+            )), 1)
+            evidence_alpha = 1.0 / float(comparison_capacity)
+            previous_evidence = min(max(float(getattr(
+                actuator_for_evidence, "_den6_actual_action_evidence", 0.0
+            )), 0.0), 1.0)
+            observed_evidence = min(max(
+                float(actual_set_contrast_evidence), 0.0
+            ), 1.0)
+            actuator_for_evidence._den6_actual_action_evidence = (
+                (1.0 - evidence_alpha) * previous_evidence
+                + evidence_alpha * observed_evidence
+            )
+            actuator_for_evidence._den6_actual_action_comparisons = int(getattr(
+                actuator_for_evidence, "_den6_actual_action_comparisons", 0
+            )) + 1
         if isinstance(selected_ids_by_operation, dict):
             # Retain the best *executed training plan* for this frame as the
             # comparison incumbent.  A worse exploratory sample must not

@@ -192,8 +192,8 @@ class GPCCGeometryEncoder:
                     f"stdout_tail={stdout_tail}\nstderr_tail={stderr_tail}"
                 )
             bit = float(os.path.getsize(bin_path) * 8) if os.path.isfile(bin_path) else 0.0
-            bbox_min = coords.amin(dim=0).detach().cpu().tolist() if coords.numel() > 0 else [0, 0, 0]
-            bbox_max = coords.amax(dim=0).detach().cpu().tolist() if coords.numel() > 0 else [0, 0, 0]
+            bbox_min = coords.min(axis=0).tolist() if coords.size > 0 else [0, 0, 0]
+            bbox_max = coords.max(axis=0).tolist() if coords.size > 0 else [0, 0, 0]
             return {
                 "bit": bit,
                 "bpp": bit / max(float(point_count), 1.0),

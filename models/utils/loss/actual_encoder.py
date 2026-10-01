@@ -39,6 +39,7 @@ class _OctAttentionActualEncoder:
         self._write_ply_data = None
         self._oa_bptt = int(getattr(args, "bptt", 1024))
         self._fast_proxy = None
+        self._proc = None
 
     def _resolve_ckpt_path(self):
         repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
@@ -51,8 +52,13 @@ class _OctAttentionActualEncoder:
         return repo_root, oa_dir, ckpt_path
 
     def _lazy_init(self):
-        if self._loaded and self._proc is not None and self._proc.poll() is None:
-            return
+        if self._loaded:
+            if not self.actualcode:
+                return
+            if self._model is not None:
+                return
+            if self._proc is not None and self._proc.poll() is None:
+                return
         self._loaded = False
 
         repo_root, oa_dir, ckpt_path = self._resolve_ckpt_path()

@@ -856,6 +856,9 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         network._den6_online_actual_plan_memory = __import__(
             "collections"
         ).OrderedDict()
+        network.actuator = torch.nn.Module()
+        network.actuator._den6_actual_action_evidence = 0.0
+        network.actuator._den6_actual_action_comparisons = 0
 
         first_score = torch.tensor([0.0, 0.0], requires_grad=True)
         first_log_prob = torch.tensor(0.0, requires_grad=True)
@@ -894,6 +897,8 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         self.assertTrue(
             network.last_discrete_policy_debug["actual_set_incumbent_updated"]
         )
+        self.assertEqual(network.actuator._den6_actual_action_comparisons, 1)
+        self.assertGreater(network.actuator._den6_actual_action_evidence, 0.0)
 
         third_score = torch.tensor([0.0, 0.0], requires_grad=True)
         third_log_prob = torch.tensor(0.0, requires_grad=True)
@@ -1689,12 +1694,43 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         self.assertTrue(all(float(value) == 0.0 for value in confidence.values()))
         self.assertTrue(all(value["confidence"] == 0.0 for value in audit.values()))
 
-    def test_learning_adaptive_exploration_tracks_ranking_quality_not_episode(self):
+    def test_actor_rank_feature_is_disabled_by_default(self):
+        actuator = StructureRepairActuator.__new__(StructureRepairActuator)
+        torch.nn.Module.__init__(actuator)
+        actuator.args = SimpleNamespace(
+            heuristic_guidance_online_actor_use_rank_feature=False
+        )
+        actuator.den6_candidate_actor = torch.nn.Linear(7, 1, bias=False)
+        actuator.den6_candidate_critic = torch.nn.Linear(7, 2, bias=False)
+        with torch.no_grad():
+            actuator.den6_candidate_actor.weight.zero_()
+            actuator.den6_candidate_actor.weight[0, 1] = 1.0
+            actuator.den6_candidate_critic.weight.zero_()
+        mapping = {
+            "rank_score": torch.tensor([1.0, 0.0]),
+            "local_rate_benefit": torch.zeros(2),
+            "local_geometry_risk": torch.zeros(2),
+        }
+        logits, _, _, features = actuator._den6_actor_critic_candidate_values(
+            mapping, torch.zeros(2), 0
+        )
+        self.assertTrue(torch.equal(features[:, 1], torch.zeros(2)))
+        self.assertTrue(torch.equal(logits, torch.zeros(2)))
+
+        actuator.args.heuristic_guidance_online_actor_use_rank_feature = True
+        logits, _, _, features = actuator._den6_actor_critic_candidate_values(
+            mapping, torch.zeros(2), 0
+        )
+        self.assertGreater(float(features[:, 1].abs().sum()), 0.0)
+        self.assertGreater(float((logits[0] - logits[1]).abs()), 0.0)
+
+    def test_learning_adaptive_exploration_requires_actual_action_evidence(self):
         actuator = StructureRepairActuator.__new__(StructureRepairActuator)
         actuator.args = SimpleNamespace(
             heuristic_guidance_exploration_min_fraction=0.25,
             _global_train_step=999999,
         )
+        actuator._den6_actual_action_evidence = 0.0
         unlearned = {
             name: {"ranking_quality": 0.0}
             for name in ("Add", "Prune", "Adjust")
@@ -1706,6 +1742,12 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         self.assertAlmostEqual(
             actuator._learning_adaptive_exploration_factor(unlearned), 1.0
         )
+        self.assertAlmostEqual(
+            actuator._learning_adaptive_exploration_factor(learned), 1.0
+        )
+        # Proxy順位を完全に学習しても、同一frameの別planをActual codecで
+        # 比較するまでは探索を縮小しない。
+        actuator._den6_actual_action_evidence = 1.0
         self.assertAlmostEqual(
             actuator._learning_adaptive_exploration_factor(learned), 0.25
         )

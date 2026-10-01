@@ -833,9 +833,17 @@ def test(model, args, writer):
                     failures.append("plan_count!=1")
                 if int(plan_debug.get("pool_reference_count", 0) or 0) != 1:
                     failures.append("pool_reference_count!=1")
-                if str(plan_debug.get("proposal_source", "")) != (
-                    "den6_exact_rank_plus_network_residual"
-                ):
+                selection_mode = str(getattr(
+                    args,
+                    "heuristic_guidance_online_selection_mode",
+                    "prior_residual",
+                )).strip().lower()
+                expected_proposal_source = (
+                    "den6_unordered_safe_pool_actor_critic"
+                    if selection_mode == "actor_critic"
+                    else "den6_exact_rank_plus_network_residual"
+                )
+                if str(plan_debug.get("proposal_source", "")) != expected_proposal_source:
                     failures.append("proposal_source_mismatch")
                 for operation in ("Add", "Prune", "Adjust"):
                     if int(selected_counts.get(operation, 0) or 0) <= 0:

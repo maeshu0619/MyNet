@@ -222,6 +222,11 @@ class StructureRepairActuator(nn.Module):
         nn.init.zeros_(self.den6_plan_critic[-1].bias)
         self._den6_factorized_group_counts = {}
         self._den6_factorized_group_uncertainty = {}
+        # This is updated only from an executed plan compared with an earlier
+        # plan for the same frame.  Dense local proxy supervision must not end
+        # behavior exploration before Actual RD has supplied evidence.
+        self._den6_actual_action_evidence = 0.0
+        self._den6_actual_action_comparisons = 0
         # Per-operation gate for the cache-derived local RD candidate feature.
         # It is a Network parameter (not a fixed heuristic weight): tanh(0)
         # makes the fresh policy exactly unchanged, then local/Actual credit
@@ -3921,7 +3926,7 @@ class StructureRepairActuator(nn.Module):
         return confidences, audit
 
     def _learning_adaptive_exploration_factor(self, confidence_audit, operation=None):
-        """Contract exploration only when the Network demonstrates RD ranking skill."""
+        """Contract exploration only after action-conditional Actual evidence."""
         floor = min(max(float(getattr(
             self.args,
             "heuristic_guidance_exploration_min_fraction",
@@ -3940,7 +3945,11 @@ class StructureRepairActuator(nn.Module):
             min(max(float(row.get("ranking_quality", 0.0)), 0.0), 1.0)
             for row in rows
         ]
-        quality = sum(qualities) / float(len(qualities)) if qualities else 0.0
+        proxy_quality = sum(qualities) / float(len(qualities)) if qualities else 0.0
+        actual_evidence = min(max(float(getattr(
+            self, "_den6_actual_action_evidence", 0.0
+        )), 0.0), 1.0)
+        quality = proxy_quality * actual_evidence
         return float(floor + (1.0 - floor) * (1.0 - quality))
 
     @staticmethod
@@ -3958,9 +3967,11 @@ class StructureRepairActuator(nn.Module):
     ):
         """Evaluate an unordered safe candidate pool without rank fusion.
 
-        ``rank_score`` is an input feature whose coefficient is learned; it is
-        never added to the final policy logit.  Rate/geometry are cheap GT
-        codec-context features, not candidate Actual encode results.
+        ``rank_score`` keeps a checkpoint-compatible feature slot, but the
+        default Actor receives zero in that slot.  The legacy rank feature can
+        be enabled only by an explicit ablation flag and is never added to the
+        final policy logit.  Rate/geometry are cheap codec-context proxy
+        features, not candidate Actual encode results.
         """
         count = int(base_network_score.numel())
         if count <= 0:
@@ -3976,8 +3987,14 @@ class StructureRepairActuator(nn.Module):
                 dtype=base_network_score.dtype,
             ).reshape(-1)
 
-        rank_feature = self._den6_standardize_candidate_feature(
-            _feature("rank_score")
+        rank_feature = (
+            self._den6_standardize_candidate_feature(_feature("rank_score"))
+            if bool(getattr(
+                self.args,
+                "heuristic_guidance_online_actor_use_rank_feature",
+                False,
+            ))
+            else base_network_score.new_zeros((count,))
         )
         rate_feature = self._den6_standardize_candidate_feature(
             _feature("local_rate_benefit")
@@ -3998,7 +4015,10 @@ class StructureRepairActuator(nn.Module):
             operation_one_hot,
         ), dim=1)
         actor_residual = self.den6_candidate_actor(features).reshape(-1)
-        critic_output = self.den6_candidate_critic(features)
+        # Proxy regression is Critic-only.  Detaching its input prevents the
+        # dense all-candidate proxy target from updating the Actor's shared
+        # point/voxel feature path indirectly before Actual plans are compared.
+        critic_output = self.den6_candidate_critic(features.detach())
         # Rate/geometry proxy values are observations, not action scores.  In
         # particular, do not add their hand-written combination to Q here:
         # doing so made a fresh Critic correlate ~1.0 with the local target and
@@ -4988,8 +5008,21 @@ class StructureRepairActuator(nn.Module):
                         candidate_critic_uncertainties[operation]
                         .detach().mean().cpu()
                     )
+                    # The old scale was proportional only to Actor logit std.
+                    # A fresh nearly-uniform Actor therefore received almost no
+                    # stochastic perturbation and converged to proxy ordering in
+                    # E1.  Keep an absolute logit-scale floor; Actual evidence,
+                    # not Episode number, still controls contraction below.
+                    exploration_logit_scale = max(
+                        score_std,
+                        max(float(getattr(
+                            self.args,
+                            "heuristic_guidance_online_gumbel_logit_floor",
+                            0.10,
+                        )), 0.0),
+                    )
                     operation_gumbel_scale = (
-                        max(score_std, 1e-3)
+                        max(exploration_logit_scale, 1e-3)
                         * max(uncertainty_scale, 1e-3)
                         * float(configured_where_gumbel_scale)
                         * float(exploration_multiplier)
@@ -5531,15 +5564,31 @@ class StructureRepairActuator(nn.Module):
         # Cross-operation Gate/Amount/Fine targets above use one shared RD
         # coefficient and are returned separately for conservative weighting;
         # the repeated-frame Actual correction remains the global teacher.
-        candidate_local_credit_loss = (
+        actor_proxy_weight = max(float(getattr(
+            self.args,
+            "heuristic_guidance_online_actor_proxy_weight",
+            0.0,
+        )), 0.0)
+        effective_actor_proxy_weight = (
+            actor_proxy_weight if actor_critic_selection else 1.0
+        )
+        actor_proxy_loss = (
             candidate_local_loss
             + float(candidate_pairwise_weight) * candidate_pairwise_loss
-            + candidate_critic_loss
             + max(float(getattr(
                 self.args,
                 "heuristic_guidance_online_actor_critic_distill_weight",
                 0.10,
             )), 0.0) * candidate_actor_critic_loss
+        )
+        # The proxy observes every candidate before any action is executed.  It
+        # is useful for a low-variance Critic, but directly teaching the Actor
+        # made it reproduce that ordering within E1.  Actor proxy imitation is
+        # now an explicit legacy/ablation weight (zero by default); executed
+        # Actual-RD policy and same-frame set contrast own the default Actor.
+        candidate_local_credit_loss = (
+            candidate_critic_loss
+            + float(effective_actor_proxy_weight) * actor_proxy_loss
         )
         if actor_critic_selection and factorized_exploration_group != "all":
             if factorized_exploration_group.endswith("Where"):
@@ -5857,6 +5906,13 @@ class StructureRepairActuator(nn.Module):
             "candidate_pairwise_local_loss": candidate_pairwise_loss,
             "candidate_critic_local_loss": candidate_critic_loss,
             "candidate_actor_critic_distill_loss": candidate_actor_critic_loss,
+            "candidate_actor_proxy_loss": actor_proxy_loss,
+            "candidate_actor_proxy_weight": float(effective_actor_proxy_weight),
+            "actor_rank_feature_enabled": bool(getattr(
+                self.args,
+                "heuristic_guidance_online_actor_use_rank_feature",
+                False,
+            )),
             "candidate_pairwise_local_weight": float(candidate_pairwise_weight),
             "operation_local_loss": operation_local_loss,
             "amount_local_loss": amount_local_loss,
@@ -5906,6 +5962,12 @@ class StructureRepairActuator(nn.Module):
                 exploration_selection_change_rates
             ),
             "learning_adaptive_exploration": True,
+            "actual_action_evidence": float(getattr(
+                self, "_den6_actual_action_evidence", 0.0
+            )),
+            "actual_action_comparisons": int(getattr(
+                self, "_den6_actual_action_comparisons", 0
+            )),
             "plan_exploration_factor": float(plan_exploration_factor),
             "operation_exploration_factors": operation_exploration_factors,
             "exploration_support_sizes": exploration_support_sizes,

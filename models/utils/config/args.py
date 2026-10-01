@@ -2467,6 +2467,24 @@ def parse_pugan_args(parser, file_day, file_time):
         help='unordered safe candidate poolを選択するActor/Criticの中間次元',
     )
     parser.add_argument(
+        '--heuristic_guidance_online_actor_use_rank_feature',
+        default=False,
+        type=str2bool,
+        help=(
+            'Actor/Criticへden6 pool_rankを入力する旧比較用設定。既定Falseでは'
+            'Heuristic順位を行動価値入力から除外し、順位を最終方策へ漏らさない'
+        ),
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_actor_proxy_weight',
+        default=0.0,
+        type=float,
+        help=(
+            'codec-context local proxyをActorへ直接模倣させる重み。既定0ではproxyは'
+            'Criticだけを学習し、Actorは探索したplanのActual RD creditから更新する'
+        ),
+    )
+    parser.add_argument(
         '--heuristic_guidance_online_actor_critic_distill_weight',
         default=0.10,
         type=float,
@@ -2550,6 +2568,15 @@ def parse_pugan_args(parser, file_day, file_time):
         default=1.0,
         type=float,
         help='combined score標準偏差に対するWhere Gumbel探索倍率。Episodeには依存しない',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_gumbel_logit_floor',
+        default=0.10,
+        type=float,
+        help=(
+            '未学習時のほぼ同値logitでも探索を消さないGumbel基準尺度の下限。'
+            'EpisodeではなくActor不確実性とActual比較証拠で実効強度を縮小する'
+        ),
     )
     parser.add_argument(
         '--heuristic_guidance_exploration_min_fraction',
@@ -4324,6 +4351,15 @@ def parse_pugan_args(parser, file_day, file_time):
     args.heuristic_guidance_online_gumbel_scale = max(
         float(getattr(args, "heuristic_guidance_online_gumbel_scale", 1.0)), 0.0
     )
+    args.heuristic_guidance_online_gumbel_logit_floor = max(float(getattr(
+        args, "heuristic_guidance_online_gumbel_logit_floor", 0.10
+    )), 0.0)
+    args.heuristic_guidance_online_actor_proxy_weight = max(float(getattr(
+        args, "heuristic_guidance_online_actor_proxy_weight", 0.0
+    )), 0.0)
+    args.heuristic_guidance_online_actor_use_rank_feature = bool(getattr(
+        args, "heuristic_guidance_online_actor_use_rank_feature", False
+    ))
     args.heuristic_guidance_exploration_min_fraction = min(max(float(getattr(
         args, "heuristic_guidance_exploration_min_fraction", 0.25
     )), 0.0), 1.0)
