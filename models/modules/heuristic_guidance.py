@@ -511,6 +511,7 @@ def _exact_den6_guidance(
         "ana_den6_exact_unique_plan_online_v6",
         "ana_den6_exact_one_pattern_anchor_online_v6",
         "ana_den6_exact_single_plan_teacher_online_v8",
+        "mynet_fast_unordered_safe_pool_v1",
     }:
         raise RuntimeError("ana_den6 exact candidate guidance sourceが不正である")
     coords = _normalize_coords_b3n(structure.get("global_voxel_coords"), like)
@@ -846,6 +847,7 @@ def _exact_den6_guidance(
                 "ana_den6_exact_unique_plan_online_v6",
                 "ana_den6_exact_one_pattern_anchor_online_v6",
                 "ana_den6_exact_single_plan_teacher_online_v8",
+                "mynet_fast_unordered_safe_pool_v1",
             }
             else "ana_den6_exact_ranked_editcandidate_pool_online_v1"
             if str(exact.get("source", "")) == "ana_den6_exact_ranked_candidate_pool_online_v1"
@@ -1003,11 +1005,18 @@ def build_heuristic_guidance(structure: Mapping[str, Any], args: Any) -> Dict[st
         and isinstance(exact, Mapping)
         and str(exact.get("source", "")) == "ana_den6_exact_single_plan_teacher_online_v8"
     )
-    if mode == "ana_den6_online" and not (single_proposal_online or exact_anchor_online):
+    fast_unordered_online = bool(
+        mode == "ana_den6_online"
+        and isinstance(exact, Mapping)
+        and str(exact.get("source", "")) == "mynet_fast_unordered_safe_pool_v1"
+    )
+    if mode == "ana_den6_online" and not (
+        single_proposal_online or exact_anchor_online or fast_unordered_online
+    ):
         raise RuntimeError(
             "ana_den6_onlineにはGT固定特徴またはfingerprint一致済みExact candidate Pool cacheが必要である"
         )
-    if mode == "ana_den6_residual" or exact_anchor_online:
+    if mode == "ana_den6_residual" or exact_anchor_online or fast_unordered_online:
         if not isinstance(exact, Mapping):
             raise RuntimeError(
                 "ana_den6_residualでexact candidate guidanceがNetworkへ伝播していない。"

@@ -365,8 +365,8 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--point_transformer_feature_warmup_steps', default=0, type=int, help='Point Transformer residualのwarmup Step数。0なら探索schedule全体へ自動追従する')
     parser.add_argument('--point_transformer_feature_lr_scale', default=0.1, type=float, help='Point Transformer Adapter/Gate専用LRのmain LRに対する倍率')
     parser.add_argument('--point_transformer_feature_cache', default=True, type=str2bool, help='固定Point Transformerのcoarse特徴とVoxel対応をCPUへキャッシュする')
-    parser.add_argument('--point_transformer_feature_cache_max_entries', default=64, type=int, help='固定Point Transformer特徴CPUキャッシュの最大frame数')
-    parser.add_argument('--point_transformer_feature_cache_max_memory_mb', default=512, type=int, help='固定Point Transformer特徴CPUキャッシュの上限MB')
+    parser.add_argument('--point_transformer_feature_cache_max_entries', default=16, type=int, help='固定Point Transformer特徴CPUキャッシュの最大frame数')
+    parser.add_argument('--point_transformer_feature_cache_max_memory_mb', default=128, type=int, help='固定Point Transformer特徴CPUキャッシュの上限MB')
     parser.add_argument(
         '--full_cloud_anchor_allow_grad',
         default=False,
@@ -1197,7 +1197,7 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--sparsepcgc_codec_prior_amount_distill_weight',
-        default=0.0,
+        default=0.05,
         type=float,
         help='codec prior ratioをNetwork Prune Amountへ模倣させるAmount蒸留loss重み。Amount自由学習では0推奨',
     )
@@ -2068,6 +2068,8 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument('--sparsepcgc_worker_cpu_trim_interval', default=16, type=int, help='永続workerの解放済みCPU領域をOSへ返すrequest間隔（0で無効）')
     parser.add_argument('--sparsepcgc_gpu_min_free_mb', default=4096, type=int, help='CUDA teacherへrequestを送るために必要なGPU全体の空き容量MB。競合時は値を変えず待機する')
+    parser.add_argument('--sparsepcgc_host_min_available_mb', default=8192, type=int, help='SparsePCGC workerの起動・encode前に必要なホストMemAvailable(MB)。共有hostのOOM killを避ける')
+    parser.add_argument('--sparsepcgc_host_wait_timeout', default=600.0, type=float, help='SparsePCGC workerのホスト空きメモリ待機上限秒')
     parser.add_argument(
         '--sparsepcgc_auto_cpu_fallback',
         default=True,
@@ -2463,6 +2465,28 @@ def parse_pugan_args(parser, file_day, file_time):
         ),
     )
     parser.add_argument(
+        '--heuristic_guidance_online_proposal_mode',
+        default='exact_den6',
+        choices=['fast_unordered', 'exact_den6'],
+        help=(
+            'ana_den6_onlineの候補生成。exact_den6は事前計算済みcompact poolの'
+            'codec-context特徴を再利用する（候補別Actual encodeは行わない）。'
+            'fast_unorderedは局所近傍だけを使う速度ablation'
+        ),
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_fast_pool_reserve_factor',
+        default=2.0,
+        type=float,
+        help='実行予定operation数に対してfast unordered poolへ保持する候補倍率',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_fast_pool_max_per_operation',
+        default=8192,
+        type=int,
+        help='fast unordered proposalのoperation別安全上限。0以下なら上限なし',
+    )
+    parser.add_argument(
         '--heuristic_guidance_online_actor_hidden_dim', default=32, type=int,
         help='unordered safe candidate poolを選択するActor/Criticの中間次元',
     )
@@ -2477,11 +2501,11 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--heuristic_guidance_online_actor_proxy_weight',
-        default=0.0,
+        default=0.05,
         type=float,
         help=(
-            'codec-context local proxyをActorへ直接模倣させる重み。既定0ではproxyは'
-            'Criticだけを学習し、Actorは探索したplanのActual RD creditから更新する'
+            'codec-context local RD proxyをActorの低分散補助信号にする重み。'
+            'Heuristic順位は含まず、Actual RD creditを主教師のまま逆順位化を防ぐ'
         ),
     )
     parser.add_argument(
@@ -2501,6 +2525,10 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument(
         '--heuristic_guidance_online_plan_critic_replay_entries', default=512, type=int,
         help='Actual RD plan replayの最大件数。点群やcodec出力は保持せずcompact特徴だけを保存',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_actual_plan_memory_entries', default=512, type=int,
+        help='同一frameのActual candidate-set比較履歴の最大件数（IDは64-bit tokenで保存）',
     )
     parser.add_argument(
         '--heuristic_guidance_online_plan_critic_replay_batch', default=32, type=int,
@@ -3401,8 +3429,8 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--amp_overflow_patience', default=2, type=int, help='オーバーフロー許容回数')
     parser.add_argument('--cache_frozen_inputs', default=True, type=str2bool, help='Encoder出力をキャッシュするか')
     parser.add_argument('--cache_gt_loss', default=True, type=str2bool, help='GT側損失をキャッシュするか')
-    parser.add_argument('--cache_max_entries', default=192, type=int, help='キャッシュ最大数')
-    parser.add_argument('--cache_max_memory_mb', default=2048, type=int, help='固定Node CPUキャッシュ最大メモリ（MB）')
+    parser.add_argument('--cache_max_entries', default=64, type=int, help='キャッシュ最大数')
+    parser.add_argument('--cache_max_memory_mb', default=512, type=int, help='固定Node CPUキャッシュ最大メモリ（MB）')
     parser.add_argument(
         '--static_node_cache_cpu',
         default=True,
@@ -4315,6 +4343,12 @@ def parse_pugan_args(parser, file_day, file_time):
     args.heuristic_guidance_online_compact_reserve_factor = min(max(
         float(getattr(args, "heuristic_guidance_online_compact_reserve_factor", 4.0)), 1.0
     ), 4.0)
+    args.heuristic_guidance_online_fast_pool_reserve_factor = min(max(float(getattr(
+        args, "heuristic_guidance_online_fast_pool_reserve_factor", 2.0
+    )), 1.0), 8.0)
+    args.heuristic_guidance_online_fast_pool_max_per_operation = max(int(getattr(
+        args, "heuristic_guidance_online_fast_pool_max_per_operation", 8192
+    )), 0)
     args.heuristic_guidance_online_memory_entries = max(
         int(getattr(args, "heuristic_guidance_online_memory_entries", 64)), 1
     )
@@ -4355,7 +4389,7 @@ def parse_pugan_args(parser, file_day, file_time):
         args, "heuristic_guidance_online_gumbel_logit_floor", 0.10
     )), 0.0)
     args.heuristic_guidance_online_actor_proxy_weight = max(float(getattr(
-        args, "heuristic_guidance_online_actor_proxy_weight", 0.0
+        args, "heuristic_guidance_online_actor_proxy_weight", 0.05
     )), 0.0)
     args.heuristic_guidance_online_actor_use_rank_feature = bool(getattr(
         args, "heuristic_guidance_online_actor_use_rank_feature", False
@@ -5239,6 +5273,12 @@ def parse_pugan_args(parser, file_day, file_time):
         getattr(args, "sparsepcgc_cpu_actual_overlap", True)
     )
     args.sparsepcgc_gpu_min_free_mb = max(int(getattr(args, "sparsepcgc_gpu_min_free_mb", 4096)), 0)
+    args.sparsepcgc_host_min_available_mb = max(int(getattr(
+        args, "sparsepcgc_host_min_available_mb", 8192
+    )), 0)
+    args.sparsepcgc_host_wait_timeout = max(float(getattr(
+        args, "sparsepcgc_host_wait_timeout", 600.0
+    )), 0.0)
     args.sparsepcgc_auto_cpu_fallback = bool(
         getattr(args, "sparsepcgc_auto_cpu_fallback", True)
     )

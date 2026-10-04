@@ -570,7 +570,62 @@ class _SparsePCGCActualEncoder:
             # 古いPyTorchでも通常のrequestは続行できる。OOM時のretryは別に残る。
             return float("inf")
 
+    @staticmethod
+    def _host_available_mb():
+        try:
+            with open("/proc/meminfo", "r", encoding="utf-8") as stream:
+                for line in stream:
+                    if line.startswith("MemAvailable:"):
+                        return float(line.split()[1]) / 1024.0
+        except (OSError, ValueError, IndexError):
+            pass
+        return float("inf")
+
+    def _wait_for_host_capacity(self, reason):
+        minimum_mb = max(int(getattr(
+            self.args, "sparsepcgc_host_min_available_mb", 8192
+        )), 0)
+        if str(reason) == "worker_init":
+            # The persistent worker itself settles near 6 GiB RSS in the
+            # measured dense-lossy configuration.  Keep one additional worker
+            # footprint available before spawning it; subsequent requests use
+            # the configured steady-state margin.
+            minimum_mb = max(minimum_mb, 12288)
+        if minimum_mb <= 0:
+            return
+        timeout = max(float(getattr(
+            self.args, "sparsepcgc_host_wait_timeout", 600.0
+        )), 0.0)
+        interval = max(float(getattr(
+            self.args, "sparsepcgc_gpu_wait_interval", 2.0
+        )), 0.1)
+        started = time.monotonic()
+        announced = False
+        available_mb = self._host_available_mb()
+        while available_mb < float(minimum_mb):
+            elapsed = time.monotonic() - started
+            if not announced and self.writer is not None and hasattr(self.writer, "write"):
+                self.writer.write(
+                    "SparsePCGCHostAdmissionWait: reason={}, available_mb={:.1f}, "
+                    "required_mb={}, timeout_sec={:.1f}".format(
+                        str(reason), available_mb, minimum_mb, timeout
+                    )
+                )
+                announced = True
+            if elapsed >= timeout:
+                raise RuntimeError(
+                    "SparsePCGC teacher host admission timed out: "
+                    f"available={available_mb:.1f}MiB, required={minimum_mb}MiB, "
+                    f"waited={elapsed:.1f}s. Shared host memory is exhausted."
+                )
+            time.sleep(min(interval, max(timeout - elapsed, 0.1)))
+            available_mb = self._host_available_mb()
+
     def _wait_for_cuda_capacity(self, reason):
+        # The worker and the training process together use roughly 12 GiB RSS.
+        # On a shared host the Linux OOM killer acts before CUDA admission can
+        # help, so reject/wait before spawning or feeding the worker.
+        self._wait_for_host_capacity(reason)
         minimum_mb = max(int(getattr(
             self.args, "sparsepcgc_gpu_min_free_mb", 4096
         )), 0)

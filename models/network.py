@@ -1,3 +1,5 @@
+import hashlib
+
 import torch
 import torch.nn as nn
 import time
@@ -1116,38 +1118,13 @@ class Network(nn.Module):
             )
             if not isinstance(plan_debug_for_replay, dict):
                 plan_debug_for_replay = {}
+            # Replay regression consumes only these sufficient statistics.
+            # Keeping thousands of candidate-id strings per step grew the
+            # Python heap but never participated in an Actor/Critic update.
             replay.append({
-                # Compact selected-action context.  Full point clouds and
-                # bitstreams are intentionally not retained.
-                "plan_feature": plan_feature.detach().float().cpu(),
-                "selected_candidate_ids": tuple(
-                    str(value) for value in plan_debug_for_replay.get(
-                        "selected_candidate_ids", ()
-                    )
+                "plan_feature": plan_feature.detach().to(
+                    device="cpu", dtype=torch.float16
                 ),
-                "selected_counts": dict(
-                    plan_debug_for_replay.get("selected_counts", {})
-                ),
-                "factorized_group": str(plan_debug_for_replay.get(
-                    "factorized_exploration_group", "none"
-                )),
-                "behavior_log_probability": float(
-                    log_prob.detach().float().mean().cpu()
-                ),
-                "operation": dict(plan_debug_for_replay.get(
-                    "operation_gate_selected_shares", {}
-                )),
-                "amount": float(plan_debug_for_replay.get(
-                    "amount_total_ratio_before_count", 0.0
-                )),
-                "fine": float(plan_debug_for_replay.get(
-                    "amount_fine_log_residual", 0.0
-                )),
-                "no_op": bool(plan_debug_for_replay.get(
-                    "no_op_selected", False
-                )),
-                "actual_rate": float(objective.detach().cpu()),
-                "geometry": float(geometry_objective_for_rd.detach().cpu()),
                 "actual_rd": float(actor_rd_target.detach().cpu()),
             })
             replay_capacity = max(int(getattr(
@@ -1215,6 +1192,16 @@ class Network(nn.Module):
         current_objective_value = float(
             (actor_rd_target if actor_critic_selection else objective.detach()).cpu()
         )
+
+        def _compact_candidate_id(value):
+            """Stable 64-bit token for memory-resident set comparison."""
+            if isinstance(value, int):
+                return int(value)
+            digest = hashlib.blake2b(
+                str(value).encode("utf-8"), digest_size=8
+            ).digest()
+            return int.from_bytes(digest, byteorder="little", signed=False)
+
         if (
             mode == "ana_den6_online"
             and isinstance(previous_plan, dict)
@@ -1250,6 +1237,7 @@ class Network(nn.Module):
             )), 1)
             contrast_terms = []
             previous_selected = previous_plan.get("selected", {})
+
             for operation in ("Add", "Prune", "Adjust"):
                 scores = score_tensors.get(operation)
                 ids = candidate_ids_by_operation.get(operation, ())
@@ -1257,13 +1245,22 @@ class Network(nn.Module):
                     continue
                 if len(ids) != int(scores.numel()):
                     continue
-                current_set = set(selected_ids_by_operation.get(operation, ()))
-                previous_set = set(previous_selected.get(operation, ()))
+                current_set = {
+                    _compact_candidate_id(value)
+                    for value in selected_ids_by_operation.get(operation, ())
+                }
+                previous_set = {
+                    _compact_candidate_id(value)
+                    for value in previous_selected.get(operation, ())
+                }
                 current_only = current_set - previous_set
                 previous_only = previous_set - current_set
                 if not current_only or not previous_only:
                     continue
-                id_to_index = {str(value): index for index, value in enumerate(ids)}
+                id_to_index = {
+                    _compact_candidate_id(value): index
+                    for index, value in enumerate(ids)
+                }
                 current_indices = [
                     id_to_index[value] for value in sorted(current_only)
                     if value in id_to_index
@@ -1345,7 +1342,7 @@ class Network(nn.Module):
                     "objective": current_objective_value,
                     "selected": {
                         name: tuple(
-                            str(value)
+                            _compact_candidate_id(value)
                             for value in selected_ids_by_operation.get(name, ())
                         )
                         for name in ("Add", "Prune", "Adjust")
@@ -1353,7 +1350,12 @@ class Network(nn.Module):
                 }
                 actual_set_incumbent_updated = True
             plan_memory.move_to_end(cache_key)
-            while len(plan_memory) > 4096:
+            plan_memory_capacity = max(int(getattr(
+                self.args,
+                "heuristic_guidance_online_actual_plan_memory_entries",
+                512,
+            )), 1)
+            while len(plan_memory) > plan_memory_capacity:
                 plan_memory.popitem(last=False)
         local_plan_credit_debug = {}
         for state_name, arg_name, debug_name in (
@@ -3788,10 +3790,22 @@ class Network(nn.Module):
         network_only_codec_mode = guidance_mode in {
             "network_only_codec_policy", "network_k_proposal_policy", "single_plan_student"
         }
+        den6_selection_mode = str(getattr(
+            self.args,
+            "heuristic_guidance_online_selection_mode",
+            "prior_residual",
+        )).strip().lower()
         network_only_guidance_forward = bool(
             guidance_mode == "ana_den6_online"
             and not self.training
             and getattr(self.args, "heuristic_guidance_network_only_inference", True)
+            # Actor/Critic is defined over the unordered legal candidate pool.
+            # Removing that pool only at validation evaluates a different
+            # policy and makes fixed-RD unusable as model-selection evidence.
+            # Keep the legacy cache-free inference path for prior_residual
+            # checkpoints, but evaluate Actor/Critic deterministically on the
+            # same pool used in training (sampling is disabled by eval mode).
+            and den6_selection_mode != "actor_critic"
         )
         # OctreeStructureAnalysis also constructs the guidance object.  Pass
         # the phase explicitly through args so every nested builder takes the

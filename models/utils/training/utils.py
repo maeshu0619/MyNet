@@ -913,7 +913,10 @@ def warmup_whole_cloud_caches(model, args, loss, seq_datasets, writer, use_cuda,
     if total_files <= 0:
         return
 
-    if bool(getattr(args, "warmup_gt_cache", True)) and getattr(loss, "gt_cache_enabled", False):
+    # Disk cache already preserves GT encode reuse.  Expanding this in-memory
+    # LRU to the complete dataset while warmup is disabled defeated the
+    # configured bound in ordinary streaming training.
+    if bool(getattr(args, "warmup_gt_cache", False)) and getattr(loss, "gt_cache_enabled", False):
         loss.gt_cache_max_entries = max(int(getattr(loss, "gt_cache_max_entries", 0)), total_files)
 
     warmup_frozen = bool(getattr(args, "warmup_frozen_cache", True) and getattr(model, "cache_enabled", False))

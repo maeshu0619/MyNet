@@ -3299,6 +3299,7 @@ class StructureRepairActuator(nn.Module):
                 "ana_den6_exact_one_pattern_anchor_online_v6",
                 "ana_den6_single_proposal_network_residual_online_v7",
                 "ana_den6_exact_single_plan_teacher_online_v8",
+                "mynet_fast_unordered_safe_pool_v1",
                 "network_only_where_amount_action_inference_v1",
             }:
                 raise RuntimeError(
@@ -6769,6 +6770,7 @@ class StructureRepairActuator(nn.Module):
                 "ana_den6_exact_unique_plan_online_v6",
                 "ana_den6_exact_one_pattern_anchor_online_v6",
                 "ana_den6_exact_single_plan_teacher_online_v8",
+                "mynet_fast_unordered_safe_pool_v1",
             }
         )
         exact_add_source_mask = self._fit_heuristic_candidate_mask(

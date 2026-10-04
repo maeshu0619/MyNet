@@ -1,9 +1,9 @@
-"""063943互換のden6 Exact順位をNetwork residualへ渡すonline入口。
+"""SparsePCGC online学習用の候補pool付与入口。
 
-cache内の候補は複数の完成planではなく、1つのAdd/Prune/Adjust複合planを組む
-Voxel edit-unit順位である。Step 0は保存Exact planを再生し、その後は同じ順位へ
-Network residualを加える。Actual encodeは最終的に選ばれた1 planだけに1回行う。
-Network-only推論は別フラグで測定し、Exact anchorの成績と混同しない。
+現行方式は現在のoccupied voxelから、Actual codecや候補順位を用いずに
+少数の合法なAdd/Prune/Adjust候補を生成する。旧den6 Exact poolは
+明示的なablation/互換modeとして残す。Actual encodeはどちらのmodeでも、
+最終的に選択された1 composite planだけに1回行う。
 """
 
 from __future__ import annotations
@@ -25,6 +25,22 @@ import torch
 SCHEMA_VERSION = "ana_den6_gt_terms_single_proposal_cache_v7"
 SOURCE_NAME = "ana_den6_gt_terms_single_proposal_online_v7"
 FIXED_FEATURE_SCHEMA_VERSION = "ana_den6_gt_fixed_symbol_features_v2"
+FAST_UNORDERED_SOURCE = "mynet_fast_unordered_safe_pool_v1"
+_FAST_NEIGHBOR_OFFSETS = tuple(
+    (dx, dy, dz)
+    for dx in (-1, 0, 1)
+    for dy in (-1, 0, 1)
+    for dz in (-1, 0, 1)
+    if not (dx == 0 and dy == 0 and dz == 0)
+)
+_FAST_PROFILES = {
+    ("8i", 8): (0.0025, (0.40, 0.40, 0.20)),
+    ("8i", 7): (0.0005, (0.35, 0.30, 0.35)),
+    ("MVUB", 8): (0.0025, (0.50, 0.40, 0.10)),
+    ("MVUB", 7): (0.0010, (0.35, 0.30, 0.35)),
+    ("UVG", 8): (0.0050, (0.25, 0.70, 0.05)),
+    ("UVG", 7): (0.0025, (0.40, 0.50, 0.10)),
+}
 _FILE_HASH_CACHE: dict[tuple[str, int, int], str] = {}
 _GLOBAL_PAYLOAD_CACHE: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
 _FIXED_FEATURE_CACHE: "OrderedDict[str, dict[str, np.ndarray]]" = OrderedDict()
@@ -314,6 +330,244 @@ def _canonical_geometry_terms(coords: torch.Tensor) -> dict[str, Any]:
         "bbox_min": [int(value) for value in minimum.tolist()],
         "bbox_max": [int(value) for value in maximum.tolist()],
         "centroid": [float(value) for value in centroid.tolist()],
+    }
+
+
+def _fast_profile(args: Any) -> tuple[float, dict[str, float]]:
+    dataset = _dataset_name(getattr(args, "dataname", "8i"))
+    scale_m = int(getattr(args, "sparsepcgc_scale_m", 8))
+    total, shares = _FAST_PROFILES.get(
+        (dataset, scale_m), (0.0025, (1.0 / 3.0,) * 3)
+    )
+    total_override = float(getattr(args, "heuristic_guidance_total_ratio_percent", -1.0))
+    if total_override >= 0.0:
+        total = total_override / 100.0
+    raw_shares = str(getattr(args, "heuristic_guidance_operation_shares", "") or "").strip()
+    if raw_shares:
+        parsed = [float(value.strip()) for value in raw_shares.split(",") if value.strip()]
+        if len(parsed) != 3 or any(value <= 0.0 for value in parsed):
+            raise ValueError("heuristic_guidance_operation_shares must contain 3 positives")
+        denominator = sum(parsed)
+        shares = tuple(value / denominator for value in parsed)
+    return float(total), dict(zip(("Add", "Prune", "Adjust"), shares))
+
+
+def _fast_spatial_source_indices(
+    point_count: int, requested: int, phase: int, device: torch.device
+) -> torch.Tensor:
+    """Choose one source per spatial/order stratum without a full randperm."""
+    count = min(max(int(requested), 0), max(int(point_count), 0))
+    if count <= 0:
+        return torch.empty((0,), device=device, dtype=torch.long)
+    slots = torch.arange(count, device=device, dtype=torch.long)
+    start = torch.div(slots * int(point_count), count, rounding_mode="floor")
+    stop = torch.div((slots + 1) * int(point_count), count, rounding_mode="floor")
+    width = (stop - start).clamp_min(1)
+    offset = (slots * 1103515245 + int(phase)) % width
+    return (start + offset).clamp_max(max(int(point_count) - 1, 0))
+
+
+def _build_fast_unordered_teacher(
+    context: Mapping[str, Any], args: Any, identity: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Generate a legal, unordered pool without codec calls or full ranking."""
+    started = time.perf_counter()
+    coords = context.get("full_global_voxel_coords", context.get("global_voxel_coords"))
+    if not torch.is_tensor(coords) or coords.ndim != 3 or coords.shape[0] != 1:
+        raise RuntimeError("fast unordered proposal requires [1,3,N] voxel coords")
+    rows = coords[0].transpose(0, 1).detach().to(dtype=torch.long).contiguous()
+    point_count = int(rows.shape[0])
+    if point_count <= 0:
+        raise RuntimeError("fast unordered proposal received an empty cloud")
+
+    total_ratio, shares = _fast_profile(args)
+    requested_total = max(int(round(point_count * total_ratio)), 1)
+    reserve = max(float(getattr(
+        args, "heuristic_guidance_online_fast_pool_reserve_factor", 2.0
+    )), 1.0)
+    configured_cap = int(getattr(
+        args, "heuristic_guidance_online_fast_pool_max_per_operation", 8192
+    ))
+    budgets = {}
+    for operation in ("Add", "Prune", "Adjust"):
+        required = max(int(round(requested_total * shares[operation])), 1)
+        budget = max(int(np.ceil(required * reserve)), required)
+        if configured_cap > 0:
+            budget = min(budget, configured_cap)
+        budgets[operation] = min(budget, point_count)
+    setup_finished = time.perf_counter()
+
+    seed = int(str(identity["input_sha256"])[:16], 16) & 0x7FFFFFFF
+    sample_count = min(
+        point_count,
+        max(max(budgets.values()) * 2, max(budgets.values()) + 256),
+    )
+    sample_indices = _fast_spatial_source_indices(
+        point_count, sample_count, seed, rows.device
+    )
+    sampled_rows = rows.index_select(0, sample_indices)
+    sampling_finished = time.perf_counter()
+    offsets = torch.as_tensor(
+        _FAST_NEIGHBOR_OFFSETS, device=rows.device, dtype=torch.long
+    )
+    targets = sampled_rows[:, None, :] + offsets[None, :, :]
+    enumeration_finished = time.perf_counter()
+
+    membership_started = time.perf_counter()
+    lower = rows.amin(dim=0) - 1
+    upper = rows.amax(dim=0) + 1
+    span = (upper - lower + 1).clamp_min(1)
+    span_product = int(span[0].item()) * int(span[1].item()) * int(span[2].item())
+    if span_product >= (1 << 62):
+        raise RuntimeError("fast proposal coordinate span exceeds int64")
+
+    def packed_keys(values: torch.Tensor) -> torch.Tensor:
+        shifted = values - lower.view(*([1] * (values.ndim - 1)), 3)
+        return (
+            shifted[..., 0] * span[1] * span[2]
+            + shifted[..., 1] * span[2]
+            + shifted[..., 2]
+        )
+
+    occupied_keys = torch.sort(packed_keys(rows)).values
+    target_keys = packed_keys(targets)
+    flat_keys = target_keys.reshape(-1)
+    positions = torch.searchsorted(occupied_keys, flat_keys)
+    inside = positions < occupied_keys.numel()
+    safe_positions = positions.clamp_max(max(int(occupied_keys.numel()) - 1, 0))
+    occupied = inside & occupied_keys.index_select(0, safe_positions).eq(flat_keys)
+    native_resolution = max(int(getattr(
+        args, "sparsepcgc_native_resolution", 1023
+    )), 1)
+    in_domain = ((targets >= 0) & (targets <= native_resolution)).all(dim=-1)
+    empty = (~occupied.reshape_as(target_keys)) & in_domain
+    neighbour_count = occupied.reshape_as(target_keys).sum(dim=1)
+    membership_finished = time.perf_counter()
+
+    def choose_pairs(budget: int, phase: int):
+        starts = (sample_indices * 2654435761 + int(phase)) % len(_FAST_NEIGHBOR_OFFSETS)
+        directions = torch.arange(
+            len(_FAST_NEIGHBOR_OFFSETS), device=rows.device, dtype=torch.long
+        ).view(1, -1)
+        priority = (directions - starts.view(-1, 1)) % len(_FAST_NEIGHBOR_OFFSETS)
+        priority = priority.masked_fill(~empty, len(_FAST_NEIGHBOR_OFFSETS) + 1)
+        selected_direction = priority.argmin(dim=1)
+        valid_rows = torch.nonzero(empty.any(dim=1), as_tuple=False).reshape(-1)
+        if int(valid_rows.numel()) > int(budget):
+            valid_rows = valid_rows[: int(budget)]
+        source_index = sample_indices.index_select(0, valid_rows)
+        direction_index = selected_direction.index_select(0, valid_rows)
+        source = rows.index_select(0, source_index)
+        target = source + offsets.index_select(0, direction_index)
+        degree = neighbour_count.index_select(0, valid_rows).float()
+        return direction_index, source, target, degree
+
+    serialization_started = time.perf_counter()
+    pools: dict[str, list[dict[str, Any]]] = {}
+    prune_indices = sample_indices[: budgets["Prune"]]
+    prune_rows = rows.index_select(0, prune_indices)
+    prune_degree = neighbour_count[: int(prune_indices.numel())].float()
+    pools["Prune"] = [
+        {
+            "candidate_id": f"fast:Prune:{x}:{y}:{z}",
+            "operation": "Prune", "pool_rank": index, "rank_score": 0.0,
+            "heuristic_score": 0.0, "remove_coords": [[x, y, z]],
+            "add_coords": [], "affected_voxel_cells": 1,
+            "operation_count": 1,
+            "optimistic_gain_bits": float((26.0 - degree) / 26.0),
+            "neighbor_bit_risk": 0.0, "geometry_cost": float(degree / 26.0),
+        }
+        for index, ((x, y, z), degree) in enumerate(
+            zip(prune_rows.cpu().tolist(), prune_degree.cpu().tolist())
+        )
+    ]
+    for operation, phase in (("Add", seed + 17), ("Adjust", seed + 43)):
+        direction_index, source, target, degree = choose_pairs(
+            budgets[operation], phase
+        )
+        pool = []
+        seen_targets = set()
+        for source_row, target_row, local_degree, direction in zip(
+            source.cpu().tolist(), target.cpu().tolist(), degree.cpu().tolist(),
+            direction_index.cpu().tolist(),
+        ):
+            source_tuple = tuple(int(value) for value in source_row)
+            target_tuple = tuple(int(value) for value in target_row)
+            if target_tuple in seen_targets:
+                continue
+            seen_targets.add(target_tuple)
+            index = len(pool)
+            pool.append({
+                "candidate_id": (
+                    f"fast:{operation}:{source_tuple[0]}:{source_tuple[1]}:"
+                    f"{source_tuple[2]}:{int(direction)}"
+                ),
+                "operation": operation, "pool_rank": index, "rank_score": 0.0,
+                "heuristic_score": 0.0,
+                "remove_coords": [list(source_tuple)] if operation == "Adjust" else [],
+                "add_coords": [list(target_tuple)], "affected_voxel_cells": 1,
+                "operation_count": 1,
+                "optimistic_gain_bits": float(abs(local_degree - 13.0) / 13.0),
+                "neighbor_bit_risk": 0.0,
+                "geometry_cost": float(
+                    (26.0 - local_degree) / 26.0
+                    if operation == "Add" else local_degree / 26.0
+                ),
+            })
+        pools[operation] = pool
+    if any(not pools[name] for name in ("Add", "Prune", "Adjust")):
+        raise RuntimeError("fast unordered proposal produced an empty operation pool")
+    serialization_finished = time.perf_counter()
+
+    elapsed = time.perf_counter() - started
+    cache_signature = hashlib.sha256("|".join((
+        FAST_UNORDERED_SOURCE, str(identity["input_sha256"]),
+        str(identity["setting_id"]), str(reserve), str(configured_cap),
+    )).encode("utf-8")).hexdigest()
+    return {
+        **dict(identity),
+        "schema_version": FAST_UNORDERED_SOURCE,
+        "source": FAST_UNORDERED_SOURCE,
+        # Candidate legality is checked from the current canonical Tensor
+        # above.  Re-sorting all ~1M voxels on CPU merely to make another hash
+        # would dominate this lightweight proposal, so the already verified
+        # input content hash identifies the frame here.
+        "input_voxel_hash": str(identity["input_sha256"]),
+        "total_ratio": float(total_ratio),
+        "operation_shares": shares,
+        "operation_heuristics": {
+            name: "safety_spatial_sampling_no_rank" for name in pools
+        },
+        "operation_priority": ["Add", "Prune", "Adjust"],
+        "operation_edit_units": pools,
+        "heuristic_anchor_plan": {"available": False},
+        "proposal_policy": "fast_spatial_unordered_safe_pool_v1",
+        "full_plan_candidate_count": 1,
+        "actual_candidate_encode_count": 0,
+        "cache_path": "", "cache_signature": cache_signature,
+        "elapsed_sec": float(elapsed),
+        "proposal_timing": {
+            "total": float(elapsed),
+            "setup": float(setup_finished - started),
+            "spatial_sampling": float(sampling_finished - setup_finished),
+            "candidate_enumeration": float(
+                enumeration_finished - sampling_finished
+            ),
+            "occupancy_screening": float(
+                membership_finished - membership_started
+            ),
+            # The fast path deliberately has neither a SparsePCGC candidate
+            # probe nor a codec-derived ranking pass.
+            "codec_proxy": 0.0,
+            "geometry_risk": 0.0,
+            "deduplication_and_pool_build": float(
+                serialization_finished - serialization_started
+            ),
+        },
+        "proposal_pool_counts": {name: len(value) for name, value in pools.items()},
+        "proposal_sampled_source_count": int(sample_count),
+        "contains_candidate_actual": False,
+        "contains_heuristic_ranking": False,
     }
 
 
@@ -755,14 +1009,14 @@ def attach_ana_den6_online_guidance(
     *,
     device: torch.device,
 ) -> dict[str, Any]:
-    """den6 Exact edit-unit poolを訓練・評価用contextへ付与する。"""
+    """Configured unordered/exact edit-unit poolを訓練・評価contextへ付与する。"""
     mode = str(getattr(args, "heuristic_guidance_mode", "proxy_prior")).strip().lower()
     if mode != "ana_den6_online":
         return dict(context)
     if not isinstance(context, Mapping):
         raise RuntimeError("ana_den6 onlineにはfull-cloud canonical contextが必要である")
-    # 063943経路と同様に、den6が順位付けしたedit-unit集合とExact anchorを
-    # 最優先する。欠落時にGT proxyへ静かに劣化させない。
+    # 現行の既定は、候補別Actualを含まない事前計算済みcompact poolを使う。
+    # fast_unorderedは局所近傍だけへ簡略化した速度ablationとして明示指定する。
     timing_start = time.perf_counter()
     stats_before = dict(_CACHE_STATS)
     identity = None
@@ -777,7 +1031,16 @@ def attach_ana_den6_online_guidance(
         current_path = Path(current_input).expanduser().resolve() if current_input else None
         if current_path is not None and current_path.is_file():
             identity = _identity(args, current_path, _sha256_file(current_path))
-    payload = _load_exact_single_plan_teacher(args, identity) if identity is not None else None
+    proposal_mode = str(getattr(
+        # Old checkpoints/tests without the new option retain the exact-den6
+        # contract.  Current parsed args explicitly select exact_den6.
+        args, "heuristic_guidance_online_proposal_mode", "exact_den6"
+    )).strip().lower()
+    payload = None
+    if identity is not None and proposal_mode == "fast_unordered":
+        payload = _build_fast_unordered_teacher(context, args, identity)
+    elif identity is not None:
+        payload = _load_exact_single_plan_teacher(args, identity)
     if payload is None:
         if bool(getattr(args, "heuristic_guidance_require_exact_single_plan_teacher", True)):
             build_error = dict(
@@ -814,6 +1077,9 @@ def attach_ana_den6_online_guidance(
         ),
         "cache_root": str(getattr(args, "heuristic_guidance_online_cache_dir", "")),
         "input_file": str(getattr(args, "_current_input_file", "")),
+        "proposal_mode": proposal_mode,
+        "proposal_pool_counts": dict(payload.get("proposal_pool_counts", {}) or {}),
+        "proposal_timing": dict(payload.get("proposal_timing", {}) or {}),
     })
     payload["teacher_bootstrap_active"] = False
     payload["teacher_bootstrap_steps"] = 0

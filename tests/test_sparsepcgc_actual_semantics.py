@@ -38,7 +38,10 @@ from models.utils.pointcloud.ana_den6_reference import (
     _current_den6_sha256,
     attach_ana_den6_reference_anchor,
 )
-from models.utils.pointcloud.ana_den6_online import attach_ana_den6_online_guidance
+from models.utils.pointcloud.ana_den6_online import (
+    _build_fast_unordered_teacher,
+    attach_ana_den6_online_guidance,
+)
 from tools.ana_den6_online_worker import _compact_online_shortlist
 
 
@@ -681,6 +684,40 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
             )
         self.assertIs(result, sentinel)
         self.assertTrue(network.args._heuristic_guidance_network_only_forward)
+
+    def test_actor_critic_eval_keeps_candidate_pool_but_disables_sampling(self):
+        network = Network.__new__(Network)
+        torch.nn.Module.__init__(network)
+        network.args = SimpleNamespace(
+            heuristic_guidance_mode="ana_den6_online",
+            heuristic_guidance_online_selection_mode="actor_critic",
+            heuristic_guidance_enabled=True,
+            heuristic_guidance_network_only_inference=True,
+            full_cloud_activation_checkpoint=True,
+            encoder_0grad=False,
+        )
+        network.cost_attributor = SimpleNamespace()
+        network.policy_module = SimpleNamespace()
+        network.training = False
+        sentinel = ("actor-critic-eval",)
+        context = {"global_voxel_coords": torch.zeros((1, 3, 4), dtype=torch.long)}
+        attached = dict(context)
+        attached["ana_den6_ranked_candidate_guidance"] = {"source": "fixture"}
+        with patch(
+            "models.network.attach_ana_den6_online_guidance",
+            return_value=attached,
+        ) as attach, patch.object(
+            Network, "_maybe_fast_full_cloud_oracle_forward", return_value=sentinel,
+        ):
+            result = network.forward(
+                torch.zeros((1, 3, 4)),
+                None,
+                full_octree_context=context,
+                octree_input_mode="full_cloud",
+            )
+        self.assertIs(result, sentinel)
+        attach.assert_called_once()
+        self.assertFalse(network.args._heuristic_guidance_network_only_forward)
 
     def test_den6_online_batch_aggregate_preserves_worker_request_counter(self):
         gt_xyz = torch.zeros((1, 3, 4), dtype=torch.float32)
@@ -1723,6 +1760,38 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         )
         self.assertGreater(float(features[:, 1].abs().sum()), 0.0)
         self.assertGreater(float((logits[0] - logits[1]).abs()), 0.0)
+
+    def test_fast_unordered_pool_is_safe_and_contains_no_ranking_teacher(self):
+        coords = torch.tensor([
+            [2, 2, 2], [2, 2, 3], [2, 3, 2], [3, 2, 2],
+            [6, 6, 6], [6, 6, 7], [6, 7, 6], [7, 6, 6],
+        ], dtype=torch.long)
+        args = SimpleNamespace(
+            dataname="8i", sparsepcgc_scale_m=8,
+            sparsepcgc_native_resolution=15,
+            heuristic_guidance_total_ratio_percent=-1.0,
+            heuristic_guidance_operation_shares="",
+            heuristic_guidance_online_fast_pool_reserve_factor=2.0,
+            heuristic_guidance_online_fast_pool_max_per_operation=32,
+        )
+        payload = _build_fast_unordered_teacher(
+            {"global_voxel_coords": coords.T.unsqueeze(0)},
+            args,
+            {"input_sha256": "1" * 64, "setting_id": "unit"},
+        )
+        occupied = {tuple(row) for row in coords.tolist()}
+        self.assertFalse(payload["contains_candidate_actual"])
+        self.assertFalse(payload["contains_heuristic_ranking"])
+        for operation, pool in payload["operation_edit_units"].items():
+            self.assertTrue(pool)
+            for candidate in pool:
+                self.assertEqual(float(candidate["rank_score"]), 0.0)
+                self.assertEqual(float(candidate["heuristic_score"]), 0.0)
+                for source in candidate["remove_coords"]:
+                    self.assertIn(tuple(source), occupied)
+                for target in candidate["add_coords"]:
+                    self.assertNotIn(tuple(target), occupied)
+                self.assertEqual(candidate["operation"], operation)
 
     def test_learning_adaptive_exploration_requires_actual_action_evidence(self):
         actuator = StructureRepairActuator.__new__(StructureRepairActuator)

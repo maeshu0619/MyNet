@@ -1404,11 +1404,23 @@ def train(model, args, loss, writer, plot, notifier=None):
                     args,
                     compression_debug_terms,
                 )
-                network_only_trust_gate = (
-                    str(getattr(args, "heuristic_guidance_mode", "")).strip().lower()
-                    in {"network_only_codec_policy", "network_k_proposal_policy", "single_plan_student"}
+                guidance_mode_for_trust = str(getattr(
+                    args, "heuristic_guidance_mode", ""
+                )).strip().lower()
+                actor_critic_trust_gate = (
+                    guidance_mode_for_trust == "ana_den6_online"
+                    and str(getattr(
+                        args,
+                        "heuristic_guidance_online_selection_mode",
+                        "prior_residual",
+                    )).strip().lower() == "actor_critic"
                 )
-                if network_only_trust_gate:
+                strict_surrogate_trust_gate = (
+                    guidance_mode_for_trust
+                    in {"network_only_codec_policy", "network_k_proposal_policy", "single_plan_student"}
+                    or actor_critic_trust_gate
+                )
+                if strict_surrogate_trust_gate:
                     # A pretrained Surrogate from the legacy action
                     # distribution can initially be several percentage points
                     # wrong on Network-only plans.  Train that Surrogate on the
@@ -1441,14 +1453,19 @@ def train(model, args, loss, writer, plot, notifier=None):
                             / max(trust_high - trust_low, 1e-12)
                         )
                     surrogate_trust_debug.update({
-                        "network_only_surrogate_trust_gate": True,
+                        "network_only_surrogate_trust_gate": bool(
+                            not actor_critic_trust_gate
+                        ),
+                        "actor_critic_surrogate_trust_gate": bool(
+                            actor_critic_trust_gate
+                        ),
                         "surrogate_trust_value": float(surrogate_trust_value),
                         "network_only_surrogate_trust_error": float(trust_low),
                         "network_only_surrogate_disable_error": float(trust_high),
                     })
                 surrogate_loss_before_trust = finite_float_or_none(L_com_objective)
                 if float(surrogate_trust_value) < 1.0 and torch.is_tensor(L_com_objective):
-                    if network_only_trust_gate:
+                    if strict_surrogate_trust_gate:
                         # Teacher-STE: preserve the Actual forward scalar and
                         # scale only the Surrogate backward contribution.
                         L_com_objective = (
@@ -4824,6 +4841,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                     writer.write(
                         "Den6OnlineAudit: "
                         f"cache={dict(cache_stats) if isinstance(cache_stats, dict) else {}}, "
+                        f"proposal_timing={dict((getattr(args, '_ana_den6_online_last_timing', {}) or {}).get('proposal_timing', {}) or {})}, "
+                        f"proposal_wall={float((getattr(args, '_ana_den6_online_last_timing', {}) or {}).get('heuristic_pool_wall_time', 0.0) or 0.0):.6f}s, "
+                        f"proposal_pool_counts={dict((getattr(args, '_ana_den6_online_last_timing', {}) or {}).get('proposal_pool_counts', {}) or {})}, "
                         f"plan_count={int(audit_plan.get('plan_count', 0) or 0)}, "
                         f"pool_reference_count={int(audit_plan.get('pool_reference_count', 0) or 0)}, "
                         f"guidance_cpu_hit={bool(audit_plan.get('guidance_cpu_tensor_cache_hit', False))}, "
