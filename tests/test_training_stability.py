@@ -670,9 +670,12 @@ class TrainingStabilityTest(unittest.TestCase):
             best = torch.load(os.path.join(directory, "best.pth"), map_location="cpu")
             self.assertAlmostEqual(float(best["weight"]), 1.0)
             self.assertEqual(trackers["best_pth_source"], "best_fixed_rd")
-    def test_fixed_validation_records_ignore_moving_training_window(self):
+    def test_fixed_validation_records_are_disjoint_and_ignore_moving_window(self):
         dataset = SimpleNamespace(
-            all_files=["/tmp/frame_0001.ply", "/tmp/frame_0002.ply", "/tmp/frame_0003.ply"],
+            all_files=[
+                "/tmp/frame_0001.ply", "/tmp/frame_0002.ply", "/tmp/frame_0003.ply",
+                "/tmp/frame_0004.ply", "/tmp/frame_0005.ply",
+            ],
             files=["/tmp/frame_0001.ply", "/tmp/frame_0002.ply"],
         )
         args = SimpleNamespace(train_frames_per_sequence=3)
@@ -680,6 +683,10 @@ class TrainingStabilityTest(unittest.TestCase):
             args, [("sequence", dataset)], 2
         )
         self.assertTrue(created)
+        self.assertEqual(
+            [path for _, path in first],
+            ["/tmp/frame_0004.ply", "/tmp/frame_0005.ply"],
+        )
         dataset.files = ["/tmp/frame_0003.ply", "/tmp/frame_0001.ply"]
         second, created_again = fixed_full_cloud_validation_records(
             args, [("sequence", dataset)], 2

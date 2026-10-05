@@ -6252,20 +6252,30 @@ def _build_exact_occupancy_ste_term(args, terms, model, out_label, before_xyz, a
     return ste_term, debug
 
 def fixed_full_cloud_validation_records(args, seq_datasets, max_frames):
-    """訓練窓の更新に影響されないfull-cloud検証集合を一度だけ固定する。"""
+    """訓練frameと重複しないfull-cloud検証集合を一度だけ固定する。"""
     records = getattr(args, "_fixed_full_cloud_validation_records", None)
     if records is not None:
         return tuple(records), False
     records = []
     records_by_dataset = OrderedDict()
+    train_paths = set()
     for seq_dir, dataset in seq_datasets:
         source_files = list(
             getattr(dataset, "all_files", getattr(dataset, "files", ()))
         )
         train_limit = int(getattr(args, "train_frames_per_sequence", 0))
         if train_limit > 0:
-            source_files = source_files[:train_limit]
-        for file_path in source_files:
+            training_files = source_files[:train_limit]
+            validation_files = source_files[train_limit:]
+        else:
+            # Without an explicit split boundary an independent fixed set cannot
+            # be proven.  Refuse leakage instead of silently reusing train data.
+            training_files = source_files
+            validation_files = []
+        train_paths.update(
+            str(Path(path).expanduser().resolve()) for path in training_files
+        )
+        for file_path in validation_files:
             record = (dataset, str(Path(file_path).expanduser().resolve()))
             if bool(getattr(args, "train_all_datasets", False)):
                 dataset_name = getattr(
@@ -6302,7 +6312,21 @@ def fixed_full_cloud_validation_records(args, seq_datasets, max_frames):
             if not progressed:
                 break
     records = tuple(records)
+    validation_paths = {path for _, path in records}
+    overlap = train_paths & validation_paths
+    if overlap:
+        raise RuntimeError(
+            "fixed Validationとtrain frameが重複している: "
+            + ",".join(sorted(overlap)[:8])
+        )
+    if max_frames > 0 and len(records) < int(max_frames):
+        raise RuntimeError(
+            "独立fixed Validation frameが不足している: "
+            f"required={int(max_frames)}, available={len(records)}, "
+            f"train_frames_per_sequence={int(getattr(args, 'train_frames_per_sequence', 0))}"
+        )
     setattr(args, "_fixed_full_cloud_validation_records", records)
+    setattr(args, "_fixed_full_cloud_validation_train_paths", tuple(sorted(train_paths)))
     return records, True
 
 
@@ -6344,10 +6368,18 @@ def run_episode_full_cloud_validation(
     )
     if fixed_records_created:
         if writer is not None and hasattr(writer, "write"):
+            train_paths = tuple(getattr(
+                args, "_fixed_full_cloud_validation_train_paths", ()
+            ))
             writer.write(
                 "FixedFullCloudValidationSet: "
                 f"count={len(fixed_records)}, "
-                f"files={','.join(os.path.basename(path) for _, path in fixed_records)}"
+                f"files={','.join(os.path.basename(path) for _, path in fixed_records)}, "
+                f"train_count={len(train_paths)}, overlap=0"
+            )
+            writer.write(
+                "TrainFrameManifest: "
+                + ",".join(os.path.basename(path) for path in train_paths)
             )
 
     values = []

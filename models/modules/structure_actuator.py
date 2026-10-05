@@ -227,6 +227,12 @@ class StructureRepairActuator(nn.Module):
         # behavior exploration before Actual RD has supplied evidence.
         self._den6_actual_action_evidence = 0.0
         self._den6_actual_action_comparisons = 0
+        # Candidate Critic may assist proposal ordering only after executed
+        # Actual-RD preferences show above-chance ranking accuracy.  It starts
+        # with zero authority, so its dense proxy warm start cannot recreate
+        # the den6 ranking under another name.
+        self._den6_actual_candidate_critic_quality = 0.0
+        self._den6_actual_candidate_critic_comparisons = 0
         # Per-operation gate for the cache-derived local RD candidate feature.
         # It is a Network parameter (not a fixed heuristic weight): tanh(0)
         # makes the fresh policy exactly unchanged, then local/Actual credit
@@ -4008,18 +4014,32 @@ class StructureRepairActuator(nn.Module):
         )
         operation_one_hot = base_network_score.new_zeros((count, 3))
         operation_one_hot[:, int(operation_index)] = 1.0
-        features = torch.cat((
+        critic_features = torch.cat((
             base_feature.reshape(-1, 1),
             rank_feature.reshape(-1, 1),
             rate_feature.reshape(-1, 1),
             geometry_feature.reshape(-1, 1),
             operation_one_hot,
         ), dim=1)
-        actor_residual = self.den6_candidate_actor(features).reshape(-1)
+        # ProxyはCriticのdense warm-start教師には有用だが、Actorへそのまま渡すと
+        # optimistic_gainだけでden6順位を再構成できる。Actorは学習特徴を主入力にし、
+        # rate proxyは既定0、geometry riskだけ安全性情報として弱く残す。
+        actor_features = torch.cat((
+            base_feature.reshape(-1, 1),
+            rank_feature.reshape(-1, 1),
+            rate_feature.reshape(-1, 1) * float(getattr(
+                self.args, "heuristic_guidance_online_actor_rate_proxy_scale", 0.0
+            )),
+            geometry_feature.reshape(-1, 1) * float(getattr(
+                self.args, "heuristic_guidance_online_actor_geometry_proxy_scale", 0.25
+            )),
+            operation_one_hot,
+        ), dim=1)
+        actor_residual = self.den6_candidate_actor(actor_features).reshape(-1)
         # Proxy regression is Critic-only.  Detaching its input prevents the
         # dense all-candidate proxy target from updating the Actor's shared
         # point/voxel feature path indirectly before Actual plans are compared.
-        critic_output = self.den6_candidate_critic(features.detach())
+        critic_output = self.den6_candidate_critic(critic_features.detach())
         # Rate/geometry proxy values are observations, not action scores.  In
         # particular, do not add their hand-written combination to Q here:
         # doing so made a fresh Critic correlate ~1.0 with the local target and
@@ -4028,11 +4048,37 @@ class StructureRepairActuator(nn.Module):
         critic_uncertainty = torch.nn.functional.softplus(
             critic_output[:, 1]
         ).clamp_min(1e-4)
-        # Actor alone owns behavior.  Critic Q trains it through the explicit
-        # distillation/policy losses below, never by being injected into the
-        # forward ranking.
-        actor_logit = actor_residual
-        return actor_logit, critic_mean, critic_uncertainty, features
+        # Staged learned proposal: Critic Q may assist the Actor only after its
+        # ordering has been validated against executed Actual-RD replay.  Both
+        # the measured quality and accumulated Actual evidence are required;
+        # at step 0 this contribution is exactly zero.  The bounded residual
+        # cannot dominate the Actor even after calibration.
+        proposal_quality = min(max(float(getattr(
+            self, "_den6_actual_candidate_critic_quality", 0.0
+        )), 0.0), 1.0)
+        actual_evidence = min(max(float(getattr(
+            self, "_den6_actual_action_evidence", 0.0
+        )), 0.0), 1.0)
+        proposal_authority = float(proposal_quality * actual_evidence)
+        if proposal_authority > 0.0:
+            critic_centered = critic_mean - critic_mean.mean()
+            # The proposal path is disabled until Actual evidence exists.  On
+            # its first enabled step Critic variance can still be nearly zero;
+            # use a detached, finite scale floor so 0/near-0 normalization
+            # cannot inject Inf/NaN gradients into an otherwise valid Actor.
+            critic_scale = critic_centered.detach().square().mean().sqrt().clamp_min(1e-3)
+            critic_proposal_residual = 0.25 * torch.tanh(
+                critic_centered / critic_scale
+            )
+            actor_logit = (
+                actor_residual
+                + float(proposal_authority) * critic_proposal_residual
+            )
+        else:
+            # Do not leave a zero-multiplied Critic graph: 0 * an undefined
+            # normalization derivative is still NaN in backward.
+            actor_logit = actor_residual
+        return actor_logit, critic_mean, critic_uncertainty, actor_features
 
     def _select_den6_factorized_exploration_group(self, confidence_audit):
         """Choose one uncertain decision group without an Episode schedule."""
@@ -4331,12 +4377,16 @@ class StructureRepairActuator(nn.Module):
                 positive_bin_tensor.log()
                 - positive_bin_tensor.new_tensor(prior_total_ratio).log()
             ) / amount_temperature
-            # No-op starts below every positive den6 bin, so the untrained
-            # policy keeps the strong heuristic plan.  It can nevertheless be
-            # promoted by learned Actual-RD credit; no Episode schedule or
-            # target operation ratio is involved.
+            # No-op is a first-class action.  It starts slightly below the most
+            # plausible positive bin (rather than below *all* bins), so fresh
+            # stochastic training can observe edit-vs-no-edit while the
+            # deterministic policy does not become a forced No-op.  The offset
+            # is fixed and has no Episode/target-loss schedule.
+            noop_prior = positive_prior_logits.amax() + float(getattr(
+                self.args, "heuristic_guidance_online_noop_prior_offset", -0.50
+            ))
             prior_amount_logits = torch.cat([
-                positive_prior_logits.amin().reshape(1), positive_prior_logits
+                noop_prior.reshape(1), positive_prior_logits
             ])
             if actor_critic_selection:
                 # Amount is a plan-level decision observed only through one
@@ -4604,6 +4654,34 @@ class StructureRepairActuator(nn.Module):
         requested_counts = self._den6_allocate_counts(total_budget, shares_value)
         for name in operations:
             requested_counts[name] = min(max(int(requested_counts[name]), 0), len(pools[name]))
+        diagnostic_policy = str(getattr(
+            self.args, "heuristic_guidance_online_diagnostic_policy", "normal"
+        )).strip().lower()
+        if diagnostic_policy == "noop":
+            no_op_selected = True
+            selected_amount_bin = selected_amount_bin.new_zeros(())
+            # The diagnostic override is applied after the normal Amount
+            # decision.  Keep the executed action's score-function term in
+            # sync with that override; otherwise the no-op replay carries the
+            # positive Amount bin's log-probability (and can become entirely
+            # non-differentiable when the positive path was detached).
+            amount_bin_log_prob = amount_log_probs[selected_amount_bin]
+            amount_fine_log_prob = amount_fine_log_prob.detach() * 0.0
+            requested_counts = {name: 0 for name in operations}
+        elif diagnostic_policy == "heuristic":
+            anchor_plan = exact.get(
+                "heuristic_anchor_plan", exact.get("initial_heuristic_plan", {})
+            )
+            anchor_counts = (
+                dict(anchor_plan.get("operation_counts") or {})
+                if isinstance(anchor_plan, dict) else {}
+            )
+            if anchor_counts:
+                no_op_selected = False
+                requested_counts = {
+                    name: min(max(int(anchor_counts.get(name, 0)), 0), len(pools[name]))
+                    for name in operations
+                }
 
         # Adjustはremove+addの2 cellを変えるため、変更Voxel cell比も1%未満に制限する。
         minimum_changed_cells = 4 if exact_anchor_active else minimum_plan_count
@@ -4681,6 +4759,8 @@ class StructureRepairActuator(nn.Module):
         candidate_critic_values = {}
         candidate_critic_uncertainties = {}
         candidate_actor_features = {}
+        candidate_critic_features = {}
+        exploration_added_indices = {name: [] for name in operations}
         candidate_pairwise_weight = max(float(getattr(
             self.args,
             "heuristic_guidance_online_candidate_pairwise_weight",
@@ -4726,6 +4806,16 @@ class StructureRepairActuator(nn.Module):
                 candidate_critic_values[operation] = critic_value
                 candidate_critic_uncertainties[operation] = critic_uncertainty
                 candidate_actor_features[operation] = actor_features
+                # Keep full proxy observations for the plan Critic while the
+                # behavior Actor receives the restricted feature view above.
+                critic_features = actor_features.clone()
+                critic_features[:, 2] = self._den6_standardize_candidate_feature(
+                    mapping.get("local_rate_benefit", actor_logit.new_zeros(actor_logit.shape))
+                )
+                critic_features[:, 3] = self._den6_standardize_candidate_feature(
+                    mapping.get("local_geometry_risk", actor_logit.new_zeros(actor_logit.shape))
+                )
+                candidate_critic_features[operation] = critic_features
                 if self.training:
                     self._den6_factorized_group_uncertainty[
                         f"{operation}Where"
@@ -5136,20 +5226,84 @@ class StructureRepairActuator(nn.Module):
             remainder_order = remainder_order[
                 torch.isfinite(deterministic_remainder_score[remainder_order])
             ]
-            # Top-1 alone overstates exploration for a composite plan that
-            # selects hundreds of candidates.  Audit the pre-conflict selected
-            # set as well: 0 means the stochastic behavior plan equals the
-            # deterministic policy set, 1 means it is entirely different.
+            # Build an incumbent plan and change only a small, explicit subset.
+            # Sampling the complete requested set changed hundreds of candidates
+            # at once, so one Actual scalar could not identify their credit.
+            deterministic_order = torch.argsort(scaled_logits, descending=True)
+            if diagnostic_policy == "heuristic":
+                deterministic_order = torch.argsort(
+                    heuristic_for_top1, descending=True
+                )
+                operation_exploration_active = False
+            elif diagnostic_policy == "random_safe":
+                valid_indices = torch.nonzero(
+                    torch.isfinite(scaled_logits), as_tuple=False
+                ).reshape(-1)
+                random_order = valid_indices.index_select(
+                    0, torch.randperm(valid_indices.numel(), device=valid_indices.device)
+                )
+                invalid_indices = torch.nonzero(
+                    ~torch.isfinite(scaled_logits), as_tuple=False
+                ).reshape(-1)
+                deterministic_order = torch.cat((random_order, invalid_indices), dim=0)
+                operation_exploration_active = False
             audit_selection_count = min(
                 max(int(requested_counts[operation]), 0),
                 int(valid_for_top1.sum().detach().cpu()),
             )
             if audit_selection_count > 0:
-                deterministic_selection = set(torch.topk(
-                    scaled_logits, k=audit_selection_count
-                ).indices.detach().cpu().tolist())
+                deterministic_prefix = deterministic_order[:audit_selection_count]
+                if operation_exploration_active and audit_selection_count > max(int(getattr(
+                    self.args,
+                    "heuristic_guidance_online_exploration_max_candidate_changes",
+                    8,
+                )), 1):
+                    incumbent_mask = torch.zeros_like(scaled_logits, dtype=torch.bool)
+                    incumbent_mask[deterministic_prefix] = True
+                    alternatives = support_order[~incumbent_mask[support_order]]
+                    maximum_changes = max(int(getattr(
+                        self.args,
+                        "heuristic_guidance_online_exploration_max_candidate_changes",
+                        8,
+                    )), 1)
+                    change_count = min(
+                        maximum_changes,
+                        audit_selection_count,
+                        int(alternatives.numel()),
+                    )
+                    if change_count > 0:
+                        kept = deterministic_prefix[:-change_count]
+                        explored = alternatives[:change_count]
+                        behavior_prefix = torch.cat((kept, explored), dim=0)
+                        exploration_added_indices[operation] = [
+                            int(value) for value in explored.detach().cpu().tolist()
+                        ]
+                    else:
+                        behavior_prefix = deterministic_prefix
+                elif operation_exploration_active:
+                    # A genuinely small plan is already credit-identifiable;
+                    # preserve ordinary stochastic sampling instead of forcing
+                    # the deterministic incumbent.
+                    behavior_prefix = support_order[:audit_selection_count]
+                    exploration_added_indices[operation] = [
+                        int(value) for value in behavior_prefix.detach().cpu().tolist()
+                        if int(value) not in set(
+                            deterministic_prefix.detach().cpu().tolist()
+                        )
+                    ]
+                else:
+                    behavior_prefix = deterministic_prefix
+                selected_mask = torch.zeros_like(scaled_logits, dtype=torch.bool)
+                selected_mask[behavior_prefix] = True
+                deterministic_tail = deterministic_order[
+                    ~selected_mask[deterministic_order]
+                ]
+                order_tensor = torch.cat((behavior_prefix, deterministic_tail), dim=0)
+                deterministic_selection = set(
+                    deterministic_prefix.detach().cpu().tolist()
+                )
                 behavior_selection = set(
-                    support_order[:audit_selection_count].detach().cpu().tolist()
+                    behavior_prefix.detach().cpu().tolist()
                 )
                 exploration_selection_change_rates[operation] = (
                     1.0
@@ -5158,7 +5312,7 @@ class StructureRepairActuator(nn.Module):
                 )
             else:
                 exploration_selection_change_rates[operation] = 0.0
-            order_tensor = torch.cat([support_order, remainder_order], dim=0)
+                order_tensor = deterministic_order
             ordered_indices[operation] = order_tensor.cpu().tolist()
 
         candidate_local_loss = (
@@ -5765,7 +5919,7 @@ class StructureRepairActuator(nn.Module):
                     selected_q = candidate_critic_values[name].index_select(
                         0, index_tensor
                     )
-                    selected_features = candidate_actor_features[name].index_select(
+                    selected_features = candidate_critic_features[name].index_select(
                         0, index_tensor
                     )
                     plan_feature_parts.extend((
@@ -5859,6 +6013,7 @@ class StructureRepairActuator(nn.Module):
             "residual_alpha": float(residual_alpha),
             "candidate_policy_alpha": float(candidate_policy_alpha),
             "selection_mode": str(selection_mode),
+            "diagnostic_policy": str(diagnostic_policy),
             "factorized_exploration_group": str(factorized_exploration_group),
             "factorized_exploration_counts": dict(
                 getattr(self, "_den6_factorized_group_counts", {})
@@ -5875,6 +6030,20 @@ class StructureRepairActuator(nn.Module):
                 for name in operations
             },
             "network_plan_confidence": float(network_plan_confidence.cpu()),
+            "learned_proposal_actual_quality": float(getattr(
+                self, "_den6_actual_candidate_critic_quality", 0.0
+            )),
+            "learned_proposal_actual_comparisons": int(getattr(
+                self, "_den6_actual_candidate_critic_comparisons", 0
+            )),
+            "learned_proposal_authority": float(
+                min(max(float(getattr(
+                    self, "_den6_actual_candidate_critic_quality", 0.0
+                )), 0.0), 1.0)
+                * min(max(float(getattr(
+                    self, "_den6_actual_action_evidence", 0.0
+                )), 0.0), 1.0)
+            ),
             "network_confidence_audit": network_confidence_audit,
             "residual_changed_candidate_count": int(residual_changed_count),
             "residual_changed_candidate_ratio": float(residual_changed_ratio),
@@ -6092,7 +6261,12 @@ class StructureRepairActuator(nn.Module):
             # Internal differentiable state for same-frame Actual set
             # comparison.  These values are consumed after the single
             # composite codec encode and are not candidate codec evaluations.
-            "_actual_credit_network_scores": network_scores,
+            # In actor_critic mode Actual preference must update the Actor
+            # logits, not the upstream legacy base score.  The old tensor here
+            # silently bypassed den6_candidate_actor.
+            "_actual_credit_network_scores": (
+                candidate_value_scores if actor_critic_selection else network_scores
+            ),
             "_actual_credit_candidate_ids": {
                 name: [str(candidate.get("candidate_id", "")) for candidate in pools[name]]
                 for name in operations
@@ -6103,6 +6277,58 @@ class StructureRepairActuator(nn.Module):
                     for index in selected_indices_by_operation[name]
                 ]
                 for name in operations
+            },
+            "_actual_credit_explored_indices": {
+                name: [
+                    int(index) for index in exploration_added_indices[name]
+                    if int(index) in set(selected_indices_by_operation[name])
+                ]
+                for name in operations
+            },
+            "_actual_credit_explored_features": {
+                name: (
+                    candidate_actor_features[name].index_select(
+                        0,
+                        torch.as_tensor(
+                            [
+                                int(index) for index in exploration_added_indices[name]
+                                if int(index) in set(selected_indices_by_operation[name])
+                            ],
+                            device=candidate_actor_features[name].device,
+                            dtype=torch.long,
+                        ),
+                    )
+                    if actor_critic_selection and any(
+                        int(index) in set(selected_indices_by_operation[name])
+                        for index in exploration_added_indices[name]
+                    )
+                    else action_ratio_stack.new_empty((0, 7))
+                )
+                for name in operations
+            },
+            "_actual_credit_explored_critic_features": {
+                name: (
+                    candidate_critic_features[name].index_select(
+                        0,
+                        torch.as_tensor(
+                            [
+                                int(index) for index in exploration_added_indices[name]
+                                if int(index) in set(selected_indices_by_operation[name])
+                            ],
+                            device=candidate_critic_features[name].device,
+                            dtype=torch.long,
+                        ),
+                    )
+                    if actor_critic_selection and any(
+                        int(index) in set(selected_indices_by_operation[name])
+                        for index in exploration_added_indices[name]
+                    )
+                    else action_ratio_stack.new_empty((0, 7))
+                )
+                for name in operations
+            },
+            "exploration_candidate_changes": {
+                name: len(exploration_added_indices[name]) for name in operations
             },
             "_actor_critic_plan_feature": plan_feature,
             "_actor_critic_plan_value": plan_critic_mean,

@@ -786,7 +786,30 @@ def _load_exact_single_plan_teacher(
         teacher.pop("operation_candidate_pools", None)
         teacher.pop("ranked_candidate_pools", None)
         teacher.pop("initial_heuristic_plan", None)
-        teacher["operation_edit_units"] = dict(edit_units)
+        # Cacheはanchorを先頭へ置いたrank-aware順序で保存されている。Actorが
+        # rank featureを無効にしても、同点時の配列順だけでden6順位を復元できて
+        # しまうため、合法candidateの内容を変えず安定した空間hash順へ並べ直す。
+        # これはrandom候補生成ではなく、全rank/空間/operationを保持したunordered
+        # safe poolへの変換である。candidate別Actual値は参照しない。
+        def _stable_spatial_key(unit):
+            coords = []
+            for field in ("remove_coords", "add_coords", "affected_cells"):
+                value = unit.get(field, ()) if isinstance(unit, Mapping) else ()
+                if isinstance(value, (list, tuple)):
+                    coords.extend(value[:2])
+            token = "|".join(
+                ",".join(str(int(axis)) for axis in row[:3])
+                for row in coords if isinstance(row, (list, tuple)) and len(row) >= 3
+            )
+            token += "|" + str(unit.get("candidate_id", ""))
+            digest = hashlib.blake2b(token.encode("utf-8"), digest_size=8).digest()
+            return int.from_bytes(digest, byteorder="little", signed=False)
+
+        teacher["operation_edit_units"] = {
+            name: sorted(list(edit_units[name]), key=_stable_spatial_key)
+            for name in ("Add", "Prune", "Adjust")
+        }
+        teacher["runtime_pool_order_policy"] = "stable_spatial_hash_unordered_v1"
         teacher["heuristic_anchor_plan"] = dict(anchor_plan)
         teacher["legacy_den6_source"] = str(candidate.get("source", ""))
         # Downstream formula contract remains v8; the cache identity/policy above
@@ -802,6 +825,7 @@ def _load_exact_single_plan_teacher(
                 str(path.resolve()),
                 str(identity["input_sha256"]),
                 str(candidate.get("shortlist_policy", "")),
+                "stable_spatial_hash_unordered_v1",
                 str(int(cache_stat.st_size)),
                 str(int(cache_stat.st_mtime_ns)),
             )).encode("utf-8")

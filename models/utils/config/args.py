@@ -2501,12 +2501,20 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--heuristic_guidance_online_actor_proxy_weight',
-        default=0.05,
+        default=0.005,
         type=float,
         help=(
-            'codec-context local RD proxyをActorの低分散補助信号にする重み。'
-            'Heuristic順位は含まず、Actual RD creditを主教師のまま逆順位化を防ぐ'
+            'codec-context local RD proxyをActorへ与えるwarm-start補助重み。'
+            'Actual経験を支配しない値に限定する'
         ),
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_actor_rate_proxy_scale', default=0.0, type=float,
+        help='optimistic gain由来rate特徴をActorへ入れる倍率。Criticは常に受け取る',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_actor_geometry_proxy_scale', default=0.25, type=float,
+        help='安全性のためActorへ残すgeometry-risk特徴の倍率',
     )
     parser.add_argument(
         '--heuristic_guidance_online_actor_critic_distill_weight',
@@ -2545,6 +2553,43 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument(
         '--heuristic_guidance_online_factorized_ucb_scale', default=0.25, type=float,
         help='coverage UCBに加えるdecision group不確実性の係数。Episode番号には依存しない',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_exploration_max_candidate_changes', default=8, type=int,
+        help='1回のWhere探索でincumbentから入れ替えるcandidate上限',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_noop_prior_offset', default=-0.50, type=float,
+        help='最良positive Amount priorに対するNo-op logit差',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_actual_actor_replay_weight', default=0.20, type=float,
+        help='比較可能contextのActual RD preferenceをActorへ返す重み',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_actual_candidate_critic_replay_weight', default=0.20, type=float,
+        help='比較可能contextのActual RD preferenceをcandidate Criticへ返す重み',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_actual_actor_replay_entries', default=512, type=int,
+        help='Actual Actor replayの最大件数',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_actual_actor_replay_batch', default=16, type=int,
+        help='1 StepでActor Actual preferenceへ使う経験数',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_actual_actor_min_delta', default=0.05, type=float,
+        help='Actor Actual preferenceに使う最小RD差[percentage point]',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_actual_actor_cross_frame_weight', default=0.25, type=float,
+        help='同一sequence・decision groupの別frame比較に掛ける信頼係数',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_diagnostic_policy', default='normal',
+        choices=['normal', 'noop', 'random_safe', 'heuristic'],
+        help='Step-0診断専用policy override。通常学習はnormal',
     )
     parser.add_argument(
         '--heuristic_guidance_online_memory_entries',
@@ -4389,14 +4434,47 @@ def parse_pugan_args(parser, file_day, file_time):
         args, "heuristic_guidance_online_gumbel_logit_floor", 0.10
     )), 0.0)
     args.heuristic_guidance_online_actor_proxy_weight = max(float(getattr(
-        args, "heuristic_guidance_online_actor_proxy_weight", 0.05
+        args, "heuristic_guidance_online_actor_proxy_weight", 0.005
     )), 0.0)
+    args.heuristic_guidance_online_actor_rate_proxy_scale = min(max(float(getattr(
+        args, "heuristic_guidance_online_actor_rate_proxy_scale", 0.0
+    )), 0.0), 1.0)
+    args.heuristic_guidance_online_actor_geometry_proxy_scale = min(max(float(getattr(
+        args, "heuristic_guidance_online_actor_geometry_proxy_scale", 0.25
+    )), 0.0), 1.0)
     args.heuristic_guidance_online_actor_use_rank_feature = bool(getattr(
         args, "heuristic_guidance_online_actor_use_rank_feature", False
     ))
     args.heuristic_guidance_exploration_min_fraction = min(max(float(getattr(
         args, "heuristic_guidance_exploration_min_fraction", 0.25
     )), 0.0), 1.0)
+    args.heuristic_guidance_online_exploration_max_candidate_changes = max(int(getattr(
+        args, "heuristic_guidance_online_exploration_max_candidate_changes", 8
+    )), 1)
+    args.heuristic_guidance_online_noop_prior_offset = min(max(float(getattr(
+        args, "heuristic_guidance_online_noop_prior_offset", -0.50
+    )), -8.0), 0.0)
+    args.heuristic_guidance_online_actual_actor_replay_weight = max(float(getattr(
+        args, "heuristic_guidance_online_actual_actor_replay_weight", 0.20
+    )), 0.0)
+    args.heuristic_guidance_online_actual_candidate_critic_replay_weight = max(float(getattr(
+        args, "heuristic_guidance_online_actual_candidate_critic_replay_weight", 0.20
+    )), 0.0)
+    args.heuristic_guidance_online_actual_actor_replay_entries = max(int(getattr(
+        args, "heuristic_guidance_online_actual_actor_replay_entries", 512
+    )), 1)
+    args.heuristic_guidance_online_actual_actor_replay_batch = max(int(getattr(
+        args, "heuristic_guidance_online_actual_actor_replay_batch", 16
+    )), 1)
+    args.heuristic_guidance_online_actual_actor_min_delta = max(float(getattr(
+        args, "heuristic_guidance_online_actual_actor_min_delta", 0.05
+    )), 0.0)
+    args.heuristic_guidance_online_actual_actor_cross_frame_weight = min(max(float(getattr(
+        args, "heuristic_guidance_online_actual_actor_cross_frame_weight", 0.25
+    )), 0.0), 1.0)
+    args.heuristic_guidance_online_diagnostic_policy = str(getattr(
+        args, "heuristic_guidance_online_diagnostic_policy", "normal"
+    )).strip().lower()
     args.heuristic_guidance_online_amount_log_sigma = min(max(
         float(getattr(args, "heuristic_guidance_online_amount_log_sigma", 0.08)), 0.0
     ), 0.50)

@@ -2594,9 +2594,25 @@ def train(model, args, loss, writer, plot, notifier=None):
                         getattr(base_model_for_policy, "last_discrete_policy_debug", {}) or {}
                     )
                     if not policy_debug:
-                        raise RuntimeError(
-                            f"{heuristic_mode}のsingle-proposal policy項が生成されていない"
-                        )
+                        diagnostic_policy = str(getattr(
+                            args,
+                            "heuristic_guidance_online_diagnostic_policy",
+                            "normal",
+                        )).strip().lower()
+                        if heuristic_mode == "ana_den6_online" and diagnostic_policy == "noop":
+                            # A forced no-op has no executed discrete Where/Gate/Fine
+                            # decision to reinforce.  It is a read-only Phase-A
+                            # reference, so absence of a score-function term is the
+                            # correct result rather than a broken training path.
+                            policy_debug = {
+                                "diagnostic_noop_reference": True,
+                                "global_credit_available": False,
+                                "actual_actor_replay_pairs": 0,
+                            }
+                        else:
+                            raise RuntimeError(
+                                f"{heuristic_mode}のsingle-proposal policy項が生成されていない"
+                            )
                     compression_debug_terms.update({
                         f"den6_online_policy_{key}": value
                         for key, value in policy_debug.items()
@@ -4882,6 +4898,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                         f"network_confidence=(mode={audit_plan.get('network_confidence_mode', '')}, "
                         f"plan={float(audit_plan.get('network_plan_confidence', 0.0) or 0.0):.6f}, "
                         f"by_op={dict(audit_plan.get('network_confidence_by_operation') or {})}), "
+                        f"learned_proposal=(quality={float(audit_plan.get('learned_proposal_actual_quality', 0.0) or 0.0):.4f}, "
+                        f"comparisons={int(audit_plan.get('learned_proposal_actual_comparisons', 0) or 0)}, "
+                        f"authority={float(audit_plan.get('learned_proposal_authority', 0.0) or 0.0):.4f}), "
                         f"policy_baseline_source={str(audit_compression.get('den6_online_policy_objective_baseline_source', ''))}, "
                         f"policy_baseline={float(audit_compression.get('den6_online_policy_objective_baseline', 0.0) or 0.0):.6f}, "
                         f"policy_advantage={float(audit_compression.get('den6_online_policy_advantage', 0.0) or 0.0):.6f}, "
@@ -4898,6 +4917,15 @@ def train(model, args, loss, writer, plot, notifier=None):
                         f"pairs={int(audit_compression.get('den6_online_policy_actual_set_contrast_pairs', 0) or 0)}, "
                         f"evidence={float(audit_compression.get('den6_online_policy_actual_set_contrast_evidence', 0.0) or 0.0):.4f}, "
                         f"incumbent_update={bool(audit_compression.get('den6_online_policy_actual_set_incumbent_updated', False))}), "
+                        f"actual_actor_replay=(raw={float(audit_compression.get('den6_online_policy_actual_actor_replay_raw', 0.0) or 0.0):.6g}, "
+                        f"weighted={float(audit_compression.get('den6_online_policy_actual_actor_replay_weighted', 0.0) or 0.0):.6g}, "
+                        f"pairs={int(audit_compression.get('den6_online_policy_actual_actor_replay_pairs', 0) or 0)}, "
+                        f"exact={int(audit_compression.get('den6_online_policy_actual_actor_replay_exact_pairs', 0) or 0)}, "
+                        f"accuracy={float(audit_compression.get('den6_online_policy_actual_actor_replay_accuracy', 0.0) or 0.0):.4f}, "
+                        f"stored={int(audit_compression.get('den6_online_policy_actual_actor_replay_count', 0) or 0)}), "
+                        f"actual_candidate_critic_replay=(raw={float(audit_compression.get('den6_online_policy_actual_candidate_critic_replay_raw', 0.0) or 0.0):.6g}, "
+                        f"weighted={float(audit_compression.get('den6_online_policy_actual_candidate_critic_replay_weighted', 0.0) or 0.0):.6g}, "
+                        f"accuracy={float(audit_compression.get('den6_online_policy_actual_candidate_critic_replay_accuracy', 0.0) or 0.0):.4f}), "
                         f"policy_global_available={bool(audit_compression.get('den6_online_policy_global_actual_credit_available', False))}, "
                         f"policy_global_confidence={float(audit_compression.get('den6_online_policy_global_actual_credit_confidence', 0.0) or 0.0):.4f}, "
                         f"policy_global_weight={float(audit_compression.get('den6_online_policy_global_actual_credit_weight', 0.0) or 0.0):.4f}, "
@@ -4948,6 +4976,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                         f"rate={float(audit_plan.get('exploration_top1_changed_rate', 0.0) or 0.0):.3f}, "
                         f"heuristic_selected={dict(audit_plan.get('exploration_heuristic_top1_selected') or {})}, "
                         f"selected_set_change={dict(audit_plan.get('exploration_selection_change_rate') or {})}), "
+                        f"exploration_candidate_changes={dict(audit_plan.get('exploration_candidate_changes') or {})}, "
                         f"where_gumbel_audit={dict(audit_plan.get('where_gumbel_audit') or {})}, "
                         f"exploration=(active={bool(audit_plan.get('exploration_active', False))}, "
                         f"alternatives={bool(audit_plan.get('has_where_alternatives', False))}, "

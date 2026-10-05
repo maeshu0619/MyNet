@@ -970,6 +970,56 @@ class Network(nn.Module):
             )), 0.0), 1.0)
             if actor_critic_selection else 1.0
         )
+        # Learn the binary edit/no-edit decision only from executed Actual
+        # outcomes.  Store best observed RD per action and compare the opposite
+        # action on a later Amount exploration.  No heuristic operation ratio or
+        # Episode schedule is used, and no additional codec call is required.
+        noop_edit_comparison_available = False
+        noop_edit_comparison_exact = False
+        if actor_critic_selection and factorized_group == "Amount":
+            noop_selected = bool(plan_debug_state.get("no_op_selected", False))
+            noop_memory = getattr(self, "_den6_noop_edit_actual_memory", None)
+            if noop_memory is None:
+                noop_memory = OrderedDict()
+                self._den6_noop_edit_actual_memory = noop_memory
+            action_name = "noop" if noop_selected else "edit"
+            opposite_name = "edit" if noop_selected else "noop"
+            frame_entry = noop_memory.setdefault(str(cache_key), {})
+            sequence_entry = noop_memory.setdefault(str(sequence_key), {})
+            opposite_value = frame_entry.get(opposite_name)
+            if opposite_value is not None:
+                noop_edit_comparison_available = True
+                noop_edit_comparison_exact = True
+                advantage = advantage.new_tensor(
+                    float(opposite_value) - float(objective_value)
+                ).clamp(-advantage_clip, advantage_clip)
+            elif opposite_name in sequence_entry:
+                noop_edit_comparison_available = True
+                advantage = advantage.new_tensor(
+                    min(max(float(getattr(
+                        self.args,
+                        "heuristic_guidance_online_actual_actor_cross_frame_weight",
+                        0.25,
+                    )), 0.0), 1.0)
+                    * (float(sequence_entry[opposite_name]) - float(objective_value))
+                ).clamp(-advantage_clip, advantage_clip)
+            if noop_edit_comparison_available:
+                global_credit_available = True
+                baseline_source = (
+                    "actual_noop_edit_frame" if noop_edit_comparison_exact
+                    else "actual_noop_edit_sequence"
+                )
+                global_credit_confidence = max(global_credit_confidence, 0.25)
+            frame_entry[action_name] = min(
+                float(frame_entry.get(action_name, float("inf"))), objective_value
+            )
+            sequence_entry[action_name] = min(
+                float(sequence_entry.get(action_name, float("inf"))), objective_value
+            )
+            noop_memory.move_to_end(str(cache_key))
+            noop_memory.move_to_end(str(sequence_key))
+            while len(noop_memory) > 1024:
+                noop_memory.popitem(last=False)
         policy_core_raw = (
             -float(global_credit_confidence) * advantage * log_prob.float().mean()
             if global_credit_available
@@ -1357,6 +1407,279 @@ class Network(nn.Module):
             )), 1)
             while len(plan_memory) > plan_memory_capacity:
                 plan_memory.popitem(last=False)
+
+        # Candidate Actual replay: factorized Where exploration changes at most
+        # a few candidates, so comparable sequence/group outcomes can supervise
+        # the Actor without candidate-wise codec encodes.  Exact-frame pairs get
+        # full weight; normalized same-sequence pairs are deliberately weaker.
+        actual_actor_replay_raw = objective.new_zeros(())
+        actual_actor_replay_weighted = objective.new_zeros(())
+        actual_actor_replay_pairs = 0
+        actual_actor_replay_exact_pairs = 0
+        actual_actor_replay_count = 0
+        actual_candidate_critic_replay_raw = objective.new_zeros(())
+        actual_candidate_critic_replay_weighted = objective.new_zeros(())
+        actual_actor_replay_accuracy = 0.0
+        actual_candidate_critic_replay_accuracy = 0.0
+        explored_features = (
+            plan_debug.get("_actual_credit_explored_features", {})
+            if isinstance(plan_debug, dict) else {}
+        )
+        replay_operation = (
+            factorized_group[:-5]
+            if factorized_group.endswith("Where") else ""
+        )
+        current_features = (
+            explored_features.get(replay_operation)
+            if isinstance(explored_features, dict) and replay_operation else None
+        )
+        explored_critic_features = (
+            plan_debug.get("_actual_credit_explored_critic_features", {})
+            if isinstance(plan_debug, dict) else {}
+        )
+        current_critic_features = (
+            explored_critic_features.get(replay_operation)
+            if isinstance(explored_critic_features, dict) and replay_operation else None
+        )
+        actor_replay = getattr(self, "_den6_actual_actor_replay", None)
+        if actor_replay is None:
+            actor_replay = []
+            self._den6_actual_actor_replay = actor_replay
+        if (
+            actor_critic_selection
+            and torch.is_tensor(current_features)
+            and current_features.ndim == 2
+            and int(current_features.shape[0]) > 0
+        ):
+            current_actor_scores = self.actuator.den6_candidate_actor(
+                current_features
+            ).reshape(-1)
+            current_critic_scores = (
+                self.actuator.den6_candidate_critic(
+                    current_critic_features.detach()
+                )[:, 0].reshape(-1)
+                if torch.is_tensor(current_critic_features)
+                and current_critic_features.ndim == 2
+                and int(current_critic_features.shape[0]) > 0
+                else None
+            )
+            minimum_delta = max(float(getattr(
+                self.args, "heuristic_guidance_online_actual_actor_min_delta", 0.05
+            )), 0.0)
+            cross_frame_weight = min(max(float(getattr(
+                self.args,
+                "heuristic_guidance_online_actual_actor_cross_frame_weight",
+                0.25,
+            )), 0.0), 1.0)
+            replay_batch = max(int(getattr(
+                self.args, "heuristic_guidance_online_actual_actor_replay_batch", 16
+            )), 1)
+            preference_terms = []
+            critic_preference_terms = []
+            actor_preference_accuracies = []
+            critic_preference_accuracies = []
+            current_advantage_value = float(advantage.detach().cpu())
+            for record in reversed(actor_replay):
+                if len(preference_terms) >= replay_batch:
+                    break
+                if (
+                    str(record.get("sequence_key", "")) != str(sequence_key)
+                    or str(record.get("factorized_group", "")) != factorized_group
+                    or str(record.get("operation", "")) != replay_operation
+                ):
+                    continue
+                exact_pair = str(record.get("cache_key", "")) == str(cache_key)
+                # Exact-frame pairs can compare the raw RD objective.  Across
+                # frames, compare each outcome relative to its sequence/group
+                # baseline instead; raw frame difficulty otherwise becomes a
+                # false candidate preference even after percent normalization.
+                delta = (
+                    float(record.get("actual_rd", 0.0)) - current_objective_value
+                    if exact_pair else
+                    current_advantage_value
+                    - float(record.get("actual_advantage", 0.0))
+                )
+                if abs(delta) < minimum_delta:
+                    continue
+                old_features = record.get("candidate_features")
+                if not torch.is_tensor(old_features) or old_features.numel() == 0:
+                    continue
+                old_features = old_features.to(
+                    device=current_features.device,
+                    dtype=current_features.dtype,
+                )
+                old_actor_scores = self.actuator.den6_candidate_actor(
+                    old_features
+                ).reshape(-1)
+                current_is_better = 1.0 if delta > 0.0 else -1.0
+                comparison_weight = 1.0 if exact_pair else cross_frame_weight
+                actor_differences = (
+                    current_actor_scores.reshape(-1, 1)
+                    - old_actor_scores.reshape(1, -1)
+                )
+                preference_terms.append(
+                    float(comparison_weight) * torch.nn.functional.softplus(
+                        -float(current_is_better)
+                        * actor_differences / 0.25
+                    ).mean()
+                )
+                actor_preference_accuracies.append(float(
+                    (
+                        float(current_is_better) * actor_differences.detach() > 0.0
+                    ).float().mean().cpu()
+                ))
+                old_critic_features = record.get("candidate_critic_features")
+                if (
+                    current_critic_scores is not None
+                    and torch.is_tensor(old_critic_features)
+                    and old_critic_features.numel() > 0
+                ):
+                    old_critic_features = old_critic_features.to(
+                        device=current_features.device,
+                        dtype=current_features.dtype,
+                    )
+                    old_critic_scores = self.actuator.den6_candidate_critic(
+                        old_critic_features.detach()
+                    )[:, 0].reshape(-1)
+                    critic_differences = (
+                        current_critic_scores.reshape(-1, 1)
+                        - old_critic_scores.reshape(1, -1)
+                    )
+                    critic_preference_terms.append(
+                        float(comparison_weight) * torch.nn.functional.softplus(
+                            -float(current_is_better)
+                            * critic_differences / 0.25
+                        ).mean()
+                    )
+                    critic_preference_accuracies.append(float(
+                        (
+                            float(current_is_better) * critic_differences.detach() > 0.0
+                        ).float().mean().cpu()
+                    ))
+                actual_actor_replay_pairs += 1
+                actual_actor_replay_exact_pairs += int(exact_pair)
+            if preference_terms:
+                actual_actor_replay_accuracy = sum(
+                    actor_preference_accuracies
+                ) / float(max(len(actor_preference_accuracies), 1))
+                actual_actor_replay_raw = torch.stack(preference_terms).mean()
+                actual_actor_weight = max(float(getattr(
+                    self.args,
+                    "heuristic_guidance_online_actual_actor_replay_weight",
+                    0.20,
+                )), 0.0)
+                actual_actor_replay_weighted = (
+                    float(actual_actor_weight)
+                    * actual_actor_replay_raw
+                    / float(policy_backward_scale)
+                )
+                policy_loss = policy_loss + actual_actor_replay_weighted
+                if actuator_for_evidence is not None:
+                    evidence_alpha = 1.0 / float(max(int(getattr(
+                        self.args,
+                        "heuristic_guidance_online_actual_actor_replay_entries",
+                        512,
+                    )), 1))
+                    previous_evidence = min(max(float(getattr(
+                        actuator_for_evidence, "_den6_actual_action_evidence", 0.0
+                    )), 0.0), 1.0)
+                    actuator_for_evidence._den6_actual_action_evidence = (
+                        (1.0 - evidence_alpha) * previous_evidence + evidence_alpha
+                    )
+                    actuator_for_evidence._den6_actual_action_comparisons = int(getattr(
+                        actuator_for_evidence, "_den6_actual_action_comparisons", 0
+                    )) + len(preference_terms)
+            if critic_preference_terms:
+                actual_candidate_critic_replay_accuracy = sum(
+                    critic_preference_accuracies
+                ) / float(max(len(critic_preference_accuracies), 1))
+                actual_candidate_critic_replay_raw = torch.stack(
+                    critic_preference_terms
+                ).mean()
+                critic_replay_weight = max(float(getattr(
+                    self.args,
+                    "heuristic_guidance_online_actual_candidate_critic_replay_weight",
+                    0.20,
+                )), 0.0)
+                actual_candidate_critic_replay_weighted = (
+                    float(critic_replay_weight)
+                    * actual_candidate_critic_replay_raw
+                    / float(policy_backward_scale)
+                )
+                policy_loss = policy_loss + actual_candidate_critic_replay_weighted
+                if actuator_for_evidence is not None:
+                    comparison_count = int(getattr(
+                        actuator_for_evidence,
+                        "_den6_actual_candidate_critic_comparisons",
+                        0,
+                    )) + len(critic_preference_terms)
+                    coverage = min(float(comparison_count) / 32.0, 1.0)
+                    observed_quality = coverage * max(
+                        2.0 * (actual_candidate_critic_replay_accuracy - 0.5),
+                        0.0,
+                    )
+                    previous_quality = min(max(float(getattr(
+                        actuator_for_evidence,
+                        "_den6_actual_candidate_critic_quality",
+                        0.0,
+                    )), 0.0), 1.0)
+                    actuator_for_evidence._den6_actual_candidate_critic_quality = (
+                        0.9 * previous_quality
+                        + 0.1 * min(max(observed_quality, 0.0), 1.0)
+                    )
+                    actuator_for_evidence._den6_actual_candidate_critic_comparisons = (
+                        comparison_count
+                    )
+            # Retain only the actually perturbed candidates.  Keeping the
+            # complete composite-plan ID list (hundreds/thousands of Python
+            # strings per record) made the bounded tensor replay unbounded in
+            # host memory and contributed no candidate-level contrast.
+            explored_indices_for_replay = (
+                plan_debug.get("_actual_credit_explored_indices", {}).get(
+                    replay_operation, ()
+                )
+                if isinstance(plan_debug, dict) and replay_operation else ()
+            )
+            operation_ids_for_replay = (
+                tuple(candidate_ids_by_operation.get(replay_operation, ()))
+                if isinstance(candidate_ids_by_operation, dict) else ()
+            )
+            selected_ids_for_replay = tuple(
+                operation_ids_for_replay[int(index)]
+                for index in explored_indices_for_replay
+                if 0 <= int(index) < len(operation_ids_for_replay)
+            )
+            actor_replay.append({
+                "sequence_key": str(sequence_key),
+                "cache_key": str(cache_key),
+                "factorized_group": str(factorized_group),
+                "operation": str(replay_operation),
+                "candidate_features": current_features.detach().to(
+                    device="cpu", dtype=torch.float16
+                ),
+                "candidate_critic_features": (
+                    current_critic_features.detach().to(
+                        device="cpu", dtype=torch.float16
+                    )
+                    if torch.is_tensor(current_critic_features)
+                    else torch.empty((0, 7), dtype=torch.float16)
+                ),
+                "selected_candidate_ids": selected_ids_for_replay,
+                "behavior_probability": float(
+                    log_prob.detach().float().mean().exp().clamp(max=1.0).cpu()
+                ),
+                "actual_rate": float(objective.detach().cpu()),
+                "geometry": float(geometry_objective_for_rd.detach().cpu()),
+                "actual_rd": float(current_objective_value),
+                "actual_advantage": float(current_advantage_value),
+                "actual_advantage_vs_noop": float(-current_objective_value),
+            })
+            replay_capacity = max(int(getattr(
+                self.args, "heuristic_guidance_online_actual_actor_replay_entries", 512
+            )), 1)
+            if len(actor_replay) > replay_capacity:
+                del actor_replay[:-replay_capacity]
+        actual_actor_replay_count = len(actor_replay)
         local_plan_credit_debug = {}
         for state_name, arg_name, debug_name in (
             (
@@ -1567,6 +1890,23 @@ class Network(nn.Module):
             "actual_set_contrast_pairs": int(actual_set_contrast_pairs),
             "actual_set_contrast_evidence": float(actual_set_contrast_evidence),
             "actual_set_incumbent_updated": bool(actual_set_incumbent_updated),
+            "actual_actor_replay_raw": float(actual_actor_replay_raw.detach().cpu()),
+            "actual_actor_replay_weighted": float(
+                actual_actor_replay_weighted.detach().cpu()
+            ),
+            "actual_actor_replay_pairs": int(actual_actor_replay_pairs),
+            "actual_actor_replay_exact_pairs": int(actual_actor_replay_exact_pairs),
+            "actual_actor_replay_count": int(actual_actor_replay_count),
+            "actual_actor_replay_accuracy": float(actual_actor_replay_accuracy),
+            "actual_candidate_critic_replay_raw": float(
+                actual_candidate_critic_replay_raw.detach().cpu()
+            ),
+            "actual_candidate_critic_replay_weighted": float(
+                actual_candidate_critic_replay_weighted.detach().cpu()
+            ),
+            "actual_candidate_critic_replay_accuracy": float(
+                actual_candidate_critic_replay_accuracy
+            ),
             "log_prob": float(log_prob.detach().float().mean().cpu()),
             "entropy": float(entropy.detach().float().mean().cpu()) if torch.is_tensor(entropy) else 0.0,
             "policy_core_raw": float(policy_core_raw.detach().cpu()),
