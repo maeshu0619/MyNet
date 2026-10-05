@@ -2555,7 +2555,7 @@ def parse_pugan_args(parser, file_day, file_time):
         help='coverage UCBに加えるdecision group不確実性の係数。Episode番号には依存しない',
     )
     parser.add_argument(
-        '--heuristic_guidance_online_exploration_max_candidate_changes', default=8, type=int,
+        '--heuristic_guidance_online_exploration_max_candidate_changes', default=4, type=int,
         help='1回のWhere探索でincumbentから入れ替えるcandidate上限',
     )
     parser.add_argument(
@@ -2611,11 +2611,31 @@ def parse_pugan_args(parser, file_day, file_time):
         help='同一frame/codec/Where群のActual counterfactualで再利用する実行anchor plan上限',
     )
     parser.add_argument(
+        '--heuristic_guidance_online_pending_matched_frames', default=1024, type=int,
+        help='未完了matched comparisonをframe/codec単位で保持する上限',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_matched_anchor_max_age_steps', default=1600, type=int,
+        help='strict matched anchorをoff-policy教師として許容する最大Step age',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_completed_matched_entries', default=4096, type=int,
+        help='Actual evidence量を算出する完了済みstrict pairのbounded履歴数',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_actual_evidence_target_pairs', default=128, type=int,
+        help='exploration/Proposal authorityを十分なActual evidenceとみなすpair数',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_proposal_coverage_entries', default=4096, type=int,
+        help='rotating safe-reservoir coverageのframe/operation visit state上限',
+    )
+    parser.add_argument(
         '--heuristic_guidance_online_actual_actor_replay_batch', default=16, type=int,
         help='1 StepでActor Actual preferenceへ使う経験数',
     )
     parser.add_argument(
-        '--heuristic_guidance_online_actual_actor_min_delta', default=0.05, type=float,
+        '--heuristic_guidance_online_actual_actor_min_delta', default=0.01, type=float,
         help='Actor Actual preferenceに使う最小RD差[percentage point]',
     )
     parser.add_argument(
@@ -4485,7 +4505,7 @@ def parse_pugan_args(parser, file_day, file_time):
         args, "heuristic_guidance_exploration_min_fraction", 0.25
     )), 0.0), 1.0)
     args.heuristic_guidance_online_exploration_max_candidate_changes = max(int(getattr(
-        args, "heuristic_guidance_online_exploration_max_candidate_changes", 8
+        args, "heuristic_guidance_online_exploration_max_candidate_changes", 4
     )), 1)
     args.heuristic_guidance_online_noop_prior_offset = min(max(float(getattr(
         args, "heuristic_guidance_online_noop_prior_offset", 0.0
@@ -4526,11 +4546,26 @@ def parse_pugan_args(parser, file_day, file_time):
     args.heuristic_guidance_online_matched_anchor_memory_entries = max(int(getattr(
         args, "heuristic_guidance_online_matched_anchor_memory_entries", 512
     )), 1)
+    args.heuristic_guidance_online_pending_matched_frames = max(int(getattr(
+        args, "heuristic_guidance_online_pending_matched_frames", 1024
+    )), 1)
+    args.heuristic_guidance_online_matched_anchor_max_age_steps = max(int(getattr(
+        args, "heuristic_guidance_online_matched_anchor_max_age_steps", 1600
+    )), 1)
+    args.heuristic_guidance_online_completed_matched_entries = max(int(getattr(
+        args, "heuristic_guidance_online_completed_matched_entries", 4096
+    )), 1)
+    args.heuristic_guidance_online_actual_evidence_target_pairs = max(int(getattr(
+        args, "heuristic_guidance_online_actual_evidence_target_pairs", 128
+    )), 1)
+    args.heuristic_guidance_online_proposal_coverage_entries = max(int(getattr(
+        args, "heuristic_guidance_online_proposal_coverage_entries", 4096
+    )), 1)
     args.heuristic_guidance_online_actual_actor_replay_batch = max(int(getattr(
         args, "heuristic_guidance_online_actual_actor_replay_batch", 16
     )), 1)
     args.heuristic_guidance_online_actual_actor_min_delta = max(float(getattr(
-        args, "heuristic_guidance_online_actual_actor_min_delta", 0.05
+        args, "heuristic_guidance_online_actual_actor_min_delta", 0.01
     )), 0.0)
     args.heuristic_guidance_online_actual_actor_cross_frame_weight = min(max(float(getattr(
         args, "heuristic_guidance_online_actual_actor_cross_frame_weight", 0.25

@@ -4959,6 +4959,9 @@ def _den6_online_grad_norms(model):
         "den6_online_candidate_critic_grad_norm": (
             getattr(actuator, "den6_candidate_critic", None),
         ),
+        "den6_online_proxy_critic_grad_norm": (
+            getattr(actuator, "den6_candidate_proxy_critic", None),
+        ),
         "den6_online_plan_critic_grad_norm": (
             getattr(actuator, "den6_plan_critic", None),
         ),
@@ -5065,6 +5068,7 @@ def _den6_online_decision_parameters(model):
         getattr(actuator, "operation_gate_head", None),
         getattr(actuator, "den6_candidate_actor", None),
         getattr(actuator, "den6_candidate_critic", None),
+        getattr(actuator, "den6_candidate_proxy_critic", None),
         getattr(actuator, "den6_candidate_proposal", None),
         getattr(actuator, "den6_plan_critic", None),
     )
@@ -5139,6 +5143,9 @@ def _probe_den6_policy_source_gradients(model, source_losses):
         "candidate_critic": list(getattr(
             actuator, "den6_candidate_critic", torch.nn.Module()
         ).parameters()),
+        "proxy_critic": list(getattr(
+            actuator, "den6_candidate_proxy_critic", torch.nn.Module()
+        ).parameters()),
         "plan_critic": list(getattr(
             actuator, "den6_plan_critic", torch.nn.Module()
         ).parameters()),
@@ -5155,7 +5162,20 @@ def _probe_den6_policy_source_gradients(model, source_losses):
             continue
         if hasattr(model, "zero_grad"):
             model.zero_grad(set_to_none=True)
-        source_loss.backward(retain_graph=True)
+        try:
+            source_loss.backward(retain_graph=True)
+        except RuntimeError as exc:
+            # This is a diagnostic-only probe.  Some Surrogate paths perform
+            # their own backward before this hook, so their saved tensors are
+            # legitimately gone.  Never abort or alter the real optimizer
+            # update merely because a low-frequency norm cannot be measured.
+            if "backward through the graph a second time" not in str(exc):
+                raise
+            if hasattr(model, "zero_grad"):
+                model.zero_grad(set_to_none=True)
+            for group_name in groups:
+                result[f"{source_name}_{group_name}"] = 0.0
+            continue
         for group_name, params in groups.items():
             norm_sq = sum(
                 float(torch.sum(param.grad.detach().float() ** 2).cpu())
@@ -6763,6 +6783,24 @@ def load_more_training_checkpoint(model, args, writer):
         cleaned_state_dict[new_key] = value
 
     incompatible = model.load_state_dict(cleaned_state_dict, strict=False)
+
+    runtime_path = ckpt_path + ".actor_critic_runtime.pth"
+    runtime_owner = model.module if hasattr(model, "module") else model
+    runtime_loader = getattr(
+        runtime_owner, "load_actor_critic_runtime_state_dict", None
+    )
+    if callable(runtime_loader) and os.path.isfile(runtime_path):
+        runtime_state = torch.load(runtime_path, map_location="cpu")
+        runtime_loaded = bool(runtime_loader(runtime_state))
+        writer.write(
+            f"MoreTraining: actor_critic_runtime_loaded={runtime_loaded} "
+            f"path={runtime_path}"
+        )
+    elif callable(runtime_loader):
+        writer.write(
+            "MoreTraining: actor_critic_runtime_loaded=False "
+            f"missing_sidecar={runtime_path}"
+        )
 
     missing_keys = list(getattr(incompatible, "missing_keys", []))
     unexpected_keys = list(getattr(incompatible, "unexpected_keys", []))

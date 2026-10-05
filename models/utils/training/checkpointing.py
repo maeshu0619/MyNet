@@ -45,6 +45,11 @@ def _save_surrogate_state(loss, ckpt_dir, filename):
 def _save_state_dict(model, ckpt_dir, filename, loss=None):
     path = os.path.join(ckpt_dir, filename)
     torch.save(model.state_dict(), path)
+    runtime_owner = model.module if hasattr(model, "module") else model
+    runtime_getter = getattr(runtime_owner, "actor_critic_runtime_state_dict", None)
+    if callable(runtime_getter):
+        runtime_path = path + ".actor_critic_runtime.pth"
+        torch.save(runtime_getter(), runtime_path)
     _save_surrogate_state(loss, ckpt_dir, filename)
     return path
 

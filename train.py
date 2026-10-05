@@ -441,7 +441,9 @@ def train(model, args, loss, writer, plot, notifier=None):
     """トレーニング"""
     """==========================================================="""
     prev_stage = None
-    global_train_step = 0
+    global_train_step = max(int(getattr(
+        args, "_restored_global_train_step", 0
+    )), 0)
     global_epoch = 0
     scheduler_step_count = 0
     # 候補そのものは保存せず、同一stateが次のθ領域へ進むための訪問回数だけを保持する。

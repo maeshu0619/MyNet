@@ -91,6 +91,7 @@ def build_optimizer_and_scheduler(model, args, writer):
     )
     online_critic_tokens = (
         "actuator.den6_candidate_critic.",
+        "actuator.den6_candidate_proxy_critic.",
         "actuator.den6_plan_critic.",
     )
     online_amount_names = {

@@ -243,6 +243,71 @@ class Network(nn.Module):
         # self.adding_module = self.policy_module
         # self.disp_module = self.actuator
 
+    def actor_critic_runtime_state_dict(self):
+        """Return bounded non-parameter state required for an exact resume."""
+        network_names = (
+            "_den6_online_objective_baseline",
+            "_den6_online_actual_plan_memory",
+            "_den6_online_geometry_baseline",
+            "_den6_actual_actor_replay",
+            "_den6_noop_edit_actual_memory",
+            "_den6_plan_critic_replay",
+        )
+        actuator_names = (
+            "_den6_factorized_group_counts",
+            "_den6_factorized_group_uncertainty",
+            "_den6_actual_action_evidence",
+            "_den6_actual_action_comparisons",
+            "_den6_actual_candidate_critic_quality",
+            "_den6_actual_candidate_critic_comparisons",
+            "_den6_matched_actual_pair_accuracy",
+            "_den6_matched_actual_pair_count",
+            "_den6_noop_actual_evidence",
+            "_den6_matched_anchor_plan_memory",
+            "_den6_pending_matched_groups",
+            "_den6_proposal_coverage_visits",
+            "_den6_completed_matched_pairs",
+        )
+        return {
+            "version": 1,
+            "global_train_step": int(getattr(
+                self.args, "_global_train_step", 0
+            )),
+            "network": {
+                name: getattr(self, name)
+                for name in network_names if hasattr(self, name)
+            },
+            "actuator": {
+                name: getattr(self.actuator, name)
+                for name in actuator_names if hasattr(self, "actuator")
+                and hasattr(self.actuator, name)
+            },
+        }
+
+    def load_actor_critic_runtime_state_dict(self, state):
+        if not isinstance(state, dict):
+            return False
+        restored_step = max(int(state.get("global_train_step", 0)), 0)
+        if restored_step <= 0:
+            actuator_state = dict(state.get("actuator") or {})
+            anchor_state = actuator_state.get(
+                "_den6_matched_anchor_plan_memory", {}
+            )
+            if isinstance(anchor_state, dict) and anchor_state:
+                restored_step = 1 + max(
+                    int(record.get("created_step", 0))
+                    for record in anchor_state.values()
+                    if isinstance(record, dict)
+                )
+        self.args._restored_global_train_step = restored_step
+        self.args._global_train_step = restored_step
+        for name, value in dict(state.get("network") or {}).items():
+            setattr(self, str(name), value)
+        if hasattr(self, "actuator"):
+            for name, value in dict(state.get("actuator") or {}).items():
+                setattr(self.actuator, str(name), value)
+        return True
+
     def train(self, mode: bool = True): # Encoderを訓練対象から外すためにPyTorchのtrain()を上書き
         super().train(mode)
         if bool(getattr(self.args, "encoder_0grad", True)):
@@ -1032,11 +1097,10 @@ class Network(nn.Module):
             / float(policy_backward_scale)
         )
         policy_loss = policy_core_weighted
-        # The original full-cloud codec baseline is the exact No-op outcome:
-        # rate delta=0, geometry=0 under the same frame/codec configuration.
-        # Therefore an executed edit can be compared with No-op without a
-        # second encode.  This supervises Amount class 0 only on factorized
-        # Amount steps; it does not impose a target No-op frequency.
+        # Compare Amount>0 with a *measured* no-op passed through the same
+        # edited pipeline.  The nominal GT baseline is not exact here (observed
+        # no-op runs differ by small bitstream overhead), so J_noop=0 would
+        # systematically bias Amount against edits.
         noop_actual_raw = objective.new_zeros(())
         noop_actual_weighted = objective.new_zeros(())
         amount_log_probs_all = plan_debug_state.get(
@@ -1045,19 +1109,32 @@ class Network(nn.Module):
         selected_amount_index = int(plan_debug_state.get(
             "_actual_credit_amount_bin_index", -1
         ))
+        measured_noop_objective = None
+        noop_memory_for_amount = getattr(
+            self, "_den6_noop_edit_actual_memory", None
+        )
+        if isinstance(noop_memory_for_amount, dict):
+            exact_noop_entry = noop_memory_for_amount.get(str(cache_key), {})
+            if isinstance(exact_noop_entry, dict):
+                measured_noop_objective = exact_noop_entry.get("noop")
         if (
             actor_critic_selection
             and factorized_group == "Amount"
             and torch.is_tensor(amount_log_probs_all)
             and amount_log_probs_all.requires_grad
             and 0 < selected_amount_index < int(amount_log_probs_all.numel())
+            and measured_noop_objective is not None
         ):
             selected_vs_noop = (
                 amount_log_probs_all[selected_amount_index]
                 - amount_log_probs_all[0]
             )
             edit_objective_value = float(actor_rd_target.detach().cpu())
-            edit_is_better = 1.0 if edit_objective_value < 0.0 else -1.0
+            edit_is_better = (
+                1.0
+                if edit_objective_value < float(measured_noop_objective)
+                else -1.0
+            )
             noop_actual_raw = torch.nn.functional.softplus(
                 -float(edit_is_better) * selected_vs_noop
             )
@@ -1292,6 +1369,10 @@ class Network(nn.Module):
         actual_set_contrast_evidence = 0.0
         actual_set_incumbent_updated = False
         plan_debug = state.get("ana_den6_exact_residual_plan_debug", {})
+        matched_anchor_age_confidence = min(max(float(
+            plan_debug.get("matched_actual_anchor_age_confidence", 1.0)
+            if isinstance(plan_debug, dict) else 1.0
+        ), 0.0), 1.0)
         score_tensors = (
             plan_debug.get("_actual_credit_network_scores", {})
             if isinstance(plan_debug, dict) else {}
@@ -1357,6 +1438,7 @@ class Network(nn.Module):
                 1e-8,
             )
             actual_set_contrast_evidence = min(abs(actual_delta) / scale_floor, 1.0)
+            actual_set_contrast_evidence *= float(matched_anchor_age_confidence)
             preference_sign = 1.0 if actual_delta > 0.0 else -1.0
             temperature = max(float(getattr(
                 self.args,
@@ -1442,25 +1524,53 @@ class Network(nn.Module):
         # dependent and contains no Episode counter or target loss value.
         actuator_for_evidence = getattr(self, "actuator", None)
         if actual_set_contrast_operations > 0 and actuator_for_evidence is not None:
-            comparison_capacity = max(int(getattr(
+            completed = getattr(
+                actuator_for_evidence, "_den6_completed_matched_pairs", None
+            )
+            if completed is None:
+                completed = OrderedDict()
+                actuator_for_evidence._den6_completed_matched_pairs = completed
+            completed_key = "|".join((
+                str(cache_key), str(factorized_group), str(matched_anchor_hash)
+            ))
+            completed[completed_key] = float(actual_set_contrast_evidence)
+            completed.move_to_end(completed_key)
+            completed_capacity = max(int(getattr(
                 self.args,
-                "heuristic_guidance_online_plan_critic_replay_entries",
-                512,
+                "heuristic_guidance_online_completed_matched_entries",
+                4096,
             )), 1)
-            evidence_alpha = 1.0 / float(comparison_capacity)
-            previous_evidence = min(max(float(getattr(
-                actuator_for_evidence, "_den6_actual_action_evidence", 0.0
-            )), 0.0), 1.0)
-            observed_evidence = min(max(
-                float(actual_set_contrast_evidence), 0.0
-            ), 1.0)
-            actuator_for_evidence._den6_actual_action_evidence = (
-                (1.0 - evidence_alpha) * previous_evidence
-                + evidence_alpha * observed_evidence
+            while len(completed) > completed_capacity:
+                completed.popitem(last=False)
+            evidence_target = max(int(getattr(
+                self.args,
+                "heuristic_guidance_online_actual_evidence_target_pairs",
+                128,
+            )), 1)
+            evidence_sum = sum(min(max(float(value), 0.0), 1.0)
+                               for value in completed.values())
+            actuator_for_evidence._den6_actual_action_evidence = min(
+                evidence_sum / float(evidence_target), 1.0
             )
             actuator_for_evidence._den6_actual_action_comparisons = int(getattr(
                 actuator_for_evidence, "_den6_actual_action_comparisons", 0
             )) + 1
+            # The outstanding evidence request is complete only after an
+            # executable candidate-set difference produced an Actual contrast.
+            frame_codec_key = str(plan_debug.get(
+                "matched_actual_frame_codec_key", ""
+            ))
+            anchor_key = str(plan_debug.get("matched_actual_anchor_key", ""))
+            pending = getattr(
+                actuator_for_evidence, "_den6_pending_matched_groups", None
+            )
+            if isinstance(pending, dict) and frame_codec_key:
+                pending.pop(frame_codec_key, None)
+            anchors = getattr(
+                actuator_for_evidence, "_den6_matched_anchor_plan_memory", None
+            )
+            if isinstance(anchors, dict) and anchor_key:
+                anchors.pop(anchor_key, None)
         if isinstance(selected_ids_by_operation, dict) and matched_anchor_hash:
             # Retain the best *executed training plan* for this frame as the
             # comparison incumbent.  A worse exploratory sample must not
@@ -1554,7 +1664,7 @@ class Network(nn.Module):
                 else None
             )
             minimum_delta = max(float(getattr(
-                self.args, "heuristic_guidance_online_actual_actor_min_delta", 0.05
+                self.args, "heuristic_guidance_online_actual_actor_min_delta", 0.01
             )), 0.0)
             cross_frame_weight = min(max(float(getattr(
                 self.args,
@@ -1665,25 +1775,11 @@ class Network(nn.Module):
                 )), 0.0)
                 actual_actor_replay_weighted = (
                     float(actual_actor_weight)
+                    * float(matched_anchor_age_confidence)
                     * actual_actor_replay_raw
                     / float(policy_backward_scale)
                 )
                 policy_loss = policy_loss + actual_actor_replay_weighted
-                if actuator_for_evidence is not None:
-                    evidence_alpha = 1.0 / float(max(int(getattr(
-                        self.args,
-                        "heuristic_guidance_online_actual_actor_replay_entries",
-                        512,
-                    )), 1))
-                    previous_evidence = min(max(float(getattr(
-                        actuator_for_evidence, "_den6_actual_action_evidence", 0.0
-                    )), 0.0), 1.0)
-                    actuator_for_evidence._den6_actual_action_evidence = (
-                        (1.0 - evidence_alpha) * previous_evidence + evidence_alpha
-                    )
-                    actuator_for_evidence._den6_actual_action_comparisons = int(getattr(
-                        actuator_for_evidence, "_den6_actual_action_comparisons", 0
-                    )) + len(preference_terms)
             if critic_preference_terms:
                 actual_candidate_critic_replay_accuracy = sum(
                     critic_preference_accuracies
@@ -1698,6 +1794,7 @@ class Network(nn.Module):
                 )), 0.0)
                 actual_candidate_critic_replay_weighted = (
                     float(critic_replay_weight)
+                    * float(matched_anchor_age_confidence)
                     * actual_candidate_critic_replay_raw
                     / float(policy_backward_scale)
                 )
@@ -1739,6 +1836,7 @@ class Network(nn.Module):
                 )), 0.0)
                 actual_proposal_replay_weighted = (
                     float(proposal_replay_weight)
+                    * float(matched_anchor_age_confidence)
                     * actual_proposal_replay_raw
                     / float(policy_backward_scale)
                 )

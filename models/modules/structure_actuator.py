@@ -201,6 +201,15 @@ class StructureRepairActuator(nn.Module):
             nn.SiLU(inplace=True),
             nn.Linear(actor_hidden, 2),
         )
+        # Keep the dense codec-proxy warm start separate from the value head
+        # that is allowed to control Actual-RD uncertainty/proposal authority.
+        # Otherwise the proxy ordering silently re-enters the policy through
+        # Candidate-Critic uncertainty even when Actor proxy loss is disabled.
+        self.den6_candidate_proxy_critic = nn.Sequential(
+            nn.Linear(7, actor_hidden),
+            nn.SiLU(inplace=True),
+            nn.Linear(actor_hidden, 2),
+        )
         # Proposal is distinct from both the value Critic and final Actor.  It
         # controls which members of the den6 safety reservoir are presented to
         # the Actor; adding a Critic residual to an Actor logit is not Proposal.
@@ -227,6 +236,9 @@ class StructureRepairActuator(nn.Module):
         nn.init.zeros_(self.den6_candidate_critic[-1].weight)
         nn.init.zeros_(self.den6_candidate_critic[-1].bias)
         nn.init.constant_(self.den6_candidate_critic[-1].bias[1], 0.0)
+        nn.init.zeros_(self.den6_candidate_proxy_critic[-1].weight)
+        nn.init.zeros_(self.den6_candidate_proxy_critic[-1].bias)
+        nn.init.constant_(self.den6_candidate_proxy_critic[-1].bias[1], 0.0)
         nn.init.normal_(self.den6_candidate_proposal[-1].weight, mean=0.0, std=0.005)
         nn.init.zeros_(self.den6_candidate_proposal[-1].bias)
         nn.init.zeros_(self.den6_plan_critic[-1].weight)
@@ -247,6 +259,12 @@ class StructureRepairActuator(nn.Module):
         self._den6_matched_actual_pair_accuracy = 0.0
         self._den6_matched_actual_pair_count = 0
         self._den6_noop_actual_evidence = 0.0
+        # Bounded runtime state used to finish a counterfactual on the next
+        # visit of the same frame.  This is evidence-driven, not Episode-driven.
+        self._den6_matched_anchor_plan_memory = OrderedDict()
+        self._den6_pending_matched_groups = OrderedDict()
+        self._den6_proposal_coverage_visits = OrderedDict()
+        self._den6_completed_matched_pairs = OrderedDict()
         # Per-operation gate for the cache-derived local RD candidate feature.
         # It is a Network parameter (not a fixed heuristic weight): tanh(0)
         # makes the fresh policy exactly unchanged, then local/Actual credit
@@ -4087,6 +4105,37 @@ class StructureRepairActuator(nn.Module):
             self.args, "heuristic_guidance_online_factorized_exploration", True
         )):
             return "all"
+        # Finish an outstanding same-frame codec comparison before opening a
+        # different group.  With 400 frames, global round-robin otherwise
+        # revisits the same frame/group only after the 512-entry LRU has
+        # evicted its anchor.  This priority depends solely on missing Actual
+        # evidence, never on Episode number or the desired metric value.
+        frame_codec_key = "|".join((
+            str(getattr(self.args, "_current_input_file", "")),
+            str(getattr(self.args, "sparsepcgc_scale_ae", 0)),
+            str(getattr(self.args, "sparsepcgc_scale_sr", 0)),
+            str(getattr(self.args, "sparsepcgc_scale_m", 8)),
+        ))
+        pending = getattr(self, "_den6_pending_matched_groups", None)
+        if pending is None:
+            pending = OrderedDict()
+            self._den6_pending_matched_groups = pending
+        record = pending.get(frame_codec_key)
+        if isinstance(record, dict):
+            current_step = max(int(getattr(self.args, "_global_train_step", 0)), 0)
+            age = current_step - int(record.get("created_step", current_step))
+            max_age = max(int(getattr(
+                self.args, "heuristic_guidance_online_matched_anchor_max_age_steps", 1600
+            )), 1)
+            group = str(record.get("group", ""))
+            if group in groups and 0 <= age <= max_age:
+                record["attempts"] = int(record.get("attempts", 0)) + 1
+                pending.move_to_end(frame_codec_key)
+                self._den6_factorized_group_counts[group] = int(
+                    self._den6_factorized_group_counts.get(group, 0)
+                ) + 1
+                return group
+            pending.pop(frame_codec_key, None)
         scale = max(float(getattr(
             self.args, "heuristic_guidance_online_factorized_ucb_scale", 0.25
         )), 0.0)
@@ -4155,6 +4204,15 @@ class StructureRepairActuator(nn.Module):
         operations = ("Add", "Prune", "Adjust")
         if any(not isinstance(pools.get(name), list) or not pools.get(name) for name in operations):
             return None
+        pool_identity_payload = json.dumps({
+            name: tuple(
+                str(candidate.get("candidate_id", "")) for candidate in pools[name]
+            )
+            for name in operations
+        }, sort_keys=True, separators=(",", ":"))
+        candidate_pool_identity_hash = hashlib.sha256(
+            pool_identity_payload.encode("utf-8")
+        ).hexdigest()
 
         point_count = int(voxel_coords.shape[-1])
         if point_count <= 0:
@@ -4309,11 +4367,14 @@ class StructureRepairActuator(nn.Module):
         # factorized Where group being explored.  This runtime memory contains
         # candidate indices only; it contains no Actual result and cannot leak a
         # codec oracle into proposal/selection.
-        matched_anchor_key = "|".join((
+        matched_frame_codec_key = "|".join((
             str(getattr(self.args, "_current_input_file", "")),
             str(getattr(self.args, "sparsepcgc_scale_ae", 0)),
             str(getattr(self.args, "sparsepcgc_scale_sr", 0)),
             str(getattr(self.args, "sparsepcgc_scale_m", 8)),
+        ))
+        matched_anchor_key = "|".join((
+            matched_frame_codec_key,
             str(factorized_exploration_group),
         ))
         matched_anchor_runtime = getattr(
@@ -4722,13 +4783,33 @@ class StructureRepairActuator(nn.Module):
                 )
                 for name in operations
             )
+            anchor_valid = bool(
+                anchor_valid
+                and str(matched_anchor_record.get("pool_identity_hash", ""))
+                == str(candidate_pool_identity_hash)
+            )
+            anchor_age_steps = current_step - int(
+                matched_anchor_record.get("created_step", current_step)
+            )
+            max_anchor_age_steps = max(int(getattr(
+                self.args,
+                "heuristic_guidance_online_matched_anchor_max_age_steps",
+                1600,
+            )), 1)
+            anchor_valid = bool(
+                anchor_valid and 0 <= anchor_age_steps <= max_anchor_age_steps
+            )
             if anchor_valid:
                 requested_counts = {
                     name: int(stored_counts[name]) for name in operations
                 }
                 no_op_selected = sum(requested_counts.values()) == 0
                 matched_anchor_reused = True
+                matched_anchor_record["reuse_count"] = int(
+                    matched_anchor_record.get("reuse_count", 0)
+                ) + 1
             else:
+                matched_anchor_runtime.pop(matched_anchor_key, None)
                 matched_anchor_record = None
 
         # Adjustはremove+addの2 cellを変えるため、変更Voxel cell比も1%未満に制限する。
@@ -4806,6 +4887,8 @@ class StructureRepairActuator(nn.Module):
         candidate_actor_logits = {}
         candidate_critic_values = {}
         candidate_critic_uncertainties = {}
+        candidate_proxy_critic_values = {}
+        candidate_proxy_critic_uncertainties = {}
         candidate_proposal_logits = {}
         candidate_proposal_masks = {}
         candidate_actor_features = {}
@@ -4869,6 +4952,14 @@ class StructureRepairActuator(nn.Module):
                     mapping.get("local_geometry_risk", actor_logit.new_zeros(actor_logit.shape))
                 )
                 candidate_critic_features[operation] = critic_features
+                proxy_critic_output = self.den6_candidate_proxy_critic(
+                    critic_features.detach()
+                )
+                candidate_proxy_critic_values[operation] = proxy_critic_output[:, 0]
+                candidate_proxy_critic_uncertainties[operation] = (
+                    torch.nn.functional.softplus(proxy_critic_output[:, 1])
+                    .clamp_min(1e-4)
+                )
                 if self.training:
                     self._den6_factorized_group_uncertainty[
                         f"{operation}Where"
@@ -4992,12 +5083,41 @@ class StructureRepairActuator(nn.Module):
                     )
                     chosen = []
                     if coverage_count > 0:
-                        positions = torch.linspace(
-                            0,
-                            max(valid_count_for_proposal - 1, 0),
-                            steps=coverage_count,
-                            device=valid_indices.device,
-                        ).round().long()
+                        coverage_key = f"{matched_frame_codec_key}|{operation}"
+                        visits = getattr(
+                            self, "_den6_proposal_coverage_visits", OrderedDict()
+                        )
+                        visit_index = int(visits.get(coverage_key, 0))
+                        visits[coverage_key] = visit_index + 1
+                        visits.move_to_end(coverage_key)
+                        while len(visits) > max(int(getattr(
+                            self.args,
+                            "heuristic_guidance_online_proposal_coverage_entries",
+                            4096,
+                        )), 1):
+                            visits.popitem(last=False)
+                        self._den6_proposal_coverage_visits = visits
+                        base_offset = int.from_bytes(hashlib.blake2b(
+                            coverage_key.encode("utf-8"), digest_size=8
+                        ).digest(), byteorder="little", signed=False)
+                        offset = (
+                            base_offset + visit_index * max(coverage_count, 1)
+                        ) % max(valid_count_for_proposal, 1)
+                        # Rotating stratified coverage ensures every safe
+                        # reservoir member remains reachable over revisits; it
+                        # is not tied to den6 rank or Episode number.
+                        positions = (
+                            offset
+                            + torch.div(
+                                torch.arange(
+                                    coverage_count,
+                                    device=valid_indices.device,
+                                    dtype=torch.long,
+                                ) * valid_count_for_proposal,
+                                max(coverage_count, 1),
+                                rounding_mode="floor",
+                            )
+                        ) % max(valid_count_for_proposal, 1)
                         chosen.append(valid_indices.index_select(0, positions))
                     if learned_count > 0:
                         proposal_value = candidate_proposal_logits[operation].masked_fill(
@@ -5077,8 +5197,16 @@ class StructureRepairActuator(nn.Module):
                         )
                     )
                     if actor_critic_selection:
-                        critic_prediction = candidate_critic_values[operation][local_valid]
-                        critic_uncertainty = candidate_critic_uncertainties[operation][local_valid]
+                        # Dense proxy targets train only the proxy head.  The
+                        # Actual head remains untrained until a strict matched
+                        # codec comparison exists, so its uncertainty cannot
+                        # recreate den6 ordering in Proposal membership.
+                        critic_prediction = candidate_proxy_critic_values[
+                            operation
+                        ][local_valid]
+                        critic_uncertainty = candidate_proxy_critic_uncertainties[
+                            operation
+                        ][local_valid]
                         critic_error = critic_prediction - local_target
                         critic_regression = torch.nn.functional.smooth_l1_loss(
                             critic_prediction,
@@ -5477,7 +5605,7 @@ class StructureRepairActuator(nn.Module):
                 if operation_exploration_active and audit_selection_count > max(int(getattr(
                     self.args,
                     "heuristic_guidance_online_exploration_max_candidate_changes",
-                    8,
+                    4,
                 )), 1):
                     incumbent_mask = torch.zeros_like(scaled_logits, dtype=torch.bool)
                     incumbent_mask[deterministic_prefix] = True
@@ -5485,7 +5613,7 @@ class StructureRepairActuator(nn.Module):
                     maximum_changes = max(int(getattr(
                         self.args,
                         "heuristic_guidance_online_exploration_max_candidate_changes",
-                        8,
+                        4,
                     )), 1)
                     change_count = min(
                         maximum_changes,
@@ -5579,22 +5707,27 @@ class StructureRepairActuator(nn.Module):
                 ),
             ))
         )
+        if (
+            actor_critic_selection
+            and str(factorized_exploration_group).endswith("Where")
+            and not matched_anchor_reused
+        ):
+            explored_operation_for_anchor = str(factorized_exploration_group)[:-5]
+            # Establish the incumbent with the explored group last, then reuse
+            # this exact order.  Fixed groups therefore resolve conflicts first
+            # in both plans and cannot be displaced by the counterfactual.
+            operation_order = tuple(
+                name for name in operation_order
+                if name != explored_operation_for_anchor
+            ) + (explored_operation_for_anchor,)
         if matched_anchor_reused:
             stored_order = tuple(matched_anchor_record.get("operation_order") or ())
             if len(stored_order) == len(operations) and set(stored_order) == set(operations):
-                explored_operation_for_anchor = (
-                    str(factorized_exploration_group)[:-5]
-                    if str(factorized_exploration_group).endswith("Where")
-                    else ""
-                )
-                # Select every fixed group first.  A newly explored candidate
-                # that conflicts with the incumbent is then rejected on the
-                # explored side; it must never evict/alter another group and
-                # create falsely attributed candidate credit.
-                operation_order = tuple(
-                    name for name in stored_order
-                    if name != explored_operation_for_anchor
-                ) + (explored_operation_for_anchor,)
+                # Strict matching requires exactly the encoded incumbent's
+                # application order.  Moving the explored operation to the end
+                # changes conflict resolution and makes more than one factor
+                # differ, even when requested counts are identical.
+                operation_order = stored_order
 
         # 1Stepにつき、この1回の順序・1回の候補sampleから1planだけを構築する。
         # 初回候補写像時にGT occupied適合性を厳密に保存済みなら、100万Voxelを
@@ -5659,6 +5792,7 @@ class StructureRepairActuator(nn.Module):
                 anchor_indices_by_operation[operation].append(int(candidate_index))
             matched_anchor_runtime[matched_anchor_key] = {
                 "pool_sizes": {name: len(pools[name]) for name in operations},
+                "pool_identity_hash": str(candidate_pool_identity_hash),
                 "selected_counts": {
                     name: int(selected_counts[name]) for name in operations
                 },
@@ -5667,7 +5801,28 @@ class StructureRepairActuator(nn.Module):
                     for name in operations
                 },
                 "operation_order": tuple(operation_order),
+                "created_step": int(current_step),
+                "policy_version": int(current_step),
+                "reuse_count": 0,
             }
+            pending_runtime = getattr(
+                self, "_den6_pending_matched_groups", OrderedDict()
+            )
+            pending_runtime[matched_frame_codec_key] = {
+                "group": str(factorized_exploration_group),
+                "anchor_key": str(matched_anchor_key),
+                "created_step": int(current_step),
+                "attempts": 0,
+            }
+            pending_runtime.move_to_end(matched_frame_codec_key)
+            pending_capacity = max(int(getattr(
+                self.args,
+                "heuristic_guidance_online_pending_matched_frames",
+                1024,
+            )), 1)
+            while len(pending_runtime) > pending_capacity:
+                pending_runtime.popitem(last=False)
+            self._den6_pending_matched_groups = pending_runtime
             anchor_capacity = max(int(getattr(
                 self.args,
                 "heuristic_guidance_online_matched_anchor_memory_entries",
@@ -6078,6 +6233,8 @@ class StructureRepairActuator(nn.Module):
                 "executed_counts": {
                     name: int(selected_counts[name]) for name in operations
                 },
+                "operation_order": tuple(operation_order),
+                "pool_identity_hash": str(candidate_pool_identity_hash),
                 "factorized_group": str(factorized_exploration_group),
             },
             sort_keys=True,
@@ -6085,6 +6242,14 @@ class StructureRepairActuator(nn.Module):
         )
         matched_anchor_hash = hashlib.sha256(
             matched_anchor_payload.encode("utf-8")
+        ).hexdigest()
+        edited_delta_payload = json.dumps({
+            "base": str(getattr(self.args, "_current_input_file", "")),
+            "removes": sorted(removes),
+            "adds": sorted(adds),
+        }, sort_keys=True, separators=(",", ":"))
+        final_edited_voxel_hash = hashlib.sha256(
+            edited_delta_payload.encode("utf-8")
         ).hexdigest()
         anchor_plan_for_delta = exact.get(
             "heuristic_anchor_plan", exact.get("initial_heuristic_plan", {})
@@ -6327,6 +6492,28 @@ class StructureRepairActuator(nn.Module):
             "factorized_exploration_group": str(factorized_exploration_group),
             "matched_actual_anchor_hash": str(matched_anchor_hash),
             "matched_actual_anchor_reused": bool(matched_anchor_reused),
+            "matched_actual_anchor_key": str(matched_anchor_key),
+            "matched_actual_frame_codec_key": str(matched_frame_codec_key),
+            "matched_actual_anchor_age_steps": int(
+                current_step - int(matched_anchor_record.get("created_step", current_step))
+            ) if isinstance(matched_anchor_record, dict) else 0,
+            "matched_actual_anchor_age_confidence": (
+                max(
+                    0.0,
+                    1.0 - (
+                        current_step - int(matched_anchor_record.get(
+                            "created_step", current_step
+                        ))
+                    ) / float(max(int(getattr(
+                        self.args,
+                        "heuristic_guidance_online_matched_anchor_max_age_steps",
+                        1600,
+                    )), 1)),
+                )
+                if isinstance(matched_anchor_record, dict) else 1.0
+            ),
+            "candidate_pool_identity_hash": str(candidate_pool_identity_hash),
+            "final_edited_voxel_hash": str(final_edited_voxel_hash),
             "deterministic_candidate_ids": deterministic_ids_by_operation,
             "factorized_exploration_counts": dict(
                 getattr(self, "_den6_factorized_group_counts", {})
@@ -6407,6 +6594,7 @@ class StructureRepairActuator(nn.Module):
             "candidate_ranking_local_loss": candidate_local_loss,
             "candidate_pairwise_local_loss": candidate_pairwise_loss,
             "candidate_critic_local_loss": candidate_critic_loss,
+            "candidate_proxy_critic_local_loss": candidate_critic_loss,
             "candidate_actor_critic_distill_loss": candidate_actor_critic_loss,
             "candidate_actor_proxy_loss": actor_proxy_loss,
             "candidate_actor_proxy_weight": float(effective_actor_proxy_weight),
