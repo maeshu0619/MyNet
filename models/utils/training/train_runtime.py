@@ -5065,6 +5065,7 @@ def _den6_online_decision_parameters(model):
         getattr(actuator, "operation_gate_head", None),
         getattr(actuator, "den6_candidate_actor", None),
         getattr(actuator, "den6_candidate_critic", None),
+        getattr(actuator, "den6_candidate_proposal", None),
         getattr(actuator, "den6_plan_critic", None),
     )
     params = []
@@ -5111,6 +5112,60 @@ def _capture_den6_policy_only_gradients(policy_loss, model):
         for param in params:
             param.grad = None
     return snapshot
+
+
+def _probe_den6_policy_source_gradients(model, source_losses):
+    """Measure Actor/Proposal gradient norms per source without an update.
+
+    The project's re-entrant checkpoints prevent ``autograd.grad(inputs=...)``.
+    A retained backward is therefore used for each diagnostic source, followed
+    by ``zero_grad(set_to_none=True)``.  The caller runs this before the normal
+    policy capture and joint backward, so neither optimizer state nor the real
+    parameter update is changed.
+    """
+    if not isinstance(source_losses, dict):
+        return {}
+    base_model = model.module if hasattr(model, "module") else model
+    actuator = getattr(base_model, "actuator", None)
+    if actuator is None:
+        return {}
+    groups = {
+        "actor": list(getattr(
+            actuator, "den6_candidate_actor", torch.nn.Module()
+        ).parameters()),
+        "proposal": list(getattr(
+            actuator, "den6_candidate_proposal", torch.nn.Module()
+        ).parameters()),
+        "candidate_critic": list(getattr(
+            actuator, "den6_candidate_critic", torch.nn.Module()
+        ).parameters()),
+        "plan_critic": list(getattr(
+            actuator, "den6_plan_critic", torch.nn.Module()
+        ).parameters()),
+    }
+    groups = {
+        name: [param for param in params if param.requires_grad]
+        for name, params in groups.items()
+    }
+    result = {}
+    for source_name, source_loss in source_losses.items():
+        if not torch.is_tensor(source_loss) or not source_loss.requires_grad:
+            for group_name in groups:
+                result[f"{source_name}_{group_name}"] = 0.0
+            continue
+        if hasattr(model, "zero_grad"):
+            model.zero_grad(set_to_none=True)
+        source_loss.backward(retain_graph=True)
+        for group_name, params in groups.items():
+            norm_sq = sum(
+                float(torch.sum(param.grad.detach().float() ** 2).cpu())
+                for param in params
+                if torch.is_tensor(param.grad)
+            )
+            result[f"{source_name}_{group_name}"] = math.sqrt(max(norm_sq, 0.0))
+    if hasattr(model, "zero_grad"):
+        model.zero_grad(set_to_none=True)
+    return result
 
 
 def _restore_den6_policy_only_gradients(snapshot):

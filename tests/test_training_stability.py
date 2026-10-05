@@ -23,6 +23,7 @@ from models.utils.training.train_flow import backward_only_scaled_loss
 from models.utils.training.train_runtime import (
     _balance_actual_operation_head_gradients,
     _capture_den6_policy_only_gradients,
+    _probe_den6_policy_source_gradients,
     _restore_den6_policy_only_gradients,
     fixed_full_cloud_validation_records,
 )
@@ -53,6 +54,34 @@ class _Plot:
 
 
 class TrainingStabilityTest(unittest.TestCase):
+    def test_source_gradient_probe_separates_actor_and_proposal_without_pollution(self):
+        class _Actuator(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.den6_candidate_actor = torch.nn.Linear(2, 1, bias=False)
+                self.den6_candidate_proposal = torch.nn.Linear(2, 1, bias=False)
+                self.den6_candidate_critic = torch.nn.Linear(2, 2, bias=False)
+                self.den6_plan_critic = torch.nn.Linear(2, 2, bias=False)
+
+        class _Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.actuator = _Actuator()
+
+        model = _Model()
+        value = torch.ones((1, 2))
+        actor_value = model.actuator.den6_candidate_actor(value).sum()
+        proposal_value = model.actuator.den6_candidate_proposal(value).sum()
+        result = _probe_den6_policy_source_gradients(model, {
+            "actual": actor_value + proposal_value,
+            "proxy": actor_value,
+        })
+        self.assertGreater(result["actual_actor"], 0.0)
+        self.assertGreater(result["actual_proposal"], 0.0)
+        self.assertGreater(result["proxy_actor"], 0.0)
+        self.assertEqual(result["proxy_proposal"], 0.0)
+        self.assertTrue(all(parameter.grad is None for parameter in model.parameters()))
+
     def test_candidate_score_fixed_scale_does_not_amplify_tiny_span(self):
         actuator = StructureRepairActuator.__new__(StructureRepairActuator)
         torch.nn.Module.__init__(actuator)

@@ -2547,6 +2547,48 @@ def train(model, args, loss, writer, plot, notifier=None):
                             online_policy_loss,
                             policy_backward_scale,
                         )
+                        source_grad_probe = {}
+                        source_grad_probe_enabled = bool(getattr(
+                            args,
+                            "heuristic_guidance_online_source_grad_probe",
+                            True,
+                        ))
+                        source_grad_probe_interval = max(int(getattr(
+                            args,
+                            "heuristic_guidance_online_source_grad_probe_interval",
+                            10,
+                        )), 1)
+                        if (
+                            source_grad_probe_enabled
+                            and (int(global_train_step) + 1) % source_grad_probe_interval == 0
+                        ):
+                            source_losses = dict(getattr(
+                                base_model_for_policy,
+                                "_den6_policy_source_losses",
+                                {},
+                            ) or {})
+                            source_losses = {
+                                name: value * float(policy_backward_scale)
+                                for name, value in source_losses.items()
+                            }
+                            # L_downstream is the differentiable compression
+                            # path (Surrogate/STE).  It is kept separate from
+                            # the score-function Actual source above.
+                            source_losses["surrogate"] = L_downstream
+                            source_grad_probe = _probe_den6_policy_source_gradients(
+                                model, source_losses
+                            )
+                            for probe_name, probe_value in source_grad_probe.items():
+                                compression_debug_terms[
+                                    f"den6_source_grad_{probe_name}"
+                                ] = float(probe_value)
+                            writer.write(
+                                "Den6SourceGradProbe: step={}, norms={}".format(
+                                    int(global_train_step) + 1,
+                                    {key: round(float(value), 8)
+                                     for key, value in source_grad_probe.items()},
+                                )
+                            )
                         # Exact planのhard argsort/int化にはSurrogate/Geometryの
                         # pathwise勾配は対応しない。Actual score-function項だけを
                         # decision head用に保存し、joint backward後に復元する。
@@ -4869,6 +4911,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                         f"performance_source={str(audit_plan.get('performance_source', ''))}, "
                         f"selection_mode={str(audit_plan.get('selection_mode', ''))}, "
                         f"factorized_group={str(audit_plan.get('factorized_exploration_group', ''))}, "
+                        f"matched_anchor_reused={bool(audit_plan.get('matched_actual_anchor_reused', False))}, "
                         f"factorized_counts={dict(audit_plan.get('factorized_exploration_counts') or {})}, "
                         f"network_only_performance={bool(audit_plan.get('network_only_performance', False))}, "
                         f"selected_action_index={int(audit_plan.get('selected_action_index', -1))}, "
@@ -4936,6 +4979,8 @@ def train(model, args, loss, writer, plot, notifier=None):
                         f"residual_candidate_delta=(count={int(audit_plan.get('residual_changed_candidate_count', 0) or 0)}, "
                         f"ratio={float(audit_plan.get('residual_changed_candidate_ratio', 0.0) or 0.0):.6f}), "
                         f"candidate=(pool={dict(audit_plan.get('candidate_pool_sizes') or {})}, "
+                        f"proposal_subset={dict(audit_plan.get('proposal_subset_sizes') or {})}, "
+                        f"proposal_fraction={dict(audit_plan.get('proposal_subset_fraction') or {})}, "
                         f"valid={dict(audit_plan.get('candidate_valid_counts') or {})}, "
                         f"duplicate={dict(audit_plan.get('candidate_duplicate_counts') or {})}, "
                         f"rank_range={dict(audit_plan.get('candidate_pool_rank_ranges') or {})}, "

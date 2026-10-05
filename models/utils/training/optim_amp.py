@@ -87,6 +87,7 @@ def build_optimizer_and_scheduler(model, args, writer):
         "actuator.move_voxel_head.",
         "actuator.operation_gate_head.",
         "actuator.den6_candidate_actor.",
+        "actuator.den6_candidate_proposal.",
     )
     online_critic_tokens = (
         "actuator.den6_candidate_critic.",

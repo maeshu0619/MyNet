@@ -1032,6 +1032,54 @@ class Network(nn.Module):
             / float(policy_backward_scale)
         )
         policy_loss = policy_core_weighted
+        # The original full-cloud codec baseline is the exact No-op outcome:
+        # rate delta=0, geometry=0 under the same frame/codec configuration.
+        # Therefore an executed edit can be compared with No-op without a
+        # second encode.  This supervises Amount class 0 only on factorized
+        # Amount steps; it does not impose a target No-op frequency.
+        noop_actual_raw = objective.new_zeros(())
+        noop_actual_weighted = objective.new_zeros(())
+        amount_log_probs_all = plan_debug_state.get(
+            "_actual_credit_amount_log_probs", None
+        )
+        selected_amount_index = int(plan_debug_state.get(
+            "_actual_credit_amount_bin_index", -1
+        ))
+        if (
+            actor_critic_selection
+            and factorized_group == "Amount"
+            and torch.is_tensor(amount_log_probs_all)
+            and amount_log_probs_all.requires_grad
+            and 0 < selected_amount_index < int(amount_log_probs_all.numel())
+        ):
+            selected_vs_noop = (
+                amount_log_probs_all[selected_amount_index]
+                - amount_log_probs_all[0]
+            )
+            edit_objective_value = float(actor_rd_target.detach().cpu())
+            edit_is_better = 1.0 if edit_objective_value < 0.0 else -1.0
+            noop_actual_raw = torch.nn.functional.softplus(
+                -float(edit_is_better) * selected_vs_noop
+            )
+            noop_actual_weight = max(float(getattr(
+                self.args, "heuristic_guidance_online_actual_set_credit_weight", 0.50
+            )), 0.0)
+            noop_actual_weighted = (
+                float(noop_actual_weight)
+                * noop_actual_raw
+                / float(policy_backward_scale)
+            )
+            policy_loss = policy_loss + noop_actual_weighted
+            if hasattr(self, "actuator"):
+                previous_noop_evidence = min(max(float(getattr(
+                    self.actuator, "_den6_noop_actual_evidence", 0.0
+                )), 0.0), 1.0)
+                evidence_alpha = 1.0 / float(max(int(getattr(
+                    self.args, "heuristic_guidance_online_actual_actor_replay_entries", 512
+                )), 1))
+                self.actuator._den6_noop_actual_evidence = (
+                    (1.0 - evidence_alpha) * previous_noop_evidence + evidence_alpha
+                )
         plan_critic_loss_raw = objective.new_zeros(())
         plan_critic_loss_weighted = objective.new_zeros(())
         plan_critic_replay_loss = objective.new_zeros(())
@@ -1187,7 +1235,11 @@ class Network(nn.Module):
         candidate_local_credit = state.get(
             "den6_online_candidate_local_credit_loss", None
         )
+        candidate_actor_proxy = state.get(
+            "den6_online_candidate_actor_proxy_loss", None
+        )
         candidate_local_credit_weighted = objective.new_zeros(())
+        candidate_actor_proxy_weighted_for_probe = objective.new_zeros(())
         if (
             mode == "ana_den6_online"
             and torch.is_tensor(candidate_local_credit)
@@ -1208,6 +1260,24 @@ class Network(nn.Module):
                 / float(policy_backward_scale)
             )
             policy_loss = policy_loss + candidate_local_credit_weighted
+            # candidate_local_credit contains the Critic/local-RD objectives as
+            # well as this small Actor warm-start term.  Keep a separate view of
+            # the latter for source-gradient diagnostics; do not add it twice.
+            if (
+                torch.is_tensor(candidate_actor_proxy)
+                and candidate_actor_proxy.requires_grad
+            ):
+                actor_proxy_weight = max(float(
+                    (state.get("ana_den6_exact_residual_plan_debug", {}) or {}).get(
+                        "candidate_actor_proxy_weight", 0.0
+                    )
+                ), 0.0)
+                candidate_actor_proxy_weighted_for_probe = (
+                    float(local_weight)
+                    * float(actor_proxy_weight)
+                    * candidate_actor_proxy.float().mean()
+                    / float(policy_backward_scale)
+                )
 
         # One codec result describes the complete plan, but consecutive plans
         # for the *same frame* reveal which candidate set was exchanged.  Give
@@ -1234,11 +1304,24 @@ class Network(nn.Module):
             plan_debug.get("_actual_credit_selected_ids", {})
             if isinstance(plan_debug, dict) else {}
         )
+        matched_anchor_hash = str(
+            plan_debug.get("matched_actual_anchor_hash", "")
+            if isinstance(plan_debug, dict) else ""
+        )
+        replay_operation = (
+            factorized_group[:-5]
+            if factorized_group.endswith("Where") else ""
+        )
         plan_memory = getattr(self, "_den6_online_actual_plan_memory", None)
         if plan_memory is None:
             plan_memory = OrderedDict()
             self._den6_online_actual_plan_memory = plan_memory
-        previous_plan = plan_memory.get(cache_key)
+        matched_plan_key = "|".join((
+            str(cache_key), str(factorized_group), str(matched_anchor_hash)
+        ))
+        previous_plan = (
+            plan_memory.get(matched_plan_key) if matched_anchor_hash else None
+        )
         current_objective_value = float(
             (actor_rd_target if actor_critic_selection else objective.detach()).cpu()
         )
@@ -1289,6 +1372,8 @@ class Network(nn.Module):
             previous_selected = previous_plan.get("selected", {})
 
             for operation in ("Add", "Prune", "Adjust"):
+                if operation != replay_operation:
+                    continue
                 scores = score_tensors.get(operation)
                 ids = candidate_ids_by_operation.get(operation, ())
                 if not torch.is_tensor(scores) or not scores.requires_grad:
@@ -1376,7 +1461,7 @@ class Network(nn.Module):
             actuator_for_evidence._den6_actual_action_comparisons = int(getattr(
                 actuator_for_evidence, "_den6_actual_action_comparisons", 0
             )) + 1
-        if isinstance(selected_ids_by_operation, dict):
+        if isinstance(selected_ids_by_operation, dict) and matched_anchor_hash:
             # Retain the best *executed training plan* for this frame as the
             # comparison incumbent.  A worse exploratory sample must not
             # replace the teacher for the next visit and cause a random walk.
@@ -1388,8 +1473,10 @@ class Network(nn.Module):
                 < float(previous_plan.get("objective", float("inf")))
             )
             if should_update_incumbent:
-                plan_memory[cache_key] = {
+                plan_memory[matched_plan_key] = {
                     "objective": current_objective_value,
+                    "anchor_hash": matched_anchor_hash,
+                    "factorized_group": factorized_group,
                     "selected": {
                         name: tuple(
                             _compact_candidate_id(value)
@@ -1399,7 +1486,8 @@ class Network(nn.Module):
                     },
                 }
                 actual_set_incumbent_updated = True
-            plan_memory.move_to_end(cache_key)
+            if matched_anchor_hash:
+                plan_memory.move_to_end(matched_plan_key)
             plan_memory_capacity = max(int(getattr(
                 self.args,
                 "heuristic_guidance_online_actual_plan_memory_entries",
@@ -1409,9 +1497,9 @@ class Network(nn.Module):
                 plan_memory.popitem(last=False)
 
         # Candidate Actual replay: factorized Where exploration changes at most
-        # a few candidates, so comparable sequence/group outcomes can supervise
-        # the Actor without candidate-wise codec encodes.  Exact-frame pairs get
-        # full weight; normalized same-sequence pairs are deliberately weaker.
+        # a few candidates.  Only an exact frame+anchor+decision-group match may
+        # supervise Actor/Critic/Proposal; cross-frame plan scalars remain solely
+        # in the plan-level replay and are never expanded into candidate labels.
         actual_actor_replay_raw = objective.new_zeros(())
         actual_actor_replay_weighted = objective.new_zeros(())
         actual_actor_replay_pairs = 0
@@ -1419,15 +1507,14 @@ class Network(nn.Module):
         actual_actor_replay_count = 0
         actual_candidate_critic_replay_raw = objective.new_zeros(())
         actual_candidate_critic_replay_weighted = objective.new_zeros(())
+        actual_proposal_replay_raw = objective.new_zeros(())
+        actual_proposal_replay_weighted = objective.new_zeros(())
         actual_actor_replay_accuracy = 0.0
         actual_candidate_critic_replay_accuracy = 0.0
+        actual_proposal_replay_accuracy = 0.0
         explored_features = (
             plan_debug.get("_actual_credit_explored_features", {})
             if isinstance(plan_debug, dict) else {}
-        )
-        replay_operation = (
-            factorized_group[:-5]
-            if factorized_group.endswith("Where") else ""
         )
         current_features = (
             explored_features.get(replay_operation)
@@ -1454,6 +1541,9 @@ class Network(nn.Module):
             current_actor_scores = self.actuator.den6_candidate_actor(
                 current_features
             ).reshape(-1)
+            current_proposal_scores = self.actuator.den6_candidate_proposal(
+                current_features
+            ).reshape(-1)
             current_critic_scores = (
                 self.actuator.den6_candidate_critic(
                     current_critic_features.detach()
@@ -1476,8 +1566,10 @@ class Network(nn.Module):
             )), 1)
             preference_terms = []
             critic_preference_terms = []
+            proposal_preference_terms = []
             actor_preference_accuracies = []
             critic_preference_accuracies = []
+            proposal_preference_accuracies = []
             current_advantage_value = float(advantage.detach().cpu())
             for record in reversed(actor_replay):
                 if len(preference_terms) >= replay_batch:
@@ -1488,17 +1580,17 @@ class Network(nn.Module):
                     or str(record.get("operation", "")) != replay_operation
                 ):
                     continue
-                exact_pair = str(record.get("cache_key", "")) == str(cache_key)
-                # Exact-frame pairs can compare the raw RD objective.  Across
-                # frames, compare each outcome relative to its sequence/group
-                # baseline instead; raw frame difficulty otherwise becomes a
-                # false candidate preference even after percent normalization.
-                delta = (
-                    float(record.get("actual_rd", 0.0)) - current_objective_value
-                    if exact_pair else
-                    current_advantage_value
-                    - float(record.get("actual_advantage", 0.0))
+                exact_pair = bool(
+                    str(record.get("cache_key", "")) == str(cache_key)
+                    and matched_anchor_hash
+                    and str(record.get("anchor_hash", "")) == matched_anchor_hash
                 )
+                # A plan scalar cannot label individual candidates across
+                # frames/anchors.  Such records remain available to Plan Critic
+                # replay, but never become candidate Actor/Proposal teachers.
+                if not exact_pair:
+                    continue
+                delta = float(record.get("actual_rd", 0.0)) - current_objective_value
                 if abs(delta) < minimum_delta:
                     continue
                 old_features = record.get("candidate_features")
@@ -1512,21 +1604,27 @@ class Network(nn.Module):
                     old_features
                 ).reshape(-1)
                 current_is_better = 1.0 if delta > 0.0 else -1.0
-                comparison_weight = 1.0 if exact_pair else cross_frame_weight
-                actor_differences = (
-                    current_actor_scores.reshape(-1, 1)
-                    - old_actor_scores.reshape(1, -1)
-                )
+                actor_difference = current_actor_scores.mean() - old_actor_scores.mean()
                 preference_terms.append(
-                    float(comparison_weight) * torch.nn.functional.softplus(
+                    torch.nn.functional.softplus(
                         -float(current_is_better)
-                        * actor_differences / 0.25
-                    ).mean()
+                        * actor_difference / 0.25
+                    )
                 )
                 actor_preference_accuracies.append(float(
-                    (
-                        float(current_is_better) * actor_differences.detach() > 0.0
-                    ).float().mean().cpu()
+                    (float(current_is_better) * actor_difference.detach() > 0.0).cpu()
+                ))
+                old_proposal_scores = self.actuator.den6_candidate_proposal(
+                    old_features
+                ).reshape(-1)
+                proposal_difference = (
+                    current_proposal_scores.mean() - old_proposal_scores.mean()
+                )
+                proposal_preference_terms.append(torch.nn.functional.softplus(
+                    -float(current_is_better) * proposal_difference / 0.25
+                ))
+                proposal_preference_accuracies.append(float(
+                    (float(current_is_better) * proposal_difference.detach() > 0.0).cpu()
                 ))
                 old_critic_features = record.get("candidate_critic_features")
                 if (
@@ -1541,20 +1639,17 @@ class Network(nn.Module):
                     old_critic_scores = self.actuator.den6_candidate_critic(
                         old_critic_features.detach()
                     )[:, 0].reshape(-1)
-                    critic_differences = (
-                        current_critic_scores.reshape(-1, 1)
-                        - old_critic_scores.reshape(1, -1)
+                    critic_difference = (
+                        current_critic_scores.mean() - old_critic_scores.mean()
                     )
                     critic_preference_terms.append(
-                        float(comparison_weight) * torch.nn.functional.softplus(
+                        torch.nn.functional.softplus(
                             -float(current_is_better)
-                            * critic_differences / 0.25
-                        ).mean()
+                            * critic_difference / 0.25
+                        )
                     )
                     critic_preference_accuracies.append(float(
-                        (
-                            float(current_is_better) * critic_differences.detach() > 0.0
-                        ).float().mean().cpu()
+                        (float(current_is_better) * critic_difference.detach() > 0.0).cpu()
                     ))
                 actual_actor_replay_pairs += 1
                 actual_actor_replay_exact_pairs += int(exact_pair)
@@ -1630,6 +1725,43 @@ class Network(nn.Module):
                     actuator_for_evidence._den6_actual_candidate_critic_comparisons = (
                         comparison_count
                     )
+            if proposal_preference_terms:
+                actual_proposal_replay_accuracy = sum(
+                    proposal_preference_accuracies
+                ) / float(max(len(proposal_preference_accuracies), 1))
+                actual_proposal_replay_raw = torch.stack(
+                    proposal_preference_terms
+                ).mean()
+                proposal_replay_weight = max(float(getattr(
+                    self.args,
+                    "heuristic_guidance_online_actual_actor_replay_weight",
+                    0.20,
+                )), 0.0)
+                actual_proposal_replay_weighted = (
+                    float(proposal_replay_weight)
+                    * actual_proposal_replay_raw
+                    / float(policy_backward_scale)
+                )
+                policy_loss = policy_loss + actual_proposal_replay_weighted
+                if actuator_for_evidence is not None:
+                    previous_count = int(getattr(
+                        actuator_for_evidence, "_den6_matched_actual_pair_count", 0
+                    ))
+                    batch_count = len(proposal_preference_terms)
+                    matched_count = previous_count + batch_count
+                    previous_accuracy = float(getattr(
+                        actuator_for_evidence,
+                        "_den6_matched_actual_pair_accuracy",
+                        0.0,
+                    ))
+                    actuator_for_evidence._den6_matched_actual_pair_accuracy = (
+                        (
+                            previous_accuracy * float(previous_count)
+                            + float(actual_proposal_replay_accuracy) * float(batch_count)
+                        )
+                        / float(max(matched_count, 1))
+                    )
+                    actuator_for_evidence._den6_matched_actual_pair_count = matched_count
             # Retain only the actually perturbed candidates.  Keeping the
             # complete composite-plan ID list (hundreds/thousands of Python
             # strings per record) made the bounded tensor replay unbounded in
@@ -1654,6 +1786,7 @@ class Network(nn.Module):
                 "cache_key": str(cache_key),
                 "factorized_group": str(factorized_group),
                 "operation": str(replay_operation),
+                "anchor_hash": str(matched_anchor_hash),
                 "candidate_features": current_features.detach().to(
                     device="cpu", dtype=torch.float16
                 ),
@@ -1723,10 +1856,28 @@ class Network(nn.Module):
                 weighted_term.detach().cpu()
             )
         entropy_raw = entropy.float().mean() if torch.is_tensor(entropy) else objective.new_zeros(())
+        matched_accuracy = min(max(float(getattr(
+            actuator_for_evidence, "_den6_matched_actual_pair_accuracy", 0.0
+        )), 0.0), 1.0) if actuator_for_evidence is not None else 0.0
+        matched_quality = max(2.0 * (matched_accuracy - 0.5), 0.0)
+        matched_evidence = min(max(float(getattr(
+            actuator_for_evidence, "_den6_actual_action_evidence", 0.0
+        )), 0.0), 1.0) if actuator_for_evidence is not None else 0.0
+        critic_actual_quality = min(max(float(getattr(
+            actuator_for_evidence, "_den6_actual_candidate_critic_quality", 0.0
+        )), 0.0), 1.0) if actuator_for_evidence is not None else 0.0
+        preference_quality = min(matched_quality, critic_actual_quality) * matched_evidence
+        entropy_min_fraction = min(max(float(getattr(
+            self.args, "heuristic_guidance_online_entropy_min_fraction", 0.10
+        )), 0.0), 1.0)
+        effective_entropy_weight = float(entropy_weight) * (
+            entropy_min_fraction
+            + (1.0 - entropy_min_fraction) * (1.0 - preference_quality)
+        )
         entropy_weighted = (
-            -entropy_weight * entropy_raw / float(policy_backward_scale)
+            -effective_entropy_weight * entropy_raw / float(policy_backward_scale)
             if mode == "ana_den6_online"
-            else -entropy_weight * entropy_raw
+            else -effective_entropy_weight * entropy_raw
         )
         if torch.is_tensor(entropy):
             policy_loss = policy_loss + entropy_weighted
@@ -1907,6 +2058,16 @@ class Network(nn.Module):
             "actual_candidate_critic_replay_accuracy": float(
                 actual_candidate_critic_replay_accuracy
             ),
+            "actual_proposal_replay_raw": float(
+                actual_proposal_replay_raw.detach().cpu()
+            ),
+            "actual_proposal_replay_weighted": float(
+                actual_proposal_replay_weighted.detach().cpu()
+            ),
+            "actual_proposal_replay_accuracy": float(
+                actual_proposal_replay_accuracy
+            ),
+            "matched_actual_anchor_hash": str(matched_anchor_hash),
             "log_prob": float(log_prob.detach().float().mean().cpu()),
             "entropy": float(entropy.detach().float().mean().cpu()) if torch.is_tensor(entropy) else 0.0,
             "policy_core_raw": float(policy_core_raw.detach().cpu()),
@@ -1936,9 +2097,16 @@ class Network(nn.Module):
             "candidate_local_credit_weighted": float(
                 candidate_local_credit_weighted.detach().cpu()
             ),
+            "candidate_actor_proxy_weighted": float(
+                candidate_actor_proxy_weighted_for_probe.detach().cpu()
+            ),
             **local_plan_credit_debug,
             "entropy_raw": float(entropy_raw.detach().cpu()),
             "entropy_weighted": float(entropy_weighted.detach().cpu()),
+            "entropy_weight_effective": float(effective_entropy_weight),
+            "actual_preference_quality": float(preference_quality),
+            "noop_actual_raw": float(noop_actual_raw.detach().cpu()),
+            "noop_actual_weighted": float(noop_actual_weighted.detach().cpu()),
             "geometry_policy_guard_passed": bool(geometry_guard_passed),
             "geometry_policy_baseline_source": str(geometry_baseline_source),
             "geometry_policy_advantage": float(geometry_advantage.detach().cpu()),
@@ -1948,6 +2116,23 @@ class Network(nn.Module):
             "adaptive_amount_entropy_weighted": float(adaptive_amount_entropy_weighted.detach().cpu()),
             "baseline_ema_alpha": float(baseline_alpha),
             "policy_loss": float(policy_loss.detach().cpu()),
+        }
+        # Retain graph-connected source tensors only until train.py performs its
+        # optional low-frequency diagnostic probe.  These are never serialized
+        # and never used to choose an action.
+        self._den6_policy_source_losses = {
+            "actual": (
+                policy_core_weighted
+                + actual_set_contrast_weighted
+                + actual_actor_replay_weighted
+                + actual_candidate_critic_replay_weighted
+                + actual_proposal_replay_weighted
+                + noop_actual_weighted
+                + plan_critic_loss_weighted
+            ),
+            "proxy": candidate_local_credit_weighted,
+            "entropy": entropy_weighted,
+            "geometry": geometry_policy_weighted,
         }
         return policy_loss.to(dtype=reward.dtype)
 
@@ -5475,6 +5660,7 @@ class Network(nn.Module):
                 "den6_online_amount_log_prob",
                 "den6_online_action_log_prob",
                 "den6_online_candidate_local_credit_loss",
+                "den6_online_candidate_actor_proxy_loss",
                 "den6_online_operation_local_credit_loss",
                 "den6_online_amount_local_credit_loss",
                 "den6_online_fine_local_credit_loss",

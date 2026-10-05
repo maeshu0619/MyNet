@@ -2501,11 +2501,11 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--heuristic_guidance_online_actor_proxy_weight',
-        default=0.005,
+        default=0.0,
         type=float,
         help=(
-            'codec-context local RD proxyをActorへ与えるwarm-start補助重み。'
-            'Actual経験を支配しない値に限定する'
+            'codec-context local RD proxyをActorへ直接模倣させるablation重み。'
+            '既定0ではproxyはCandidate Criticのwarm-startだけに用いる'
         ),
     )
     parser.add_argument(
@@ -2559,8 +2559,40 @@ def parse_pugan_args(parser, file_day, file_time):
         help='1回のWhere探索でincumbentから入れ替えるcandidate上限',
     )
     parser.add_argument(
-        '--heuristic_guidance_online_noop_prior_offset', default=-0.50, type=float,
-        help='最良positive Amount priorに対するNo-op logit差',
+        '--heuristic_guidance_online_noop_prior_offset', default=0.0, type=float,
+        help='最良positive Amount priorに対するNo-op logit差。既定は公平なcontrol action',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_learned_proposal', default=True, type=str2bool,
+        help='安全reservoirからActorへ渡すsubset membershipを学習する軽量Proposalを有効化',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_proposal_max_candidates', default=2048, type=int,
+        help='operation別にActorへ渡すlearned proposal subsetの上限。0以下は全safe pool',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_proposal_reserve_factor', default=2.0, type=float,
+        help='requested countに対してProposal subsetへ残す最低倍率',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_proposal_coverage_fraction', default=0.40, type=float,
+        help='空間hash順のcoverage candidateをProposal subsetへ必ず残す比率',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_proposal_uncertainty_fraction', default=0.20, type=float,
+        help='Critic uncertaintyでProposal subsetへ残す探索candidate比率',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_entropy_min_fraction', default=0.10, type=float,
+        help='Actual根拠が十分な場合にも残すentropy bonusの下限比率',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_source_grad_probe', default=True, type=str2bool,
+        help='Actor/ProposalのActual/proxy/entropy/pathwise勾配を低頻度で分離計測',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_source_grad_probe_interval', default=10, type=int,
+        help='source別decision gradient診断のStep間隔。0で無効',
     )
     parser.add_argument(
         '--heuristic_guidance_online_actual_actor_replay_weight', default=0.20, type=float,
@@ -2573,6 +2605,10 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument(
         '--heuristic_guidance_online_actual_actor_replay_entries', default=512, type=int,
         help='Actual Actor replayの最大件数',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_matched_anchor_memory_entries', default=512, type=int,
+        help='同一frame/codec/Where群のActual counterfactualで再利用する実行anchor plan上限',
     )
     parser.add_argument(
         '--heuristic_guidance_online_actual_actor_replay_batch', default=16, type=int,
@@ -4434,7 +4470,7 @@ def parse_pugan_args(parser, file_day, file_time):
         args, "heuristic_guidance_online_gumbel_logit_floor", 0.10
     )), 0.0)
     args.heuristic_guidance_online_actor_proxy_weight = max(float(getattr(
-        args, "heuristic_guidance_online_actor_proxy_weight", 0.005
+        args, "heuristic_guidance_online_actor_proxy_weight", 0.0
     )), 0.0)
     args.heuristic_guidance_online_actor_rate_proxy_scale = min(max(float(getattr(
         args, "heuristic_guidance_online_actor_rate_proxy_scale", 0.0
@@ -4452,8 +4488,32 @@ def parse_pugan_args(parser, file_day, file_time):
         args, "heuristic_guidance_online_exploration_max_candidate_changes", 8
     )), 1)
     args.heuristic_guidance_online_noop_prior_offset = min(max(float(getattr(
-        args, "heuristic_guidance_online_noop_prior_offset", -0.50
+        args, "heuristic_guidance_online_noop_prior_offset", 0.0
     )), -8.0), 0.0)
+    args.heuristic_guidance_online_learned_proposal = bool(getattr(
+        args, "heuristic_guidance_online_learned_proposal", True
+    ))
+    args.heuristic_guidance_online_proposal_max_candidates = int(getattr(
+        args, "heuristic_guidance_online_proposal_max_candidates", 2048
+    ))
+    args.heuristic_guidance_online_proposal_reserve_factor = max(float(getattr(
+        args, "heuristic_guidance_online_proposal_reserve_factor", 2.0
+    )), 1.0)
+    args.heuristic_guidance_online_proposal_coverage_fraction = min(max(float(getattr(
+        args, "heuristic_guidance_online_proposal_coverage_fraction", 0.40
+    )), 0.0), 1.0)
+    args.heuristic_guidance_online_proposal_uncertainty_fraction = min(max(float(getattr(
+        args, "heuristic_guidance_online_proposal_uncertainty_fraction", 0.20
+    )), 0.0), 1.0)
+    args.heuristic_guidance_online_entropy_min_fraction = min(max(float(getattr(
+        args, "heuristic_guidance_online_entropy_min_fraction", 0.10
+    )), 0.0), 1.0)
+    args.heuristic_guidance_online_source_grad_probe = bool(getattr(
+        args, "heuristic_guidance_online_source_grad_probe", True
+    ))
+    args.heuristic_guidance_online_source_grad_probe_interval = max(int(getattr(
+        args, "heuristic_guidance_online_source_grad_probe_interval", 10
+    )), 0)
     args.heuristic_guidance_online_actual_actor_replay_weight = max(float(getattr(
         args, "heuristic_guidance_online_actual_actor_replay_weight", 0.20
     )), 0.0)
@@ -4462,6 +4522,9 @@ def parse_pugan_args(parser, file_day, file_time):
     )), 0.0)
     args.heuristic_guidance_online_actual_actor_replay_entries = max(int(getattr(
         args, "heuristic_guidance_online_actual_actor_replay_entries", 512
+    )), 1)
+    args.heuristic_guidance_online_matched_anchor_memory_entries = max(int(getattr(
+        args, "heuristic_guidance_online_matched_anchor_memory_entries", 512
     )), 1)
     args.heuristic_guidance_online_actual_actor_replay_batch = max(int(getattr(
         args, "heuristic_guidance_online_actual_actor_replay_batch", 16

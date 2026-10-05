@@ -903,6 +903,8 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
             "den6_online_policy_log_prob": first_log_prob,
             "den6_online_policy_entropy": first_log_prob.new_zeros(()),
             "ana_den6_exact_residual_plan_debug": {
+                "factorized_exploration_group": "AddWhere",
+                "matched_actual_anchor_hash": "same-anchor",
                 "_actual_credit_network_scores": {"Add": first_score},
                 "_actual_credit_candidate_ids": {"Add": ["old", "new"]},
                 "_actual_credit_selected_ids": {"Add": ["old"]},
@@ -916,6 +918,8 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
             "den6_online_policy_log_prob": second_log_prob,
             "den6_online_policy_entropy": second_log_prob.new_zeros(()),
             "ana_den6_exact_residual_plan_debug": {
+                "factorized_exploration_group": "AddWhere",
+                "matched_actual_anchor_hash": "same-anchor",
                 "_actual_credit_network_scores": {"Add": second_score},
                 "_actual_credit_candidate_ids": {"Add": ["old", "new"]},
                 "_actual_credit_selected_ids": {"Add": ["new"]},
@@ -943,6 +947,8 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
             "den6_online_policy_log_prob": third_log_prob,
             "den6_online_policy_entropy": third_log_prob.new_zeros(()),
             "ana_den6_exact_residual_plan_debug": {
+                "factorized_exploration_group": "AddWhere",
+                "matched_actual_anchor_hash": "same-anchor",
                 "_actual_credit_network_scores": {"Add": third_score},
                 "_actual_credit_candidate_ids": {"Add": ["old", "new"]},
                 "_actual_credit_selected_ids": {"Add": ["old"]},
@@ -955,6 +961,104 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         self.assertFalse(
             network.last_discrete_policy_debug["actual_set_incumbent_updated"]
         )
+
+    def test_exact_matched_actual_replay_updates_actor_proposal_and_candidate_critic(self):
+        """An exact frame/anchor/group revisit supervises all candidate heads."""
+        network = Network.__new__(Network)
+        torch.nn.Module.__init__(network)
+        network.args = SimpleNamespace(
+            heuristic_guidance_mode="ana_den6_online",
+            heuristic_guidance_online_selection_mode="actor_critic",
+            _current_input_file="/dataset/loot/frame_0001.ply",
+            sparsepcgc_scale_ae=0,
+            sparsepcgc_scale_sr=2,
+            sparsepcgc_scale_m=8,
+            heuristic_guidance_online_policy_weight=1.0,
+            heuristic_guidance_online_policy_backward_scale=10.0,
+            heuristic_guidance_online_entropy_weight=0.0,
+            heuristic_guidance_online_global_actual_credit_weight=0.0,
+            heuristic_guidance_online_actual_set_credit_weight=0.0,
+            heuristic_guidance_online_actual_actor_replay_weight=0.2,
+            heuristic_guidance_online_actual_candidate_critic_replay_weight=0.2,
+            heuristic_guidance_online_actual_actor_min_delta=0.01,
+            heuristic_guidance_online_actual_actor_replay_batch=16,
+            heuristic_guidance_online_actual_actor_replay_entries=32,
+            heuristic_guidance_online_reward_ema=0.1,
+            heuristic_guidance_online_advantage_clip=2.0,
+            heuristic_guidance_online_plan_critic_weight=0.0,
+            cp_lambda_geom=1.0,
+            cp_tau_geom=0.0,
+        )
+        network._den6_online_objective_baseline = __import__(
+            "collections"
+        ).OrderedDict()
+        network._den6_online_actual_plan_memory = __import__(
+            "collections"
+        ).OrderedDict()
+        actuator = torch.nn.Module()
+        actuator.den6_candidate_actor = torch.nn.Linear(7, 1, bias=False)
+        actuator.den6_candidate_proposal = torch.nn.Linear(7, 1, bias=False)
+        actuator.den6_candidate_critic = torch.nn.Linear(7, 2, bias=False)
+        with torch.no_grad():
+            actuator.den6_candidate_actor.weight.zero_()
+            actuator.den6_candidate_proposal.weight.zero_()
+            actuator.den6_candidate_critic.weight.zero_()
+        actuator._den6_actual_action_evidence = 0.0
+        actuator._den6_actual_action_comparisons = 0
+        actuator._den6_actual_candidate_critic_comparisons = 0
+        actuator._den6_actual_candidate_critic_quality = 0.0
+        actuator._den6_matched_actual_pair_count = 0
+        actuator._den6_matched_actual_pair_accuracy = 0.0
+        network.actuator = actuator
+
+        def state(features):
+            log_prob = torch.tensor(0.0, requires_grad=True)
+            return {
+                "den6_online_policy_log_prob": log_prob,
+                "den6_online_policy_entropy": log_prob.new_zeros(()),
+                "den6_online_actor_critic_changed_ratio": log_prob.new_zeros(()),
+                "ana_den6_exact_residual_plan_debug": {
+                    "factorized_exploration_group": "AddWhere",
+                    "matched_actual_anchor_hash": "same-anchor",
+                    "_actual_credit_explored_features": {"Add": features},
+                    "_actual_credit_explored_critic_features": {
+                        "Add": features.clone()
+                    },
+                    "_actual_credit_candidate_ids": {"Add": ["a", "b"]},
+                    "_actual_credit_explored_indices": {"Add": [0, 1]},
+                },
+            }
+
+        old_features = torch.zeros((2, 7))
+        old_features[:, 0] = -1.0
+        network.last_actuator_voxel_state = state(old_features)
+        network.discrete_policy_loss(torch.tensor(-1.0), torch.tensor(0.0))
+
+        new_features = torch.zeros((2, 7))
+        new_features[:, 0] = 1.0
+        network.last_actuator_voxel_state = state(new_features)
+        loss = network.discrete_policy_loss(torch.tensor(-2.0), torch.tensor(0.0))
+        debug = network.last_discrete_policy_debug
+        self.assertEqual(debug["actual_actor_replay_exact_pairs"], 1)
+        self.assertGreater(debug["actual_actor_replay_weighted"], 0.0)
+        self.assertGreater(debug["actual_proposal_replay_weighted"], 0.0)
+        self.assertGreater(debug["actual_candidate_critic_replay_weighted"], 0.0)
+
+        for module in (
+            actuator.den6_candidate_actor,
+            actuator.den6_candidate_proposal,
+            actuator.den6_candidate_critic,
+        ):
+            gradients = torch.autograd.grad(
+                loss,
+                tuple(module.parameters()),
+                retain_graph=True,
+                allow_unused=True,
+            )
+            self.assertGreater(sum(
+                float(gradient.abs().sum())
+                for gradient in gradients if gradient is not None
+            ), 0.0)
 
     def test_den6_geometry_credit_updates_amount_only_inside_compression_guard(self):
         """圧縮改善を保ったGeometry改善だけを離散Amountへ返す。"""
@@ -1739,23 +1843,25 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         )
         actuator.den6_candidate_actor = torch.nn.Linear(7, 1, bias=False)
         actuator.den6_candidate_critic = torch.nn.Linear(7, 2, bias=False)
+        actuator.den6_candidate_proposal = torch.nn.Linear(7, 1, bias=False)
         with torch.no_grad():
             actuator.den6_candidate_actor.weight.zero_()
             actuator.den6_candidate_actor.weight[0, 1] = 1.0
             actuator.den6_candidate_critic.weight.zero_()
+            actuator.den6_candidate_proposal.weight.zero_()
         mapping = {
             "rank_score": torch.tensor([1.0, 0.0]),
             "local_rate_benefit": torch.zeros(2),
             "local_geometry_risk": torch.zeros(2),
         }
-        logits, _, _, features = actuator._den6_actor_critic_candidate_values(
+        logits, _, _, _, features = actuator._den6_actor_critic_candidate_values(
             mapping, torch.zeros(2), 0
         )
         self.assertTrue(torch.equal(features[:, 1], torch.zeros(2)))
         self.assertTrue(torch.equal(logits, torch.zeros(2)))
 
         actuator.args.heuristic_guidance_online_actor_use_rank_feature = True
-        logits, _, _, features = actuator._den6_actor_critic_candidate_values(
+        logits, _, _, _, features = actuator._den6_actor_critic_candidate_values(
             mapping, torch.zeros(2), 0
         )
         self.assertGreater(float(features[:, 1].abs().sum()), 0.0)
@@ -1817,6 +1923,8 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         # Proxy順位を完全に学習しても、同一frameの別planをActual codecで
         # 比較するまでは探索を縮小しない。
         actuator._den6_actual_action_evidence = 1.0
+        actuator._den6_matched_actual_pair_accuracy = 1.0
+        actuator._den6_actual_candidate_critic_quality = 1.0
         self.assertAlmostEqual(
             actuator._learning_adaptive_exploration_factor(learned), 0.25
         )
@@ -1826,8 +1934,10 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         )
         mixed = dict(learned)
         mixed["Adjust"] = {"ranking_quality": 0.0}
+        # Proxy ranking quality is no longer allowed to reopen/contract Actual
+        # exploration.  Only matched Actual accuracy/critic quality control it.
         self.assertAlmostEqual(
-            actuator._learning_adaptive_exploration_factor(mixed, "Adjust"), 1.0
+            actuator._learning_adaptive_exploration_factor(mixed, "Adjust"), 0.25
         )
 
     def test_den6_anchor_amounts_are_operation_specific_at_step_zero(self):
