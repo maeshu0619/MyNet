@@ -109,6 +109,47 @@ def candidate_pairwise_local_credit(prediction, utility_target, max_pairs=256):
     return (weights * torch.nn.functional.softplus(-predicted_gap)).mean()
 
 
+def candidate_actual_critic_policy_credit(
+    actor_logits,
+    proposal_logits,
+    critic_values,
+    actor_mask,
+    proposal_mask,
+    authority,
+):
+    """Distil only an Actual-calibrated Critic into Actor/Proposal.
+
+    The Critic prediction is detached deliberately.  It generalizes strict
+    group-level Actual comparisons and is not an individual-candidate Actual
+    label.  Without reliable Actual authority this path is exactly zero.
+    """
+    authority = min(max(float(authority), 0.0), 1.0)
+    actor_zero = actor_logits.reshape(-1).sum() * 0.0
+    proposal_zero = proposal_logits.reshape(-1).sum() * 0.0
+    if authority <= 0.0:
+        return actor_zero, proposal_zero
+    teacher = critic_values.detach().reshape(-1)
+    actor_mask = actor_mask.to(device=teacher.device, dtype=torch.bool).reshape(-1)
+    proposal_mask = proposal_mask.to(
+        device=teacher.device, dtype=torch.bool
+    ).reshape(-1)
+    actor_valid = actor_mask & torch.isfinite(teacher)
+    proposal_valid = proposal_mask & torch.isfinite(teacher)
+    actor_loss = (
+        float(authority) * candidate_listwise_local_credit(
+            actor_logits.reshape(-1)[actor_valid], teacher[actor_valid]
+        )
+        if int(actor_valid.sum().detach().cpu()) > 1 else actor_zero
+    )
+    proposal_loss = (
+        float(authority) * candidate_listwise_local_credit(
+            proposal_logits.reshape(-1)[proposal_valid], teacher[proposal_valid]
+        )
+        if int(proposal_valid.sum().detach().cpu()) > 1 else proposal_zero
+    )
+    return actor_loss, proposal_loss
+
+
 class StructureRepairActuator(nn.Module):
     """Apply small geometry-preserving movements that realize repair policies.
 
@@ -4884,6 +4925,8 @@ class StructureRepairActuator(nn.Module):
         candidate_pairwise_losses = []
         candidate_critic_losses = []
         candidate_actor_critic_losses = []
+        candidate_actual_critic_actor_losses = []
+        candidate_actual_critic_proposal_losses = []
         candidate_actor_logits = {}
         candidate_critic_values = {}
         candidate_critic_uncertainties = {}
@@ -5178,6 +5221,52 @@ class StructureRepairActuator(nn.Module):
                     policy_logits = policy_logits.clone()
                     policy_logits[anchor_index_tensor] = logits[anchor_index_tensor]
             candidate_proposal_masks[operation] = proposal_mask
+            if actor_critic_selection:
+                # The proxy Critic below is only a dense warm-start.  Once
+                # strict same-anchor Actual comparisons have calibrated the
+                # distinct Actual Critic, let that Critic generalize the
+                # observed group-level preferences back to Actor/Proposal.
+                # The detached Critic prediction is not individual Actual GT.
+                matched_accuracy = min(max(float(getattr(
+                    self, "_den6_matched_actual_pair_accuracy", 0.0
+                )), 0.0), 1.0)
+                matched_quality = max(2.0 * (matched_accuracy - 0.5), 0.0)
+                actual_critic_quality = min(max(float(getattr(
+                    self, "_den6_actual_candidate_critic_quality", 0.0
+                )), 0.0), 1.0)
+                actual_evidence = min(max(float(getattr(
+                    self, "_den6_actual_action_evidence", 0.0
+                )), 0.0), 1.0)
+                actual_teacher_authority = (
+                    min(matched_quality, actual_critic_quality)
+                    * actual_evidence
+                )
+                if actual_teacher_authority > 0.0:
+                    actual_teacher = candidate_critic_values[operation].detach()
+                    safe_reservoir_mask = torch.isfinite(logits)
+                    if operation in static_compatible:
+                        safe_reservoir_mask = (
+                            safe_reservoir_mask
+                            & torch.as_tensor(
+                                static_compatible[operation],
+                                device=logits.device,
+                                dtype=torch.bool,
+                            ).reshape_as(logits)
+                        )
+                    actor_actual_loss, proposal_actual_loss = (
+                        candidate_actual_critic_policy_credit(
+                            candidate_actor_logits[operation],
+                            candidate_proposal_logits[operation],
+                            actual_teacher,
+                            proposal_mask,
+                            safe_reservoir_mask,
+                            actual_teacher_authority,
+                        )
+                    )
+                    candidate_actual_critic_actor_losses.append(actor_actual_loss)
+                    candidate_actual_critic_proposal_losses.append(
+                        proposal_actual_loss
+                    )
             if (
                 torch.is_tensor(utility_target)
                 and int(utility_target.numel()) == int(policy_logits.numel())
@@ -5684,6 +5773,20 @@ class StructureRepairActuator(nn.Module):
             if candidate_actor_critic_losses
             else next(iter(network_scores.values())).new_zeros(())
         )
+        candidate_actual_critic_actor_loss = (
+            torch.stack(candidate_actual_critic_actor_losses).mean()
+            if candidate_actual_critic_actor_losses
+            else next(iter(network_scores.values())).new_zeros(())
+        )
+        candidate_actual_critic_proposal_loss = (
+            torch.stack(candidate_actual_critic_proposal_losses).mean()
+            if candidate_actual_critic_proposal_losses
+            else next(iter(network_scores.values())).new_zeros(())
+        )
+        candidate_actual_critic_policy_loss = (
+            candidate_actual_critic_actor_loss
+            + candidate_actual_critic_proposal_loss
+        )
         gumbel_scale = (
             sum(gumbel_scales) / float(len(gumbel_scales))
             if gumbel_scales else 0.0
@@ -5707,10 +5810,28 @@ class StructureRepairActuator(nn.Module):
                 ),
             ))
         )
+        # A Where counterfactual is meaningful only when its incumbent really
+        # executes at least one candidate of that operation.  Previously a
+        # no-op plan installed an empty Where anchor; every later revisit then
+        # produced zero changed candidates, so the pending evidence request
+        # could never complete and that frame stopped collecting matched
+        # evidence permanently.
+        explored_operation_for_anchor = (
+            str(factorized_exploration_group)[:-5]
+            if str(factorized_exploration_group).endswith("Where") else ""
+        )
+        matched_anchor_is_requested = bool(
+            explored_operation_for_anchor in operations
+            and not no_op_selected
+            and int(requested_counts.get(explored_operation_for_anchor, 0)) > 0
+            and len(pools[explored_operation_for_anchor])
+                > int(requested_counts.get(explored_operation_for_anchor, 0))
+        )
         if (
             actor_critic_selection
             and str(factorized_exploration_group).endswith("Where")
             and not matched_anchor_reused
+            and matched_anchor_is_requested
         ):
             explored_operation_for_anchor = str(factorized_exploration_group)[:-5]
             # Establish the incumbent with the explored group last, then reuse
@@ -5782,10 +5903,22 @@ class StructureRepairActuator(nn.Module):
                 f"requested={requested_counts}, selected={selected_counts}"
             )
 
+        # Conflict resolution may execute fewer candidates than requested.
+        # Install a matched anchor only from the actually executed plan, while
+        # the earlier ordering decision necessarily uses requested counts.
+        matched_anchor_is_executable = bool(
+            explored_operation_for_anchor in operations
+            and not no_op_selected
+            and int(selected_counts.get(explored_operation_for_anchor, 0)) > 0
+            and len(pools[explored_operation_for_anchor])
+                > int(selected_counts.get(explored_operation_for_anchor, 0))
+        )
+
         if (
             actor_critic_selection
             and str(factorized_exploration_group).endswith("Where")
             and not matched_anchor_reused
+            and matched_anchor_is_executable
         ):
             anchor_indices_by_operation = {name: [] for name in operations}
             for operation, candidate_index, _ in selected:
@@ -6596,6 +6729,9 @@ class StructureRepairActuator(nn.Module):
             "candidate_critic_local_loss": candidate_critic_loss,
             "candidate_proxy_critic_local_loss": candidate_critic_loss,
             "candidate_actor_critic_distill_loss": candidate_actor_critic_loss,
+            "candidate_actual_critic_actor_loss": candidate_actual_critic_actor_loss,
+            "candidate_actual_critic_proposal_loss": candidate_actual_critic_proposal_loss,
+            "candidate_actual_critic_policy_loss": candidate_actual_critic_policy_loss,
             "candidate_actor_proxy_loss": actor_proxy_loss,
             "candidate_actor_proxy_weight": float(effective_actor_proxy_weight),
             "actor_rank_feature_enabled": bool(getattr(
@@ -14744,6 +14880,9 @@ class StructureRepairActuator(nn.Module):
             ),
             "den6_online_candidate_actor_proxy_loss": exact_residual_plan_debug.get(
                 "candidate_actor_proxy_loss", pts_xyz.new_zeros(())
+            ),
+            "den6_online_candidate_actual_critic_policy_loss": exact_residual_plan_debug.get(
+                "candidate_actual_critic_policy_loss", pts_xyz.new_zeros(())
             ),
             "den6_online_operation_local_credit_loss": exact_residual_plan_debug.get(
                 "operation_local_loss", pts_xyz.new_zeros(())

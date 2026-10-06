@@ -2603,6 +2603,13 @@ def parse_pugan_args(parser, file_day, file_time):
         help='比較可能contextのActual RD preferenceをcandidate Criticへ返す重み',
     )
     parser.add_argument(
+        '--heuristic_guidance_online_actual_critic_policy_distill_weight', default=0.10, type=float,
+        help=(
+            'strict matched Actualで校正済みのCandidate Critic順位をActor/Proposalへ'
+            '伝える重み。Actual evidence/精度がない間は自動的に0'
+        ),
+    )
+    parser.add_argument(
         '--heuristic_guidance_online_actual_actor_replay_entries', default=512, type=int,
         help='Actual Actor replayの最大件数',
     )
@@ -3564,6 +3571,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--debug_grad_flow_rate', default=1, type=int, help='勾配ログの出力間隔')
     parser.add_argument('--train_grad_clip', default=0.0, type=float, help='学習時の勾配クリップ値（0で無効）')
     parser.add_argument('--skip_optimizer_on_nonfinite_grad', default=True, type=str2bool, help='Lossが有限でも勾配にNaN/Infがあるstepはoptimizer更新をスキップする')
+    parser.add_argument('--den6_quarantine_nonfinite_grad_elements', default=True, type=str2bool, help='den6 Actor-Critic訓練では非有限grad要素だけを0へ隔離し、有限なActual head更新を保持する')
     parser.add_argument('--nonfinite_grad_log_param_limit', default=8, type=int, help='非有限勾配を検出したときにログへ出すパラメータ名の最大数')
     parser.add_argument('--debug_timing', default=False, type=str2bool, help='ステップ内の時間内訳をログ出力するか')
     parser.add_argument('--sparsepcgc_hard_debug_interval', default=0, type=int, help='SparsePCGCの重いhard統計を何Stepごとに収集するか(0で無効)')
@@ -4540,6 +4548,9 @@ def parse_pugan_args(parser, file_day, file_time):
     args.heuristic_guidance_online_actual_candidate_critic_replay_weight = max(float(getattr(
         args, "heuristic_guidance_online_actual_candidate_critic_replay_weight", 0.20
     )), 0.0)
+    args.heuristic_guidance_online_actual_critic_policy_distill_weight = max(float(getattr(
+        args, "heuristic_guidance_online_actual_critic_policy_distill_weight", 0.10
+    )), 0.0)
     args.heuristic_guidance_online_actual_actor_replay_entries = max(int(getattr(
         args, "heuristic_guidance_online_actual_actor_replay_entries", 512
     )), 1)
@@ -5271,6 +5282,7 @@ def parse_pugan_args(parser, file_day, file_time):
     args.step_grad_log_interval = max(int(getattr(args, "step_grad_log_interval", 1)), 1)
     args.step_grad_first_step_only = bool(getattr(args, "step_grad_first_step_only", True))
     args.skip_optimizer_on_nonfinite_grad = bool(getattr(args, "skip_optimizer_on_nonfinite_grad", True))
+    args.den6_quarantine_nonfinite_grad_elements = bool(getattr(args, "den6_quarantine_nonfinite_grad_elements", True))
     args.nonfinite_grad_log_param_limit = max(int(getattr(args, "nonfinite_grad_log_param_limit", 8)), 0)
     args.train_grad_clip = max(float(getattr(args, "train_grad_clip", 0.0)), 0.0)
     args.surrogate_update_during_training = bool(getattr(args, "surrogate_update_during_training", True))

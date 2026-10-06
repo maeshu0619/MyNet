@@ -4213,6 +4213,41 @@ def train(model, args, loss, writer, plot, notifier=None):
                         model,
                         limit=int(getattr(args, "nonfinite_grad_log_param_limit", 8)),
                     )
+                    if (
+                        den6_online_full_cloud
+                        and bool(getattr(
+                            args, "den6_quarantine_nonfinite_grad_elements", True
+                        ))
+                        and bool(nonfinite_grad_summary.get("has_nonfinite", False))
+                    ):
+                        quarantine = _quarantine_nonfinite_grad_elements(
+                            model,
+                            limit=int(getattr(
+                                args, "nonfinite_grad_log_param_limit", 8
+                            )),
+                        )
+                        comp_debug.update({
+                            "nonfinite_grad_quarantined_elements": int(
+                                quarantine["quarantined_element_count"]
+                            ),
+                            "nonfinite_grad_quarantined_parameters": int(
+                                quarantine["quarantined_parameter_count"]
+                            ),
+                        })
+                        writer.write(
+                            "NonFiniteGradQuarantine: elements={}, params={}, names={}; "
+                            "finite Actor/Critic gradients retained".format(
+                                quarantine["quarantined_element_count"],
+                                quarantine["quarantined_parameter_count"],
+                                ",".join(quarantine["quarantined_names"]),
+                            )
+                        )
+                        nonfinite_grad_summary = _summarize_nonfinite_grads(
+                            model,
+                            limit=int(getattr(
+                                args, "nonfinite_grad_log_param_limit", 8
+                            )),
+                        )
                     last_nonfinite_grad_summary = nonfinite_grad_summary
                     if (
                         bool(getattr(args, "skip_optimizer_on_nonfinite_grad", True))
@@ -4340,6 +4375,41 @@ def train(model, args, loss, writer, plot, notifier=None):
                         model,
                         limit=int(getattr(args, "nonfinite_grad_log_param_limit", 8)),
                     )
+                    if (
+                        den6_online_full_cloud
+                        and bool(getattr(
+                            args, "den6_quarantine_nonfinite_grad_elements", True
+                        ))
+                        and bool(nonfinite_grad_summary.get("has_nonfinite", False))
+                    ):
+                        quarantine = _quarantine_nonfinite_grad_elements(
+                            model,
+                            limit=int(getattr(
+                                args, "nonfinite_grad_log_param_limit", 8
+                            )),
+                        )
+                        comp_debug.update({
+                            "nonfinite_grad_quarantined_elements": int(
+                                quarantine["quarantined_element_count"]
+                            ),
+                            "nonfinite_grad_quarantined_parameters": int(
+                                quarantine["quarantined_parameter_count"]
+                            ),
+                        })
+                        writer.write(
+                            "NonFiniteGradQuarantine: elements={}, params={}, names={}; "
+                            "finite Actor/Critic gradients retained".format(
+                                quarantine["quarantined_element_count"],
+                                quarantine["quarantined_parameter_count"],
+                                ",".join(quarantine["quarantined_names"]),
+                            )
+                        )
+                        nonfinite_grad_summary = _summarize_nonfinite_grads(
+                            model,
+                            limit=int(getattr(
+                                args, "nonfinite_grad_log_param_limit", 8
+                            )),
+                        )
                     last_nonfinite_grad_summary = nonfinite_grad_summary
                     if (
                         bool(getattr(args, "skip_optimizer_on_nonfinite_grad", True))
@@ -4971,6 +5041,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                         f"actual_candidate_critic_replay=(raw={float(audit_compression.get('den6_online_policy_actual_candidate_critic_replay_raw', 0.0) or 0.0):.6g}, "
                         f"weighted={float(audit_compression.get('den6_online_policy_actual_candidate_critic_replay_weighted', 0.0) or 0.0):.6g}, "
                         f"accuracy={float(audit_compression.get('den6_online_policy_actual_candidate_critic_replay_accuracy', 0.0) or 0.0):.4f}), "
+                        f"actual_critic_policy=(actor={case_float(audit_plan.get('candidate_actual_critic_actor_loss', 0.0), 0.0):.6g}, "
+                        f"proposal={case_float(audit_plan.get('candidate_actual_critic_proposal_loss', 0.0), 0.0):.6g}, "
+                        f"weighted={float(audit_compression.get('den6_online_policy_candidate_actual_critic_policy_weighted', 0.0) or 0.0):.6g}), "
                         f"policy_global_available={bool(audit_compression.get('den6_online_policy_global_actual_credit_available', False))}, "
                         f"policy_global_confidence={float(audit_compression.get('den6_online_policy_global_actual_credit_confidence', 0.0) or 0.0):.4f}, "
                         f"policy_global_weight={float(audit_compression.get('den6_online_policy_global_actual_credit_weight', 0.0) or 0.0):.4f}, "
