@@ -1909,7 +1909,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--cp_lambda_geom', default=1.0, type=float, help='compression_primaryのgeometry safety penalty重み')
     parser.add_argument(
         '--rd_geometry_weight_multiplier',
-        default=1.0,
+        default=1.25,
         type=float,
         help=(
             'SparsePCGC online方策のGeometry重要度を、従来RD設定に対して共通に'
@@ -2766,7 +2766,7 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--heuristic_guidance_online_candidate_pairwise_weight',
-        default=0.0,
+        default=0.01,
         type=float,
         help=(
             'RD utility差が明確な候補対へ与えるpairwise順位損失重み。'
@@ -4781,10 +4781,10 @@ def parse_pugan_args(parser, file_day, file_time):
         args.heuristic_guidance_online_prefetch_workers = 0
         args.batch_size = 1
         if not _cli_option_was_provided("--heuristic_guidance_final_where_weight"):
-            # 20260903/004957で実測した構成へ戻す。den6は候補poolと弱い
-            # safety priorだけを与え、候補順位はlocal-RD creditを受ける
-            # Network scoreが上書きできるようにする。
-            args.heuristic_guidance_final_where_weight = 0.01
+            # 20260914/155928で実測された構成を再現する。den6の順位を
+            # 安全な初期方策として残し、NetworkはRD整合confidenceで制限した
+            # residualとして候補順位を更新する。
+            args.heuristic_guidance_final_where_weight = 1.0
         if not _cli_option_was_provided("--heuristic_guidance_exact_anchor_steps"):
             # 完成済みden6 planを通常trainのStep 1へ混ぜると、そのActual値が
             # 未学習Networkの性能として記録される。anchorはA/B監査用の明示的な

@@ -4423,24 +4423,18 @@ class StructureRepairActuator(nn.Module):
         if not amount_bins:
             raise RuntimeError("ana_den6 online Amount離散binが空である")
         positive_bin_tensor = next(iter(ratio_tensors.values())).new_tensor(amount_bins)
-        # The successful 20260903/004957 prior-residual policy learned among
-        # the five measured positive Amount bins.  The later Actor/Critic
-        # experiment added an explicit no-op class; keep that class local to
-        # that experimental path instead of changing the restored policy's
-        # action space.
-        bin_tensor = positive_bin_tensor
+        # 20260914/155928の実測構成はNo-opと5つのpositive Amountを同じ
+        # 離散actionとして比較していた。Actor/Critic実験以前の
+        # prior-residual経路でも同じ6-class action spaceを維持する。
+        bin_tensor = torch.cat([
+            positive_bin_tensor.new_zeros((1,)), positive_bin_tensor
+        ])
         learned_total = sum(ratio_tensors.values()).clamp(1e-9, max_total_ratio)
         amount_temperature = max(float(getattr(
             self.args, "heuristic_guidance_online_amount_temperature", 0.35
         )), 0.05)
         if torch.is_tensor(amount_selector_logits):
             selector = amount_selector_logits.reshape(amount_selector_logits.shape[0], -1)[0]
-            if actor_critic_selection and int(selector.numel()) == int(positive_bin_tensor.numel()) + 1:
-                bin_tensor = torch.cat([
-                    positive_bin_tensor.new_zeros((1,)), positive_bin_tensor
-                ])
-            elif not actor_critic_selection and int(selector.numel()) == int(positive_bin_tensor.numel()) + 1:
-                selector = selector[1:]
             if int(selector.numel()) != int(bin_tensor.numel()):
                 raise RuntimeError(
                     "ana_den6 Amount selectorと離散bin数が一致しない: "
@@ -4469,16 +4463,12 @@ class StructureRepairActuator(nn.Module):
                 positive_bin_tensor.log()
                 - positive_bin_tensor.new_tensor(prior_total_ratio).log()
             ) / amount_temperature
-            if int(bin_tensor.numel()) == int(positive_bin_tensor.numel()) + 1:
-                # Explicit no-op belongs only to the Actor/Critic action space.
-                noop_prior = positive_prior_logits.amax() + float(getattr(
-                    self.args, "heuristic_guidance_online_noop_prior_offset", -0.50
-                ))
-                prior_amount_logits = torch.cat([
-                    noop_prior.reshape(1), positive_prior_logits
-                ])
-            else:
-                prior_amount_logits = positive_prior_logits
+            noop_prior = positive_prior_logits.amax() + float(getattr(
+                self.args, "heuristic_guidance_online_noop_prior_offset", -0.50
+            ))
+            prior_amount_logits = torch.cat([
+                noop_prior.reshape(1), positive_prior_logits
+            ])
             if actor_critic_selection:
                 # Amount is a plan-level decision observed only through one
                 # composite Actual result.  Giving an uncalibrated head full
@@ -4509,8 +4499,12 @@ class StructureRepairActuator(nn.Module):
             positive_amount_logits = -torch.abs(
                 positive_bin_tensor.log() - learned_total.log().reshape(1)
             ) / amount_temperature
-            amount_logits = positive_amount_logits
-            bin_tensor = positive_bin_tensor
+            noop_logit = positive_amount_logits.amax() + float(getattr(
+                self.args, "heuristic_guidance_online_noop_prior_offset", -0.50
+            ))
+            amount_logits = torch.cat([
+                noop_logit.reshape(1), positive_amount_logits
+            ])
             amount_logits_uncalibrated = amount_logits
             amount_logit_calibration_scale = 1.0
         amount_log_probs = torch.log_softmax(amount_logits, dim=0)
@@ -4568,8 +4562,6 @@ class StructureRepairActuator(nn.Module):
             else bin_tensor[selected_amount_bin]
         )
         no_op_selected = bool(
-            actor_critic_selection
-            and
             (not exact_anchor_active)
             and int(selected_amount_bin.detach().cpu()) == 0
             and int(bin_tensor.numel()) == int(positive_bin_tensor.numel()) + 1
@@ -4989,7 +4981,18 @@ class StructureRepairActuator(nn.Module):
                     * float(residual_weight)
                     * candidate_value_score
                 )
-                network_term = network_term_uncalibrated * float(calibration_scale)
+                # 20260914/155928: Heuristic順位を初期方策とし、Networkの
+                # hard-forward authorityだけをRD整合confidenceで制限する。
+                # STEによりbackwardは縮小せず、confidenceが低い初期にも
+                # candidate-local RDを学習できる。
+                network_term_forward = (
+                    network_term_uncalibrated * local_feature_gate
+                )
+                network_term = (
+                    network_term_forward.detach()
+                    + network_term_uncalibrated
+                    - network_term_uncalibrated.detach()
+                ) * float(calibration_scale)
                 network_terms[operation] = network_term
                 logits = heuristic_term + network_term
             static_mask = mapping.get("static_compatible")
@@ -6084,13 +6087,10 @@ class StructureRepairActuator(nn.Module):
                 - float(local_geometry_weight)
                 * _global_standardize(torch.stack(bin_geometry_values))
             )
-            # Local codec attribution can rank *edited* Amount bins, but it
-            # does not observe the Actual no-edit counterfactual.  Including
-            # the zero bin in this proxy softmax assigned it about 3% forever
-            # and explicitly trained the Network away from No-op.  Rank only
-            # positive bins here; the zero-vs-edit decision is learned from
-            # the one-per-step Actual RD policy signal below.  This neither
-            # rewards No-op nor imposes an operation-count target.
+            # Local attribution can rank edited Amount bins, but it does not
+            # observe the Actual no-edit counterfactual.  Keep the restored
+            # six-class action space while learning zero-vs-edit only from the
+            # one-per-step Actual RD signal.
             has_noop_bin = (
                 int(bin_tensor.numel()) == int(positive_bin_tensor.numel()) + 1
             )
