@@ -4841,40 +4841,6 @@ def _summarize_nonfinite_grads(model, limit=8):
         "bad_names": bad_names,
     }
 
-
-def _quarantine_nonfinite_grad_elements(model, limit=8):
-    """Zero only NaN/Inf gradient elements and retain all finite head updates.
-
-    Sparse hard-edit backward can make a subset of the continuous feature path
-    non-finite on particular clouds while the independently computed
-    Actor/Critic Actual gradients remain finite.  Dropping the whole optimizer
-    step discards that valid Actual evidence.  This helper does not alter a
-    loss, forward action, or metric; it quarantines only invalid derivative
-    elements and reports exactly what was removed.
-    """
-    base_model = _unwrap_train_model(model)
-    names = []
-    bad_count = 0
-    touched_parameters = 0
-    for name, parameter in base_model.named_parameters():
-        if not parameter.requires_grad or parameter.grad is None:
-            continue
-        grad = parameter.grad
-        finite = torch.isfinite(grad)
-        if bool(finite.all().item()):
-            continue
-        count = int((~finite).sum().detach().cpu().item())
-        bad_count += count
-        touched_parameters += 1
-        if len(names) < int(limit):
-            names.append(f"{name}:{count}")
-        grad.data.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
-    return {
-        "quarantined_element_count": int(bad_count),
-        "quarantined_parameter_count": int(touched_parameters),
-        "quarantined_names": names,
-    }
-
 def _phase7_named_grad_norms(model):
     base_model = model.module if hasattr(model, "module") else model
 
@@ -5196,20 +5162,7 @@ def _probe_den6_policy_source_gradients(model, source_losses):
             continue
         if hasattr(model, "zero_grad"):
             model.zero_grad(set_to_none=True)
-        try:
-            source_loss.backward(retain_graph=True)
-        except RuntimeError as exc:
-            # This is a diagnostic-only probe.  Some Surrogate paths perform
-            # their own backward before this hook, so their saved tensors are
-            # legitimately gone.  Never abort or alter the real optimizer
-            # update merely because a low-frequency norm cannot be measured.
-            if "backward through the graph a second time" not in str(exc):
-                raise
-            if hasattr(model, "zero_grad"):
-                model.zero_grad(set_to_none=True)
-            for group_name in groups:
-                result[f"{source_name}_{group_name}"] = 0.0
-            continue
+        source_loss.backward(retain_graph=True)
         for group_name, params in groups.items():
             norm_sq = sum(
                 float(torch.sum(param.grad.detach().float() ** 2).cpu())

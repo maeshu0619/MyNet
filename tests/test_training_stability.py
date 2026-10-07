@@ -24,7 +24,6 @@ from models.utils.training.train_runtime import (
     _balance_actual_operation_head_gradients,
     _capture_den6_policy_only_gradients,
     _probe_den6_policy_source_gradients,
-    _quarantine_nonfinite_grad_elements,
     _restore_den6_policy_only_gradients,
     fixed_full_cloud_validation_records,
 )
@@ -55,24 +54,6 @@ class _Plot:
 
 
 class TrainingStabilityTest(unittest.TestCase):
-    def test_nonfinite_gradient_quarantine_preserves_finite_heads(self):
-        model = torch.nn.Sequential(
-            torch.nn.Linear(2, 2, bias=False),
-            torch.nn.Linear(2, 1, bias=False),
-        )
-        model[0].weight.grad = torch.tensor([
-            [float("nan"), 2.0], [float("inf"), -3.0]
-        ])
-        model[1].weight.grad = torch.tensor([[4.0, 5.0]])
-        result = _quarantine_nonfinite_grad_elements(model)
-        self.assertEqual(result["quarantined_element_count"], 2)
-        self.assertEqual(result["quarantined_parameter_count"], 1)
-        self.assertTrue(torch.isfinite(model[0].weight.grad).all())
-        self.assertEqual(float(model[0].weight.grad[0, 1]), 2.0)
-        self.assertTrue(torch.equal(
-            model[1].weight.grad, torch.tensor([[4.0, 5.0]])
-        ))
-
     def test_source_gradient_probe_separates_actor_and_proposal_without_pollution(self):
         class _Actuator(torch.nn.Module):
             def __init__(self):

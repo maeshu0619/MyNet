@@ -1909,7 +1909,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--cp_lambda_geom', default=1.0, type=float, help='compression_primaryのgeometry safety penalty重み')
     parser.add_argument(
         '--rd_geometry_weight_multiplier',
-        default=1.25,
+        default=1.0,
         type=float,
         help=(
             'SparsePCGC online方策のGeometry重要度を、従来RD設定に対して共通に'
@@ -2456,7 +2456,7 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--heuristic_guidance_online_selection_mode',
-        default='actor_critic',
+        default='prior_residual',
         choices=['actor_critic', 'prior_residual'],
         help=(
             'ana_den6_onlineの候補選択。actor_criticはHeuristic順位を最終scoreへ'
@@ -2601,13 +2601,6 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument(
         '--heuristic_guidance_online_actual_candidate_critic_replay_weight', default=0.20, type=float,
         help='比較可能contextのActual RD preferenceをcandidate Criticへ返す重み',
-    )
-    parser.add_argument(
-        '--heuristic_guidance_online_actual_critic_policy_distill_weight', default=0.10, type=float,
-        help=(
-            'strict matched Actualで校正済みのCandidate Critic順位をActor/Proposalへ'
-            '伝える重み。Actual evidence/精度がない間は自動的に0'
-        ),
     )
     parser.add_argument(
         '--heuristic_guidance_online_actual_actor_replay_entries', default=512, type=int,
@@ -2773,7 +2766,7 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--heuristic_guidance_online_candidate_pairwise_weight',
-        default=0.01,
+        default=0.0,
         type=float,
         help=(
             'RD utility差が明確な候補対へ与えるpairwise順位損失重み。'
@@ -3571,7 +3564,6 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--debug_grad_flow_rate', default=1, type=int, help='勾配ログの出力間隔')
     parser.add_argument('--train_grad_clip', default=0.0, type=float, help='学習時の勾配クリップ値（0で無効）')
     parser.add_argument('--skip_optimizer_on_nonfinite_grad', default=True, type=str2bool, help='Lossが有限でも勾配にNaN/Infがあるstepはoptimizer更新をスキップする')
-    parser.add_argument('--den6_quarantine_nonfinite_grad_elements', default=True, type=str2bool, help='den6 Actor-Critic訓練では非有限grad要素だけを0へ隔離し、有限なActual head更新を保持する')
     parser.add_argument('--nonfinite_grad_log_param_limit', default=8, type=int, help='非有限勾配を検出したときにログへ出すパラメータ名の最大数')
     parser.add_argument('--debug_timing', default=False, type=str2bool, help='ステップ内の時間内訳をログ出力するか')
     parser.add_argument('--sparsepcgc_hard_debug_interval', default=0, type=int, help='SparsePCGCの重いhard統計を何Stepごとに収集するか(0で無効)')
@@ -4548,9 +4540,6 @@ def parse_pugan_args(parser, file_day, file_time):
     args.heuristic_guidance_online_actual_candidate_critic_replay_weight = max(float(getattr(
         args, "heuristic_guidance_online_actual_candidate_critic_replay_weight", 0.20
     )), 0.0)
-    args.heuristic_guidance_online_actual_critic_policy_distill_weight = max(float(getattr(
-        args, "heuristic_guidance_online_actual_critic_policy_distill_weight", 0.10
-    )), 0.0)
     args.heuristic_guidance_online_actual_actor_replay_entries = max(int(getattr(
         args, "heuristic_guidance_online_actual_actor_replay_entries", 512
     )), 1)
@@ -4792,10 +4781,10 @@ def parse_pugan_args(parser, file_day, file_time):
         args.heuristic_guidance_online_prefetch_workers = 0
         args.batch_size = 1
         if not _cli_option_was_provided("--heuristic_guidance_final_where_weight"):
-            # 20260911の同一seed E1比較ではH=1,N=0がfixed RD=-2.063、
-            # H=1,N=0.15が-1.985、H=.01,N=1が+0.183であった。
-            # 未学習Networkがden6順位を壊さないようpriorを基準尺度で残す。
-            args.heuristic_guidance_final_where_weight = 1.0
+            # 20260903/004957で実測した構成へ戻す。den6は候補poolと弱い
+            # safety priorだけを与え、候補順位はlocal-RD creditを受ける
+            # Network scoreが上書きできるようにする。
+            args.heuristic_guidance_final_where_weight = 0.01
         if not _cli_option_was_provided("--heuristic_guidance_exact_anchor_steps"):
             # 完成済みden6 planを通常trainのStep 1へ混ぜると、そのActual値が
             # 未学習Networkの性能として記録される。anchorはA/B監査用の明示的な
@@ -5282,7 +5271,6 @@ def parse_pugan_args(parser, file_day, file_time):
     args.step_grad_log_interval = max(int(getattr(args, "step_grad_log_interval", 1)), 1)
     args.step_grad_first_step_only = bool(getattr(args, "step_grad_first_step_only", True))
     args.skip_optimizer_on_nonfinite_grad = bool(getattr(args, "skip_optimizer_on_nonfinite_grad", True))
-    args.den6_quarantine_nonfinite_grad_elements = bool(getattr(args, "den6_quarantine_nonfinite_grad_elements", True))
     args.nonfinite_grad_log_param_limit = max(int(getattr(args, "nonfinite_grad_log_param_limit", 8)), 0)
     args.train_grad_clip = max(float(getattr(args, "train_grad_clip", 0.0)), 0.0)
     args.surrogate_update_during_training = bool(getattr(args, "surrogate_update_during_training", True))

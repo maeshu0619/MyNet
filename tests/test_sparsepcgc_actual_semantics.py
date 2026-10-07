@@ -23,7 +23,6 @@ from models.modules.heuristic_guidance import (
 from models.modules.octree_structure import OctreeStructureAnalysis
 from models.modules.structure_actuator import (
     StructureRepairActuator,
-    candidate_actual_critic_policy_credit,
     candidate_listwise_local_credit,
     candidate_pairwise_local_credit,
 )
@@ -153,28 +152,6 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         aligned_loss.backward()
         self.assertTrue(torch.isfinite(aligned.grad).all())
         self.assertGreater(float(aligned.grad.abs().sum()), 0.0)
-
-    def test_actual_critic_distillation_is_evidence_gated_and_detached(self):
-        actor = torch.zeros(4, requires_grad=True)
-        proposal = torch.zeros(4, requires_grad=True)
-        critic = torch.tensor([-2.0, -0.5, 0.5, 2.0], requires_grad=True)
-        mask = torch.ones(4, dtype=torch.bool)
-        actor_zero, proposal_zero = candidate_actual_critic_policy_credit(
-            actor, proposal, critic, mask, mask, authority=0.0
-        )
-        self.assertEqual(float(actor_zero.detach()), 0.0)
-        self.assertEqual(float(proposal_zero.detach()), 0.0)
-        actor_loss, proposal_loss = candidate_actual_critic_policy_credit(
-            actor, proposal, critic, mask, mask, authority=1.0
-        )
-        gradients = torch.autograd.grad(
-            actor_loss + proposal_loss,
-            (actor, proposal, critic),
-            allow_unused=True,
-        )
-        self.assertGreater(float(gradients[0].abs().sum()), 0.0)
-        self.assertGreater(float(gradients[1].abs().sum()), 0.0)
-        self.assertIsNone(gradients[2])
 
     def test_den6_candidate_local_proxy_uses_complete_codec_gain(self):
         exact = {
@@ -1021,12 +998,11 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         actuator = torch.nn.Module()
         actuator.den6_candidate_actor = torch.nn.Linear(7, 1, bias=False)
         actuator.den6_candidate_proposal = torch.nn.Linear(7, 1, bias=False)
-        actuator.den6_candidate_critic = torch.nn.Linear(7, 2, bias=True)
+        actuator.den6_candidate_critic = torch.nn.Linear(7, 2, bias=False)
         with torch.no_grad():
             actuator.den6_candidate_actor.weight.zero_()
             actuator.den6_candidate_proposal.weight.zero_()
             actuator.den6_candidate_critic.weight.zero_()
-            actuator.den6_candidate_critic.bias.zero_()
         actuator._den6_actual_action_evidence = 0.0
         actuator._den6_actual_action_comparisons = 0
         actuator._den6_actual_candidate_critic_comparisons = 0
@@ -1083,17 +1059,6 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
                 float(gradient.abs().sum())
                 for gradient in gradients if gradient is not None
             ), 0.0)
-        critic_gradient = torch.autograd.grad(
-            loss,
-            actuator.den6_candidate_critic.bias,
-            retain_graph=True,
-        )[0]
-        self.assertGreater(
-            float(critic_gradient[1].abs()), 0.0,
-            "Actual matched evidence must calibrate Critic uncertainty, not only its mean",
-        )
-        self.assertEqual(actuator._den6_matched_actual_pair_count, 1)
-        self.assertEqual(actuator._den6_matched_actual_pair_accuracy, 0.0)
 
     def test_den6_geometry_credit_updates_amount_only_inside_compression_guard(self):
         """圧縮改善を保ったGeometry改善だけを離散Amountへ返す。"""

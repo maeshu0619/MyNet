@@ -270,9 +270,6 @@ class Network(nn.Module):
         )
         return {
             "version": 1,
-            "global_train_step": int(getattr(
-                self.args, "_global_train_step", 0
-            )),
             "network": {
                 name: getattr(self, name)
                 for name in network_names if hasattr(self, name)
@@ -287,20 +284,6 @@ class Network(nn.Module):
     def load_actor_critic_runtime_state_dict(self, state):
         if not isinstance(state, dict):
             return False
-        restored_step = max(int(state.get("global_train_step", 0)), 0)
-        if restored_step <= 0:
-            actuator_state = dict(state.get("actuator") or {})
-            anchor_state = actuator_state.get(
-                "_den6_matched_anchor_plan_memory", {}
-            )
-            if isinstance(anchor_state, dict) and anchor_state:
-                restored_step = 1 + max(
-                    int(record.get("created_step", 0))
-                    for record in anchor_state.values()
-                    if isinstance(record, dict)
-                )
-        self.args._restored_global_train_step = restored_step
-        self.args._global_train_step = restored_step
         for name, value in dict(state.get("network") or {}).items():
             setattr(self, str(name), value)
         if hasattr(self, "actuator"):
@@ -1041,12 +1024,7 @@ class Network(nn.Module):
         # Episode schedule is used, and no additional codec call is required.
         noop_edit_comparison_available = False
         noop_edit_comparison_exact = False
-        # Record the measured edit/no-op objective on every factorized step.
-        # The comparison is consumed only by the Amount policy below, but a
-        # no-op reached while Gate/Fine is the explored group is still the same
-        # executable no-op pipeline and must not be discarded.  This avoids
-        # starving Amount of no-op Actual evidence without adding a codec call.
-        if actor_critic_selection:
+        if actor_critic_selection and factorized_group == "Amount":
             noop_selected = bool(plan_debug_state.get("no_op_selected", False))
             noop_memory = getattr(self, "_den6_noop_edit_actual_memory", None)
             if noop_memory is None:
@@ -1073,7 +1051,7 @@ class Network(nn.Module):
                     )), 0.0), 1.0)
                     * (float(sequence_entry[opposite_name]) - float(objective_value))
                 ).clamp(-advantage_clip, advantage_clip)
-            if noop_edit_comparison_available and factorized_group == "Amount":
+            if noop_edit_comparison_available:
                 global_credit_available = True
                 baseline_source = (
                     "actual_noop_edit_frame" if noop_edit_comparison_exact
@@ -1320,12 +1298,8 @@ class Network(nn.Module):
         candidate_actor_proxy = state.get(
             "den6_online_candidate_actor_proxy_loss", None
         )
-        candidate_actual_critic_policy = state.get(
-            "den6_online_candidate_actual_critic_policy_loss", None
-        )
         candidate_local_credit_weighted = objective.new_zeros(())
         candidate_actor_proxy_weighted_for_probe = objective.new_zeros(())
-        candidate_actual_critic_policy_weighted = objective.new_zeros(())
         if (
             mode == "ana_den6_online"
             and torch.is_tensor(candidate_local_credit)
@@ -1364,22 +1338,6 @@ class Network(nn.Module):
                     * candidate_actor_proxy.float().mean()
                     / float(policy_backward_scale)
                 )
-        if (
-            mode == "ana_den6_online"
-            and torch.is_tensor(candidate_actual_critic_policy)
-            and candidate_actual_critic_policy.requires_grad
-        ):
-            actual_distill_weight = max(float(getattr(
-                self.args,
-                "heuristic_guidance_online_actual_critic_policy_distill_weight",
-                0.10,
-            )), 0.0)
-            candidate_actual_critic_policy_weighted = (
-                float(actual_distill_weight)
-                * candidate_actual_critic_policy.float().mean()
-                / float(policy_backward_scale)
-            )
-            policy_loss = policy_loss + candidate_actual_critic_policy_weighted
 
         # One codec result describes the complete plan, but consecutive plans
         # for the *same frame* reveal which candidate set was exchanged.  Give
@@ -1679,27 +1637,17 @@ class Network(nn.Module):
             current_proposal_scores = self.actuator.den6_candidate_proposal(
                 current_features
             ).reshape(-1)
-            current_critic_output = (
+            current_critic_scores = (
                 self.actuator.den6_candidate_critic(
                     current_critic_features.detach()
-                )
+                )[:, 0].reshape(-1)
                 if torch.is_tensor(current_critic_features)
                 and current_critic_features.ndim == 2
                 and int(current_critic_features.shape[0]) > 0
                 else None
             )
-            current_critic_scores = (
-                current_critic_output[:, 0].reshape(-1)
-                if torch.is_tensor(current_critic_output) else None
-            )
-            current_critic_uncertainty = (
-                torch.nn.functional.softplus(
-                    current_critic_output[:, 1]
-                ).reshape(-1)
-                if torch.is_tensor(current_critic_output) else None
-            )
             minimum_delta = max(float(getattr(
-                self.args, "heuristic_guidance_online_actual_actor_min_delta", 0.01
+                self.args, "heuristic_guidance_online_actual_actor_min_delta", 0.05
             )), 0.0)
             cross_frame_weight = min(max(float(getattr(
                 self.args,
@@ -1781,47 +1729,17 @@ class Network(nn.Module):
                         device=current_features.device,
                         dtype=current_features.dtype,
                     )
-                    old_critic_output = self.actuator.den6_candidate_critic(
+                    old_critic_scores = self.actuator.den6_candidate_critic(
                         old_critic_features.detach()
-                    )
-                    old_critic_scores = old_critic_output[:, 0].reshape(-1)
+                    )[:, 0].reshape(-1)
                     critic_difference = (
                         current_critic_scores.mean() - old_critic_scores.mean()
                     )
-                    critic_preference = torch.nn.functional.softplus(
-                        -float(current_is_better)
-                        * critic_difference / 0.25
-                    )
-                    # The Actual Critic has a distinct uncertainty output, but
-                    # the old loss trained only its mean.  Consequently every
-                    # candidate retained softplus(0)=0.693147 forever and the
-                    # Proposal's uncertainty branch was arbitrary.  Calibrate
-                    # group uncertainty from the strength of this exact Actual
-                    # contrast.  This remains group-level supervision: no
-                    # individual candidate is labelled with the plan scalar.
-                    delta_strength = abs(float(delta)) / max(
-                        abs(float(delta)) + float(minimum_delta), 1e-12
-                    )
-                    uncertainty_target = current_actor_scores.new_tensor(
-                        1.0 - min(max(delta_strength, 0.0), 1.0)
-                    )
-                    old_critic_uncertainty = torch.nn.functional.softplus(
-                        old_critic_output[:, 1]
-                    ).reshape(-1)
-                    critic_calibration = 0.5 * (
-                        torch.nn.functional.smooth_l1_loss(
-                            current_critic_uncertainty.mean(),
-                            uncertainty_target,
-                            beta=0.25,
-                        )
-                        + torch.nn.functional.smooth_l1_loss(
-                            old_critic_uncertainty.mean(),
-                            uncertainty_target,
-                            beta=0.25,
-                        )
-                    )
                     critic_preference_terms.append(
-                        critic_preference + 0.1 * critic_calibration
+                        torch.nn.functional.softplus(
+                            -float(current_is_better)
+                            * critic_difference / 0.25
+                        )
                     )
                     critic_preference_accuracies.append(float(
                         (float(current_is_better) * critic_difference.detach() > 0.0).cpu()
@@ -1976,32 +1894,6 @@ class Network(nn.Module):
             if len(actor_replay) > replay_capacity:
                 del actor_replay[:-replay_capacity]
         actual_actor_replay_count = len(actor_replay)
-
-        # A reused anchor that produced no executable candidate-set change is
-        # not an Actual comparison.  Release it instead of leaving its pending
-        # frame/group request to monopolise every future revisit forever.  A
-        # later visit may establish a fresh executable anchor.
-        if (
-            actor_critic_selection
-            and bool(plan_debug.get("matched_actual_anchor_reused", False))
-            and actual_set_contrast_operations <= 0
-        ):
-            stale_frame_key = str(plan_debug.get(
-                "matched_actual_frame_codec_key", ""
-            ))
-            stale_anchor_key = str(plan_debug.get(
-                "matched_actual_anchor_key", ""
-            ))
-            pending = getattr(
-                actuator_for_evidence, "_den6_pending_matched_groups", None
-            ) if actuator_for_evidence is not None else None
-            if isinstance(pending, dict) and stale_frame_key:
-                pending.pop(stale_frame_key, None)
-            anchors = getattr(
-                actuator_for_evidence, "_den6_matched_anchor_plan_memory", None
-            ) if actuator_for_evidence is not None else None
-            if isinstance(anchors, dict) and stale_anchor_key:
-                anchors.pop(stale_anchor_key, None)
         local_plan_credit_debug = {}
         for state_name, arg_name, debug_name in (
             (
@@ -2289,9 +2181,6 @@ class Network(nn.Module):
             "candidate_actor_proxy_weighted": float(
                 candidate_actor_proxy_weighted_for_probe.detach().cpu()
             ),
-            "candidate_actual_critic_policy_weighted": float(
-                candidate_actual_critic_policy_weighted.detach().cpu()
-            ),
             **local_plan_credit_debug,
             "entropy_raw": float(entropy_raw.detach().cpu()),
             "entropy_weighted": float(entropy_weighted.detach().cpu()),
@@ -2319,7 +2208,6 @@ class Network(nn.Module):
                 + actual_actor_replay_weighted
                 + actual_candidate_critic_replay_weighted
                 + actual_proposal_replay_weighted
-                + candidate_actual_critic_policy_weighted
                 + noop_actual_weighted
                 + plan_critic_loss_weighted
             ),
@@ -5854,7 +5742,6 @@ class Network(nn.Module):
                 "den6_online_action_log_prob",
                 "den6_online_candidate_local_credit_loss",
                 "den6_online_candidate_actor_proxy_loss",
-                "den6_online_candidate_actual_critic_policy_loss",
                 "den6_online_operation_local_credit_loss",
                 "den6_online_amount_local_credit_loss",
                 "den6_online_fine_local_credit_loss",
