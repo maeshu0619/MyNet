@@ -6429,6 +6429,7 @@ def run_episode_full_cloud_validation(
     use_cuda,
     use_amp,
     amp_dtype,
+    diagnostic_policy_override=None,
 ):
     if (
         str(getattr(args, "heuristic_guidance_mode", "")).strip().lower()
@@ -6494,8 +6495,13 @@ def run_episode_full_cloud_validation(
             "sparsepcgc_scale_sr",
             "sparsepcgc_psnr_resolution",
             "sparsepcgc_dense_scale_sr_list",
+            "heuristic_guidance_online_diagnostic_policy",
         )
     }
+    if diagnostic_policy_override is not None:
+        args.heuristic_guidance_online_diagnostic_policy = str(
+            diagnostic_policy_override
+        )
     model.eval()
     if old_replay_max is not None:
         loss.surrogate_replay_max_entries = 0
@@ -6707,6 +6713,7 @@ def run_episode_full_cloud_validation(
     ).hexdigest()
     writer.write(
         "FullCloudValidationSummary: "
+        f"policy={str(diagnostic_policy_override or 'network')}, "
         f"episode={episode + 1}, count={len(values)}, "
         f"actual_percent={avg_value if avg_value is not None else 'n/a'}, "
         f"geometry={avg_geometry if avg_geometry is not None else 'n/a'}, "
@@ -6721,6 +6728,7 @@ def run_episode_full_cloud_validation(
         "count": len(values),
         "sample_names": sample_names,
         "sample_signature": validation_signature,
+        "diagnostic_policy": str(diagnostic_policy_override or "network"),
     }
 
 def load_more_training_checkpoint(model, args, writer):

@@ -267,6 +267,9 @@ class Network(nn.Module):
             "_den6_pending_matched_groups",
             "_den6_proposal_coverage_visits",
             "_den6_completed_matched_pairs",
+            "_den6_fixed_rd_safe_authority",
+            "_den6_fixed_rd_authority_rejected",
+            "_den6_fixed_rd_reject_evidence",
         )
         return {
             "version": 1,
@@ -814,6 +817,9 @@ class Network(nn.Module):
             mode == "ana_den6_online"
             and selection_mode in {"actor_critic", "prior_residual"}
         )
+        # prior_residual differs only in forward safety (H is retained).  The
+        # Actual Actor/Critic/Proposal learners and their replay are shared.
+        actual_residual_learning = bool(factorized_actual_credit)
         geometry_objective_for_rd = (
             torch.nan_to_num(
                 geometry.float().mean(), nan=0.0, posinf=1e3, neginf=0.0
@@ -1156,7 +1162,7 @@ class Network(nn.Module):
         plan_critic_replay_pearson = 0.0
         plan_critic_replay_spearman = 0.0
         if (
-            actor_critic_selection
+            actual_residual_learning
             and torch.is_tensor(plan_critic_value)
             and plan_critic_value.requires_grad
             and torch.is_tensor(plan_feature)
@@ -1639,7 +1645,7 @@ class Network(nn.Module):
             actor_replay = []
             self._den6_actual_actor_replay = actor_replay
         if (
-            actor_critic_selection
+            actual_residual_learning
             and torch.is_tensor(current_features)
             and current_features.ndim == 2
             and int(current_features.shape[0]) > 0
@@ -1650,14 +1656,24 @@ class Network(nn.Module):
             current_proposal_scores = self.actuator.den6_candidate_proposal(
                 current_features
             ).reshape(-1)
-            current_critic_scores = (
+            current_critic_output = (
                 self.actuator.den6_candidate_critic(
                     current_critic_features.detach()
-                )[:, 0].reshape(-1)
+                )
                 if torch.is_tensor(current_critic_features)
                 and current_critic_features.ndim == 2
                 and int(current_critic_features.shape[0]) > 0
                 else None
+            )
+            current_critic_scores = (
+                current_critic_output[:, 0].reshape(-1)
+                if torch.is_tensor(current_critic_output) else None
+            )
+            current_critic_uncertainty = (
+                torch.nn.functional.softplus(
+                    current_critic_output[:, 1]
+                ).clamp_min(1e-4).reshape(-1)
+                if torch.is_tensor(current_critic_output) else None
             )
             minimum_delta = max(float(getattr(
                 self.args, "heuristic_guidance_online_actual_actor_min_delta", 0.05
@@ -1742,17 +1758,47 @@ class Network(nn.Module):
                         device=current_features.device,
                         dtype=current_features.dtype,
                     )
-                    old_critic_scores = self.actuator.den6_candidate_critic(
+                    old_critic_output = self.actuator.den6_candidate_critic(
                         old_critic_features.detach()
-                    )[:, 0].reshape(-1)
+                    )
+                    old_critic_scores = old_critic_output[:, 0].reshape(-1)
+                    old_critic_uncertainty = torch.nn.functional.softplus(
+                        old_critic_output[:, 1]
+                    ).clamp_min(1e-4).reshape(-1)
                     critic_difference = (
                         current_critic_scores.mean() - old_critic_scores.mean()
                     )
+                    preference_loss = torch.nn.functional.softplus(
+                        -float(current_is_better)
+                        * critic_difference / 0.25
+                    )
+                    # The value difference is a group-level Actual advantage,
+                    # not an individual-candidate label.  Calibrate both its
+                    # magnitude and uncertainty so deterministic LCB fallback
+                    # has a meaningful unit after enough matched evidence.
+                    advantage_scale = max(minimum_delta, 0.01)
+                    target_difference = critic_difference.new_tensor(
+                        math.tanh(float(delta) / float(advantage_scale))
+                    )
+                    regression_loss = torch.nn.functional.smooth_l1_loss(
+                        critic_difference,
+                        target_difference,
+                        beta=0.25,
+                    )
+                    predicted_uncertainty = torch.sqrt(
+                        current_critic_uncertainty.mean().square()
+                        + old_critic_uncertainty.mean().square()
+                    )
+                    uncertainty_target = (
+                        critic_difference.detach() - target_difference
+                    ).abs().add(0.05).clamp(max=2.0)
+                    calibration_loss = torch.nn.functional.smooth_l1_loss(
+                        predicted_uncertainty,
+                        uncertainty_target,
+                        beta=0.25,
+                    )
                     critic_preference_terms.append(
-                        torch.nn.functional.softplus(
-                            -float(current_is_better)
-                            * critic_difference / 0.25
-                        )
+                        preference_loss + regression_loss + 0.1 * calibration_loss
                     )
                     critic_preference_accuracies.append(float(
                         (float(current_is_better) * critic_difference.detach() > 0.0).cpu()
@@ -1838,6 +1884,14 @@ class Network(nn.Module):
                 )
                 policy_loss = policy_loss + actual_proposal_replay_weighted
                 if actuator_for_evidence is not None:
+                    # Forward authority requires both the final Actor and the
+                    # membership Proposal to order the same matched groups
+                    # correctly.  Proposal accuracy alone previously let a
+                    # good subset scorer grant authority to a wrong Actor.
+                    joint_actor_proposal_accuracy = min(
+                        float(actual_actor_replay_accuracy),
+                        float(actual_proposal_replay_accuracy),
+                    )
                     previous_count = int(getattr(
                         actuator_for_evidence, "_den6_matched_actual_pair_count", 0
                     ))
@@ -1851,7 +1905,7 @@ class Network(nn.Module):
                     actuator_for_evidence._den6_matched_actual_pair_accuracy = (
                         (
                             previous_accuracy * float(previous_count)
-                            + float(actual_proposal_replay_accuracy) * float(batch_count)
+                            + float(joint_actor_proposal_accuracy) * float(batch_count)
                         )
                         / float(max(matched_count, 1))
                     )

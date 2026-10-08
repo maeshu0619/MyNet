@@ -4939,6 +4939,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                         f"amount_total_ratio={float(audit_plan.get('amount_total_ratio_before_count', 0.0) or 0.0):.7f}, "
                         f"residual_alpha={float(audit_plan.get('residual_alpha', 0.0)):.6f}, "
                         f"where_residual_weight={float(audit_plan.get('where_residual_weight', 0.0) or 0.0):.6f}, "
+                        f"actual_residual_authority={float(audit_plan.get('actual_residual_authority', 0.0) or 0.0):.6f}, "
                         f"network_confidence=(mode={audit_plan.get('network_confidence_mode', '')}, "
                         f"plan={float(audit_plan.get('network_plan_confidence', 0.0) or 0.0):.6f}, "
                         f"by_op={dict(audit_plan.get('network_confidence_by_operation') or {})}), "
@@ -5775,6 +5776,31 @@ def train(model, args, loss, writer, plot, notifier=None):
             use_amp=use_amp,
             amp_dtype=amp_dtype,
         )
+        heuristic_only_val = {
+            "value": None,
+            "geometry_value": None,
+            "fixed_objective": None,
+            "count": 0,
+        }
+        if str(getattr(
+            args, "heuristic_guidance_mode", ""
+        )).strip().lower() == "ana_den6_online":
+            # This is a plan-level deterministic baseline, not a candidate
+            # oracle.  It adds one validation encode per fixed frame and never
+            # participates in the training loss.
+            heuristic_only_val = run_episode_full_cloud_validation(
+                model=model,
+                args=args,
+                loss=loss,
+                writer=writer,
+                seq_datasets=seq_datasets,
+                episode=episode,
+                global_step=global_train_step,
+                use_cuda=use_cuda,
+                use_amp=use_amp,
+                amp_dtype=amp_dtype,
+                diagnostic_policy_override="heuristic",
+            )
         _record_memory(
             "episode_after_full_cloud_validation",
             episode=episode + 1,
@@ -5787,6 +5813,79 @@ def train(model, args, loss, writer, plot, notifier=None):
         checkpoint_metrics["full_cloud_val_sample_signature"] = str(
             full_cloud_val.get("sample_signature") or ""
         )
+        checkpoint_metrics["heuristic_only_val_actual_percent"] = (
+            heuristic_only_val.get("value")
+        )
+        checkpoint_metrics["heuristic_only_val_geometry"] = (
+            heuristic_only_val.get("geometry_value")
+        )
+        checkpoint_metrics["heuristic_only_val_fixed_objective"] = (
+            heuristic_only_val.get("fixed_objective")
+        )
+        network_fixed_rd = finite_float_or_none(
+            full_cloud_val.get("fixed_objective")
+        )
+        heuristic_fixed_rd = finite_float_or_none(
+            heuristic_only_val.get("fixed_objective")
+        )
+        actuator_for_authority = getattr(
+            model.module if hasattr(model, "module") else model,
+            "actuator",
+            None,
+        )
+        if actuator_for_authority is not None:
+            current_authority = float(
+                actuator_for_authority._den6_actual_residual_authority()
+                if hasattr(actuator_for_authority, "_den6_actual_residual_authority")
+                else 0.0
+            )
+            tolerance = max(float(getattr(
+                args,
+                "heuristic_guidance_online_fixed_guard_tolerance",
+                0.0,
+            )), 0.0)
+            rd_gap = None
+            if network_fixed_rd is not None and heuristic_fixed_rd is not None:
+                rd_gap = float(network_fixed_rd) - float(heuristic_fixed_rd)
+                if rd_gap <= tolerance:
+                    actuator_for_authority._den6_fixed_rd_safe_authority = max(
+                        float(getattr(
+                            actuator_for_authority,
+                            "_den6_fixed_rd_safe_authority",
+                            0.0,
+                        )),
+                        current_authority,
+                    )
+                    actuator_for_authority._den6_fixed_rd_authority_rejected = False
+                else:
+                    actuator_for_authority._den6_fixed_rd_authority_rejected = True
+                    actuator_for_authority._den6_fixed_rd_reject_evidence = float(
+                        getattr(
+                            actuator_for_authority,
+                            "_den6_actual_action_evidence",
+                            0.0,
+                        )
+                    )
+            checkpoint_metrics["network_minus_heuristic_fixed_rd"] = rd_gap
+            checkpoint_metrics["actual_residual_authority"] = current_authority
+            checkpoint_metrics["actual_residual_authority_safe"] = float(getattr(
+                actuator_for_authority,
+                "_den6_fixed_rd_safe_authority",
+                0.0,
+            ))
+            checkpoint_metrics["actual_residual_authority_rejected"] = int(bool(getattr(
+                actuator_for_authority,
+                "_den6_fixed_rd_authority_rejected",
+                False,
+            )))
+            writer.write(
+                "FixedPolicyComparison: "
+                f"episode={episode + 1}, network_rd={network_fixed_rd}, "
+                f"heuristic_rd={heuristic_fixed_rd}, gap={rd_gap}, "
+                f"authority={current_authority:.6f}, "
+                f"safe_authority={float(getattr(actuator_for_authority, '_den6_fixed_rd_safe_authority', 0.0)):.6f}, "
+                f"rejected={bool(getattr(actuator_for_authority, '_den6_fixed_rd_authority_rejected', False))}"
+            )
         # Plateau schedulerはmoving train窓や平滑plotではなく、同一frame・
         # explorationなしのraw deterministic fixed RDだけをEpisodeごとに見る。
         # 固定EpisodeでのLR変更ではなく、実性能が2 dataset周期停滞した場合だけ

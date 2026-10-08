@@ -968,7 +968,10 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         torch.nn.Module.__init__(network)
         network.args = SimpleNamespace(
             heuristic_guidance_mode="ana_den6_online",
-            heuristic_guidance_online_selection_mode="actor_critic",
+            # Production uses the safe Heuristic prior.  The dedicated
+            # Actual Actor/Critic/Proposal replay must remain live in this
+            # mode rather than only in the pure actor_critic ablation.
+            heuristic_guidance_online_selection_mode="prior_residual",
             _current_input_file="/dataset/loot/frame_0001.ply",
             sparsepcgc_scale_ae=0,
             sparsepcgc_scale_sr=2,

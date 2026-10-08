@@ -265,6 +265,9 @@ class StructureRepairActuator(nn.Module):
         self._den6_pending_matched_groups = OrderedDict()
         self._den6_proposal_coverage_visits = OrderedDict()
         self._den6_completed_matched_pairs = OrderedDict()
+        self._den6_fixed_rd_safe_authority = 0.0
+        self._den6_fixed_rd_authority_rejected = False
+        self._den6_fixed_rd_reject_evidence = 0.0
         # Per-operation gate for the cache-derived local RD candidate feature.
         # It is a Network parameter (not a fixed heuristic weight): tanh(0)
         # makes the fresh policy exactly unchanged, then local/Actual credit
@@ -3995,6 +3998,41 @@ class StructureRepairActuator(nn.Module):
         quality = min(matched_quality, candidate_quality) * actual_evidence
         return float(floor + (1.0 - floor) * (1.0 - quality))
 
+    def _den6_actual_residual_authority(self):
+        """Return authority earned only from matched, executed Actual-RD data.
+
+        The three factors deliberately have an AND relationship.  A lucky
+        pair, a proxy-trained Critic, or evidence volume without correct
+        ordering cannot grant the Actor forward authority on its own.
+        """
+        matched_accuracy = min(max(float(getattr(
+            self, "_den6_matched_actual_pair_accuracy", 0.0
+        )), 0.0), 1.0)
+        matched_quality = max(2.0 * (matched_accuracy - 0.5), 0.0)
+        critic_quality = min(max(float(getattr(
+            self, "_den6_actual_candidate_critic_quality", 0.0
+        )), 0.0), 1.0)
+        evidence = min(max(float(getattr(
+            self, "_den6_actual_action_evidence", 0.0
+        )), 0.0), 1.0)
+        raw_authority = float(min(matched_quality, critic_quality) * evidence)
+        if bool(getattr(self, "_den6_fixed_rd_authority_rejected", False)):
+            rejected_evidence = min(max(float(getattr(
+                self, "_den6_fixed_rd_reject_evidence", 0.0
+            )), 0.0), 1.0)
+            retry_delta = min(max(float(getattr(
+                self.args,
+                "heuristic_guidance_online_fixed_guard_retry_evidence",
+                0.10,
+            )), 0.0), 1.0)
+            # A rejected authority may be probed again only after materially
+            # more matched Actual evidence has accumulated.
+            if evidence < min(rejected_evidence + retry_delta, 1.0):
+                return float(min(raw_authority, max(float(getattr(
+                    self, "_den6_fixed_rd_safe_authority", 0.0
+                )), 0.0)))
+        return raw_authority
+
     @staticmethod
     def _den6_standardize_candidate_feature(value):
         value = value.float().reshape(-1)
@@ -4369,6 +4407,19 @@ class StructureRepairActuator(nn.Module):
         factorized_actual_credit = selection_mode in {
             "actor_critic", "prior_residual"
         }
+        # Both modes learn the same Actual Actor/Critic/Proposal.  Their only
+        # behavioral difference is whether the safe Heuristic prior is kept in
+        # the forward score (prior_residual) or removed (actor_critic).
+        actual_residual_learning = bool(
+            factorized_actual_credit
+            and hasattr(self, "den6_candidate_actor")
+            and hasattr(self, "den6_candidate_critic")
+            and hasattr(self, "den6_candidate_proposal")
+            and hasattr(self, "den6_plan_critic")
+        )
+        factorized_behavior = bool(
+            factorized_actual_credit and actual_residual_learning
+        )
         factorized_exploration_group = (
             self._select_den6_factorized_exploration_group(
                 network_confidence_audit
@@ -4543,7 +4594,7 @@ class StructureRepairActuator(nn.Module):
                 torch.abs(positive_bin_tensor - float(prior_total_ratio))
             )
         elif amount_exploration_active and (
-            not actor_critic_selection
+            not factorized_behavior
             or factorized_exploration_group in {"all", "Amount"}
         ):
             uniform = torch.rand_like(amount_logits).clamp_(1e-8, 1.0 - 1e-8)
@@ -4614,7 +4665,7 @@ class StructureRepairActuator(nn.Module):
                 amount_exploration_active
                 and fine_sigma > 0.0
                 and (
-                    not actor_critic_selection
+                    not factorized_behavior
                     or factorized_exploration_group in {"all", "Fine"}
                 )
             ):
@@ -4678,7 +4729,7 @@ class StructureRepairActuator(nn.Module):
             gate_combined_logits = prior_share_tensor.log() + gate_residual
             gate_log_probs = torch.log_softmax(gate_combined_logits, dim=0)
             if (
-                actor_critic_selection
+                factorized_behavior
                 and exploration_active
                 and factorized_exploration_group in {"all", "Gate"}
             ):
@@ -4944,7 +4995,7 @@ class StructureRepairActuator(nn.Module):
             base_network_score = network_scores[operation]
             heuristic_term = float(heuristic_prior_weight) * rank_score.float()
             calibration_scale = 1.0
-            if actor_critic_selection:
+            if actual_residual_learning:
                 (
                     actor_logit,
                     critic_value,
@@ -4983,12 +5034,66 @@ class StructureRepairActuator(nn.Module):
                     ] = min(max(float(
                         critic_uncertainty.detach().mean().cpu()
                     ), 0.0), 1.0)
-                candidate_value_score = actor_logit
+                # Bound magnitude without changing the learned ordering.  The
+                # detached scale prevents raw Actor growth from eventually
+                # overwhelming H merely through parameter norm inflation.
+                actor_centered = actor_logit - actor_logit.mean()
+                actor_scale = actor_centered.detach().square().mean().sqrt().clamp_min(1.0)
+                actor_residual = 0.5 * torch.tanh(actor_centered / actor_scale)
+                candidate_value_score = actor_residual
                 candidate_value_scores[operation] = actor_logit
-                network_term_uncalibrated = actor_logit
-                network_term = actor_logit
-                network_terms[operation] = actor_logit
-                logits = actor_logit
+                network_term_uncalibrated = actor_residual
+                if actor_critic_selection:
+                    network_term = actor_residual
+                    logits = actor_residual
+                else:
+                    actual_authority = self._den6_actual_residual_authority()
+                    candidate_authority = actor_residual.new_full(
+                        actor_residual.shape, float(actual_authority)
+                    )
+                    # Fixed/eval is conservative: a candidate may perturb the
+                    # Heuristic policy only when its Actual Critic lower bound
+                    # beats the Heuristic cutoff candidate.  Training still
+                    # explores the safe reservoir to collect contrary data.
+                    if not self.training and int(actor_residual.numel()) > 0:
+                        valid_rank = torch.isfinite(heuristic_term)
+                        valid_indices = torch.nonzero(
+                            valid_rank, as_tuple=False
+                        ).reshape(-1)
+                        if int(valid_indices.numel()) > 0:
+                            cutoff_position = min(
+                                max(int(requested_counts[operation]), 1),
+                                int(valid_indices.numel()),
+                            ) - 1
+                            heuristic_order = torch.argsort(
+                                heuristic_term.index_select(0, valid_indices),
+                                descending=True,
+                            )
+                            cutoff_index = valid_indices[heuristic_order[cutoff_position]]
+                            cutoff_mean = critic_value[cutoff_index].detach()
+                            cutoff_uncertainty = critic_uncertainty[cutoff_index].detach()
+                            kappa = max(float(getattr(
+                                self.args,
+                                "heuristic_guidance_online_actual_lcb_kappa",
+                                1.0,
+                            )), 0.0)
+                            relative_mean = critic_value - cutoff_mean
+                            relative_uncertainty = torch.sqrt(
+                                critic_uncertainty.square()
+                                + cutoff_uncertainty.square()
+                            )
+                            lcb = relative_mean - float(kappa) * relative_uncertainty
+                            candidate_authority = candidate_authority * lcb.gt(0.0).to(
+                                candidate_authority.dtype
+                            )
+                    network_term_forward = actor_residual * candidate_authority
+                    network_term = (
+                        network_term_forward.detach()
+                        + actor_residual
+                        - actor_residual.detach()
+                    )
+                    logits = heuristic_term + network_term
+                network_terms[operation] = network_term
             else:
                 candidate_value_score = base_network_score
                 candidate_value_scores[operation] = candidate_value_score
@@ -5035,7 +5140,7 @@ class StructureRepairActuator(nn.Module):
             # Episode number and den6 rank never do.
             proposal_mask = torch.isfinite(policy_logits)
             if (
-                actor_critic_selection
+                actual_residual_learning
                 and bool(getattr(
                     self.args, "heuristic_guidance_online_learned_proposal", True
                 ))
@@ -5093,6 +5198,19 @@ class StructureRepairActuator(nn.Module):
                         "heuristic_guidance_online_proposal_uncertainty_fraction",
                         0.20,
                     )), 0.05), 0.50)
+                    # Always retain the full deterministic Heuristic baseline
+                    # plan in support.  Proposal may improve membership around
+                    # it, but an untrained head cannot delete the known-safe
+                    # action before Actual evidence exists.
+                    heuristic_core_count = min(
+                        max(int(requested_counts[operation]), 0),
+                        proposal_count,
+                    )
+                    heuristic_core = torch.topk(
+                        heuristic_term.masked_fill(~proposal_mask, float("-inf")),
+                        k=heuristic_core_count,
+                    ).indices if heuristic_core_count > 0 else valid_indices[:0]
+                    remaining_count = max(proposal_count - heuristic_core_count, 0)
                     learned_fraction = min(
                         1.0 - coverage_fraction,
                         0.15 + 0.55 * actual_authority,
@@ -5101,14 +5219,14 @@ class StructureRepairActuator(nn.Module):
                         uncertainty_fraction,
                         max(1.0 - coverage_fraction - learned_fraction, 0.0),
                     )
-                    learned_count = int(round(proposal_count * learned_fraction))
+                    learned_count = int(round(remaining_count * learned_fraction))
                     uncertainty_count = int(round(
-                        proposal_count * uncertainty_fraction
+                        remaining_count * uncertainty_fraction
                     ))
                     coverage_count = max(
-                        proposal_count - learned_count - uncertainty_count, 0
+                        remaining_count - learned_count - uncertainty_count, 0
                     )
-                    chosen = []
+                    chosen = [heuristic_core] if heuristic_core_count > 0 else []
                     if coverage_count > 0:
                         coverage_key = f"{matched_frame_codec_key}|{operation}"
                         visits = getattr(
@@ -5223,7 +5341,7 @@ class StructureRepairActuator(nn.Module):
                             local_prediction, local_target
                         )
                     )
-                    if actor_critic_selection:
+                    if actual_residual_learning:
                         # Dense proxy targets train only the proxy head.  The
                         # Actual head remains untrained until a strict matched
                         # codec comparison exists, so its uncertainty cannot
@@ -5433,7 +5551,7 @@ class StructureRepairActuator(nn.Module):
             operation_exploration_active = bool(
                 exploration_active
                 and (
-                    not actor_critic_selection
+                    not factorized_behavior
                     or factorized_exploration_group in {
                         "all", f"{operation}Where"
                     }
@@ -5449,7 +5567,7 @@ class StructureRepairActuator(nn.Module):
                     float(finite_scaled.std(unbiased=False).cpu())
                     if int(finite_scaled.numel()) > 1 else 0.0
                 )
-                if actor_critic_selection:
+                if actual_residual_learning:
                     uncertainty_scale = float(
                         candidate_critic_uncertainties[operation]
                         .detach().mean().cpu()
@@ -6174,8 +6292,11 @@ class StructureRepairActuator(nn.Module):
             "heuristic_guidance_online_actor_proxy_weight",
             0.0,
         )), 0.0)
+        # prior_residual now uses the same dedicated Actual Actor as the pure
+        # actor_critic mode.  Do not silently restore the legacy proxy-imitation
+        # weight just because H is retained in the forward policy.
         effective_actor_proxy_weight = (
-            actor_proxy_weight if actor_critic_selection else 1.0
+            actor_proxy_weight if actual_residual_learning else 1.0
         )
         actor_proxy_loss = (
             candidate_local_loss
@@ -6413,7 +6534,7 @@ class StructureRepairActuator(nn.Module):
             selected_counts["Add"] + selected_counts["Prune"] + 2 * selected_counts["Adjust"]
         ) / max(float(point_count), 1.0)
         plan_feature_parts = []
-        if actor_critic_selection:
+        if actual_residual_learning:
             for name in operations:
                 indices = selected_indices_by_operation[name]
                 if indices:
@@ -6487,7 +6608,7 @@ class StructureRepairActuator(nn.Module):
             "candidate_actual_encode_count": 0,
             "proposal_source": (
                 "den6_unordered_safe_pool_actor_critic"
-                if actor_critic_selection
+                if actual_residual_learning
                 else "den6_pool_confidence_bounded_network_residual"
             ),
             "performance_source": (
@@ -6495,6 +6616,8 @@ class StructureRepairActuator(nn.Module):
                 if exact_anchor_active
                 else "network_actor_critic_no_rank_fusion"
                 if actor_critic_selection
+                else "heuristic_prior_plus_actual_actor_residual"
+                if actual_residual_learning
                 else "heuristic_prior_plus_rd_aligned_network_residual"
             ),
             "network_only_performance": False,
@@ -6561,6 +6684,9 @@ class StructureRepairActuator(nn.Module):
                 for name in operations
             },
             "network_plan_confidence": float(network_plan_confidence.cpu()),
+            "actual_residual_authority": float(
+                self._den6_actual_residual_authority()
+            ),
             "learned_proposal_actual_quality": float(max(
                 2.0 * (float(getattr(
                     self, "_den6_matched_actual_pair_accuracy", 0.0
@@ -6818,7 +6944,7 @@ class StructureRepairActuator(nn.Module):
             # logits, not the upstream legacy base score.  The old tensor here
             # silently bypassed den6_candidate_actor.
             "_actual_credit_network_scores": (
-                candidate_value_scores if actor_critic_selection else network_scores
+                candidate_value_scores if actual_residual_learning else network_scores
             ),
             "_actual_credit_proposal_scores": candidate_proposal_logits,
             "_actual_credit_proposal_features": candidate_actor_features,
@@ -6853,7 +6979,7 @@ class StructureRepairActuator(nn.Module):
                             dtype=torch.long,
                         ),
                     )
-                    if actor_critic_selection and any(
+                    if actual_residual_learning and any(
                         int(index) in set(selected_indices_by_operation[name])
                         for index in exploration_added_indices[name]
                     )
@@ -6874,7 +7000,7 @@ class StructureRepairActuator(nn.Module):
                             dtype=torch.long,
                         ),
                     )
-                    if actor_critic_selection and any(
+                    if actual_residual_learning and any(
                         int(index) in set(selected_indices_by_operation[name])
                         for index in exploration_added_indices[name]
                     )

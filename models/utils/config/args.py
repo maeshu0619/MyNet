@@ -2591,6 +2591,18 @@ def parse_pugan_args(parser, file_day, file_time):
         help='Actual根拠が十分な場合にも残すentropy bonusの下限比率',
     )
     parser.add_argument(
+        '--heuristic_guidance_online_actual_lcb_kappa', default=1.0, type=float,
+        help='deterministic prior-residualでActual Critic advantageのLCBに用いる係数',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_fixed_guard_tolerance', default=0.0, type=float,
+        help='Network ON fixed RDがHeuristic-onlyを上回れない時に許容する差',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_fixed_guard_retry_evidence', default=0.10, type=float,
+        help='Fixedで棄却したActor authorityを再評価するために必要な追加Actual evidence率',
+    )
+    parser.add_argument(
         '--heuristic_guidance_online_source_grad_probe', default=True, type=str2bool,
         help='Actor/ProposalのActual/proxy/entropy/pathwise勾配を低頻度で分離計測',
     )
@@ -4525,6 +4537,15 @@ def parse_pugan_args(parser, file_day, file_time):
     )), 1.0)
     args.heuristic_guidance_online_proposal_coverage_fraction = min(max(float(getattr(
         args, "heuristic_guidance_online_proposal_coverage_fraction", 0.40
+    )), 0.0), 1.0)
+    args.heuristic_guidance_online_actual_lcb_kappa = max(float(getattr(
+        args, "heuristic_guidance_online_actual_lcb_kappa", 1.0
+    )), 0.0)
+    args.heuristic_guidance_online_fixed_guard_tolerance = max(float(getattr(
+        args, "heuristic_guidance_online_fixed_guard_tolerance", 0.0
+    )), 0.0)
+    args.heuristic_guidance_online_fixed_guard_retry_evidence = min(max(float(getattr(
+        args, "heuristic_guidance_online_fixed_guard_retry_evidence", 0.10
     )), 0.0), 1.0)
     args.heuristic_guidance_online_proposal_uncertainty_fraction = min(max(float(getattr(
         args, "heuristic_guidance_online_proposal_uncertainty_fraction", 0.20
