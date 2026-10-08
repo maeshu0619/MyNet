@@ -2557,9 +2557,10 @@ def train(model, args, loss, writer, plot, notifier=None):
                             args,
                             "heuristic_guidance_online_source_grad_probe_interval",
                             10,
-                        )), 1)
+                        )), 0)
                         if (
                             source_grad_probe_enabled
+                            and source_grad_probe_interval > 0
                             and (int(global_train_step) + 1) % source_grad_probe_interval == 0
                         ):
                             source_losses = dict(getattr(

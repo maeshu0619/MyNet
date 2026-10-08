@@ -5133,6 +5133,31 @@ def _probe_den6_policy_source_gradients(model, source_losses):
     actuator = getattr(base_model, "actuator", None)
     if actuator is None:
         return {}
+    # ``StructureRepairActuator._run_large_head`` uses re-entrant activation
+    # checkpointing for the full-cloud path.  A re-entrant checkpoint supports
+    # the ordinary training backward, but it is not safe to traverse the same
+    # forward graph repeatedly for this per-source diagnostic: even with
+    # ``retain_graph=True`` its recomputed inner graph can already have released
+    # saved tensors on the preceding probe.  The probe is logging-only, so skip
+    # it instead of consuming/corrupting the graph needed by the real policy
+    # capture and joint training backward below.  Source probing remains
+    # available when activation checkpointing is disabled.
+    actuator_args = getattr(actuator, "args", None)
+    checkpoint_mode = str(getattr(
+        actuator_args, "heuristic_guidance_mode", ""
+    )).strip().lower()
+    reentrant_checkpoint_active = bool(
+        actuator.training
+        and getattr(actuator_args, "full_cloud_activation_checkpoint", False)
+        and checkpoint_mode in {
+            "ana_den6_online",
+            "network_only_codec_policy",
+            "network_k_proposal_policy",
+            "single_plan_student",
+        }
+    )
+    if reentrant_checkpoint_active:
+        return {"probe_skipped_reentrant_checkpoint": 1.0}
     groups = {
         "actor": list(getattr(
             actuator, "den6_candidate_actor", torch.nn.Module()

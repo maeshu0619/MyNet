@@ -82,6 +82,30 @@ class TrainingStabilityTest(unittest.TestCase):
         self.assertEqual(result["proxy_proposal"], 0.0)
         self.assertTrue(all(parameter.grad is None for parameter in model.parameters()))
 
+    def test_source_gradient_probe_skips_reentrant_checkpoint_training_graph(self):
+        class _Actuator(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.args = SimpleNamespace(
+                    heuristic_guidance_mode="ana_den6_online",
+                    full_cloud_activation_checkpoint=True,
+                )
+                self.den6_candidate_actor = torch.nn.Linear(2, 1, bias=False)
+
+        class _Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.actuator = _Actuator()
+
+        model = _Model()
+        value = torch.ones((1, 2))
+        actor_value = model.actuator.den6_candidate_actor(value).sum()
+        result = _probe_den6_policy_source_gradients(
+            model, {"actual": actor_value}
+        )
+        self.assertEqual(result, {"probe_skipped_reentrant_checkpoint": 1.0})
+        self.assertTrue(all(parameter.grad is None for parameter in model.parameters()))
+
     def test_candidate_score_fixed_scale_does_not_amplify_tiny_span(self):
         actuator = StructureRepairActuator.__new__(StructureRepairActuator)
         torch.nn.Module.__init__(actuator)
