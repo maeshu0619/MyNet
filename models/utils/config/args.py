@@ -2559,8 +2559,12 @@ def parse_pugan_args(parser, file_day, file_time):
         help='1回のWhere探索でincumbentから入れ替えるcandidate上限',
     )
     parser.add_argument(
-        '--heuristic_guidance_online_noop_prior_offset', default=0.0, type=float,
-        help='最良positive Amount priorに対するNo-op logit差。既定は公平なcontrol action',
+        '--heuristic_guidance_online_noop_prior_offset', default=-1.5, type=float,
+        help=(
+            '最良positive Amount priorに対するNo-op logit差。-1.5は'
+            '20260914/155928のfresh Step 1で観測されたNo-op確率約0.071を'
+            '再現する初期priorであり、学習後はActual edit/no-op比較で更新する'
+        ),
     )
     parser.add_argument(
         '--heuristic_guidance_online_learned_proposal', default=True, type=str2bool,
@@ -4508,7 +4512,7 @@ def parse_pugan_args(parser, file_day, file_time):
         args, "heuristic_guidance_online_exploration_max_candidate_changes", 4
     )), 1)
     args.heuristic_guidance_online_noop_prior_offset = min(max(float(getattr(
-        args, "heuristic_guidance_online_noop_prior_offset", 0.0
+        args, "heuristic_guidance_online_noop_prior_offset", -1.5
     )), -8.0), 0.0)
     args.heuristic_guidance_online_learned_proposal = bool(getattr(
         args, "heuristic_guidance_online_learned_proposal", True

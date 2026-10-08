@@ -4139,8 +4139,14 @@ class StructureRepairActuator(nn.Module):
         scale = max(float(getattr(
             self.args, "heuristic_guidance_online_factorized_ucb_scale", 0.25
         )), 0.0)
-        counts = self._den6_factorized_group_counts
-        remembered = self._den6_factorized_group_uncertainty
+        counts = getattr(self, "_den6_factorized_group_counts", None)
+        if not isinstance(counts, dict):
+            counts = {}
+            self._den6_factorized_group_counts = counts
+        remembered = getattr(self, "_den6_factorized_group_uncertainty", None)
+        if not isinstance(remembered, dict):
+            remembered = {}
+            self._den6_factorized_group_uncertainty = remembered
         total = sum(int(counts.get(name, 0)) for name in groups)
         scores = {}
         for name in groups:
@@ -4347,17 +4353,27 @@ class StructureRepairActuator(nn.Module):
         selection_mode = str(getattr(
             self.args,
             "heuristic_guidance_online_selection_mode",
-            # Missing on old checkpoints/tests: retain their prior-residual
-            # forward contract.  The current CLI explicitly selects the new
-            # Actor/Critic path.
+            # Missing on old checkpoints/tests: retain the safe
+            # prior-residual forward contract.
             "prior_residual",
         )).strip().lower()
         actor_critic_selection = selection_mode == "actor_critic"
+        # ``prior_residual`` keeps den6 as the safe forward prior, but it must
+        # not disable the action-conditional Actual-RD evidence machinery.
+        # The 20261008/041554 run reached E131 with factorized_group=all and
+        # zero matched comparisons because every anchor/evidence branch was
+        # guarded by ``actor_critic_selection``.  Keep behavior selection and
+        # credit collection as separate concerns: both trainable policies use
+        # factorized exploration and strict same-frame anchors, while only the
+        # pure actor_critic mode removes the heuristic term from its logits.
+        factorized_actual_credit = selection_mode in {
+            "actor_critic", "prior_residual"
+        }
         factorized_exploration_group = (
             self._select_den6_factorized_exploration_group(
                 network_confidence_audit
             )
-            if actor_critic_selection and exploration_active
+            if factorized_actual_credit and exploration_active
             else "all" if exploration_active else "none"
         )
         # Exact candidate credit needs an actually reused counterfactual anchor,
@@ -4385,7 +4401,7 @@ class StructureRepairActuator(nn.Module):
             self._den6_matched_anchor_plan_memory = matched_anchor_runtime
         matched_anchor_record = (
             matched_anchor_runtime.get(matched_anchor_key)
-            if actor_critic_selection
+            if factorized_actual_credit
             and str(factorized_exploration_group).endswith("Where")
             else None
         )
@@ -4464,7 +4480,7 @@ class StructureRepairActuator(nn.Module):
                 - positive_bin_tensor.new_tensor(prior_total_ratio).log()
             ) / amount_temperature
             noop_prior = positive_prior_logits.amax() + float(getattr(
-                self.args, "heuristic_guidance_online_noop_prior_offset", -0.50
+                self.args, "heuristic_guidance_online_noop_prior_offset", -1.50
             ))
             prior_amount_logits = torch.cat([
                 noop_prior.reshape(1), positive_prior_logits
@@ -4500,7 +4516,7 @@ class StructureRepairActuator(nn.Module):
                 positive_bin_tensor.log() - learned_total.log().reshape(1)
             ) / amount_temperature
             noop_logit = positive_amount_logits.amax() + float(getattr(
-                self.args, "heuristic_guidance_online_noop_prior_offset", -0.50
+                self.args, "heuristic_guidance_online_noop_prior_offset", -1.50
             ))
             amount_logits = torch.cat([
                 noop_logit.reshape(1), positive_amount_logits
@@ -5719,7 +5735,7 @@ class StructureRepairActuator(nn.Module):
             ))
         )
         if (
-            actor_critic_selection
+            factorized_actual_credit
             and str(factorized_exploration_group).endswith("Where")
             and not matched_anchor_reused
         ):
@@ -5794,7 +5810,7 @@ class StructureRepairActuator(nn.Module):
             )
 
         if (
-            actor_critic_selection
+            factorized_actual_credit
             and str(factorized_exploration_group).endswith("Where")
             and not matched_anchor_reused
         ):
@@ -6179,7 +6195,7 @@ class StructureRepairActuator(nn.Module):
             candidate_critic_loss
             + float(effective_actor_proxy_weight) * actor_proxy_loss
         )
-        if actor_critic_selection and factorized_exploration_group != "all":
+        if factorized_actual_credit and factorized_exploration_group != "all":
             if factorized_exploration_group.endswith("Where"):
                 explored_operation = factorized_exploration_group[:-5]
                 policy_log_prob = where_log_prob_by_operation[explored_operation]
@@ -6199,7 +6215,7 @@ class StructureRepairActuator(nn.Module):
         # outcome existed.  Amount already has Gumbel sampling and Gate is
         # trained from repeated-frame Actual credit, so neither needs an
         # artificial uniform target.
-        if actor_critic_selection and factorized_exploration_group.endswith("Where"):
+        if factorized_actual_credit and factorized_exploration_group.endswith("Where"):
             entropy_operation = factorized_exploration_group[:-5]
             policy_entropy = candidate_entropy_by_operation[entropy_operation]
         else:

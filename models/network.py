@@ -798,12 +798,21 @@ class Network(nn.Module):
         selection_mode = str(getattr(
             self.args,
             "heuristic_guidance_online_selection_mode",
-            # Missing on old checkpoints/tests: keep legacy policy semantics.
-            # Current args explicitly opt into actor_critic.
+            # Missing on old checkpoints/tests: keep prior-residual semantics.
             "prior_residual",
         )).strip().lower()
         actor_critic_selection = bool(
             mode == "ana_den6_online" and selection_mode == "actor_critic"
+        )
+        # Safe prior-residual behavior still needs the same factorized Actual
+        # RD baselines as the pure Actor/Critic policy.  Previously these were
+        # coupled to ``actor_critic_selection``; consequently the restored
+        # prior-residual run explored all heads at once and accumulated zero
+        # matched evidence through E131.  This flag changes credit semantics,
+        # not the forward ranking equation.
+        factorized_actual_credit = bool(
+            mode == "ana_den6_online"
+            and selection_mode in {"actor_critic", "prior_residual"}
         )
         geometry_objective_for_rd = (
             torch.nan_to_num(
@@ -854,7 +863,7 @@ class Network(nn.Module):
         # This uses no extra codec encode and is independent of Episode number.
         policy_baseline_key = (
             f"{cache_key}|factor={factorized_group}"
-            if actor_critic_selection else cache_key
+            if factorized_actual_credit else cache_key
         )
         normalized_input_file = input_file.replace("\\", "/")
         sequence_name = (
@@ -870,7 +879,7 @@ class Network(nn.Module):
         ))
         policy_sequence_key = (
             f"{sequence_key}|factor={factorized_group}"
-            if actor_critic_selection else sequence_key
+            if factorized_actual_credit else sequence_key
         )
         sequence_objective_baseline = getattr(
             self, "_den6_online_sequence_objective_baseline", None
@@ -883,12 +892,12 @@ class Network(nn.Module):
         if baseline_seen:
             previous = self._den6_online_objective_baseline[policy_baseline_key]
             baseline_source = (
-                "frame_factor" if actor_critic_selection else "frame"
+                "frame_factor" if factorized_actual_credit else "frame"
             )
         elif sequence_baseline_seen:
             previous = sequence_objective_baseline[policy_sequence_key]
             baseline_source = (
-                "sequence_factor" if actor_critic_selection else "sequence"
+                "sequence_factor" if factorized_actual_credit else "sequence"
             )
         else:
             previous = 0.0
@@ -897,7 +906,7 @@ class Network(nn.Module):
             # baseline; later unseen frames compare only against that same
             # sequence and same explored decision group.
             baseline_source = (
-                "frame_factor_unseen" if actor_critic_selection else "frame_unseen"
+                "frame_factor_unseen" if factorized_actual_credit else "frame_unseen"
             )
         previous_t = objective.new_tensor(float(previous))
         # objectiveはActual圧縮率[%]で、小さいほど良い。baselineより小さい時に
@@ -915,7 +924,7 @@ class Network(nn.Module):
         effective_baseline_t = torch.minimum(previous_t, previous_t.new_zeros(()))
         ema_advantage = (
             effective_baseline_t
-            - (actor_rd_target.detach() if actor_critic_selection else objective.detach())
+            - (actor_rd_target.detach() if factorized_actual_credit else objective.detach())
         ) * float(reward_scale)
         advantage = ema_advantage
         plan_critic_value = state.get(
@@ -941,7 +950,7 @@ class Network(nn.Module):
         # negative-advantage forever; that failure mode collapsed Amount to
         # zero after the first -1 byte event.
         objective_value = float(
-            (actor_rd_target.detach() if actor_critic_selection else objective.detach()).cpu()
+            (actor_rd_target.detach() if factorized_actual_credit else objective.detach()).cpu()
         )
         baseline_alpha = min(max(
             float(getattr(self.args, "heuristic_guidance_online_reward_ema", 0.10)),
@@ -1024,7 +1033,7 @@ class Network(nn.Module):
         # Episode schedule is used, and no additional codec call is required.
         noop_edit_comparison_available = False
         noop_edit_comparison_exact = False
-        if actor_critic_selection and factorized_group == "Amount":
+        if factorized_actual_credit and factorized_group == "Amount":
             noop_selected = bool(plan_debug_state.get("no_op_selected", False))
             noop_memory = getattr(self, "_den6_noop_edit_actual_memory", None)
             if noop_memory is None:
@@ -1101,7 +1110,7 @@ class Network(nn.Module):
             if isinstance(exact_noop_entry, dict):
                 measured_noop_objective = exact_noop_entry.get("noop")
         if (
-            actor_critic_selection
+            factorized_actual_credit
             and factorized_group == "Amount"
             and torch.is_tensor(amount_log_probs_all)
             and amount_log_probs_all.requires_grad
@@ -1387,7 +1396,11 @@ class Network(nn.Module):
             plan_memory.get(matched_plan_key) if matched_anchor_hash else None
         )
         current_objective_value = float(
-            (actor_rd_target if actor_critic_selection else objective.detach()).cpu()
+            (
+                actor_rd_target
+                if factorized_actual_credit
+                else objective.detach()
+            ).cpu()
         )
 
         def _compact_candidate_id(value):
