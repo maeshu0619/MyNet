@@ -6080,17 +6080,12 @@ class StructureRepairActuator(nn.Module):
         )
         if (
             factorized_actual_credit
-            and str(factorized_exploration_group) in {
-                "AddWhere", "PruneWhere", "AdjustWhere",
-                "Amount", "Gate", "Fine",
-            }
+            # Moving one operation to the end is meaningful only for a
+            # ``*Where`` counterfactual.  Slicing ``Gate``/``Fine`` with
+            # ``[:-5]`` produced an empty operation name and later caused
+            # ``ordered_indices['']`` to raise KeyError.
+            and str(factorized_exploration_group).endswith("Where")
             and not matched_anchor_reused
-            # Gate/Fine have no effect on a no-op plan and therefore cannot
-            # form an identifiable counterfactual in that state.
-            and not (
-                no_op_selected
-                and str(factorized_exploration_group) in {"Gate", "Fine"}
-            )
         ):
             explored_operation_for_anchor = str(factorized_exploration_group)[:-5]
             # Establish the incumbent with the explored group last, then reuse
@@ -6108,6 +6103,12 @@ class StructureRepairActuator(nn.Module):
                 # changes conflict resolution and makes more than one factor
                 # differ, even when requested counts are identical.
                 operation_order = stored_order
+
+        # Keep malformed legacy/runtime anchor data from reaching the plan
+        # builder as an invalid dictionary key.  A valid order must contain
+        # each supported operation exactly once.
+        if len(operation_order) != len(operations) or set(operation_order) != set(operations):
+            operation_order = tuple(operations)
 
         # 1Stepにつき、この1回の順序・1回の候補sampleから1planだけを構築する。
         # 初回候補写像時にGT occupied適合性を厳密に保存済みなら、100万Voxelを
