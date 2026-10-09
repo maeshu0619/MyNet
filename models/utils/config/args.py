@@ -2650,6 +2650,10 @@ def parse_pugan_args(parser, file_day, file_time):
         help='exploration/Proposal authorityを十分なActual evidenceとみなすpair数',
     )
     parser.add_argument(
+        '--heuristic_guidance_online_group_authority_pairs', default=8, type=int,
+        help='decision groupごとのActor residual authorityを校正するstrict Actual pair数',
+    )
+    parser.add_argument(
         '--heuristic_guidance_online_proposal_coverage_entries', default=4096, type=int,
         help='rotating safe-reservoir coverageのframe/operation visit state上限',
     )
@@ -4592,6 +4596,9 @@ def parse_pugan_args(parser, file_day, file_time):
     )), 1)
     args.heuristic_guidance_online_actual_evidence_target_pairs = max(int(getattr(
         args, "heuristic_guidance_online_actual_evidence_target_pairs", 128
+    )), 1)
+    args.heuristic_guidance_online_group_authority_pairs = max(int(getattr(
+        args, "heuristic_guidance_online_group_authority_pairs", 8
     )), 1)
     args.heuristic_guidance_online_proposal_coverage_entries = max(int(getattr(
         args, "heuristic_guidance_online_proposal_coverage_entries", 4096

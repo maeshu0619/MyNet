@@ -1305,6 +1305,97 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
             "frame_factor",
         )
 
+    def test_amount_strict_matched_pair_updates_only_amount_group(self):
+        """A same-anchor Amount comparison yields group-level Actual credit."""
+        network = Network.__new__(Network)
+        torch.nn.Module.__init__(network)
+        network.args = SimpleNamespace(
+            heuristic_guidance_mode="ana_den6_online",
+            heuristic_guidance_online_selection_mode="prior_residual",
+            _current_input_file="/dataset/longdress/frame_0001.ply",
+            sparsepcgc_scale_ae=0,
+            sparsepcgc_scale_sr=2,
+            sparsepcgc_scale_m=8,
+            heuristic_guidance_online_policy_weight=1.0,
+            heuristic_guidance_online_entropy_weight=0.0,
+            heuristic_guidance_online_reward_scale=1.0,
+            heuristic_guidance_online_advantage_clip=10.0,
+            heuristic_guidance_online_reward_ema=0.1,
+            heuristic_guidance_online_global_actual_credit_weight=0.0,
+            heuristic_guidance_online_actual_actor_min_delta=0.01,
+            heuristic_guidance_online_actual_actor_replay_weight=0.4,
+            heuristic_guidance_online_actual_candidate_critic_replay_weight=0.4,
+        )
+        network._den6_online_objective_baseline = __import__(
+            "collections"
+        ).OrderedDict()
+        network._den6_online_actual_plan_memory = __import__(
+            "collections"
+        ).OrderedDict()
+        network.actuator = torch.nn.Module()
+        network.actuator._den6_actual_group_stats = {
+            group: {
+                "comparisons": 0,
+                "evidence": 0.0,
+                "actor_correct": 0.0,
+                "critic_correct": 0.0,
+                "proposal_correct": 0.0,
+                "proposal_comparisons": 0,
+            }
+            for group in (
+                "AddWhere", "PruneWhere", "AdjustWhere",
+                "Amount", "Gate", "Fine",
+            )
+        }
+        network.actuator._den6_completed_matched_pairs = __import__(
+            "collections"
+        ).OrderedDict()
+        network.actuator._den6_pending_matched_groups = __import__(
+            "collections"
+        ).OrderedDict()
+        network.actuator._den6_matched_anchor_plan_memory = __import__(
+            "collections"
+        ).OrderedDict()
+        network.actuator._den6_actual_action_evidence = 0.0
+        network.actuator._den6_actual_action_comparisons = 0
+
+        def state(log_prob, reused):
+            return {
+                "den6_online_policy_log_prob": log_prob,
+                "den6_online_policy_entropy": log_prob.new_zeros(()),
+                "ana_den6_exact_residual_plan_debug": {
+                    "factorized_exploration_group": "Amount",
+                    "matched_actual_anchor_hash": "amount-anchor",
+                    "matched_actual_anchor_reused": reused,
+                    "matched_actual_anchor_age_confidence": 1.0,
+                    "matched_actual_frame_codec_key": "frame-codec",
+                    "matched_actual_anchor_key": "frame-codec|Amount",
+                    "_actual_credit_group_log_prob": log_prob,
+                    "_actual_credit_anchor_group_log_prob": log_prob.new_zeros(()),
+                    "_actual_credit_selected_ids": {
+                        "Add": (), "Prune": (), "Adjust": (),
+                    },
+                },
+            }
+
+        first = torch.tensor(0.0, requires_grad=True)
+        network.last_actuator_voxel_state = state(first, False)
+        network.discrete_policy_loss(torch.tensor(-3.0))
+        second = torch.tensor(0.2, requires_grad=True)
+        network.last_actuator_voxel_state = state(second, True)
+        loss = network.discrete_policy_loss(torch.tensor(-3.2))
+        gradient = torch.autograd.grad(loss, second)[0]
+        self.assertLess(float(gradient), 0.0)
+        self.assertTrue(
+            network.last_discrete_policy_debug["actual_group_pair_available"]
+        )
+        self.assertEqual(
+            network.actuator._den6_actual_group_stats["Amount"]["comparisons"], 1
+        )
+        self.assertEqual(
+            network.actuator._den6_actual_group_stats["Gate"]["comparisons"], 0
+        )
+
     def test_den6_same_sequence_factor_receives_confidence_scaled_actual_credit(self):
         """別frameでも同一系列・同一decisionだけを弱いActual補正に使う。"""
         network = Network.__new__(Network)
@@ -1925,22 +2016,78 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         )
         # Proxy順位を完全に学習しても、同一frameの別planをActual codecで
         # 比較するまでは探索を縮小しない。
-        actuator._den6_actual_action_evidence = 1.0
-        actuator._den6_matched_actual_pair_accuracy = 1.0
-        actuator._den6_actual_candidate_critic_quality = 1.0
+        actuator._den6_actual_group_stats = {
+            group: {
+                "comparisons": 8,
+                "evidence": 8.0,
+                "actor_correct": 8.0,
+                "critic_correct": 8.0,
+                "proposal_correct": 8.0,
+                "proposal_comparisons": 8,
+            }
+            for group in (
+                "AddWhere", "PruneWhere", "AdjustWhere",
+                "Amount", "Gate", "Fine",
+            )
+        }
+        learned_authority = 0.8 * (0.25 + 0.75 * 0.8)
+        learned_factor = 0.25 + 0.75 * (1.0 - learned_authority)
         self.assertAlmostEqual(
-            actuator._learning_adaptive_exploration_factor(learned), 0.25
+            actuator._learning_adaptive_exploration_factor(learned), learned_factor
         )
         actuator.args._global_train_step = 0
         self.assertAlmostEqual(
-            actuator._learning_adaptive_exploration_factor(learned), 0.25
+            actuator._learning_adaptive_exploration_factor(learned), learned_factor
         )
         mixed = dict(learned)
         mixed["Adjust"] = {"ranking_quality": 0.0}
         # Proxy ranking quality is no longer allowed to reopen/contract Actual
         # exploration.  Only matched Actual accuracy/critic quality control it.
         self.assertAlmostEqual(
-            actuator._learning_adaptive_exploration_factor(mixed, "Adjust"), 0.25
+            actuator._learning_adaptive_exploration_factor(mixed, "Adjust"), learned_factor
+        )
+
+    def test_actual_authority_is_decision_group_local(self):
+        actuator = StructureRepairActuator.__new__(StructureRepairActuator)
+        actuator.args = SimpleNamespace(
+            heuristic_guidance_online_group_authority_pairs=8,
+            heuristic_guidance_exploration_min_fraction=0.25,
+        )
+        actuator._den6_fixed_rd_authority_rejected = False
+        actuator._den6_actual_group_stats = {
+            group: {
+                "comparisons": 0,
+                "evidence": 0.0,
+                "actor_correct": 0.0,
+                "critic_correct": 0.0,
+                "proposal_correct": 0.0,
+                "proposal_comparisons": 0,
+            }
+            for group in (
+                "AddWhere", "PruneWhere", "AdjustWhere",
+                "Amount", "Gate", "Fine",
+            )
+        }
+        actuator._den6_actual_group_stats["AddWhere"].update({
+            "comparisons": 8,
+            "evidence": 8.0,
+            "actor_correct": 8.0,
+            "critic_correct": 8.0,
+            "proposal_correct": 8.0,
+            "proposal_comparisons": 8,
+        })
+        self.assertGreater(
+            actuator._den6_group_actual_authority("AddWhere"), 0.0
+        )
+        self.assertEqual(
+            actuator._den6_group_actual_authority("PruneWhere"), 0.0
+        )
+        self.assertEqual(actuator._den6_group_actual_authority("Amount"), 0.0)
+        self.assertLess(
+            actuator._learning_adaptive_exploration_factor({}, "Add"), 1.0
+        )
+        self.assertEqual(
+            actuator._learning_adaptive_exploration_factor({}, "Prune"), 1.0
         )
 
     def test_den6_anchor_amounts_are_operation_specific_at_step_zero(self):

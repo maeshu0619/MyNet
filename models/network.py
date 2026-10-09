@@ -262,6 +262,7 @@ class Network(nn.Module):
             "_den6_actual_candidate_critic_comparisons",
             "_den6_matched_actual_pair_accuracy",
             "_den6_matched_actual_pair_count",
+            "_den6_actual_group_stats",
             "_den6_noop_actual_evidence",
             "_den6_matched_anchor_plan_memory",
             "_den6_pending_matched_groups",
@@ -1409,6 +1410,135 @@ class Network(nn.Module):
             ).cpu()
         )
 
+        # Strict one-factor plan preference.  This is the only Actual teacher
+        # for Amount/Gate/Fine and an additional group-level teacher for Where.
+        # It acts on the composite action log-probability; the scalar plan RD
+        # is never copied to each candidate as an individual target.
+        actual_group_pair_raw = objective.new_zeros(())
+        actual_group_pair_weighted = objective.new_zeros(())
+        actual_group_pair_available = False
+        actual_group_pair_delta = 0.0
+        actual_group_actor_correct = 0.0
+        actual_group_critic_correct = 0.0
+        current_group_log_prob = (
+            plan_debug.get("_actual_credit_group_log_prob")
+            if isinstance(plan_debug, dict) else None
+        )
+        anchor_group_log_prob = (
+            plan_debug.get("_actual_credit_anchor_group_log_prob")
+            if isinstance(plan_debug, dict) else None
+        )
+        strict_group = factorized_group in {
+            "AddWhere", "PruneWhere", "AdjustWhere",
+            "Amount", "Gate", "Fine",
+        }
+        matched_reused = bool(
+            plan_debug.get("matched_actual_anchor_reused", False)
+            if isinstance(plan_debug, dict) else False
+        )
+        group_min_delta = max(float(getattr(
+            self.args, "heuristic_guidance_online_actual_actor_min_delta", 0.05
+        )), 0.0)
+        if (
+            mode == "ana_den6_online"
+            and strict_group
+            and matched_reused
+            and isinstance(previous_plan, dict)
+            and torch.is_tensor(current_group_log_prob)
+            and current_group_log_prob.requires_grad
+        ):
+            actual_group_pair_delta = (
+                float(previous_plan.get("objective", 0.0))
+                - current_objective_value
+            )
+            if abs(actual_group_pair_delta) >= group_min_delta:
+                preference_sign = 1.0 if actual_group_pair_delta > 0.0 else -1.0
+                if torch.is_tensor(anchor_group_log_prob):
+                    group_logit_difference = (
+                        current_group_log_prob - anchor_group_log_prob
+                    )
+                else:
+                    group_logit_difference = current_group_log_prob
+                actual_group_pair_raw = torch.nn.functional.softplus(
+                    -float(preference_sign) * group_logit_difference / 0.25
+                )
+                actual_group_actor_correct = float(
+                    (float(preference_sign) * group_logit_difference.detach() > 0.0)
+                    .float().cpu()
+                )
+                group_weight = max(float(getattr(
+                    self.args,
+                    "heuristic_guidance_online_actual_actor_replay_weight",
+                    0.20,
+                )), 0.0)
+                actual_group_pair_weighted = (
+                    float(group_weight)
+                    * float(matched_anchor_age_confidence)
+                    * actual_group_pair_raw
+                    / float(policy_backward_scale)
+                )
+                policy_loss = policy_loss + actual_group_pair_weighted
+                actual_group_pair_available = True
+
+                old_plan_feature = previous_plan.get("plan_feature")
+                if (
+                    torch.is_tensor(old_plan_feature)
+                    and torch.is_tensor(plan_feature)
+                    and plan_feature.numel() > 0
+                ):
+                    old_plan_feature = old_plan_feature.to(
+                        device=plan_feature.device, dtype=plan_feature.dtype
+                    )
+                    old_plan_value = self.actuator.den6_plan_critic(
+                        old_plan_feature.reshape(1, -1)
+                    ).reshape(-1)[0]
+                    critic_advantage = old_plan_value - plan_critic_value.reshape(())
+                    actual_group_critic_correct = float(
+                        (float(preference_sign) * critic_advantage.detach() > 0.0)
+                        .float().cpu()
+                    )
+                    critic_pair_loss = torch.nn.functional.softplus(
+                        -float(preference_sign) * critic_advantage / 0.25
+                    )
+                    critic_pair_weight = max(float(getattr(
+                        self.args,
+                        "heuristic_guidance_online_actual_candidate_critic_replay_weight",
+                        0.20,
+                    )), 0.0)
+                    policy_loss = policy_loss + (
+                        float(critic_pair_weight)
+                        * float(matched_anchor_age_confidence)
+                        * critic_pair_loss
+                        / float(policy_backward_scale)
+                    )
+
+                actuator_for_group = getattr(self, "actuator", None)
+                if actuator_for_group is not None:
+                    stats = getattr(
+                        actuator_for_group, "_den6_actual_group_stats", None
+                    )
+                    if not isinstance(stats, dict):
+                        stats = {}
+                        actuator_for_group._den6_actual_group_stats = stats
+                    row = stats.setdefault(factorized_group, {
+                        "comparisons": 0,
+                        "evidence": 0.0,
+                        "actor_correct": 0.0,
+                        "critic_correct": 0.0,
+                        "proposal_correct": 0.0,
+                        "proposal_comparisons": 0,
+                    })
+                    row["comparisons"] = int(row.get("comparisons", 0)) + 1
+                    row["evidence"] = float(row.get("evidence", 0.0)) + float(
+                        matched_anchor_age_confidence
+                    )
+                    row["actor_correct"] = float(
+                        row.get("actor_correct", 0.0)
+                    ) + float(actual_group_actor_correct)
+                    row["critic_correct"] = float(
+                        row.get("critic_correct", 0.0)
+                    ) + float(actual_group_critic_correct)
+
         def _compact_candidate_id(value):
             """Stable 64-bit token for memory-resident set comparison."""
             if isinstance(value, int):
@@ -1525,7 +1655,10 @@ class Network(nn.Module):
         # lucky comparison cannot terminate exploration.  This is evidence
         # dependent and contains no Episode counter or target loss value.
         actuator_for_evidence = getattr(self, "actuator", None)
-        if actual_set_contrast_operations > 0 and actuator_for_evidence is not None:
+        if (
+            (actual_set_contrast_operations > 0 or actual_group_pair_available)
+            and actuator_for_evidence is not None
+        ):
             completed = getattr(
                 actuator_for_evidence, "_den6_completed_matched_pairs", None
             )
@@ -1535,7 +1668,17 @@ class Network(nn.Module):
             completed_key = "|".join((
                 str(cache_key), str(factorized_group), str(matched_anchor_hash)
             ))
-            completed[completed_key] = float(actual_set_contrast_evidence)
+            group_pair_evidence = (
+                min(
+                    abs(float(actual_group_pair_delta))
+                    / max(group_min_delta, 1e-8),
+                    1.0,
+                ) * float(matched_anchor_age_confidence)
+                if actual_group_pair_available else 0.0
+            )
+            completed[completed_key] = float(max(
+                actual_set_contrast_evidence, group_pair_evidence
+            ))
             completed.move_to_end(completed_key)
             completed_capacity = max(int(getattr(
                 self.args,
@@ -1589,6 +1732,11 @@ class Network(nn.Module):
                     "objective": current_objective_value,
                     "anchor_hash": matched_anchor_hash,
                     "factorized_group": factorized_group,
+                    "plan_feature": (
+                        plan_feature.detach().to(device="cpu", dtype=torch.float16)
+                        if torch.is_tensor(plan_feature) and plan_feature.numel() > 0
+                        else torch.empty((0,), dtype=torch.float16)
+                    ),
                     "selected": {
                         name: tuple(
                             _compact_candidate_id(value)
@@ -1910,6 +2058,43 @@ class Network(nn.Module):
                         / float(max(matched_count, 1))
                     )
                     actuator_for_evidence._den6_matched_actual_pair_count = matched_count
+                    group_stats = getattr(
+                        actuator_for_evidence, "_den6_actual_group_stats", None
+                    )
+                    if isinstance(group_stats, dict) and factorized_group in group_stats:
+                        group_row = group_stats[factorized_group]
+                        group_row["proposal_comparisons"] = int(
+                            group_row.get("proposal_comparisons", 0)
+                        ) + 1
+                        group_row["proposal_correct"] = float(
+                            group_row.get("proposal_correct", 0.0)
+                        ) + float(actual_proposal_replay_accuracy)
+            if (
+                actuator_for_evidence is not None
+                and factorized_group.endswith("Where")
+                and actual_group_pair_available
+                and actual_actor_replay_pairs > 0
+            ):
+                # Where authority should reflect the changed candidate group,
+                # not the nearly identical mean log-probability of the full
+                # thousand-candidate plan.  Replace this pair's coarse plan
+                # diagnostic with the candidate-group replay observation.
+                group_stats = getattr(
+                    actuator_for_evidence, "_den6_actual_group_stats", None
+                )
+                if isinstance(group_stats, dict) and factorized_group in group_stats:
+                    group_row = group_stats[factorized_group]
+                    group_row["actor_correct"] = float(
+                        group_row.get("actor_correct", 0.0)
+                    ) - float(actual_group_actor_correct) + float(
+                        actual_actor_replay_accuracy
+                    )
+                    if critic_preference_terms:
+                        group_row["critic_correct"] = float(
+                            group_row.get("critic_correct", 0.0)
+                        ) - float(actual_group_critic_correct) + float(
+                            actual_candidate_critic_replay_accuracy
+                        )
             # Retain only the actually perturbed candidates.  Keeping the
             # complete composite-plan ID list (hundreds/thousands of Python
             # strings per record) made the bounded tensor replay unbounded in
@@ -2004,17 +2189,19 @@ class Network(nn.Module):
                 weighted_term.detach().cpu()
             )
         entropy_raw = entropy.float().mean() if torch.is_tensor(entropy) else objective.new_zeros(())
-        matched_accuracy = min(max(float(getattr(
-            actuator_for_evidence, "_den6_matched_actual_pair_accuracy", 0.0
-        )), 0.0), 1.0) if actuator_for_evidence is not None else 0.0
-        matched_quality = max(2.0 * (matched_accuracy - 0.5), 0.0)
-        matched_evidence = min(max(float(getattr(
-            actuator_for_evidence, "_den6_actual_action_evidence", 0.0
-        )), 0.0), 1.0) if actuator_for_evidence is not None else 0.0
-        critic_actual_quality = min(max(float(getattr(
-            actuator_for_evidence, "_den6_actual_candidate_critic_quality", 0.0
-        )), 0.0), 1.0) if actuator_for_evidence is not None else 0.0
-        preference_quality = min(matched_quality, critic_actual_quality) * matched_evidence
+        group_authority_fn = getattr(
+            actuator_for_evidence, "_den6_group_actual_authority", None
+        ) if actuator_for_evidence is not None else None
+        if callable(group_authority_fn):
+            preference_quality = sum(
+                float(group_authority_fn(group))
+                for group in (
+                    "AddWhere", "PruneWhere", "AdjustWhere",
+                    "Amount", "Gate", "Fine",
+                )
+            ) / 6.0
+        else:
+            preference_quality = 0.0
         entropy_min_fraction = min(max(float(getattr(
             self.args, "heuristic_guidance_online_entropy_min_fraction", 0.10
         )), 0.0), 1.0)
@@ -2197,6 +2384,14 @@ class Network(nn.Module):
             "actual_actor_replay_exact_pairs": int(actual_actor_replay_exact_pairs),
             "actual_actor_replay_count": int(actual_actor_replay_count),
             "actual_actor_replay_accuracy": float(actual_actor_replay_accuracy),
+            "actual_group_pair_available": bool(actual_group_pair_available),
+            "actual_group_pair_delta": float(actual_group_pair_delta),
+            "actual_group_pair_raw": float(actual_group_pair_raw.detach().cpu()),
+            "actual_group_pair_weighted": float(
+                actual_group_pair_weighted.detach().cpu()
+            ),
+            "actual_group_actor_correct": float(actual_group_actor_correct),
+            "actual_group_critic_correct": float(actual_group_critic_correct),
             "actual_candidate_critic_replay_raw": float(
                 actual_candidate_critic_replay_raw.detach().cpu()
             ),
@@ -2271,6 +2466,7 @@ class Network(nn.Module):
         self._den6_policy_source_losses = {
             "actual": (
                 policy_core_weighted
+                + actual_group_pair_weighted
                 + actual_set_contrast_weighted
                 + actual_actor_replay_weighted
                 + actual_candidate_critic_replay_weighted

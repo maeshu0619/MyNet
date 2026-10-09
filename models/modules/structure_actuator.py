@@ -258,6 +258,25 @@ class StructureRepairActuator(nn.Module):
         self._den6_actual_candidate_critic_comparisons = 0
         self._den6_matched_actual_pair_accuracy = 0.0
         self._den6_matched_actual_pair_count = 0
+        # Actual evidence is action conditional.  A failed Adjust comparison
+        # must not revoke an already calibrated Add Actor (and vice versa),
+        # nor may sparse Proposal evidence globally freeze Amount/Gate/Fine.
+        # Each row stores weighted Bernoulli observations from strict
+        # same-frame, one-factor comparisons only.
+        self._den6_actual_group_stats = {
+            group: {
+                "comparisons": 0,
+                "evidence": 0.0,
+                "actor_correct": 0.0,
+                "critic_correct": 0.0,
+                "proposal_correct": 0.0,
+                "proposal_comparisons": 0,
+            }
+            for group in (
+                "AddWhere", "PruneWhere", "AdjustWhere",
+                "Amount", "Gate", "Fine",
+            )
+        }
         self._den6_noop_actual_evidence = 0.0
         # Bounded runtime state used to finish a counterfactual on the next
         # visit of the same frame.  This is evidence-driven, not Episode-driven.
@@ -3967,6 +3986,46 @@ class StructureRepairActuator(nn.Module):
             }
         return confidences, audit
 
+    def _den6_group_actual_quality(self, group, source="actor"):
+        """Return a bounded quality backed only by matched Actual pairs.
+
+        Beta(1,1) smoothing avoids treating one lucky pair as certainty.  The
+        coverage term is evidence driven (never Episode driven), so a fresh
+        group has zero forward authority while a repeatedly correct group can
+        earn a bounded residual corridor independently of other groups.
+        """
+        stats = getattr(self, "_den6_actual_group_stats", {})
+        row = stats.get(str(group), {}) if isinstance(stats, dict) else {}
+        comparisons = max(int(row.get(
+            "proposal_comparisons" if source == "proposal" else "comparisons", 0
+        )), 0)
+        if comparisons <= 0:
+            return 0.0
+        correct = min(max(float(row.get(f"{source}_correct", 0.0)), 0.0),
+                      float(comparisons))
+        accuracy = (correct + 1.0) / (float(comparisons) + 2.0)
+        target = max(int(getattr(
+            self.args, "heuristic_guidance_online_group_authority_pairs", 8
+        )), 1)
+        coverage = min(float(comparisons) / float(target), 1.0)
+        return float(coverage * max(2.0 * (accuracy - 0.5), 0.0))
+
+    def _den6_group_actual_authority(self, group):
+        """Authority for one decision group, without a global AND deadlock."""
+        actor_quality = self._den6_group_actual_quality(group, "actor")
+        critic_quality = self._den6_group_actual_quality(group, "critic")
+        # The Actor must itself be correct.  Critic calibration strengthens the
+        # grant, but an initially uncalibrated Critic cannot make the Actor's
+        # otherwise valid matched evidence identically useless forever.
+        raw_authority = actor_quality * (0.25 + 0.75 * critic_quality)
+        raw_authority = min(max(float(raw_authority), 0.0), 1.0)
+        if bool(getattr(self, "_den6_fixed_rd_authority_rejected", False)):
+            safe = min(max(float(getattr(
+                self, "_den6_fixed_rd_safe_authority", 0.0
+            )), 0.0), 1.0)
+            return float(min(raw_authority, safe))
+        return raw_authority
+
     def _learning_adaptive_exploration_factor(self, confidence_audit, operation=None):
         """Contract exploration only after action-conditional Actual evidence."""
         floor = min(max(float(getattr(
@@ -3983,28 +4042,44 @@ class StructureRepairActuator(nn.Module):
             value = confidence_audit.get(operation, {}) \
                 if isinstance(confidence_audit, dict) else {}
             rows = [value] if isinstance(value, dict) else []
-        # Do not contract behavior exploration from dense local proxy agreement.
-        # Only matched, executed Actual comparisons may establish action quality.
-        matched_accuracy = min(max(float(getattr(
-            self, "_den6_matched_actual_pair_accuracy", 0.0
-        )), 0.0), 1.0)
-        matched_quality = max(2.0 * (matched_accuracy - 0.5), 0.0)
-        candidate_quality = min(max(float(getattr(
-            self, "_den6_actual_candidate_critic_quality", 0.0
-        )), 0.0), 1.0)
-        actual_evidence = min(max(float(getattr(
-            self, "_den6_actual_action_evidence", 0.0
-        )), 0.0), 1.0)
-        quality = min(matched_quality, candidate_quality) * actual_evidence
+        group = (
+            f"{operation}Where"
+            if operation in {"Add", "Prune", "Adjust"}
+            else str(operation)
+            if operation in {
+                "AddWhere", "PruneWhere", "AdjustWhere",
+                "Amount", "Gate", "Fine",
+            }
+            else None
+        )
+        if group is None:
+            qualities = [
+                self._den6_group_actual_authority(name)
+                for name in (
+                    "AddWhere", "PruneWhere", "AdjustWhere",
+                    "Amount", "Gate", "Fine",
+                )
+            ]
+            quality = sum(qualities) / float(max(len(qualities), 1))
+        else:
+            quality = self._den6_group_actual_authority(group)
         return float(floor + (1.0 - floor) * (1.0 - quality))
 
-    def _den6_actual_residual_authority(self):
+    def _den6_actual_residual_authority(self, group=None):
         """Return authority earned only from matched, executed Actual-RD data.
 
         The three factors deliberately have an AND relationship.  A lucky
         pair, a proxy-trained Critic, or evidence volume without correct
         ordering cannot grant the Actor forward authority on its own.
         """
+        if group is not None:
+            return self._den6_group_actual_authority(group)
+        group_authorities = [
+            self._den6_group_actual_authority(name)
+            for name in ("AddWhere", "PruneWhere", "AdjustWhere")
+        ]
+        if any(value > 0.0 for value in group_authorities):
+            return float(sum(group_authorities) / len(group_authorities))
         matched_accuracy = min(max(float(getattr(
             self, "_den6_matched_actual_pair_accuracy", 0.0
         )), 0.0), 1.0)
@@ -4453,12 +4528,21 @@ class StructureRepairActuator(nn.Module):
         matched_anchor_record = (
             matched_anchor_runtime.get(matched_anchor_key)
             if factorized_actual_credit
-            and str(factorized_exploration_group).endswith("Where")
+            and str(factorized_exploration_group) in {
+                "AddWhere", "PruneWhere", "AdjustWhere",
+                "Amount", "Gate", "Fine",
+            }
             else None
         )
         matched_anchor_reused = False
         plan_exploration_factor = self._learning_adaptive_exploration_factor(
-            network_confidence_audit
+            network_confidence_audit,
+            factorized_exploration_group
+            if str(factorized_exploration_group) in {
+                "AddWhere", "PruneWhere", "AdjustWhere",
+                "Amount", "Gate", "Fine",
+            }
+            else None,
         )
         operation_exploration_factors = {
             name: self._learning_adaptive_exploration_factor(
@@ -4467,9 +4551,16 @@ class StructureRepairActuator(nn.Module):
             for name in operations
         }
 
-        def _confidence_forward_full_backward(residual):
+        def _confidence_forward_full_backward(residual, decision_group=None):
             """Scale hard forward authority but keep the residual trainable."""
-            forward_value = residual * network_plan_confidence
+            forward_authority = (
+                float(network_plan_confidence)
+                + (1.0 - float(network_plan_confidence))
+                * self._den6_group_actual_authority(decision_group)
+                if decision_group is not None
+                else float(network_plan_confidence)
+            )
+            forward_value = residual * float(forward_authority)
             return forward_value.detach() + residual - residual.detach()
 
         # AmountはStep 0でden6 Exact値へ固定し、その後はNetwork値をden6で
@@ -4547,11 +4638,11 @@ class StructureRepairActuator(nn.Module):
                 # the full Network gradient, so this is not a time schedule or
                 # a fixed Amount target.
                 amount_logits = prior_amount_logits + _confidence_forward_full_backward(
-                    network_amount_logits - prior_amount_logits
+                    network_amount_logits - prior_amount_logits, "Amount"
                 )
             else:
                 amount_logits = prior_amount_logits + _confidence_forward_full_backward(
-                    network_amount_logits - prior_amount_logits
+                    network_amount_logits - prior_amount_logits, "Amount"
                 )
             uncalibrated_std = float(
                 amount_logits_centered.detach().std(unbiased=False).cpu()
@@ -4655,11 +4746,19 @@ class StructureRepairActuator(nn.Module):
         }
         operation_fine_samples = {}
         operation_fine_log_probs = {}
+        operation_fine_policy_means = {}
         for name in operations:
-            fine_mean = _confidence_forward_full_backward(operation_fine_means[name])
+            fine_mean = _confidence_forward_full_backward(
+                operation_fine_means[name], "Fine"
+            )
+            operation_fine_policy_means[name] = fine_mean
             fine_sigma = (
                 float(fine_sigma_base)
-                * float(operation_exploration_factors[name])
+                * float(
+                    plan_exploration_factor
+                    if str(factorized_exploration_group) == "Fine"
+                    else operation_exploration_factors[name]
+                )
             )
             if (
                 amount_exploration_active
@@ -4725,7 +4824,9 @@ class StructureRepairActuator(nn.Module):
             # scale only the Network residual by measured RD alignment.  Full
             # backward authority is retained by the STE helper; no Episode or
             # requested operation-ratio schedule is introduced.
-            gate_residual = _confidence_forward_full_backward(gate_residual_raw)
+            gate_residual = _confidence_forward_full_backward(
+                gate_residual_raw, "Gate"
+            )
             gate_combined_logits = prior_share_tensor.log() + gate_residual
             gate_log_probs = torch.log_softmax(gate_combined_logits, dim=0)
             if (
@@ -4868,10 +4969,82 @@ class StructureRepairActuator(nn.Module):
                 anchor_valid and 0 <= anchor_age_steps <= max_anchor_age_steps
             )
             if anchor_valid:
-                requested_counts = {
-                    name: int(stored_counts[name]) for name in operations
-                }
-                no_op_selected = sum(requested_counts.values()) == 0
+                matched_group = str(factorized_exploration_group)
+                if matched_group.endswith("Where"):
+                    requested_counts = {
+                        name: int(stored_counts[name]) for name in operations
+                    }
+                    no_op_selected = sum(requested_counts.values()) == 0
+                else:
+                    # Reconstruct a strict one-factor counterfactual.  The
+                    # stored Amount/Gate/Fine components remain frozen and
+                    # only the currently explored component is substituted.
+                    stored_total = float(matched_anchor_record.get(
+                        "coarse_total_ratio", prior_total_ratio
+                    ))
+                    stored_gate = dict(
+                        matched_anchor_record.get("gate_shares") or {}
+                    )
+                    stored_fine = dict(
+                        matched_anchor_record.get("fine_log_residuals") or {}
+                    )
+                    current_total = float(hard_total.detach().cpu())
+                    current_gate = {
+                        name: float(gate_probs[index].detach().cpu())
+                        for index, name in enumerate(operations)
+                    }
+                    current_fine = {
+                        name: float(operation_fine_samples[name].detach().cpu())
+                        for name in operations
+                    }
+                    counterfactual_total = (
+                        current_total if matched_group == "Amount" else stored_total
+                    )
+                    counterfactual_gate = (
+                        current_gate if matched_group == "Gate" else stored_gate
+                    )
+                    counterfactual_fine = (
+                        current_fine if matched_group == "Fine" else stored_fine
+                    )
+                    if matched_group != "Amount":
+                        no_op_selected = bool(
+                            matched_anchor_record.get("no_op_selected", False)
+                        )
+                    if no_op_selected or counterfactual_total <= 0.0:
+                        requested_counts = {name: 0 for name in operations}
+                    else:
+                        counterfactual_ratios = {
+                            name: max(counterfactual_total, 0.0)
+                            * max(float(counterfactual_gate.get(
+                                name, prior_shares[name] / prior_share_sum
+                            )), 0.0)
+                            * math.exp(float(counterfactual_fine.get(name, 0.0)))
+                            for name in operations
+                        }
+                        ratio_sum = sum(counterfactual_ratios.values())
+                        if ratio_sum > max_total_ratio:
+                            ratio_scale = max_total_ratio / max(ratio_sum, 1e-12)
+                            counterfactual_ratios = {
+                                name: value * ratio_scale
+                                for name, value in counterfactual_ratios.items()
+                            }
+                            ratio_sum = sum(counterfactual_ratios.values())
+                        total_budget = min(
+                            max(1, int(math.ceil(point_count * ratio_sum))),
+                            max(int(math.floor(point_count * max_total_ratio)), 1),
+                        )
+                        ratio_shares = {
+                            name: counterfactual_ratios[name]
+                            / max(ratio_sum, 1e-12)
+                            for name in operations
+                        }
+                        requested_counts = self._den6_allocate_counts(
+                            total_budget, ratio_shares
+                        )
+                        requested_counts = {
+                            name: min(max(int(requested_counts[name]), 0), len(pools[name]))
+                            for name in operations
+                        }
                 matched_anchor_reused = True
                 matched_anchor_record["reuse_count"] = int(
                     matched_anchor_record.get("reuse_count", 0)
@@ -5048,7 +5221,9 @@ class StructureRepairActuator(nn.Module):
                     network_term = actor_residual
                     logits = actor_residual
                 else:
-                    actual_authority = self._den6_actual_residual_authority()
+                    actual_authority = self._den6_actual_residual_authority(
+                        f"{operation}Where"
+                    )
                     candidate_authority = actor_residual.new_full(
                         actor_residual.shape, float(actual_authority)
                     )
@@ -5172,22 +5347,18 @@ class StructureRepairActuator(nn.Module):
                         max(minimum_count, configured_max),
                     )
                 if proposal_count < valid_count_for_proposal:
-                    matched_accuracy = min(max(float(getattr(
-                        self, "_den6_matched_actual_pair_accuracy", 0.0
-                    )), 0.0), 1.0)
-                    matched_quality = max(2.0 * (matched_accuracy - 0.5), 0.0)
-                    critic_quality = min(max(float(getattr(
-                        self, "_den6_actual_candidate_critic_quality", 0.0
-                    )), 0.0), 1.0)
-                    actual_evidence = min(max(float(getattr(
-                        self, "_den6_actual_action_evidence", 0.0
-                    )), 0.0), 1.0)
-                    # Membership authority rises only when both the learned
-                    # Proposal and Candidate Critic order exact matched-Actual
-                    # plan groups correctly.  Proxy quality and Episode number
-                    # have no authority here.
-                    actual_authority = (
-                        min(matched_quality, critic_quality) * actual_evidence
+                    group_name = f"{operation}Where"
+                    proposal_quality = self._den6_group_actual_quality(
+                        group_name, "proposal"
+                    )
+                    critic_quality = self._den6_group_actual_quality(
+                        group_name, "critic"
+                    )
+                    # Proposal controls membership, not final Actor authority.
+                    # It earns operation-local authority and cannot freeze all
+                    # operations because another Proposal pair was incorrect.
+                    actual_authority = proposal_quality * (
+                        0.25 + 0.75 * critic_quality
                     )
                     coverage_fraction = min(max(float(getattr(
                         self.args,
@@ -5909,8 +6080,17 @@ class StructureRepairActuator(nn.Module):
         )
         if (
             factorized_actual_credit
-            and str(factorized_exploration_group).endswith("Where")
+            and str(factorized_exploration_group) in {
+                "AddWhere", "PruneWhere", "AdjustWhere",
+                "Amount", "Gate", "Fine",
+            }
             and not matched_anchor_reused
+            # Gate/Fine have no effect on a no-op plan and therefore cannot
+            # form an identifiable counterfactual in that state.
+            and not (
+                no_op_selected
+                and str(factorized_exploration_group) in {"Gate", "Fine"}
+            )
         ):
             explored_operation_for_anchor = str(factorized_exploration_group)[:-5]
             # Establish the incumbent with the explored group last, then reuse
@@ -6001,6 +6181,17 @@ class StructureRepairActuator(nn.Module):
                     for name in operations
                 },
                 "operation_order": tuple(operation_order),
+                "coarse_total_ratio": float(hard_total.detach().cpu()),
+                "amount_bin_index": int(selected_amount_bin.detach().cpu()),
+                "gate_shares": {
+                    name: float(gate_probs[index].detach().cpu())
+                    for index, name in enumerate(operations)
+                },
+                "fine_log_residuals": {
+                    name: float(operation_fine_samples[name].detach().cpu())
+                    for name in operations
+                },
+                "no_op_selected": bool(no_op_selected),
                 "created_step": int(current_step),
                 "policy_version": int(current_step),
                 "reuse_count": 0,
@@ -6110,6 +6301,67 @@ class StructureRepairActuator(nn.Module):
             else gate_log_probs.sum().detach() * 0.0
         )
         action_entropy = -(gate_probs * gate_log_probs).sum()
+
+        # Evaluate the stored anchor action under the *current* policy.  This
+        # gives every factorized group a pairwise preference diagnostic and
+        # avoids pretending that a composite Actual scalar is an individual
+        # candidate label.
+        anchor_group_log_prob = action_ratio_stack.new_zeros(())
+        if isinstance(matched_anchor_record, dict) and matched_anchor_reused:
+            matched_group = str(factorized_exploration_group)
+            if matched_group.endswith("Where"):
+                matched_operation = matched_group[:-5]
+                anchor_indices = tuple(
+                    (matched_anchor_record.get("selected_indices") or {}).get(
+                        matched_operation, ()
+                    )
+                )
+                if anchor_indices:
+                    index_tensor = torch.as_tensor(
+                        anchor_indices,
+                        device=candidate_log_probs[matched_operation].device,
+                        dtype=torch.long,
+                    )
+                    anchor_group_log_prob = candidate_log_probs[
+                        matched_operation
+                    ].index_select(0, index_tensor).mean()
+            elif matched_group == "Amount":
+                anchor_bin = min(max(int(matched_anchor_record.get(
+                    "amount_bin_index", 0
+                )), 0), int(amount_log_probs.numel()) - 1)
+                anchor_group_log_prob = amount_log_probs[anchor_bin]
+            elif matched_group == "Gate":
+                anchor_counts = dict(
+                    matched_anchor_record.get("selected_counts") or {}
+                )
+                anchor_share = gate_log_probs.new_tensor([
+                    float(anchor_counts.get(name, 0)) for name in operations
+                ])
+                anchor_share = anchor_share / anchor_share.sum().clamp_min(1.0)
+                anchor_group_log_prob = (
+                    anchor_share.detach() * gate_log_probs
+                ).sum()
+            elif matched_group == "Fine":
+                stored_fine = dict(
+                    matched_anchor_record.get("fine_log_residuals") or {}
+                )
+                anchor_scores = []
+                for name in operations:
+                    stored_value = operation_fine_policy_means[name].new_tensor(
+                        float(stored_fine.get(name, 0.0))
+                    )
+                    sigma = max(
+                        float(fine_sigma_base)
+                        * float(operation_exploration_factors[name]),
+                        1e-3,
+                    )
+                    anchor_scores.append(
+                        -0.5 * (
+                            (stored_value - operation_fine_policy_means[name])
+                            / float(sigma)
+                        ).square()
+                    )
+                anchor_group_log_prob = torch.stack(anchor_scores).mean()
 
         # Candidate-local attributionからGate/Amount/Fine用の低分散RD教師を
         # 作る。rateとgeometryは別々に同一集合内で標準化してからcandidate
@@ -6430,6 +6682,18 @@ class StructureRepairActuator(nn.Module):
             for name, identifiers in executed_ids_by_operation.items()
             if name != explored_where_operation
         }
+        matched_group = str(factorized_exploration_group)
+        if matched_group in {"Amount", "Gate", "Fine"}:
+            # Counts and selected prefixes are the effect of the explored
+            # plan-level factor.  The pool, frame and frozen operation order
+            # identify the anchor; the reconstruction above freezes the other
+            # two plan-level factors.
+            matched_anchor_selected = {}
+            matched_executed_counts = {}
+        else:
+            matched_executed_counts = {
+                name: int(selected_counts[name]) for name in operations
+            }
         matched_anchor_payload = json.dumps(
             {
                 # A matched Where comparison deliberately permits only the
@@ -6437,9 +6701,7 @@ class StructureRepairActuator(nn.Module):
                 # operation selections and every requested count form the
                 # immutable anchor identity.
                 "selected_fixed_groups": matched_anchor_selected,
-                "executed_counts": {
-                    name: int(selected_counts[name]) for name in operations
-                },
+                "executed_counts": matched_executed_counts,
                 "operation_order": tuple(operation_order),
                 "pool_identity_hash": str(candidate_pool_identity_hash),
                 "factorized_group": str(factorized_exploration_group),
@@ -6742,6 +7004,19 @@ class StructureRepairActuator(nn.Module):
             "actual_residual_authority": float(
                 self._den6_actual_residual_authority()
             ),
+            "actual_group_authority": {
+                group: float(self._den6_group_actual_authority(group))
+                for group in (
+                    "AddWhere", "PruneWhere", "AdjustWhere",
+                    "Amount", "Gate", "Fine",
+                )
+            },
+            "actual_group_stats": {
+                group: dict(values)
+                for group, values in dict(getattr(
+                    self, "_den6_actual_group_stats", {}
+                )).items()
+            },
             "learned_proposal_actual_quality": float(max(
                 2.0 * (float(getattr(
                     self, "_den6_matched_actual_pair_accuracy", 0.0
@@ -6978,6 +7253,8 @@ class StructureRepairActuator(nn.Module):
             "amount_bin_log_prob": amount_bin_log_prob,
             "_actual_credit_amount_log_probs": amount_log_probs,
             "_actual_credit_amount_bin_index": int(selected_amount_bin.detach().cpu()),
+            "_actual_credit_group_log_prob": policy_log_prob,
+            "_actual_credit_anchor_group_log_prob": anchor_group_log_prob,
             "amount_bin_entropy": -(
                 amount_prob * torch.log(amount_prob.clamp_min(1e-12))
             ).sum(),
