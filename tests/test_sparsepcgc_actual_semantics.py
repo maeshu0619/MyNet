@@ -2250,6 +2250,8 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
             _heuristic_guidance_network_residual_weight_current=0.05,
             heuristic_guidance_online_where_temperature=0.75,
             heuristic_guidance_online_gumbel_scale=1.0,
+            repair_policy_exploration_mode="constant",
+            repair_policy_exploration_constant_multiplier=0.50,
             repair_exploration_fraction=1.0,
         )
         actuator.train()

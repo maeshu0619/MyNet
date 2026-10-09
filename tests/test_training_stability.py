@@ -30,6 +30,7 @@ from models.utils.training.train_runtime import (
 from models.modules.structure_actuator import (
     StructureRepairActuator,
     adaptive_exploration_candidate_changes,
+    exploration_candidate_change_budget,
     policy_exploration_multiplier,
     smooth_exploration_phase,
 )
@@ -266,6 +267,23 @@ class TrainingStabilityTest(unittest.TestCase):
         self.assertEqual(adaptive_exploration_candidate_changes(16, 0.0), 1)
         self.assertEqual(adaptive_exploration_candidate_changes(0, 1.0), 0)
 
+    def test_candidate_exploration_budget_scales_with_executed_plan(self):
+        self.assertEqual(
+            exploration_candidate_change_budget(96, 800, 0.125, 1.0), 96
+        )
+        self.assertEqual(
+            exploration_candidate_change_budget(96, 400, 0.125, 1.0), 50
+        )
+        self.assertEqual(
+            exploration_candidate_change_budget(96, 400, 0.125, 0.5), 25
+        )
+        self.assertEqual(
+            exploration_candidate_change_budget(96, 0, 0.125, 1.0), 0
+        )
+        self.assertEqual(
+            exploration_candidate_change_budget(96, 400, 0.125, 0.0), 0
+        )
+
     def test_annealed_policy_exploration_remains_available_for_ablation(self):
         self.assertAlmostEqual(
             policy_exploration_multiplier(
@@ -276,6 +294,51 @@ class TrainingStabilityTest(unittest.TestCase):
             ),
             0.4,
         )
+
+    def test_quarter_training_exploration_reaches_zero_at_boundary(self):
+        fraction = 0.25
+        expected_rows = (
+            (0.0, 1.0, 16),
+            (0.125, 0.5, 8),
+            (0.25, 0.0, 0),
+            (0.8, 0.0, 0),
+        )
+        for progress, expected, expected_budget in expected_rows:
+            phase = smooth_exploration_phase(progress, fraction, 0.25)
+            multiplier = policy_exploration_multiplier(
+                training=True,
+                schedule_mode="annealed",
+                constant_multiplier=0.50,
+                annealed_phase=phase,
+            )
+            self.assertAlmostEqual(multiplier, expected, places=6)
+            budget = (
+                adaptive_exploration_candidate_changes(16, multiplier)
+                if multiplier > 0.0 else 0
+            )
+            self.assertEqual(budget, expected_budget)
+
+    def test_exact_online_legacy_noise_is_zero_after_quarter_window(self):
+        actuator = StructureRepairActuator.__new__(StructureRepairActuator)
+        torch.nn.Module.__init__(actuator)
+        actuator.args = SimpleNamespace(
+            heuristic_guidance_mode="ana_den6_online",
+            repair_policy_exploration_mode="annealed",
+            repair_policy_exploration_constant_multiplier=0.50,
+            repair_exploration_fraction=0.25,
+            repair_exploration_smooth_tail_fraction=0.25,
+            _exploration_schedule_steps_estimate=1000,
+            _total_train_steps_estimate=1000,
+            _global_train_step=0,
+            noise_start=0.10,
+            noise_end=0.05,
+        )
+        actuator.train()
+        values = []
+        for step in (0, 125, 250, 800):
+            actuator.args._global_train_step = step
+            values.append(actuator._annealed_value("noise_start", "noise_end"))
+        self.assertEqual([round(value, 6) for value in values], [0.10, 0.05, 0.0, 0.0])
 
     def test_constant_exact_online_phase_also_freezes_legacy_random_mix(self):
         actuator = StructureRepairActuator.__new__(StructureRepairActuator)

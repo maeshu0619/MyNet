@@ -70,6 +70,33 @@ def adaptive_exploration_candidate_changes(max_changes, learning_factor):
     return min(max(int(math.ceil(float(maximum) * factor)), 1), maximum)
 
 
+def exploration_candidate_change_budget(
+    max_changes, requested_count, requested_fraction, learning_factor
+):
+    """Scale a Where perturbation with the size of the executed operation.
+
+    A fixed budget of 16 changed only 2--4% of the hundreds of candidates in
+    a normal den6 plan, even at the start of the exploration window. Use a
+    bounded fraction of the incumbent instead, then apply the existing
+    exploration multiplier so the perturbation still reaches exactly zero at
+    the end of the configured window. The hard cap keeps one composite Actual
+    encode and its group-level credit computationally bounded.
+    """
+    maximum = max(int(max_changes), 0)
+    requested = max(int(requested_count), 0)
+    fraction = min(max(float(requested_fraction), 0.0), 1.0)
+    factor = min(max(float(learning_factor), 0.0), 1.0)
+    if maximum <= 0 or requested <= 0 or fraction <= 0.0 or factor <= 0.0:
+        return 0
+    initial_budget = min(
+        maximum,
+        max(int(math.ceil(float(requested) * fraction)), 1),
+    )
+    return adaptive_exploration_candidate_changes(
+        initial_budget, factor
+    )
+
+
 def candidate_listwise_local_credit(prediction, utility_target):
     """Train one operation pool from relative, non-heuristic RD utility."""
     prediction = prediction.float().reshape(-1)
@@ -3197,7 +3224,7 @@ class StructureRepairActuator(nn.Module):
             == "ana_den6_online"
         )
         schedule_mode = str(getattr(
-            self.args, "repair_policy_exploration_mode", "constant"
+            self.args, "repair_policy_exploration_mode", "annealed"
         )).strip().lower()
         if exact_online and schedule_mode == "constant":
             multiplier = policy_exploration_multiplier(
@@ -3218,6 +3245,20 @@ class StructureRepairActuator(nn.Module):
         # Amount/gate random mixも入力される。片方だけ一定化すると、後者の
         # 減衰が依然としてtrain Actualを時刻で改善させるため、同じ一定phaseを使う。
         phase = self._behavior_exploration_phase()
+        exact_online = (
+            str(getattr(self.args, "heuristic_guidance_mode", "")).strip().lower()
+            == "ana_den6_online"
+        )
+        schedule_mode = str(getattr(
+            self.args, "repair_policy_exploration_mode", "annealed"
+        )).strip().lower()
+        if exact_online and schedule_mode == "annealed":
+            # For the requested finite exploration window, every stochastic
+            # legacy component must become exactly zero at the boundary.  Some
+            # historical ``*_end`` defaults are deliberately non-zero and
+            # would otherwise keep random Amount/Gate/Fine behavior alive
+            # after the first 25% of training.
+            return start * max(1.0 - float(phase), 0.0)
         return start + (end - start) * phase
 
     @staticmethod
@@ -4439,13 +4480,12 @@ class StructureRepairActuator(nn.Module):
             and self.training
             and current_step >= exact_anchor_steps
         )
-        # Exact-onlineのActual値は実行plan自体の値である。Gumbel強度を
-        # 時刻だけで下げると、Networkが改善しなくてもtrain Actualが
-        # 下がる。通常は一定のbehavior探索を使い、収束は探索なし
-        # fixed validationで判定する。annealedは従来比較実験にだけ残す。
+        # Exact-onlineのActual値は実行plan自体の値である。既定設定では
+        # 全Stepの最初の25%だけbehavior探索を滑らかに減衰させ、その後は
+        # 学習済みの決定論的方策を実行する。Fixed validationは常に探索なし。
         module_is_training = bool(getattr(self, "training", False))
         exploration_mode = str(getattr(
-            self.args, "repair_policy_exploration_mode", "constant"
+            self.args, "repair_policy_exploration_mode", "annealed"
         )).strip().lower()
         annealed_phase = (
             self._exploration_phase() if exploration_mode == "annealed" else 0.0
@@ -4458,6 +4498,12 @@ class StructureRepairActuator(nn.Module):
             ),
             annealed_phase=annealed_phase,
         )
+        # Once the scheduled 25% exploration window closes, do not merely set
+        # Gumbel to zero: disable the stochastic branch itself so tail lifting
+        # and random Amount/Gate/Fine choices cannot survive through ties.
+        if exploration_multiplier <= 0.0:
+            exploration_active = False
+            amount_exploration_active = False
 
         # Compute candidate scores once, before Amount/Gate, so the same
         # per-input evidence controls every Network residual in the plan.
@@ -4566,6 +4612,18 @@ class StructureRepairActuator(nn.Module):
             )
             for name in operations
         }
+        if exploration_mode == "annealed" and exploration_multiplier > 0.0:
+            # Do not let a small amount of early matched evidence collapse the
+            # requested exploration window immediately.  The schedule is an
+            # upper-envelope guarantee during the first 25%; Actual quality can
+            # still contract each group as that envelope falls.
+            plan_exploration_factor = max(
+                float(plan_exploration_factor), float(exploration_multiplier)
+            )
+            operation_exploration_factors = {
+                name: max(float(value), float(exploration_multiplier))
+                for name, value in operation_exploration_factors.items()
+            }
 
         def _confidence_forward_full_backward(residual, decision_group=None):
             """Scale hard forward authority but keep the residual trainable."""
@@ -5749,12 +5807,24 @@ class StructureRepairActuator(nn.Module):
             configured_max_candidate_changes = max(int(getattr(
                 self.args,
                 "heuristic_guidance_online_exploration_max_candidate_changes",
-                16,
+                96,
             )), 1)
+            configured_candidate_change_fraction = min(max(float(getattr(
+                self.args,
+                "heuristic_guidance_online_exploration_candidate_fraction",
+                0.125,
+            )), 0.0), 1.0)
+            candidate_change_factor = (
+                float(exploration_multiplier)
+                if exploration_mode == "annealed"
+                else float(operation_exploration_factors[operation])
+            )
             effective_max_candidate_changes = (
-                adaptive_exploration_candidate_changes(
+                exploration_candidate_change_budget(
                     configured_max_candidate_changes,
-                    operation_exploration_factors[operation],
+                    requested_counts[operation],
+                    configured_candidate_change_fraction,
+                    candidate_change_factor,
                 )
             )
             exploration_change_budgets[operation] = int(
@@ -5843,7 +5913,7 @@ class StructureRepairActuator(nn.Module):
                 tail_fraction = min(max(float(getattr(
                     self.args,
                     "heuristic_guidance_online_exploration_tail_fraction",
-                    0.25,
+                    0.50,
                 )), 0.0), 1.0)
                 max_tail = effective_max_candidate_changes
                 tail_count = min(

@@ -267,11 +267,20 @@ def train(model, args, loss, writer, plot, notifier=None):
         1,
     )
     policy_exploration_mode = str(getattr(
-        args, "repair_policy_exploration_mode", "constant"
+        args, "repair_policy_exploration_mode", "annealed"
     )).strip().lower()
     policy_constant_multiplier = float(getattr(
         args, "repair_policy_exploration_constant_multiplier", 0.50
     ))
+    exploration_fraction = float(getattr(
+        args, "repair_exploration_fraction", 0.0
+    ))
+    exploration_end_step = int(math.ceil(
+        float(args._exploration_schedule_steps_estimate) * exploration_fraction
+    ))
+    exploration_end_episode = (
+        float(exploration_end_step) / float(max(total_train_files, 1))
+    )
     writer.write(
         "ExplorationSchedule: "
         f"training_episodes={int(getattr(args, 'episodes', 1))}, "
@@ -281,9 +290,14 @@ def train(model, args, loss, writer, plot, notifier=None):
         f"anneal_active={policy_exploration_mode == 'annealed'}, "
         f"constant_legacy_phase="
         f"{(1.0 - policy_constant_multiplier) if policy_exploration_mode == 'constant' else 'n/a'}, "
-        f"fraction={float(getattr(args, 'repair_exploration_fraction', 0.0)):.6g}, "
+        f"fraction={exploration_fraction:.6g}, "
         f"smooth_tail={float(getattr(args, 'repair_exploration_smooth_tail_fraction', 0.25)):.6g}, "
+        f"where_change_fraction={float(getattr(args, 'heuristic_guidance_online_exploration_candidate_fraction', 0.125)):.6g}, "
+        f"where_change_cap={int(getattr(args, 'heuristic_guidance_online_exploration_max_candidate_changes', 96))}, "
+        f"where_tail_fraction={float(getattr(args, 'heuristic_guidance_online_exploration_tail_fraction', 0.50)):.6g}, "
         f"anneal_steps={int(args._exploration_schedule_steps_estimate)}, "
+        f"exploration_end_step={exploration_end_step}, "
+        f"exploration_end_episode={exploration_end_episode:.3f}, "
         f"total_train_steps={int(args._total_train_steps_estimate)}, "
         f"source={'explicit' if int(getattr(args, 'exploration_schedule_episodes', 0)) > 0 else 'training_limit'}"
     )
