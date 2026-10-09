@@ -898,6 +898,28 @@ class PlotMaker():
                         row.append("")
                 f.write(",".join(row) + "\n")
 
+    @staticmethod
+    def _set_integer_padded_ylim(ax, series_values):
+        """Fit a metric without forcing zero into view.
+
+        One integer unit is left above and below the observed finite range.
+        For example, -4.0..-3.2 becomes -5..-2.  This changes only rendering;
+        raw CSV values, losses, checkpoint selection, and training are untouched.
+        """
+        finite = []
+        for values in series_values:
+            finite.extend(
+                float(value) for value in values
+                if value is not None and math.isfinite(float(value))
+            )
+        if not finite:
+            return
+        lower = math.floor(min(finite)) - 1
+        upper = math.ceil(max(finite)) + 1
+        if lower >= upper:
+            upper = lower + 1
+        ax.set_ylim(lower, upper)
+
     def _plot_single_axis(self, ax, epochs, values, loss_idx, xl):
         values = self._plot_values(values)
         epochs, values = self._downsample_series(epochs, values)
@@ -905,7 +927,12 @@ class PlotMaker():
             ax.plot(epochs, values, marker="o", linewidth=2, markersize=3)
         else:
             ax.text(0.5, 0.5, "no finite data", ha="center", va="center", transform=ax.transAxes, alpha=0.7)
-        ax.axhline(0.0, color="black", linewidth=0.7, alpha=0.4)
+        metric_key = str(self.metric_keys[loss_idx]).lower()
+        compression_axis = "compression" in metric_key
+        if compression_axis:
+            self._set_integer_padded_ylim(ax, [values])
+        else:
+            ax.axhline(0.0, color="black", linewidth=0.7, alpha=0.4)
         ax.set_xlabel(xl)
         ax.set_ylabel(self.metric_keys[loss_idx])
         ax.set_title(self.title[loss_idx])
@@ -928,6 +955,7 @@ class PlotMaker():
             return
         plotted = False
         handles = []
+        plotted_values = []
         series = [
             ("Surrogate", loss_history[surrogate_idx], "tab:blue"),
             ("StochasticTrainObjective", loss_history[actual_idx], "tab:orange"),
@@ -942,10 +970,11 @@ class PlotMaker():
             if any(math.isfinite(value) for value in plot_values):
                 line, = ax.plot(plot_x, plot_values, marker="o", linewidth=2, markersize=3, color=color, label=label)
                 handles.append(line)
+                plotted_values.append(plot_values)
                 plotted = True
         if not plotted:
             ax.text(0.5, 0.5, "no compression data", ha="center", va="center", transform=ax.transAxes, alpha=0.7)
-        ax.axhline(0.0, color="black", linewidth=0.7, alpha=0.4)
+        self._set_integer_padded_ylim(ax, plotted_values)
         ax.set_xlabel(xl)
         ax.set_ylabel("Delta [%]")
         ax.set_title("Exploration-affected training metrics (use fixed validation as learning evidence)")

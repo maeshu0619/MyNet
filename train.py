@@ -5037,6 +5037,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                         f"quality_factor={float(audit_plan.get('plan_exploration_factor', 1.0) or 0.0):.3f}, "
                         f"factor_by_op={dict(audit_plan.get('operation_exploration_factors') or {})}, "
                         f"support={dict(audit_plan.get('exploration_support_sizes') or {})}, "
+                        f"tail_support={dict(audit_plan.get('exploration_tail_sizes') or {})}, "
                         f"reserve_by_op={dict(audit_plan.get('exploration_support_reserve_factors') or {})}, "
                         f"legacy_phase={float(audit_plan.get('behavior_exploration_phase', 1.0) or 0.0):.3f}, "
                         f"where_gumbel={float(audit_plan.get('effective_where_gumbel_scale', 0.0) or 0.0):.4f}, "

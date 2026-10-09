@@ -1909,7 +1909,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--cp_lambda_geom', default=1.0, type=float, help='compression_primaryのgeometry safety penalty重み')
     parser.add_argument(
         '--rd_geometry_weight_multiplier',
-        default=1.25,
+        default=1.10,
         type=float,
         help=(
             'SparsePCGC online方策のGeometry重要度を、従来RD設定に対して共通に'
@@ -2543,7 +2543,7 @@ def parse_pugan_args(parser, file_day, file_time):
         help='1 Stepでplan Criticへ再利用する過去Actual plan数',
     )
     parser.add_argument(
-        '--heuristic_guidance_online_edit_tiebreak_weight', default=0.0, type=float,
+        '--heuristic_guidance_online_edit_tiebreak_weight', default=2.0, type=float,
         help='同等RD時だけ少数編集を選ぶActual RD objectiveの微小tie-break係数。0で無効',
     )
     parser.add_argument(
@@ -2557,6 +2557,13 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument(
         '--heuristic_guidance_online_exploration_max_candidate_changes', default=4, type=int,
         help='1回のWhere探索でincumbentから入れ替えるcandidate上限',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_exploration_tail_fraction', default=0.25, type=float,
+        help=(
+            'Where探索supportに安全pool全域から回転coverage候補を追加する'
+            'requested count比。Actual学習品質に応じて探索係数と共に縮小する'
+        ),
     )
     parser.add_argument(
         '--heuristic_guidance_online_noop_prior_offset', default=-1.5, type=float,
@@ -2611,11 +2618,11 @@ def parse_pugan_args(parser, file_day, file_time):
         help='source別decision gradient診断のStep間隔。0で無効',
     )
     parser.add_argument(
-        '--heuristic_guidance_online_actual_actor_replay_weight', default=0.20, type=float,
+        '--heuristic_guidance_online_actual_actor_replay_weight', default=0.40, type=float,
         help='比較可能contextのActual RD preferenceをActorへ返す重み',
     )
     parser.add_argument(
-        '--heuristic_guidance_online_actual_candidate_critic_replay_weight', default=0.20, type=float,
+        '--heuristic_guidance_online_actual_candidate_critic_replay_weight', default=0.40, type=float,
         help='比較可能contextのActual RD preferenceをcandidate Criticへ返す重み',
     )
     parser.add_argument(
@@ -4497,7 +4504,7 @@ def parse_pugan_args(parser, file_day, file_time):
         0.0,
     ), 0.25)
     args.rd_geometry_weight_multiplier = min(max(
-        float(getattr(args, "rd_geometry_weight_multiplier", 1.25)), 0.0
+        float(getattr(args, "rd_geometry_weight_multiplier", 1.10)), 0.0
     ), 4.0)
     args.heuristic_guidance_online_gumbel_scale = max(
         float(getattr(args, "heuristic_guidance_online_gumbel_scale", 1.0)), 0.0
@@ -4505,6 +4512,9 @@ def parse_pugan_args(parser, file_day, file_time):
     args.heuristic_guidance_online_gumbel_logit_floor = max(float(getattr(
         args, "heuristic_guidance_online_gumbel_logit_floor", 0.10
     )), 0.0)
+    args.heuristic_guidance_online_exploration_tail_fraction = min(max(float(getattr(
+        args, "heuristic_guidance_online_exploration_tail_fraction", 0.25
+    )), 0.0), 1.0)
     args.heuristic_guidance_online_actor_proxy_weight = max(float(getattr(
         args, "heuristic_guidance_online_actor_proxy_weight", 0.0
     )), 0.0)
@@ -7780,7 +7790,9 @@ def parse_pugan_args(parser, file_day, file_time):
         if not _cli_option_was_provided("--network_only_plan_gain_loss_weight"):
             args.network_only_plan_gain_loss_weight = 1.0
         if not _cli_option_was_provided("--heuristic_guidance_online_entropy_weight"):
-            args.heuristic_guidance_online_entropy_weight = 0.005
+            # Actual preferenceが形成された後もentropyを1へ戻し続けた
+            # 0.005を廃止。実効値はActual evidence/qualityでさらに縮小する。
+            args.heuristic_guidance_online_entropy_weight = 0.001
         args.repair_drop_ratio_floor = 0.0
         args.repair_add_ratio_floor = 0.0
         args.repair_move_ratio_floor = 0.0

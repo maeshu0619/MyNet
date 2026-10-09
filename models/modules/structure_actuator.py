@@ -4942,6 +4942,7 @@ class StructureRepairActuator(nn.Module):
         exploration_heuristic_top1_selected = {}
         exploration_selection_change_rates = {}
         exploration_support_sizes = {}
+        exploration_tail_sizes = {}
         exploration_support_reserve_factors = {}
         exploration_support_masks = {}
         gumbel_audit = {}
@@ -5632,14 +5633,67 @@ class StructureRepairActuator(nn.Module):
                 ).indices
                 support_mask = torch.zeros_like(scaled_logits, dtype=torch.bool)
                 support_mask[support_indices] = True
+                # Heuristic上位候補だけを反復すると、Actual RDは低いが
+                # rankingの誤りをActor/Criticが観測できない。合法・安全性filter後の
+                # tailから少数をrotating coverageでsupportへ入れる。これは
+                # Episode scheduleではなく、Actual品質が上がるとoperation factorと
+                # 共に自然に減る安全pool内の探索である。
+                tail_fraction = min(max(float(getattr(
+                    self.args,
+                    "heuristic_guidance_online_exploration_tail_fraction",
+                    0.25,
+                )), 0.0), 1.0)
+                max_tail = max(int(getattr(
+                    self.args,
+                    "heuristic_guidance_online_exploration_max_candidate_changes",
+                    4,
+                )), 0)
+                tail_count = min(
+                    max_tail,
+                    max(
+                        int(math.ceil(
+                            requested_for_support * tail_fraction
+                            * float(operation_exploration_factors[operation])
+                        )),
+                        0,
+                    ),
+                    max(valid_count_for_support - support_count, 0),
+                )
+                tail_indices = finite_indices.new_empty((0,), dtype=torch.long)
+                if tail_count > 0:
+                    ranked_indices = finite_indices[torch.argsort(
+                        scaled_logits[finite_indices], descending=True
+                    )]
+                    tail_pool = ranked_indices[support_count:]
+                    rotation = int(getattr(
+                        self, "_den6_exploration_rotation", 0
+                    ))
+                    stride = max(int(tail_pool.numel()) // tail_count, 1)
+                    positions = (
+                        rotation + torch.arange(
+                            tail_count, device=tail_pool.device, dtype=torch.long
+                        ) * stride
+                    ) % max(int(tail_pool.numel()), 1)
+                    tail_indices = tail_pool[positions]
+                    support_mask[tail_indices] = True
+                    self._den6_exploration_rotation = rotation + 1
+                sampled_base = scaled_logits.clone()
+                if int(tail_indices.numel()) > 0:
+                    # Tailを強制選択せず、上位supportの境界値までだけ引き上げ、
+                    # uncertainty-scaled Gumbelで試される可能性を与える。
+                    cutoff = scaled_logits[support_indices].min().detach()
+                    sampled_base[tail_indices] = torch.maximum(
+                        sampled_base[tail_indices], cutoff
+                    )
                 sampled_support_score = (
-                    scaled_logits
+                    sampled_base
                     + gumbel * float(operation_gumbel_scale)
                 ).masked_fill(~support_mask, float("-inf")).detach()
                 deterministic_remainder_score = scaled_logits.masked_fill(
                     support_mask, float("-inf")
                 ).detach()
-                exploration_support_sizes[operation] = int(support_count)
+                exploration_support_sizes[operation] = int(support_mask.sum().cpu())
+                exploration_tail_sizes[operation] = int(tail_indices.numel())
                 exploration_support_reserve_factors[operation] = float(
                     adaptive_reserve
                 )
@@ -5654,6 +5708,7 @@ class StructureRepairActuator(nn.Module):
                 )
                 support_mask = torch.isfinite(scaled_logits)
                 exploration_support_sizes[operation] = int(support_mask.sum().cpu())
+                exploration_tail_sizes[operation] = 0
                 exploration_support_reserve_factors[operation] = 1.0
                 exploration_support_masks[operation] = support_mask
                 gumbel_audit[operation] = _score_stats(
@@ -6818,6 +6873,7 @@ class StructureRepairActuator(nn.Module):
             "plan_exploration_factor": float(plan_exploration_factor),
             "operation_exploration_factors": operation_exploration_factors,
             "exploration_support_sizes": exploration_support_sizes,
+            "exploration_tail_sizes": exploration_tail_sizes,
             "exploration_support_reserve_factors": (
                 exploration_support_reserve_factors
             ),
