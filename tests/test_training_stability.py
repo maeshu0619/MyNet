@@ -29,6 +29,7 @@ from models.utils.training.train_runtime import (
 )
 from models.modules.structure_actuator import (
     StructureRepairActuator,
+    adaptive_exploration_candidate_changes,
     policy_exploration_multiplier,
     smooth_exploration_phase,
 )
@@ -255,6 +256,15 @@ class TrainingStabilityTest(unittest.TestCase):
             ),
             0.0,
         )
+
+    def test_candidate_exploration_budget_contracts_with_actual_quality(self):
+        self.assertEqual(adaptive_exploration_candidate_changes(16, 1.0), 16)
+        self.assertEqual(adaptive_exploration_candidate_changes(16, 0.5), 8)
+        self.assertEqual(adaptive_exploration_candidate_changes(16, 0.25), 4)
+
+    def test_candidate_exploration_budget_never_vanishes_while_enabled(self):
+        self.assertEqual(adaptive_exploration_candidate_changes(16, 0.0), 1)
+        self.assertEqual(adaptive_exploration_candidate_changes(0, 1.0), 0)
 
     def test_annealed_policy_exploration_remains_available_for_ablation(self):
         self.assertAlmostEqual(

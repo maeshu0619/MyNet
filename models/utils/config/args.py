@@ -1630,7 +1630,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--repair_exploration_fraction', default=1.0, type=float, help='annealedモードで全学習stepのうち探索ノイズを残す割合')
     parser.add_argument('--repair_exploration_smooth_tail_fraction', default=0.25, type=float, help='探索減衰末尾を傾き0へ滑らかにつなぐ割合。0なら従来の線形clip')
     parser.add_argument('--repair_policy_exploration_mode', default='constant', choices=['constant', 'annealed'], help='Exact-online離散方策の探索強度。constantは時刻による見かけの圧縮改善を防ぎ、annealedは従来ablation用')
-    parser.add_argument('--repair_policy_exploration_constant_multiplier', default=0.25, type=float, help='constant時のWhere/Amount/Fineおよび旧汎用random-mixの残存倍率。eval時の確率ノイズは常に0')
+    parser.add_argument('--repair_policy_exploration_constant_multiplier', default=0.50, type=float, help='constant時のWhere/Amount/Fineおよび旧汎用random-mixの基準倍率。実効探索はActual evidence品質で縮小し、eval時の確率ノイズは常に0')
     parser.add_argument('--repair_add_candidate_ratio_start', default=0.0, type=float, help='探索初期の追加候補割合(0ならmax_add_ratio)')
     parser.add_argument('--repair_add_candidate_ratio_end', default=0.0, type=float, help='探索終了後の追加候補割合(0ならmax_add_ratio)')
     parser.add_argument('--repair_add_score_noise_start', default=0.0, type=float, help='探索初期に追加位置logitへ入れるGumbelノイズ量')
@@ -2555,8 +2555,11 @@ def parse_pugan_args(parser, file_day, file_time):
         help='coverage UCBに加えるdecision group不確実性の係数。Episode番号には依存しない',
     )
     parser.add_argument(
-        '--heuristic_guidance_online_exploration_max_candidate_changes', default=4, type=int,
-        help='1回のWhere探索でincumbentから入れ替えるcandidate上限',
+        '--heuristic_guidance_online_exploration_max_candidate_changes', default=16, type=int,
+        help=(
+            'Actual evidenceがない1回のWhere探索でincumbentから入れ替えるcandidate上限。'
+            '実効数はdecision groupのActual品質に応じて自然に縮小する'
+        ),
     )
     parser.add_argument(
         '--heuristic_guidance_online_exploration_tail_fraction', default=0.25, type=float,
@@ -4535,7 +4538,7 @@ def parse_pugan_args(parser, file_day, file_time):
         args, "heuristic_guidance_exploration_min_fraction", 0.25
     )), 0.0), 1.0)
     args.heuristic_guidance_online_exploration_max_candidate_changes = max(int(getattr(
-        args, "heuristic_guidance_online_exploration_max_candidate_changes", 4
+        args, "heuristic_guidance_online_exploration_max_candidate_changes", 16
     )), 1)
     args.heuristic_guidance_online_noop_prior_offset = min(max(float(getattr(
         args, "heuristic_guidance_online_noop_prior_offset", -1.5
@@ -7487,7 +7490,7 @@ def parse_pugan_args(parser, file_day, file_time):
     if args.repair_policy_exploration_mode not in {"constant", "annealed"}:
         raise ValueError("--repair_policy_exploration_mode must be constant or annealed")
     args.repair_policy_exploration_constant_multiplier = min(max(float(getattr(
-        args, "repair_policy_exploration_constant_multiplier", 0.25
+        args, "repair_policy_exploration_constant_multiplier", 0.50
     )), 0.0), 1.0)
     args.repair_add_candidate_ratio_start = max(float(getattr(args, "repair_add_candidate_ratio_start", 0.0)), 0.0)
     args.repair_add_candidate_ratio_end = max(float(getattr(args, "repair_add_candidate_ratio_end", 0.0)), 0.0)

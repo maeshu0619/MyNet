@@ -54,6 +54,22 @@ def policy_exploration_multiplier(
     raise ValueError("repair_policy_exploration_mode must be constant or annealed")
 
 
+def adaptive_exploration_candidate_changes(max_changes, learning_factor):
+    """Return an evidence-controlled factorized Where perturbation budget.
+
+    ``learning_factor`` is one for an uncalibrated Actual policy and contracts
+    toward the configured exploration floor as matched Actual ordering becomes
+    reliable.  Consequently this budget is not a function of Episode or wall
+    clock time: an unlearned group keeps exploring, while a calibrated group
+    changes only a small number of candidates around its incumbent plan.
+    """
+    maximum = max(int(max_changes), 0)
+    if maximum <= 0:
+        return 0
+    factor = min(max(float(learning_factor), 0.0), 1.0)
+    return min(max(int(math.ceil(float(maximum) * factor)), 1), maximum)
+
+
 def candidate_listwise_local_credit(prediction, utility_target):
     """Train one operation pool from relative, non-heuristic RD utility."""
     prediction = prediction.float().reshape(-1)
@@ -3188,7 +3204,7 @@ class StructureRepairActuator(nn.Module):
                 training=bool(getattr(self, "training", False)),
                 schedule_mode=schedule_mode,
                 constant_multiplier=getattr(
-                    self.args, "repair_policy_exploration_constant_multiplier", 0.25
+                    self.args, "repair_policy_exploration_constant_multiplier", 0.50
                 ),
                 annealed_phase=annealed_phase,
             )
@@ -4438,7 +4454,7 @@ class StructureRepairActuator(nn.Module):
             training=module_is_training,
             schedule_mode=exploration_mode,
             constant_multiplier=getattr(
-                self.args, "repair_policy_exploration_constant_multiplier", 0.25
+                self.args, "repair_policy_exploration_constant_multiplier", 0.50
             ),
             annealed_phase=annealed_phase,
         )
@@ -5116,6 +5132,7 @@ class StructureRepairActuator(nn.Module):
         exploration_selection_change_rates = {}
         exploration_support_sizes = {}
         exploration_tail_sizes = {}
+        exploration_change_budgets = {}
         exploration_support_reserve_factors = {}
         exploration_support_masks = {}
         gumbel_audit = {}
@@ -5729,6 +5746,20 @@ class StructureRepairActuator(nn.Module):
                     }
                 )
             )
+            configured_max_candidate_changes = max(int(getattr(
+                self.args,
+                "heuristic_guidance_online_exploration_max_candidate_changes",
+                16,
+            )), 1)
+            effective_max_candidate_changes = (
+                adaptive_exploration_candidate_changes(
+                    configured_max_candidate_changes,
+                    operation_exploration_factors[operation],
+                )
+            )
+            exploration_change_budgets[operation] = int(
+                effective_max_candidate_changes
+            )
             if operation_exploration_active:
                 uniform = torch.rand_like(scaled_logits).clamp_(1e-8, 1.0 - 1e-8)
                 gumbel = -torch.log(-torch.log(uniform))
@@ -5814,11 +5845,7 @@ class StructureRepairActuator(nn.Module):
                     "heuristic_guidance_online_exploration_tail_fraction",
                     0.25,
                 )), 0.0), 1.0)
-                max_tail = max(int(getattr(
-                    self.args,
-                    "heuristic_guidance_online_exploration_max_candidate_changes",
-                    4,
-                )), 0)
+                max_tail = effective_max_candidate_changes
                 tail_count = min(
                     max_tail,
                     max(
@@ -5828,14 +5855,21 @@ class StructureRepairActuator(nn.Module):
                         )),
                         0,
                     ),
-                    max(valid_count_for_support - support_count, 0),
+                    # Candidates below the incumbent selection boundary are
+                    # the informative tail.  Previously this used
+                    # ``support_count``; when the reserve covered the complete
+                    # Proposal subset (the common case), tail_count became
+                    # zero and no lower-priority safe action could be tested.
+                    max(valid_count_for_support - requested_for_support, 0),
                 )
                 tail_indices = finite_indices.new_empty((0,), dtype=torch.long)
                 if tail_count > 0:
                     ranked_indices = finite_indices[torch.argsort(
                         scaled_logits[finite_indices], descending=True
                     )]
-                    tail_pool = ranked_indices[support_count:]
+                    tail_pool = ranked_indices[
+                        min(requested_for_support, valid_count_for_support):
+                    ]
                     rotation = int(getattr(
                         self, "_den6_exploration_rotation", 0
                     ))
@@ -5850,11 +5884,17 @@ class StructureRepairActuator(nn.Module):
                     self._den6_exploration_rotation = rotation + 1
                 sampled_base = scaled_logits.clone()
                 if int(tail_indices.numel()) > 0:
-                    # Tailを強制選択せず、上位supportの境界値までだけ引き上げ、
+                    # Tailを強制選択せず、incumbent選択境界までだけ引き上げ、
                     # uncertainty-scaled Gumbelで試される可能性を与える。
-                    cutoff = scaled_logits[support_indices].min().detach()
+                    incumbent_boundary_count = min(
+                        requested_for_support, valid_count_for_support
+                    )
+                    incumbent_boundary = torch.topk(
+                        scaled_logits[finite_indices],
+                        k=max(incumbent_boundary_count, 1),
+                    ).values.min().detach()
                     sampled_base[tail_indices] = torch.maximum(
-                        sampled_base[tail_indices], cutoff
+                        sampled_base[tail_indices], incumbent_boundary
                     )
                 sampled_support_score = (
                     sampled_base
@@ -5973,21 +6013,15 @@ class StructureRepairActuator(nn.Module):
                 deterministic_indices_by_operation[operation] = [
                     int(value) for value in deterministic_prefix.detach().cpu().tolist()
                 ]
-                if operation_exploration_active and audit_selection_count > max(int(getattr(
-                    self.args,
-                    "heuristic_guidance_online_exploration_max_candidate_changes",
-                    4,
-                )), 1):
+                if (
+                    operation_exploration_active
+                    and audit_selection_count > effective_max_candidate_changes
+                ):
                     incumbent_mask = torch.zeros_like(scaled_logits, dtype=torch.bool)
                     incumbent_mask[deterministic_prefix] = True
                     alternatives = support_order[~incumbent_mask[support_order]]
-                    maximum_changes = max(int(getattr(
-                        self.args,
-                        "heuristic_guidance_online_exploration_max_candidate_changes",
-                        4,
-                    )), 1)
                     change_count = min(
-                        maximum_changes,
+                        effective_max_candidate_changes,
                         audit_selection_count,
                         int(alternatives.numel()),
                     )
@@ -6165,8 +6199,17 @@ class StructureRepairActuator(nn.Module):
 
         if (
             factorized_actual_credit
-            and str(factorized_exploration_group).endswith("Where")
+            and str(factorized_exploration_group) in {
+                "AddWhere", "PruneWhere", "AdjustWhere",
+                "Amount", "Gate", "Fine",
+            }
             and not matched_anchor_reused
+            # Gate/Fine cannot change an executed no-op plan, so saving such
+            # an anchor would manufacture a comparison with no action delta.
+            and not (
+                no_op_selected
+                and str(factorized_exploration_group) in {"Gate", "Fine"}
+            )
         ):
             anchor_indices_by_operation = {name: [] for name in operations}
             for operation, candidate_index, _ in selected:
@@ -7150,6 +7193,7 @@ class StructureRepairActuator(nn.Module):
             "operation_exploration_factors": operation_exploration_factors,
             "exploration_support_sizes": exploration_support_sizes,
             "exploration_tail_sizes": exploration_tail_sizes,
+            "exploration_change_budgets": exploration_change_budgets,
             "exploration_support_reserve_factors": (
                 exploration_support_reserve_factors
             ),

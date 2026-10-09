@@ -2279,9 +2279,10 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
                 if candidate_id.startswith("p")
             )
             selected_amount_bins.add(result[1]["amount_bin_ratio"])
-        # Score-relative exploration does not deliberately select a clearly
-        # lower-valued candidate merely because training is early.
-        self.assertEqual(selected_prune, {"p0"})
+        # Training exploration must retain the safe lower-priority candidate;
+        # otherwise the Actor can never observe whether the heuristic ordering
+        # is wrong.  Evaluation below remains deterministic and noise-free.
+        self.assertEqual(selected_prune, {"p0", "p1"})
         # anchor後のcoarse Amount探索にanchor移行係数を二重適用しない。
         # 修正前はここが12回すべて0.0025だった。
         self.assertGreater(len(selected_amount_bins), 1)
