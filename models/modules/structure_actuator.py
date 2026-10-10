@@ -87,19 +87,24 @@ def exploration_candidate_change_budget(
 ):
     """Scale a Where perturbation with the size of the executed operation.
 
-    A fixed budget of 16 changed only 2--4% of the hundreds of candidates in
-    a normal den6 plan, even at the start of the exploration window. Use a
-    bounded fraction of the incumbent instead, then apply the existing
-    exploration multiplier so the perturbation still reaches exactly zero at
-    the end of the configured window. The hard cap keeps one composite Actual
-    encode and its group-level credit computationally bounded.
+    A fixed budget changed only a small fraction of a normal den6 plan. Use a
+    fraction of the incumbent instead, then apply the exploration multiplier
+    so the perturbation reaches exactly zero at the end of the configured
+    window. A positive optional cap can still bound unusually large plans.
     """
-    maximum = max(int(max_changes), 0)
     requested = max(int(requested_count), 0)
     fraction = min(max(float(requested_fraction), 0.0), 1.0)
     factor = min(max(float(learning_factor), 0.0), 1.0)
-    if maximum <= 0 or requested <= 0 or fraction <= 0.0 or factor <= 0.0:
+    if requested <= 0 or fraction <= 0.0 or factor <= 0.0:
         return 0
+    # A non-positive configured cap means "uncapped", not "disable
+    # exploration". The plan size and requested fraction remain strict bounds.
+    configured_maximum = int(max_changes)
+    maximum = (
+        requested
+        if configured_maximum <= 0
+        else min(configured_maximum, requested)
+    )
     initial_budget = min(
         maximum,
         max(int(math.ceil(float(requested) * fraction)), 1),
@@ -107,6 +112,13 @@ def exploration_candidate_change_budget(
     return adaptive_exploration_candidate_changes(
         initial_budget, factor
     )
+
+
+def exploration_proposal_count(valid_count, ordinary_count, broaden_safe_pool):
+    """Expose every safe candidate only for the currently explored group."""
+    valid = max(int(valid_count), 0)
+    ordinary = min(max(int(ordinary_count), 0), valid)
+    return valid if bool(broaden_safe_pool) else ordinary
 
 
 def evidence_driven_post_window_multiplier(floor, evidence_target, group_states):
@@ -4646,7 +4658,7 @@ class StructureRepairActuator(nn.Module):
             post_window_floor = min(max(float(getattr(
                 self.args,
                 "heuristic_guidance_online_post_window_exploration_floor",
-                0.02,
+                0.0,
             )), 0.0), 0.10)
             (
                 exploration_multiplier,
@@ -5587,6 +5599,25 @@ class StructureRepairActuator(nn.Module):
                         valid_count_for_proposal,
                         max(minimum_count, configured_max),
                     )
+                broaden_explored_safe_pool = bool(
+                    exploration_active
+                    and bool(getattr(
+                        self.args,
+                        "heuristic_guidance_online_exploration_full_safe_pool",
+                        True,
+                    ))
+                    and (
+                        not factorized_behavior
+                        or factorized_exploration_group in {
+                            "all", f"{operation}Where"
+                        }
+                    )
+                )
+                proposal_count = exploration_proposal_count(
+                    valid_count_for_proposal,
+                    proposal_count,
+                    broaden_explored_safe_pool,
+                )
                 if proposal_count < valid_count_for_proposal:
                     group_name = f"{operation}Where"
                     proposal_quality = self._den6_group_actual_quality(
@@ -5973,12 +6004,12 @@ class StructureRepairActuator(nn.Module):
             configured_max_candidate_changes = max(int(getattr(
                 self.args,
                 "heuristic_guidance_online_exploration_max_candidate_changes",
-                128,
-            )), 1)
+                0,
+            )), 0)
             configured_candidate_change_fraction = min(max(float(getattr(
                 self.args,
                 "heuristic_guidance_online_exploration_candidate_fraction",
-                0.175,
+                0.50,
             )), 0.0), 1.0)
             candidate_change_factor = (
                 float(exploration_multiplier)
@@ -6080,7 +6111,7 @@ class StructureRepairActuator(nn.Module):
                 tail_fraction = min(max(float(getattr(
                     self.args,
                     "heuristic_guidance_online_exploration_tail_fraction",
-                    0.50,
+                    1.0,
                 )), 0.0), 1.0)
                 max_tail = effective_max_candidate_changes
                 tail_count = min(

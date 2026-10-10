@@ -2579,31 +2579,38 @@ def parse_pugan_args(parser, file_day, file_time):
         help='Actual evidence不足と低authorityをfactorized group UCBへ加える重み',
     )
     parser.add_argument(
-        '--heuristic_guidance_online_exploration_max_candidate_changes', default=192, type=int,
+        '--heuristic_guidance_online_exploration_max_candidate_changes', default=0, type=int,
         help=(
-            'Actual evidenceがない1回のWhere探索でincumbentから入れ替えるcandidate上限。'
-            '実効数は選択数比と前半25%の探索係数に応じて縮小する'
+            '1回のWhere探索でincumbentから入れ替えるcandidate上限。'
+            '0以下は固定上限なし（選択数比が上限）。実効数は前半25%の探索係数で0まで縮小する'
         ),
     )
     parser.add_argument(
-        '--heuristic_guidance_online_exploration_candidate_fraction', default=0.25, type=float,
+        '--heuristic_guidance_online_exploration_candidate_fraction', default=0.50, type=float,
         help=(
             'Where探索開始時にincumbentから入れ替えるcandidateの選択数比。'
             '上限と探索係数を併用し、探索窓の終端では0になる'
         ),
     )
     parser.add_argument(
-        '--heuristic_guidance_online_exploration_tail_fraction', default=0.50, type=float,
+        '--heuristic_guidance_online_exploration_tail_fraction', default=1.0, type=float,
         help=(
             'Where探索supportに安全pool全域から回転coverage候補を追加する'
             'requested count比。Actual学習品質に応じて探索係数と共に縮小する'
         ),
     )
     parser.add_argument(
-        '--heuristic_guidance_online_post_window_exploration_floor', default=0.02, type=float,
+        '--heuristic_guidance_online_exploration_full_safe_pool', default=True, type=str2bool,
         help=(
-            '前半25%%終了後、Actual evidence/accuracy/uncertaintyが不足するgroupだけに残す'
-            '微小探索上限。0.02では通常1--3 candidateだけを差し替え、十分学習後は0になる'
+            '探索対象のWhere操作ではlearned Proposal上限を一時的に外し、'
+            'static compatibility通過後のsafe pool全体を選択可能にする'
+        ),
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_post_window_exploration_floor', default=0.0, type=float,
+        help=(
+            '前半25%%終了後に任意で残すevidence-driven微小探索上限。'
+            '既定0ではwindow終端でnoiseを完全に停止する'
         ),
     )
     parser.add_argument(
@@ -4561,10 +4568,10 @@ def parse_pugan_args(parser, file_day, file_time):
         args, "heuristic_guidance_online_gumbel_logit_floor", 0.10
     )), 0.0)
     args.heuristic_guidance_online_exploration_tail_fraction = min(max(float(getattr(
-        args, "heuristic_guidance_online_exploration_tail_fraction", 0.50
+        args, "heuristic_guidance_online_exploration_tail_fraction", 1.0
     )), 0.0), 1.0)
     args.heuristic_guidance_online_exploration_candidate_fraction = min(max(float(getattr(
-        args, "heuristic_guidance_online_exploration_candidate_fraction", 0.25
+        args, "heuristic_guidance_online_exploration_candidate_fraction", 0.50
     )), 0.0), 1.0)
     args.heuristic_guidance_online_actor_proxy_weight = max(float(getattr(
         args, "heuristic_guidance_online_actor_proxy_weight", 0.0
@@ -4581,11 +4588,14 @@ def parse_pugan_args(parser, file_day, file_time):
     args.heuristic_guidance_exploration_min_fraction = min(max(float(getattr(
         args, "heuristic_guidance_exploration_min_fraction", 0.25
     )), 0.0), 1.0)
-    args.heuristic_guidance_online_exploration_max_candidate_changes = max(int(getattr(
-        args, "heuristic_guidance_online_exploration_max_candidate_changes", 192
-    )), 1)
+    args.heuristic_guidance_online_exploration_max_candidate_changes = int(getattr(
+        args, "heuristic_guidance_online_exploration_max_candidate_changes", 0
+    ))
+    args.heuristic_guidance_online_exploration_full_safe_pool = bool(getattr(
+        args, "heuristic_guidance_online_exploration_full_safe_pool", True
+    ))
     args.heuristic_guidance_online_post_window_exploration_floor = min(max(float(getattr(
-        args, "heuristic_guidance_online_post_window_exploration_floor", 0.02
+        args, "heuristic_guidance_online_post_window_exploration_floor", 0.0
     )), 0.0), 0.10)
     args.heuristic_guidance_online_where_exploration_share = min(max(float(getattr(
         args, "heuristic_guidance_online_where_exploration_share", 0.60

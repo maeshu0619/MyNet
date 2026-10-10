@@ -33,6 +33,7 @@ from models.modules.structure_actuator import (
     adaptive_exploration_candidate_changes,
     evidence_driven_post_window_multiplier,
     exploration_candidate_change_budget,
+    exploration_proposal_count,
     policy_exploration_multiplier,
     smooth_exploration_phase,
 )
@@ -329,6 +330,46 @@ class TrainingStabilityTest(unittest.TestCase):
         self.assertEqual(
             exploration_candidate_change_budget(192, 800, 0.25, 0.50), 96
         )
+
+    def test_uncapped_exploration_uses_fraction_and_anneals_to_zero(self):
+        self.assertEqual(
+            exploration_candidate_change_budget(0, 800, 0.50, 1.0), 400
+        )
+        self.assertEqual(
+            exploration_candidate_change_budget(0, 800, 0.50, 0.50), 200
+        )
+        self.assertEqual(
+            exploration_candidate_change_budget(0, 800, 0.50, 0.0), 0
+        )
+
+    def test_current_broad_exploration_schedule_converges_to_zero(self):
+        multipliers = []
+        budgets = []
+        for progress in (0.0, 0.10, 0.175, 0.225, 0.25):
+            phase = smooth_exploration_phase(
+                progress, 0.25, 0.25, 0.40
+            )
+            multiplier = policy_exploration_multiplier(
+                training=True,
+                schedule_mode="annealed",
+                constant_multiplier=0.50,
+                annealed_phase=phase,
+            )
+            multipliers.append(multiplier)
+            budgets.append(exploration_candidate_change_budget(
+                0, 800, 0.50, multiplier
+            ))
+        self.assertEqual(multipliers[:2], [1.0, 1.0])
+        self.assertEqual(budgets[:2], [400, 400])
+        self.assertTrue(all(
+            left >= right for left, right in zip(budgets, budgets[1:])
+        ))
+        self.assertEqual(multipliers[-1], 0.0)
+        self.assertEqual(budgets[-1], 0)
+
+    def test_explored_proposal_can_use_complete_safe_pool(self):
+        self.assertEqual(exploration_proposal_count(3400, 2048, True), 3400)
+        self.assertEqual(exploration_proposal_count(3400, 2048, False), 2048)
 
     def test_post_window_exploration_is_evidence_driven_and_tiny(self):
         multiplier, need = evidence_driven_post_window_multiplier(
