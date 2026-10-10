@@ -182,6 +182,10 @@ class PlotMaker():
         self.plot_outlier_min_history = max(int(getattr(args, "plot_outlier_min_history", 8)), 0)
         self.plot_outlier_history_window = max(int(getattr(args, "plot_outlier_history_window", 64)), 0)
         self.plot_outlier_min_scale = max(float(getattr(args, "plot_outlier_min_scale", 1.0)), 0.0)
+        self.plot_ylim_margin_ratio = max(float(getattr(args, "plot_ylim_margin_ratio", 0.15)), 0.0)
+        self.plot_ylim_min_margin = max(float(getattr(args, "plot_ylim_min_margin", 1e-3)), 0.0)
+        self.plot_ylim_update_interval = max(int(getattr(args, "plot_ylim_update_interval", 5)), 1)
+        self._plot_ylim_cache = {}
 
         self.filename_step = f"{args.time}_step"
         self.filename_epo = f"{args.time}_epo"
@@ -898,14 +902,8 @@ class PlotMaker():
                         row.append("")
                 f.write(",".join(row) + "\n")
 
-    @staticmethod
-    def _set_integer_padded_ylim(ax, series_values):
-        """Fit a metric without forcing zero into view.
-
-        One integer unit is left above and below the observed finite range.
-        For example, -4.0..-3.2 becomes -5..-2.  This changes only rendering;
-        raw CSV values, losses, checkpoint selection, and training are untouched.
-        """
+    def _adaptive_ylim(self, series_values):
+        """Return observed finite range plus a scale-aware display margin."""
         finite = []
         for values in series_values:
             finite.extend(
@@ -913,26 +911,72 @@ class PlotMaker():
                 if value is not None and math.isfinite(float(value))
             )
         if not finite:
-            return
-        lower = math.floor(min(finite)) - 1
-        upper = math.ceil(max(finite)) + 1
+            return None
+        observed_min = min(finite)
+        observed_max = max(finite)
+        observed_range = observed_max - observed_min
+        value_scale = max(abs(observed_min), abs(observed_max))
+        minimum_margin = max(
+            self.plot_ylim_min_margin,
+            value_scale * 0.01,
+        )
+        margin = max(observed_range * self.plot_ylim_margin_ratio, minimum_margin)
+        lower = observed_min - margin
+        upper = observed_max + margin
         if lower >= upper:
-            upper = lower + 1
+            upper = lower + max(2.0 * minimum_margin, 1e-12)
+        return lower, upper
+
+    def _set_adaptive_ylim(self, ax, series_values, cache_key=None, update_position=None):
+        """Apply periodically refreshed loss-axis limits.
+
+        Episode plots shrink/refit only at the configured interval so their
+        scale does not jitter every Episode.  A newly observed value outside
+        the cached limits expands them immediately, preventing clipped data.
+        Other plot modes pass no cache key and are fitted on every render.
+        """
+        proposed = self._adaptive_ylim(series_values)
+        if proposed is None:
+            return
+        if cache_key is None or update_position is None:
+            ax.set_ylim(*proposed)
+            return
+
+        update_bucket = int(update_position) // self.plot_ylim_update_interval
+        cached = self._plot_ylim_cache.get(cache_key)
+        refresh = cached is None or cached[0] != update_bucket
+        if refresh:
+            limits = proposed
+        else:
+            _, cached_lower, cached_upper = cached
+            proposed_lower, proposed_upper = proposed
+            if proposed_lower < cached_lower or proposed_upper > cached_upper:
+                limits = (
+                    min(cached_lower, proposed_lower),
+                    max(cached_upper, proposed_upper),
+                )
+            else:
+                limits = (cached_lower, cached_upper)
+        self._plot_ylim_cache[cache_key] = (update_bucket, limits[0], limits[1])
+        lower, upper = limits
         ax.set_ylim(lower, upper)
 
-    def _plot_single_axis(self, ax, epochs, values, loss_idx, xl):
-        values = self._plot_values(values)
-        epochs, values = self._downsample_series(epochs, values)
+    def _plot_single_axis(self, ax, epochs, values, loss_idx, xl, ylim_cache_key=None):
+        axis_values = self._plot_values(values)
+        epochs, values = self._downsample_series(epochs, axis_values)
         if any(math.isfinite(value) for value in values):
             ax.plot(epochs, values, marker="o", linewidth=2, markersize=3)
         else:
             ax.text(0.5, 0.5, "no finite data", ha="center", va="center", transform=ax.transAxes, alpha=0.7)
-        metric_key = str(self.metric_keys[loss_idx]).lower()
-        compression_axis = "compression" in metric_key
-        if compression_axis:
-            self._set_integer_padded_ylim(ax, [values])
-        else:
+        if "compression" not in str(self.metric_keys[loss_idx]).lower():
             ax.axhline(0.0, color="black", linewidth=0.7, alpha=0.4)
+        update_position = epochs[-1] if epochs and ylim_cache_key is not None else None
+        self._set_adaptive_ylim(
+            ax,
+            [axis_values],
+            cache_key=ylim_cache_key,
+            update_position=update_position,
+        )
         ax.set_xlabel(xl)
         ax.set_ylabel(self.metric_keys[loss_idx])
         ax.set_title(self.title[loss_idx])
@@ -974,7 +1018,7 @@ class PlotMaker():
                 plotted = True
         if not plotted:
             ax.text(0.5, 0.5, "no compression data", ha="center", va="center", transform=ax.transAxes, alpha=0.7)
-        self._set_integer_padded_ylim(ax, plotted_values)
+        self._set_adaptive_ylim(ax, plotted_values)
         ax.set_xlabel(xl)
         ax.set_ylabel("Delta [%]")
         ax.set_title("Exploration-affected training metrics (use fixed validation as learning evidence)")
@@ -1075,7 +1119,15 @@ class PlotMaker():
 
             for ax, loss_idx in zip(axes, group):
                 epochs = list(x_history)
-                self._plot_single_axis(ax, epochs, loss_history[loss_idx], loss_idx, xl)
+                ylim_cache_key = ("epi", int(loss_idx)) if epoORepi == "epi" else None
+                self._plot_single_axis(
+                    ax,
+                    epochs,
+                    loss_history[loss_idx],
+                    loss_idx,
+                    xl,
+                    ylim_cache_key=ylim_cache_key,
+                )
 
             plot_mod.tight_layout()
             plot_mod.savefig(save_path, dpi=140)

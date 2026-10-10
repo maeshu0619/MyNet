@@ -1629,6 +1629,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--repair_add_weight_mode', default='hard', type=str, help='追加点のfinal_wをhard/softのどちらで作るか')
     parser.add_argument('--repair_exploration_fraction', default=0.25, type=float, help='annealedモードで全学習Stepのうち探索ノイズを残す割合。既定は前半4分の1')
     parser.add_argument('--repair_exploration_smooth_tail_fraction', default=0.25, type=float, help='探索減衰末尾を傾き0へ滑らかにつなぐ割合。0なら従来の線形clip')
+    parser.add_argument('--repair_exploration_plateau_fraction', default=0.40, type=float, help='前半25% exploration window内で最大探索強度を保持する割合。windowの最後では必ず0へ収束する')
     parser.add_argument('--repair_policy_exploration_mode', default='annealed', choices=['constant', 'annealed'], help='Exact-online離散方策の探索強度。annealedは指定fraction内で0へ滑らかに収束し、それ以降は決定論的方策を使う')
     parser.add_argument('--repair_policy_exploration_constant_multiplier', default=0.50, type=float, help='constant時のWhere/Amount/Fineおよび旧汎用random-mixの基準倍率。実効探索はActual evidence品質で縮小し、eval時の確率ノイズは常に0')
     parser.add_argument('--repair_add_candidate_ratio_start', default=0.0, type=float, help='探索初期の追加候補割合(0ならmax_add_ratio)')
@@ -2566,6 +2567,10 @@ def parse_pugan_args(parser, file_day, file_time):
         help='Where familyのsoft coverage不足をfactorized group UCBへ加える重み',
     )
     parser.add_argument(
+        '--heuristic_guidance_online_where_evidence_balance_weight', default=1.0, type=float,
+        help='Add/Prune/Adjust間のusabled matched Actual比較数の差をWhere group探索優先度へ反映する重み。操作率や性能値の目標ではない',
+    )
+    parser.add_argument(
         '--heuristic_guidance_online_group_evidence_target', default=64, type=int,
         help='group探索優先度のevidence不足を正規化する比較数。authority閾値ではない',
     )
@@ -2574,14 +2579,14 @@ def parse_pugan_args(parser, file_day, file_time):
         help='Actual evidence不足と低authorityをfactorized group UCBへ加える重み',
     )
     parser.add_argument(
-        '--heuristic_guidance_online_exploration_max_candidate_changes', default=128, type=int,
+        '--heuristic_guidance_online_exploration_max_candidate_changes', default=192, type=int,
         help=(
             'Actual evidenceがない1回のWhere探索でincumbentから入れ替えるcandidate上限。'
             '実効数は選択数比と前半25%の探索係数に応じて縮小する'
         ),
     )
     parser.add_argument(
-        '--heuristic_guidance_online_exploration_candidate_fraction', default=0.175, type=float,
+        '--heuristic_guidance_online_exploration_candidate_fraction', default=0.25, type=float,
         help=(
             'Where探索開始時にincumbentから入れ替えるcandidateの選択数比。'
             '上限と探索係数を併用し、探索窓の終端では0になる'
@@ -3622,6 +3627,9 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--plot_outlier_min_history', default=4, type=int, help='相対外れ値判定を始めるまでに必要な履歴数')
     parser.add_argument('--plot_outlier_history_window', default=64, type=int, help='相対外れ値判定で参照する直近履歴数（0で全履歴）')
     parser.add_argument('--plot_outlier_min_scale', default=1.0, type=float, help='相対外れ値判定で使う中央値の下限値')
+    parser.add_argument('--plot_ylim_margin_ratio', default=0.15, type=float, help='loss図の観測済み最小・最大へ加える縦軸余白（観測幅に対する片側比率）')
+    parser.add_argument('--plot_ylim_min_margin', default=1e-3, type=float, help='loss図の縦軸に確保する片側の最小絶対余白')
+    parser.add_argument('--plot_ylim_update_interval', default=5, type=int, help='Episode loss図の縦軸を再計算するEpisode間隔（範囲外の新値は即時拡張）')
     parser.add_argument('--retain_debug_tensors', default=False, type=str2bool, help='中間勾配を保持するか')
     parser.add_argument('--debug_grad_flow', default=False, type=str2bool, help='勾配ノルムをログ出力するか')
     parser.add_argument('--debug_grad_flow_rate', default=1, type=int, help='勾配ログの出力間隔')
@@ -4556,7 +4564,7 @@ def parse_pugan_args(parser, file_day, file_time):
         args, "heuristic_guidance_online_exploration_tail_fraction", 0.50
     )), 0.0), 1.0)
     args.heuristic_guidance_online_exploration_candidate_fraction = min(max(float(getattr(
-        args, "heuristic_guidance_online_exploration_candidate_fraction", 0.175
+        args, "heuristic_guidance_online_exploration_candidate_fraction", 0.25
     )), 0.0), 1.0)
     args.heuristic_guidance_online_actor_proxy_weight = max(float(getattr(
         args, "heuristic_guidance_online_actor_proxy_weight", 0.0
@@ -4574,7 +4582,7 @@ def parse_pugan_args(parser, file_day, file_time):
         args, "heuristic_guidance_exploration_min_fraction", 0.25
     )), 0.0), 1.0)
     args.heuristic_guidance_online_exploration_max_candidate_changes = max(int(getattr(
-        args, "heuristic_guidance_online_exploration_max_candidate_changes", 128
+        args, "heuristic_guidance_online_exploration_max_candidate_changes", 192
     )), 1)
     args.heuristic_guidance_online_post_window_exploration_floor = min(max(float(getattr(
         args, "heuristic_guidance_online_post_window_exploration_floor", 0.02
@@ -4584,6 +4592,9 @@ def parse_pugan_args(parser, file_day, file_time):
     )), 0.0), 1.0)
     args.heuristic_guidance_online_where_coverage_weight = max(float(getattr(
         args, "heuristic_guidance_online_where_coverage_weight", 1.0
+    )), 0.0)
+    args.heuristic_guidance_online_where_evidence_balance_weight = max(float(getattr(
+        args, "heuristic_guidance_online_where_evidence_balance_weight", 1.0
     )), 0.0)
     args.heuristic_guidance_online_group_evidence_target = max(int(getattr(
         args, "heuristic_guidance_online_group_evidence_target", 64
@@ -5014,6 +5025,9 @@ def parse_pugan_args(parser, file_day, file_time):
     args.plot_outlier_min_history = max(int(getattr(args, "plot_outlier_min_history", 0)), 0)
     args.plot_outlier_history_window = max(int(getattr(args, "plot_outlier_history_window", 0)), 0)
     args.plot_outlier_min_scale = max(float(getattr(args, "plot_outlier_min_scale", 0.0)), 0.0)
+    args.plot_ylim_margin_ratio = max(float(getattr(args, "plot_ylim_margin_ratio", 0.15)), 0.0)
+    args.plot_ylim_min_margin = max(float(getattr(args, "plot_ylim_min_margin", 1e-3)), 0.0)
+    args.plot_ylim_update_interval = max(int(getattr(args, "plot_ylim_update_interval", 5)), 1)
     args.save_compression_metric_csv = bool(getattr(args, "save_compression_metric_csv", True))
     args.save_operation_metric_csv = bool(getattr(args, "save_operation_metric_csv", True))
     args.save_step_metric_csv = bool(getattr(args, "save_step_metric_csv", False))
@@ -7535,6 +7549,9 @@ def parse_pugan_args(parser, file_day, file_time):
     args.repair_exploration_smooth_tail_fraction = min(max(float(getattr(
         args, "repair_exploration_smooth_tail_fraction", 0.25
     )), 0.0), 1.0)
+    args.repair_exploration_plateau_fraction = min(max(float(getattr(
+        args, "repair_exploration_plateau_fraction", 0.40
+    )), 0.0), 0.90)
     args.repair_policy_exploration_mode = str(getattr(
         args, "repair_policy_exploration_mode", "annealed"
     )).strip().lower()

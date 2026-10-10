@@ -237,6 +237,28 @@ class TrainingStabilityTest(unittest.TestCase):
         self.assertAlmostEqual(left_slope, right_slope, places=3)
         self.assertAlmostEqual(end_slope, 0.0, places=3)
 
+    def test_exploration_plateau_keeps_early_strength_and_same_endpoint(self):
+        fraction = 0.25
+        plateau = 0.40
+        self.assertEqual(
+            smooth_exploration_phase(0.0, fraction, 0.25, plateau), 0.0
+        )
+        self.assertEqual(
+            smooth_exploration_phase(
+                fraction * plateau, fraction, 0.25, plateau
+            ),
+            0.0,
+        )
+        self.assertGreater(
+            smooth_exploration_phase(
+                fraction * 0.70, fraction, 0.25, plateau
+            ),
+            0.0,
+        )
+        self.assertEqual(
+            smooth_exploration_phase(fraction, fraction, 0.25, plateau), 1.0
+        )
+
     def test_constant_policy_exploration_does_not_change_with_training_phase(self):
         values = [
             policy_exploration_multiplier(
@@ -297,6 +319,17 @@ class TrainingStabilityTest(unittest.TestCase):
             exploration_candidate_change_budget(128, 800, 0.175, 0.02), 3
         )
 
+    def test_broader_factorized_plan_perturbation_remains_bounded(self):
+        self.assertEqual(
+            exploration_candidate_change_budget(192, 800, 0.25, 1.0), 192
+        )
+        self.assertEqual(
+            exploration_candidate_change_budget(192, 400, 0.25, 1.0), 100
+        )
+        self.assertEqual(
+            exploration_candidate_change_budget(192, 800, 0.25, 0.50), 96
+        )
+
     def test_post_window_exploration_is_evidence_driven_and_tiny(self):
         multiplier, need = evidence_driven_post_window_multiplier(
             0.02,
@@ -321,6 +354,7 @@ class TrainingStabilityTest(unittest.TestCase):
             heuristic_guidance_online_factorized_ucb_scale=0.25,
             heuristic_guidance_online_where_exploration_share=0.60,
             heuristic_guidance_online_where_coverage_weight=1.0,
+            heuristic_guidance_online_where_evidence_balance_weight=1.0,
             heuristic_guidance_online_group_evidence_target=64,
             heuristic_guidance_online_group_need_weight=0.75,
             heuristic_guidance_online_group_authority_pairs=8,
@@ -357,6 +391,38 @@ class TrainingStabilityTest(unittest.TestCase):
         where_count = sum(counts.get(name, 0) for name in groups[:3])
         self.assertGreaterEqual(where_count, 60)
         self.assertTrue(all(counts.get(name, 0) > 0 for name in groups))
+
+    def test_where_group_selection_balances_usable_actual_evidence(self):
+        actuator = StructureRepairActuator.__new__(StructureRepairActuator)
+        torch.nn.Module.__init__(actuator)
+        groups = (
+            "AddWhere", "PruneWhere", "AdjustWhere", "Amount", "Gate", "Fine"
+        )
+        actuator.args = SimpleNamespace(
+            heuristic_guidance_online_factorized_exploration=True,
+            heuristic_guidance_online_factorized_ucb_scale=0.0,
+            heuristic_guidance_online_where_exploration_share=1.0,
+            heuristic_guidance_online_where_coverage_weight=0.0,
+            heuristic_guidance_online_where_evidence_balance_weight=1.0,
+            heuristic_guidance_online_group_evidence_target=64,
+            heuristic_guidance_online_group_need_weight=0.0,
+            heuristic_guidance_online_group_authority_pairs=8,
+            _current_input_file="frame.ply",
+            sparsepcgc_scale_ae=0,
+            sparsepcgc_scale_sr=0,
+            sparsepcgc_scale_m=8,
+        )
+        actuator._den6_factorized_group_counts = {name: 64 for name in groups}
+        actuator._den6_factorized_group_uncertainty = {}
+        actuator._den6_pending_matched_groups = OrderedDict()
+        actuator._den6_actual_group_stats = {
+            name: {"comparisons": 64} for name in groups
+        }
+        actuator._den6_actual_group_stats["AdjustWhere"]["comparisons"] = 16
+        actuator._den6_fixed_rd_authority_rejected = False
+        actuator.train()
+        selected = actuator._select_den6_factorized_exploration_group({})
+        self.assertEqual(selected, "AdjustWhere")
 
     def test_completed_matched_group_releases_pending_frame(self):
         actuator = StructureRepairActuator.__new__(StructureRepairActuator)
@@ -427,7 +493,10 @@ class TrainingStabilityTest(unittest.TestCase):
         for step in (0, 125, 250, 800):
             actuator.args._global_train_step = step
             values.append(actuator._annealed_value("noise_start", "noise_end"))
-        self.assertEqual([round(value, 6) for value in values], [0.10, 0.05, 0.0, 0.0])
+        self.assertEqual(
+            [round(value, 6) for value in values],
+            [0.10, 0.083333, 0.0, 0.0],
+        )
 
     def test_constant_exact_online_phase_also_freezes_legacy_random_mix(self):
         actuator = StructureRepairActuator.__new__(StructureRepairActuator)

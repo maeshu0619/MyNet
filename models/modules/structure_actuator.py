@@ -21,12 +21,24 @@ from .executable_voxel_plan import (
 )
 
 
-def smooth_exploration_phase(progress, fraction, tail_fraction=0.25):
-    """Linear curriculum with a C2-smooth landing at zero exploration."""
+def smooth_exploration_phase(
+    progress, fraction, tail_fraction=0.25, plateau_fraction=0.0
+):
+    """Exploration phase with an optional plateau and a C2-smooth landing.
+
+    ``plateau_fraction`` is measured inside the configured exploration window,
+    not over the full training run.  Holding the multiplier at one early in
+    that window gives every factorized decision group time to collect Actual
+    comparisons before the stochastic perturbation starts contracting.
+    """
     fraction = min(max(float(fraction), 0.0), 1.0)
     if fraction <= 0.0:
         return 1.0
     normalized = min(max(float(progress) / fraction, 0.0), 1.0)
+    plateau = min(max(float(plateau_fraction), 0.0), 0.90)
+    if normalized <= plateau:
+        return 0.0
+    normalized = (normalized - plateau) / max(1.0 - plateau, 1e-8)
     tail = min(max(float(tail_fraction), 0.0), 1.0)
     if tail <= 0.0 or normalized <= 1.0 - tail:
         return normalized
@@ -3234,6 +3246,7 @@ class StructureRepairActuator(nn.Module):
             progress,
             fraction,
             getattr(self.args, "repair_exploration_smooth_tail_fraction", 0.25),
+            getattr(self.args, "repair_exploration_plateau_fraction", 0.40),
         )
 
     def _behavior_exploration_phase(self):
@@ -4340,6 +4353,22 @@ class StructureRepairActuator(nn.Module):
             self.args, "heuristic_guidance_online_group_need_weight", 0.75
         )), 0.0)
         actual_stats = getattr(self, "_den6_actual_group_stats", {})
+        where_actual_comparisons = {
+            name: max(int(
+                (actual_stats.get(name, {}) or {}).get("comparisons", 0)
+            ), 0)
+            for name in where_groups
+        } if isinstance(actual_stats, dict) else {
+            name: 0 for name in where_groups
+        }
+        max_where_actual_comparisons = max(
+            where_actual_comparisons.values(), default=0
+        )
+        where_evidence_balance_weight = max(float(getattr(
+            self.args,
+            "heuristic_guidance_online_where_evidence_balance_weight",
+            1.0,
+        )), 0.0)
         scores = {}
         score_audit = {}
         for name in groups:
@@ -4369,6 +4398,17 @@ class StructureRepairActuator(nn.Module):
                 float(where_coverage_weight) * float(where_family_deficit)
                 if name in where_groups else 0.0
             )
+            # A low-authority operation can otherwise monopolise Where
+            # exploration: rejected/sub-margin comparisons keep its evidence
+            # deficit high after it has already consumed hundreds of Steps.
+            # Balance usable matched-Actual evidence across the three Where
+            # groups without imposing an operation-rate or performance target.
+            evidence_balance_bonus = (
+                float(where_evidence_balance_weight)
+                * float(max_where_actual_comparisons - comparisons)
+                / float(evidence_target)
+                if name in where_groups else 0.0
+            )
             # The old order ``uncertainty + scale * coverage`` let a
             # high-entropy Amount head monopolise the group indefinitely:
             # in the 220604 run no Where group was sampled after E5.  Coverage
@@ -4382,6 +4422,7 @@ class StructureRepairActuator(nn.Module):
                 + float(scale) * min(max(uncertainty, 0.0), 1.0)
                 + float(need_weight) * float(learning_need)
                 + float(family_bonus)
+                + float(evidence_balance_bonus)
             )
             score_audit[name] = {
                 "score": float(scores[name]),
@@ -4391,6 +4432,7 @@ class StructureRepairActuator(nn.Module):
                 "evidence_deficit": float(evidence_deficit),
                 "authority": float(actual_authority),
                 "family_bonus": float(family_bonus),
+                "evidence_balance_bonus": float(evidence_balance_bonus),
             }
         # Stable order is used only to break exact UCB ties; after selection the
         # count changes, so initially unknown groups are covered in turn.

@@ -35,6 +35,44 @@ def _args(root, window=100):
 
 
 class EpisodeAndHundredStepPlotTest(unittest.TestCase):
+    def test_loss_ylim_uses_observed_range_and_fifteen_percent_margin(self):
+        with tempfile.TemporaryDirectory() as root:
+            plot = PlotMaker(_args(root))
+            lower, upper = plot._adaptive_ylim([[-4.0, -3.5]])
+            self.assertAlmostEqual(lower, -4.075)
+            self.assertAlmostEqual(upper, -3.425)
+
+            # A constant series still receives a scale-aware minimum margin.
+            lower, upper = plot._adaptive_ylim([[2.0, 2.0]])
+            self.assertAlmostEqual(lower, 1.98)
+            self.assertAlmostEqual(upper, 2.02)
+
+    def test_episode_ylim_refits_periodically_and_expands_for_clipped_values(self):
+        class _Axis:
+            def __init__(self):
+                self.ylim = None
+
+            def set_ylim(self, lower, upper):
+                self.ylim = (lower, upper)
+
+        with tempfile.TemporaryDirectory() as root:
+            plot = PlotMaker(_args(root))
+            axis = _Axis()
+            plot._set_adaptive_ylim(axis, [[0.0, 10.0]], ("epi", 0), 1)
+            first_limits = axis.ylim
+            plot._set_adaptive_ylim(axis, [[4.0, 6.0]], ("epi", 0), 2)
+            self.assertEqual(axis.ylim, first_limits)
+
+            # Episode 5 enters the next update bucket and permits a tighter fit.
+            plot._set_adaptive_ylim(axis, [[4.0, 6.0]], ("epi", 0), 5)
+            self.assertAlmostEqual(axis.ylim[0], 3.7)
+            self.assertAlmostEqual(axis.ylim[1], 6.3)
+
+            # Values outside a cached range are made visible immediately.
+            plot._set_adaptive_ylim(axis, [[2.0, 7.0]], ("epi", 0), 6)
+            self.assertLessEqual(axis.ylim[0], 1.25)
+            self.assertGreaterEqual(axis.ylim[1], 7.75)
+
     def test_step_values_are_kept_only_as_episode_and_block_average(self):
         with tempfile.TemporaryDirectory() as root:
             plot = PlotMaker(_args(root))
