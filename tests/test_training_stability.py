@@ -31,6 +31,7 @@ from models.utils.training.train_runtime import (
 from models.modules.structure_actuator import (
     StructureRepairActuator,
     adaptive_exploration_candidate_changes,
+    evidence_driven_post_window_multiplier,
     exploration_candidate_change_budget,
     policy_exploration_multiplier,
     smooth_exploration_phase,
@@ -284,6 +285,33 @@ class TrainingStabilityTest(unittest.TestCase):
         self.assertEqual(
             exploration_candidate_change_budget(96, 400, 0.125, 0.0), 0
         )
+
+    def test_slightly_wider_exploration_budget_remains_bounded(self):
+        self.assertEqual(
+            exploration_candidate_change_budget(128, 800, 0.175, 1.0), 128
+        )
+        self.assertEqual(
+            exploration_candidate_change_budget(128, 400, 0.175, 1.0), 70
+        )
+        self.assertEqual(
+            exploration_candidate_change_budget(128, 800, 0.175, 0.02), 3
+        )
+
+    def test_post_window_exploration_is_evidence_driven_and_tiny(self):
+        multiplier, need = evidence_driven_post_window_multiplier(
+            0.02,
+            64,
+            [{"comparisons": 0, "authority": 0.0, "uncertainty": 1.0}],
+        )
+        self.assertAlmostEqual(multiplier, 0.02)
+        self.assertAlmostEqual(need, 1.0)
+        multiplier, need = evidence_driven_post_window_multiplier(
+            0.02,
+            64,
+            [{"comparisons": 64, "authority": 1.0, "uncertainty": 0.1}],
+        )
+        self.assertEqual(multiplier, 0.0)
+        self.assertEqual(need, 0.0)
 
     def test_factorized_exploration_softly_prioritizes_where_coverage(self):
         actuator = StructureRepairActuator.__new__(StructureRepairActuator)

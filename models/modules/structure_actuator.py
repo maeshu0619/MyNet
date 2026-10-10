@@ -97,6 +97,26 @@ def exploration_candidate_change_budget(
     )
 
 
+def evidence_driven_post_window_multiplier(floor, evidence_target, group_states):
+    """Keep only a tiny post-window probe while an Actual group is unlearned."""
+    floor = min(max(float(floor), 0.0), 0.10)
+    target = max(int(evidence_target), 1)
+    maximum_need = 0.0
+    for state in group_states:
+        comparisons = max(int(state.get("comparisons", 0)), 0)
+        evidence_deficit = 1.0 - min(float(comparisons) / float(target), 1.0)
+        authority_deficit = 1.0 - min(max(float(
+            state.get("authority", 0.0)
+        ), 0.0), 1.0)
+        uncertainty = min(max(float(state.get("uncertainty", 1.0)), 0.0), 1.0)
+        maximum_need = max(
+            maximum_need,
+            evidence_deficit,
+            authority_deficit * uncertainty,
+        )
+    return float(floor * maximum_need), float(maximum_need)
+
+
 def candidate_listwise_local_credit(prediction, utility_target):
     """Train one operation pool from relative, non-heuristic RD utility."""
     prediction = prediction.float().reshape(-1)
@@ -4544,6 +4564,57 @@ class StructureRepairActuator(nn.Module):
             ),
             annealed_phase=annealed_phase,
         )
+        scheduled_exploration_multiplier = float(exploration_multiplier)
+        post_window_exploration = False
+        post_window_learning_need = 0.0
+        # The first 25% remains the broad exploration envelope.  Afterwards,
+        # retain only a tiny evidence-driven probe for decision groups that are
+        # still unsupported by matched Actual comparisons.  Accuracy enters via
+        # group authority, and the remembered Critic uncertainty prevents a
+        # poorly calibrated group from being declared complete merely because
+        # it accumulated many comparisons.  This is not an Episode anneal: once
+        # every group is supported and calibrated, the residual floor is zero.
+        if exploration_multiplier <= 0.0 and exploration_active:
+            actual_stats = getattr(self, "_den6_actual_group_stats", {})
+            remembered_uncertainty = getattr(
+                self, "_den6_factorized_group_uncertainty", {}
+            )
+            evidence_target = max(int(getattr(
+                self.args, "heuristic_guidance_online_group_evidence_target", 64
+            )), 1)
+            post_window_group_states = []
+            for group_name in (
+                "AddWhere", "PruneWhere", "AdjustWhere",
+                "Amount", "Gate", "Fine",
+            ):
+                row = actual_stats.get(group_name, {}) \
+                    if isinstance(actual_stats, dict) else {}
+                comparisons = max(int(row.get("comparisons", 0)), 0)
+                uncertainty = min(max(float(
+                    remembered_uncertainty.get(group_name, 1.0)
+                    if isinstance(remembered_uncertainty, dict) else 1.0
+                ), 0.0), 1.0)
+                post_window_group_states.append({
+                    "comparisons": int(comparisons),
+                    "authority": float(
+                        self._den6_group_actual_authority(group_name)
+                    ),
+                    "uncertainty": float(uncertainty),
+                })
+            post_window_floor = min(max(float(getattr(
+                self.args,
+                "heuristic_guidance_online_post_window_exploration_floor",
+                0.02,
+            )), 0.0), 0.10)
+            (
+                exploration_multiplier,
+                post_window_learning_need,
+            ) = evidence_driven_post_window_multiplier(
+                post_window_floor,
+                evidence_target,
+                post_window_group_states,
+            )
+            post_window_exploration = exploration_multiplier > 0.0
         # Once the scheduled 25% exploration window closes, do not merely set
         # Gumbel to zero: disable the stochastic branch itself so tail lifting
         # and random Amount/Gate/Fine choices cannot survive through ties.
@@ -5860,12 +5931,12 @@ class StructureRepairActuator(nn.Module):
             configured_max_candidate_changes = max(int(getattr(
                 self.args,
                 "heuristic_guidance_online_exploration_max_candidate_changes",
-                96,
+                128,
             )), 1)
             configured_candidate_change_fraction = min(max(float(getattr(
                 self.args,
                 "heuristic_guidance_online_exploration_candidate_fraction",
-                0.125,
+                0.175,
             )), 0.0), 1.0)
             candidate_change_factor = (
                 float(exploration_multiplier)
@@ -7438,6 +7509,11 @@ class StructureRepairActuator(nn.Module):
             "amount_exploration_active": bool(amount_exploration_active),
             "exploration_mode": str(exploration_mode),
             "exploration_multiplier": float(exploration_multiplier),
+            "scheduled_exploration_multiplier": float(
+                scheduled_exploration_multiplier
+            ),
+            "post_window_exploration": bool(post_window_exploration),
+            "post_window_learning_need": float(post_window_learning_need),
             "behavior_exploration_phase": float(1.0 - exploration_multiplier),
             "effective_where_gumbel_scale": float(gumbel_scale),
             "effective_amount_log_sigma": float(fine_sigma_base),

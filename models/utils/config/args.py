@@ -2574,14 +2574,14 @@ def parse_pugan_args(parser, file_day, file_time):
         help='Actual evidence不足と低authorityをfactorized group UCBへ加える重み',
     )
     parser.add_argument(
-        '--heuristic_guidance_online_exploration_max_candidate_changes', default=96, type=int,
+        '--heuristic_guidance_online_exploration_max_candidate_changes', default=128, type=int,
         help=(
             'Actual evidenceがない1回のWhere探索でincumbentから入れ替えるcandidate上限。'
             '実効数は選択数比と前半25%の探索係数に応じて縮小する'
         ),
     )
     parser.add_argument(
-        '--heuristic_guidance_online_exploration_candidate_fraction', default=0.125, type=float,
+        '--heuristic_guidance_online_exploration_candidate_fraction', default=0.175, type=float,
         help=(
             'Where探索開始時にincumbentから入れ替えるcandidateの選択数比。'
             '上限と探索係数を併用し、探索窓の終端では0になる'
@@ -2592,6 +2592,13 @@ def parse_pugan_args(parser, file_day, file_time):
         help=(
             'Where探索supportに安全pool全域から回転coverage候補を追加する'
             'requested count比。Actual学習品質に応じて探索係数と共に縮小する'
+        ),
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_post_window_exploration_floor', default=0.02, type=float,
+        help=(
+            '前半25%%終了後、Actual evidence/accuracy/uncertaintyが不足するgroupだけに残す'
+            '微小探索上限。0.02では通常1--3 candidateだけを差し替え、十分学習後は0になる'
         ),
     )
     parser.add_argument(
@@ -4549,7 +4556,7 @@ def parse_pugan_args(parser, file_day, file_time):
         args, "heuristic_guidance_online_exploration_tail_fraction", 0.50
     )), 0.0), 1.0)
     args.heuristic_guidance_online_exploration_candidate_fraction = min(max(float(getattr(
-        args, "heuristic_guidance_online_exploration_candidate_fraction", 0.125
+        args, "heuristic_guidance_online_exploration_candidate_fraction", 0.175
     )), 0.0), 1.0)
     args.heuristic_guidance_online_actor_proxy_weight = max(float(getattr(
         args, "heuristic_guidance_online_actor_proxy_weight", 0.0
@@ -4567,8 +4574,11 @@ def parse_pugan_args(parser, file_day, file_time):
         args, "heuristic_guidance_exploration_min_fraction", 0.25
     )), 0.0), 1.0)
     args.heuristic_guidance_online_exploration_max_candidate_changes = max(int(getattr(
-        args, "heuristic_guidance_online_exploration_max_candidate_changes", 96
+        args, "heuristic_guidance_online_exploration_max_candidate_changes", 128
     )), 1)
+    args.heuristic_guidance_online_post_window_exploration_floor = min(max(float(getattr(
+        args, "heuristic_guidance_online_post_window_exploration_floor", 0.02
+    )), 0.0), 0.10)
     args.heuristic_guidance_online_where_exploration_share = min(max(float(getattr(
         args, "heuristic_guidance_online_where_exploration_share", 0.60
     )), 0.0), 1.0)
