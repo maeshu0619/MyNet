@@ -1539,6 +1539,50 @@ class Network(nn.Module):
                         row.get("critic_correct", 0.0)
                     ) + float(actual_group_critic_correct)
 
+        # A strict counterfactual has now consumed the pending anchor.  The
+        # previous implementation left this entry resident, so every revisit
+        # of a frame was permanently locked to its first group.  That produced
+        # the observed 22% Where rate and repeatedly sampled Amount/Gate/Fine
+        # even after their comparison was complete.  Releasing both records
+        # lets the next visit choose the group from current Actual evidence,
+        # uncertainty and coverage.  This is independent of Episode number and
+        # also applies when the RD delta is below the training margin: the
+        # comparison was still performed and must not monopolise the frame.
+        if mode == "ana_den6_online" and strict_group and matched_reused:
+            actuator_for_completion = getattr(self, "actuator", None)
+            if actuator_for_completion is not None:
+                completed_frame_key = str(
+                    plan_debug.get("matched_actual_frame_codec_key", "")
+                    if isinstance(plan_debug, dict) else ""
+                )
+                completed_anchor_key = str(
+                    plan_debug.get("matched_actual_anchor_key", "")
+                    if isinstance(plan_debug, dict) else ""
+                )
+                complete_pending = getattr(
+                    actuator_for_completion,
+                    "_complete_den6_pending_matched_group",
+                    None,
+                )
+                if callable(complete_pending):
+                    complete_pending(completed_frame_key, completed_anchor_key)
+                else:
+                    # Lightweight test/legacy actuator compatibility.
+                    pending_groups = getattr(
+                        actuator_for_completion,
+                        "_den6_pending_matched_groups",
+                        None,
+                    )
+                    if isinstance(pending_groups, OrderedDict) and completed_frame_key:
+                        pending_groups.pop(completed_frame_key, None)
+                    anchor_memory = getattr(
+                        actuator_for_completion,
+                        "_den6_matched_anchor_plan_memory",
+                        None,
+                    )
+                    if isinstance(anchor_memory, OrderedDict) and completed_anchor_key:
+                        anchor_memory.pop(completed_anchor_key, None)
+
         def _compact_candidate_id(value):
             """Stable 64-bit token for memory-resident set comparison."""
             if isinstance(value, int):

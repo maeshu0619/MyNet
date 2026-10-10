@@ -4928,6 +4928,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                         f"factorized_group={str(audit_plan.get('factorized_exploration_group', ''))}, "
                         f"matched_anchor_reused={bool(audit_plan.get('matched_actual_anchor_reused', False))}, "
                         f"factorized_counts={dict(audit_plan.get('factorized_exploration_counts') or {})}, "
+                        f"factorized_score={dict(audit_plan.get('factorized_exploration_score_audit') or {})}, "
                         f"network_only_performance={bool(audit_plan.get('network_only_performance', False))}, "
                         f"selected_action_index={int(audit_plan.get('selected_action_index', -1))}, "
                         f"selected_action_mask={list(audit_plan.get('selected_action_mask', []))}, "
@@ -5045,6 +5046,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                         f"heuristic_selected={dict(audit_plan.get('exploration_heuristic_top1_selected') or {})}, "
                         f"selected_set_change={dict(audit_plan.get('exploration_selection_change_rate') or {})}), "
                         f"exploration_candidate_changes={dict(audit_plan.get('exploration_candidate_changes') or {})}, "
+                        f"exploration_rank_band={dict(audit_plan.get('exploration_heuristic_rank_bands') or {})}, "
                         f"where_gumbel_audit={dict(audit_plan.get('where_gumbel_audit') or {})}, "
                         f"exploration=(active={bool(audit_plan.get('exploration_active', False))}, "
                         f"alternatives={bool(audit_plan.get('has_where_alternatives', False))}, "
@@ -5862,52 +5864,19 @@ def train(model, args, loss, writer, plot, notifier=None):
                 if hasattr(actuator_for_authority, "_den6_actual_residual_authority")
                 else 0.0
             )
-            tolerance = max(float(getattr(
-                args,
-                "heuristic_guidance_online_fixed_guard_tolerance",
-                0.0,
-            )), 0.0)
             rd_gap = None
             if network_fixed_rd is not None and heuristic_fixed_rd is not None:
                 rd_gap = float(network_fixed_rd) - float(heuristic_fixed_rd)
-                if rd_gap <= tolerance:
-                    actuator_for_authority._den6_fixed_rd_safe_authority = max(
-                        float(getattr(
-                            actuator_for_authority,
-                            "_den6_fixed_rd_safe_authority",
-                            0.0,
-                        )),
-                        current_authority,
-                    )
-                    actuator_for_authority._den6_fixed_rd_authority_rejected = False
-                else:
-                    actuator_for_authority._den6_fixed_rd_authority_rejected = True
-                    actuator_for_authority._den6_fixed_rd_reject_evidence = float(
-                        getattr(
-                            actuator_for_authority,
-                            "_den6_actual_action_evidence",
-                            0.0,
-                        )
-                    )
             checkpoint_metrics["network_minus_heuristic_fixed_rd"] = rd_gap
             checkpoint_metrics["actual_residual_authority"] = current_authority
-            checkpoint_metrics["actual_residual_authority_safe"] = float(getattr(
-                actuator_for_authority,
-                "_den6_fixed_rd_safe_authority",
-                0.0,
-            ))
-            checkpoint_metrics["actual_residual_authority_rejected"] = int(bool(getattr(
-                actuator_for_authority,
-                "_den6_fixed_rd_authority_rejected",
-                False,
-            )))
+            checkpoint_metrics["actual_residual_authority_safe"] = current_authority
+            checkpoint_metrics["actual_residual_authority_rejected"] = 0
             writer.write(
                 "FixedPolicyComparison: "
                 f"episode={episode + 1}, network_rd={network_fixed_rd}, "
                 f"heuristic_rd={heuristic_fixed_rd}, gap={rd_gap}, "
                 f"authority={current_authority:.6f}, "
-                f"safe_authority={float(getattr(actuator_for_authority, '_den6_fixed_rd_safe_authority', 0.0)):.6f}, "
-                f"rejected={bool(getattr(actuator_for_authority, '_den6_fixed_rd_authority_rejected', False))}"
+                f"training_feedback=False"
             )
         # Plateau schedulerはmoving train窓や平滑plotではなく、同一frame・
         # explorationなしのraw deterministic fixed RDだけをEpisodeごとに見る。

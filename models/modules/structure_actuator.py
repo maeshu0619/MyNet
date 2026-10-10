@@ -4075,13 +4075,11 @@ class StructureRepairActuator(nn.Module):
         # grant, but an initially uncalibrated Critic cannot make the Actor's
         # otherwise valid matched evidence identically useless forever.
         raw_authority = actor_quality * (0.25 + 0.75 * critic_quality)
-        raw_authority = min(max(float(raw_authority), 0.0), 1.0)
-        if bool(getattr(self, "_den6_fixed_rd_authority_rejected", False)):
-            safe = min(max(float(getattr(
-                self, "_den6_fixed_rd_safe_authority", 0.0
-            )), 0.0), 1.0)
-            return float(min(raw_authority, safe))
-        return raw_authority
+        # Independent fixed validation is evaluation/model selection only.
+        # Never feed its result back into training authority; candidate-level
+        # LCB below supplies the deployment-time safety decision from the
+        # Actual-trained Critic itself.
+        return min(max(float(raw_authority), 0.0), 1.0)
 
     def _learning_adaptive_exploration_factor(self, confidence_audit, operation=None):
         """Contract exploration only after action-conditional Actual evidence."""
@@ -4148,21 +4146,6 @@ class StructureRepairActuator(nn.Module):
             self, "_den6_actual_action_evidence", 0.0
         )), 0.0), 1.0)
         raw_authority = float(min(matched_quality, critic_quality) * evidence)
-        if bool(getattr(self, "_den6_fixed_rd_authority_rejected", False)):
-            rejected_evidence = min(max(float(getattr(
-                self, "_den6_fixed_rd_reject_evidence", 0.0
-            )), 0.0), 1.0)
-            retry_delta = min(max(float(getattr(
-                self.args,
-                "heuristic_guidance_online_fixed_guard_retry_evidence",
-                0.10,
-            )), 0.0), 1.0)
-            # A rejected authority may be probed again only after materially
-            # more matched Actual evidence has accumulated.
-            if evidence < min(rejected_evidence + retry_delta, 1.0):
-                return float(min(raw_authority, max(float(getattr(
-                    self, "_den6_fixed_rd_safe_authority", 0.0
-                )), 0.0)))
         return raw_authority
 
     @staticmethod
@@ -4318,7 +4301,27 @@ class StructureRepairActuator(nn.Module):
             remembered = {}
             self._den6_factorized_group_uncertainty = remembered
         total = sum(int(counts.get(name, 0)) for name in groups)
+        where_groups = groups[:3]
+        where_count = sum(int(counts.get(name, 0)) for name in where_groups)
+        where_share = (
+            float(where_count) / float(max(total, 1)) if total > 0 else 0.0
+        )
+        desired_where_share = min(max(float(getattr(
+            self.args, "heuristic_guidance_online_where_exploration_share", 0.60
+        )), 0.0), 1.0)
+        where_coverage_weight = max(float(getattr(
+            self.args, "heuristic_guidance_online_where_coverage_weight", 1.0
+        )), 0.0)
+        where_family_deficit = max(desired_where_share - where_share, 0.0)
+        evidence_target = max(int(getattr(
+            self.args, "heuristic_guidance_online_group_evidence_target", 64
+        )), 1)
+        need_weight = max(float(getattr(
+            self.args, "heuristic_guidance_online_group_need_weight", 0.75
+        )), 0.0)
+        actual_stats = getattr(self, "_den6_actual_group_stats", {})
         scores = {}
+        score_audit = {}
         for name in groups:
             if name.endswith("Where") and name in remembered:
                 uncertainty = float(remembered[name])
@@ -4332,6 +4335,20 @@ class StructureRepairActuator(nn.Module):
             coverage = math.sqrt(
                 math.log(float(total) + 2.0) / float(int(counts.get(name, 0)) + 1)
             )
+            actual_row = actual_stats.get(name, {}) \
+                if isinstance(actual_stats, dict) else {}
+            comparisons = max(int(actual_row.get("comparisons", 0)), 0)
+            evidence_deficit = 1.0 - min(
+                float(comparisons) / float(evidence_target), 1.0
+            )
+            actual_authority = self._den6_group_actual_authority(name)
+            learning_need = 0.5 * (
+                evidence_deficit + (1.0 - actual_authority)
+            )
+            family_bonus = (
+                float(where_coverage_weight) * float(where_family_deficit)
+                if name in where_groups else 0.0
+            )
             # The old order ``uncertainty + scale * coverage`` let a
             # high-entropy Amount head monopolise the group indefinitely:
             # in the 220604 run no Where group was sampled after E5.  Coverage
@@ -4340,14 +4357,43 @@ class StructureRepairActuator(nn.Module):
             # coverage unscaled makes every non-zero decision group revisit
             # possible without an Episode schedule; ``scale`` now controls
             # how strongly measured uncertainty biases that fair coverage.
-            scores[name] = coverage + float(scale) * min(
-                max(uncertainty, 0.0), 1.0
+            scores[name] = (
+                coverage
+                + float(scale) * min(max(uncertainty, 0.0), 1.0)
+                + float(need_weight) * float(learning_need)
+                + float(family_bonus)
             )
+            score_audit[name] = {
+                "score": float(scores[name]),
+                "coverage": float(coverage),
+                "uncertainty": float(uncertainty),
+                "comparisons": int(comparisons),
+                "evidence_deficit": float(evidence_deficit),
+                "authority": float(actual_authority),
+                "family_bonus": float(family_bonus),
+            }
         # Stable order is used only to break exact UCB ties; after selection the
         # count changes, so initially unknown groups are covered in turn.
         selected = max(groups, key=lambda name: (scores[name], -groups.index(name)))
         counts[selected] = int(counts.get(selected, 0)) + 1
+        self._den6_last_factorized_group_scores = {
+            "selected": str(selected),
+            "where_share": float(where_share),
+            "where_target": float(desired_where_share),
+            "groups": score_audit,
+        }
         return selected
+
+    def _complete_den6_pending_matched_group(self, frame_codec_key, anchor_key):
+        """Release one consumed same-frame counterfactual anchor."""
+        removed = False
+        pending = getattr(self, "_den6_pending_matched_groups", None)
+        if isinstance(pending, OrderedDict) and str(frame_codec_key):
+            removed = pending.pop(str(frame_codec_key), None) is not None or removed
+        anchors = getattr(self, "_den6_matched_anchor_plan_memory", None)
+        if isinstance(anchors, OrderedDict) and str(anchor_key):
+            removed = anchors.pop(str(anchor_key), None) is not None or removed
+        return bool(removed)
 
     def _build_exact_den6_residual_plan(
         self,
@@ -5211,6 +5257,10 @@ class StructureRepairActuator(nn.Module):
         candidate_actor_features = {}
         candidate_critic_features = {}
         exploration_added_indices = {name: [] for name in operations}
+        exploration_heuristic_rank_bands = {
+            name: {"count": 0, "min": 0, "max": 0, "mean": 0.0}
+            for name in operations
+        }
         deterministic_indices_by_operation = {name: [] for name in operations}
         candidate_pairwise_weight = max(float(getattr(
             self.args,
@@ -5306,7 +5356,10 @@ class StructureRepairActuator(nn.Module):
                     # Heuristic policy only when its Actual Critic lower bound
                     # beats the Heuristic cutoff candidate.  Training still
                     # explores the safe reservoir to collect contrary data.
-                    if not self.training and int(actor_residual.numel()) > 0:
+                    if (
+                        (not self.training or not exploration_active)
+                        and int(actor_residual.numel()) > 0
+                    ):
                         valid_rank = torch.isfinite(heuristic_term)
                         valid_indices = torch.nonzero(
                             valid_rank, as_tuple=False
@@ -5816,6 +5869,7 @@ class StructureRepairActuator(nn.Module):
             )), 0.0), 1.0)
             candidate_change_factor = (
                 float(exploration_multiplier)
+                * float(operation_exploration_factors[operation])
                 if exploration_mode == "annealed"
                 else float(operation_exploration_factors[operation])
             )
@@ -6117,6 +6171,36 @@ class StructureRepairActuator(nn.Module):
                     ]
                 else:
                     behavior_prefix = deterministic_prefix
+                explored_for_rank = exploration_added_indices[operation]
+                if explored_for_rank:
+                    heuristic_order_for_rank = torch.argsort(
+                        heuristic_for_top1, descending=True
+                    )
+                    inverse_heuristic_rank = torch.empty_like(
+                        heuristic_order_for_rank
+                    )
+                    inverse_heuristic_rank[heuristic_order_for_rank] = torch.arange(
+                        heuristic_order_for_rank.numel(),
+                        device=heuristic_order_for_rank.device,
+                        dtype=heuristic_order_for_rank.dtype,
+                    )
+                    explored_tensor = torch.as_tensor(
+                        explored_for_rank,
+                        device=inverse_heuristic_rank.device,
+                        dtype=torch.long,
+                    )
+                    # Report local, one-based Heuristic ranks.  The manifest's
+                    # pool_rank is global/interleaved across operations and is
+                    # not an intuitive exploration band.
+                    local_ranks = (
+                        inverse_heuristic_rank.index_select(0, explored_tensor) + 1
+                    ).detach().cpu().tolist()
+                    exploration_heuristic_rank_bands[operation] = {
+                        "count": int(len(local_ranks)),
+                        "min": int(min(local_ranks)),
+                        "max": int(max(local_ranks)),
+                        "mean": float(sum(local_ranks) / len(local_ranks)),
+                    }
                 selected_mask = torch.zeros_like(scaled_logits, dtype=torch.bool)
                 selected_mask[behavior_prefix] = True
                 deterministic_tail = deterministic_order[
@@ -7103,6 +7187,9 @@ class StructureRepairActuator(nn.Module):
             "factorized_exploration_counts": dict(
                 getattr(self, "_den6_factorized_group_counts", {})
             ),
+            "factorized_exploration_score_audit": dict(
+                getattr(self, "_den6_last_factorized_group_scores", {})
+            ),
             "heuristic_candidate_prior_weight": float(heuristic_prior_weight),
             "where_residual_weight": float(residual_weight),
             "where_residual_weight_start": float(residual_weight_start),
@@ -7459,6 +7546,7 @@ class StructureRepairActuator(nn.Module):
             "exploration_candidate_changes": {
                 name: len(exploration_added_indices[name]) for name in operations
             },
+            "exploration_heuristic_rank_bands": exploration_heuristic_rank_bands,
             "_actor_critic_plan_feature": plan_feature,
             "_actor_critic_plan_value": plan_critic_mean,
             "_actor_critic_plan_log_variance": plan_critic_log_variance,

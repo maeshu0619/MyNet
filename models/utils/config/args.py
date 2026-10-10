@@ -2555,6 +2555,25 @@ def parse_pugan_args(parser, file_day, file_time):
         help='coverage UCBに加えるdecision group不確実性の係数。Episode番号には依存しない',
     )
     parser.add_argument(
+        '--heuristic_guidance_online_where_exploration_share', default=0.60, type=float,
+        help=(
+            'Where三群の累積coverageが不足したときだけ加えるsoft UCB基準。'
+            '固定抽選比率ではなくActual evidence/uncertainty scoreと併用する'
+        ),
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_where_coverage_weight', default=1.0, type=float,
+        help='Where familyのsoft coverage不足をfactorized group UCBへ加える重み',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_group_evidence_target', default=64, type=int,
+        help='group探索優先度のevidence不足を正規化する比較数。authority閾値ではない',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_group_need_weight', default=0.75, type=float,
+        help='Actual evidence不足と低authorityをfactorized group UCBへ加える重み',
+    )
+    parser.add_argument(
         '--heuristic_guidance_online_exploration_max_candidate_changes', default=96, type=int,
         help=(
             'Actual evidenceがない1回のWhere探索でincumbentから入れ替えるcandidate上限。'
@@ -4550,6 +4569,18 @@ def parse_pugan_args(parser, file_day, file_time):
     args.heuristic_guidance_online_exploration_max_candidate_changes = max(int(getattr(
         args, "heuristic_guidance_online_exploration_max_candidate_changes", 96
     )), 1)
+    args.heuristic_guidance_online_where_exploration_share = min(max(float(getattr(
+        args, "heuristic_guidance_online_where_exploration_share", 0.60
+    )), 0.0), 1.0)
+    args.heuristic_guidance_online_where_coverage_weight = max(float(getattr(
+        args, "heuristic_guidance_online_where_coverage_weight", 1.0
+    )), 0.0)
+    args.heuristic_guidance_online_group_evidence_target = max(int(getattr(
+        args, "heuristic_guidance_online_group_evidence_target", 64
+    )), 1)
+    args.heuristic_guidance_online_group_need_weight = max(float(getattr(
+        args, "heuristic_guidance_online_group_need_weight", 0.75
+    )), 0.0)
     args.heuristic_guidance_online_noop_prior_offset = min(max(float(getattr(
         args, "heuristic_guidance_online_noop_prior_offset", -1.5
     )), -8.0), 0.0)

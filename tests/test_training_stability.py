@@ -1,4 +1,5 @@
 import os
+from collections import OrderedDict
 from types import SimpleNamespace
 import unittest
 from tempfile import TemporaryDirectory
@@ -283,6 +284,66 @@ class TrainingStabilityTest(unittest.TestCase):
         self.assertEqual(
             exploration_candidate_change_budget(96, 400, 0.125, 0.0), 0
         )
+
+    def test_factorized_exploration_softly_prioritizes_where_coverage(self):
+        actuator = StructureRepairActuator.__new__(StructureRepairActuator)
+        torch.nn.Module.__init__(actuator)
+        actuator.args = SimpleNamespace(
+            heuristic_guidance_online_factorized_exploration=True,
+            heuristic_guidance_online_factorized_ucb_scale=0.25,
+            heuristic_guidance_online_where_exploration_share=0.60,
+            heuristic_guidance_online_where_coverage_weight=1.0,
+            heuristic_guidance_online_group_evidence_target=64,
+            heuristic_guidance_online_group_need_weight=0.75,
+            heuristic_guidance_online_group_authority_pairs=8,
+            _current_input_file="frame.ply",
+            sparsepcgc_scale_ae=0,
+            sparsepcgc_scale_sr=0,
+            sparsepcgc_scale_m=8,
+        )
+        groups = (
+            "AddWhere", "PruneWhere", "AdjustWhere", "Amount", "Gate", "Fine"
+        )
+        actuator._den6_factorized_group_counts = {}
+        actuator._den6_factorized_group_uncertainty = {}
+        actuator._den6_pending_matched_groups = OrderedDict()
+        actuator._den6_actual_group_stats = {
+            name: {
+                "comparisons": 0,
+                "actor_correct": 0.0,
+                "critic_correct": 0.0,
+                "proposal_comparisons": 0,
+                "proposal_correct": 0.0,
+            }
+            for name in groups
+        }
+        actuator._den6_fixed_rd_authority_rejected = False
+        actuator.train()
+        confidence = {
+            name: {"uncertainty": 1.0}
+            for name in ("Add", "Prune", "Adjust")
+        }
+        for _ in range(120):
+            actuator._select_den6_factorized_exploration_group(confidence)
+        counts = actuator._den6_factorized_group_counts
+        where_count = sum(counts.get(name, 0) for name in groups[:3])
+        self.assertGreaterEqual(where_count, 60)
+        self.assertTrue(all(counts.get(name, 0) > 0 for name in groups))
+
+    def test_completed_matched_group_releases_pending_frame(self):
+        actuator = StructureRepairActuator.__new__(StructureRepairActuator)
+        torch.nn.Module.__init__(actuator)
+        actuator._den6_pending_matched_groups = OrderedDict((
+            ("frame", {"group": "AddWhere"}),
+        ))
+        actuator._den6_matched_anchor_plan_memory = OrderedDict((
+            ("anchor", {"selected_indices": {}}),
+        ))
+        self.assertTrue(
+            actuator._complete_den6_pending_matched_group("frame", "anchor")
+        )
+        self.assertFalse(actuator._den6_pending_matched_groups)
+        self.assertFalse(actuator._den6_matched_anchor_plan_memory)
 
     def test_annealed_policy_exploration_remains_available_for_ablation(self):
         self.assertAlmostEqual(
