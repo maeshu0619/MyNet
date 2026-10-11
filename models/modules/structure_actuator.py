@@ -546,14 +546,14 @@ class StructureRepairActuator(nn.Module):
 
         def _run(point_features):
             if checkpoint_enabled:
-                # The dummy keeps re-entrant checkpointing valid even when the
-                # upstream full-cloud feature extractor is intentionally frozen.
-                dummy = point_features.new_zeros((), requires_grad=True)
+                # Non-reentrant checkpointing supports both the normal
+                # backward and the read-only per-loss ``autograd.grad`` audit.
+                # It also works when the frozen upstream features do not
+                # require gradients, so no artificial dummy input is needed.
                 return checkpoint(
-                    lambda value, _dummy: head(value),
+                    lambda value: head(value),
                     point_features,
-                    dummy,
-                    use_reentrant=True,
+                    use_reentrant=False,
                 )
             return head(point_features)
 
@@ -7701,6 +7701,9 @@ class StructureRepairActuator(nn.Module):
             "_actor_critic_plan_log_variance": plan_critic_log_variance,
             "_actor_critic_selected_changed_ratio": action_ratio_stack.new_tensor(
                 float(selected_changed_ratio)
+            ),
+            "_actor_critic_selected_operation_ratio": action_ratio_stack.new_tensor(
+                float(selected_total_ratio)
             ),
         }
         plan_hash_payload = {
@@ -15607,6 +15610,9 @@ class StructureRepairActuator(nn.Module):
             ),
             "den6_online_actor_critic_changed_ratio": exact_residual_plan_debug.get(
                 "_actor_critic_selected_changed_ratio", pts_xyz.new_zeros(())
+            ),
+            "den6_online_actor_critic_operation_ratio": exact_residual_plan_debug.get(
+                "_actor_critic_selected_operation_ratio", pts_xyz.new_zeros(())
             ),
             "network_only_direction_log_prob": exact_residual_plan_debug.get(
                 "direction_log_prob", single_direction_log_prob

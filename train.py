@@ -2591,7 +2591,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                             # L_downstream is the differentiable compression
                             # path (Surrogate/STE).  It is kept separate from
                             # the score-function Actual source above.
-                            source_losses["surrogate"] = L_downstream
+                            source_losses["surrogate_compression"] = L_downstream
                             source_grad_probe = _probe_den6_policy_source_gradients(
                                 model, source_losses
                             )
@@ -5124,7 +5124,11 @@ def train(model, args, loss, writer, plot, notifier=None):
                         f"baseline={float(audit_compression.get('den6_online_policy_objective_baseline', 0.0) or 0.0):.6g}, "
                         f"advantage={float(audit_compression.get('den6_online_policy_advantage', 0.0) or 0.0):.6g}, "
                         f"log_prob={float(audit_compression.get('den6_online_policy_log_prob', 0.0) or 0.0):.6g}, "
-                        f"loss={float(audit_compression.get('den6_online_policy_policy_loss', 0.0) or 0.0):.6g})"
+                        f"loss={float(audit_compression.get('den6_online_policy_policy_loss', 0.0) or 0.0):.6g}, "
+                        f"eff_guard={bool(audit_compression.get('den6_online_policy_efficiency_policy_guard_passed', False))}, "
+                        f"eff_op_ratio={float(audit_compression.get('den6_online_policy_efficiency_policy_operation_ratio', 0.0) or 0.0):.6g}, "
+                        f"eff_adv={float(audit_compression.get('den6_online_policy_efficiency_policy_advantage', 0.0) or 0.0):.6g}, "
+                        f"eff_loss={float(audit_compression.get('den6_online_policy_efficiency_policy_weighted', 0.0) or 0.0):.6g})"
                         f", shadow=(raw={float(audit_compression.get('single_plan_shadow_loss_raw', 0.0) or 0.0):.6g}, "
                         f"scaled={float(audit_compression.get('single_plan_shadow_loss', 0.0) or 0.0):.6g}, "
                         f"scale={float(audit_compression.get('single_plan_shadow_loss_scale', 0.0) or 0.0):.6g}, "

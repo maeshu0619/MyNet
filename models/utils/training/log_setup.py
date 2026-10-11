@@ -132,7 +132,20 @@ def log_loss_weight_setup(writer, args):
             "soft auxiliary proxies are diagnostics unless explicitly enabled."
         )
 
-    if actual_total_bit_backend:
+    loss_mode = str(getattr(args, "loss_mode", "legacy_total")).strip().lower()
+    if loss_mode == "compression_primary":
+        writer.write(
+            "Active Loss Weights: "
+            "mode=compression_primary, "
+            f"compression(w_com)={float(args.w_com):.6g}, "
+            f"geometry(cp_lambda_geom)={float(args.cp_lambda_geom):.6g}, "
+            f"geometry_tau(cp_tau_geom)={float(getattr(args, 'cp_tau_geom', 0.0)):.6g}"
+        )
+        writer.write(
+            "Legacy Loss Weight (inactive in compression_primary): "
+            f"geometry(w_geom)={float(args.w_geom):.6g}"
+        )
+    elif actual_total_bit_backend:
         writer.write(
             "Loss Weight: "
             f"geom={args.w_geom}, "
@@ -233,6 +246,14 @@ def log_runtime_setup(writer, args):
             f"temperature={float(getattr(args, 'heuristic_guidance_online_amount_temperature', 0.35)):.6g}, "
             f"gumbel_scale={float(getattr(args, 'heuristic_guidance_online_amount_gumbel_scale', 2.0)):.6g}, "
             f"geometry_policy_weight={float(getattr(args, 'heuristic_guidance_online_geometry_policy_weight', 0.50)):.6g}"
+        )
+        writer.write(
+            "Network Edit Efficiency: "
+            f"weight={float(getattr(args, 'heuristic_guidance_online_efficiency_policy_weight', 0.25)):.6g}, "
+            f"compression_tolerance={float(getattr(args, 'heuristic_guidance_online_efficiency_compression_tolerance', 0.02)):.6g}pp, "
+            f"geometry_relative_tolerance={float(getattr(args, 'heuristic_guidance_online_efficiency_geometry_relative_tolerance', 0.005)):.6g}, "
+            f"advantage_clip={float(getattr(args, 'heuristic_guidance_online_efficiency_advantage_clip', 0.25)):.6g}, "
+            "scope=same_frame_same_decision_group_Amount/Gate/Fine"
         )
 
 

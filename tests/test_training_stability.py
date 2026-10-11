@@ -87,29 +87,46 @@ class TrainingStabilityTest(unittest.TestCase):
         self.assertEqual(result["proxy_proposal"], 0.0)
         self.assertTrue(all(parameter.grad is None for parameter in model.parameters()))
 
-    def test_source_gradient_probe_skips_reentrant_checkpoint_training_graph(self):
-        class _Actuator(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.args = SimpleNamespace(
-                    heuristic_guidance_mode="ana_den6_online",
-                    full_cloud_activation_checkpoint=True,
-                )
-                self.den6_candidate_actor = torch.nn.Linear(2, 1, bias=False)
-
+    def test_source_gradient_probe_runs_with_full_cloud_checkpoint_enabled(self):
         class _Model(torch.nn.Module):
-            def __init__(self):
+            def __init__(self, actuator):
                 super().__init__()
-                self.actuator = _Actuator()
+                self.actuator = actuator
 
-        model = _Model()
-        value = torch.ones((1, 2))
-        actor_value = model.actuator.den6_candidate_actor(value).sum()
-        result = _probe_den6_policy_source_gradients(
-            model, {"actual": actor_value}
+        actuator = StructureRepairActuator.__new__(StructureRepairActuator)
+        torch.nn.Module.__init__(actuator)
+        actuator.args = SimpleNamespace(
+            heuristic_guidance_mode="ana_den6_online",
+            full_cloud_activation_checkpoint=True,
+            full_cloud_head_chunk_size=0,
         )
-        self.assertEqual(result, {"probe_skipped_reentrant_checkpoint": 1.0})
+        actuator.den6_candidate_actor = torch.nn.Sequential(
+            torch.nn.Conv1d(2, 4, 1),
+            torch.nn.SiLU(),
+            torch.nn.Conv1d(4, 1, 1),
+        )
+        model = _Model(actuator)
+        value = torch.ones((1, 2, 4))
+        actor_value = actuator._run_large_head(
+            actuator.den6_candidate_actor, value
+        )
+        result = _probe_den6_policy_source_gradients(
+            model,
+            {
+                "compression": actor_value.sum(),
+                "geometry": actor_value.square().sum(),
+            },
+        )
+        self.assertGreater(result["compression_actor"], 0.0)
+        self.assertGreater(result["geometry_actor"], 0.0)
         self.assertTrue(all(parameter.grad is None for parameter in model.parameters()))
+        # The diagnostic traversals must leave the retained graph valid for
+        # the real training backward that follows them.
+        actor_value.sum().backward()
+        self.assertTrue(any(
+            parameter.grad is not None
+            for parameter in actuator.den6_candidate_actor.parameters()
+        ))
 
     def test_candidate_score_fixed_scale_does_not_amplify_tiny_span(self):
         actuator = StructureRepairActuator.__new__(StructureRepairActuator)

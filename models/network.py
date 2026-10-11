@@ -2374,6 +2374,127 @@ class Network(nn.Module):
                 sequence_geometry_baseline.move_to_end(sequence_key)
                 while len(sequence_geometry_baseline) > 128:
                     sequence_geometry_baseline.popitem(last=False)
+
+        # Learn edit efficiency as a constrained tie-break, not as a fixed
+        # operation-ratio target.  Only an Amount/Gate/Fine action whose Actual
+        # compression and geometry stay within the previous same-frame,
+        # same-decision envelope receives credit for using fewer operations.
+        # A performance-regressing action receives no sparsity reward and is
+        # left to the ordinary RD losses.  Thus the model can choose any ratio,
+        # including a larger one when it is needed for better RD performance.
+        efficiency_policy_raw = objective.new_zeros(())
+        efficiency_policy_weighted = objective.new_zeros(())
+        efficiency_advantage = objective.new_zeros(())
+        efficiency_guard_passed = False
+        efficiency_baseline_available = False
+        operation_ratio = state.get(
+            "den6_online_actor_critic_operation_ratio", objective.new_zeros(())
+        )
+        if not torch.is_tensor(operation_ratio):
+            operation_ratio = objective.new_tensor(float(operation_ratio))
+        operation_ratio_value = float(operation_ratio.detach().float().mean().cpu())
+        if (
+            mode == "ana_den6_online"
+            and factorized_actual_credit
+            and factorized_group in {"Amount", "Gate", "Fine"}
+            and torch.is_tensor(geometry)
+            and torch.is_tensor(log_prob)
+            and log_prob.requires_grad
+        ):
+            efficiency_memory = getattr(
+                self, "_den6_online_efficiency_baseline", None
+            )
+            if efficiency_memory is None:
+                efficiency_memory = OrderedDict()
+                self._den6_online_efficiency_baseline = efficiency_memory
+            efficiency_key = str(policy_baseline_key)
+            previous_efficiency = efficiency_memory.get(efficiency_key)
+            current_geometry_value = float(
+                geometry_objective_for_rd.detach().cpu()
+            )
+            current_compression_value = float(objective.detach().cpu())
+            if isinstance(previous_efficiency, dict):
+                efficiency_baseline_available = True
+                previous_compression = float(previous_efficiency["compression"])
+                previous_geometry_value = float(previous_efficiency["geometry"])
+                previous_operation_ratio = float(previous_efficiency["operation_ratio"])
+                compression_tolerance = max(float(getattr(
+                    self.args,
+                    "heuristic_guidance_online_efficiency_compression_tolerance",
+                    0.02,
+                )), 0.0)
+                geometry_relative_tolerance = max(float(getattr(
+                    self.args,
+                    "heuristic_guidance_online_efficiency_geometry_relative_tolerance",
+                    0.005,
+                )), 0.0)
+                compression_ok = bool(
+                    current_compression_value
+                    <= min(0.0, previous_compression + compression_tolerance)
+                )
+                geometry_ok = bool(
+                    current_geometry_value
+                    <= previous_geometry_value
+                    + abs(previous_geometry_value) * geometry_relative_tolerance
+                    + 1e-12
+                )
+                efficiency_guard_passed = bool(compression_ok and geometry_ok)
+                if efficiency_guard_passed:
+                    efficiency_advantage = operation_ratio.new_tensor(
+                        (previous_operation_ratio - operation_ratio_value)
+                        / max(previous_operation_ratio, 1e-6)
+                    )
+                    efficiency_clip = max(float(getattr(
+                        self.args,
+                        "heuristic_guidance_online_efficiency_advantage_clip",
+                        0.25,
+                    )), 0.0)
+                    if efficiency_clip > 0.0:
+                        efficiency_advantage = efficiency_advantage.clamp(
+                            -efficiency_clip, efficiency_clip
+                        )
+                    efficiency_policy_raw = (
+                        -efficiency_advantage.detach() * log_prob.float().mean()
+                    )
+                    efficiency_weight = max(float(getattr(
+                        self.args,
+                        "heuristic_guidance_online_efficiency_policy_weight",
+                        0.25,
+                    )), 0.0)
+                    efficiency_policy_weighted = (
+                        float(efficiency_weight)
+                        * efficiency_policy_raw
+                        / float(policy_backward_scale)
+                    )
+                    policy_loss = policy_loss + efficiency_policy_weighted
+            # Initialize immediately, then update only inside the feasible RD
+            # envelope.  Bad compression/geometry samples therefore cannot
+            # relax the reference and manufacture a false sparsity reward.
+            if previous_efficiency is None or efficiency_guard_passed:
+                if isinstance(previous_efficiency, dict):
+                    efficiency_memory[efficiency_key] = {
+                        "compression": (
+                            (1.0 - baseline_alpha) * float(previous_efficiency["compression"])
+                            + baseline_alpha * current_compression_value
+                        ),
+                        "geometry": (
+                            (1.0 - baseline_alpha) * float(previous_efficiency["geometry"])
+                            + baseline_alpha * current_geometry_value
+                        ),
+                        "operation_ratio": (
+                            (1.0 - baseline_alpha) * float(previous_efficiency["operation_ratio"])
+                            + baseline_alpha * operation_ratio_value
+                        ),
+                    }
+                else:
+                    efficiency_memory[efficiency_key] = {
+                        "compression": current_compression_value,
+                        "geometry": current_geometry_value,
+                        "operation_ratio": operation_ratio_value,
+                    }
+                efficiency_memory.move_to_end(efficiency_key)
+                while len(efficiency_memory) > 4096:
+                    efficiency_memory.popitem(last=False)
         adaptive_amount_entropy = objective.new_zeros(())
         adaptive_amount_entropy_weighted = objective.new_zeros(())
         if mode in {"network_only_codec_policy", "network_k_proposal_policy", "single_plan_student"}:
@@ -2499,6 +2620,12 @@ class Network(nn.Module):
             "geometry_policy_advantage": float(geometry_advantage.detach().cpu()),
             "geometry_policy_raw": float(geometry_policy_raw.detach().cpu()),
             "geometry_policy_weighted": float(geometry_policy_weighted.detach().cpu()),
+            "efficiency_policy_guard_passed": bool(efficiency_guard_passed),
+            "efficiency_policy_baseline_available": bool(efficiency_baseline_available),
+            "efficiency_policy_operation_ratio": float(operation_ratio_value),
+            "efficiency_policy_advantage": float(efficiency_advantage.detach().cpu()),
+            "efficiency_policy_raw": float(efficiency_policy_raw.detach().cpu()),
+            "efficiency_policy_weighted": float(efficiency_policy_weighted.detach().cpu()),
             "adaptive_amount_entropy_raw": float(adaptive_amount_entropy.detach().cpu()),
             "adaptive_amount_entropy_weighted": float(adaptive_amount_entropy_weighted.detach().cpu()),
             "baseline_ema_alpha": float(baseline_alpha),
@@ -2508,7 +2635,7 @@ class Network(nn.Module):
         # optional low-frequency diagnostic probe.  These are never serialized
         # and never used to choose an action.
         self._den6_policy_source_losses = {
-            "actual": (
+            "actual_compression_policy": (
                 policy_core_weighted
                 + actual_group_pair_weighted
                 + actual_set_contrast_weighted
@@ -2521,6 +2648,7 @@ class Network(nn.Module):
             "proxy": candidate_local_credit_weighted,
             "entropy": entropy_weighted,
             "geometry": geometry_policy_weighted,
+            "efficiency": efficiency_policy_weighted,
         }
         return policy_loss.to(dtype=reward.dtype)
 

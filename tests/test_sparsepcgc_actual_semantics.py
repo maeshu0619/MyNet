@@ -1122,6 +1122,65 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         self.assertIsNone(rejected_grad)
         self.assertFalse(network.last_discrete_policy_debug["geometry_policy_guard_passed"])
 
+    def test_den6_edit_efficiency_rewards_fewer_operations_only_inside_rd_guard(self):
+        """圧縮・幾何を維持したAmount比較だけで少数操作を学習する。"""
+        network = Network.__new__(Network)
+        torch.nn.Module.__init__(network)
+        network.args = SimpleNamespace(
+            heuristic_guidance_mode="ana_den6_online",
+            heuristic_guidance_online_selection_mode="prior_residual",
+            _current_input_file="/dataset/longdress/frame_0001.ply",
+            sparsepcgc_scale_ae=0,
+            sparsepcgc_scale_sr=2,
+            sparsepcgc_scale_m=8,
+            cp_lambda_geom=0.0,
+            cp_tau_geom=0.0,
+            heuristic_guidance_online_edit_tiebreak_weight=0.0,
+            heuristic_guidance_online_policy_weight=0.0,
+            heuristic_guidance_online_global_actual_credit_weight=0.0,
+            heuristic_guidance_online_entropy_weight=0.0,
+            heuristic_guidance_online_geometry_policy_weight=0.0,
+            heuristic_guidance_online_reward_ema=0.1,
+            heuristic_guidance_online_efficiency_policy_weight=1.0,
+            heuristic_guidance_online_efficiency_compression_tolerance=0.02,
+            heuristic_guidance_online_efficiency_geometry_relative_tolerance=0.005,
+            heuristic_guidance_online_efficiency_advantage_clip=1.0,
+        )
+        network._den6_online_objective_baseline = __import__(
+            "collections"
+        ).OrderedDict()
+
+        def step(compression, geometry, ratio):
+            log_prob = torch.tensor(0.0, requires_grad=True)
+            network.last_actuator_voxel_state = {
+                "den6_online_policy_log_prob": log_prob,
+                "den6_online_policy_entropy": log_prob.new_zeros(()),
+                "den6_online_actor_critic_operation_ratio": log_prob.new_tensor(ratio),
+                "ana_den6_exact_residual_plan_debug": {
+                    "factorized_exploration_group": "Amount",
+                    "network_plan_confidence": 1.0,
+                },
+            }
+            loss = network.discrete_policy_loss(
+                torch.tensor(float(compression)),
+                geometry=torch.tensor(float(geometry)),
+            )
+            grad = torch.autograd.grad(loss, log_prob)[0]
+            return grad, dict(network.last_discrete_policy_debug)
+
+        first_grad, first_debug = step(-4.0, 0.010, 0.0030)
+        self.assertEqual(float(first_grad), 0.0)
+        self.assertFalse(first_debug["efficiency_policy_baseline_available"])
+
+        lower_grad, lower_debug = step(-4.0, 0.010, 0.0020)
+        self.assertLess(float(lower_grad), 0.0)
+        self.assertTrue(lower_debug["efficiency_policy_guard_passed"])
+        self.assertGreater(lower_debug["efficiency_policy_advantage"], 0.0)
+
+        _, regressed_debug = step(-3.0, 0.010, 0.0010)
+        self.assertFalse(regressed_debug["efficiency_policy_guard_passed"])
+        self.assertEqual(regressed_debug["efficiency_policy_weighted"], 0.0)
+
     def test_den6_new_frame_does_not_receive_cross_frame_policy_credit(self):
         """未知frameの難易度差をActorの行動creditとして扱わない。"""
         network = Network.__new__(Network)

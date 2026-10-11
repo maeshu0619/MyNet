@@ -1907,7 +1907,17 @@ def parse_pugan_args(parser, file_day, file_time):
         help='loss構成。legacy_totalは既存互換、compression_primaryは圧縮主目的の実験モード',
     )
     parser.add_argument('--compression_primary_warmup_steps', default=0, type=int, help='compression_primaryでw_comを滑らかに上げるstep数(0で無効)')
-    parser.add_argument('--cp_lambda_geom', default=1.0, type=float, help='compression_primaryのgeometry safety penalty重み')
+    parser.add_argument(
+        '--cp_lambda_geom',
+        '--geometry_loss_weight',
+        dest='cp_lambda_geom',
+        default=150.0,
+        type=float,
+        help=(
+            'compression_primaryで実際に使う幾何損失重み。'
+            '--geometry_loss_weightは同じ値を指定する読みやすいalias'
+        ),
+    )
     parser.add_argument(
         '--rd_geometry_weight_multiplier',
         default=1.10,
@@ -1943,9 +1953,24 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--cp_use_stage_factors', default=False, type=str2bool, help='compression_primaryでも既存stage factorを使うか(default False)')
     parser.add_argument('--cp_force_joint_actuator', default=True, type=str2bool, help='compression_primaryでactuator strengthをjoint相当に固定するか')
     parser.add_argument('--cp_log_grad_terms', default=True, type=str2bool, help='compression_primaryの各loss項のrequires_grad/finiteをログするか')
-    parser.add_argument('--w_geom',     default=10**4, type=float, help='幾何損失ブロック全体の重み')
+    parser.add_argument(
+        '--w_geom',
+        default=10**4,
+        type=float,
+        help='legacy_totalモードの幾何損失重み（compression_primaryでは--cp_lambda_geomを使う）',
+    )
     parser.add_argument('--geom_d2_weight', default=0.2, type=float, help='loss_type=cd+d2 のときの D2PSNR 報酬項の重み')
-    parser.add_argument('--w_com',      default=3, type=float, help='圧縮損失ブロック全体の重み（actual/surrogate backendでは total-bit 差[%%] に直接掛かる）')
+    parser.add_argument(
+        '--w_com',
+        '--compression_loss_weight',
+        dest='w_com',
+        default=3.0,
+        type=float,
+        help=(
+            '圧縮損失の実行重み（actual/surrogate backendでは total-bit 差[%%] に直接掛かる）。'
+            '--compression_loss_weightは同じ値を指定する読みやすいalias'
+        ),
+    )
     parser.add_argument('--w_attr',     default=20.0, type=float, help='原因分解損失ブロック全体の重み')
     parser.add_argument('--w_policy',   default=0.3, type=float, help='構造修復ポリシー損失ブロック全体の重み')
     parser.add_argument('--w_actuator', default=1.0, type=float, help='構造修復アクチュエータ正則化損失ブロック全体の重み')
@@ -2546,6 +2571,33 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument(
         '--heuristic_guidance_online_edit_tiebreak_weight', default=2.0, type=float,
         help='同等RD時だけ少数編集を選ぶActual RD objectiveの微小tie-break係数。0で無効',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_efficiency_policy_weight',
+        default=0.25,
+        type=float,
+        help=(
+            '同一frame・同一decision groupで圧縮/幾何性能を維持した場合のみ、'
+            '実行Voxel操作率の低下をAmount/Gate/Fineへ返す方策重み'
+        ),
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_efficiency_compression_tolerance',
+        default=0.02,
+        type=float,
+        help='Voxel操作効率creditを許すActual圧縮損失の悪化幅[percentage point]',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_efficiency_geometry_relative_tolerance',
+        default=0.005,
+        type=float,
+        help='Voxel操作効率creditを許す幾何損失の相対悪化率',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_efficiency_advantage_clip',
+        default=0.25,
+        type=float,
+        help='基準操作率に対する操作率削減advantageの絶対値上限',
     )
     parser.add_argument(
         '--heuristic_guidance_online_factorized_exploration', default=True, type=str2bool,
@@ -6779,11 +6831,6 @@ def parse_pugan_args(parser, file_day, file_time):
         if not _cli_option_was_provided("--cp_tau_geom"):
             # 実測L_geomは約0.003であり、旧0.06ではpenaltyが常に0だった。
             args.cp_tau_geom = 0.0
-        if not _cli_option_was_provided("--cp_lambda_geom"):
-            # Add-only point-to-plane Fit修正後の実測 L_geom約0.03 に対し、
-            # 主圧縮block約8--10の約15%を与える。
-            # support上限があるため圧縮主目的を逆転させない。
-            args.cp_lambda_geom = 50.0 * float(args.rd_geometry_weight_multiplier)
         if not _cli_option_was_provided("--heuristic_guidance_online_geometry_policy_weight"):
             # Candidate-local、global policy、fixed validationでGeometryの
             # 相対的重要度を同じ倍率だけ上げ、別々の目的へ乖離させない。
