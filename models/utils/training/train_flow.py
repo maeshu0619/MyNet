@@ -240,9 +240,38 @@ def apply_epoch_file_window(dataset, args, window_index):
     if window_size <= 0 or len(all_files) <= window_size:
         dataset.files = list(all_files)
         return dataset
-    # 同じ系列を次に使うEpisodeでは、訓練領域内を次のwindow_size件へ進める。
-    start = (int(window_index) * window_size) % len(all_files)
-    # 訓練領域の末尾を超えた分だけ、その訓練領域の先頭へ巻き戻す。
-    dataset.files = [all_files[(start + offset) % len(all_files)] for offset in range(window_size)]
+    # 1周で訓練領域を一度ずつ使い切る。従来はここが完全に固定されていたため、
+    # train_frames_per_sequence / max_files Episodeごとに同じ入力窓が同じ順番で再現していた。
+    windows_per_cycle = (len(all_files) + window_size - 1) // window_size
+    safe_window_index = max(int(window_index), 0)
+    cycle_index = safe_window_index // windows_per_cycle
+    slot_index = safe_window_index % windows_per_cycle
+    ordered_files = list(all_files)
+
+    # global RNGは進めず、系列・周回ごとの局所Generatorで並べ替える。
+    # 再現性と「1周内で重複なし」を保ったまま、固定的な10 Episode周期を作らない。
+    shuffle_each_cycle = bool(getattr(args, "train_window_shuffle_each_cycle", True))
+    if shuffle_each_cycle:
+        file_identity = "\n".join(str(path) for path in all_files)
+        seed_text = (
+            f"seed={int(getattr(args, 'seed', 0))}|cycle={cycle_index}|"
+            f"files={file_identity}"
+        )
+        cycle_seed = int(hashlib.sha256(seed_text.encode("utf-8")).hexdigest()[:16], 16)
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(cycle_seed % (2**63 - 1))
+        permutation = torch.randperm(len(ordered_files), generator=generator).tolist()
+        ordered_files = [ordered_files[index] for index in permutation]
+
+    start = slot_index * window_size
+    # 末尾windowは残数だけにし、同じ周回内の重複サンプルを作らない。
+    dataset.files = ordered_files[start:start + window_size]
+    # 実際の窓と周回をログから監査できるよう、軽量なmetadataを保持する。
+    dataset.active_window_cycle = int(cycle_index)
+    dataset.active_window_slot = int(slot_index)
+    dataset.active_window_count = int(windows_per_cycle)
+    dataset.active_window_signature = hashlib.sha256(
+        "\n".join(str(path) for path in dataset.files).encode("utf-8")
+    ).hexdigest()[:16]
     # DataLoaderが更新後のfilesだけを読む同じDatasetを返す。
     return dataset

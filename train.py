@@ -560,10 +560,19 @@ def train(model, args, loss, writer, plot, notifier=None):
             )
 
             """基本情報のセットアップ"""
-            active_dataset = apply_epoch_file_window(dataset, args, episode) # 各系列の訓練用150件内をEpisodeごとにmax_files件ずつ進める
+            active_dataset = apply_epoch_file_window(dataset, args, episode) # 各系列の訓練フレームを1周ごとに再配置し、非重複windowで読む
             loader = torch.utils.data.DataLoader(active_dataset, **loader_kwargs) # 現在Epochの窓Datasetから点群ファイルを順に読み出す
             num_steps = len(active_dataset)
             active_files = list(getattr(active_dataset, "files", ()))
+            writer.write(
+                "TrainingWindow: "
+                f"episode={episode + 1}, sequence={sequence_name}, "
+                f"cycle={int(getattr(active_dataset, 'active_window_cycle', 0))}, "
+                f"slot={int(getattr(active_dataset, 'active_window_slot', 0)) + 1}/"
+                f"{int(getattr(active_dataset, 'active_window_count', 1))}, "
+                f"files={len(active_files)}, "
+                f"signature={getattr(active_dataset, 'active_window_signature', '')}"
+            )
             if den6_prefetch_lookahead > 0:
                 prefetch_ana_den6_online_guidance(args, active_files[:den6_prefetch_lookahead])
             epoch_has_optimizer_step = False

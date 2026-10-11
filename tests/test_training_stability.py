@@ -20,7 +20,10 @@ from models.utils.training.convergence_control import (
     TrainingConvergenceMonitor,
     exploration_schedule_step_estimate,
 )
-from models.utils.training.train_flow import backward_only_scaled_loss
+from models.utils.training.train_flow import (
+    apply_epoch_file_window,
+    backward_only_scaled_loss,
+)
 from models.utils.training.train_runtime import (
     _balance_actual_operation_head_gradients,
     _capture_den6_policy_only_gradients,
@@ -59,6 +62,57 @@ class _Plot:
 
 
 class TrainingStabilityTest(unittest.TestCase):
+    def test_training_windows_cover_each_cycle_without_fixed_periodic_replay(self):
+        files = [f"sequence/frame_{index:03d}.ply" for index in range(100)]
+        dataset = SimpleNamespace(all_files=files, files=list(files))
+        args = SimpleNamespace(
+            train_frames_per_sequence=100,
+            max_files=10,
+            train_window_shuffle_each_cycle=True,
+            seed=21,
+        )
+
+        first_cycle = []
+        first_signatures = []
+        for episode in range(10):
+            apply_epoch_file_window(dataset, args, episode)
+            first_cycle.extend(dataset.files)
+            first_signatures.append(dataset.active_window_signature)
+        second_cycle = []
+        second_signatures = []
+        for episode in range(10, 20):
+            apply_epoch_file_window(dataset, args, episode)
+            second_cycle.extend(dataset.files)
+            second_signatures.append(dataset.active_window_signature)
+
+        self.assertEqual(sorted(first_cycle), files)
+        self.assertEqual(sorted(second_cycle), files)
+        self.assertEqual(len(set(first_cycle)), 100)
+        self.assertEqual(len(set(second_cycle)), 100)
+        self.assertNotEqual(first_signatures, second_signatures)
+
+        # 同じseed・周回は完全に再現でき、global RNGに依存しない。
+        apply_epoch_file_window(dataset, args, 13)
+        replay = list(dataset.files)
+        torch.manual_seed(999)
+        apply_epoch_file_window(dataset, args, 13)
+        self.assertEqual(dataset.files, replay)
+
+    def test_training_window_shuffle_can_be_disabled_for_legacy_order(self):
+        files = [f"frame_{index:03d}.ply" for index in range(23)]
+        dataset = SimpleNamespace(all_files=files, files=list(files))
+        args = SimpleNamespace(
+            train_frames_per_sequence=23,
+            max_files=10,
+            train_window_shuffle_each_cycle=False,
+            seed=21,
+        )
+
+        apply_epoch_file_window(dataset, args, 0)
+        self.assertEqual(dataset.files, files[:10])
+        apply_epoch_file_window(dataset, args, 2)
+        self.assertEqual(dataset.files, files[20:])
+
     def test_source_gradient_probe_separates_actor_and_proposal_without_pollution(self):
         class _Actuator(torch.nn.Module):
             def __init__(self):

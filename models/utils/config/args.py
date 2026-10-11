@@ -1875,6 +1875,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--min_surrogate_lr', default=1e-6, type=float, help='Surrogate optimizerの学習率floor')
     parser.add_argument('--max_files', default=10, type=int, help='1系列の1Epochで読み込むフレーム数')
     parser.add_argument('--train_frames_per_sequence', default=100, type=int, help='各系列で訓練に使用する先頭フレーム数。残りは訓練窓から除外する')
+    parser.add_argument('--train_window_shuffle_each_cycle', default=True, type=str2bool, help='訓練フレームを1周ごとにseed固定で再配置し、固定的なEpisode周期を防ぐ')
     parser.add_argument('--episodes', default=382, type=int, help='学習エピソード数')
     parser.add_argument('--exploration_schedule_episodes', default=0, type=int, help='探索ノイズの減衰基準Episode数。0なら実際の最大訓練長へ連動し、訓練延長時に旧固定長で探索が途中終了することを防ぐ')
     parser.add_argument('--train_until_converged', default=False, type=str2bool, help='Trueならepisodesを最低訓練長とし、固定検証で十分な収束証拠が得られるまで継続する')
@@ -5585,6 +5586,9 @@ def parse_pugan_args(parser, file_day, file_time):
     args.network_only_head_audit_interval = max(int(getattr(
         args, "network_only_head_audit_interval", 10
     )), 1)
+    args.train_window_shuffle_each_cycle = bool(getattr(
+        args, "train_window_shuffle_each_cycle", True
+    ))
     args.full_cloud_empty_cache_threshold_mb = max(float(getattr(
         args, "full_cloud_empty_cache_threshold_mb", 8192.0
     )), 0.0)
