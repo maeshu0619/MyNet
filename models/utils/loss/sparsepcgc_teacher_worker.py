@@ -112,6 +112,33 @@ def _recover_cuda_after_oom() -> None:
     except Exception:
         pass
 
+
+def _configure_persistent_cuda_allocator_cache(encoder, cleanup_interval: int) -> bool:
+    """Reuse allocator blocks while clearing request-local ME coordinates.
+
+    Only allocation lifetime changes; codec models, inputs, arithmetic coding,
+    and returned bit counts remain identical.
+    """
+    interval = max(int(cleanup_interval), 0)
+    is_cuda = getattr(encoder, "_is_cuda", None)
+    original_cleanup = getattr(encoder, "_cleanup_runtime_cache", None)
+    if not callable(is_cuda) or not bool(is_cuda()) or not callable(original_cleanup):
+        return False
+
+    me_runtime = getattr(encoder, "ME", None)
+
+    def clear_request_coordinates_only() -> None:
+        clear_coordinate_manager = getattr(
+            me_runtime, "clear_global_coordinate_manager", None
+        )
+        if callable(clear_coordinate_manager):
+            clear_coordinate_manager()
+
+    encoder._full_cleanup_runtime_cache = original_cleanup
+    encoder._cleanup_runtime_cache = clear_request_coordinates_only
+    encoder._cuda_cleanup_interval = interval
+    return True
+
 def _setup_protocol_stdout() -> None:
     global _PROTOCOL_OUT
     if _PROTOCOL_OUT is not None:
@@ -167,6 +194,12 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=16,
         help="永続workerの解放済みCPU領域をOSへ返すrequest間隔（0で無効）",
+    )
+    parser.add_argument(
+        "--cuda-cleanup-interval",
+        type=int,
+        default=1,
+        help="CUDA allocator cacheを完全解放するrequest間隔（0でworker終了まで保持）",
     )
     return parser.parse_args()
 
@@ -270,6 +303,11 @@ def _build_encoder(args: argparse.Namespace):
     )
     _debug(f"initializing SparsePCGCEncoder mode={encoder_args.mode} device={encoder_args.device}")
     encoder = SparsePCGCEncoder(encoder_args)
+    encoder._persistent_cuda_allocator_cache = bool(
+        _configure_persistent_cuda_allocator_cache(
+            encoder, int(getattr(args, "cuda_cleanup_interval", 1))
+        )
+    )
     _debug("SparsePCGCEncoder ready")
     return encoder
 
@@ -367,6 +405,25 @@ def main() -> int:
             result["sparsepcgc_mode_effective"] = str(args.mode)
             result.setdefault("sparsepcgc_rate_definition", result.get("rate_definition", "physical_bin_bits"))
             completed_requests += 1
+            cuda_cleanup_interval = max(int(args.cuda_cleanup_interval), 0)
+            cuda_cleanup_due = bool(
+                getattr(encoder, "_persistent_cuda_allocator_cache", False)
+                and cuda_cleanup_interval > 0
+                and completed_requests % cuda_cleanup_interval == 0
+            )
+            if cuda_cleanup_due:
+                full_cuda_cleanup = getattr(
+                    encoder, "_full_cleanup_runtime_cache", None
+                )
+                if callable(full_cuda_cleanup):
+                    full_cuda_cleanup()
+            result["sparsepcgc_worker_persistent_cuda_cache"] = bool(
+                getattr(encoder, "_persistent_cuda_allocator_cache", False)
+            )
+            result["sparsepcgc_worker_cuda_cleanup_interval"] = int(
+                cuda_cleanup_interval
+            )
+            result["sparsepcgc_worker_cuda_cleanup_due"] = bool(cuda_cleanup_due)
             trim_interval = max(int(args.cpu_trim_interval), 0)
             cpu_trimmed = bool(
                 trim_interval > 0 and completed_requests % trim_interval == 0

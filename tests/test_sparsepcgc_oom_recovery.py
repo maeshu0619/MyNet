@@ -5,9 +5,30 @@ import unittest
 from unittest.mock import Mock, patch
 
 from models.utils.loss.actual_encoder import _SparsePCGCActualEncoder
+from models.utils.loss.sparsepcgc_teacher_worker import (
+    _configure_persistent_cuda_allocator_cache,
+)
 
 
 class SparsePCGCOOMRecoveryTest(unittest.TestCase):
+    def test_persistent_cuda_cache_only_changes_cleanup_lifetime(self):
+        coordinate_manager = SimpleNamespace(clear_global_coordinate_manager=Mock())
+        full_cleanup = Mock()
+        encoder = SimpleNamespace(
+            _is_cuda=Mock(return_value=True),
+            _cleanup_runtime_cache=full_cleanup,
+            ME=coordinate_manager,
+        )
+
+        enabled = _configure_persistent_cuda_allocator_cache(encoder, 1)
+        encoder._cleanup_runtime_cache()
+
+        self.assertTrue(enabled)
+        self.assertIs(encoder._full_cleanup_runtime_cache, full_cleanup)
+        self.assertEqual(encoder._cuda_cleanup_interval, 1)
+        full_cleanup.assert_not_called()
+        coordinate_manager.clear_global_coordinate_manager.assert_called_once_with()
+
     def _encoder(self):
         encoder = _SparsePCGCActualEncoder.__new__(_SparsePCGCActualEncoder)
         encoder.args = SimpleNamespace(

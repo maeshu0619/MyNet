@@ -475,6 +475,10 @@ class _SparsePCGCActualEncoder:
             str(max(int(getattr(
                 self.args, "sparsepcgc_worker_cpu_trim_interval", 16
             )), 0)),
+            "--cuda-cleanup-interval",
+            str(max(int(getattr(
+                self.args, "sparsepcgc_worker_cuda_cleanup_interval", 1
+            )), 0)),
         ]
         if bool(getattr(self.args, "sparsepcgc_inner_psnr", False)):
             cmd.append("--inner-psnr")

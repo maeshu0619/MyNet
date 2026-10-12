@@ -2094,6 +2094,7 @@ def parse_pugan_args(parser, file_day, file_time):
         help='CPU teacherの1回の実符号化とGPU幾何損失を重ねる。CUDA teacherでは常に無効',
     )
     parser.add_argument('--sparsepcgc_worker_cpu_trim_interval', default=16, type=int, help='永続workerの解放済みCPU領域をOSへ返すrequest間隔（0で無効）')
+    parser.add_argument('--sparsepcgc_worker_cuda_cleanup_interval', default=1, type=int, help='CUDA teacherのallocator cacheを完全解放するrequest間隔。既定値1は各request終了時に解放し、符号化前の重複解放だけを省く（0でworker終了まで完全解放なし）')
     parser.add_argument('--sparsepcgc_gpu_min_free_mb', default=4096, type=int, help='CUDA teacherへrequestを送るために必要なGPU全体の空き容量MB。競合時は値を変えず待機する')
     parser.add_argument('--sparsepcgc_host_min_available_mb', default=8192, type=int, help='SparsePCGC workerの起動・encode前に必要なホストMemAvailable(MB)。共有hostのOOM killを避ける')
     parser.add_argument('--sparsepcgc_host_wait_timeout', default=600.0, type=float, help='SparsePCGC workerのホスト空きメモリ待機上限秒')
@@ -3637,7 +3638,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--use_tf32', default=True, type=str2bool, help='TF32を使用するか')
     parser.add_argument('--use_amp', default=True, type=str2bool, help='混合精度学習を使うか')
     parser.add_argument('--amp_dtype', default='auto', type=str, help='AMPのデータ型')
-    parser.add_argument('--full_cloud_activation_checkpoint', default=True, type=str2bool, help='FP32精度を維持したままfull-cloud headの中間activationをbackward時に再計算してGPUメモリを削減する')
+    parser.add_argument('--full_cloud_activation_checkpoint', default=False, type=str2bool, help='full-cloud headの中間activationをbackward時に再計算して単一StepのGPU peakを削減する。追加計算とPyTorch 1.11でのStep間activation残留を避けるため既定はFalse')
     parser.add_argument('--full_cloud_head_chunk_size', default=131072, type=int, help='点単位full-cloud headを厳密分割する最大点数（0で無効、小さいほどforwardピークGPUメモリを削減）')
     parser.add_argument(
         '--full_cloud_saved_tensor_cpu_offload_mb',
@@ -5621,6 +5622,9 @@ def parse_pugan_args(parser, file_day, file_time):
     args.sparsepcgc_actual_result_cache = bool(getattr(args, "sparsepcgc_actual_result_cache", True))
     args.sparsepcgc_actual_result_cache_max_entries = max(int(getattr(args, "sparsepcgc_actual_result_cache_max_entries", 256)), 1)
     args.sparsepcgc_omp_threads = max(int(getattr(args, "sparsepcgc_omp_threads", 12)), 1)
+    args.sparsepcgc_worker_cuda_cleanup_interval = max(int(getattr(
+        args, "sparsepcgc_worker_cuda_cleanup_interval", 1
+    )), 0)
     args.sparsepcgc_cpu_actual_overlap = bool(
         getattr(args, "sparsepcgc_cpu_actual_overlap", True)
     )
