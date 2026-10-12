@@ -570,6 +570,50 @@ class _SparsePCGCActualEncoder:
             # 古いPyTorchでも通常のrequestは続行できる。OOM時のretryは別に残る。
             return float("inf")
 
+    def _stop_worker(self, *, preserve_workspace=False, preserve_cache=False):
+        """Stop only the persistent teacher process, optionally preserving request state."""
+        proc = self._proc
+        self._proc = None
+        if proc is not None and proc.poll() is None:
+            try:
+                if proc.stdin is not None:
+                    self._request_id += 1
+                    proc.stdin.write(json.dumps({
+                        "command": "shutdown",
+                        "request_id": self._request_id,
+                    }) + "\n")
+                    proc.stdin.flush()
+                proc.wait(timeout=5.0)
+            except Exception:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5.0)
+                except Exception:
+                    proc.kill()
+        self._loaded = False
+        if self._stdout_thread is not None:
+            self._stdout_thread.join(timeout=1.0)
+        self._stdout_thread = None
+        self._stdout_queue = None
+        if self._stderr_file is not None:
+            try:
+                self._stderr_file.close()
+            except Exception:
+                pass
+            self._stderr_file = None
+        if not preserve_workspace and self._workspace_dir is not None:
+            shutil.rmtree(self._workspace_dir, ignore_errors=True)
+            self._workspace_dir = None
+        if not preserve_cache:
+            self._result_cache.clear()
+
+    def _restart_worker_on_cpu(self):
+        # encode requestのPLY/output pathと既存Actual cacheは有効なため、
+        # CUDA workerだけを停止して同じcodec設定をCPUで再起動する。
+        self._stop_worker(preserve_workspace=True, preserve_cache=True)
+        self.args.sparsepcgc_device = "cpu"
+        self._lazy_init()
+
     @staticmethod
     def _host_available_mb():
         try:
@@ -649,15 +693,17 @@ class _SparsePCGCActualEncoder:
             getattr(self.args, "sparsepcgc_device", "auto")
         ).strip().lower()
         if (
-            str(reason) == "worker_init"
-            and requested_device == "auto"
+            requested_device == "auto"
             and bool(getattr(self.args, "sparsepcgc_auto_cpu_fallback", True))
             and free_now < float(minimum_mb)
         ):
             # autoは「利用可能な実行先を選ぶ」指定であり、混雑GPUを10分待って
-            # 失敗する指定ではない。worker生成前ならdeviceを書き換えるだけで
-            # 同じSparsePCGC codec/重み/量子化設定をCPUで安全に実行できる。
-            self.args.sparsepcgc_device = "cpu"
+            # 失敗する指定ではない。起動前ならdeviceのみ変更し、起動後なら
+            # request workspaceを保ったままCUDA workerをCPU workerへ置き換える。
+            if str(reason) == "worker_init":
+                self.args.sparsepcgc_device = "cpu"
+            else:
+                self._restart_worker_on_cpu()
             if self.writer is not None and hasattr(self.writer, "write"):
                 self.writer.write(
                     "SparsePCGCAutoCPUFallback: reason={}, free_mb={:.1f}, "
@@ -1310,31 +1356,7 @@ class _SparsePCGCActualEncoder:
         )
 
     def close(self):
-        proc = self._proc
-        self._proc = None
-        if proc is not None and proc.poll() is None:
-            try:
-                if proc.stdin is not None:
-                    self._request_id += 1
-                    proc.stdin.write(json.dumps({"command": "shutdown", "request_id": self._request_id}) + "\n")
-                    proc.stdin.flush()
-                proc.wait(timeout=5.0)
-            except Exception:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5.0)
-                except Exception:
-                    proc.kill()
-        if self._workspace_dir is not None:
-            shutil.rmtree(self._workspace_dir, ignore_errors=True)
-            self._workspace_dir = None
-        self._result_cache.clear()
-        if self._stderr_file is not None:
-            try:
-                self._stderr_file.close()
-            except Exception:
-                pass
-            self._stderr_file = None
+        self._stop_worker(preserve_workspace=False, preserve_cache=False)
 
     def __del__(self):
         try:

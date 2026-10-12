@@ -2101,7 +2101,7 @@ def parse_pugan_args(parser, file_day, file_time):
         '--sparsepcgc_auto_cpu_fallback',
         default=True,
         type=str2bool,
-        help='device=autoでworker起動時のGPU空き容量が不足する場合、待機せずCPU teacherへ切り替える',
+        help='device=autoでGPU空き容量が不足する場合、起動時またはencode前に待機せずCPU teacherへ切り替える',
     )
     parser.add_argument('--sparsepcgc_gpu_wait_timeout', default=600.0, type=float, help='SparsePCGC CUDA teacherの空きGPU待機上限秒')
     parser.add_argument('--sparsepcgc_gpu_wait_interval', default=2.0, type=float, help='SparsePCGC CUDA teacherの空きGPU確認間隔秒')

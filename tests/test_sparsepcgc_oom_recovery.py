@@ -38,6 +38,18 @@ class SparsePCGCOOMRecoveryTest(unittest.TestCase):
         self.assertEqual(encoder._gpu_admission_wait_count, 1)
         self.assertGreaterEqual(encoder.writer.write.call_count, 2)
 
+    def test_cuda_free_mb_uses_runtime_memory_information(self):
+        encoder = self._encoder()
+        encoder._cuda_worker_enabled = Mock(return_value=True)
+        with patch(
+            "models.utils.loss.actual_encoder.torch.cuda.mem_get_info",
+            return_value=(3 * 1024**3, 48 * 1024**3),
+        ) as memory_info:
+            free_mb = encoder._cuda_free_mb()
+
+        memory_info.assert_called_once_with(None)
+        self.assertEqual(free_mb, 3072.0)
+
     def test_auto_device_falls_back_to_cpu_before_worker_launch(self):
         encoder = self._encoder()
         encoder.args.sparsepcgc_auto_cpu_fallback = True
@@ -61,6 +73,38 @@ class SparsePCGCOOMRecoveryTest(unittest.TestCase):
         with patch("models.utils.loss.actual_encoder.time.sleep", return_value=None):
             result = encoder._wait_for_cuda_capacity("worker_init")
 
+        self.assertEqual(encoder.args.sparsepcgc_device, "cuda")
+        self.assertEqual(result["free_after_mb"], 5120.0)
+
+    def test_auto_device_restarts_loaded_worker_on_cpu_before_encode(self):
+        encoder = self._encoder()
+        encoder.args.sparsepcgc_auto_cpu_fallback = True
+        encoder._cuda_worker_enabled = Mock(return_value=True)
+        encoder._cuda_free_mb = Mock(return_value=2134.7)
+
+        def restart_on_cpu():
+            encoder.args.sparsepcgc_device = "cpu"
+
+        encoder._restart_worker_on_cpu = Mock(side_effect=restart_on_cpu)
+        result = encoder._wait_for_cuda_capacity("encode")
+
+        encoder._restart_worker_on_cpu.assert_called_once_with()
+        self.assertEqual(encoder.args.sparsepcgc_device, "cpu")
+        self.assertTrue(result["auto_cpu_fallback"])
+        self.assertEqual(result["wait_seconds"], 0.0)
+
+    def test_explicit_cuda_encode_still_waits_instead_of_switching_device(self):
+        encoder = self._encoder()
+        encoder.args.sparsepcgc_device = "cuda"
+        encoder.args.sparsepcgc_auto_cpu_fallback = True
+        encoder._cuda_worker_enabled = Mock(return_value=True)
+        encoder._cuda_free_mb = Mock(side_effect=[2134.7, 5120.0])
+        encoder._restart_worker_on_cpu = Mock()
+
+        with patch("models.utils.loss.actual_encoder.time.sleep", return_value=None):
+            result = encoder._wait_for_cuda_capacity("encode")
+
+        encoder._restart_worker_on_cpu.assert_not_called()
         self.assertEqual(encoder.args.sparsepcgc_device, "cuda")
         self.assertEqual(result["free_after_mb"], 5120.0)
 
