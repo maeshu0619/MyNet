@@ -1181,6 +1181,107 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         self.assertFalse(regressed_debug["efficiency_policy_guard_passed"])
         self.assertEqual(regressed_debug["efficiency_policy_weighted"], 0.0)
 
+    def test_positive_rate_geometry_objective_uses_positive_ema_baseline(self):
+        network = Network.__new__(Network)
+        torch.nn.Module.__init__(network)
+        network.args = SimpleNamespace(
+            heuristic_guidance_mode="ana_den6_online",
+            heuristic_guidance_online_selection_mode="prior_residual",
+            _current_input_file="/dataset/longdress/frame_0001.ply",
+            sparsepcgc_scale_ae=0,
+            sparsepcgc_scale_sr=2,
+            sparsepcgc_scale_m=8,
+            cp_lambda_geom=150.0,
+            cp_tau_geom=0.0,
+            heuristic_guidance_online_edit_tiebreak_weight=0.0,
+            heuristic_guidance_online_policy_weight=1.0,
+            heuristic_guidance_online_global_actual_credit_weight=1.0,
+            heuristic_guidance_online_entropy_weight=0.0,
+            heuristic_guidance_online_geometry_policy_weight=0.0,
+            heuristic_guidance_online_efficiency_policy_weight=0.0,
+            heuristic_guidance_online_reward_ema=0.1,
+            heuristic_guidance_online_policy_backward_scale=1.0,
+        )
+        network._den6_online_objective_baseline = __import__(
+            "collections"
+        ).OrderedDict()
+
+        def step(geometry):
+            log_prob = torch.tensor(0.0, requires_grad=True)
+            network.last_actuator_voxel_state = {
+                "den6_online_policy_log_prob": log_prob,
+                "den6_online_policy_entropy": log_prob.new_zeros(()),
+                "ana_den6_exact_residual_plan_debug": {
+                    "factorized_exploration_group": "Amount",
+                    "network_plan_confidence": 1.0,
+                },
+            }
+            loss = network.discrete_policy_loss(
+                torch.tensor(-3.8), geometry=torch.tensor(float(geometry))
+            )
+            return torch.autograd.grad(loss, log_prob)[0]
+
+        self.assertEqual(float(step(0.033)), 0.0)
+        # RD improves from +1.15 to +1.00, so the selected log-probability
+        # must increase.  Clamping this positive EMA to zero flips the sign.
+        self.assertLess(float(step(0.032)), 0.0)
+
+    def test_edit_efficiency_direct_gradient_active_after_exploration(self):
+        network = Network.__new__(Network)
+        torch.nn.Module.__init__(network)
+        network.args = SimpleNamespace(
+            heuristic_guidance_mode="ana_den6_online",
+            heuristic_guidance_online_selection_mode="prior_residual",
+            _current_input_file="/dataset/longdress/frame_0001.ply",
+            sparsepcgc_scale_ae=0,
+            sparsepcgc_scale_sr=2,
+            sparsepcgc_scale_m=8,
+            cp_lambda_geom=0.0,
+            cp_tau_geom=0.0,
+            heuristic_guidance_online_edit_tiebreak_weight=0.0,
+            heuristic_guidance_online_policy_weight=0.0,
+            heuristic_guidance_online_global_actual_credit_weight=0.0,
+            heuristic_guidance_online_entropy_weight=0.0,
+            heuristic_guidance_online_geometry_policy_weight=0.0,
+            heuristic_guidance_online_reward_ema=0.1,
+            heuristic_guidance_online_policy_backward_scale=10.0,
+            heuristic_guidance_online_efficiency_policy_weight=0.25,
+            heuristic_guidance_online_efficiency_direct_grad_scale=0.10,
+            heuristic_guidance_online_efficiency_compression_tolerance=0.02,
+            heuristic_guidance_online_efficiency_geometry_relative_tolerance=0.005,
+            heuristic_guidance_online_efficiency_advantage_clip=1.0,
+        )
+        network._den6_online_objective_baseline = __import__(
+            "collections"
+        ).OrderedDict()
+
+        def step(ratio_value):
+            log_prob = torch.tensor(0.0, requires_grad=True)
+            ratio = torch.tensor(float(ratio_value), requires_grad=True)
+            network.last_actuator_voxel_state = {
+                "den6_online_policy_log_prob": log_prob,
+                "den6_online_policy_entropy": log_prob.new_zeros(()),
+                "den6_online_actor_critic_operation_ratio": ratio,
+                "ana_den6_exact_residual_plan_debug": {
+                    "factorized_exploration_group": "none",
+                    "network_plan_confidence": 1.0,
+                },
+            }
+            loss = network.discrete_policy_loss(
+                torch.tensor(-4.0), geometry=torch.tensor(0.010)
+            )
+            ratio_grad = torch.autograd.grad(
+                loss, ratio, allow_unused=True
+            )[0]
+            return ratio_grad, dict(network.last_discrete_policy_debug)
+
+        first_grad, _ = step(0.0030)
+        self.assertIsNone(first_grad)
+        ratio_grad, debug = step(0.0025)
+        self.assertIsNotNone(ratio_grad)
+        self.assertGreater(float(ratio_grad), 0.0)
+        self.assertTrue(debug["efficiency_policy_guard_passed"])
+
     def test_den6_new_frame_does_not_receive_cross_frame_policy_credit(self):
         """未知frameの難易度差をActorの行動creditとして扱わない。"""
         network = Network.__new__(Network)

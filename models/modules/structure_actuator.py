@@ -4449,6 +4449,34 @@ class StructureRepairActuator(nn.Module):
         # Stable order is used only to break exact UCB ties; after selection the
         # count changes, so initially unknown groups are covered in turn.
         selected = max(groups, key=lambda name: (scores[name], -groups.index(name)))
+        # A large evidence deficit can keep one group at the top of the UCB
+        # score for hundreds of consecutive Steps.  In 172318 this produced
+        # long synchronized waves (AddWhere at E41--60, AdjustWhere at
+        # E61--80, PruneWhere at E81--96), so the measured compression curve
+        # changed when the *exploration group* changed rather than when the
+        # Network improved.  Bound only consecutive exploration ownership;
+        # this does not prescribe an operation count or alter any score inside
+        # the selected group.
+        max_consecutive = max(int(getattr(
+            self.args,
+            "heuristic_guidance_online_factorized_max_consecutive_steps",
+            8,
+        )), 1)
+        previous_group = str(getattr(
+            self, "_den6_last_factorized_exploration_group", ""
+        ))
+        previous_streak = max(int(getattr(
+            self, "_den6_factorized_exploration_group_streak", 0
+        )), 0)
+        if selected == previous_group and previous_streak >= max_consecutive:
+            selected = max(
+                (name for name in groups if name != previous_group),
+                key=lambda name: (scores[name], -groups.index(name)),
+            )
+            score_audit[selected]["selected_by_consecutive_cap"] = True
+        current_streak = previous_streak + 1 if selected == previous_group else 1
+        self._den6_last_factorized_exploration_group = str(selected)
+        self._den6_factorized_exploration_group_streak = int(current_streak)
         counts[selected] = int(counts.get(selected, 0)) + 1
         self._den6_last_factorized_group_scores = {
             "selected": str(selected),
@@ -7702,8 +7730,14 @@ class StructureRepairActuator(nn.Module):
             "_actor_critic_selected_changed_ratio": action_ratio_stack.new_tensor(
                 float(selected_changed_ratio)
             ),
-            "_actor_critic_selected_operation_ratio": action_ratio_stack.new_tensor(
-                float(selected_total_ratio)
+            # Keep the exact executed ratio in the forward pass while sending
+            # the continuous Amount/Gate/Fine derivative backward.  The old
+            # new_tensor(float(...)) detached this value, making the edit
+            # efficiency objective unable to lower the operation ratio.
+            "_actor_critic_selected_operation_ratio": (
+                action_ratio_stack.new_tensor(float(selected_total_ratio))
+                + action_ratio_stack.sum()
+                - action_ratio_stack.sum().detach()
             ),
         }
         plan_hash_payload = {

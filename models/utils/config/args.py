@@ -2604,12 +2604,27 @@ def parse_pugan_args(parser, file_day, file_time):
         help='基準操作率に対する操作率削減advantageの絶対値上限',
     )
     parser.add_argument(
+        '--heuristic_guidance_online_efficiency_direct_grad_scale',
+        default=0.10,
+        type=float,
+        help=(
+            '圧縮・幾何guard内で、実行値を変えずAmount/Gate/Fineの連続STE操作率へ'
+            '返す低分散gradient倍率'
+        ),
+    )
+    parser.add_argument(
         '--heuristic_guidance_online_factorized_exploration', default=True, type=str2bool,
         help='1 StepでWhere/Amount/Gate/Fineの一群だけを探索してActual creditを識別可能にする',
     )
     parser.add_argument(
         '--heuristic_guidance_online_factorized_ucb_scale', default=0.25, type=float,
         help='coverage UCBに加えるdecision group不確実性の係数。Episode番号には依存しない',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_factorized_max_consecutive_steps',
+        default=8,
+        type=int,
+        help='同一factorized探索groupが新規選択を連続占有できる最大Step数',
     )
     parser.add_argument(
         '--heuristic_guidance_online_where_exploration_share', default=0.60, type=float,
@@ -4753,6 +4768,12 @@ def parse_pugan_args(parser, file_day, file_time):
         float(getattr(args, "heuristic_guidance_online_amount_gumbel_scale", 2.0)),
         0.0,
     )
+    args.heuristic_guidance_online_efficiency_direct_grad_scale = max(float(getattr(
+        args, "heuristic_guidance_online_efficiency_direct_grad_scale", 0.10
+    )), 0.0)
+    args.heuristic_guidance_online_factorized_max_consecutive_steps = max(int(getattr(
+        args, "heuristic_guidance_online_factorized_max_consecutive_steps", 8
+    )), 1)
     args.heuristic_guidance_online_amount_logit_std_cap = max(float(getattr(
         args, "heuristic_guidance_online_amount_logit_std_cap", 0.35
     )), 0.0)
@@ -4926,8 +4947,14 @@ def parse_pugan_args(parser, file_day, file_time):
         args.phase7_eval_summary = False
         args.phase7_metric_columns = False
         args.loss_grad_probe_enabled = False
-        args.step_grad_log = False
-        args.compression_grad_probe = False
+        # Heavy gradient diagnostics stay off by default on the online hot
+        # path, but an explicit CLI request must not be silently discarded.
+        if not _cli_option_was_provided("--step_grad_log"):
+            args.step_grad_log = False
+        elif bool(args.step_grad_log):
+            args.save_step_metric_csv = True
+        if not _cli_option_was_provided("--compression_grad_probe"):
+            args.compression_grad_probe = False
         if not _cli_option_was_provided("--debug_grad_flow"):
             args.debug_grad_flow = False
         args.for_better_log = False
@@ -7876,8 +7903,12 @@ def parse_pugan_args(parser, file_day, file_time):
             args.phase7_eval_summary = False
             args.phase7_metric_columns = False
             args.loss_grad_probe_enabled = False
-            args.step_grad_log = False
-            args.compression_grad_probe = False
+            if not _cli_option_was_provided("--step_grad_log"):
+                args.step_grad_log = False
+            elif bool(args.step_grad_log):
+                args.save_step_metric_csv = True
+            if not _cli_option_was_provided("--compression_grad_probe"):
+                args.compression_grad_probe = False
             if not _cli_option_was_provided("--debug_grad_flow"):
                 args.debug_grad_flow = False
             args.for_better_log = False
@@ -7956,8 +7987,12 @@ def parse_pugan_args(parser, file_day, file_time):
         args.save_proxy_actual_bad_cases = False
         args.phase7_eval_summary = False
         args.loss_grad_probe_enabled = False
-        args.step_grad_log = False
-        args.compression_grad_probe = False
+        if not _cli_option_was_provided("--step_grad_log"):
+            args.step_grad_log = False
+        elif bool(args.step_grad_log):
+            args.save_step_metric_csv = True
+        if not _cli_option_was_provided("--compression_grad_probe"):
+            args.compression_grad_probe = False
         if not _cli_option_was_provided("--debug_grad_flow"):
             args.debug_grad_flow = False
         args.heuristic_guidance_online_prefetch_workers = 0

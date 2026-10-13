@@ -258,8 +258,11 @@ class Network(nn.Module):
         """Return bounded non-parameter state required for an exact resume."""
         network_names = (
             "_den6_online_objective_baseline",
+            "_den6_online_sequence_objective_baseline",
             "_den6_online_actual_plan_memory",
             "_den6_online_geometry_baseline",
+            "_den6_online_sequence_geometry_baseline",
+            "_den6_online_efficiency_baseline",
             "_den6_actual_actor_replay",
             "_den6_noop_edit_actual_memory",
             "_den6_plan_critic_replay",
@@ -267,6 +270,8 @@ class Network(nn.Module):
         actuator_names = (
             "_den6_factorized_group_counts",
             "_den6_factorized_group_uncertainty",
+            "_den6_last_factorized_exploration_group",
+            "_den6_factorized_exploration_group_streak",
             "_den6_actual_action_evidence",
             "_den6_actual_action_comparisons",
             "_den6_actual_candidate_critic_quality",
@@ -1062,7 +1067,16 @@ class Network(nn.Module):
         # RD objective convention: smaller is better.  The EMA compares the
         # same rate+geometry quantity as the Actor target; comparing Critic RD
         # against a rate-only EMA gave Gate/Amount contradictory credit.
-        effective_baseline_t = torch.minimum(previous_t, previous_t.new_zeros(()))
+        # The factorized objective is rate + lambda*geometry and can validly be
+        # positive (172318: about -3.8 + 150*0.033 ~= +1.15).  Clamping its EMA
+        # baseline to zero therefore marked virtually every executed plan as a
+        # negative-advantage action.  The zero clamp is meaningful only for the
+        # legacy compression-only objective.
+        effective_baseline_t = (
+            previous_t
+            if factorized_actual_credit
+            else torch.minimum(previous_t, previous_t.new_zeros(()))
+        )
         ema_advantage = (
             effective_baseline_t
             - (actor_rd_target.detach() if factorized_actual_credit else objective.detach())
@@ -2521,16 +2535,33 @@ class Network(nn.Module):
         efficiency_advantage = objective.new_zeros(())
         efficiency_guard_passed = False
         efficiency_baseline_available = False
-        operation_ratio = state.get(
-            "den6_online_actor_critic_operation_ratio", objective.new_zeros(())
+        # Prefer the exact plan-debug tensor.  Some forward wrappers retain the
+        # public state dictionary from the pre-edit branch, while the attached
+        # exact-plan debug is the object that actually produced the encoded
+        # point cloud.  172318/155935 exposed this mismatch as
+        # eff_op_ratio=0 despite selected_amount_ratios summing to ~0.00248.
+        operation_ratio = plan_debug_state.get(
+            "_actor_critic_selected_operation_ratio",
+            state.get(
+                "den6_online_actor_critic_operation_ratio", objective.new_zeros(())
+            ),
         )
         if not torch.is_tensor(operation_ratio):
             operation_ratio = objective.new_tensor(float(operation_ratio))
         operation_ratio_value = float(operation_ratio.detach().float().mean().cpu())
+        if operation_ratio_value <= 0.0:
+            selected_ratio_rows = plan_debug_state.get("selected_amount_ratios", {})
+            if isinstance(selected_ratio_rows, dict):
+                fallback_ratio = sum(
+                    max(float(selected_ratio_rows.get(name, 0.0) or 0.0), 0.0)
+                    for name in ("Add", "Prune", "Adjust")
+                )
+                if fallback_ratio > 0.0:
+                    operation_ratio = objective.new_tensor(fallback_ratio)
+                    operation_ratio_value = float(fallback_ratio)
         if (
             mode == "ana_den6_online"
             and factorized_actual_credit
-            and factorized_group in {"Amount", "Gate", "Fine"}
             and torch.is_tensor(geometry)
             and torch.is_tensor(log_prob)
             and log_prob.requires_grad
@@ -2541,7 +2572,13 @@ class Network(nn.Module):
             if efficiency_memory is None:
                 efficiency_memory = OrderedDict()
                 self._den6_online_efficiency_baseline = efficiency_memory
-            efficiency_key = str(policy_baseline_key)
+            # Efficiency is a property of the complete executed plan, not of
+            # the currently explored factor.  Keying it by factorized_group
+            # left it inactive on every Where Step and on every deterministic
+            # Step after exploration (the 172318 log consequently reported
+            # eff_loss=0 throughout).  Same-frame/codec isolation still keeps
+            # intrinsic frame difficulty out of this comparison.
+            efficiency_key = str(cache_key)
             previous_efficiency = efficiency_memory.get(efficiency_key)
             current_geometry_value = float(
                 geometry_objective_for_rd.detach().cpu()
@@ -2587,9 +2624,26 @@ class Network(nn.Module):
                         efficiency_advantage = efficiency_advantage.clamp(
                             -efficiency_clip, efficiency_clip
                         )
-                    efficiency_policy_raw = (
+                    score_function_term = (
                         -efficiency_advantage.detach() * log_prob.float().mean()
                     )
+                    # A hard selected bin changes only at a decision boundary.
+                    # Add a zero-forward, continuous backward tie-break through
+                    # the STE operation ratio so Amount/Gate/Fine can improve
+                    # between boundaries without changing the reported loss.
+                    direct_scale = max(float(getattr(
+                        self.args,
+                        "heuristic_guidance_online_efficiency_direct_grad_scale",
+                        0.10,
+                    )), 0.0)
+                    normalized_ratio = (
+                        operation_ratio.float().mean()
+                        / max(previous_operation_ratio, 1e-6)
+                    )
+                    direct_term = float(direct_scale) * (
+                        normalized_ratio - normalized_ratio.detach()
+                    )
+                    efficiency_policy_raw = score_function_term + direct_term
                     efficiency_weight = max(float(getattr(
                         self.args,
                         "heuristic_guidance_online_efficiency_policy_weight",
@@ -2615,9 +2669,11 @@ class Network(nn.Module):
                             (1.0 - baseline_alpha) * float(previous_efficiency["geometry"])
                             + baseline_alpha * current_geometry_value
                         ),
-                        "operation_ratio": (
-                            (1.0 - baseline_alpha) * float(previous_efficiency["operation_ratio"])
-                            + baseline_alpha * operation_ratio_value
+                        # Retain the best feasible edit ratio as the frontier;
+                        # an equally safe but larger plan must not relax it.
+                        "operation_ratio": min(
+                            float(previous_efficiency["operation_ratio"]),
+                            operation_ratio_value,
                         ),
                     }
                 else:

@@ -3985,6 +3985,23 @@ def train(model, args, loss, writer, plot, notifier=None):
                     ("surrogate_loss_for_grad", terms.get("surrogate", None)),
                     ("L_discrete_policy", L_discrete_policy),
                 ]
+                if compression_primary_mode and torch.is_tensor(L_geom):
+                    # Compare gradients after the actual objective weights and
+                    # adaptive balance, not raw losses with different units.
+                    weighted_geometry_primary = (
+                        float(cp_debug.get("cp_aux_balance_scale", 1.0))
+                        * float(stage_factors.get("geom", 1.0))
+                        * float(getattr(args, "cp_lambda_geom", 1.0))
+                        * torch.relu(
+                            L_geom - L_geom.new_tensor(float(getattr(
+                                args, "cp_tau_geom", 0.0
+                            )))
+                        )
+                    )
+                    step_grad_loss_items.extend((
+                        ("weighted_compression_primary", L_com_objective),
+                        ("weighted_geometry_primary", weighted_geometry_primary),
+                    ))
                 if torch.is_tensor(La_fit) and La_fit.requires_grad:
                     step_grad_loss_items.append(("La_fit", La_fit))
                 sparsepcgc_aux_term = terms.get("sparsepcgc", None)

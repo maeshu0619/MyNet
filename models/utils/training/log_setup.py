@@ -253,7 +253,8 @@ def log_runtime_setup(writer, args):
             f"compression_tolerance={float(getattr(args, 'heuristic_guidance_online_efficiency_compression_tolerance', 0.02)):.6g}pp, "
             f"geometry_relative_tolerance={float(getattr(args, 'heuristic_guidance_online_efficiency_geometry_relative_tolerance', 0.005)):.6g}, "
             f"advantage_clip={float(getattr(args, 'heuristic_guidance_online_efficiency_advantage_clip', 0.25)):.6g}, "
-            "scope=same_frame_same_decision_group_Amount/Gate/Fine"
+            f"direct_grad_scale={float(getattr(args, 'heuristic_guidance_online_efficiency_direct_grad_scale', 0.10)):.6g}, "
+            "scope=same_frame_all_train_steps"
         )
 
 

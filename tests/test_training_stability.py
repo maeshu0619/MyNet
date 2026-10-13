@@ -536,6 +536,50 @@ class TrainingStabilityTest(unittest.TestCase):
         selected = actuator._select_den6_factorized_exploration_group({})
         self.assertEqual(selected, "AdjustWhere")
 
+    def test_factorized_group_ucb_cannot_monopolize_new_selections(self):
+        actuator = StructureRepairActuator.__new__(StructureRepairActuator)
+        torch.nn.Module.__init__(actuator)
+        groups = (
+            "AddWhere", "PruneWhere", "AdjustWhere", "Amount", "Gate", "Fine"
+        )
+        actuator.args = SimpleNamespace(
+            heuristic_guidance_online_factorized_exploration=True,
+            heuristic_guidance_online_factorized_ucb_scale=0.0,
+            heuristic_guidance_online_factorized_max_consecutive_steps=2,
+            heuristic_guidance_online_where_exploration_share=1.0,
+            heuristic_guidance_online_where_coverage_weight=0.0,
+            heuristic_guidance_online_where_evidence_balance_weight=10.0,
+            heuristic_guidance_online_group_evidence_target=64,
+            heuristic_guidance_online_group_need_weight=0.0,
+            heuristic_guidance_online_group_authority_pairs=8,
+            _current_input_file="frame.ply",
+            sparsepcgc_scale_ae=0,
+            sparsepcgc_scale_sr=0,
+            sparsepcgc_scale_m=8,
+        )
+        actuator._den6_factorized_group_counts = {name: 64 for name in groups}
+        actuator._den6_factorized_group_uncertainty = {}
+        actuator._den6_pending_matched_groups = OrderedDict()
+        actuator._den6_actual_group_stats = {
+            name: {"comparisons": 64} for name in groups
+        }
+        actuator._den6_actual_group_stats["AdjustWhere"]["comparisons"] = 0
+        actuator._den6_fixed_rd_authority_rejected = False
+        actuator.train()
+
+        selected = [
+            actuator._select_den6_factorized_exploration_group({})
+            for _ in range(12)
+        ]
+        longest = 1
+        current = 1
+        for previous, value in zip(selected, selected[1:]):
+            current = current + 1 if value == previous else 1
+            longest = max(longest, current)
+        self.assertLessEqual(longest, 2)
+        self.assertIn("AdjustWhere", selected)
+        self.assertTrue(any(value != "AdjustWhere" for value in selected))
+
     def test_completed_matched_group_releases_pending_frame(self):
         actuator = StructureRepairActuator.__new__(StructureRepairActuator)
         torch.nn.Module.__init__(actuator)
