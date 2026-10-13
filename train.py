@@ -3988,7 +3988,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                 if compression_primary_mode and torch.is_tensor(L_geom):
                     # Compare gradients after the actual objective weights and
                     # adaptive balance, not raw losses with different units.
-                    weighted_geometry_primary = (
+                    weighted_geometry_primary_raw = (
                         float(cp_debug.get("cp_aux_balance_scale", 1.0))
                         * float(stage_factors.get("geom", 1.0))
                         * float(getattr(args, "cp_lambda_geom", 1.0))
@@ -3996,6 +3996,16 @@ def train(model, args, loss, writer, plot, notifier=None):
                             L_geom - L_geom.new_tensor(float(getattr(
                                 args, "cp_tau_geom", 0.0
                             )))
+                        )
+                    )
+                    geometry_backward_scale = max(float(getattr(
+                        args, "cp_geometry_backward_scale", 1.0
+                    )), 0.0)
+                    weighted_geometry_primary = (
+                        weighted_geometry_primary_raw.detach()
+                        + geometry_backward_scale * (
+                            weighted_geometry_primary_raw
+                            - weighted_geometry_primary_raw.detach()
                         )
                     )
                     step_grad_loss_items.extend((

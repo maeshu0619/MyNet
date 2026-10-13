@@ -536,6 +536,47 @@ class TrainingStabilityTest(unittest.TestCase):
         selected = actuator._select_den6_factorized_exploration_group({})
         self.assertEqual(selected, "AdjustWhere")
 
+    def test_where_exploration_can_cover_all_operations_in_same_step(self):
+        actuator = StructureRepairActuator.__new__(StructureRepairActuator)
+        torch.nn.Module.__init__(actuator)
+        groups = (
+            "AddWhere", "PruneWhere", "AdjustWhere", "Amount", "Gate", "Fine"
+        )
+        actuator.args = SimpleNamespace(
+            heuristic_guidance_online_factorized_exploration=True,
+            heuristic_guidance_online_simultaneous_operation_exploration=True,
+            heuristic_guidance_online_factorized_ucb_scale=0.0,
+            heuristic_guidance_online_where_exploration_share=1.0,
+            heuristic_guidance_online_where_coverage_weight=10.0,
+            heuristic_guidance_online_where_evidence_balance_weight=0.0,
+            heuristic_guidance_online_group_evidence_target=64,
+            heuristic_guidance_online_group_need_weight=0.0,
+            heuristic_guidance_online_group_authority_pairs=8,
+            _current_input_file="frame.ply",
+            sparsepcgc_scale_ae=0,
+            sparsepcgc_scale_sr=0,
+            sparsepcgc_scale_m=8,
+        )
+        actuator._den6_factorized_group_counts = {}
+        actuator._den6_factorized_group_uncertainty = {}
+        actuator._den6_pending_matched_groups = OrderedDict()
+        actuator._den6_actual_group_stats = {
+            name: {"comparisons": 0} for name in groups
+        }
+        actuator._den6_fixed_rd_authority_rejected = False
+        actuator.train()
+
+        selected = actuator._select_den6_factorized_exploration_group({})
+
+        self.assertEqual(selected, "WhereAll")
+        self.assertIn(
+            actuator._den6_last_factorized_group_scores["selected"], groups[:3]
+        )
+        self.assertEqual(
+            actuator._den6_last_factorized_group_scores["behavior_group"],
+            "WhereAll",
+        )
+
     def test_factorized_group_ucb_cannot_monopolize_new_selections(self):
         actuator = StructureRepairActuator.__new__(StructureRepairActuator)
         torch.nn.Module.__init__(actuator)
@@ -1269,6 +1310,38 @@ class TrainingStabilityTest(unittest.TestCase):
         self.assertAlmostEqual(debug["cp_geom_block_raw"], 0.3, places=6)
         total.backward()
         self.assertGreater(float(geom.grad), 0.0)
+
+    def test_geometry_backward_scale_preserves_forward_and_scales_gradient(self):
+        common = dict(
+            compression_loss_backend="sparsepcgc_surrogate",
+            w_com=1.0,
+            cp_tau_geom=0.0,
+            cp_lambda_geom=150.0,
+            compression_primary_aux_target_ratio=1.0,
+            compression_primary_aux_balance_min_scale=0.0,
+            compression_primary_aux_balance_max_scale=1.0,
+        )
+
+        def evaluate(scale):
+            main = torch.tensor(-4.0, requires_grad=True)
+            geom = torch.tensor(0.003, requires_grad=True)
+            args = SimpleNamespace(**common, cp_geometry_backward_scale=scale)
+            total, _, _ = build_compression_primary_loss(
+                args,
+                terms={"main": main},
+                L_com=main,
+                L_geom=geom,
+                L_actuator=torch.tensor(0.0),
+                global_train_step=0,
+                stage_factors={},
+            )
+            total.backward()
+            return float(total.detach()), float(geom.grad)
+
+        full_value, full_grad = evaluate(1.0)
+        scaled_value, scaled_grad = evaluate(0.0755)
+        self.assertAlmostEqual(full_value, scaled_value, places=7)
+        self.assertAlmostEqual(scaled_grad / full_grad, 0.0755, places=6)
 
     def test_gradient_clip_is_shared_by_fp32_and_amp_paths(self):
         model = torch.nn.Linear(1, 1, bias=False)

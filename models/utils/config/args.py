@@ -1922,6 +1922,15 @@ def parse_pugan_args(parser, file_day, file_time):
         ),
     )
     parser.add_argument(
+        '--cp_geometry_backward_scale',
+        default=0.0755,
+        type=float,
+        help=(
+            'cp_lambda_geomによるforward損失値を変えず、幾何primaryのbackwardだけを'
+            '倍率調整する。0.0755は最新実Stepの圧縮/幾何gradient L2比で校正'
+        ),
+    )
+    parser.add_argument(
         '--rd_geometry_weight_multiplier',
         default=1.10,
         type=float,
@@ -2615,6 +2624,15 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument(
         '--heuristic_guidance_online_factorized_exploration', default=True, type=str2bool,
         help='1 StepでWhere/Amount/Gate/Fineの一群だけを探索してActual creditを識別可能にする',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_simultaneous_operation_exploration',
+        default=True,
+        type=str2bool,
+        help=(
+            'Where探索StepではAdd/Prune/Adjust三操作の候補順位を同時に探索する。'
+            'Amount/Gate/Fineは因果分離のため従来どおり別groupに保つ'
+        ),
     )
     parser.add_argument(
         '--heuristic_guidance_online_factorized_ucb_scale', default=0.25, type=float,

@@ -139,6 +139,7 @@ def log_loss_weight_setup(writer, args):
             "mode=compression_primary, "
             f"compression(w_com)={float(args.w_com):.6g}, "
             f"geometry(cp_lambda_geom)={float(args.cp_lambda_geom):.6g}, "
+            f"geometry_backward_scale={float(getattr(args, 'cp_geometry_backward_scale', 1.0)):.6g}, "
             f"geometry_tau(cp_tau_geom)={float(getattr(args, 'cp_tau_geom', 0.0)):.6g}"
         )
         writer.write(
@@ -228,10 +229,17 @@ def log_runtime_setup(writer, args):
         writer.write(
             "Compression Primary Geometry: "
             f"lambda={float(getattr(args, 'cp_lambda_geom', 1.0)):.6g}, "
+            f"backward_scale={float(getattr(args, 'cp_geometry_backward_scale', 1.0)):.6g}, "
             f"tau={float(getattr(args, 'cp_tau_geom', 0.0)):.6g}, "
             f"aux_ratio_cap={float(getattr(args, 'compression_primary_aux_target_ratio', 0.25)):.6g}"
         )
     if str(getattr(args, "heuristic_guidance_mode", "")).strip().lower() == "ana_den6_online":
+        writer.write(
+            "Factorized Exploration: "
+            f"enabled={bool(getattr(args, 'heuristic_guidance_online_factorized_exploration', True))}, "
+            "simultaneous_add_prune_adjust_where="
+            f"{bool(getattr(args, 'heuristic_guidance_online_simultaneous_operation_exploration', True))}"
+        )
         writer.write(
             "Network Pool Autonomy: "
             f"start={float(getattr(args, 'heuristic_guidance_network_residual_weight', 0.05)):.6g}, "

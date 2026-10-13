@@ -4295,8 +4295,21 @@ class StructureRepairActuator(nn.Module):
         )
 
     def _select_den6_factorized_exploration_group(self, confidence_audit):
-        """Choose one uncertain decision group without an Episode schedule."""
+        """Choose an uncertain decision family without an Episode schedule.
+
+        Add/Prune/Adjust candidate locations share one behavioural exploration
+        step when requested. The internal UCB group is retained for evidence
+        accounting, but no longer creates three long operation-specific waves.
+        """
         groups = ("AddWhere", "PruneWhere", "AdjustWhere", "Amount", "Gate", "Fine")
+        simultaneous_where = bool(getattr(
+            self.args,
+            "heuristic_guidance_online_simultaneous_operation_exploration",
+            False,
+        ))
+
+        def behavior_group(group):
+            return "WhereAll" if simultaneous_where and group in groups[:3] else group
         if not bool(getattr(self, "training", False)):
             return "none"
         if not bool(getattr(
@@ -4332,7 +4345,7 @@ class StructureRepairActuator(nn.Module):
                 self._den6_factorized_group_counts[group] = int(
                     self._den6_factorized_group_counts.get(group, 0)
                 ) + 1
-                return group
+                return behavior_group(group)
             pending.pop(frame_codec_key, None)
         scale = max(float(getattr(
             self.args, "heuristic_guidance_online_factorized_ucb_scale", 0.25
@@ -4480,11 +4493,12 @@ class StructureRepairActuator(nn.Module):
         counts[selected] = int(counts.get(selected, 0)) + 1
         self._den6_last_factorized_group_scores = {
             "selected": str(selected),
+            "behavior_group": str(behavior_group(selected)),
             "where_share": float(where_share),
             "where_target": float(desired_where_share),
             "groups": score_audit,
         }
-        return selected
+        return behavior_group(selected)
 
     def _complete_den6_pending_matched_group(self, frame_codec_key, anchor_key):
         """Release one consumed same-frame counterfactual anchor."""
@@ -5637,7 +5651,7 @@ class StructureRepairActuator(nn.Module):
                     and (
                         not factorized_behavior
                         or factorized_exploration_group in {
-                            "all", f"{operation}Where"
+                            "all", "WhereAll", f"{operation}Where"
                         }
                     )
                 )
@@ -6025,7 +6039,7 @@ class StructureRepairActuator(nn.Module):
                 and (
                     not factorized_behavior
                     or factorized_exploration_group in {
-                        "all", f"{operation}Where"
+                        "all", "WhereAll", f"{operation}Where"
                     }
                 )
             )
@@ -6994,7 +7008,11 @@ class StructureRepairActuator(nn.Module):
             + float(effective_actor_proxy_weight) * actor_proxy_loss
         )
         if factorized_actual_credit and factorized_exploration_group != "all":
-            if factorized_exploration_group.endswith("Where"):
+            if factorized_exploration_group == "WhereAll":
+                policy_log_prob = torch.stack(tuple(
+                    where_log_prob_by_operation[name] for name in operations
+                )).mean()
+            elif factorized_exploration_group.endswith("Where"):
                 explored_operation = factorized_exploration_group[:-5]
                 policy_log_prob = where_log_prob_by_operation[explored_operation]
             elif factorized_exploration_group == "Amount":
@@ -7013,7 +7031,11 @@ class StructureRepairActuator(nn.Module):
         # outcome existed.  Amount already has Gumbel sampling and Gate is
         # trained from repeated-frame Actual credit, so neither needs an
         # artificial uniform target.
-        if factorized_actual_credit and factorized_exploration_group.endswith("Where"):
+        if factorized_actual_credit and factorized_exploration_group == "WhereAll":
+            policy_entropy = torch.stack(tuple(
+                candidate_entropy_by_operation[name] for name in operations
+            )).mean()
+        elif factorized_actual_credit and factorized_exploration_group.endswith("Where"):
             entropy_operation = factorized_exploration_group[:-5]
             policy_entropy = candidate_entropy_by_operation[entropy_operation]
         else:

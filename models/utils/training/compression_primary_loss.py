@@ -375,7 +375,18 @@ def build_compression_primary_loss(
     sf_repair = float(stage_factors.get("repair", 1.0)) if use_stage else 1.0
 
     main_block = sf_com * L_com_primary
-    geom_block = sf_geom * float(getattr(args, "cp_lambda_geom", 1.0)) * P_geom
+    geom_block_raw = sf_geom * float(getattr(args, "cp_lambda_geom", 1.0)) * P_geom
+    # Keep the declared RD objective (and every logged forward value) intact,
+    # while calibrating its backward magnitude independently.  The latest
+    # real-step probe measured geometry/compression parameter-gradient L2 as
+    # 2.56117/0.193396=13.24, so 0.0755 equalises those two primary sources.
+    geom_backward_scale = max(float(getattr(
+        args, "cp_geometry_backward_scale", 1.0
+    )), 0.0)
+    geom_block = (
+        geom_block_raw.detach()
+        + float(geom_backward_scale) * (geom_block_raw - geom_block_raw.detach())
+    )
     single_block = sf_com * single_weight_effective * P_single
     node_block = sf_com * node_weight_effective * P_nodes
     sparsepcgc_block = sf_com * float(getattr(args, "cp_lambda_sparsepcgc", 1.0)) * P_sparsepcgc
@@ -424,7 +435,10 @@ def build_compression_primary_loss(
     # ReLUのactive領域ではこれがdL/dL_geomの厳密な局所値。
     # autograd.gradを追加実行せず、毎Stepの幾何勾配強度を監査できる。
     geom_scalar_grad_scale = (
-        aux_balance_scale * sf_geom * float(getattr(args, "cp_lambda_geom", 1.0))
+        aux_balance_scale
+        * sf_geom
+        * float(getattr(args, "cp_lambda_geom", 1.0))
+        * float(geom_backward_scale)
         if geom_active else 0.0
     )
 
@@ -438,7 +452,8 @@ def build_compression_primary_loss(
         "cp_geom_loss_raw": case_float(as_scalar_loss_tensor(L_geom), float("nan")),
         "cp_geom_tau": float(getattr(args, "cp_tau_geom", 0.0)),
         "cp_geom_lambda": float(getattr(args, "cp_lambda_geom", 1.0)),
-        "cp_geom_block_raw": case_float(geom_block, float("nan")),
+        "cp_geom_backward_scale": float(geom_backward_scale),
+        "cp_geom_block_raw": case_float(geom_block_raw, float("nan")),
         "cp_geom_block_scaled": case_float(
             aux_balance_scale * geom_block, float("nan")
         ),
