@@ -1923,11 +1923,12 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     parser.add_argument(
         '--cp_geometry_backward_scale',
-        default=0.0755,
+        default=0.036,
         type=float,
         help=(
             'cp_lambda_geomによるforward損失値を変えず、幾何primaryのbackwardだけを'
-            '倍率調整する。0.0755は最新実Stepの圧縮/幾何gradient L2比で校正'
+            '倍率調整する。0.036はauxの固定25%化を解除した実効scale=1で、'
+            '圧縮/幾何gradient L2が同程度になるよう実Stepから校正'
         ),
     )
     parser.add_argument(
@@ -1944,7 +1945,16 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--cp_lambda_actuator', default=0.05, type=float, help='compression_primaryのactuator safety penalty重み')
     parser.add_argument('--cp_lambda_sparsepcgc', default=0.0, type=float, help='compression_primaryのSparsePCGC soft aux safety penalty重み')
     parser.add_argument('--cp_lambda_op', default=0.0, type=float, help='compression_primaryのoperation safety penalty重み(現状は実験用、default無効)')
-    parser.add_argument('--compression_primary_aux_target_ratio', default=0.25, type=float, help='compression_primary内部のsupport blockを|main|に対してどこまで許すかの比率上限')
+    parser.add_argument(
+        '--compression_primary_aux_target_ratio',
+        default=0.75,
+        type=float,
+        help=(
+            'compression_primary内部support blockの|main|に対する上限。'
+            '通常の幾何block比(約0.5)より上に置き、毎Stepの全体損失が'
+            '圧縮損失の固定倍率へ潰れるのを防ぐ'
+        ),
+    )
     parser.add_argument('--compression_primary_aux_balance_min_scale', default=0.0, type=float, help='compression_primary内部support blockの最小scale')
     parser.add_argument('--compression_primary_aux_balance_max_scale', default=1.0, type=float, help='compression_primary内部support blockの最大scale')
     parser.add_argument('--compression_primary_tail_target_ratio', default=0.40, type=float, help='compression_primary終盤で加えるattr/policy/actuator/correction support blockを|main|に対してどこまで許すかの比率上限')
@@ -2560,6 +2570,15 @@ def parse_pugan_args(parser, file_day, file_time):
         default=0.10,
         type=float,
         help='local RD Critic順位をActorへ伝える補助損失。Heuristic順位は教師にしない',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_local_geometry_weight',
+        default=0.50,
+        type=float,
+        help=(
+            'candidate/Gate/Amount/Fineのlocal RD教師に使う標準化geometry-risk重み。'
+            '全体損失のaux上限とは独立に設定する'
+        ),
     )
     parser.add_argument(
         '--heuristic_guidance_online_plan_critic_weight', default=0.10, type=float,
@@ -4671,6 +4690,9 @@ def parse_pugan_args(parser, file_day, file_time):
     args.heuristic_guidance_online_actor_geometry_proxy_scale = min(max(float(getattr(
         args, "heuristic_guidance_online_actor_geometry_proxy_scale", 0.25
     )), 0.0), 1.0)
+    args.heuristic_guidance_online_local_geometry_weight = max(float(getattr(
+        args, "heuristic_guidance_online_local_geometry_weight", 0.50
+    )), 0.0)
     args.heuristic_guidance_online_actor_use_rank_feature = bool(getattr(
         args, "heuristic_guidance_online_actor_use_rank_feature", False
     ))

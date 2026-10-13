@@ -978,10 +978,15 @@ class Network(nn.Module):
         )
         if not torch.is_tensor(changed_ratio):
             changed_ratio = objective.new_tensor(float(changed_ratio))
+        actor_compression_weight = max(float(getattr(
+            self.args, "w_com", 1.0
+        )), 0.0)
+        actor_geometry_weight = max(float(getattr(
+            self.args, "cp_lambda_geom", 1.0
+        )), 0.0)
         actor_rd_target = (
-            objective.detach()
-            + max(float(getattr(self.args, "cp_lambda_geom", 1.0)), 0.0)
-            * geometry_penalty.detach()
+            float(actor_compression_weight) * objective.detach()
+            + float(actor_geometry_weight) * geometry_penalty.detach()
             + max(float(getattr(
                 self.args, "heuristic_guidance_online_edit_tiebreak_weight", 0.0
             )), 0.0) * changed_ratio.detach().float().mean()
@@ -2772,6 +2777,8 @@ class Network(nn.Module):
             "policy_core_weighted": float(policy_core_weighted.detach().cpu()),
             "selection_mode": str(selection_mode),
             "actor_rd_target": float(actor_rd_target.detach().cpu()),
+            "actor_rd_compression_weight": float(actor_compression_weight),
+            "actor_rd_geometry_weight": float(actor_geometry_weight),
             "plan_critic_value": float(
                 plan_critic_value.detach().float().mean().cpu()
             ) if torch.is_tensor(plan_critic_value) else 0.0,

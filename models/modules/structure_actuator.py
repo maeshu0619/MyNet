@@ -6787,14 +6787,14 @@ class StructureRepairActuator(nn.Module):
                     torch.finfo(value.dtype).eps
                 )
 
-            local_geometry_weight = (
-                max(float(getattr(
-                    self.args, "compression_primary_aux_target_ratio", 0.25
-                )), 0.0)
-                * max(float(getattr(
-                    self.args, "rd_geometry_weight_multiplier", 1.25
-                )), 0.0)
-            )
+            # Candidate RD must not inherit the *safety cap* used to bound the
+            # scalar training loss.  Coupling these values made changing the
+            # plotted loss mixture silently change every action target.
+            local_geometry_weight = max(float(getattr(
+                self.args, "heuristic_guidance_online_local_geometry_weight", 0.50
+            )), 0.0) * max(float(getattr(
+                self.args, "rd_geometry_weight_multiplier", 1.0
+            )), 0.0)
             global_utility = (
                 _global_standardize(all_rate)
                 - float(local_geometry_weight) * _global_standardize(all_geometry)
@@ -6992,12 +6992,12 @@ class StructureRepairActuator(nn.Module):
         actor_proxy_loss = (
             candidate_local_loss
             + float(candidate_pairwise_weight) * candidate_pairwise_loss
-            + max(float(getattr(
-                self.args,
-                "heuristic_guidance_online_actor_critic_distill_weight",
-                0.10,
-            )), 0.0) * candidate_actor_critic_loss
         )
+        actor_critic_distill_weight = max(float(getattr(
+            self.args,
+            "heuristic_guidance_online_actor_critic_distill_weight",
+            0.10,
+        )), 0.0)
         # The proxy observes every candidate before any action is executed.  It
         # is useful for a low-variance Critic, but directly teaching the Actor
         # made it reproduce that ordering within E1.  Actor proxy imitation is
@@ -7006,6 +7006,7 @@ class StructureRepairActuator(nn.Module):
         candidate_local_credit_loss = (
             candidate_critic_loss
             + float(effective_actor_proxy_weight) * actor_proxy_loss
+            + float(actor_critic_distill_weight) * candidate_actor_critic_loss
         )
         if factorized_actual_credit and factorized_exploration_group != "all":
             if factorized_exploration_group == "WhereAll":

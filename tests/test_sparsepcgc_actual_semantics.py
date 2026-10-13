@@ -1226,6 +1226,58 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         # must increase.  Clamping this positive EMA to zero flips the sign.
         self.assertLess(float(step(0.032)), 0.0)
 
+    def test_actual_actor_rd_uses_declared_compression_weight(self):
+        network = Network.__new__(Network)
+        torch.nn.Module.__init__(network)
+        network.args = SimpleNamespace(
+            heuristic_guidance_mode="ana_den6_online",
+            heuristic_guidance_online_selection_mode="prior_residual",
+            _current_input_file="/dataset/longdress/frame_0001.ply",
+            sparsepcgc_scale_ae=0,
+            sparsepcgc_scale_sr=2,
+            sparsepcgc_scale_m=8,
+            w_com=3.0,
+            cp_lambda_geom=150.0,
+            cp_tau_geom=0.0,
+            heuristic_guidance_online_edit_tiebreak_weight=0.0,
+            heuristic_guidance_online_policy_weight=1.0,
+            heuristic_guidance_online_global_actual_credit_weight=1.0,
+            heuristic_guidance_online_entropy_weight=0.0,
+            heuristic_guidance_online_geometry_policy_weight=0.0,
+            heuristic_guidance_online_efficiency_policy_weight=0.0,
+            heuristic_guidance_online_reward_ema=0.1,
+            heuristic_guidance_online_policy_backward_scale=1.0,
+        )
+        network._den6_online_objective_baseline = __import__(
+            "collections"
+        ).OrderedDict()
+
+        def step(compression, geometry):
+            log_prob = torch.tensor(0.0, requires_grad=True)
+            network.last_actuator_voxel_state = {
+                "den6_online_policy_log_prob": log_prob,
+                "den6_online_policy_entropy": log_prob.new_zeros(()),
+                "ana_den6_exact_residual_plan_debug": {
+                    "factorized_exploration_group": "Amount",
+                    "network_plan_confidence": 1.0,
+                },
+            }
+            loss = network.discrete_policy_loss(
+                torch.tensor(float(compression)),
+                geometry=torch.tensor(float(geometry)),
+            )
+            return torch.autograd.grad(loss, log_prob)[0]
+
+        self.assertEqual(float(step(-3.8, 0.033)), 0.0)
+        # Compression improves by 0.1 percentage point while geometry worsens
+        # by 0.001.  With the declared 3:150 objective this is an RD gain
+        # (-0.30 + 0.15); the old unweighted Actor formula flipped the sign.
+        self.assertLess(float(step(-3.9, 0.034)), 0.0)
+        self.assertEqual(
+            network.last_discrete_policy_debug["actor_rd_compression_weight"],
+            3.0,
+        )
+
     def test_edit_efficiency_direct_gradient_active_after_exploration(self):
         network = Network.__new__(Network)
         torch.nn.Module.__init__(network)

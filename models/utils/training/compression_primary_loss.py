@@ -378,8 +378,9 @@ def build_compression_primary_loss(
     geom_block_raw = sf_geom * float(getattr(args, "cp_lambda_geom", 1.0)) * P_geom
     # Keep the declared RD objective (and every logged forward value) intact,
     # while calibrating its backward magnitude independently.  The latest
-    # real-step probe measured geometry/compression parameter-gradient L2 as
-    # 2.56117/0.193396=13.24, so 0.0755 equalises those two primary sources.
+    # real-step probes calibrate this after the support balance.  Keeping it
+    # separate from the forward coefficient lets geometry remain visible in
+    # the reported objective without overwhelming parameter updates.
     geom_backward_scale = max(float(getattr(
         args, "cp_geometry_backward_scale", 1.0
     )), 0.0)
