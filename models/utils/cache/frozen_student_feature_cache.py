@@ -52,9 +52,10 @@ def _array_checksum(metadata: Mapping[str, object], arrays: Mapping[str, np.ndar
 
 
 class FrozenStudentFeatureCache:
-    def __init__(self, root: str):
+    def __init__(self, root: str, *, compressed: bool = True):
         self.root = Path(root).expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True)
+        self.compressed = bool(compressed)
 
     def path_for(self, fingerprint: Mapping[str, object]) -> Path:
         return self.root / ("student_features_" + str(fingerprint["fingerprint_sha256"]) + ".npz")
@@ -79,7 +80,8 @@ class FrozenStudentFeatureCache:
             temporary = Path(temporary_name)
             try:
                 with temporary.open("wb") as stream:
-                    np.savez_compressed(
+                    writer = np.savez_compressed if self.compressed else np.savez
+                    writer(
                         stream,
                         metadata_json=np.asarray(json.dumps(metadata, sort_keys=True)),
                         payload_sha256=np.asarray(checksum),

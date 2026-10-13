@@ -365,8 +365,10 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--point_transformer_feature_warmup_steps', default=0, type=int, help='Point Transformer residualのwarmup Step数。0なら探索schedule全体へ自動追従する')
     parser.add_argument('--point_transformer_feature_lr_scale', default=0.1, type=float, help='Point Transformer Adapter/Gate専用LRのmain LRに対する倍率')
     parser.add_argument('--point_transformer_feature_cache', default=True, type=str2bool, help='固定Point Transformerのcoarse特徴とVoxel対応をCPUへキャッシュする')
-    parser.add_argument('--point_transformer_feature_cache_max_entries', default=16, type=int, help='固定Point Transformer特徴CPUキャッシュの最大frame数')
-    parser.add_argument('--point_transformer_feature_cache_max_memory_mb', default=128, type=int, help='固定Point Transformer特徴CPUキャッシュの上限MB')
+    parser.add_argument('--point_transformer_feature_cache_max_entries', default=16, type=int, help='固定Point Transformer特徴RAM cacheの最大frame数。全件保持はせず共有RAMを圧迫しない')
+    parser.add_argument('--point_transformer_feature_cache_max_memory_mb', default=128, type=int, help='固定Point Transformer特徴RAM cacheの上限MB。元dtypeを保持してcache hit時も同一数値を返す')
+    parser.add_argument('--point_transformer_feature_disk_cache', default=True, type=str2bool, help='固定Point Transformer特徴を重みfingerprint付きで永続化し、次Episode以降のGPU Encoder再計算を省く')
+    parser.add_argument('--point_transformer_feature_disk_cache_dir', default=str((_DATA_ROOT / 'cache' / 'point_transformer_features').resolve()), type=str, help='固定Point Transformer特徴disk cacheの保存先')
     parser.add_argument(
         '--full_cloud_anchor_allow_grad',
         default=False,
@@ -3414,7 +3416,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--compression_good_step_extra_surrogate_steps', default=4, type=int, help='実bit改善stepをSurrogateへ追加fitするstep数')
     parser.add_argument('--loss_grad_probe_enabled', default=False, type=str2bool, help='損失項ごとのmodule/操作別勾配CSVを出力するか')
     parser.add_argument('--loss_grad_probe_interval', default=1, type=int, help='損失項ごとの勾配CSVを何stepごとに出すか')
-    parser.add_argument('--step_grad_log', default=True, type=str2bool, help='train.py内蔵の損失項ごとのmodule/操作別勾配CSVを出力するか')
+    parser.add_argument('--step_grad_log', default=False, type=str2bool, help='train.py内蔵の損失項ごとのmodule/操作別勾配CSVを出力するか。複数回のautograd.gradが必要な診断専用のため既定はFalse')
     parser.add_argument('--step_grad_log_interval', default=50, type=int, help='train.py内蔵step_grad CSVを何stepごとに出すか')
     parser.add_argument('--step_grad_first_step_only', default=False, type=str2bool, help='step_grad CSVをglobal_step=0だけに制限するか')
     parser.add_argument('--compression_bad_step_penalty_scale', default=1.25, type=float, help='実bit悪化stepの主圧縮勾配倍率')
@@ -3428,7 +3430,7 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--sparsepcgc_add_use_candidate_score', default=True, type=str2bool, help='SparsePCGC Add実験で既存candidate scoreを使うか')
     parser.add_argument('--sparsepcgc_move_existing_target_only', default=False, type=str2bool, help='SparsePCGCでmove targetを既存occupied voxelへ寄せる旧実験設定。点潰れを避けるため既定ではFalse')
     parser.add_argument('--sparsepcgc_move_source_prior_weight', default=0.55, type=float, help='SparsePCGC時に原因診断scoreからAdjust source候補を起こす補助重み')
-    parser.add_argument('--enable_voxel_collision_log', default=True, type=str2bool, help='SparsePCGC互換量子化後のVoxel衝突率ログを有効化する')
+    parser.add_argument('--enable_voxel_collision_log', default=False, type=str2bool, help='SparsePCGC互換量子化後のVoxel衝突率ログを有効化する。全点uniqueを3経路で再計算する診断専用のため既定はFalse')
     parser.add_argument('--voxel_collision_log_interval', default=1, type=int, help='Voxel衝突率ログを記録するStep間隔')
     parser.add_argument('--voxel_collision_max_points', default=300000, type=int, help='Voxel衝突率ログで1点群あたり処理する最大点数。超過時は間引く')
     parser.add_argument('--voxel_collision_log_first_batch_only', default=True, type=str2bool, help='Voxel衝突率ログをBatch先頭だけに制限する')
@@ -5441,7 +5443,7 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     args.loss_grad_probe_enabled = bool(getattr(args, "loss_grad_probe_enabled", False))
     args.loss_grad_probe_interval = max(int(getattr(args, "loss_grad_probe_interval", 1)), 0)
-    args.step_grad_log = bool(getattr(args, "step_grad_log", True))
+    args.step_grad_log = bool(getattr(args, "step_grad_log", False))
     args.step_grad_log_interval = max(int(getattr(args, "step_grad_log_interval", 1)), 1)
     args.step_grad_first_step_only = bool(getattr(args, "step_grad_first_step_only", True))
     args.skip_optimizer_on_nonfinite_grad = bool(getattr(args, "skip_optimizer_on_nonfinite_grad", True))
@@ -7343,11 +7345,17 @@ def parse_pugan_args(parser, file_day, file_time):
         args, "point_transformer_feature_cache", True
     ))
     args.point_transformer_feature_cache_max_entries = max(int(getattr(
-        args, "point_transformer_feature_cache_max_entries", 64
+        args, "point_transformer_feature_cache_max_entries", 16
     )), 0)
     args.point_transformer_feature_cache_max_memory_mb = max(int(getattr(
-        args, "point_transformer_feature_cache_max_memory_mb", 512
+        args, "point_transformer_feature_cache_max_memory_mb", 128
     )), 0)
+    args.point_transformer_feature_disk_cache = bool(getattr(
+        args, "point_transformer_feature_disk_cache", True
+    ))
+    args.point_transformer_feature_disk_cache_dir = str(getattr(
+        args, "point_transformer_feature_disk_cache_dir", ""
+    )).strip()
     args.allow_slow_knn_fallback = bool(getattr(args, "allow_slow_knn_fallback", False))
 
     args.patch_parallel_mode = str(args.patch_parallel_mode).strip().lower()
@@ -7535,7 +7543,7 @@ def parse_pugan_args(parser, file_day, file_time):
         max(float(getattr(args, "sparsepcgc_move_source_prior_weight", 0.55)), 0.0),
         1.0,
     )
-    args.enable_voxel_collision_log = bool(getattr(args, "enable_voxel_collision_log", True))
+    args.enable_voxel_collision_log = bool(getattr(args, "enable_voxel_collision_log", False))
     args.voxel_collision_log_interval = max(int(getattr(args, "voxel_collision_log_interval", 1)), 1)
     args.voxel_collision_max_points = max(int(getattr(args, "voxel_collision_max_points", 300000)), 0)
     args.voxel_collision_log_first_batch_only = bool(getattr(args, "voxel_collision_log_first_batch_only", True))

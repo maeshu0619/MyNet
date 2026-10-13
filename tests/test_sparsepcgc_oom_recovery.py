@@ -38,6 +38,7 @@ class SparsePCGCOOMRecoveryTest(unittest.TestCase):
             sparsepcgc_gpu_wait_interval=0.1,
             sparsepcgc_oom_retry_count=2,
             sparsepcgc_auto_cpu_fallback=False,
+            sparsepcgc_host_min_available_mb=0,
         )
         encoder.writer = Mock()
         encoder._request_id = 0

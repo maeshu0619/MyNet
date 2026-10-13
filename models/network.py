@@ -1,4 +1,6 @@
 import hashlib
+import json
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -18,7 +20,10 @@ from .utils.pointcloud.sparsepcgc_voxel import (
     restore_points_from_voxel_coords,
 )
 from .utils.pointcloud.ana_den6_reference import attach_ana_den6_reference_anchor
-from .utils.pointcloud.ana_den6_online import attach_ana_den6_online_guidance
+from .utils.pointcloud.ana_den6_online import (
+    _sha256_file as _ana_den6_sha256_file,
+    attach_ana_den6_online_guidance,
+)
 from .modules.heuristic_guidance import build_heuristic_guidance, release_exact_guidance_cache
 from .modules.cause_aggregation import CauseDiagnosisAggregation
 from .modules.cost_attribution import CAUSE_NAMES, CostAttributionModule
@@ -32,6 +37,7 @@ from .modules.fast_heuristic_emulator import FastHeuristicEmulator
 from .utils.loss.k_proposal_distillation import KProposalSetLoss
 from .utils.loss.single_plan_distillation import SinglePlanDistillationLoss
 from .utils.training.saved_tensor_offload import selective_saved_tensor_cpu_offload
+from .utils.cache.frozen_student_feature_cache import FrozenStudentFeatureCache
 
 
 class Network(nn.Module):
@@ -64,6 +70,11 @@ class Network(nn.Module):
         self._point_transformer_feature_cache_hits = 0
         self._point_transformer_feature_cache_misses = 0
         self._point_transformer_feature_cache_working_set_bypassed = 0
+        self._point_transformer_feature_disk_cache = None
+        self._point_transformer_feature_disk_hits = 0
+        self._point_transformer_feature_disk_misses = 0
+        self._point_transformer_feature_disk_writes = 0
+        self._point_transformer_encoder_state_sha256 = None
         self.expected_input_cache_entries = 0 # 想定されるキャッシュ数を初期化
         self.debug_tensors = {} # デバッグ用のテンソルを保存
         self.last_structure_debug = {} # 直近Forward時の構造診断デバッグ情報を保存する辞書の初期化
@@ -325,6 +336,15 @@ class Network(nn.Module):
             "point_transformer_working_set_bypassed": int(getattr(
                 self, "_point_transformer_feature_cache_working_set_bypassed", 0
             )),
+            "point_transformer_disk_hits": int(getattr(
+                self, "_point_transformer_feature_disk_hits", 0
+            )),
+            "point_transformer_disk_misses": int(getattr(
+                self, "_point_transformer_feature_disk_misses", 0
+            )),
+            "point_transformer_disk_writes": int(getattr(
+                self, "_point_transformer_feature_disk_writes", 0
+            )),
         }
 
     def set_expected_input_cache_entries(self, total_entries): # 想定されるキャッシュ件数を設定する関数
@@ -533,6 +553,15 @@ class Network(nn.Module):
     def _point_transformer_cache_key(self, cache_key, source, batch_index, point_count):
         if not cache_key:
             return ""
+        input_sha256 = ""
+        input_file = str(getattr(self.args, "_current_input_file", "") or "").strip()
+        if input_file:
+            try:
+                input_path = Path(input_file).expanduser().resolve()
+                if input_path.is_file():
+                    input_sha256 = _ana_den6_sha256_file(input_path)
+            except (OSError, ValueError):
+                input_sha256 = ""
         return "|".join((
             "frozen_point_transformer_node_v1",
             str(cache_key),
@@ -544,19 +573,118 @@ class Network(nn.Module):
             str(getattr(self.args, "encoder_pre_downsample_max_points", 8192)),
             str(getattr(self.args, "encoder_raw_downsample_factor", 10.0)),
             str(getattr(self.args, "out_dim", 64)),
+            str(input_sha256),
         ))
 
-    def _get_point_transformer_feature_cache(self, key, device, dtype):
+    def _point_transformer_encoder_fingerprint(self):
+        cached = getattr(self, "_point_transformer_encoder_state_sha256", None)
+        if cached:
+            return str(cached)
+        digest = hashlib.sha256(b"mynet_point_transformer_node_features_v2")
+        for name, value in sorted(self.encoder.state_dict().items()):
+            tensor = value.detach().cpu().contiguous()
+            digest.update(str(name).encode("utf-8"))
+            digest.update(str(tensor.dtype).encode("ascii"))
+            digest.update(str(tuple(tensor.shape)).encode("ascii"))
+            try:
+                digest.update(tensor.numpy().tobytes(order="C"))
+            except TypeError:
+                digest.update(tensor.float().numpy().tobytes(order="C"))
+        cached = digest.hexdigest()
+        self._point_transformer_encoder_state_sha256 = cached
+        return cached
+
+    def _point_transformer_disk_fingerprint(self, key):
+        value = {
+            "schema_version": "mynet_point_transformer_node_features_v2",
+            "cache_key": str(key),
+            "encoder_state_sha256": self._point_transformer_encoder_fingerprint(),
+        }
+        encoded = json.dumps(
+            value, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        value["fingerprint_sha256"] = hashlib.sha256(encoded).hexdigest()
+        return value
+
+    def _point_transformer_disk_cache(self):
+        if not bool(getattr(
+            self.args, "point_transformer_feature_disk_cache", True
+        )):
+            return None
+        cache = getattr(self, "_point_transformer_feature_disk_cache", None)
+        if cache is None:
+            root = str(getattr(
+                self.args, "point_transformer_feature_disk_cache_dir", ""
+            )).strip()
+            if not root:
+                return None
+            # These entries are read on every later Episode.  Uncompressed NPZ
+            # is exact and substantially cheaper to write/read; /data has ample
+            # capacity, while compressing 400 large index arrays wastes CPU.
+            cache = FrozenStudentFeatureCache(root, compressed=False)
+            self._point_transformer_feature_disk_cache = cache
+        return cache
+
+    def _load_point_transformer_feature_disk_cache(self, key):
+        cache = self._point_transformer_disk_cache()
+        if cache is None:
+            return None
+        fingerprint = self._point_transformer_disk_fingerprint(key)
+        try:
+            tensors = cache.load(fingerprint)
+        except FileNotFoundError:
+            self._point_transformer_feature_disk_misses += 1
+            return None
+        coarse_fused = tensors.get("coarse_fused")
+        full_to_coarse_idx = tensors.get("full_to_coarse_idx")
+        if (
+            not torch.is_tensor(coarse_fused)
+            or not torch.is_tensor(full_to_coarse_idx)
+            or coarse_fused.ndim != 3
+            or full_to_coarse_idx.ndim != 1
+            or not coarse_fused.is_floating_point()
+        ):
+            raise RuntimeError(
+                "Point Transformer feature disk cache has invalid tensors"
+            )
+        self._point_transformer_feature_disk_hits += 1
+        return {
+            "coarse_fused": coarse_fused.contiguous(),
+            "full_to_coarse_idx": full_to_coarse_idx.to(
+                dtype=torch.int32
+            ).contiguous(),
+            "coarse_count": int(coarse_fused.shape[-1]),
+        }
+
+    def _write_point_transformer_feature_disk_cache(
+        self, key, coarse_fused, full_to_coarse_idx
+    ):
+        cache = self._point_transformer_disk_cache()
+        if cache is None:
+            return
+        fingerprint = self._point_transformer_disk_fingerprint(key)
+        cache.write(fingerprint, {
+            "coarse_fused": coarse_fused.detach().cpu().contiguous(),
+            "full_to_coarse_idx": full_to_coarse_idx.detach().to(
+                device="cpu", dtype=torch.int32
+            ).contiguous(),
+        })
+        self._point_transformer_feature_disk_writes += 1
+
+    def _get_point_transformer_feature_cache(self, key, device):
         if not key or not bool(getattr(self.args, "point_transformer_feature_cache", True)):
             return None
         entry = self.point_transformer_feature_cache.get(key)
-        if not isinstance(entry, dict):
-            self._point_transformer_feature_cache_misses += 1
-            return None
-        self.point_transformer_feature_cache.move_to_end(key)
-        self._point_transformer_feature_cache_hits += 1
+        if isinstance(entry, dict):
+            self.point_transformer_feature_cache.move_to_end(key)
+            self._point_transformer_feature_cache_hits += 1
+        else:
+            entry = self._load_point_transformer_feature_disk_cache(key)
+            if not isinstance(entry, dict):
+                self._point_transformer_feature_cache_misses += 1
+                return None
         return {
-            "coarse_fused": entry["coarse_fused"].to(device=device, dtype=dtype),
+            "coarse_fused": entry["coarse_fused"].to(device=device),
             "full_to_coarse_idx": entry["full_to_coarse_idx"].to(
                 device=device, dtype=torch.long
             ),
@@ -575,16 +703,12 @@ class Network(nn.Module):
             or not bool(getattr(self.args, "encoder_0grad", True))
         ):
             return
-        max_entries = max(int(getattr(
-            self.args, "point_transformer_feature_cache_max_entries", 64
-        )), 0)
-        max_bytes = max(int(getattr(
-            self.args, "point_transformer_feature_cache_max_memory_mb", 512
-        )), 0) * 1024 * 1024
-        if max_entries <= 0 or max_bytes <= 0:
-            return
+        # Encoder is frozen, so its exact output can be reused across Episodes.
+        # Preserve the source dtype: float16 compression changed the adapter
+        # input on a cache hit and therefore was not a computation-only cache.
+        # Build each CPU payload once and share it between disk and RAM cache.
         cached_feature = coarse_fused.detach().to(
-            device=torch.device("cpu"), dtype=torch.float16
+            device=torch.device("cpu")
         ).contiguous()
         cached_index = full_to_coarse_idx.detach().to(
             device=torch.device("cpu"), dtype=torch.int32
@@ -593,6 +717,17 @@ class Network(nn.Module):
             int(cached_feature.numel()) * int(cached_feature.element_size())
             + int(cached_index.numel()) * int(cached_index.element_size())
         )
+        self._write_point_transformer_feature_disk_cache(
+            key, cached_feature, cached_index
+        )
+        max_entries = max(int(getattr(
+            self.args, "point_transformer_feature_cache_max_entries", 16
+        )), 0)
+        max_bytes = max(int(getattr(
+            self.args, "point_transformer_feature_cache_max_memory_mb", 128
+        )), 0) * 1024 * 1024
+        if max_entries <= 0 or max_bytes <= 0:
+            return
         if entry_bytes > max_bytes:
             return
         expected_entries = max(int(getattr(
@@ -714,7 +849,6 @@ class Network(nn.Module):
             cached = self._get_point_transformer_feature_cache(
                 feature_key,
                 node_xyz.device,
-                node_xyz.dtype,
             )
             if cached is not None:
                 coarse_fused = cached["coarse_fused"]

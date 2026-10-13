@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import tempfile
 import unittest
 
 import torch
@@ -11,6 +12,7 @@ class _FrozenEncoder(nn.Module):
     def __init__(self):
         super().__init__()
         self.calls = 0
+        self.register_buffer("cache_identity", torch.zeros(()))
 
     def forward(self, points, feat=None):
         self.calls += 1
@@ -19,7 +21,7 @@ class _FrozenEncoder(nn.Module):
         channel_offset = torch.linspace(
             0.0, 1.0, 64, device=points.device, dtype=points.dtype
         ).view(1, 64, 1)
-        fused = fused + channel_offset
+        fused = fused + channel_offset + self.cache_identity
         return fused, fused
 
 
@@ -35,6 +37,8 @@ def _network():
         point_transformer_feature_cache=True,
         point_transformer_feature_cache_max_entries=4,
         point_transformer_feature_cache_max_memory_mb=16,
+        point_transformer_feature_disk_cache=False,
+        point_transformer_feature_disk_cache_dir="",
         encoder_0grad=True,
         encoder_pre_downsample_max_points=8,
         encoder_raw_downsample_factor=2.0,
@@ -65,6 +69,11 @@ def _network():
     network._point_transformer_feature_cache_hits = 0
     network._point_transformer_feature_cache_misses = 0
     network._point_transformer_feature_cache_working_set_bypassed = 0
+    network._point_transformer_feature_disk_cache = None
+    network._point_transformer_feature_disk_hits = 0
+    network._point_transformer_feature_disk_misses = 0
+    network._point_transformer_feature_disk_writes = 0
+    network._point_transformer_encoder_state_sha256 = None
     network.input_cache = OrderedDict()
     network._input_cache_bytes = 0
     return network
@@ -139,7 +148,7 @@ class PointTransformerNodeFeatureTest(unittest.TestCase):
         )
         self.assertEqual(network.encoder.calls, 1)
         self.assertEqual(second_debug["cache_hits_this_forward"], 1)
-        self.assertTrue(torch.allclose(first.detach(), second.detach(), atol=2e-4, rtol=0.0))
+        self.assertTrue(torch.equal(first.detach(), second.detach()))
 
         # 巨大な静的Node cacheだけをbypass/clearしても、再利用可能な固定
         # Point Transformer特徴まで誤って捨てない。
@@ -152,7 +161,7 @@ class PointTransformerNodeFeatureTest(unittest.TestCase):
         )
         self.assertEqual(network.encoder.calls, 1)
         self.assertEqual(third_debug["cache_hits_this_forward"], 1)
-        self.assertTrue(torch.allclose(second.detach(), third.detach(), atol=2e-4, rtol=0.0))
+        self.assertTrue(torch.equal(second.detach(), third.detach()))
 
     def test_cache_is_bypassed_when_sequential_working_set_cannot_fit(self):
         torch.manual_seed(5)
@@ -183,6 +192,62 @@ class PointTransformerNodeFeatureTest(unittest.TestCase):
         self.assertEqual(
             network._point_transformer_feature_cache_working_set_bypassed, 2
         )
+
+    def test_disk_cache_reuses_exact_frozen_features_across_networks(self):
+        torch.manual_seed(5)
+        points = torch.stack((
+            torch.arange(16, dtype=torch.float32),
+            torch.zeros(16),
+            torch.zeros(16),
+        )).unsqueeze(0)
+        counts = torch.tensor([16])
+        with tempfile.TemporaryDirectory() as directory:
+            first_network = _network()
+            first_network.args.point_transformer_feature_disk_cache = True
+            first_network.args.point_transformer_feature_disk_cache_dir = directory
+            first, _ = first_network._point_transformer_features_for_nodes(
+                points,
+                counts,
+                cache_key="frame0.ply",
+                source="full_octree_context",
+            )
+            self.assertEqual(first_network.encoder.calls, 1)
+            self.assertEqual(
+                first_network.input_cache_stats()["point_transformer_disk_writes"],
+                1,
+            )
+
+            torch.manual_seed(5)
+            second_network = _network()
+            second_network.args.point_transformer_feature_disk_cache = True
+            second_network.args.point_transformer_feature_disk_cache_dir = directory
+            second, debug = second_network._point_transformer_features_for_nodes(
+                points,
+                counts,
+                cache_key="frame0.ply",
+                source="full_octree_context",
+            )
+            self.assertEqual(second_network.encoder.calls, 0)
+            self.assertEqual(debug["cache_hits_this_forward"], 1)
+            self.assertEqual(
+                second_network.input_cache_stats()["point_transformer_disk_hits"],
+                1,
+            )
+            self.assertTrue(torch.equal(first.detach(), second.detach()))
+
+            third_network = _network()
+            third_network.load_state_dict(first_network.state_dict(), strict=False)
+            third_network.args.point_transformer_feature_disk_cache = True
+            third_network.args.point_transformer_feature_disk_cache_dir = directory
+            third_network.encoder.cache_identity.fill_(1.0)
+            third, _ = third_network._point_transformer_features_for_nodes(
+                points,
+                counts,
+                cache_key="frame0.ply",
+                source="full_octree_context",
+            )
+            self.assertEqual(third_network.encoder.calls, 1)
+            self.assertFalse(torch.equal(first.detach(), third.detach()))
 
 
 if __name__ == "__main__":

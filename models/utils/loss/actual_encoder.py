@@ -630,17 +630,18 @@ class _SparsePCGCActualEncoder:
         return float("inf")
 
     def _wait_for_host_capacity(self, reason):
-        minimum_mb = max(int(getattr(
+        configured_minimum_mb = max(int(getattr(
             self.args, "sparsepcgc_host_min_available_mb", 8192
         )), 0)
+        if configured_minimum_mb <= 0:
+            return
+        minimum_mb = configured_minimum_mb
         if str(reason) == "worker_init":
             # The persistent worker itself settles near 6 GiB RSS in the
             # measured dense-lossy configuration.  Keep one additional worker
             # footprint available before spawning it; subsequent requests use
             # the configured steady-state margin.
             minimum_mb = max(minimum_mb, 12288)
-        if minimum_mb <= 0:
-            return
         timeout = max(float(getattr(
             self.args, "sparsepcgc_host_wait_timeout", 600.0
         )), 0.0)

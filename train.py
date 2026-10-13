@@ -5108,6 +5108,9 @@ def train(model, args, loss, writer, plot, notifier=None):
                         f"point_transformer_hits={int(static_node_cache.get('point_transformer_hits', 0) or 0)}, "
                         f"point_transformer_misses={int(static_node_cache.get('point_transformer_misses', 0) or 0)}, "
                         f"point_transformer_working_set_bypassed={int(static_node_cache.get('point_transformer_working_set_bypassed', 0) or 0)})"
+                        f", point_transformer_disk=(hits={int(static_node_cache.get('point_transformer_disk_hits', 0) or 0)}, "
+                        f"misses={int(static_node_cache.get('point_transformer_disk_misses', 0) or 0)}, "
+                        f"writes={int(static_node_cache.get('point_transformer_disk_writes', 0) or 0)})"
                         f", cuda_cache_released_before_actual="
                         f"{int(getattr(args, '_den6_online_cuda_cache_released_bytes', 0) or 0) / (1024 ** 2):.1f}MiB"
                         f", grad_norms=(where={float(audit_compression.get('den6_online_where_grad_norm', 0.0) or 0.0):.6g}, "
@@ -6460,7 +6463,8 @@ def main():
     writer.write(
         "PointTransformerNodeFeatures: enabled={}, encoder_frozen={}, "
         "bottleneck_dim={}, fusion=bounded_warmup_structure_residual, feature_scale={}, "
-        "gate_max={}, warmup_steps={}, lr_scale={}, coarse_max_points={}, cpu_cache={}".format(
+        "gate_max={}, warmup_steps={}, lr_scale={}, coarse_max_points={}, "
+        "ram_cache={}, disk_cache={}".format(
             bool(getattr(args, "point_transformer_node_features", True)),
             bool(getattr(args, "encoder_0grad", True)),
             int(getattr(args, "point_transformer_node_feature_dim", 8)),
@@ -6470,6 +6474,7 @@ def main():
             float(getattr(args, "point_transformer_feature_lr_scale", 0.1)),
             int(getattr(args, "encoder_pre_downsample_max_points", 8192)),
             bool(getattr(args, "point_transformer_feature_cache", True)),
+            bool(getattr(args, "point_transformer_feature_disk_cache", True)),
         )
     )
     writer.write(f"SetupTiming: encoder_ckpt_load={time.time() - setup_ckpt_t0:.3f}s")
