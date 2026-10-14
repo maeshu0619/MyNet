@@ -4914,6 +4914,26 @@ def _den6_online_grad_norms(model):
     base_model = _unwrap_train_model(model)
     actuator = getattr(base_model, "actuator", None)
     groups = {
+        "den6_online_add_where_grad_norm": (
+            getattr(actuator, "add_head", None),
+            getattr(actuator, "add_voxel_head", None),
+        ),
+        "den6_online_prune_where_grad_norm": (
+            getattr(actuator, "drop_head", None),
+        ),
+        "den6_online_adjust_where_grad_norm": (
+            getattr(actuator, "subtree_move_source_head", None),
+            getattr(actuator, "move_voxel_head", None),
+        ),
+        "den6_online_add_amount_grad_norm": (
+            getattr(actuator, "add_amount_head", None),
+        ),
+        "den6_online_prune_amount_grad_norm": (
+            getattr(actuator, "drop_amount_head", None),
+        ),
+        "den6_online_adjust_amount_grad_norm": (
+            getattr(actuator, "move_amount_head", None),
+        ),
         "den6_online_where_grad_norm": (
             getattr(actuator, "drop_head", None),
             getattr(actuator, "add_head", None),
@@ -4981,7 +5001,29 @@ def _den6_online_grad_norms(model):
         else:
             norm_squares.append(torch.zeros((), device=next(base_model.parameters()).device))
     values = torch.sqrt(torch.stack(norm_squares)).detach().cpu().tolist()
-    return {name: float(value) for name, value in zip(groups.keys(), values)}
+    out = {name: float(value) for name, value in zip(groups.keys(), values)}
+    decision_tensors = getattr(
+        actuator, "_den6_online_operation_decision_tensors", {}
+    )
+    for operation in ("Add", "Prune", "Adjust"):
+        row = decision_tensors.get(operation, {}) \
+            if isinstance(decision_tensors, dict) else {}
+        for decision in ("where", "amount"):
+            tensor = row.get(decision) if isinstance(row, dict) else None
+            grad = tensor.grad if torch.is_tensor(tensor) else None
+            value = (
+                float(torch.linalg.vector_norm(
+                    torch.nan_to_num(grad.detach().float()).reshape(-1)
+                ).cpu())
+                if torch.is_tensor(grad) else 0.0
+            )
+            out[
+                f"den6_online_{operation.lower()}_{decision}_decision_grad_norm"
+            ] = value
+    # Do not keep the completed autograd graph alive until the next forward.
+    if actuator is not None:
+        actuator._den6_online_operation_decision_tensors = {}
+    return out
 
 def _format_nonfinite_grad_summary(summary):
     if not summary or not summary.get("has_nonfinite", False):

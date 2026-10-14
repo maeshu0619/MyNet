@@ -360,7 +360,7 @@ class StructureRepairActuator(nn.Module):
                 "proposal_comparisons": 0,
             }
             for group in (
-                "AddWhere", "PruneWhere", "AdjustWhere",
+                "WhereAll", "AddWhere", "PruneWhere", "AdjustWhere",
                 "Amount", "Gate", "Fine",
             )
         }
@@ -4114,6 +4114,19 @@ class StructureRepairActuator(nn.Module):
 
     def _den6_group_actual_authority(self, group):
         """Authority for one decision group, without a global AND deadlock."""
+        if (
+            bool(getattr(
+                self.args,
+                "heuristic_guidance_online_simultaneous_operation_exploration",
+                False,
+            ))
+            and str(group) in {"AddWhere", "PruneWhere", "AdjustWhere"}
+        ):
+            # In simultaneous mode the executed counterfactual changes all
+            # three Where sets together.  Its Actual evidence therefore
+            # belongs to the joint Where policy, not to three fictitious
+            # one-operation experiments.
+            group = "WhereAll"
         actor_quality = self._den6_group_actual_quality(group, "actor")
         critic_quality = self._den6_group_actual_quality(group, "critic")
         # The Actor must itself be correct.  Critic calibration strengthens the
@@ -4143,11 +4156,20 @@ class StructureRepairActuator(nn.Module):
                 if isinstance(confidence_audit, dict) else {}
             rows = [value] if isinstance(value, dict) else []
         group = (
-            f"{operation}Where"
+            "WhereAll"
+            if (
+                operation in {"Add", "Prune", "Adjust"}
+                and bool(getattr(
+                    self.args,
+                    "heuristic_guidance_online_simultaneous_operation_exploration",
+                    False,
+                ))
+            )
+            else f"{operation}Where"
             if operation in {"Add", "Prune", "Adjust"}
             else str(operation)
             if operation in {
-                "AddWhere", "PruneWhere", "AdjustWhere",
+                "WhereAll", "AddWhere", "PruneWhere", "AdjustWhere",
                 "Amount", "Gate", "Fine",
             }
             else None
@@ -4156,8 +4178,16 @@ class StructureRepairActuator(nn.Module):
             qualities = [
                 self._den6_group_actual_authority(name)
                 for name in (
-                    "AddWhere", "PruneWhere", "AdjustWhere",
-                    "Amount", "Gate", "Fine",
+                    ("WhereAll", "Amount", "Gate", "Fine")
+                    if bool(getattr(
+                        self.args,
+                        "heuristic_guidance_online_simultaneous_operation_exploration",
+                        False,
+                    ))
+                    else (
+                        "AddWhere", "PruneWhere", "AdjustWhere",
+                        "Amount", "Gate", "Fine",
+                    )
                 )
             ]
             quality = sum(qualities) / float(max(len(qualities), 1))
@@ -4174,9 +4204,18 @@ class StructureRepairActuator(nn.Module):
         """
         if group is not None:
             return self._den6_group_actual_authority(group)
+        simultaneous_where = bool(getattr(
+            self.args,
+            "heuristic_guidance_online_simultaneous_operation_exploration",
+            False,
+        ))
         group_authorities = [
             self._den6_group_actual_authority(name)
-            for name in ("AddWhere", "PruneWhere", "AdjustWhere")
+            for name in (
+                ("WhereAll",)
+                if simultaneous_where
+                else ("AddWhere", "PruneWhere", "AdjustWhere")
+            )
         ]
         if any(value > 0.0 for value in group_authorities):
             return float(sum(group_authorities) / len(group_authorities))
@@ -4301,15 +4340,23 @@ class StructureRepairActuator(nn.Module):
         step when requested. The internal UCB group is retained for evidence
         accounting, but no longer creates three long operation-specific waves.
         """
-        groups = ("AddWhere", "PruneWhere", "AdjustWhere", "Amount", "Gate", "Fine")
         simultaneous_where = bool(getattr(
             self.args,
             "heuristic_guidance_online_simultaneous_operation_exploration",
             False,
         ))
+        groups = (
+            ("WhereAll", "Amount", "Gate", "Fine")
+            if simultaneous_where
+            else (
+                "AddWhere", "PruneWhere", "AdjustWhere",
+                "Amount", "Gate", "Fine",
+            )
+        )
+        where_groups = ("WhereAll",) if simultaneous_where else groups[:3]
 
         def behavior_group(group):
-            return "WhereAll" if simultaneous_where and group in groups[:3] else group
+            return str(group)
         if not bool(getattr(self, "training", False)):
             return "none"
         if not bool(getattr(
@@ -4359,7 +4406,6 @@ class StructureRepairActuator(nn.Module):
             remembered = {}
             self._den6_factorized_group_uncertainty = remembered
         total = sum(int(counts.get(name, 0)) for name in groups)
-        where_groups = groups[:3]
         where_count = sum(int(counts.get(name, 0)) for name in where_groups)
         where_share = (
             float(where_count) / float(max(total, 1)) if total > 0 else 0.0
@@ -4397,7 +4443,21 @@ class StructureRepairActuator(nn.Module):
         scores = {}
         score_audit = {}
         for name in groups:
-            if name.endswith("Where") and name in remembered:
+            if name == "WhereAll":
+                where_uncertainties = []
+                for operation in ("Add", "Prune", "Adjust"):
+                    row = confidence_audit.get(operation, {}) \
+                        if isinstance(confidence_audit, dict) else {}
+                    where_uncertainties.append(float(
+                        row.get(
+                            "uncertainty",
+                            remembered.get(f"{operation}Where", 1.0),
+                        )
+                    ))
+                uncertainty = sum(where_uncertainties) / float(
+                    max(len(where_uncertainties), 1)
+                )
+            elif name.endswith("Where") and name in remembered:
                 uncertainty = float(remembered[name])
             elif name.endswith("Where"):
                 operation = name[:-5]
@@ -4680,8 +4740,16 @@ class StructureRepairActuator(nn.Module):
             )), 1)
             post_window_group_states = []
             for group_name in (
-                "AddWhere", "PruneWhere", "AdjustWhere",
-                "Amount", "Gate", "Fine",
+                ("WhereAll", "Amount", "Gate", "Fine")
+                if bool(getattr(
+                    self.args,
+                    "heuristic_guidance_online_simultaneous_operation_exploration",
+                    False,
+                ))
+                else (
+                    "AddWhere", "PruneWhere", "AdjustWhere",
+                    "Amount", "Gate", "Fine",
+                )
             ):
                 row = actual_stats.get(group_name, {}) \
                     if isinstance(actual_stats, dict) else {}
@@ -4804,7 +4872,7 @@ class StructureRepairActuator(nn.Module):
             matched_anchor_runtime.get(matched_anchor_key)
             if factorized_actual_credit
             and str(factorized_exploration_group) in {
-                "AddWhere", "PruneWhere", "AdjustWhere",
+                "WhereAll", "AddWhere", "PruneWhere", "AdjustWhere",
                 "Amount", "Gate", "Fine",
             }
             else None
@@ -4814,7 +4882,7 @@ class StructureRepairActuator(nn.Module):
             network_confidence_audit,
             factorized_exploration_group
             if str(factorized_exploration_group) in {
-                "AddWhere", "PruneWhere", "AdjustWhere",
+                "WhereAll", "AddWhere", "PruneWhere", "AdjustWhere",
                 "Amount", "Gate", "Fine",
             }
             else None,
@@ -6540,7 +6608,7 @@ class StructureRepairActuator(nn.Module):
         if (
             factorized_actual_credit
             and str(factorized_exploration_group) in {
-                "AddWhere", "PruneWhere", "AdjustWhere",
+                "WhereAll", "AddWhere", "PruneWhere", "AdjustWhere",
                 "Amount", "Gate", "Fine",
             }
             and not matched_anchor_reused
@@ -6693,7 +6761,30 @@ class StructureRepairActuator(nn.Module):
         anchor_group_log_prob = action_ratio_stack.new_zeros(())
         if isinstance(matched_anchor_record, dict) and matched_anchor_reused:
             matched_group = str(factorized_exploration_group)
-            if matched_group.endswith("Where"):
+            if matched_group == "WhereAll":
+                anchor_where_scores = []
+                for matched_operation in operations:
+                    anchor_indices = tuple(
+                        (matched_anchor_record.get("selected_indices") or {}).get(
+                            matched_operation, ()
+                        )
+                    )
+                    if not anchor_indices:
+                        continue
+                    index_tensor = torch.as_tensor(
+                        anchor_indices,
+                        device=candidate_log_probs[matched_operation].device,
+                        dtype=torch.long,
+                    )
+                    anchor_where_scores.append(
+                        candidate_log_probs[matched_operation]
+                        .index_select(0, index_tensor).mean()
+                    )
+                if anchor_where_scores:
+                    anchor_group_log_prob = torch.stack(
+                        anchor_where_scores
+                    ).mean()
+            elif matched_group.endswith("Where"):
                 matched_operation = matched_group[:-5]
                 anchor_indices = tuple(
                     (matched_anchor_record.get("selected_indices") or {}).get(
@@ -7295,6 +7386,12 @@ class StructureRepairActuator(nn.Module):
                     / max(math.log(len(operations)), 1e-12)
                 ).cpu())
                 self._den6_factorized_group_uncertainty.update({
+                    "WhereAll": min(max(float(sum(
+                        self._den6_factorized_group_uncertainty.get(
+                            f"{name}Where", 1.0
+                        )
+                        for name in operations
+                    ) / float(len(operations))), 0.0), 1.0),
                     "Amount": min(max(amount_entropy_value, 0.0), 1.0),
                     "Gate": min(max(gate_entropy_value, 0.0), 1.0),
                     "Fine": min(max(float(plan_exploration_factor), 0.0), 1.0),
@@ -7303,6 +7400,26 @@ class StructureRepairActuator(nn.Module):
             plan_feature = action_ratio_stack.new_zeros((18,))
             plan_critic_mean = action_ratio_stack.new_zeros(())
             plan_critic_log_variance = action_ratio_stack.new_zeros(())
+        # Retain gradients on the actual operation-specific decision tensors.
+        # Parameter norms alone cannot attribute the shared Candidate Actor to
+        # Add/Prune/Adjust.  These tensors make the audit reflect the gradient
+        # entering each operation's Where logits and Fine Amount residual,
+        # while the coarse Amount selector remains correctly reported as one
+        # joint plan-level decision.
+        operation_decision_tensors = {}
+        if bool(getattr(self, "training", False)):
+            for name in operations:
+                where_tensor = candidate_actor_logits.get(name)
+                amount_tensor = operation_fine_policy_means.get(name)
+                row = {}
+                if torch.is_tensor(where_tensor) and where_tensor.requires_grad:
+                    where_tensor.retain_grad()
+                    row["where"] = where_tensor
+                if torch.is_tensor(amount_tensor) and amount_tensor.requires_grad:
+                    amount_tensor.retain_grad()
+                    row["amount"] = amount_tensor
+                operation_decision_tensors[name] = row
+        self._den6_online_operation_decision_tensors = operation_decision_tensors
         debug = {
             "plan_count": 1,
             "pool_reference_count": 1,
@@ -7403,7 +7520,7 @@ class StructureRepairActuator(nn.Module):
             "actual_group_authority": {
                 group: float(self._den6_group_actual_authority(group))
                 for group in (
-                    "AddWhere", "PruneWhere", "AdjustWhere",
+                    "WhereAll", "AddWhere", "PruneWhere", "AdjustWhere",
                     "Amount", "Gate", "Fine",
                 )
             },

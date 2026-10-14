@@ -1,5 +1,5 @@
 import os
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from types import SimpleNamespace
 import unittest
 from tempfile import TemporaryDirectory
@@ -569,13 +569,82 @@ class TrainingStabilityTest(unittest.TestCase):
         selected = actuator._select_den6_factorized_exploration_group({})
 
         self.assertEqual(selected, "WhereAll")
-        self.assertIn(
-            actuator._den6_last_factorized_group_scores["selected"], groups[:3]
+        self.assertEqual(
+            actuator._den6_last_factorized_group_scores["selected"],
+            "WhereAll",
         )
         self.assertEqual(
             actuator._den6_last_factorized_group_scores["behavior_group"],
             "WhereAll",
         )
+
+    def test_simultaneous_where_scheduler_does_not_starve_amount_gate_or_fine(self):
+        actuator = StructureRepairActuator.__new__(StructureRepairActuator)
+        torch.nn.Module.__init__(actuator)
+        actuator.args = SimpleNamespace(
+            heuristic_guidance_online_factorized_exploration=True,
+            heuristic_guidance_online_simultaneous_operation_exploration=True,
+            heuristic_guidance_online_factorized_ucb_scale=0.25,
+            heuristic_guidance_online_factorized_max_consecutive_steps=8,
+            heuristic_guidance_online_where_exploration_share=0.60,
+            heuristic_guidance_online_where_coverage_weight=1.0,
+            heuristic_guidance_online_where_evidence_balance_weight=1.0,
+            heuristic_guidance_online_group_evidence_target=64,
+            heuristic_guidance_online_group_need_weight=0.75,
+            heuristic_guidance_online_group_authority_pairs=8,
+            _current_input_file="frame.ply",
+            sparsepcgc_scale_ae=0,
+            sparsepcgc_scale_sr=0,
+            sparsepcgc_scale_m=8,
+        )
+        actuator._den6_factorized_group_counts = {}
+        actuator._den6_factorized_group_uncertainty = {}
+        actuator._den6_pending_matched_groups = OrderedDict()
+        actuator._den6_actual_group_stats = {
+            name: {"comparisons": 0}
+            for name in ("WhereAll", "Amount", "Gate", "Fine")
+        }
+        actuator._den6_fixed_rd_authority_rejected = False
+        actuator.train()
+
+        selected = [
+            actuator._select_den6_factorized_exploration_group({})
+            for _ in range(400)
+        ]
+
+        counts = Counter(selected)
+        self.assertEqual(
+            set(counts), {"WhereAll", "Amount", "Gate", "Fine"}
+        )
+        self.assertTrue(all(counts[name] >= 20 for name in counts))
+        longest = 1
+        current = 1
+        for previous, value in zip(selected, selected[1:]):
+            current = current + 1 if value == previous else 1
+            longest = max(longest, current)
+        self.assertLessEqual(longest, 8)
+
+    def test_simultaneous_where_actual_authority_is_shared_by_three_operations(self):
+        actuator = StructureRepairActuator.__new__(StructureRepairActuator)
+        torch.nn.Module.__init__(actuator)
+        actuator.args = SimpleNamespace(
+            heuristic_guidance_online_simultaneous_operation_exploration=True,
+            heuristic_guidance_online_group_authority_pairs=8,
+        )
+        actuator._den6_actual_group_stats = {
+            "WhereAll": {
+                "comparisons": 8,
+                "actor_correct": 8.0,
+                "critic_correct": 8.0,
+            }
+        }
+        joint_authority = actuator._den6_group_actual_authority("WhereAll")
+        self.assertGreater(joint_authority, 0.0)
+        for group in ("AddWhere", "PruneWhere", "AdjustWhere"):
+            self.assertEqual(
+                actuator._den6_group_actual_authority(group),
+                joint_authority,
+            )
 
     def test_factorized_group_ucb_cannot_monopolize_new_selections(self):
         actuator = StructureRepairActuator.__new__(StructureRepairActuator)

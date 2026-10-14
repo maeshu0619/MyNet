@@ -1582,7 +1582,7 @@ class Network(nn.Module):
             if isinstance(plan_debug, dict) else None
         )
         strict_group = factorized_group in {
-            "AddWhere", "PruneWhere", "AdjustWhere",
+            "WhereAll", "AddWhere", "PruneWhere", "AdjustWhere",
             "Amount", "Gate", "Fine",
         }
         matched_reused = bool(
@@ -2390,13 +2390,22 @@ class Network(nn.Module):
             actuator_for_evidence, "_den6_group_actual_authority", None
         ) if actuator_for_evidence is not None else None
         if callable(group_authority_fn):
-            preference_quality = sum(
-                float(group_authority_fn(group))
-                for group in (
+            preference_groups = (
+                ("WhereAll", "Amount", "Gate", "Fine")
+                if bool(getattr(
+                    self.args,
+                    "heuristic_guidance_online_simultaneous_operation_exploration",
+                    False,
+                ))
+                else (
                     "AddWhere", "PruneWhere", "AdjustWhere",
                     "Amount", "Gate", "Fine",
                 )
-            ) / 6.0
+            )
+            preference_quality = sum(
+                float(group_authority_fn(group))
+                for group in preference_groups
+            ) / float(len(preference_groups))
         else:
             preference_quality = 0.0
         entropy_min_fraction = min(max(float(getattr(

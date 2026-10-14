@@ -4212,7 +4212,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                     if (
                         den6_online_full_cloud
                         and _den6_online_grad_audit_enabled(args, global_train_step)
-                        and "den6_online_candidate_where_grad_norm" not in comp_debug
+                        and "den6_online_add_where_grad_norm" not in comp_debug
                     ):
                         comp_debug.update(_den6_online_grad_norms(model))
                     # Phase7-4:
@@ -4358,7 +4358,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                     if (
                         den6_online_full_cloud
                         and _den6_online_grad_audit_enabled(args, global_train_step)
-                        and "den6_online_candidate_where_grad_norm" not in comp_debug
+                        and "den6_online_add_where_grad_norm" not in comp_debug
                     ):
                         comp_debug.update(_den6_online_grad_norms(model))
                     # Phase7-4:
@@ -5149,6 +5149,20 @@ def train(model, args, loss, writer, plot, notifier=None):
                         f"gate_head={float(audit_compression.get('den6_online_gate_head_grad_norm', 0.0) or 0.0):.6g}, "
                         f"shared_amount_residual={float(audit_compression.get('den6_online_shared_amount_residual_grad_norm', 0.0) or 0.0):.6g}, "
                         f"surrogate={float(audit_compression.get('surrogate_grad_norm', 0.0) or 0.0):.6g})"
+                        f", operation_grad_norms=("
+                        f"AddWhere={float(audit_compression.get('den6_online_add_where_grad_norm', 0.0) or 0.0):.6g}, "
+                        f"PruneWhere={float(audit_compression.get('den6_online_prune_where_grad_norm', 0.0) or 0.0):.6g}, "
+                        f"AdjustWhere={float(audit_compression.get('den6_online_adjust_where_grad_norm', 0.0) or 0.0):.6g}, "
+                        f"AddAmount={float(audit_compression.get('den6_online_add_amount_grad_norm', 0.0) or 0.0):.6g}, "
+                        f"PruneAmount={float(audit_compression.get('den6_online_prune_amount_grad_norm', 0.0) or 0.0):.6g}, "
+                        f"AdjustAmount={float(audit_compression.get('den6_online_adjust_amount_grad_norm', 0.0) or 0.0):.6g})"
+                        f", operation_decision_grad_norms=("
+                        f"AddWhere={float(audit_compression.get('den6_online_add_where_decision_grad_norm', 0.0) or 0.0):.6g}, "
+                        f"PruneWhere={float(audit_compression.get('den6_online_prune_where_decision_grad_norm', 0.0) or 0.0):.6g}, "
+                        f"AdjustWhere={float(audit_compression.get('den6_online_adjust_where_decision_grad_norm', 0.0) or 0.0):.6g}, "
+                        f"AddAmount={float(audit_compression.get('den6_online_add_amount_decision_grad_norm', 0.0) or 0.0):.6g}, "
+                        f"PruneAmount={float(audit_compression.get('den6_online_prune_amount_decision_grad_norm', 0.0) or 0.0):.6g}, "
+                        f"AdjustAmount={float(audit_compression.get('den6_online_adjust_amount_decision_grad_norm', 0.0) or 0.0):.6g})"
                         f", grad_norms_pre_decision_balance=(where={float(audit_compression.get('den6_online_where_grad_norm_before_balance', 0.0) or 0.0):.6g}, "
                         f"amount={float(audit_compression.get('den6_online_amount_grad_norm_before_balance', 0.0) or 0.0):.6g}, "
                         f"action={float(audit_compression.get('den6_online_action_grad_norm_before_balance', 0.0) or 0.0):.6g})"
