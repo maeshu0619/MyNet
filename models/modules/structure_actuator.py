@@ -21,6 +21,46 @@ from .executable_voxel_plan import (
 )
 
 
+def normalized_fine_log_prob(mean, sample, sigma):
+    """Use the same Normal density and bounded score gradient for both plans."""
+    sigma = max(float(sigma), 1e-6)
+    raw = torch.distributions.Normal(mean, mean.new_tensor(sigma)).log_prob(
+        sample.detach()
+    )
+    return raw.detach() + sigma * (raw - raw.detach())
+
+
+def amount_forward_authority(confidence, evidence, floor):
+    """Keep the bounded learned Amount reachable even without Where alignment."""
+    authority = float(confidence) + (1.0 - float(confidence)) * float(evidence)
+    return max(authority, min(max(float(floor), 0.0), 1.0))
+
+
+def matched_plan_comparison_hash(group, selected_ids, selected_counts,
+                                 requested_counts, operation_order, pool_hash):
+    """Hash only factors held fixed in the executed counterfactual."""
+    explored_operation = group[:-5] if group.endswith("Where") else ""
+    fixed_groups = {
+        name: ids for name, ids in selected_ids.items()
+        if name != explored_operation
+    }
+    counts = dict(selected_counts)
+    if group == "WhereAll":
+        fixed_groups = {}
+        counts = dict(requested_counts)
+    elif group in {"Amount", "Gate", "Fine"}:
+        fixed_groups = {}
+        counts = {}
+    payload = json.dumps({
+        "selected_fixed_groups": fixed_groups,
+        "executed_counts": counts,
+        "operation_order": tuple(operation_order),
+        "pool_identity_hash": str(pool_hash),
+        "factorized_group": str(group),
+    }, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def smooth_exploration_phase(
     progress, fraction, tail_fraction=0.25, plateau_fraction=0.0
 ):
@@ -4336,9 +4376,9 @@ class StructureRepairActuator(nn.Module):
     def _select_den6_factorized_exploration_group(self, confidence_audit):
         """Choose an uncertain decision family without an Episode schedule.
 
-        Add/Prune/Adjust candidate locations share one behavioural exploration
-        step when requested. The internal UCB group is retained for evidence
-        accounting, but no longer creates three long operation-specific waves.
+        Simultaneous Add/Prune/Adjust locations use one WhereAll group for
+        both behavior and evidence. Coverage floors keep plan-level decisions
+        reachable after UCB bonuses alone become too small to ensure revisits.
         """
         simultaneous_where = bool(getattr(
             self.args,
@@ -4522,6 +4562,22 @@ class StructureRepairActuator(nn.Module):
         # Stable order is used only to break exact UCB ties; after selection the
         # count changes, so initially unknown groups are covered in turn.
         selected = max(groups, key=lambda name: (scores[name], -groups.index(name)))
+        # Bounded score bonuses do not guarantee revisits once counts grow:
+        # the UCB coverage term tends to zero.  In 104216 Amount got only
+        # 9/2200 Steps in E41--95.  Reserve coverage for every decision family;
+        # pending same-frame comparisons above still finish before a new one.
+        min_share = min(max(float(getattr(
+            self.args, "heuristic_guidance_online_factorized_min_share", 0.10
+        )), 0.0), 1.0 / float(len(groups)))
+        underserved = [
+            name for name in groups
+            if int(counts.get(name, 0)) < min_share * float(total)
+        ] if all(int(counts.get(name, 0)) > 0 for name in groups) else []
+        if underserved:
+            selected = min(underserved, key=lambda name: (
+                int(counts.get(name, 0)), -scores[name], groups.index(name)
+            ))
+            score_audit[selected]["selected_by_coverage_floor"] = True
         # A large evidence deficit can keep one group at the top of the UCB
         # score for hundreds of consecutive Steps.  In 172318 this produced
         # long synchronized waves (AddWhere at E41--60, AdjustWhere at
@@ -4915,12 +4971,19 @@ class StructureRepairActuator(nn.Module):
                 if decision_group is not None
                 else float(network_plan_confidence)
             )
+            if decision_group == "Amount":
+                forward_authority = amount_forward_authority(
+                    float(network_plan_confidence),
+                    self._den6_group_actual_authority(decision_group),
+                    getattr(self.args,
+                            "heuristic_guidance_online_amount_authority_floor", 0.75),
+                )
             forward_value = residual * float(forward_authority)
             return forward_value.detach() + residual - residual.detach()
 
-        # AmountはStep 0でden6 Exact値へ固定し、その後はNetwork値をden6で
-        # 実際に比較したtotal-ratio集合へSTE量子化する。連続量の無制限探索や
-        # operation別hard overrideには戻さない。
+        # Explicit diagnostic anchors replay the Exact amount. Otherwise the
+        # Network chooses from the existing discrete total-ratio set; Fine
+        # residuals and per-operation safety/count bounds remain in place.
         raw_bins = str(getattr(
             self.args,
             "heuristic_guidance_online_amount_bins",
@@ -4967,7 +5030,10 @@ class StructureRepairActuator(nn.Module):
                 self.args, "heuristic_guidance_online_amount_logit_std_cap", 0.35
             )), 0.0)
             if amount_logit_std_cap > 0.0:
-                network_amount_logits = amount_logit_std_cap * torch.tanh(
+                # Softsign retains a nonzero derivative for large logits;
+                # tanh rounded to +/-1 and killed Amount learning after the
+                # first exploration window despite an unchanged hard bin.
+                network_amount_logits = amount_logit_std_cap * torch.nn.functional.softsign(
                     amount_logits_centered / amount_logit_std_cap
                 )
             else:
@@ -4982,23 +5048,13 @@ class StructureRepairActuator(nn.Module):
             prior_amount_logits = torch.cat([
                 noop_prior.reshape(1), positive_prior_logits
             ])
-            if actor_critic_selection:
-                # Amount is a plan-level decision observed only through one
-                # composite Actual result.  Giving an uncalibrated head full
-                # forward authority made it jump to the largest bin when the
-                # input-frame distribution changed, even while its local RD
-                # target was ambiguous.  Keep the codec-derived safe amount
-                # as a prior and grant forward authority according to the
-                # measured candidate-RD alignment.  The STE helper preserves
-                # the full Network gradient, so this is not a time schedule or
-                # a fixed Amount target.
-                amount_logits = prior_amount_logits + _confidence_forward_full_backward(
-                    network_amount_logits - prior_amount_logits, "Amount"
-                )
-            else:
-                amount_logits = prior_amount_logits + _confidence_forward_full_backward(
-                    network_amount_logits - prior_amount_logits, "Amount"
-                )
+            # Keep the bounded logits and safe prior, but give the selector
+            # enough authority to overcome that prior. Candidate Where rank
+            # confidence alone was too small for any alternative bin to win,
+            # even with the maximum possible learned logit difference.
+            amount_logits = prior_amount_logits + _confidence_forward_full_backward(
+                network_amount_logits - prior_amount_logits, "Amount"
+            )
             uncalibrated_std = float(
                 amount_logits_centered.detach().std(unbiased=False).cpu()
             ) if int(amount_logits_centered.numel()) > 1 else 0.0
@@ -5102,6 +5158,7 @@ class StructureRepairActuator(nn.Module):
         operation_fine_samples = {}
         operation_fine_log_probs = {}
         operation_fine_policy_means = {}
+        operation_fine_sigmas = {}
         for name in operations:
             fine_mean = _confidence_forward_full_backward(
                 operation_fine_means[name], "Fine"
@@ -5115,6 +5172,7 @@ class StructureRepairActuator(nn.Module):
                     else operation_exploration_factors[name]
                 )
             )
+            operation_fine_sigmas[name] = fine_sigma
             if (
                 amount_exploration_active
                 and fine_sigma > 0.0
@@ -5125,17 +5183,11 @@ class StructureRepairActuator(nn.Module):
             ):
                 fine_noise = torch.randn_like(fine_mean).detach()
                 fine_sample = fine_mean + float(fine_sigma) * fine_noise
-                fine_distribution = torch.distributions.Normal(
-                    fine_mean, fine_mean.new_tensor(max(fine_sigma, 1e-6))
-                )
-                fine_log_prob_raw = fine_distribution.log_prob(fine_sample.detach())
                 # Normal score-functionのmean勾配は1/sigmaで発散する。forwardの
                 # log-prob値は変えず、backwardだけsigma倍して標準化すると、
                 # exploration幅とは独立な有限分散のFine residual更新になる。
-                fine_log_prob = (
-                    fine_log_prob_raw.detach()
-                    + float(fine_sigma)
-                    * (fine_log_prob_raw - fine_log_prob_raw.detach())
+                fine_log_prob = normalized_fine_log_prob(
+                    fine_mean, fine_sample, fine_sigma
                 )
             else:
                 fine_sample = fine_mean
@@ -5325,9 +5377,13 @@ class StructureRepairActuator(nn.Module):
             )
             if anchor_valid:
                 matched_group = str(factorized_exploration_group)
-                if matched_group.endswith("Where"):
+                if matched_group == "WhereAll" or matched_group.endswith("Where"):
+                    frozen_counts = (
+                        dict(matched_anchor_record.get("requested_counts") or stored_counts)
+                        if matched_group == "WhereAll" else stored_counts
+                    )
                     requested_counts = {
-                        name: int(stored_counts[name]) for name in operations
+                        name: int(frozen_counts[name]) for name in operations
                     }
                     no_op_selected = sum(requested_counts.values()) == 0
                 else:
@@ -6625,6 +6681,7 @@ class StructureRepairActuator(nn.Module):
             matched_anchor_runtime[matched_anchor_key] = {
                 "pool_sizes": {name: len(pools[name]) for name in operations},
                 "pool_identity_hash": str(candidate_pool_identity_hash),
+                "requested_counts": dict(requested_counts),
                 "selected_counts": {
                     name: int(selected_counts[name]) for name in operations
                 },
@@ -6825,16 +6882,17 @@ class StructureRepairActuator(nn.Module):
                     stored_value = operation_fine_policy_means[name].new_tensor(
                         float(stored_fine.get(name, 0.0))
                     )
-                    sigma = max(
-                        float(fine_sigma_base)
-                        * float(operation_exploration_factors[name]),
-                        1e-3,
-                    )
+                    sigma = float(operation_fine_sigmas[name])
+                    # Match the current action's density *and* sigma-scaled
+                    # backward.  A quadratic without the Normal constant and
+                    # without sigma scaling gave the anchor a different
+                    # likelihood and gradients up to 1/sigma stronger.
                     anchor_scores.append(
-                        -0.5 * (
-                            (stored_value - operation_fine_policy_means[name])
-                            / float(sigma)
-                        ).square()
+                        normalized_fine_log_prob(
+                            operation_fine_policy_means[name], stored_value, sigma
+                        )
+                        if sigma > 0.0
+                        else operation_fine_policy_means[name] * 0.0
                     )
                 anchor_group_log_prob = torch.stack(anchor_scores).mean()
 
@@ -7157,45 +7215,13 @@ class StructureRepairActuator(nn.Module):
             )
             for name in operations
         }
-        explored_where_operation = (
-            str(factorized_exploration_group)[:-5]
-            if str(factorized_exploration_group).endswith("Where") else ""
+        # All WhereAll candidate sets are variables; hashing their IDs would
+        # reject precisely the changed plans needed for Actual learning.
+        matched_anchor_hash = matched_plan_comparison_hash(
+            str(factorized_exploration_group), executed_ids_by_operation,
+            selected_counts, requested_counts, operation_order,
+            candidate_pool_identity_hash,
         )
-        matched_anchor_selected = {
-            name: identifiers
-            for name, identifiers in executed_ids_by_operation.items()
-            if name != explored_where_operation
-        }
-        matched_group = str(factorized_exploration_group)
-        if matched_group in {"Amount", "Gate", "Fine"}:
-            # Counts and selected prefixes are the effect of the explored
-            # plan-level factor.  The pool, frame and frozen operation order
-            # identify the anchor; the reconstruction above freezes the other
-            # two plan-level factors.
-            matched_anchor_selected = {}
-            matched_executed_counts = {}
-        else:
-            matched_executed_counts = {
-                name: int(selected_counts[name]) for name in operations
-            }
-        matched_anchor_payload = json.dumps(
-            {
-                # A matched Where comparison deliberately permits only the
-                # explored operation's candidate set to differ.  All other
-                # operation selections and every requested count form the
-                # immutable anchor identity.
-                "selected_fixed_groups": matched_anchor_selected,
-                "executed_counts": matched_executed_counts,
-                "operation_order": tuple(operation_order),
-                "pool_identity_hash": str(candidate_pool_identity_hash),
-                "factorized_group": str(factorized_exploration_group),
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        matched_anchor_hash = hashlib.sha256(
-            matched_anchor_payload.encode("utf-8")
-        ).hexdigest()
         edited_delta_payload = json.dumps({
             "base": str(getattr(self.args, "_current_input_file", "")),
             "removes": sorted(removes),

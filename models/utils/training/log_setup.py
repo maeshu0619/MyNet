@@ -238,7 +238,8 @@ def log_runtime_setup(writer, args):
             "Factorized Exploration: "
             f"enabled={bool(getattr(args, 'heuristic_guidance_online_factorized_exploration', True))}, "
             "simultaneous_add_prune_adjust_where="
-            f"{bool(getattr(args, 'heuristic_guidance_online_simultaneous_operation_exploration', True))}"
+            f"{bool(getattr(args, 'heuristic_guidance_online_simultaneous_operation_exploration', True))}, "
+            f"min_group_share={float(getattr(args, 'heuristic_guidance_online_factorized_min_share', 0.10)):.6g}"
         )
         writer.write(
             "Network Pool Autonomy: "
@@ -253,6 +254,7 @@ def log_runtime_setup(writer, args):
             f"bins={str(getattr(args, 'heuristic_guidance_online_amount_bins', ''))}, "
             f"temperature={float(getattr(args, 'heuristic_guidance_online_amount_temperature', 0.35)):.6g}, "
             f"gumbel_scale={float(getattr(args, 'heuristic_guidance_online_amount_gumbel_scale', 2.0)):.6g}, "
+            f"amount_authority_floor={float(getattr(args, 'heuristic_guidance_online_amount_authority_floor', 0.75)):.6g}, "
             f"geometry_policy_weight={float(getattr(args, 'heuristic_guidance_online_geometry_policy_weight', 0.50)):.6g}"
         )
         writer.write(

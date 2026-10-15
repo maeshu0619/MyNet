@@ -2658,6 +2658,14 @@ def parse_pugan_args(parser, file_day, file_time):
         help='coverage UCBに加えるdecision group不確実性の係数。Episode番号には依存しない',
     )
     parser.add_argument(
+        '--heuristic_guidance_online_factorized_min_share', default=0.10, type=float,
+        help='各意思決定群の探索coverage下限。割合の目標ではなく、Amount等の探索飢餓を防ぐ',
+    )
+    parser.add_argument(
+        '--heuristic_guidance_online_amount_authority_floor', default=0.75, type=float,
+        help='有界coarse Amount selectorのforward裁量下限。0で旧制御。Fine/Gateのconfidenceと安全上限は維持',
+    )
+    parser.add_argument(
         '--heuristic_guidance_online_factorized_max_consecutive_steps',
         default=8,
         type=int,
@@ -2927,7 +2935,7 @@ def parse_pugan_args(parser, file_day, file_time):
         '--heuristic_guidance_online_amount_logit_std_cap',
         default=0.35,
         type=float,
-        help='Amount bin logitsの候補内標準偏差上限。argmax順位を変えずsoftmax飽和を防ぐ。0で無効',
+        help='Amount中心logitの絶対値上限。softsignで極端なlogitでも勾配を保つ。0で無効',
     )
     parser.add_argument(
         '--heuristic_guidance_online_amount_gumbel_scale',
@@ -4817,6 +4825,12 @@ def parse_pugan_args(parser, file_day, file_time):
     args.heuristic_guidance_online_amount_logit_std_cap = max(float(getattr(
         args, "heuristic_guidance_online_amount_logit_std_cap", 0.35
     )), 0.0)
+    args.heuristic_guidance_online_amount_authority_floor = min(max(float(getattr(
+        args, "heuristic_guidance_online_amount_authority_floor", 0.75
+    )), 0.0), 1.0)
+    args.heuristic_guidance_online_factorized_min_share = min(max(float(getattr(
+        args, "heuristic_guidance_online_factorized_min_share", 0.10
+    )), 0.0), 1.0 / 6.0)
     args.heuristic_guidance_online_policy_weight = max(
         float(getattr(args, "heuristic_guidance_online_policy_weight", 0.1)), 0.0
     )

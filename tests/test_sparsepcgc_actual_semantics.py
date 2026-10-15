@@ -2451,6 +2451,10 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
         torch.nn.Module.__init__(actuator)
         actuator.args = SimpleNamespace(
             heuristic_guidance_mode="ana_den6_online",
+            # This test samples independent seeds without completing Actual
+            # comparisons.  Do not retain pending factorized anchors between
+            # those independent trials (a sampled no-op can otherwise pin it).
+            heuristic_guidance_online_factorized_exploration=False,
             _global_train_step=2,
             _total_train_steps_estimate=100,
             heuristic_guidance_anchor_steps=200,

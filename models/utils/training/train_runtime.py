@@ -4820,16 +4820,29 @@ def _summarize_nonfinite_grads(model, limit=8):
     bad_element_count = 0
     checked_param_count = 0
     checked_element_count = 0
+    device_rows = {}
     for name, param in base_model.named_parameters():
         if not param.requires_grad or param.grad is None:
             continue
         checked_param_count += 1
         grad = param.grad.detach()
         checked_element_count += int(grad.numel())
-        finite_mask = torch.isfinite(grad)
-        if bool(finite_mask.all().item()):
+        # Collect tiny scalar counters on-device.  The previous .all().item()
+        # waited for CUDA separately for every trainable parameter.
+        bad_count = (~torch.isfinite(grad)).sum()
+        device_rows.setdefault(grad.device, []).append((name, bad_count))
+    counts_by_name = {}
+    for rows in device_rows.values():
+        counts = torch.stack([count for _, count in rows]).cpu().tolist()
+        counts_by_name.update(
+            (name, int(count)) for (name, _), count in zip(rows, counts)
+        )
+    # Preserve model order in the bounded error report, including mixed-device
+    # models.  No parameter or gradient is modified by this diagnostic.
+    for name, param in base_model.named_parameters():
+        bad_count = counts_by_name.get(name, 0)
+        if bad_count == 0:
             continue
-        bad_count = int((~finite_mask).sum().detach().cpu().item())
         bad_element_count += bad_count
         if len(bad_names) < int(limit):
             bad_names.append(f"{name}:{bad_count}")
@@ -4987,6 +5000,8 @@ def _den6_online_grad_norms(model):
         ),
     }
     norm_squares = []
+    parameter_squares = {}
+    device = next(base_model.parameters()).device
     for modules in groups.values():
         terms = []
         for module in modules:
@@ -4994,14 +5009,19 @@ def _den6_online_grad_norms(model):
                 continue
             for parameter in module.parameters():
                 if parameter.grad is not None:
-                    grad = torch.nan_to_num(parameter.grad.detach().float())
-                    terms.append(torch.sum(grad * grad))
+                    key = id(parameter)
+                    if key not in parameter_squares:
+                        grad = torch.nan_to_num(parameter.grad.detach().float())
+                        parameter_squares[key] = torch.sum(grad * grad)
+                    # Keep group order and reductions unchanged while reusing
+                    # the per-parameter result across overlapping audit groups.
+                    terms.append(parameter_squares[key])
         if terms:
             norm_squares.append(torch.stack(terms).sum())
         else:
-            norm_squares.append(torch.zeros((), device=next(base_model.parameters()).device))
-    values = torch.sqrt(torch.stack(norm_squares)).detach().cpu().tolist()
-    out = {name: float(value) for name, value in zip(groups.keys(), values)}
+            norm_squares.append(torch.zeros((), device=device))
+    names = list(groups.keys())
+    norms = list(torch.sqrt(torch.stack(norm_squares)).unbind())
     decision_tensors = getattr(
         actuator, "_den6_online_operation_decision_tensors", {}
     )
@@ -5012,14 +5032,19 @@ def _den6_online_grad_norms(model):
             tensor = row.get(decision) if isinstance(row, dict) else None
             grad = tensor.grad if torch.is_tensor(tensor) else None
             value = (
-                float(torch.linalg.vector_norm(
+                torch.linalg.vector_norm(
                     torch.nan_to_num(grad.detach().float()).reshape(-1)
-                ).cpu())
-                if torch.is_tensor(grad) else 0.0
+                )
+                if torch.is_tensor(grad) else torch.zeros((), device=device)
             )
-            out[
+            names.append(
                 f"den6_online_{operation.lower()}_{decision}_decision_grad_norm"
-            ] = value
+            )
+            norms.append(value)
+    # Transfer all module and decision norms together instead of synchronizing
+    # once for the aggregate and again for each operation's decision tensor.
+    values = torch.stack(norms).detach().cpu().tolist()
+    out = {name: float(value) for name, value in zip(names, values)}
     # Do not keep the completed autograd graph alive until the next forward.
     if actuator is not None:
         actuator._den6_online_operation_decision_tensors = {}
