@@ -7433,7 +7433,8 @@ class StructureRepairActuator(nn.Module):
         # while the coarse Amount selector remains correctly reported as one
         # joint plan-level decision.
         operation_decision_tensors = {}
-        if bool(getattr(self, "training", False)):
+        if (bool(getattr(self, "training", False))
+                and bool(getattr(self.args, "heuristic_guidance_online_grad_audit", False))):
             for name in operations:
                 where_tensor = candidate_actor_logits.get(name)
                 amount_tensor = operation_fine_policy_means.get(name)

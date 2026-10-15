@@ -5161,6 +5161,14 @@ def _den6_online_decision_parameters(model):
     return params
 
 
+def _den6_retained_decision_tensors(model):
+    base_model = model.module if hasattr(model, "module") else model
+    actuator = getattr(base_model, "actuator", None)
+    rows = getattr(actuator, "_den6_online_operation_decision_tensors", {})
+    return [tensor for row in rows.values() for tensor in row.values()
+            if torch.is_tensor(tensor) and tensor.requires_grad] if isinstance(rows, dict) else []
+
+
 def _capture_den6_policy_only_gradients(policy_loss, model):
     """Capture only Actual score-function gradients before the joint backward."""
     if not torch.is_tensor(policy_loss) or not policy_loss.requires_grad:
@@ -5172,7 +5180,19 @@ def _capture_den6_policy_only_gradients(policy_loss, model):
     # is incompatible with the re-entrant checkpoint used by this project,
     # so perform a normal retained backward, snapshot the decision heads, and
     # clear all temporary grads before the joint objective backward.
+    decisions = _den6_retained_decision_tensors(model)
+    # zero_grad() clears Parameters only, not retained non-leaf decision
+    # tensors.  Source probes must not inflate the reported decision gradient.
+    for tensor in decisions:
+        tensor.grad = None
     policy_loss.backward(retain_graph=True)
+    base_model = model.module if hasattr(model, "module") else model
+    actuator = getattr(base_model, "actuator", None)
+    if actuator is not None:
+        actuator._den6_policy_decision_grad_snapshot = [
+            (tensor, None if tensor.grad is None else tensor.grad.detach().clone())
+            for tensor in decisions
+        ]
     snapshot = [
         (param, None if param.grad is None else param.grad.detach().clone())
         for param in params
@@ -5242,7 +5262,7 @@ def _probe_den6_policy_source_gradients(model, source_losses):
     return result
 
 
-def _restore_den6_policy_only_gradients(snapshot):
+def _restore_den6_policy_only_gradients(snapshot, model=None):
     """Remove unrelated STE gradients from hard decision heads after backward."""
     restored = 0
     cleared = 0
@@ -5253,6 +5273,15 @@ def _restore_den6_policy_only_gradients(snapshot):
         else:
             param.grad = grad.to(device=param.device, dtype=param.dtype)
             restored += 1
+    if model is not None:
+        base_model = model.module if hasattr(model, "module") else model
+        actuator = getattr(base_model, "actuator", None)
+        if actuator is not None:
+            for tensor, grad in getattr(
+                actuator, "_den6_policy_decision_grad_snapshot", ()
+            ):
+                tensor.grad = grad
+            actuator._den6_policy_decision_grad_snapshot = []
     return {
         "den6_policy_only_gradient_isolation": bool(snapshot),
         "den6_policy_only_gradient_restored_params": int(restored),

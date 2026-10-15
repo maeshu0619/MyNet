@@ -3,11 +3,34 @@ import torch
 
 from models.utils.training.train_runtime import (
     _den6_online_grad_norms,
+    _capture_den6_policy_only_gradients,
+    _restore_den6_policy_only_gradients,
+    _probe_den6_policy_source_gradients,
     _summarize_nonfinite_grads,
 )
 
 
 class GradientDiagnosticBatchingTest(unittest.TestCase):
+    def test_retained_decision_audit_excludes_source_probe_and_joint_backward(self):
+        model = torch.nn.Module()
+        model.actuator = torch.nn.Module()
+        model.actuator.den6_candidate_actor = torch.nn.Linear(2, 1)
+        decision = model.actuator.den6_candidate_actor(torch.ones(1, 2))
+        decision.retain_grad()
+        model.actuator._den6_online_operation_decision_tensors = {
+            'Add': {'where': decision}
+        }
+        policy = (3 * decision).sum()
+        _probe_den6_policy_source_gradients(model, {'a': policy, 'b': 2 * policy})
+        self.assertEqual(float(decision.grad), 9.)
+        snapshot = _capture_den6_policy_only_gradients(policy, model)
+        (policy + 100 * decision.sum()).backward()
+        _restore_den6_policy_only_gradients(snapshot, model)
+        self.assertEqual(float(decision.grad), 3.)
+        for parameter, expected in snapshot:
+            torch.testing.assert_close(parameter.grad, expected)
+        self.assertEqual(model.actuator._den6_policy_decision_grad_snapshot, [])
+
     def test_nonfinite_counts_names_and_limit_preserve_parameter_order(self):
         model = torch.nn.Sequential(
             torch.nn.Linear(3, 2), torch.nn.Linear(2, 1)

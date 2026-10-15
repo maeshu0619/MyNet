@@ -962,7 +962,7 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
             network.last_discrete_policy_debug["actual_set_incumbent_updated"]
         )
 
-    def test_exact_matched_actual_replay_updates_actor_proposal_and_candidate_critic(self):
+    def test_exact_matched_actual_replay_updates_actor_proposal_and_candidate_critic(self, group="AddWhere"):
         """An exact frame/anchor/group revisit supervises all candidate heads."""
         network = Network.__new__(Network)
         torch.nn.Module.__init__(network)
@@ -1016,19 +1016,20 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
 
         def state(features):
             log_prob = torch.tensor(0.0, requires_grad=True)
+            operations = ("Add", "Prune", "Adjust") if group == "WhereAll" else ("Add",)
             return {
                 "den6_online_policy_log_prob": log_prob,
                 "den6_online_policy_entropy": log_prob.new_zeros(()),
                 "den6_online_actor_critic_changed_ratio": log_prob.new_zeros(()),
                 "ana_den6_exact_residual_plan_debug": {
-                    "factorized_exploration_group": "AddWhere",
+                    "factorized_exploration_group": group,
                     "matched_actual_anchor_hash": "same-anchor",
-                    "_actual_credit_explored_features": {"Add": features},
+                    "_actual_credit_explored_features": {op: features.clone() for op in operations},
                     "_actual_credit_explored_critic_features": {
-                        "Add": features.clone()
+                        op: features.clone() for op in operations
                     },
-                    "_actual_credit_candidate_ids": {"Add": ["a", "b"]},
-                    "_actual_credit_explored_indices": {"Add": [0, 1]},
+                    "_actual_credit_candidate_ids": {op: ["a", "b"] for op in operations},
+                    "_actual_credit_explored_indices": {op: [0, 1] for op in operations},
                 },
             }
 
@@ -1062,6 +1063,23 @@ class SparsePCGCActualSemanticsTest(unittest.TestCase):
                 float(gradient.abs().sum())
                 for gradient in gradients if gradient is not None
             ), 0.0)
+        return network
+
+    def test_where_all_joint_actual_replay_updates_all_candidate_heads(self):
+        network = self.test_exact_matched_actual_replay_updates_actor_proposal_and_candidate_critic("WhereAll")
+        record = network._den6_actual_actor_replay[-1]
+        self.assertEqual(record['operation'], 'All')
+        self.assertEqual(record['candidate_features'].shape, (6, 7))
+        self.assertEqual(len(record['selected_candidate_ids']), 6)
+        # A different frame is not a valid candidate-level Actual teacher.
+        network.args._current_input_file = '/dataset/loot/frame_0002.ply'
+        loss = network.discrete_policy_loss(torch.tensor(-3.0), torch.tensor(0.0))
+        self.assertEqual(network.last_discrete_policy_debug['actual_actor_replay_exact_pairs'], 0)
+        gradients = torch.autograd.grad(
+            loss, tuple(network.actuator.den6_candidate_proposal.parameters()),
+            allow_unused=True,
+        )
+        self.assertTrue(all(gradient is None for gradient in gradients))
 
     def test_den6_geometry_credit_updates_amount_only_inside_compression_guard(self):
         """圧縮改善を保ったGeometry改善だけを離散Amountへ返す。"""

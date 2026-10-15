@@ -4201,7 +4201,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                     scaler.unscale_(optimizer) # Optimizer内の勾配を元のスケールへ戻す
                     if den6_online_full_cloud:
                         comp_debug.update(_restore_den6_policy_only_gradients(
-                            den6_policy_only_grad_snapshot
+                            den6_policy_only_grad_snapshot, model
                         ))
                     operation_grad_balance_debug = _balance_actual_operation_head_gradients(
                         args,
@@ -4347,7 +4347,7 @@ def train(model, args, loss, writer, plot, notifier=None):
                     L.backward() # 通常の勾配を流す
                     if den6_online_full_cloud:
                         comp_debug.update(_restore_den6_policy_only_gradients(
-                            den6_policy_only_grad_snapshot
+                            den6_policy_only_grad_snapshot, model
                         ))
                     operation_grad_balance_debug = _balance_actual_operation_head_gradients(
                         args,

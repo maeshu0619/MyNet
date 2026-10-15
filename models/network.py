@@ -1545,6 +1545,15 @@ class Network(nn.Module):
             factorized_group[:-5]
             if factorized_group.endswith("Where") else ""
         )
+        # WhereAll changes one joint Add/Prune/Adjust candidate set.  Keep
+        # that set as a single replay observation, not three independent
+        # candidate labels derived from the same composite codec scalar.
+        if factorized_group == "WhereAll":
+            replay_operation = "All"
+        replay_operations = (
+            ("Add", "Prune", "Adjust") if replay_operation == "All"
+            else (replay_operation,) if replay_operation else ()
+        )
         plan_memory = getattr(self, "_den6_online_actual_plan_memory", None)
         if plan_memory is None:
             plan_memory = OrderedDict()
@@ -1783,7 +1792,7 @@ class Network(nn.Module):
             previous_selected = previous_plan.get("selected", {})
 
             for operation in ("Add", "Prune", "Adjust"):
-                if operation != replay_operation:
+                if operation not in replay_operations:
                     continue
                 scores = score_tensors.get(operation)
                 ids = candidate_ids_by_operation.get(operation, ())
@@ -1823,17 +1832,19 @@ class Network(nn.Module):
                 previous_mean = scores.reshape(-1).index_select(
                     0, torch.as_tensor(previous_indices, device=scores.device)
                 ).mean()
-                contrast_terms.append(torch.nn.functional.softplus(
-                    -float(preference_sign)
-                    * (current_mean - previous_mean)
-                    / float(temperature)
-                ))
+                contrast_terms.append(current_mean - previous_mean)
                 actual_set_contrast_operations += 1
                 actual_set_contrast_pairs += min(
                     len(current_indices), len(previous_indices)
                 )
             if contrast_terms and actual_set_contrast_evidence > 0.0:
-                actual_set_contrast_raw = torch.stack(contrast_terms).mean()
+                # Credit the joint set difference once.  An improving joint
+                # plan does not prove that each individual operation improved.
+                actual_set_contrast_raw = torch.nn.functional.softplus(
+                    -float(preference_sign)
+                    * torch.stack(contrast_terms).mean()
+                    / float(temperature)
+                )
                 contrast_weight = max(float(getattr(
                     self.args,
                     "heuristic_guidance_online_actual_set_credit_weight",
@@ -1985,6 +1996,24 @@ class Network(nn.Module):
             explored_critic_features.get(replay_operation)
             if isinstance(explored_critic_features, dict) and replay_operation else None
         )
+        if replay_operation == "All":
+            feature_parts = []
+            critic_parts = []
+            for operation in replay_operations:
+                features = explored_features.get(operation)
+                critic_features = explored_critic_features.get(operation)
+                if not torch.is_tensor(features) or features.numel() == 0:
+                    continue
+                if (not torch.is_tensor(critic_features)
+                        or critic_features.shape != features.shape):
+                    # Never align the Actor's rows with a different Critic set.
+                    feature_parts = []
+                    critic_parts = []
+                    break
+                feature_parts.append(features)
+                critic_parts.append(critic_features)
+            current_features = torch.cat(feature_parts, dim=0) if feature_parts else None
+            current_critic_features = torch.cat(critic_parts, dim=0) if critic_parts else None
         actor_replay = getattr(self, "_den6_actual_actor_replay", None)
         if actor_replay is None:
             actor_replay = []
@@ -2268,7 +2297,7 @@ class Network(nn.Module):
                         ) + float(actual_proposal_replay_accuracy)
             if (
                 actuator_for_evidence is not None
-                and factorized_group.endswith("Where")
+                and bool(replay_operations)
                 and actual_group_pair_available
                 and actual_actor_replay_pairs > 0
             ):
@@ -2311,6 +2340,15 @@ class Network(nn.Module):
                 for index in explored_indices_for_replay
                 if 0 <= int(index) < len(operation_ids_for_replay)
             )
+            if replay_operation == "All":
+                selected_ids_for_replay = tuple(
+                    (operation, candidate_ids_by_operation[operation][int(index)])
+                    for operation in replay_operations
+                    for index in plan_debug.get(
+                        "_actual_credit_explored_indices", {}
+                    ).get(operation, ())
+                    if 0 <= int(index) < len(candidate_ids_by_operation.get(operation, ()))
+                )
             actor_replay.append({
                 "sequence_key": str(sequence_key),
                 "cache_key": str(cache_key),
