@@ -7,6 +7,9 @@ def quantize_sparsepcgc_coords(pts_xyz, args, coord_scale=None, offset=None, ret
     Phase1/Phase2互換用の量子化入口である。
     既存の canonical_sparsepcgc_voxel_coords を正式実装として使う。
     """
+    from .geometry_octree import is_geometry_octree, quantize_geometry_octree
+    if is_geometry_octree(args):
+        return quantize_geometry_octree(pts_xyz, args, coord_scale, offset, return_metadata)
     return canonical_sparsepcgc_voxel_coords(
         pts_xyz,
         args=args,
@@ -183,6 +186,9 @@ def restore_points_from_voxel_coords(
     unique=Trueなら同一voxelを1点にまとめる。
     戻り値は xyz, restore_info である。
     """
+    from .geometry_octree import is_geometry_octree, restore_geometry_octree_points
+    if is_geometry_octree(args):
+        return restore_geometry_octree_points(coords, meta, args, center, unique, dtype, device)
     coords_b3n = normalize_voxel_coords_b3n(coords, device=device)
     input_points = int(coords_b3n.shape[-1])
 

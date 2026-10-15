@@ -701,6 +701,9 @@ class CompressionLossMixin:
 
     def _actual_gt_cache_fingerprint(self, cache_key):
         args = self.args
+        from ..pointcloud.geometry_octree import is_geometry_octree, geometry_actual_cache_fingerprint
+        if is_geometry_octree(args):
+            return geometry_actual_cache_fingerprint(args, cache_key)
         source_path = str(cache_key).split("|", 1)[0]
         try:
             source_stat = os.stat(source_path)
@@ -731,6 +734,11 @@ class CompressionLossMixin:
         )
 
     def _actual_gt_disk_cache_path(self, cache_key):
+        from ..pointcloud.geometry_octree import is_geometry_octree
+        if is_geometry_octree(self.args):
+            root = os.path.join(str(self.args.log_root), 'geometry_actual_gt_cache')
+            digest = hashlib.sha256(self._actual_gt_cache_fingerprint(cache_key).encode()).hexdigest()
+            return os.path.join(root, digest + '.json')
         if not bool(getattr(self.args, "sparsepcgc_actual_gt_disk_cache", False)):
             return ""
         root = str(getattr(self.args, "sparsepcgc_actual_gt_disk_cache_dir", "")).strip()
@@ -1281,7 +1289,8 @@ class CompressionLossMixin:
         if codec_key == "sparsepcgc":
             return max(float(getattr(args, "sparsepcgc_voxel_size", 1.0)), 1e-9)
         if codec_key == "gpcc":
-            return max(float(getattr(args, "gpcc_effective_qs", getattr(args, "qs", 1.0))), 1e-9)
+            from ..pointcloud.geometry_octree import geometry_step
+            return geometry_step(args)
         if codec_key == "draco":
             return max(float(getattr(args, "draco_effective_qs", getattr(args, "qs", 1.0))), 1e-9)
         return max(float(getattr(args, "qs", 1.0)), 1e-9)

@@ -2074,7 +2074,10 @@ def parse_pugan_args(parser, file_day, file_time):
     )
 
     """Compression"""
-    parser.add_argument('--compress', default='SparsePCGC', type=str, help='使用する圧縮手法')
+    parser.add_argument('--compress', '--compression', dest='compress', default='SparsePCGC', type=str, help='使用する圧縮手法: SparsePCGC / G-PCC / OctAttention')
+    parser.add_argument('--geometry_octree_initial_total_ratio', default=0.0025, type=float, help='G-PCC/OctAttentionの初期合計編集割合（fraction）。以後は共通Amount headが学習する')
+    parser.add_argument('--geometry_octree_pool_reserve_factor', default=4.0, type=float, help='幾何Octree用の各操作候補pool余裕倍率')
+    parser.add_argument('--geometry_octree_pool_max_per_operation', default=8192, type=int, help='幾何Octree用の各操作候補pool上限')
     parser.add_argument('--octree_voxel', type=float, default=1e-3, help='Octreeボクセルサイズ')
     parser.add_argument('--qs', type=int, default=2, help='量子化ステップサイズ')
 
@@ -3819,7 +3822,7 @@ def parse_pugan_args(parser, file_day, file_time):
     )
     # more_training=True のときに読む追加学習用checkpointパスを確定する
     # グローバル設定値をログで確認しやすいようにargsへ保存する
-    args.method_com = method_com
+    args.method_com = _compress_display_name(args.compress)
     args.model_name = model_name
     # pretrained_*はCLI既定が空文字なので、more_training pathを組み立てる前に
     # 現在選択中のmodel日時へ正規化する。後段だけで補完すると空ディレクトリを
@@ -4212,6 +4215,8 @@ def parse_pugan_args(parser, file_day, file_time):
         args.compress = "OctAttention"
 
     args.compression_loss_backend = str(args.compression_loss_backend).strip().lower()
+    if compress_key in {"gpcc", "octattention"} and not _cli_option_was_provided("--compression_loss_backend"):
+        args.compression_loss_backend = compress_key + "_surrogate"
     if bool(args.surrogate):
         if compress_key == "sparsepcgc":
             args.compression_loss_backend = "sparsepcgc_surrogate"
@@ -8054,4 +8059,7 @@ def parse_pugan_args(parser, file_day, file_time):
         args.compression_surrogate_replay_steps = 0
         args.compression_surrogate_reuse_last_target = False
         args.compression_surrogate_refresh_interval = 1
+    if compress_key in {"gpcc", "octattention"}:
+        from .geometry_codec import configure_geometry_codec
+        args = configure_geometry_codec(args, _cli_option_was_provided)
     return args

@@ -1344,6 +1344,9 @@ class StructureRepairActuator(nn.Module):
         return voxel_offset.to(dtype=dtype) + voxel_coords.to(dtype=dtype) * voxel_step.to(dtype=dtype)
 
     def _effective_qs(self):
+        from ..utils.pointcloud.geometry_octree import is_geometry_octree, geometry_step
+        if is_geometry_octree(self.args):
+            return geometry_step(self.args)
         compress_key = (
             str(getattr(self.args, "compress", ""))
             .strip()
@@ -1478,6 +1481,15 @@ class StructureRepairActuator(nn.Module):
 
     @staticmethod
     def _algorithmic_amount_bin_values_from_args(args):
+        from ..utils.pointcloud.geometry_octree import is_geometry_octree
+        if is_geometry_octree(args):
+            values = getattr(args, "geometry_octree_amount_bin_values", None)
+            if values is None:
+                values = [float(v) for v in str(getattr(
+                    args, "heuristic_guidance_online_amount_bins",
+                    "0.0015,0.002,0.0025,0.00275,0.003"
+                )).split(",")]
+            return sorted(set(values))
         raw_values = getattr(args, "sparsepcgc_algorithmic_amount_bin_values", None)
         values = []
         if isinstance(raw_values, (list, tuple)):
@@ -3490,6 +3502,10 @@ class StructureRepairActuator(nn.Module):
         if not bool(getattr(self.args, "heuristic_guidance_enabled", True)):
             return None
         mode = str(getattr(self.args, "heuristic_guidance_mode", "proxy_prior")).strip().lower()
+        if str(guidance.get("formula_basis", "")) == "mynet_geometry_octree_safe_pool_v1":
+            from ..utils.pointcloud.geometry_octree import is_geometry_octree
+            if not is_geometry_octree(self.args):
+                raise RuntimeError("conventional geometry pools cannot enter the SparsePCGC actuator")
         if mode in {"ana_den6_online", "ana_den6_residual"}:
             if str(guidance.get("formula_basis", "")) not in {
                 "ana_den6_exact_ranked_editcandidate_pool_v2",
@@ -3502,6 +3518,7 @@ class StructureRepairActuator(nn.Module):
                 "ana_den6_single_proposal_network_residual_online_v7",
                 "ana_den6_exact_single_plan_teacher_online_v8",
                 "mynet_fast_unordered_safe_pool_v1",
+                "mynet_geometry_octree_safe_pool_v1",
                 "network_only_where_amount_action_inference_v1",
             }:
                 raise RuntimeError(
@@ -8567,6 +8584,7 @@ class StructureRepairActuator(nn.Module):
                 "ana_den6_exact_one_pattern_anchor_online_v6",
                 "ana_den6_exact_single_plan_teacher_online_v8",
                 "mynet_fast_unordered_safe_pool_v1",
+                "mynet_geometry_octree_safe_pool_v1",
             }
         )
         exact_add_source_mask = self._fit_heuristic_candidate_mask(

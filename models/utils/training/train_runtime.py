@@ -3120,6 +3120,9 @@ def _build_full_cloud_octree_context_for_train(input_xyz, args, coord_scale=None
     full cloud anchor用の最小full_octree_contextを作る。
     Node/Voxel入力経路へ入れるため、global_voxel_coords/global_qs/global_offsetを必ず持たせる。
     """
+    from models.utils.pointcloud.geometry_octree import is_geometry_octree, build_geometry_octree_context
+    if is_geometry_octree(args):
+        return build_geometry_octree_context(input_xyz, args, coord_scale)
     q_result = quantize_sparsepcgc_coords(
         input_xyz,
         args,
@@ -3156,7 +3159,7 @@ def _full_cloud_canonical_meta(full_cloud_canonical_context):
     if not isinstance(full_cloud_canonical_context, dict):
         return {}
 
-    meta = full_cloud_canonical_context.get("sparsepcgc_voxel_meta", None)
+    meta = full_cloud_canonical_context.get("geometry_octree_meta", full_cloud_canonical_context.get("sparsepcgc_voxel_meta", None))
     if isinstance(meta, dict):
         return dict(meta)
 
@@ -6517,7 +6520,8 @@ def run_episode_full_cloud_validation(
     compress_key = str(getattr(args, "compress", "")).strip().lower().replace("-", "").replace("_", "")
     backend = str(getattr(args, "compression_loss_backend", "")).strip().lower()
     sparsepcgc_backend = compress_key == "sparsepcgc" or backend.startswith("sparsepcgc_")
-    if source not in {"auto", "full_cloud"} or not sparsepcgc_backend:
+    from models.utils.pointcloud.geometry_octree import is_geometry_octree
+    if source not in {"auto", "full_cloud"} or not (sparsepcgc_backend or is_geometry_octree(args)):
         return {"value": None, "count": 0, "sample_names": []}
 
     # dataset.filesはEpisodeごとに訓練窓へ更新される。ここでそれを直接読むと

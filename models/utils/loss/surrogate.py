@@ -442,7 +442,8 @@ class SurrogateCompressionLossMixin:
                 1e-9,
             )
         if str(codec_key).strip().lower() == "gpcc":
-            return max(float(getattr(args, "gpcc_effective_qs", getattr(args, "qs", 1.0))), 1e-9)
+            from ..pointcloud.geometry_octree import geometry_step
+            return geometry_step(args)
         if str(codec_key).strip().lower() == "draco":
             return max(float(getattr(args, "draco_effective_qs", getattr(args, "qs", 1.0))), 1e-9)
         return max(float(getattr(args, "qs", 1.0)), 1e-9)

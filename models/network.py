@@ -28,6 +28,9 @@ from .modules.heuristic_guidance import build_heuristic_guidance, release_exact_
 from .modules.cause_aggregation import CauseDiagnosisAggregation
 from .modules.cost_attribution import CAUSE_NAMES, CostAttributionModule
 from .modules.octree_structure import OctreeStructureAnalysis
+from .modules.geometry_octree_structure import GeometryOctreeStructureAnalysis
+from .utils.pointcloud.geometry_octree import is_geometry_octree, build_geometry_point_features, align_geometry_context, geometry_step, geometry_cache_key
+from .utils.pointcloud.geometry_octree_proposals import attach_geometry_octree_guidance
 from .modules.proposal_selector import AlgorithmicProposalSelector, FullCloudAmountSelector
 from .modules.structure_actuator import StructureRepairActuator
 from .modules.structure_policy import POLICY_NAMES, StructureRepairPolicy
@@ -114,7 +117,10 @@ class Network(nn.Module):
 
         """モジュールセットアップ"""
         self.encoder = PointTransformer(self.args) # 特徴抽出器
-        self.structure_analyzer = OctreeStructureAnalysis(self.args, self.writer) # Octree構造解析モジュールの作成
+        if is_geometry_octree(self.args):
+            self.structure_analyzer = GeometryOctreeStructureAnalysis(self.args, self.writer)
+        else:
+            self.structure_analyzer = OctreeStructureAnalysis(self.args, self.writer) # Octree構造解析モジュールの作成
 
         """次元数セットアップ"""
         fused_dim = int(getattr(self.args, "fused_feat_dim", getattr(self.args, "out_dim", 64))) # Encoderが出す統合特徴の次元数
@@ -473,6 +479,8 @@ class Network(nn.Module):
         return value
 
     def _static_node_cache_key(self, cache_key, source):
+        if is_geometry_octree(self.args):
+            cache_key = geometry_cache_key(self.args, cache_key)
         if not cache_key:
             return ""
         # Include every coordinate convention that can change a voxel-derived
@@ -556,6 +564,8 @@ class Network(nn.Module):
         self._input_cache_bytes = max(int(self._input_cache_bytes), 0)
 
     def _point_transformer_cache_key(self, cache_key, source, batch_index, point_count):
+        if is_geometry_octree(self.args):
+            cache_key = geometry_cache_key(self.args, cache_key)
         if not cache_key:
             return ""
         input_sha256 = ""
@@ -861,7 +871,8 @@ class Network(nn.Module):
                 cache_hits += 1
             else:
                 sparse_qs, sparse_quant_mode, sparse_pos_q = self._encoder_sparse_qs_mode_and_pos()
-                sparse_tensor = build_sparse_point_tensor_single(
+                point_builder = build_geometry_point_features if is_geometry_octree(self.args) else build_sparse_point_tensor_single
+                sparse_tensor = point_builder(
                     sample_xyz,
                     scales[batch_index:batch_index + 1],
                     max_points=int(getattr(self.args, "encoder_pre_downsample_max_points", 8192)),
@@ -4428,6 +4439,8 @@ class Network(nn.Module):
         return torch.cat(propagated, dim=0)
 
     def _encoder_sparse_qs_mode_and_pos(self): # Encoder用のSparse Tensorを作る時に、どの量子化スケール・量子化モード・位置量子化倍率を使うか決める関数
+        if is_geometry_octree(self.args):
+            return geometry_step(self.args), "geometry_octree", 1
         compress_key = (
             str(getattr(self.args, "compress", ""))
             .strip()
@@ -4466,7 +4479,8 @@ class Network(nn.Module):
             if utils_repkpu.KNN_BACKEND != "pointops_cuda" and cdist_cap > 0:
                 encoder_max_points = min(encoder_max_points, cdist_cap) if encoder_max_points > 0 else cdist_cap
             for b in range(pts_xyz.shape[0]):
-                sparse_tensor = build_sparse_point_tensor_single(
+                point_builder = build_geometry_point_features if is_geometry_octree(self.args) else build_sparse_point_tensor_single
+                sparse_tensor = point_builder(
                     pts_xyz[b],
                     scale[b:b + 1],
                     max_points=encoder_max_points,
@@ -5115,7 +5129,8 @@ class Network(nn.Module):
                 if not isinstance(full_octree_context, dict):
                     raise RuntimeError("ana_den6_onlineにはfull-cloud canonical contextが必要である")
                 if not network_only_guidance_forward:
-                    full_octree_context = attach_ana_den6_online_guidance(
+                    guidance_builder = attach_geometry_octree_guidance if is_geometry_octree(self.args) else attach_ana_den6_online_guidance
+                    full_octree_context = guidance_builder(
                         full_octree_context,
                         self.args,
                         device=pts_xyz.device,
@@ -5303,6 +5318,9 @@ class Network(nn.Module):
             if node_voxel_input_state is not None:
                 pts_xyz = node_voxel_input_state["node_xyz"].to(device=pts_xyz.device, dtype=pts_xyz.dtype)
                 pts_attr = None
+                if is_geometry_octree(self.args):
+                    full_octree_context = align_geometry_context(full_octree_context, node_voxel_input_state["voxel_coords"])
+                    canonical_subtree_tree = align_geometry_context(canonical_subtree_tree, node_voxel_input_state["voxel_coords"])
 
                 # ここで selection_mask を full cloud 用maskのまま使ってはいけない。
                 # pts_xyz はすでに subtree subset のnode_xyzになっているため、

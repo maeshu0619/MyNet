@@ -8,6 +8,14 @@ def log_basic_setup(writer, args, file_day, file_time):
     writer.write(f"Date of Training: {file_day}-{file_time}")
     writer.write(f"Log Root: {args.log_root}")
     writer.write(f"Checkpoint Root: {args.out_path}")
+    from models.utils.pointcloud.geometry_octree import is_geometry_octree, codec_key, geometry_step
+    if is_geometry_octree(args):
+        writer.write(
+            f"GeometryCodecRoute: codec={codec_key(args)}, structure=GeometryOctreeStructureAnalysis, "
+            f"quant_step={geometry_step(args)}, proposal=conventional_octree_safe_pools, "
+            f"sparsepcgc_teacher=False, sparsepcgc_candidate_cache=False, "
+            f"octattention_actualcode={getattr(args, 'octattention_actualcode', False)}"
+        )
     writer.write(f"Method Name: {getattr(args, 'method_name', 'Mine')}")
     writer.write(
         f"Surrogate Name: "

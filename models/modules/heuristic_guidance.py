@@ -501,6 +501,10 @@ def _exact_den6_guidance(
     exact: Mapping[str, Any],
 ) -> Dict[str, Any]:
     """den6 pool rankを現在のcanonical voxel行へ厳密に対応付ける。"""
+    if str(exact.get("source", "")) == "mynet_geometry_octree_safe_pool_v1":
+        from ..utils.pointcloud.geometry_octree import is_geometry_octree
+        if not is_geometry_octree(args):
+            raise RuntimeError("conventional geometry pools cannot enter the SparsePCGC route")
     if str(exact.get("source", "")) not in {
         "ana_den6_exact_ranked_candidate_pool_v2",
         "ana_den6_exact_ranked_candidate_pool_online_v1",
@@ -512,6 +516,7 @@ def _exact_den6_guidance(
         "ana_den6_exact_one_pattern_anchor_online_v6",
         "ana_den6_exact_single_plan_teacher_online_v8",
         "mynet_fast_unordered_safe_pool_v1",
+        "mynet_geometry_octree_safe_pool_v1",
     }:
         raise RuntimeError("ana_den6 exact candidate guidance sourceが不正である")
     coords = _normalize_coords_b3n(structure.get("global_voxel_coords"), like)
@@ -848,6 +853,7 @@ def _exact_den6_guidance(
                 "ana_den6_exact_one_pattern_anchor_online_v6",
                 "ana_den6_exact_single_plan_teacher_online_v8",
                 "mynet_fast_unordered_safe_pool_v1",
+                "mynet_geometry_octree_safe_pool_v1",
             }
             else "ana_den6_exact_ranked_editcandidate_pool_online_v1"
             if str(exact.get("source", "")) == "ana_den6_exact_ranked_candidate_pool_online_v1"
@@ -1008,7 +1014,7 @@ def build_heuristic_guidance(structure: Mapping[str, Any], args: Any) -> Dict[st
     fast_unordered_online = bool(
         mode == "ana_den6_online"
         and isinstance(exact, Mapping)
-        and str(exact.get("source", "")) == "mynet_fast_unordered_safe_pool_v1"
+        and str(exact.get("source", "")) in {"mynet_fast_unordered_safe_pool_v1", "mynet_geometry_octree_safe_pool_v1"}
     )
     if mode == "ana_den6_online" and not (
         single_proposal_online or exact_anchor_online or fast_unordered_online
