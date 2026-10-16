@@ -3988,15 +3988,16 @@ def train(model, args, loss, writer, plot, notifier=None):
                 if compression_primary_mode and torch.is_tensor(L_geom):
                     # Compare gradients after the actual objective weights and
                     # adaptive balance, not raw losses with different units.
+                    from models.utils.pointcloud.geometry_rd import enabled as geometry_rd_enabled, geometry_penalty
+                    primary_geometry_penalty = torch.relu(
+                        L_geom - L_geom.new_tensor(float(getattr(args, 'cp_tau_geom', 0.))))
+                    if geometry_rd_enabled(args):
+                        primary_geometry_penalty = geometry_penalty(L_geom, args)
                     weighted_geometry_primary_raw = (
                         float(cp_debug.get("cp_aux_balance_scale", 1.0))
                         * float(stage_factors.get("geom", 1.0))
                         * float(getattr(args, "cp_lambda_geom", 1.0))
-                        * torch.relu(
-                            L_geom - L_geom.new_tensor(float(getattr(
-                                args, "cp_tau_geom", 0.0
-                            )))
-                        )
+                        * primary_geometry_penalty
                     )
                     geometry_backward_scale = max(float(getattr(
                         args, "cp_geometry_backward_scale", 1.0
@@ -4909,6 +4910,12 @@ def train(model, args, loss, writer, plot, notifier=None):
                                 ))
                             ):
                                 continue
+                            if (head_name in {'Where', 'Surrogate'} and no_op_selected
+                                    and bool(audit_plan.get('geometry_joint_policy'))):
+                                # A joint no-op has no spatial edit, and its
+                                # rate surrogate may already match exactly.
+                                # Zero is valid here; Amount still learns.
+                                continue
                             # With gradient balancing explicitly disabled there is no
                             # ``*_before_balance`` field.  The direct head audit is
                             # the same pre-clip gradient and must be used instead of
@@ -4949,6 +4956,13 @@ def train(model, args, loss, writer, plot, notifier=None):
                             "loss": float(timing_loss_end - timing_loss_start),
                             "backward_opt": float(timing_step_end - timing_loss_end),
                         }
+                    if audit_plan.get('geometry_joint_policy'):
+                        from models.utils.pointcloud.geometry_rd import geometry_penalty
+                        writer.write('GeometryJointPolicyAudit: ' + str(audit_plan['geometry_joint_policy']))
+                        writer.write('GeometryRDAudit: raw={}, no_edit_reference={}, voxel_scale={}, penalty={}'.format(
+                            case_float(L_geom, 0.), getattr(args, '_geometry_noop_chamfer', None),
+                            getattr(args, '_geometry_rd_voxel_scale', None),
+                            case_float(geometry_penalty(L_geom.detach(), args), 0.)))
                     writer.write(
                         "Den6OnlineAudit: "
                         f"cache={dict(cache_stats) if isinstance(cache_stats, dict) else {}}, "

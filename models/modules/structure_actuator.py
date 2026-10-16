@@ -247,6 +247,10 @@ class StructureRepairActuator(nn.Module):
     def __init__(self, in_channels, hidden_dim=64, args=None):
         super().__init__()
         self.args = args
+        from ..utils.pointcloud.geometry_octree import is_geometry_octree
+        if is_geometry_octree(args) and getattr(args, 'geometry_octree_joint_policy', True):
+            from ..utils.pointcloud.geometry_joint_policy import GeometryJointContext
+            self.geometry_joint_context = GeometryJointContext()
         self.last_runtime_timing = {}
         neighbor_offsets = [
             (dx, dy, dz)
@@ -4673,6 +4677,9 @@ class StructureRepairActuator(nn.Module):
         if not isinstance(pools, dict):
             return None
         operations = ("Add", "Prune", "Adjust")
+        from ..utils.pointcloud.geometry_octree import is_geometry_octree
+        geometry_joint = bool(is_geometry_octree(self.args) and getattr(
+            self.args, 'geometry_octree_joint_policy', True))
         if any(not isinstance(pools.get(name), list) or not pools.get(name) for name in operations):
             return None
         pool_identity_payload = json.dumps({
@@ -4698,6 +4705,9 @@ class StructureRepairActuator(nn.Module):
         max_changed_ratio = min(max(float(
             getattr(self.args, "heuristic_guidance_online_max_changed_ratio", 0.0099)
         ), 0.0), 0.0099)
+        if geometry_joint:
+            max_total_ratio = max_changed_ratio = float(getattr(
+                self.args, 'geometry_octree_max_edit_ratio', .0099))
         # A plan needs at least one executable edit, but individual operation
         # families may be zero because their counts are owned by the Gate.
         if online_mode and int(math.floor(point_count * max_total_ratio)) < 1:
@@ -4915,9 +4925,14 @@ class StructureRepairActuator(nn.Module):
             self._select_den6_factorized_exploration_group(
                 network_confidence_audit
             )
-            if factorized_actual_credit and exploration_active
+            if factorized_actual_credit and exploration_active and not geometry_joint
             else "all" if exploration_active else "none"
         )
+        if geometry_joint:
+            # One composite Actual result must supervise the joint decision;
+            # do not freeze the other operations/Amount behind factor anchors.
+            factorized_behavior = False
+            factorized_exploration_group = 'all' if exploration_active else 'none'
         # Exact candidate credit needs an actually reused counterfactual anchor,
         # not merely two plans whose hashes happen to coincide after the Network
         # has changed.  Keep the first executed plan for each
@@ -4981,6 +4996,10 @@ class StructureRepairActuator(nn.Module):
 
         def _confidence_forward_full_backward(residual, decision_group=None):
             """Scale hard forward authority but keep the residual trainable."""
+            if geometry_joint:
+                # SparsePCGC-specific alignment is not a geometry-codec
+                # safety proof and must not freeze Gate/Fine at their priors.
+                return residual
             forward_authority = (
                 float(network_plan_confidence)
                 + (1.0 - float(network_plan_confidence))
@@ -5072,6 +5091,10 @@ class StructureRepairActuator(nn.Module):
             amount_logits = prior_amount_logits + _confidence_forward_full_backward(
                 network_amount_logits - prior_amount_logits, "Amount"
             )
+            if geometry_joint:
+                # Every positive bin and no-op is reachable. A codec-specific
+                # Amount policy must not be trapped by the SparsePCGC prior.
+                amount_logits = network_amount_logits
             uncalibrated_std = float(
                 amount_logits_centered.detach().std(unbiased=False).cpu()
             ) if int(amount_logits_centered.numel()) > 1 else 0.0
@@ -5332,7 +5355,11 @@ class StructureRepairActuator(nn.Module):
         )
         requested_counts = self._den6_allocate_counts(total_budget, shares_value)
         for name in operations:
-            requested_counts[name] = min(max(int(requested_counts[name]), 0), len(pools[name]))
+            if geometry_joint:
+                capacity = sum(int(c.get('operation_count', 1)) for c in pools[name])
+                requested_counts[name] = min(max(int(requested_counts[name]), 0), capacity)
+            else:
+                requested_counts[name] = min(max(int(requested_counts[name]), 0), len(pools[name]))
         diagnostic_policy = str(getattr(
             self.args, "heuristic_guidance_online_diagnostic_policy", "normal"
         )).strip().lower()
@@ -6646,7 +6673,17 @@ class StructureRepairActuator(nn.Module):
         # while the conflict-free plan is assembled.
         true_add_targets = set()
         selected_counts = {name: 0 for name in operations}
-        for operation in operation_order:
+        joint_geometry_result = None
+        if geometry_joint:
+            from ..utils.pointcloud.geometry_joint_policy import select_joint_geometry_plan
+            joint_geometry_result = select_joint_geometry_plan(
+                voxel_coords, exact, pools, requested_counts, candidate_value_scores,
+                self.args, exploration=float(exploration_multiplier) if self.training and diagnostic_policy == 'normal' else 0.,
+                heuristic_only=diagnostic_policy == 'heuristic', masks=candidate_proposal_masks,
+                context_head=self.geometry_joint_context, random_only=diagnostic_policy == 'random_safe')
+            (selected, removes, adds, true_add_targets, selected_counts,
+             joint_where_log_prob, joint_where_entropy, joint_geometry_audit) = joint_geometry_result
+        for operation in (() if geometry_joint else operation_order):
             for candidate_index in ordered_indices[operation]:
                 if selected_counts[operation] >= requested_counts[operation]:
                     break
@@ -6812,6 +6849,8 @@ class StructureRepairActuator(nn.Module):
             )
             for name in operations
         }
+        if geometry_joint:
+            where_log_prob = joint_where_log_prob
         # coarse selectorをoperation数+1で希釈しない。旧meanでは後半の
         # fine exploration=0時に実質1/4となり、Geometry creditが消えていた。
         amount_log_prob = amount_bin_log_prob + amount_fine_log_prob
@@ -7214,6 +7253,8 @@ class StructureRepairActuator(nn.Module):
             # requires_gradは契約上維持し、backwardだけ厳密に0とする。
             policy_log_prob = policy_log_prob.detach() + 0.0 * policy_log_prob
             policy_entropy = policy_entropy.detach() + 0.0 * policy_entropy
+        if geometry_joint:
+            policy_entropy = joint_where_entropy
 
         selected_ids = [str(candidate.get("candidate_id", "")) for _, _, candidate in selected]
         executed_ids_by_operation = {
@@ -7483,7 +7524,8 @@ class StructureRepairActuator(nn.Module):
                 else "den6_pool_confidence_bounded_network_residual"
             ),
             "performance_source": (
-                "exact_teacher_anchor"
+                "geometry_joint_conditional_occupancy_actual_actor"
+                if geometry_joint else "exact_teacher_anchor"
                 if exact_anchor_active
                 else "network_actor_critic_no_rank_fusion"
                 if actor_critic_selection
@@ -7635,6 +7677,7 @@ class StructureRepairActuator(nn.Module):
             ),
             "score_audit": score_audit,
             "candidate_local_credit_loss": candidate_local_credit_loss,
+            "geometry_joint_policy": joint_geometry_audit if geometry_joint else {},
             "candidate_ranking_local_loss": candidate_local_loss,
             "candidate_pairwise_local_loss": candidate_pairwise_loss,
             "candidate_critic_local_loss": candidate_critic_loss,

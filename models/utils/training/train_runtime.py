@@ -5002,6 +5002,9 @@ def _den6_online_grad_norms(model):
             getattr(actuator, "den6_plan_critic", None),
         ),
     }
+    if getattr(actuator, 'geometry_joint_context', None) is not None:
+        for group_name in ('den6_online_where_grad_norm', 'den6_online_candidate_where_grad_norm'):
+            groups[group_name] += (actuator.geometry_joint_context,)
     norm_squares = []
     parameter_squares = {}
     device = next(base_model.parameters()).device
@@ -5144,6 +5147,8 @@ def _den6_online_decision_parameters(model):
     )
     params = []
     seen = set()
+    if getattr(actuator, 'geometry_joint_context', None) is not None:
+        modules = modules + (actuator.geometry_joint_context,)
     local_utility_gate = getattr(
         actuator, "candidate_local_utility_gate_logits", None
     )
@@ -5244,6 +5249,8 @@ def _probe_den6_policy_source_gradients(model, source_losses):
         name: [param for param in params if param.requires_grad]
         for name, params in groups.items()
     }
+    if getattr(actuator, 'geometry_joint_context', None) is not None:
+        groups['actor'] = groups['actor'] + list(actuator.geometry_joint_context.parameters())
     result = {}
     for source_name, source_loss in source_losses.items():
         if not torch.is_tensor(source_loss) or not source_loss.requires_grad:
@@ -6547,6 +6554,7 @@ def run_episode_full_cloud_validation(
 
     values = []
     geometry_values = []
+    geometry_edit_penalties = []
     sample_names = []
     was_training = bool(model.training)
     old_replay_max = getattr(loss, "surrogate_replay_max_entries", None)
@@ -6754,6 +6762,10 @@ def run_episode_full_cloud_validation(
                         sample_names.append(os.path.basename(str(file_path)))
                         if validation_geometry_value is not None:
                             geometry_values.append(float(validation_geometry_value))
+                            if is_geometry_octree(args) and getattr(args, 'geometry_octree_joint_policy', True):
+                                from models.utils.pointcloud.geometry_rd import geometry_penalty
+                                geometry_edit_penalties.append(float(geometry_penalty(
+                                    torch.tensor(float(validation_geometry_value)), args)))
                 except Exception as exc:
                     writer.write(
                         "FullCloudValidationWarning: "
@@ -6781,6 +6793,10 @@ def run_episode_full_cloud_validation(
         fixed_objective = avg_value + float(
             getattr(args, "cp_lambda_geom", 1.0)
         ) * geom_penalty
+        if is_geometry_octree(args) and getattr(args, 'geometry_octree_joint_policy', True):
+            geom_penalty = sum(geometry_edit_penalties) / len(geometry_edit_penalties)
+            fixed_objective = float(getattr(args, 'w_com', 1.)) * avg_value + float(
+                getattr(args, 'cp_lambda_geom', 1.)) * geom_penalty
     else:
         fixed_objective = None
     validation_signature = hashlib.sha256(

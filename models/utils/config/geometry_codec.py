@@ -14,9 +14,36 @@ def configure_geometry_codec(args, explicit):
         raise ValueError('geometry_octree_initial_total_ratio must be between 0 and 1')
     if not math.isfinite(args.geometry_octree_pool_reserve_factor) or args.geometry_octree_pool_reserve_factor < 1 or args.geometry_octree_pool_max_per_operation < 1:
         raise ValueError('geometry candidate reserve must be >=1 and pool cap positive')
+    if not math.isfinite(args.geometry_octree_max_edit_ratio) or not 0 < args.geometry_octree_max_edit_ratio < 1:
+        raise ValueError('geometry_octree_max_edit_ratio must be between 0 and 1')
+    if key == 'octattention' and args.geometry_octree_rate_model == 'neighbour_binary':
+        raise ValueError('neighbour_binary is an experimental G-PCC prior, not an OctAttention probability model')
+    if args.geometry_octree_joint_policy:
+        # The shared initializer reads this legacy field. Its SparsePCGC 3%
+        # default would always initialize geometry's largest positive bin.
+        if not explicit('--sparsepcgc_algorithmic_amount_init_ratio'):
+            args.sparsepcgc_algorithmic_amount_init_ratio = args.geometry_octree_initial_total_ratio
+        for name, value in (
+            ('heuristic_guidance_online_actor_proxy_weight', 0.),
+            ('heuristic_guidance_online_actor_critic_distill_weight', 0.),
+            ('cp_geometry_backward_scale', 1.),
+            ('heuristic_guidance_online_global_actual_credit_weight', 0.5),
+        ):
+            if not explicit('--' + name):
+                setattr(args, name, value)
+        if not explicit('--heuristic_guidance_online_amount_bins'):
+            args.heuristic_guidance_online_amount_bins = '0.0005,0.0015,0.003,0.006,0.009'
+        if not explicit('--cp_tau_geom'):
+            args.cp_tau_geom = 0.  # excess distortion, measured in voxel^2
+    for name in ('geometry_octree_distortion_weight', 'geometry_octree_actor_weight',
+                 'geometry_octree_score_scale', 'geometry_octree_joint_temperature'):
+        value = float(getattr(args, name))
+        if not math.isfinite(value) or value < 0 or (name.endswith('scale') and value == 0):
+            raise ValueError(name + ' must be finite and nonnegative (scale positive)')
     bins = sorted(set(float(v) for v in args.heuristic_guidance_online_amount_bins.split(',')))
-    if not bins or any(not math.isfinite(v) or v <= 0 or v > 0.0099 for v in bins):
-        raise ValueError('conventional Amount bins must be finite positive ratios <=0.0099')
+    maximum = args.geometry_octree_max_edit_ratio if args.geometry_octree_joint_policy else .0099
+    if not bins or any(not math.isfinite(v) or v <= 0 or v > maximum for v in bins):
+        raise ValueError('conventional Amount bins must be finite positive ratios <=geometry_octree_max_edit_ratio')
     args.geometry_octree_amount_bin_values = tuple(bins)
     shares = [float(v) for v in (args.heuristic_guidance_operation_shares or '0.4,0.4,0.2').split(',')]
     if len(shares) != 3 or any(not math.isfinite(v) or v <= 0 for v in shares):

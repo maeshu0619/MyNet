@@ -424,6 +424,9 @@ class GeometryLossMixin:
         return proxy
 
     def get_geometry_loss(self, args, gen_pts, gt_pts, final_w=None, out_label=None):
+        from ..pointcloud.geometry_rd import enabled, set_geometry_reference
+        if enabled(args) and gt_pts.shape[-1] > 0:
+            set_geometry_reference(gt_pts, args)
         use_torch_d2 = args.trainORtest == "train"
         audit_enabled = self._should_verbose_step(args) or args.trainORtest != "train"
         # Phase2/Phase6では out_label がdictになる。

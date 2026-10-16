@@ -94,6 +94,9 @@ def build_optimizer_and_scheduler(model, args, writer):
         "actuator.den6_candidate_proxy_critic.",
         "actuator.den6_plan_critic.",
     )
+    from models.utils.pointcloud.geometry_octree import is_geometry_octree
+    if is_geometry_octree(args) and getattr(args, 'geometry_octree_joint_policy', True):
+        online_decision_tokens += ('actuator.geometry_joint_context.',)
     online_amount_names = {
         name for name in named_trainable
         if online_mode and any(token in name for token in online_amount_tokens)

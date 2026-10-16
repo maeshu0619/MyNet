@@ -294,7 +294,7 @@ class Network(nn.Module):
             "_den6_fixed_rd_authority_rejected",
             "_den6_fixed_rd_reject_evidence",
         )
-        return {
+        result = {
             "version": 1,
             "network": {
                 name: getattr(self, name)
@@ -306,10 +306,27 @@ class Network(nn.Module):
                 and hasattr(self.actuator, name)
             },
         }
+        if is_geometry_octree(self.args) and getattr(self.args, 'geometry_octree_joint_policy', True):
+            result['geometry_joint'] = dict(schema='geometry_joint_v3',
+                codec=str(self.args.compress),
+                bins=str(self.args.heuristic_guidance_online_amount_bins),
+                prior_trust=float(getattr(self.args, '_geometry_octree_prior_trust', 1.)),
+                compression_baseline=getattr(self, '_geometry_policy_compression_baseline', OrderedDict()))
+        return result
 
     def load_actor_critic_runtime_state_dict(self, state):
         if not isinstance(state, dict):
             return False
+        if is_geometry_octree(self.args) and getattr(self.args, 'geometry_octree_joint_policy', True):
+            joint = state.get('geometry_joint', {})
+            if joint.get('schema') != 'geometry_joint_v3':
+                raise ValueError('Old geometry runtime has incompatible RD/action bins; start a fresh joint run with --more_training false')
+            if joint.get('codec') != str(self.args.compress):
+                raise ValueError('geometry joint runtime belongs to a different codec')
+            if joint.get('bins') != str(self.args.heuristic_guidance_online_amount_bins):
+                raise ValueError('geometry joint Amount bins differ from saved runtime')
+            self.args._geometry_octree_prior_trust = float(joint['prior_trust'])
+            self._geometry_policy_compression_baseline = OrderedDict(joint['compression_baseline'])
         for name, value in dict(state.get("network") or {}).items():
             setattr(self, str(name), value)
         if hasattr(self, "actuator"):
@@ -968,6 +985,17 @@ class Network(nn.Module):
             mode == "ana_den6_online"
             and selection_mode in {"actor_critic", "prior_residual"}
         )
+        geometry_joint_policy = bool(is_geometry_octree(self.args) and getattr(
+            self.args, 'geometry_octree_joint_policy', True))
+        if geometry_joint_policy:
+            # Calibrate trust using the executed codec, never treat proxy gain
+            # as an Actual label. Repeated sign failures remove prior control.
+            joint_audit = (state.get('ana_den6_exact_residual_plan_debug', {}) or {}).get('geometry_joint_policy', {})
+            predicted_gain = float(joint_audit.get('joint_gain', 0.))
+            if joint_audit and abs(predicted_gain) > 1e-8:
+                correct = float((predicted_gain > 0.) == (float(objective.detach().cpu()) < 0.))
+                previous_trust = float(getattr(self.args, '_geometry_octree_prior_trust', 1.))
+                self.args._geometry_octree_prior_trust = .9 * previous_trust + .1 * correct
         # prior_residual differs only in forward safety (H is retained).  The
         # Actual Actor/Critic/Proposal learners and their replay are shared.
         actual_residual_learning = bool(factorized_actual_credit)
@@ -984,6 +1012,9 @@ class Network(nn.Module):
                 self.args, "cp_tau_geom", 0.0
             )))
         )
+        if geometry_joint_policy:
+            from .utils.pointcloud.geometry_rd import geometry_penalty as conventional_geometry_penalty
+            geometry_penalty = conventional_geometry_penalty(geometry_objective_for_rd, self.args)
         changed_ratio = state.get(
             "den6_online_actor_critic_changed_ratio", objective.new_zeros(())
         )
@@ -1204,7 +1235,7 @@ class Network(nn.Module):
         # Episode schedule is used, and no additional codec call is required.
         noop_edit_comparison_available = False
         noop_edit_comparison_exact = False
-        if factorized_actual_credit and factorized_group == "Amount":
+        if factorized_actual_credit and (factorized_group == "Amount" or geometry_joint_policy):
             noop_selected = bool(plan_debug_state.get("no_op_selected", False))
             noop_memory = getattr(self, "_den6_noop_edit_actual_memory", None)
             if noop_memory is None:
@@ -1282,7 +1313,7 @@ class Network(nn.Module):
                 measured_noop_objective = exact_noop_entry.get("noop")
         if (
             factorized_actual_credit
-            and factorized_group == "Amount"
+            and (factorized_group == "Amount" or geometry_joint_policy)
             and torch.is_tensor(amount_log_probs_all)
             and amount_log_probs_all.requires_grad
             and 0 < selected_amount_index < int(amount_log_probs_all.numel())
@@ -2526,6 +2557,22 @@ class Network(nn.Module):
                     float(effective_baseline_t.detach().cpu()) + compression_tolerance,
                 )
             )
+            if geometry_joint_policy:
+                # Positive Actual is not a reason to disable learning which
+                # reduces distortion while holding the *current* rate.
+                memory = getattr(self, '_geometry_policy_compression_baseline', None)
+                if memory is None:
+                    memory = OrderedDict()
+                    self._geometry_policy_compression_baseline = memory
+                current_rate = float(objective.detach().cpu())
+                previous_rate = memory.get(cache_key)
+                geometry_guard_passed = bool(previous_rate is not None and
+                    current_rate <= previous_rate + compression_tolerance)
+                memory[cache_key] = current_rate if previous_rate is None else (
+                    (1. - baseline_alpha) * previous_rate + baseline_alpha * current_rate)
+                memory.move_to_end(cache_key)
+                while len(memory) > 4096:
+                    memory.popitem(last=False)
             geometry_reference_available = bool(
                 geometry_seen or sequence_geometry_seen
             )
@@ -2666,6 +2713,8 @@ class Network(nn.Module):
                     current_compression_value
                     <= min(0.0, previous_compression + compression_tolerance)
                 )
+                if geometry_joint_policy:
+                    compression_ok = current_compression_value <= previous_compression + compression_tolerance
                 geometry_ok = bool(
                     current_geometry_value
                     <= previous_geometry_value

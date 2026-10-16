@@ -425,9 +425,9 @@ def _candidate_local_proxy_tensors(
         # Treat context risk as uncertainty in the denominator, matching its
         # meaning in the probe without copying heuristic score/rank itself.
         affected = max(int(candidate.get("affected_voxel_cells", 1) or 1), 1)
-        optimistic_gain = max(float(
-            candidate.get("optimistic_gain_bits", 0.0) or 0.0
-        ), 0.0)
+        optimistic_gain = float(candidate.get("optimistic_gain_bits", 0.0) or 0.0)
+        if not str(exact.get('schema_version', '')).startswith('geometry_joint_occupancy_'):
+            optimistic_gain = max(optimistic_gain, 0.0)
         context_risk = max(float(
             candidate.get("neighbor_bit_risk", 0.0) or 0.0
         ), 0.0)

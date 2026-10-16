@@ -346,6 +346,9 @@ def build_compression_primary_loss(
         )
 
     P_geom = relu_penalty(as_scalar_loss_tensor(L_geom), getattr(args, "cp_tau_geom", 0.06))
+    from ..pointcloud.geometry_rd import enabled as geometry_rd_enabled, geometry_penalty
+    if geometry_rd_enabled(args):
+        P_geom = geometry_penalty(as_scalar_loss_tensor(L_geom), args)
     P_single = relu_penalty(L_single, getattr(args, "cp_tau_single", 0.0)) if L_single is not None else zero
     P_nodes = relu_penalty(L_nodes, getattr(args, "cp_tau_nodes", 0.0)) if L_nodes is not None else zero
     P_sparsepcgc = (
@@ -442,6 +445,10 @@ def build_compression_primary_loss(
         * float(geom_backward_scale)
         if geom_active else 0.0
     )
+    if geometry_rd_enabled(args):
+        geom_scalar_grad_scale = (aux_balance_scale * sf_geom * float(args.cp_lambda_geom)
+            * geom_backward_scale / float(args._geometry_rd_voxel_scale)
+            if case_float(P_geom, 0.) > 0 else 0.)
 
     debug = {
         "loss_mode": "compression_primary",

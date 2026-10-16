@@ -2078,6 +2078,13 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--geometry_octree_initial_total_ratio', default=0.0025, type=float, help='G-PCC/OctAttentionの初期合計編集割合（fraction）。以後は共通Amount headが学習する')
     parser.add_argument('--geometry_octree_pool_reserve_factor', default=4.0, type=float, help='幾何Octree用の各操作候補pool余裕倍率')
     parser.add_argument('--geometry_octree_pool_max_per_operation', default=8192, type=int, help='幾何Octree用の各操作候補pool上限')
+    parser.add_argument('--geometry_octree_joint_policy', default=True, type=str2bool, help='幾何codecのみ: 3操作共通Octree状態で限界コストを再評価して1planを構築')
+    parser.add_argument('--geometry_octree_max_edit_ratio', default=0.0099, type=float, help='幾何codec専用の総操作/変更Voxel率上限。大きいAmount binを試す際だけ明示的に拡張する')
+    parser.add_argument('--geometry_octree_distortion_weight', default=0.05, type=float, help='幾何codecの候補prior用の局所距離コスト係数。Actual RD損失とは別')
+    parser.add_argument('--geometry_octree_actor_weight', default=0.25, type=float, help='joint限界コストへ加える有界Actor残差の重み')
+    parser.add_argument('--geometry_octree_score_scale', default=4.0, type=float, help='empirical occupancy gainをjoint選択logitへ変換するscale')
+    parser.add_argument('--geometry_octree_joint_temperature', default=0.25, type=float, help='joint候補選択の初期Gumbel温度。既存探索scheduleで0まで減衰')
+    parser.add_argument('--geometry_octree_rate_model', default='empirical', choices=['empirical', 'neighbour_binary'], help='幾何候補prior。どちらもActual bitsではない。neighbour_binaryはG-PCC用の実験的近傍条件付きモデル')
     parser.add_argument('--octree_voxel', type=float, default=1e-3, help='Octreeボクセルサイズ')
     parser.add_argument('--qs', type=int, default=2, help='量子化ステップサイズ')
 

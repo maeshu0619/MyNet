@@ -17,6 +17,9 @@ SOURCE = 'mynet_geometry_octree_safe_pool_v1'
 
 
 def attach_geometry_octree_guidance(context, args, *, device):
+    if bool(getattr(args, 'geometry_octree_joint_policy', True)):
+        from .geometry_joint_proposals import attach_joint_geometry_guidance
+        return attach_joint_geometry_guidance(context, args, device=device)
     started = time.perf_counter()
     coords = context.get('full_global_voxel_coords', context.get('global_voxel_coords'))
     if not torch.is_tensor(coords) or coords.ndim != 3 or coords.shape[:2] != (1, 3):

@@ -10,6 +10,12 @@ def log_basic_setup(writer, args, file_day, file_time):
     writer.write(f"Checkpoint Root: {args.out_path}")
     from models.utils.pointcloud.geometry_octree import is_geometry_octree, codec_key, geometry_step
     if is_geometry_octree(args):
+        writer.write('GeometryJointPolicy: enabled={}, actor_proxy_distill={}, bins={}'.format(
+            getattr(args, 'geometry_octree_joint_policy', True),
+            getattr(args, 'heuristic_guidance_online_actor_critic_distill_weight', 0.),
+            getattr(args, 'heuristic_guidance_online_amount_bins', '')))
+        if getattr(args, 'geometry_octree_joint_policy', True):
+            writer.write('GeometryRD: excess_voxel_chamfer=max(0,(raw_CD-no_edit_CD)/quant_step^2-tau); raw_CD plots unchanged; actual bits definition unchanged')
         writer.write(
             f"GeometryCodecRoute: codec={codec_key(args)}, structure=GeometryOctreeStructureAnalysis, "
             f"quant_step={geometry_step(args)}, proposal=conventional_octree_safe_pools, "
