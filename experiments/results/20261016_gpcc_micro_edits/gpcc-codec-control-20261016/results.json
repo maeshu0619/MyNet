@@ -1,0 +1,164 @@
+[
+  {
+    "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+    "setting": "current",
+    "flags": [],
+    "bits": 150240,
+    "stream_sha256": "fa7b6836f413a0ca6ecd73c883625067344522ccb82e6bd9a73d746a9157722e",
+    "codec_sec": 1.1339218630455434,
+    "decoded_exact": true,
+    "compression_percent_vs_current": 0.0,
+    "physical_geometry_unchanged": true,
+    "is_voxel_edit_result": false
+  },
+  {
+    "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+    "setting": "planar_on",
+    "flags": [
+      "--planarEnabled=1"
+    ],
+    "bits": 150288,
+    "stream_sha256": "ceec871f06d5f6810f3cd834a2136f941ab232e4a3e408a3cc638c30c8277c9d",
+    "codec_sec": 1.1917340499348938,
+    "decoded_exact": true,
+    "compression_percent_vs_current": 0.03194888178914557,
+    "physical_geometry_unchanged": true,
+    "is_voxel_edit_result": false
+  },
+  {
+    "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+    "setting": "no_qtbt",
+    "flags": [
+      "--maxNumQtBtBeforeOt=0"
+    ],
+    "bits": 169424,
+    "stream_sha256": "94cd47138c5aaf79b4f5a7682468aab06180dbbfbfa913683f4dfce4072b78da",
+    "codec_sec": 1.3915539956651628,
+    "decoded_exact": true,
+    "compression_percent_vs_current": 12.768903088391914,
+    "physical_geometry_unchanged": true,
+    "is_voxel_edit_result": false
+  },
+  {
+    "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+    "setting": "no_idcm",
+    "flags": [
+      "--inferredDirectCodingMode=0"
+    ],
+    "bits": 150240,
+    "stream_sha256": "fa7b6836f413a0ca6ecd73c883625067344522ccb82e6bd9a73d746a9157722e",
+    "codec_sec": 1.150477709248662,
+    "decoded_exact": true,
+    "compression_percent_vs_current": 0.0,
+    "physical_geometry_unchanged": true,
+    "is_voxel_edit_result": false
+  },
+  {
+    "frame": "/data/maejima/data/ground/8i/loot/loot_vox10_1000.ply",
+    "setting": "current",
+    "flags": [],
+    "bits": 144536,
+    "stream_sha256": "c9fe30c02c4a19ba98686c6570dcbe53fe38de6bd773a5ca17aa12ac23f61252",
+    "codec_sec": 1.0937523879110813,
+    "decoded_exact": true,
+    "compression_percent_vs_current": 0.0,
+    "physical_geometry_unchanged": true,
+    "is_voxel_edit_result": false
+  },
+  {
+    "frame": "/data/maejima/data/ground/8i/loot/loot_vox10_1000.ply",
+    "setting": "planar_on",
+    "flags": [
+      "--planarEnabled=1"
+    ],
+    "bits": 144584,
+    "stream_sha256": "5bca0abc946a2f70675c4618eeac8de7d2b5a550e1d64040d7e3ac35db013f0b",
+    "codec_sec": 1.0930478717200458,
+    "decoded_exact": true,
+    "compression_percent_vs_current": 0.0332097193778802,
+    "physical_geometry_unchanged": true,
+    "is_voxel_edit_result": false
+  },
+  {
+    "frame": "/data/maejima/data/ground/8i/loot/loot_vox10_1000.ply",
+    "setting": "no_qtbt",
+    "flags": [
+      "--maxNumQtBtBeforeOt=0"
+    ],
+    "bits": 165184,
+    "stream_sha256": "e403c1859c9f9d926b6e36db8a6a4ce8eefd0deb34a1832fbd86df7405231f02",
+    "codec_sec": 1.333815302234143,
+    "decoded_exact": true,
+    "compression_percent_vs_current": 14.28571428571428,
+    "physical_geometry_unchanged": true,
+    "is_voxel_edit_result": false
+  },
+  {
+    "frame": "/data/maejima/data/ground/8i/loot/loot_vox10_1000.ply",
+    "setting": "no_idcm",
+    "flags": [
+      "--inferredDirectCodingMode=0"
+    ],
+    "bits": 144536,
+    "stream_sha256": "c9fe30c02c4a19ba98686c6570dcbe53fe38de6bd773a5ca17aa12ac23f61252",
+    "codec_sec": 1.1564853210002184,
+    "decoded_exact": true,
+    "compression_percent_vs_current": 0.0,
+    "physical_geometry_unchanged": true,
+    "is_voxel_edit_result": false
+  },
+  {
+    "frame": "/data/maejima/data/ground/8i/soldier/soldier_vox10_0536.ply",
+    "setting": "current",
+    "flags": [],
+    "bits": 215664,
+    "stream_sha256": "40897bc1bc1e6f1da0788c3bcf058e30f96dda17109bdc558390df6e518ff06c",
+    "codec_sec": 1.5745263337157667,
+    "decoded_exact": true,
+    "compression_percent_vs_current": 0.0,
+    "physical_geometry_unchanged": true,
+    "is_voxel_edit_result": false
+  },
+  {
+    "frame": "/data/maejima/data/ground/8i/soldier/soldier_vox10_0536.ply",
+    "setting": "planar_on",
+    "flags": [
+      "--planarEnabled=1"
+    ],
+    "bits": 215712,
+    "stream_sha256": "5361001176df6cf55a8b418b4d88c5c15ebdae302893f2a50930941a24cc03f5",
+    "codec_sec": 1.5426356350071728,
+    "decoded_exact": true,
+    "compression_percent_vs_current": 0.022256843979517882,
+    "physical_geometry_unchanged": true,
+    "is_voxel_edit_result": false
+  },
+  {
+    "frame": "/data/maejima/data/ground/8i/soldier/soldier_vox10_0536.ply",
+    "setting": "no_qtbt",
+    "flags": [
+      "--maxNumQtBtBeforeOt=0"
+    ],
+    "bits": 252600,
+    "stream_sha256": "0019e4e832bfb3aae1aae02c1002c26f6c6bbd54c4a22fa162c0939f34876f4b",
+    "codec_sec": 1.7791230180300772,
+    "decoded_exact": true,
+    "compression_percent_vs_current": 17.126641442243496,
+    "physical_geometry_unchanged": true,
+    "is_voxel_edit_result": false
+  },
+  {
+    "frame": "/data/maejima/data/ground/8i/soldier/soldier_vox10_0536.ply",
+    "setting": "no_idcm",
+    "flags": [
+      "--inferredDirectCodingMode=0"
+    ],
+    "bits": 215664,
+    "stream_sha256": "40897bc1bc1e6f1da0788c3bcf058e30f96dda17109bdc558390df6e518ff06c",
+    "codec_sec": 1.579793549142778,
+    "decoded_exact": true,
+    "compression_percent_vs_current": 0.0,
+    "physical_geometry_unchanged": true,
+    "is_voxel_edit_result": false
+  }
+]

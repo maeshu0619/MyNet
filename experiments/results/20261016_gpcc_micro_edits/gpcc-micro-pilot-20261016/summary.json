@@ -1,0 +1,47 @@
+[
+  {
+    "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+    "best": {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "trial": "min_plane_prune_011",
+      "bits": 148600,
+      "stream_sha256": "d9d9516c25cb631b1f8fcab15c8cf359f134d0a5cc9defaa7c38900c5a61017f",
+      "codec_sec": 0.7985309166833758,
+      "decoded_exact": false,
+      "baseline_bits": 150240,
+      "compression_percent": -1.091586794462196,
+      "input_points": 765821,
+      "baseline_voxels": 211887,
+      "edited_voxels": 211804,
+      "add": 0,
+      "prune": 83,
+      "adjust": 0,
+      "operation_percent": 0.039171822716825476,
+      "removed_cells": 83,
+      "added_cells": 0,
+      "changed_cells_percent": 0.039171822716825476,
+      "bbox_min": [
+        0,
+        1,
+        1
+      ],
+      "bbox_max": [
+        178,
+        502,
+        148
+      ],
+      "chamfer_sq": 2.1796141535412565,
+      "d1_gt_to_rec_sq": 1.501897963101038,
+      "d1_rec_to_gt_sq": 0.6777161904402184,
+      "d1_max_direction_mse": 1.501897963101038,
+      "max_gt_to_rec_distance": 4.242640687119285,
+      "max_rec_to_gt_distance": 1.7320508075688772,
+      "sanity_only": false
+    },
+    "best_decoded_exact": true,
+    "trials": 16,
+    "baseline_decoded_exact": true,
+    "negative_trials": 5,
+    "candidate_actual_encodes": 18
+  }
+]

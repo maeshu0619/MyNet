@@ -1,0 +1,302 @@
+[
+  {
+    "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1450.ply",
+    "best": {
+      "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1450.ply",
+      "trial": "quality_bbox_guard_prune_0.00150",
+      "bits": 159744,
+      "stream_sha256": "35df9b1a2ad7c2574586c3f84998173b704c37060a31ba3007089fd3f4741b4a",
+      "codec_sec": 0.7733712373301387,
+      "decoded_exact": false,
+      "baseline_bits": 160048,
+      "compression_percent": -0.1899430170948735,
+      "input_points": 729133,
+      "baseline_voxels": 200642,
+      "edited_voxels": 200341,
+      "add": 0,
+      "prune": 301,
+      "adjust": 0,
+      "operation_percent": 0.1500184408050159,
+      "removed_cells": 301,
+      "added_cells": 0,
+      "changed_cells_percent": 0.1500184408050159,
+      "bbox_min": [
+        0,
+        0,
+        0
+      ],
+      "bbox_max": [
+        197,
+        489,
+        116
+      ],
+      "chamfer_sq": 2.170098861302903,
+      "d1_gt_to_rec_sq": 1.4987485136456586,
+      "d1_rec_to_gt_sq": 0.6713503476572444,
+      "d1_max_direction_mse": 1.4987485136456586,
+      "max_gt_to_rec_distance": 1.7320508075688772,
+      "max_rec_to_gt_distance": 1.7320508075688772,
+      "sanity_only": false,
+      "prediction": {
+        "original_max_gt_distance": 1.7320508075688772,
+        "eligible_voxels": 83567,
+        "bbox_protected": true
+      }
+    },
+    "best_decoded_exact": true,
+    "trials": 3,
+    "baseline_decoded_exact": true,
+    "negative_trials": 2,
+    "candidate_actual_encodes": 4
+  },
+  {
+    "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+    "best": {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "trial": "quality_bbox_guard_prune_0.00150",
+      "bits": 149840,
+      "stream_sha256": "795099817f8a7f222550986c4a0c18a2f1bb2d6a0c74333cff8d1ae6cb640ccd",
+      "codec_sec": 0.7860291730612516,
+      "decoded_exact": false,
+      "baseline_bits": 150240,
+      "compression_percent": -0.26624068157614644,
+      "input_points": 765821,
+      "baseline_voxels": 211887,
+      "edited_voxels": 211569,
+      "add": 0,
+      "prune": 318,
+      "adjust": 0,
+      "operation_percent": 0.15007999546928316,
+      "removed_cells": 318,
+      "added_cells": 0,
+      "changed_cells_percent": 0.15007999546928316,
+      "bbox_min": [
+        0,
+        0,
+        0
+      ],
+      "bbox_max": [
+        178,
+        502,
+        148
+      ],
+      "chamfer_sq": 2.1756612296083753,
+      "d1_gt_to_rec_sq": 1.5005765054758227,
+      "d1_rec_to_gt_sq": 0.6750847241325525,
+      "d1_max_direction_mse": 1.5005765054758227,
+      "max_gt_to_rec_distance": 1.7320508075688772,
+      "max_rec_to_gt_distance": 1.7320508075688772,
+      "sanity_only": false,
+      "prediction": {
+        "original_max_gt_distance": 1.7320508075688772,
+        "eligible_voxels": 89278,
+        "bbox_protected": true
+      }
+    },
+    "best_decoded_exact": true,
+    "trials": 3,
+    "baseline_decoded_exact": true,
+    "negative_trials": 2,
+    "candidate_actual_encodes": 8
+  },
+  {
+    "frame": "/data/maejima/data/ground/8i/loot/loot_vox10_1000.ply",
+    "best": {
+      "frame": "/data/maejima/data/ground/8i/loot/loot_vox10_1000.ply",
+      "trial": "quality_bbox_guard_prune_0.00150",
+      "bits": 144160,
+      "stream_sha256": "43de0b09ba5897a08bb4a61b9d325db40f30acdce06ba58a024fbedcf673bd2b",
+      "codec_sec": 0.8281465549953282,
+      "decoded_exact": false,
+      "baseline_bits": 144536,
+      "compression_percent": -0.26014280179332827,
+      "input_points": 784142,
+      "baseline_voxels": 216179,
+      "edited_voxels": 215855,
+      "add": 0,
+      "prune": 324,
+      "adjust": 0,
+      "operation_percent": 0.1498757973716226,
+      "removed_cells": 324,
+      "added_cells": 0,
+      "changed_cells_percent": 0.1498757973716226,
+      "bbox_min": [
+        0,
+        0,
+        0
+      ],
+      "bbox_max": [
+        176,
+        496,
+        176
+      ],
+      "chamfer_sq": 2.170149378631644,
+      "d1_gt_to_rec_sq": 1.5003200950848188,
+      "d1_rec_to_gt_sq": 0.6698292835468254,
+      "d1_max_direction_mse": 1.5003200950848188,
+      "max_gt_to_rec_distance": 1.7320508075688772,
+      "max_rec_to_gt_distance": 1.7320508075688772,
+      "sanity_only": false,
+      "prediction": {
+        "original_max_gt_distance": 1.7320508075688772,
+        "eligible_voxels": 88782,
+        "bbox_protected": true
+      }
+    },
+    "best_decoded_exact": true,
+    "trials": 3,
+    "baseline_decoded_exact": true,
+    "negative_trials": 2,
+    "candidate_actual_encodes": 12
+  },
+  {
+    "frame": "/data/maejima/data/ground/8i/soldier/soldier_vox10_0536.ply",
+    "best": {
+      "frame": "/data/maejima/data/ground/8i/soldier/soldier_vox10_0536.ply",
+      "trial": "quality_bbox_guard_prune_0.00150",
+      "bits": 215272,
+      "stream_sha256": "4f75e032dcd7bd3af926bab0ab0ddabac87411ffafdeed0a2d082e1208d92de7",
+      "codec_sec": 1.1125785098411143,
+      "decoded_exact": false,
+      "baseline_bits": 215664,
+      "compression_percent": -0.18176422583278118,
+      "input_points": 1059810,
+      "baseline_voxels": 294679,
+      "edited_voxels": 294237,
+      "add": 0,
+      "prune": 442,
+      "adjust": 0,
+      "operation_percent": 0.14999372198222471,
+      "removed_cells": 442,
+      "added_cells": 0,
+      "changed_cells_percent": 0.14999372198222471,
+      "bbox_min": [
+        0,
+        0,
+        0
+      ],
+      "bbox_max": [
+        180,
+        508,
+        202
+      ],
+      "chamfer_sq": 2.187024093697055,
+      "d1_gt_to_rec_sq": 1.5013115558449155,
+      "d1_rec_to_gt_sq": 0.6857125378521396,
+      "d1_max_direction_mse": 1.5013115558449155,
+      "max_gt_to_rec_distance": 1.7320508075688772,
+      "max_rec_to_gt_distance": 1.7320508075688772,
+      "sanity_only": false,
+      "prediction": {
+        "original_max_gt_distance": 1.7320508075688772,
+        "eligible_voxels": 128704,
+        "bbox_protected": true
+      }
+    },
+    "best_decoded_exact": true,
+    "trials": 3,
+    "baseline_decoded_exact": true,
+    "negative_trials": 2,
+    "candidate_actual_encodes": 16
+  },
+  {
+    "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1052.ply",
+    "best": {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1052.ply",
+      "trial": "quality_bbox_guard_prune_0.00150",
+      "bits": 150920,
+      "stream_sha256": "7272abe391d063d4a00ead600cc9c1d593570c7d4a51490b10fa9748c72d8266",
+      "codec_sec": 0.8419948909431696,
+      "decoded_exact": false,
+      "baseline_bits": 151360,
+      "compression_percent": -0.29069767441860517,
+      "input_points": 775745,
+      "baseline_voxels": 214520,
+      "edited_voxels": 214198,
+      "add": 0,
+      "prune": 322,
+      "adjust": 0,
+      "operation_percent": 0.1501025545403692,
+      "removed_cells": 322,
+      "added_cells": 0,
+      "changed_cells_percent": 0.1501025545403692,
+      "bbox_min": [
+        0,
+        0,
+        0
+      ],
+      "bbox_max": [
+        180,
+        502,
+        154
+      ],
+      "chamfer_sq": 2.1744359169807232,
+      "d1_gt_to_rec_sq": 1.5003306498913946,
+      "d1_rec_to_gt_sq": 0.6741052670893286,
+      "d1_max_direction_mse": 1.5003306498913946,
+      "max_gt_to_rec_distance": 1.7320508075688772,
+      "max_rec_to_gt_distance": 1.7320508075688772,
+      "sanity_only": false,
+      "prediction": {
+        "original_max_gt_distance": 1.7320508075688772,
+        "eligible_voxels": 90106,
+        "bbox_protected": true
+      }
+    },
+    "best_decoded_exact": true,
+    "trials": 3,
+    "baseline_decoded_exact": true,
+    "negative_trials": 2,
+    "candidate_actual_encodes": 20
+  },
+  {
+    "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+    "best": {
+      "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+      "trial": "quality_bbox_guard_prune_0.00150",
+      "bits": 158400,
+      "stream_sha256": "37443e7fae4f128fbdc18b8f053de64e1f16eaee28afc042081979487dc15c78",
+      "codec_sec": 0.7672328841872513,
+      "decoded_exact": false,
+      "baseline_bits": 158896,
+      "compression_percent": -0.31215386164534786,
+      "input_points": 720568,
+      "baseline_voxels": 198530,
+      "edited_voxels": 198232,
+      "add": 0,
+      "prune": 298,
+      "adjust": 0,
+      "operation_percent": 0.1501032589533068,
+      "removed_cells": 298,
+      "added_cells": 0,
+      "changed_cells_percent": 0.1501032589533068,
+      "bbox_min": [
+        0,
+        0,
+        0
+      ],
+      "bbox_max": [
+        184,
+        490,
+        117
+      ],
+      "chamfer_sq": 2.1736294315318263,
+      "d1_gt_to_rec_sq": 1.501114398641072,
+      "d1_rec_to_gt_sq": 0.6725150328907543,
+      "d1_max_direction_mse": 1.501114398641072,
+      "max_gt_to_rec_distance": 1.7320508075688772,
+      "max_rec_to_gt_distance": 1.7320508075688772,
+      "sanity_only": false,
+      "prediction": {
+        "original_max_gt_distance": 1.7320508075688772,
+        "eligible_voxels": 82777,
+        "bbox_protected": true
+      }
+    },
+    "best_decoded_exact": true,
+    "trials": 3,
+    "baseline_decoded_exact": true,
+    "negative_trials": 2,
+    "candidate_actual_encodes": 24
+  }
+]

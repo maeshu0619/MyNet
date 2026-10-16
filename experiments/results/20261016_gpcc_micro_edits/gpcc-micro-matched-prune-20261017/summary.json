@@ -1,0 +1,202 @@
+[
+  {
+    "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+    "best": {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "trial": "matched_prune_for_total_0.00150",
+      "bits": 150120,
+      "stream_sha256": "da630649bd3a448630da9c01c6b4f7ece269bed4236e280ec2bdfd7162dcb1e2",
+      "codec_sec": 0.840035299770534,
+      "decoded_exact": false,
+      "baseline_bits": 150240,
+      "compression_percent": -0.07987220447284171,
+      "input_points": 765821,
+      "baseline_voxels": 211887,
+      "edited_voxels": 211760,
+      "add": 0,
+      "prune": 127,
+      "adjust": 0,
+      "operation_percent": 0.05993760825345585,
+      "removed_cells": 127,
+      "added_cells": 0,
+      "changed_cells_percent": 0.05993760825345585,
+      "bbox_min": [
+        0,
+        0,
+        0
+      ],
+      "bbox_max": [
+        178,
+        502,
+        148
+      ],
+      "chamfer_sq": 2.1774607140137903,
+      "d1_gt_to_rec_sq": 1.5005765054758227,
+      "d1_rec_to_gt_sq": 0.6768842085379675,
+      "d1_max_direction_mse": 1.5005765054758227,
+      "max_gt_to_rec_distance": 1.7320508075688772,
+      "max_rec_to_gt_distance": 1.7320508075688772,
+      "sanity_only": false,
+      "prediction": {
+        "original_max_gt_distance": 1.7320508075688772,
+        "eligible_voxels": 89278,
+        "bbox_protected": true
+      }
+    },
+    "best_decoded_exact": true,
+    "trials": 2,
+    "baseline_decoded_exact": true,
+    "negative_trials": 1,
+    "candidate_actual_encodes": 3
+  },
+  {
+    "frame": "/data/maejima/data/ground/8i/loot/loot_vox10_1000.ply",
+    "best": {
+      "frame": "/data/maejima/data/ground/8i/loot/loot_vox10_1000.ply",
+      "trial": "matched_prune_for_total_0.00150",
+      "bits": 144440,
+      "stream_sha256": "b3b455c57cb10e0957cf08a2f8a3ca2dc94685b0eb1d5395241b727301235203",
+      "codec_sec": 0.7848305059596896,
+      "decoded_exact": false,
+      "baseline_bits": 144536,
+      "compression_percent": -0.06641943875573819,
+      "input_points": 784142,
+      "baseline_voxels": 216179,
+      "edited_voxels": 216050,
+      "add": 0,
+      "prune": 129,
+      "adjust": 0,
+      "operation_percent": 0.059672771175738624,
+      "removed_cells": 129,
+      "added_cells": 0,
+      "changed_cells_percent": 0.059672771175738624,
+      "bbox_min": [
+        0,
+        0,
+        0
+      ],
+      "bbox_max": [
+        176,
+        496,
+        176
+      ],
+      "chamfer_sq": 2.171993318875608,
+      "d1_gt_to_rec_sq": 1.5003200950848188,
+      "d1_rec_to_gt_sq": 0.6716732237907892,
+      "d1_max_direction_mse": 1.5003200950848188,
+      "max_gt_to_rec_distance": 1.7320508075688772,
+      "max_rec_to_gt_distance": 1.7320508075688772,
+      "sanity_only": false,
+      "prediction": {
+        "original_max_gt_distance": 1.7320508075688772,
+        "eligible_voxels": 88782,
+        "bbox_protected": true
+      }
+    },
+    "best_decoded_exact": true,
+    "trials": 2,
+    "baseline_decoded_exact": true,
+    "negative_trials": 1,
+    "candidate_actual_encodes": 6
+  },
+  {
+    "frame": "/data/maejima/data/ground/8i/soldier/soldier_vox10_0536.ply",
+    "best": {
+      "frame": "/data/maejima/data/ground/8i/soldier/soldier_vox10_0536.ply",
+      "trial": "matched_prune_for_total_0.00150",
+      "bits": 215512,
+      "stream_sha256": "6f4d8fb78764e5fff4830accc35678efb39e4a49766e0b5d43377b45cb186d0d",
+      "codec_sec": 1.097559621091932,
+      "decoded_exact": false,
+      "baseline_bits": 215664,
+      "compression_percent": -0.07048000593515846,
+      "input_points": 1059810,
+      "baseline_voxels": 294679,
+      "edited_voxels": 294503,
+      "add": 0,
+      "prune": 176,
+      "adjust": 0,
+      "operation_percent": 0.05972600694314831,
+      "removed_cells": 176,
+      "added_cells": 0,
+      "changed_cells_percent": 0.05972600694314831,
+      "bbox_min": [
+        0,
+        0,
+        0
+      ],
+      "bbox_max": [
+        180,
+        508,
+        202
+      ],
+      "chamfer_sq": 2.1888834990848824,
+      "d1_gt_to_rec_sq": 1.5013115558449155,
+      "d1_rec_to_gt_sq": 0.687571943239967,
+      "d1_max_direction_mse": 1.5013115558449155,
+      "max_gt_to_rec_distance": 1.7320508075688772,
+      "max_rec_to_gt_distance": 1.7320508075688772,
+      "sanity_only": false,
+      "prediction": {
+        "original_max_gt_distance": 1.7320508075688772,
+        "eligible_voxels": 128704,
+        "bbox_protected": true
+      }
+    },
+    "best_decoded_exact": true,
+    "trials": 2,
+    "baseline_decoded_exact": true,
+    "negative_trials": 1,
+    "candidate_actual_encodes": 9
+  },
+  {
+    "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1052.ply",
+    "best": {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1052.ply",
+      "trial": "matched_prune_for_total_0.00150",
+      "bits": 151208,
+      "stream_sha256": "e0c054969c97a2cc401c874b13fed36a98b7ad5f542b681a6ac788379de1c34e",
+      "codec_sec": 0.7856440753675997,
+      "decoded_exact": false,
+      "baseline_bits": 151360,
+      "compression_percent": -0.1004228329809731,
+      "input_points": 775745,
+      "baseline_voxels": 214520,
+      "edited_voxels": 214392,
+      "add": 0,
+      "prune": 128,
+      "adjust": 0,
+      "operation_percent": 0.05966809621480515,
+      "removed_cells": 128,
+      "added_cells": 0,
+      "changed_cells_percent": 0.05966809621480515,
+      "bbox_min": [
+        0,
+        0,
+        0
+      ],
+      "bbox_max": [
+        180,
+        502,
+        154
+      ],
+      "chamfer_sq": 2.1761860922586473,
+      "d1_gt_to_rec_sq": 1.5003306498913946,
+      "d1_rec_to_gt_sq": 0.6758554423672525,
+      "d1_max_direction_mse": 1.5003306498913946,
+      "max_gt_to_rec_distance": 1.7320508075688772,
+      "max_rec_to_gt_distance": 1.7320508075688772,
+      "sanity_only": false,
+      "prediction": {
+        "original_max_gt_distance": 1.7320508075688772,
+        "eligible_voxels": 90106,
+        "bbox_protected": true
+      }
+    },
+    "best_decoded_exact": true,
+    "trials": 2,
+    "baseline_decoded_exact": true,
+    "negative_trials": 1,
+    "candidate_actual_encodes": 12
+  }
+]

@@ -1,0 +1,48 @@
+[
+  {
+    "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1450.ply",
+    "best": {
+      "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1450.ply",
+      "trial": "baseline",
+      "bits": 160048,
+      "stream_sha256": "12440919931e51e239a7f14d12a2d5fb79a8bac56d77ace8b4426f21cf04397f",
+      "codec_sec": 1.0625586570240557,
+      "decoded_exact": true,
+      "baseline_bits": 160048,
+      "compression_percent": 0.0,
+      "input_points": 729133,
+      "baseline_voxels": 200642,
+      "edited_voxels": 200642,
+      "add": 0,
+      "prune": 0,
+      "adjust": 0,
+      "operation_percent": 0.0,
+      "removed_cells": 0,
+      "added_cells": 0,
+      "changed_cells_percent": 0.0,
+      "bbox_min": [
+        0,
+        0,
+        0
+      ],
+      "bbox_max": [
+        197,
+        489,
+        116
+      ],
+      "chamfer_sq": 2.1722067128262887,
+      "d1_gt_to_rec_sq": 1.4987485136456586,
+      "d1_rec_to_gt_sq": 0.6734581991806302,
+      "d1_max_direction_mse": 1.4987485136456586,
+      "max_gt_to_rec_distance": 1.7320508075688772,
+      "max_rec_to_gt_distance": 1.7320508075688772,
+      "sanity_only": false,
+      "prediction": {}
+    },
+    "best_decoded_exact": true,
+    "trials": 2,
+    "baseline_decoded_exact": true,
+    "negative_trials": 0,
+    "candidate_actual_encodes": 3
+  }
+]

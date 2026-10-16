@@ -1,0 +1,202 @@
+[
+  {
+    "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+    "voxels": 211887,
+    "pool_counts": {
+      "Add": 848,
+      "Prune": 848,
+      "Adjust": 424
+    },
+    "sparse_prune_coverage": [
+      {
+        "budget_percent": 0.15,
+        "desired": 318,
+        "covered_single": 2,
+        "covered_any_bundle": 16,
+        "single_coverage_percent": 0.6289308176100629,
+        "bundle_coverage_percent": 5.031446540880503
+      },
+      {
+        "budget_percent": 0.3,
+        "desired": 636,
+        "covered_single": 3,
+        "covered_any_bundle": 26,
+        "single_coverage_percent": 0.4716981132075472,
+        "bundle_coverage_percent": 4.088050314465409
+      }
+    ],
+    "boundary_extension_candidates": {
+      "Add": 0,
+      "Prune": 0,
+      "Adjust": 0
+    },
+    "quality_guard_prune_coverage": [
+      {
+        "trial": "quality_guard_prune_0.00150",
+        "desired": 318,
+        "covered_single": 2,
+        "covered_any_bundle": 10,
+        "single_coverage_percent": 0.6289308176100629,
+        "bundle_coverage_percent": 3.1446540880503147
+      },
+      {
+        "trial": "quality_guard_prune_0.00300",
+        "desired": 636,
+        "covered_single": 4,
+        "covered_any_bundle": 21,
+        "single_coverage_percent": 0.6289308176100629,
+        "bundle_coverage_percent": 3.30188679245283
+      }
+    ]
+  },
+  {
+    "frame": "/data/maejima/data/ground/8i/loot/loot_vox10_1000.ply",
+    "voxels": 216179,
+    "pool_counts": {
+      "Add": 865,
+      "Prune": 865,
+      "Adjust": 433
+    },
+    "sparse_prune_coverage": [
+      {
+        "budget_percent": 0.15,
+        "desired": 324,
+        "covered_single": 1,
+        "covered_any_bundle": 7,
+        "single_coverage_percent": 0.30864197530864196,
+        "bundle_coverage_percent": 2.1604938271604937
+      },
+      {
+        "budget_percent": 0.3,
+        "desired": 649,
+        "covered_single": 3,
+        "covered_any_bundle": 12,
+        "single_coverage_percent": 0.4622496147919877,
+        "bundle_coverage_percent": 1.8489984591679507
+      }
+    ],
+    "boundary_extension_candidates": {
+      "Add": 0,
+      "Prune": 0,
+      "Adjust": 0
+    },
+    "quality_guard_prune_coverage": [
+      {
+        "trial": "quality_guard_prune_0.00150",
+        "desired": 324,
+        "covered_single": 1,
+        "covered_any_bundle": 7,
+        "single_coverage_percent": 0.30864197530864196,
+        "bundle_coverage_percent": 2.1604938271604937
+      },
+      {
+        "trial": "quality_guard_prune_0.00300",
+        "desired": 649,
+        "covered_single": 3,
+        "covered_any_bundle": 12,
+        "single_coverage_percent": 0.4622496147919877,
+        "bundle_coverage_percent": 1.8489984591679507
+      }
+    ]
+  },
+  {
+    "frame": "/data/maejima/data/ground/8i/soldier/soldier_vox10_0536.ply",
+    "voxels": 294679,
+    "pool_counts": {
+      "Add": 1179,
+      "Prune": 1179,
+      "Adjust": 590
+    },
+    "sparse_prune_coverage": [
+      {
+        "budget_percent": 0.15,
+        "desired": 442,
+        "covered_single": 2,
+        "covered_any_bundle": 8,
+        "single_coverage_percent": 0.45248868778280543,
+        "bundle_coverage_percent": 1.8099547511312217
+      },
+      {
+        "budget_percent": 0.3,
+        "desired": 884,
+        "covered_single": 6,
+        "covered_any_bundle": 20,
+        "single_coverage_percent": 0.6787330316742082,
+        "bundle_coverage_percent": 2.262443438914027
+      }
+    ],
+    "boundary_extension_candidates": {
+      "Add": 0,
+      "Prune": 0,
+      "Adjust": 0
+    },
+    "quality_guard_prune_coverage": [
+      {
+        "trial": "quality_guard_prune_0.00150",
+        "desired": 442,
+        "covered_single": 2,
+        "covered_any_bundle": 8,
+        "single_coverage_percent": 0.45248868778280543,
+        "bundle_coverage_percent": 1.8099547511312217
+      },
+      {
+        "trial": "quality_guard_prune_0.00300",
+        "desired": 884,
+        "covered_single": 7,
+        "covered_any_bundle": 20,
+        "single_coverage_percent": 0.7918552036199095,
+        "bundle_coverage_percent": 2.262443438914027
+      }
+    ]
+  },
+  {
+    "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1052.ply",
+    "voxels": 214520,
+    "pool_counts": {
+      "Add": 859,
+      "Prune": 859,
+      "Adjust": 430
+    },
+    "sparse_prune_coverage": [
+      {
+        "budget_percent": 0.15,
+        "desired": 322,
+        "covered_single": 3,
+        "covered_any_bundle": 6,
+        "single_coverage_percent": 0.9316770186335404,
+        "bundle_coverage_percent": 1.8633540372670807
+      },
+      {
+        "budget_percent": 0.3,
+        "desired": 644,
+        "covered_single": 4,
+        "covered_any_bundle": 12,
+        "single_coverage_percent": 0.6211180124223602,
+        "bundle_coverage_percent": 1.8633540372670807
+      }
+    ],
+    "boundary_extension_candidates": {
+      "Add": 0,
+      "Prune": 0,
+      "Adjust": 0
+    },
+    "quality_guard_prune_coverage": [
+      {
+        "trial": "quality_guard_prune_0.00150",
+        "desired": 322,
+        "covered_single": 3,
+        "covered_any_bundle": 5,
+        "single_coverage_percent": 0.9316770186335404,
+        "bundle_coverage_percent": 1.5527950310559007
+      },
+      {
+        "trial": "quality_guard_prune_0.00300",
+        "desired": 644,
+        "covered_single": 3,
+        "covered_any_bundle": 10,
+        "single_coverage_percent": 0.4658385093167702,
+        "bundle_coverage_percent": 1.5527950310559007
+      }
+    ]
+  }
+]

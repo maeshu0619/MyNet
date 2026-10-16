@@ -1,0 +1,50 @@
+[
+  {
+    "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1450.ply",
+    "best": {
+      "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1450.ply",
+      "trial": "restore_min_axis2_quality_guard_prune_0.00150",
+      "bits": 159736,
+      "stream_sha256": "9f841f5f5b7494581b9ccf0198ac78880e90c4649284003a71b922752110825f",
+      "codec_sec": 0.7683358299545944,
+      "decoded_exact": false,
+      "baseline_bits": 160048,
+      "compression_percent": -0.19494151754473332,
+      "input_points": 729133,
+      "baseline_voxels": 200642,
+      "edited_voxels": 200342,
+      "add": 0,
+      "prune": 300,
+      "adjust": 0,
+      "operation_percent": 0.14952004066945107,
+      "removed_cells": 300,
+      "added_cells": 0,
+      "changed_cells_percent": 0.14952004066945107,
+      "bbox_min": [
+        0,
+        0,
+        0
+      ],
+      "bbox_max": [
+        196,
+        489,
+        116
+      ],
+      "chamfer_sq": 2.170115476139794,
+      "d1_gt_to_rec_sq": 1.4987485136456586,
+      "d1_rec_to_gt_sq": 0.6713669624941351,
+      "d1_max_direction_mse": 1.4987485136456586,
+      "max_gt_to_rec_distance": 1.7320508075688772,
+      "max_rec_to_gt_distance": 1.7320508075688772,
+      "sanity_only": false,
+      "prediction": {
+        "restored_anchor_count": 1
+      }
+    },
+    "best_decoded_exact": true,
+    "trials": 3,
+    "baseline_decoded_exact": true,
+    "negative_trials": 1,
+    "candidate_actual_encodes": 4
+  }
+]

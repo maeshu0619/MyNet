@@ -1,0 +1,167 @@
+[
+  {
+    "source": "/tmp/gpcc-micro-full-20261016/metadata.json",
+    "archived": "experiments/results/20261016_gpcc_micro_edits/gpcc-micro-full-20261016/metadata.json",
+    "sha256": "7bd2d38f951216ad7341a21f095faf14825a494a23ae93c046be29bccf936020"
+  },
+  {
+    "source": "/tmp/gpcc-micro-full-20261016/summary.json",
+    "archived": "experiments/results/20261016_gpcc_micro_edits/gpcc-micro-full-20261016/summary.json",
+    "sha256": "60880098bb90f1b9d830e7736c2f7740da9eaf0fc77774e6f580944dd7a90aaa"
+  },
+  {
+    "source": "/tmp/gpcc-micro-full-20261016/trials.jsonl",
+    "archived": "experiments/results/20261016_gpcc_micro_edits/gpcc-micro-full-20261016/trials.jsonl",
+    "sha256": "fd53096da689bc8b34762b20a51dd71a2d82aaaecbb79fd1c79e2fc35b66bc8f"
+  },
+  {
+    "source": "/tmp/gpcc-micro-combo-20261016/metadata.json",
+    "archived": "experiments/results/20261016_gpcc_micro_edits/gpcc-micro-combo-20261016/metadata.json",
+    "sha256": "61ac7ce63f1236c17f68184e8ae38b0c95b621806f47f76a9e9a16002acb3cfd"
+  },
+  {
+    "source": "/tmp/gpcc-micro-combo-20261016/summary.json",
+    "archived": "experiments/results/20261016_gpcc_micro_edits/gpcc-micro-combo-20261016/summary.json",
+    "sha256": "ee4268d7ca64a4fba82dd8ac3bdb21dba6d460da25a0c9fe691086511bf1f134"
+  },
+  {
+    "source": "/tmp/gpcc-micro-combo-20261016/trials.jsonl",
+    "archived": "experiments/results/20261016_gpcc_micro_edits/gpcc-micro-combo-20261016/trials.jsonl",
+    "sha256": "79fd041aa0ec1894425a2f13d7f8e3fb22a1ad6fa1b22c9b45a91040cd726a0a"
+  },
+  {
+    "source": "/tmp/gpcc-micro-phase4-20261016/metadata.json",
+    "archived": "experiments/results/20261016_gpcc_micro_edits/gpcc-micro-phase4-20261016/metadata.json",
+    "sha256": "63cfa57884e47a6d9137dd42c038f46ae1f8426ce6099fd8851f399d6475eeea"
+  },
+  {
+    "source": "/tmp/gpcc-micro-phase4-20261016/summary.json",
+    "archived": "experiments/results/20261016_gpcc_micro_edits/gpcc-micro-phase4-20261016/summary.json",
+    "sha256": "ef5151d9a9dc1812c6d11fc0eca99dbf484c00cbdc903c73431be8e962454873"
+  },
+  {
+    "source": "/tmp/gpcc-micro-phase4-20261016/trials.jsonl",
+    "archived": "experiments/results/20261016_gpcc_micro_edits/gpcc-micro-phase4-20261016/trials.jsonl",
+    "sha256": "4197551ffb0dde29dc6dee3c89a67b7b38b116a3ed0b049642191f8a3159f2af"
+  },
+  {
+    "source": "/tmp/gpcc-micro-adjust-20261016/metadata.json",
+    "archived": "experiments/results/20261016_gpcc_micro_edits/gpcc-micro-adjust-20261016/metadata.json",
+    "sha256": "370ccba9670495b48c5d86504a49b15971f131b956ffa60ee0771969d5ff6f5a"
+  },
+  {
+    "source": "/tmp/gpcc-micro-adjust-20261016/summary.json",
+    "archived": "experiments/results/20261016_gpcc_micro_edits/gpcc-micro-adjust-20261016/summary.json",
+    "sha256": "bbea23081b8320b9725fcfde2e873c309b6c5e9d05febbae153ed4346f2f3a4a"
+  },
+  {
+    "source": "/tmp/gpcc-micro-adjust-20261016/trials.jsonl",
+    "archived": "experiments/results/20261016_gpcc_micro_edits/gpcc-micro-adjust-20261016/trials.jsonl",
+    "sha256": "163f7a87c7582444cc754c912624010eac30f5e7627575360e69738cf78ef000"
+  },
+  {
+    "source": "/tmp/gpcc-micro-qualityguard-20261016/metadata.json",
+    "archived": "experiments/results/20261016_gpcc_micro_edits/gpcc-micro-qualityguard-20261016/metadata.json",
+    "sha256": "19a5d4de6de829268000c75fc56cbed7f06457ecdfa8d734462bee6c2649146f"
+  },
+  {
+    "source": "/tmp/gpcc-micro-qualityguard-20261016/summary.json",
+    "archived": "experiments/results/20261016_gpcc_micro_edits/gpcc-micro-qualityguard-20261016/summary.json",
+    "sha256": "6c6795bb78db468fa8d67ae5c16f891887a93bdc27d78132138ac1c2ccc89d28"
+  },
+  {
+    "source": "/tmp/gpcc-micro-qualityguard-20261016/trials.jsonl",
+    "archived": "experiments/results/20261016_gpcc_micro_edits/gpcc-micro-qualityguard-20261016/trials.jsonl",
+    "sha256": "a1d6f315f78cc2384885d6be0ee493f9e061de6b5e7ef1b9ca55a54f36d13b77"
+  },
+  {
+    "source": "/tmp/gpcc-quant-control-20261016/results.json",
+    "archived": "experiments/results/20261016_gpcc_micro_edits/gpcc-quant-control-20261016/results.json",
+    "sha256": "46e5801c4dcbe6d4699978eed6b76ff483c591105b278c2b8ae760860eba7b47"
+  },
+  {
+    "source": "/tmp/gpcc-codec-control-20261016/results.json",
+    "archived": "experiments/results/20261016_gpcc_micro_edits/gpcc-codec-control-20261016/results.json",
+    "sha256": "b3967c7b7f47be471f11ae7ef59fced31ed41d6de4b80541ad3ee1de03802cd1"
+  },
+  {
+    "source": "/tmp/gpcc-pool-audit-v2-20261016/results.json",
+    "archived": "experiments/results/20261016_gpcc_micro_edits/gpcc-pool-audit-v2-20261016/results.json",
+    "sha256": "9433710d8104513ee663e7b060f27059904ba7e4682b32e1e9371afe681e1606"
+  },
+  {
+    "source": "/tmp/gpcc-micro-pilot-20261016/metadata.json",
+    "archived": "experiments/results/20261016_gpcc_micro_edits/gpcc-micro-pilot-20261016/metadata.json",
+    "sha256": "f9781a8bc742ab7ddc6d4e1f88bd18edf2fe4c3161af540cf231abfc183861bb"
+  },
+  {
+    "source": "/tmp/gpcc-micro-pilot-20261016/summary.json",
+    "archived": "experiments/results/20261016_gpcc_micro_edits/gpcc-micro-pilot-20261016/summary.json",
+    "sha256": "8fb07e5b5f955df4ea96ccad3eb1bfc50b5584a149c167763eb636733dd90d49"
+  },
+  {
+    "source": "/tmp/gpcc-micro-pilot-20261016/trials.jsonl",
+    "archived": "experiments/results/20261016_gpcc_micro_edits/gpcc-micro-pilot-20261016/trials.jsonl",
+    "sha256": "b230258243edad54537fc364bbcd070aa65b2878d709a979ef27eab5a9c3db33"
+  },
+  {
+    "source": "/tmp/gpcc-micro-unseen-20261016/metadata.json",
+    "archived": "experiments/results/20261016_gpcc_micro_edits/gpcc-micro-unseen-20261016/metadata.json",
+    "sha256": "030f6cf1fb694e5736875a02e9e0f35c8583c339a14204f6e2ccb8b9326c97e4"
+  },
+  {
+    "source": "/tmp/gpcc-micro-unseen-20261016/summary.json",
+    "archived": "experiments/results/20261016_gpcc_micro_edits/gpcc-micro-unseen-20261016/summary.json",
+    "sha256": "4bbdbf728b50c3cb3bc6a4aebe89a7964180a5404d42ed4a30c57b3638f1028b"
+  },
+  {
+    "source": "/tmp/gpcc-micro-unseen-20261016/trials.jsonl",
+    "archived": "experiments/results/20261016_gpcc_micro_edits/gpcc-micro-unseen-20261016/trials.jsonl",
+    "sha256": "3eba2e21a1c2c9a033a346c9e08b1fca8639513eb410e4d7fbfd96f19ce8bedb"
+  },
+  {
+    "source": "/tmp/gpcc-micro-bboxguard-20261016/metadata.json",
+    "archived": "experiments/results/20261016_gpcc_micro_edits/gpcc-micro-bboxguard-20261016/metadata.json",
+    "sha256": "b91798e7e9d9dcb60da1d949cc2e94887701178f6d9e4983ebd2f4b5a86bf904"
+  },
+  {
+    "source": "/tmp/gpcc-micro-bboxguard-20261016/summary.json",
+    "archived": "experiments/results/20261016_gpcc_micro_edits/gpcc-micro-bboxguard-20261016/summary.json",
+    "sha256": "8786615be9016144d34b7c114a64d6c5fda7cee81d508b313137640950a59888"
+  },
+  {
+    "source": "/tmp/gpcc-micro-bboxguard-20261016/trials.jsonl",
+    "archived": "experiments/results/20261016_gpcc_micro_edits/gpcc-micro-bboxguard-20261016/trials.jsonl",
+    "sha256": "748ff64cf218c23cf5318b6196ab1625ea1fe1bf08ddfb10a764521013971325"
+  },
+  {
+    "source": "/tmp/gpcc-micro-bboxaxes-20261016/metadata.json",
+    "archived": "experiments/results/20261016_gpcc_micro_edits/gpcc-micro-bboxaxes-20261016/metadata.json",
+    "sha256": "183778afb10f1bf36ab85c5bd84d10cba3cb199c6ec2840805e39452218f853e"
+  },
+  {
+    "source": "/tmp/gpcc-micro-bboxaxes-20261016/summary.json",
+    "archived": "experiments/results/20261016_gpcc_micro_edits/gpcc-micro-bboxaxes-20261016/summary.json",
+    "sha256": "51ba3105f4d9f2822caba9192696e6929c53f685673d69b67f1d1a5ea666eee1"
+  },
+  {
+    "source": "/tmp/gpcc-micro-bboxaxes-20261016/trials.jsonl",
+    "archived": "experiments/results/20261016_gpcc_micro_edits/gpcc-micro-bboxaxes-20261016/trials.jsonl",
+    "sha256": "115a1ea358167b43c222a2c751c06f4228d677689c2f37c0d813704d44ec28e1"
+  },
+  {
+    "source": "/tmp/gpcc-micro-matched-prune-20261017/metadata.json",
+    "archived": "experiments/results/20261016_gpcc_micro_edits/gpcc-micro-matched-prune-20261017/metadata.json",
+    "sha256": "871338b042dcb01cd0b474a4af780b4d51727733077e8b8772b32c4560e7927f"
+  },
+  {
+    "source": "/tmp/gpcc-micro-matched-prune-20261017/summary.json",
+    "archived": "experiments/results/20261016_gpcc_micro_edits/gpcc-micro-matched-prune-20261017/summary.json",
+    "sha256": "70f6699ea5eeeacd342552b8f7ba939133d3da8bd8445c98f6ad7f1c0e0150d1"
+  },
+  {
+    "source": "/tmp/gpcc-micro-matched-prune-20261017/trials.jsonl",
+    "archived": "experiments/results/20261016_gpcc_micro_edits/gpcc-micro-matched-prune-20261017/trials.jsonl",
+    "sha256": "299d999d710083124bc259246b5b71870507e1560783a5263142619ba777f806"
+  }
+]

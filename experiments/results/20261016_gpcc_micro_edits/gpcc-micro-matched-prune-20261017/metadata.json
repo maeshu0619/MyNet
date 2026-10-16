@@ -1,0 +1,32 @@
+{
+  "arguments": {
+    "frames": [
+      "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "/data/maejima/data/ground/8i/loot/loot_vox10_1000.ply",
+      "/data/maejima/data/ground/8i/soldier/soldier_vox10_0536.ply",
+      "/data/maejima/data/ground/8i/longdress/longdress_vox10_1052.ply"
+    ],
+    "out": "/tmp/gpcc-micro-matched-prune-20261017",
+    "qs": 2.0,
+    "threads": 2,
+    "seed": 21,
+    "modes": [
+      "matchedprune"
+    ],
+    "phases": 2,
+    "anchor_only": false,
+    "budgets": [
+      0.0015
+    ],
+    "max_ratio": 0.0099
+  },
+  "encoder": "/home/maejima/MasterEx/compress/octree/G-PCC/build/tmc3/tmc3",
+  "cfg": "/home/maejima/MasterEx/compress/octree/G-PCC/cfg/octree-predlift/lossless-geom-lossless-attrs/longdress_vox10_1300/encoder.cfg",
+  "experiment_sha256": "957f8251f924432f8cd543f0f29bc4b0cb7d91a529eefd5f774c73648ef848b3",
+  "encoder_sha256": "ae225666df7a0d14590f09ec4216fe69b4733d75a4adf18410904bca05c9aacd",
+  "cfg_sha256": "47ccdb5bfba4ac61df20ffb4a0aa57f658db3219f63bf826a6d9035df65c2b81",
+  "rate_definition": "100*(edited_total_bits-baseline_total_bits)/baseline_total_bits",
+  "quality_definition": "mean(sqNN(raw,recon))+mean(sqNN(recon,raw))",
+  "operation_denominator": "unedited unique qs-grid voxels",
+  "training_modified": false
+}
