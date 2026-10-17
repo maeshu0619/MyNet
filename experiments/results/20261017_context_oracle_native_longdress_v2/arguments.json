@@ -1,0 +1,7 @@
+{
+  "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+  "wide": "experiments/results/20261017_context_oracle_wide_v1",
+  "out": "experiments/results/20261017_context_oracle_native_longdress_v2",
+  "budget": 0.05,
+  "max_options": 5
+}

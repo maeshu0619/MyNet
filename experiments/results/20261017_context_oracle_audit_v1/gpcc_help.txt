@@ -1,0 +1,540 @@
+MPEG PCC tmc3 version release-v23.0-rc2-0-ga3d15c5
+        --help=0                        this help text
+  -c,   --config=...                    configuration file name
+
+ General
+ -------
+        --mode=0                        The encoding/decoding mode:
+                                          0: encode
+                                          1: decode
+        --firstFrameNum=0               Frame number for use with
+                                        interpolating %d format specifiers in
+                                        input/output filenames
+        --frameCount=1                  Number of frames to encode
+        --reconstructedDataPath=""      The ouput reconstructed pointcloud
+                                        file path (decoder only)
+        --uncompressedDataPath=""       The input pointcloud file path
+        --compressedStreamPath=""       The compressed bitstream path
+                                        (encoder=output, decoder=input)
+        --postRecolorPath=""            Recolored pointcloud file path
+                                        (encoder only)
+        --preInvScalePath=""            Pre inverse scaled pointcloud file
+                                        path (decoder only)
+        --convertPlyColourspace=1       Convert ply colourspace according to
+                                        attribute colourMatrix
+        --outputBinaryPly=1             Output ply files using binary (or
+                                        ascii) format
+        --outputUnitLength=0            Length of reconstructed point cloud x,y,z unit vectors
+                                         0: use srcUnitLength
+        --outputScaling=1 (External)    Output coordnate system scaling
+                                         0: Conformance
+                                         1: External
+        --outputPrecisionBits=-1        Fractional bits in conformance output (prior to external scaling)
+                                         0: integer,  -1: automatic (full)
+
+ Coordinate system scaling
+ -------------------------
+        --srcUnitLength=1               Length of source point cloud x,y,z
+                                        unit vectors in srcUnits
+        --srcUnit=0 (Dimensionless)      0: dimensionless
+                                         1: metres
+        --inputScale=1                  Scale input while reading src ply. Eg,
+                                        1000 converts metres to integer
+                                        millimetres
+        --codingScale=1                 Scale used to represent coded
+                                        geometry. Relative to inputScale
+        --sequenceScale=1               Scale used to obtain sequence
+                                        coordinate system. Relative to
+                                        inputScale
+        --positionQuantizationScale=1   (deprecated)
+        --externalScale=1               Scale used to define external coordinate system.
+                                        Meaningless when srcUnit = metres
+                                          0: Use srcUnitLength
+                                         >0: Relative to inputScale
+
+ Decoder
+ -------
+        --skipOctreeLayers=0            Partial decoding of octree and attributes
+                                         0   : Full decode
+                                         N>0 : Skip the bottom N layers in
+                                        decoding process
+        --decodeMaxPoints=0             Partially decode up to N points
+
+ Encoder
+ -------
+        --sortInputByAzimuth=0          Sort input points by azimuth angle
+        --geometry_axis_order=1 (xyz)   Sets the geometry axis coding order:
+                                          0: (zyx)
+                                          1: (xyz)
+                                          2: (xzy)
+                                          3: (yzx)
+                                          4: (zyx)
+                                          5: (zxy)
+                                          6: (yxz)
+                                          7: (xyz)
+        --autoSeqBbox=1                 Calculate seqOrigin and seqSizeWhd
+                                        automatically.
+        --seqOrigin="0,0,0"             Origin (x,y,z) of the sequence
+                                        bounding box (in input coordinate
+                                        system). Requires autoSeqBbox=0
+        --seqSizeWhd="0,0,0"            Size of the sequence bounding box (in
+                                        input coordinate system). Requires
+                                        autoSeqBbox=0
+        --mergeDuplicatedPoints=1       Enables removal of duplicated points
+
+        --partitionMethod=4 (UniformSquare)
+                                        Method used to partition input point cloud into slices/tiles:
+                                          0: none
+                                          2: n Uniform-geometry partition bins along the longest edge
+                                          3: Uniform geometry partition at n octree depth
+                                          4: Uniform square partition
+                                          5: n-point spans of input
+        --safeTrisoupPartionning=1      Use safer partitioning to not break Trisoup surfaces
+                                          This is compatible with partitionMethod 2 and 4, but sliceMaxPoints
+                                          may be exceeded.
+        --partitionOctreeDepth=1        Depth of octree partition for
+                                        partitionMethod=4
+        --sliceMaxPointsTrisoup=1100000 Maximum number of points per slice
+        --sliceMaxPoints=1100000        Maximum number of points per slice
+        --sliceMinPoints=550000         Minimum number of points per slice
+                                        (soft limit)
+        --tileSize=0                    Partition input into cubic tiles of
+                                        given size
+
+        --cabac_bypass_stream_enabled_flag=0
+                                        Controls coding method for ep(bypass)
+                                        bins
+        --entropyContinuationEnabled=0  Propagate context state between
+                                        slices
+
+        --bypassBinCodingWithoutProbUpdate=1
+                                        Codes the bypass bins without using
+                                        probability updateOnly applies when
+                                        cabac_bypass_stream_enabled_flag is
+                                        0.
+
+        --InterEntropyContinuationEnabled=0
+                                        Propagate context state between P
+                                        frames
+        --disableAttributeCoding=0      Ignore attribute coding configuration
+        --enforceLevelLimits=1          Abort if level limits exceeded
+
+ Geometry
+ --------
+        --geomTreeType=0                Selects the tree coding method:
+                                          0: octree
+                                          1: predictive
+        --qtbtEnabled=1                 Enables non-cubic geometry bounding
+                                        box
+        --maxNumQtBtBeforeOt=4          Max number of qtbt partitions before
+                                        ot
+        --minQtbtSizeLog2=0             Minimum size of qtbt partitions
+        --numOctreeEntropyStreams=1     Number of entropy streams for octree
+                                        coding
+        --bitwiseOccupancyCoding=1      Selects between bitwise and bytewise occupancy coding:
+                                          0: bytewise
+                                          1: bitwise
+        --neighbourAvailBoundaryLog2=0  Defines the avaliability volume for neighbour occupancy lookups:
+                                        <2: Limited to sibling nodes only
+        --inferredDirectCodingMode=1    Early termination of the geometry octree for isolated points: 0: disabled
+                                         1: fully constrained
+                                         2: partially constrained
+                                         3: unconstrained (fastest)
+        --jointTwoPointIdcm=1           Jointly code common prefix of two IDCM
+                                        points
+
+        --adjacentChildContextualization=1
+                                        Occupancy contextualization using
+                                        neighbouring adjacent children
+
+        --intra_pred_max_node_size_log2=0
+                                        octree nodesizes eligible for
+                                        occupancy intra prediction
+        --planarEnabled=1               Use planar mode for geometry coding
+
+        --octreeDepthPlanarEligibilityEnabled=1
+                                        Determine the eligibility for planar
+                                        mode per octree depth
+
+        --octreePlanarDynamicOBUFEligibilityEnabled=1
+                                        Determine the eligibility for planar
+                                        mode by using the Dynamic OBUF
+        --multiplePlanarEnabled=1       Use multiple planar mode for geometry
+                                        coding
+        --planarModeThreshold0=77       Activation threshold (0-127) of first
+                                        planar mode when the eligibility is
+                                        not determined per octree depth. Lower
+                                        values imply more use of the first
+                                        planar mode
+        --planarModeThreshold1=99       Activation threshold (0-127) of second
+                                        planar mode when the eligibility is
+                                        not determined per octree depth. Lower
+                                        values imply more use of the first
+                                        planar mode
+        --planarModeThreshold2=113      Activation threshold (0-127) of third
+                                        planar mode when the eligibility is
+                                        not determined per octree depth. Lower
+                                        values imply more use of the third
+                                        planar mode
+        --planarModeIdcmUse=0           Degree (1/32%) of IDCM activation when planar mode is enabled
+                                          0 => never, 32 => always
+        --trisoupNodeSizeLog2="0"       Node size for surface triangulation
+                                         <2: disabled
+        --trisoup_sampling_value=0      Trisoup voxelisation sampling rate
+                                          0: automatic
+        --trisoupQuantizationBits=0     Trisoup number of bits for quantization of position of vertices along edges
+                                          0: inferred to trisoupNodeSizeLog2
+
+        --trisoupCentroidResidualEnabled=1
+                                        Trisoup activate residual position
+                                        value for the centroid vertex
+        --trisoupHaloEnabled=1          Trisoup activate halo around triangles
+                                        for ray tracing
+        --trisoupAdaptiveHaloEnabled=1  Trisoup activate adaptive halo around
+                                        triangles for ray tracing when halo is
+                                        activated
+
+        --trisoupFineRayTracingEnabled=1
+                                        Trisoup activate more ray tracing from
+                                        non-integer origin
+
+        --trisoupImprovedEncoderEnabled=1
+                                        Trisoup activate improved
+                                        determination of vertex position
+                                        (encoder only)
+        --nodeUniqueDSE=1               Enables to calculate a node unique distanceSearchEncoder
+                                        value, based on node characteristics instead of slice characteristics
+                                        
+
+        --trisoupNonCubicNodeNearOriginSideEnabled=1
+                                        Trisoup activate non-cubic-node near
+                                        the origin side of the slice bounding
+                                        box
+
+        --trisoupNonCubicNodeFarFromOriginSideEnabled=1
+                                        Trisoup activate non-cubic-node far
+                                        from the origin side of the slice
+                                        bounding box
+        --trisoupFaceVertexEnabled=1    Trisoup activate face vertex
+        --positionQuantisationEnabled=0 Enable in-loop quantisation of
+                                        positions
+
+        --positionQuantisationMethod=0 (Uniform)
+                                        Method used to determine per-node QP:
+                                          0: uniform
+                                          1: random
+                                          2: by node point density
+        --positionQpMultiplierLog2=0    Granularity of QP to step size mapping:
+                                          n: 2^n QPs per doubling interval, n
+                                        in 0..3
+        --positionBaseQp=0              Base QP used in position quantisation
+                                        (0 = lossless)
+        --positionIdcmQp=0              QP used in position quantisation of
+                                        IDCM nodes
+        --positionSliceQpOffset=0       Per-slice QP offset used in position
+                                        quantisation
+
+        --positionQuantisationOctreeSizeLog2=-1
+                                        Octree node size used for signalling
+                                        position QP offsets (-1 => disabled)
+
+        --positionQuantisationOctreeDepth=-1
+                                        Octree depth used for signalling
+                                        position QP offsets (-1 => disabled)
+        --positionBaseQpFreqLog2=8      Frequency of sending QP offsets in
+                                        predictive geometry coding
+        --positionSliceQpFreqLog2=0     Frequency of sending QP offsets in
+                                        predictive geometry coding
+        --angularEnabled=0              Controls angular contextualisation of
+                                        occupancy
+        --interIDCMPredEnabled=1        Controls the eligible of inter idcm
+                                        coding
+        --zCompensationEnabled=0        Enables z compensation when using
+                                        octree
+        --secondaryResidualDisabled=0   Controls disabling of quantized
+                                        cartesian residual in lossy pred tree
+        --lidarHeadPosition="0,0,0"     laser head position (x,y,z) in angular
+                                        mode
+        --numLasers=0                   Number of lasers in angular mode
+        --lasersTheta=""                Vertical laser angle in angular mode
+        --lasersZ=""                    Vertical laser offset in angular mode
+        --lasersNumPhiPerTurn=""        Number of sampling poisitions in a
+                                        complete laser turn in angular mode
+        --planarBufferDisabled=0        Disable planar buffer (when angular
+                                        mode is enabled)
+        --octreeAngularExtension=1      Enable extension for octree angular
+        --predGeomAzimuthQuantization=1 Quantize azimuth according to radius
+                                        in predictive geometry coding
+        --positionAzimuthScaleLog2=5    Additional bits to represent azimuth
+                                        angle in predictive geometry coding
+        --positionAzimuthSpeed=363      Scale factor applied to azimuth angle
+                                        in predictive geometry coding
+        --positionRadiusInvScaleLog2=0  Inverse scale factor applied to radius
+                                        in predictive geometry coding
+        --resRContextQphiThreshold=0    Qphi threshold used for context of
+                                        radius resicdual coding in predictive
+                                        geometry coding
+
+        --resRContextQphiThresholdPresentFlag=0
+                                        Present the qphi threshold used for
+                                        context of radius resicdual coding
+        --disable_planar_IDCM_angluar=1 Disable planar mode for geometry
+                                        coding of IDCM coded nodes when
+                                        angular coding is enabled
+        --interAzimScaleLog2=1          Scale factor applied to azimuth angle
+                                        during inter search
+        --randomAccessPeriod=1          Distance (in pictures) between random
+                                        access points when encoding a
+                                        sequence
+        --enableGroundPartition=0       Enable ground and object partition for
+                                        predictive geometry coding
+        --interPredictionEnabled=0      Enable inter prediciton
+        --biPredictionEnabled=0         Enable bi-directional inter prediciton: 0: disable bi-directional inter prediction
+                                         1: enable bi-directional inter prediction using IBBB GOF structure
+                                         2: enable bi-directional inter
+                                        prediction using hierarchical GOF
+                                        structure
+        --frameMergeEnabled=0           Enable frameMerge mode for
+                                        bi-directional inter prediciton
+        --predictionPeriod=1            Maxium distance (in pictures) between
+                                        I-frame and P-frame when encoding a
+                                        sequence using bi-direction inter
+                                        prediction
+        --globalMotionEnabled=0         Enable global motion compensation for
+                                        inter prediction
+        --resamplingEnabled=0           Enable resampling of reference frame
+                                        in inter prediction
+        --motionVectorPath=""           File path containing motion vector
+                                        information
+
+        --lpuType=0 (RoadObjClassfication)
+                                        Reference motion used in MC for LPU:  0: use road and object classification-based LPU
+                                          1: use cuboid partition-based LPU
+                                        
+
+        --globalMotionSrcType=0 (ExternalGMSrc)
+                                        If using outside global motion matrix:  0: external GM
+                                          1: internal GM based on LMS
+                                          2: internal GM based on ICP
+
+        --globalMotionBlockSize="0,0,4096"
+                                        Block size for global moton
+                                        compensation
+        --globalMotionWindowSize=512    Window size for global moton
+                                        compensation
+        --deriveGMThreshold=0           Derive thresholds for applying global
+                                        motion compensation
+        --gmThresholdHistScale=100      Scale value used for histogram
+                                        computation in GM threshold deriation
+        --gmThresholdMinZ=-4000         Min Z value used for histogram
+                                        computation in GM threshold deriation
+        --gmThresholdMaxZ=-500          Max Z value used for histogram
+                                        computation in GM threshold deriation
+        --gmThresholdLeftScale=1.5      Scale value to calculate lower
+                                        threshold to apply GM
+        --gmThresholdRightScale=1.5     Scale value to calculate upper
+                                        threshold to apply GM
+
+        --use_cuboidal_regions_in_GM_estimation=0
+                                        Use cuboidal regions with square
+                                        cross-section in xy-plane for global
+                                        motion estimation using LMS0: Use
+                                        cubic regions1: Use cuboidal regions
+        --predGeomSort=1 (Morton)       Predictive geometry tree construction
+                                        order
+
+        --predGeomAzimuthSortPrecision=0
+                                        Reciprocal precision used in azimuthal
+                                        sorting for tree construction
+        --predGeomTreePtsMax=1100000    Maximum number of points per
+                                        predictive geometry tree
+        --pointCountMetadata=0          Add octree layer point count metadata
+        --predGeomMaxPredIdx=3          Maximum prediction index usable in the prediction list,
+                                         default is 3, maximum allowed is 7.
+        --predGeomMaxPredIdxTested=-1   Maximum prediction index tested by encoder in prediction list,
+                                         a value lower than 0 or higher than predGeomMaxPredIdx implies
+                                         the maximum prediction index is set equal to predGeomMaxPredIdx;
+                                         default is -1.
+
+        --predGeomRadiusPredThreshold=2048
+                                        Threshold for considering new predictor in the list,
+                                         the threshold effectively used is predGeomRadiusPredThreshold,
+                                         scaled accordingly to
+                                        positionRadiusInvScaleLog2.
+
+ Attributes
+ ----------
+        --attribute=...                 Encode the given attribute (NB, must
+                                        appear after thefollowing attribute
+                                        parameters)
+        --attrScale=1                   Scale factor used to interpret coded
+                                        attribute values
+        --attrOffset=0                  Offset used to interpret coded
+                                        attribute values
+        --bitdepth=8                    Attribute bitdepth
+        --defaultValue=""               Default attribute component value(s)
+                                        in case of data omission
+        --colourMatrix=1 (Bt709)        Matrix used in colourspace conversion
+                                          0: none (identity)
+                                          1: ITU-T BT.709
+                                          8: YCgCo
+        --transformType=1 (Pred)        Coding method to use for attribute:
+                                          0: Region Adaptive Hierarchical Transform (RAHT)
+                                          1: Hierarchical neighbourhood prediction
+                                          2: Hierarchical neighbourhood
+                                        prediction as lifting transform
+        --integerHaar=0                 Controls Integer Haar Transform method:
+                                         0: off
+                                         1: Turn on Integer Haar Transform
+        --rahtExtension=1               Enable extensions of RAHT coding,
+                                        including buffer precision increase
+                                        and skipping transform domain
+                                        prediction in one-subnode condition
+        --rahtPredictionEnabled=1       Controls the use of transform-domain
+                                        prediction
+        --rahtPredictionThreshold0=2    Grandparent threshold for early
+                                        transform-domain prediction
+                                        termination
+        --rahtPredictionThreshold1=6    Parent threshold for early
+                                        transform-domain prediction
+                                        termination
+
+        --rahtSubnodePredictionEnabled=1
+                                        Controls the use of transform-domain
+                                        subnode prediction
+        --rahtPredictionSearchRange=-1  RAHT prediction nearest neighbor search range
+                                         -1: Full-range
+
+        --rahtPredictionWeights="9,3,1,5,2"
+                                        Prediction weights for neighbours
+
+        --numberOfNearestNeighborsInPrediction=3
+                                        Attribute's maximum number of nearest
+                                        neighbors to be used for prediction
+
+        --adaptivePredictionThreshold=64
+                                        Neighbouring attribute value
+                                        difference that enables direct
+                                        prediction. 8-bit value scaled to
+                                        attribute bitdeph. Applies to
+                                        transformType=0 only
+        --intraLodSearchRange=-1        Intra LoD nearest neighbor search range
+                                         -1: Full-range
+        --interLodSearchRange=-1        Inter LoD nearest neighbor search range
+                                         -1: Full-range
+
+        --predictionWithDistributionEnabled=1
+                                        enable LoD prediction with
+                                        distribution
+        --lod_neigh_bias="1,1,1"        Attribute's (x,y,z) component intra
+                                        prediction weights
+        --lodDecimator=0 (None)         LoD decimation method:
+                                         0: none
+                                         1: periodic subsampling using lodSamplingPeriod
+                                         2: centroid subsampling using
+                                        lodSamplingPeriod
+        --max_num_direct_predictors=3   Maximum number of nearest neighbour
+                                        candidates used in directattribute
+                                        prediction
+
+        --direct_avg_predictor_disabled_flag=0
+                                        Disable average predictor
+        --predWeightBlending=0          Blend prediction weights according to
+                                        neigbour distances. Applies to
+                                        transformType=0 only
+        --levelOfDetailCount=1          Attribute's number of levels of
+                                        detail
+        --dist2=0                       Initial squared distance used in LoD
+                                        generation
+        --dist2PercentileEstimate=0.85  Percentile for dist2 estimation during
+                                        nearest neighbour search
+
+        --positionQuantizationScaleAdjustsDist2=0
+                                        Scale dist2 values by squared
+                                        positionQuantizationScale
+        --lodSamplingPeriod="4"         List of per LoD sampling periods used
+                                        in LoD generation
+
+        --intraLodPredictionSkipLayers=-1
+                                        Number of finest detail levels that skip intra prediction
+                                         -1: skip all (disables intra pred)
+
+        --interComponentPredictionEnabled=0
+                                        Use primary attribute component to
+                                        predict values of subsequent
+                                        components
+
+        --lastComponentPredictionEnabled=1
+                                        Use second attribute component to
+                                        predict value of the final component
+        --canonical_point_order_flag=0  Enable skipping morton sort in case of
+                                        number of LoD equal to 1, when
+                                        max_points_per_sort_log2_plus1 is
+                                        equal to 0
+
+        --max_points_per_sort_log2_plus1=0
+                                        max number of points per sort based on
+                                        morton code in case of number of LoD
+                                        equal to 1
+        --spherical_coord_flag=0        Code attributes in spherical domain
+        --attrSphericalMaxLog2=0        Override spherical coordinate
+                                        normalisation factor
+        --aps_scalable_enable_flag=0    Enable scalable attritube coding
+        --max_neigh_range=5             maximum nearest neighbour range for
+                                        scalable lifting
+        --qp=4                          Attribute's luma quantisation
+                                        parameter
+        --qpChromaOffset=0              Attribute's chroma quantisation
+                                        parameter offset (relative to luma)
+
+        --aps_slice_qp_deltas_present_flag=0
+                                        Enable signalling of per-slice QP
+                                        values
+        --qpLayerOffsetsLuma=""         Attribute's per layer luma QP offsets
+        --qpLayerOffsetsChroma=""       Attribute's per layer chroma QP
+                                        offsets
+        --quantNeighWeight="16,8,4"     Factors used to derive quantization
+                                        weights (transformType=1)
+
+        --attributeInterPredictionEnabled=1
+                                        Enable inter prediction for
+                                        attributes
+        --attrInterPredSearchRange=128  Search range for nearest neighbour
+                                        search in inter prediction
+                                        candidate-1: Full range
+        --rahtEnableCodeLayer=1         Type of inter prediction for RAHT
+
+        --attrInterPredTranslationThresh=1000
+                                        Maximum translation threshold used to
+                                        disable attr inter prediction
+        --QPShiftStep=0                 QP shift step used to derive the QP
+                                        shift for attrbute coding in inter
+                                        predicted pictures
+        --attrInterIntraSliceRDO=0      Enable rate and distortion
+                                        optimization to choose between intra
+                                        or interprediction for a slice
+
+        --rahtInterPredictionDepthMinus1=0
+                                        Maximun depth of inter prediction for
+                                        RAHT
+        --rahtInterSendFilters=0        send inter filters for RAHT
+
+        --rahtInterSkipFilteringLayers=3
+                                        skip initial layers for inter
+                                        filtering in RAHT
+
+ Recolouring
+ -----------
+        --recolourSearchRange=1
+        --recolourNumNeighboursFwd=8
+        --recolourNumNeighboursBwd=1
+        --recolourUseDistWeightedAvgFwd=1
+        --recolourUseDistWeightedAvgBwd=1
+        --recolourSkipAvgIfIdenticalSourcePointPresentFwd=1
+        --recolourSkipAvgIfIdenticalSourcePointPresentBwd=0
+        --recolourDistOffsetFwd=4
+        --recolourDistOffsetBwd=4
+        --recolourMaxGeometryDist2Fwd=1000
+        --recolourMaxGeometryDist2Bwd=1000
+        --recolourMaxAttributeDist2Fwd=1000
+        --recolourMaxAttributeDist2Bwd=1000

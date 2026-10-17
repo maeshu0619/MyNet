@@ -1,0 +1,66 @@
+[
+  {
+    "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+    "raw_unique_voxels": 765821,
+    "qs2_unique_voxels": 211887,
+    "raw_gpcc": {
+      "bits": 557528,
+      "stream_sha256": "5cf4d4eac7d89d9f20c8425c47ef275614c92fd35d66881855287c43ca5e7331",
+      "codec_sec": 4.258161943405867,
+      "decoded_exact": true
+    },
+    "qs2_gpcc": {
+      "bits": 150240,
+      "stream_sha256": "fa7b6836f413a0ca6ecd73c883625067344522ccb82e6bd9a73d746a9157722e",
+      "codec_sec": 1.150843432173133,
+      "decoded_exact": true
+    },
+    "qs2_rate_change_from_raw": -73.05247449455453,
+    "raw_quality": {
+      "chamfer_sq": 0.0,
+      "d1_mse": 0.0,
+      "max_gt_to_rec": 0.0,
+      "max_rec_to_gt": 0.0
+    },
+    "qs2_quality": {
+      "chamfer_sq": 2.178329269921022,
+      "d1_mse": 1.5005765054758227,
+      "max_gt_to_rec": 1.7320508075688772,
+      "max_rec_to_gt": 1.7320508075688772
+    },
+    "geometry_preserving_success": false,
+    "interpretation": "Loss improvement is relative to the already qs=2-quantized baseline, not raw-grid bytes"
+  },
+  {
+    "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+    "raw_unique_voxels": 720568,
+    "qs2_unique_voxels": 198530,
+    "raw_gpcc": {
+      "bits": 590776,
+      "stream_sha256": "8c7ad7cd1955c65d7d613ca599cacc658d04c3f8e1e35d224a3b3d5138f0cb72",
+      "codec_sec": 3.748870948795229,
+      "decoded_exact": true
+    },
+    "qs2_gpcc": {
+      "bits": 158896,
+      "stream_sha256": "07711d7f5040ab7b8ac7976070ff96177be5e0cc84679cb822ae8bcc7059b24d",
+      "codec_sec": 1.0249577416107059,
+      "decoded_exact": true
+    },
+    "qs2_rate_change_from_raw": -73.10384985172045,
+    "raw_quality": {
+      "chamfer_sq": 0.0,
+      "d1_mse": 0.0,
+      "max_gt_to_rec": 0.0,
+      "max_rec_to_gt": 0.0
+    },
+    "qs2_quality": {
+      "chamfer_sq": 2.175526326309434,
+      "d1_mse": 1.501114398641072,
+      "max_gt_to_rec": 1.7320508075688772,
+      "max_rec_to_gt": 1.7320508075688772
+    },
+    "geometry_preserving_success": false,
+    "interpretation": "Loss improvement is relative to the already qs=2-quantized baseline, not raw-grid bytes"
+  }
+]

@@ -1,0 +1,6640 @@
+{
+  "commit": "fdc313b84acaf00585ce12e33745012693de657f",
+  "same_pool_table": [
+    {
+      "frame": "longdress_vox10_1051",
+      "budget_percent": 0.15,
+      "method": "current_prior",
+      "plan": 1,
+      "operation_percent": 0.14630439809898674,
+      "changed_cell_percent": 0.21804074813461893,
+      "counts": {
+        "Add": 81,
+        "Prune": 77,
+        "Adjust": 152
+      },
+      "oa_C": -1.0218359126563548,
+      "gpcc_C": -0.38871139510117114,
+      "quality": {
+        "chamfer_sq": 2.177698233156564,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "self_gain": 2590.552428849817,
+      "context_gain": -666.1431986456853,
+      "total_gain": 1924.4092302041315,
+      "actual_oa_gain": 1928,
+      "baseline_quality": {
+        "chamfer_sq": 2.178329269921022,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "longdress_vox10_1051",
+      "budget_percent": 0.15,
+      "method": "node_only",
+      "plan": 2,
+      "operation_percent": 0.15007999546928316,
+      "changed_cell_percent": 0.2675954636197596,
+      "counts": {
+        "Add": 31,
+        "Prune": 38,
+        "Adjust": 249
+      },
+      "oa_C": -1.4161543353826578,
+      "gpcc_C": -0.38871139510117114,
+      "quality": {
+        "chamfer_sq": 2.177138710497533,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "self_gain": 3480.511204655439,
+      "context_gain": -812.0517272984257,
+      "total_gain": 2668.4594773570134,
+      "actual_oa_gain": 2672,
+      "baseline_quality": {
+        "chamfer_sq": 2.178329269921022,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "longdress_vox10_1051",
+      "budget_percent": 0.15,
+      "method": "total_context",
+      "plan": 3,
+      "operation_percent": 0.15007999546928316,
+      "changed_cell_percent": 0.27325885967520425,
+      "counts": {
+        "Add": 21,
+        "Prune": 36,
+        "Adjust": 261
+      },
+      "oa_C": -1.5645537417850353,
+      "gpcc_C": -0.3407880724174639,
+      "quality": {
+        "chamfer_sq": 2.17696602367549,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "self_gain": 3322.1684449360364,
+      "context_gain": -368.0179543572722,
+      "total_gain": 2954.150490578764,
+      "actual_oa_gain": 2952,
+      "baseline_quality": {
+        "chamfer_sq": 2.178329269921022,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "longdress_vox10_1051",
+      "budget_percent": 0.15,
+      "method": "actual_oa_oracle",
+      "plan": 3,
+      "operation_percent": 0.15007999546928316,
+      "changed_cell_percent": 0.27325885967520425,
+      "counts": {
+        "Add": 21,
+        "Prune": 36,
+        "Adjust": 261
+      },
+      "oa_C": -1.5645537417850353,
+      "gpcc_C": -0.3407880724174639,
+      "quality": {
+        "chamfer_sq": 2.17696602367549,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "self_gain": 3322.1684449360364,
+      "context_gain": -368.0179543572722,
+      "total_gain": 2954.150490578764,
+      "actual_oa_gain": 2952,
+      "baseline_quality": {
+        "chamfer_sq": 2.178329269921022,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "longdress_vox10_1051",
+      "budget_percent": 0.15,
+      "method": "actual_gpcc_oracle",
+      "plan": 1,
+      "operation_percent": 0.14630439809898674,
+      "changed_cell_percent": 0.21804074813461893,
+      "counts": {
+        "Add": 81,
+        "Prune": 77,
+        "Adjust": 152
+      },
+      "oa_C": -1.0218359126563548,
+      "gpcc_C": -0.38871139510117114,
+      "quality": {
+        "chamfer_sq": 2.177698233156564,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "self_gain": 2590.552428849817,
+      "context_gain": -666.1431986456853,
+      "total_gain": 1924.4092302041315,
+      "actual_oa_gain": 1928,
+      "baseline_quality": {
+        "chamfer_sq": 2.178329269921022,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "longdress_vox10_1051",
+      "budget_percent": 0.3,
+      "method": "current_prior",
+      "plan": 4,
+      "operation_percent": 0.297328292910844,
+      "changed_cell_percent": 0.4162596100751816,
+      "counts": {
+        "Add": 194,
+        "Prune": 184,
+        "Adjust": 252
+      },
+      "oa_C": -1.4755140979436088,
+      "gpcc_C": -0.2555910543130979,
+      "quality": {
+        "chamfer_sq": 2.1772212904421036,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "self_gain": 4083.053482895678,
+      "context_gain": -1304.3069932923886,
+      "total_gain": 2778.7464896032893,
+      "actual_oa_gain": 2784,
+      "baseline_quality": {
+        "chamfer_sq": 2.178329269921022,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "longdress_vox10_1051",
+      "budget_percent": 0.3,
+      "method": "node_only",
+      "plan": 5,
+      "operation_percent": 0.3001599909385663,
+      "changed_cell_percent": 0.5134812423603147,
+      "counts": {
+        "Add": 98,
+        "Prune": 86,
+        "Adjust": 452
+      },
+      "oa_C": -2.4634301462794106,
+      "gpcc_C": -0.37273695420659836,
+      "quality": {
+        "chamfer_sq": 2.176157796562614,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "self_gain": 6315.168644847913,
+      "context_gain": -1667.199206083751,
+      "total_gain": 4647.969438764162,
+      "actual_oa_gain": 4648,
+      "baseline_quality": {
+        "chamfer_sq": 2.178329269921022,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "longdress_vox10_1051",
+      "budget_percent": 0.3,
+      "method": "total_context",
+      "plan": 6,
+      "operation_percent": 0.3001599909385663,
+      "changed_cell_percent": 0.5186726887444723,
+      "counts": {
+        "Add": 70,
+        "Prune": 103,
+        "Adjust": 463
+      },
+      "oa_C": -2.7390290438838227,
+      "gpcc_C": -0.38871139510117114,
+      "quality": {
+        "chamfer_sq": 2.175772631109514,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "self_gain": 5965.789152919946,
+      "context_gain": -801.9797357245525,
+      "total_gain": 5163.8094171953935,
+      "actual_oa_gain": 5168,
+      "baseline_quality": {
+        "chamfer_sq": 2.178329269921022,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "longdress_vox10_1051",
+      "budget_percent": 0.3,
+      "method": "actual_oa_oracle",
+      "plan": 6,
+      "operation_percent": 0.3001599909385663,
+      "changed_cell_percent": 0.5186726887444723,
+      "counts": {
+        "Add": 70,
+        "Prune": 103,
+        "Adjust": 463
+      },
+      "oa_C": -2.7390290438838227,
+      "gpcc_C": -0.38871139510117114,
+      "quality": {
+        "chamfer_sq": 2.175772631109514,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "self_gain": 5965.789152919946,
+      "context_gain": -801.9797357245525,
+      "total_gain": 5163.8094171953935,
+      "actual_oa_gain": 5168,
+      "baseline_quality": {
+        "chamfer_sq": 2.178329269921022,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "longdress_vox10_1051",
+      "budget_percent": 0.3,
+      "method": "actual_gpcc_oracle",
+      "plan": 1,
+      "operation_percent": 0.14630439809898674,
+      "changed_cell_percent": 0.21804074813461893,
+      "counts": {
+        "Add": 81,
+        "Prune": 77,
+        "Adjust": 152
+      },
+      "oa_C": -1.0218359126563548,
+      "gpcc_C": -0.38871139510117114,
+      "quality": {
+        "chamfer_sq": 2.177698233156564,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "self_gain": 2590.552428849817,
+      "context_gain": -666.1431986456853,
+      "total_gain": 1924.4092302041315,
+      "actual_oa_gain": 1928,
+      "baseline_quality": {
+        "chamfer_sq": 2.178329269921022,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "longdress_vox10_1051",
+      "budget_percent": 1.0,
+      "method": "current_prior",
+      "plan": 7,
+      "operation_percent": 0.3577378508355869,
+      "changed_cell_percent": 0.48752401043952676,
+      "counts": {
+        "Add": 236,
+        "Prune": 247,
+        "Adjust": 275
+      },
+      "oa_C": -1.573033707865168,
+      "gpcc_C": -0.18104366347178047,
+      "quality": {
+        "chamfer_sq": 2.1769438146566644,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "self_gain": 4406.631272622433,
+      "context_gain": -1441.5804722794082,
+      "total_gain": 2965.050800343025,
+      "actual_oa_gain": 2968,
+      "baseline_quality": {
+        "chamfer_sq": 2.178329269921022,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "longdress_vox10_1051",
+      "budget_percent": 1.0,
+      "method": "node_only",
+      "plan": 8,
+      "operation_percent": 0.9986455044434062,
+      "changed_cell_percent": 1.5942459896076682,
+      "counts": {
+        "Add": 479,
+        "Prune": 375,
+        "Adjust": 1262
+      },
+      "oa_C": -6.3896544413822305,
+      "gpcc_C": -0.18636847710330473,
+      "quality": {
+        "chamfer_sq": 2.1721285996685005,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "self_gain": 16650.989766940525,
+      "context_gain": -4599.912158506155,
+      "total_gain": 12051.07760843437,
+      "actual_oa_gain": 12056,
+      "baseline_quality": {
+        "chamfer_sq": 2.178329269921022,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "longdress_vox10_1051",
+      "budget_percent": 1.0,
+      "method": "total_context",
+      "plan": 9,
+      "operation_percent": 1.0000613534572673,
+      "changed_cell_percent": 1.6121800771165762,
+      "counts": {
+        "Add": 359,
+        "Prune": 463,
+        "Adjust": 1297
+      },
+      "oa_C": -6.974772100911597,
+      "gpcc_C": -0.2981895633652809,
+      "quality": {
+        "chamfer_sq": 2.170276150867568,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "self_gain": 15541.895355175655,
+      "context_gain": -2383.664941720215,
+      "total_gain": 13158.23041345544,
+      "actual_oa_gain": 13160,
+      "baseline_quality": {
+        "chamfer_sq": 2.178329269921022,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "longdress_vox10_1051",
+      "budget_percent": 1.0,
+      "method": "actual_oa_oracle",
+      "plan": 9,
+      "operation_percent": 1.0000613534572673,
+      "changed_cell_percent": 1.6121800771165762,
+      "counts": {
+        "Add": 359,
+        "Prune": 463,
+        "Adjust": 1297
+      },
+      "oa_C": -6.974772100911597,
+      "gpcc_C": -0.2981895633652809,
+      "quality": {
+        "chamfer_sq": 2.170276150867568,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "self_gain": 15541.895355175655,
+      "context_gain": -2383.664941720215,
+      "total_gain": 13158.23041345544,
+      "actual_oa_gain": 13160,
+      "baseline_quality": {
+        "chamfer_sq": 2.178329269921022,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "longdress_vox10_1051",
+      "budget_percent": 1.0,
+      "method": "actual_gpcc_oracle",
+      "plan": 1,
+      "operation_percent": 0.14630439809898674,
+      "changed_cell_percent": 0.21804074813461893,
+      "counts": {
+        "Add": 81,
+        "Prune": 77,
+        "Adjust": 152
+      },
+      "oa_C": -1.0218359126563548,
+      "gpcc_C": -0.38871139510117114,
+      "quality": {
+        "chamfer_sq": 2.177698233156564,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "self_gain": 2590.552428849817,
+      "context_gain": -666.1431986456853,
+      "total_gain": 1924.4092302041315,
+      "actual_oa_gain": 1928,
+      "baseline_quality": {
+        "chamfer_sq": 2.178329269921022,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "longdress_vox10_1051",
+      "budget_percent": 3.0,
+      "method": "current_prior",
+      "plan": 7,
+      "operation_percent": 0.3577378508355869,
+      "changed_cell_percent": 0.48752401043952676,
+      "counts": {
+        "Add": 236,
+        "Prune": 247,
+        "Adjust": 275
+      },
+      "oa_C": -1.573033707865168,
+      "gpcc_C": -0.18104366347178047,
+      "quality": {
+        "chamfer_sq": 2.1769438146566644,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "self_gain": 4406.631272622433,
+      "context_gain": -1441.5804722794082,
+      "total_gain": 2965.050800343025,
+      "actual_oa_gain": 2968,
+      "baseline_quality": {
+        "chamfer_sq": 2.178329269921022,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "longdress_vox10_1051",
+      "budget_percent": 3.0,
+      "method": "node_only",
+      "plan": 10,
+      "operation_percent": 2.9997121107005147,
+      "changed_cell_percent": 4.427359866343853,
+      "counts": {
+        "Add": 1669,
+        "Prune": 1662,
+        "Adjust": 3025
+      },
+      "oa_C": -13.996184015263935,
+      "gpcc_C": 0.11182108626197618,
+      "quality": {
+        "chamfer_sq": 2.161562658929908,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "self_gain": 36786.36157111759,
+      "context_gain": -10383.81436979961,
+      "total_gain": 26402.54720131798,
+      "actual_oa_gain": 26408,
+      "baseline_quality": {
+        "chamfer_sq": 2.178329269921022,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "longdress_vox10_1051",
+      "budget_percent": 3.0,
+      "method": "total_context",
+      "plan": 11,
+      "operation_percent": 2.9997121107005147,
+      "changed_cell_percent": 4.5458192338369035,
+      "counts": {
+        "Add": 1338,
+        "Prune": 1742,
+        "Adjust": 3276
+      },
+      "oa_C": -15.704897180411281,
+      "gpcc_C": -0.7028753993610248,
+      "quality": {
+        "chamfer_sq": 2.1574519990143104,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "self_gain": 34475.068177303714,
+      "context_gain": -4847.51167603385,
+      "total_gain": 29627.556501269864,
+      "actual_oa_gain": 29632,
+      "baseline_quality": {
+        "chamfer_sq": 2.178329269921022,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "longdress_vox10_1051",
+      "budget_percent": 3.0,
+      "method": "actual_oa_oracle",
+      "plan": 11,
+      "operation_percent": 2.9997121107005147,
+      "changed_cell_percent": 4.5458192338369035,
+      "counts": {
+        "Add": 1338,
+        "Prune": 1742,
+        "Adjust": 3276
+      },
+      "oa_C": -15.704897180411281,
+      "gpcc_C": -0.7028753993610248,
+      "quality": {
+        "chamfer_sq": 2.1574519990143104,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "self_gain": 34475.068177303714,
+      "context_gain": -4847.51167603385,
+      "total_gain": 29627.556501269864,
+      "actual_oa_gain": 29632,
+      "baseline_quality": {
+        "chamfer_sq": 2.178329269921022,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "longdress_vox10_1051",
+      "budget_percent": 3.0,
+      "method": "actual_gpcc_oracle",
+      "plan": 11,
+      "operation_percent": 2.9997121107005147,
+      "changed_cell_percent": 4.5458192338369035,
+      "counts": {
+        "Add": 1338,
+        "Prune": 1742,
+        "Adjust": 3276
+      },
+      "oa_C": -15.704897180411281,
+      "gpcc_C": -0.7028753993610248,
+      "quality": {
+        "chamfer_sq": 2.1574519990143104,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "self_gain": 34475.068177303714,
+      "context_gain": -4847.51167603385,
+      "total_gain": 29627.556501269864,
+      "actual_oa_gain": 29632,
+      "baseline_quality": {
+        "chamfer_sq": 2.178329269921022,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "longdress_vox10_1051",
+      "budget_percent": 5.0,
+      "method": "current_prior",
+      "plan": 7,
+      "operation_percent": 0.3577378508355869,
+      "changed_cell_percent": 0.48752401043952676,
+      "counts": {
+        "Add": 236,
+        "Prune": 247,
+        "Adjust": 275
+      },
+      "oa_C": -1.573033707865168,
+      "gpcc_C": -0.18104366347178047,
+      "quality": {
+        "chamfer_sq": 2.1769438146566644,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "self_gain": 4406.631272622433,
+      "context_gain": -1441.5804722794082,
+      "total_gain": 2965.050800343025,
+      "actual_oa_gain": 2968,
+      "baseline_quality": {
+        "chamfer_sq": 2.178329269921022,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "longdress_vox10_1051",
+      "budget_percent": 5.0,
+      "method": "node_only",
+      "plan": 12,
+      "operation_percent": 4.991339723531882,
+      "changed_cell_percent": 7.041961045274132,
+      "counts": {
+        "Add": 2900,
+        "Prune": 3331,
+        "Adjust": 4345
+      },
+      "oa_C": -18.622005511977957,
+      "gpcc_C": 0.1650692225772188,
+      "quality": {
+        "chamfer_sq": 2.152045368974612,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "self_gain": 50972.782935614996,
+      "context_gain": -15834.758690160728,
+      "total_gain": 35138.02424545427,
+      "actual_oa_gain": 35136,
+      "baseline_quality": {
+        "chamfer_sq": 2.178329269921022,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "longdress_vox10_1051",
+      "budget_percent": 5.0,
+      "method": "total_context",
+      "plan": 13,
+      "operation_percent": 4.991339723531882,
+      "changed_cell_percent": 7.285015125986964,
+      "counts": {
+        "Add": 2498,
+        "Prune": 3218,
+        "Adjust": 4860
+      },
+      "oa_C": -22.039431842272627,
+      "gpcc_C": -1.2300319488817935,
+      "quality": {
+        "chamfer_sq": 2.1467286031047137,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "self_gain": 47273.58617091871,
+      "context_gain": -5694.903759748151,
+      "total_gain": 41578.68241117056,
+      "actual_oa_gain": 41584,
+      "baseline_quality": {
+        "chamfer_sq": 2.178329269921022,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "longdress_vox10_1051",
+      "budget_percent": 5.0,
+      "method": "actual_oa_oracle",
+      "plan": 13,
+      "operation_percent": 4.991339723531882,
+      "changed_cell_percent": 7.285015125986964,
+      "counts": {
+        "Add": 2498,
+        "Prune": 3218,
+        "Adjust": 4860
+      },
+      "oa_C": -22.039431842272627,
+      "gpcc_C": -1.2300319488817935,
+      "quality": {
+        "chamfer_sq": 2.1467286031047137,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "self_gain": 47273.58617091871,
+      "context_gain": -5694.903759748151,
+      "total_gain": 41578.68241117056,
+      "actual_oa_gain": 41584,
+      "baseline_quality": {
+        "chamfer_sq": 2.178329269921022,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "longdress_vox10_1051",
+      "budget_percent": 5.0,
+      "method": "actual_gpcc_oracle",
+      "plan": 13,
+      "operation_percent": 4.991339723531882,
+      "changed_cell_percent": 7.285015125986964,
+      "counts": {
+        "Add": 2498,
+        "Prune": 3218,
+        "Adjust": 4860
+      },
+      "oa_C": -22.039431842272627,
+      "gpcc_C": -1.2300319488817935,
+      "quality": {
+        "chamfer_sq": 2.1467286031047137,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "self_gain": 47273.58617091871,
+      "context_gain": -5694.903759748151,
+      "total_gain": 41578.68241117056,
+      "actual_oa_gain": 41584,
+      "baseline_quality": {
+        "chamfer_sq": 2.178329269921022,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "redandblack_vox10_1451",
+      "budget_percent": 0.15,
+      "method": "current_prior",
+      "plan": 1,
+      "operation_percent": 0.1495995567420541,
+      "changed_cell_percent": 0.22263637737369668,
+      "counts": {
+        "Add": 64,
+        "Prune": 88,
+        "Adjust": 145
+      },
+      "oa_C": -0.8845775821546109,
+      "gpcc_C": -0.3725707380928367,
+      "quality": {
+        "chamfer_sq": 2.174711166496955,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "self_gain": 2266.88659528037,
+      "context_gain": -611.4130204621156,
+      "total_gain": 1655.4735748182543,
+      "actual_oa_gain": 1656,
+      "baseline_quality": {
+        "chamfer_sq": 2.175526326309434,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "redandblack_vox10_1451",
+      "budget_percent": 0.15,
+      "method": "node_only",
+      "plan": 2,
+      "operation_percent": 0.1501032589533068,
+      "changed_cell_percent": 0.25436961668261726,
+      "counts": {
+        "Add": 46,
+        "Prune": 45,
+        "Adjust": 207
+      },
+      "oa_C": -1.0726037348831263,
+      "gpcc_C": -0.25677172490182754,
+      "quality": {
+        "chamfer_sq": 2.1745507889277276,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "self_gain": 3198.0063425479498,
+      "context_gain": -1189.1810879426607,
+      "total_gain": 2008.825254605289,
+      "actual_oa_gain": 2008,
+      "baseline_quality": {
+        "chamfer_sq": 2.175526326309434,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "redandblack_vox10_1451",
+      "budget_percent": 0.15,
+      "method": "total_context",
+      "plan": 3,
+      "operation_percent": 0.1501032589533068,
+      "changed_cell_percent": 0.25033999899259557,
+      "counts": {
+        "Add": 38,
+        "Prune": 61,
+        "Adjust": 199
+      },
+      "oa_C": -1.3033631041408533,
+      "gpcc_C": -0.4027791763165811,
+      "quality": {
+        "chamfer_sq": 2.1743400279639675,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "self_gain": 2942.4458075219977,
+      "context_gain": -507.2054062137877,
+      "total_gain": 2435.24040130821,
+      "actual_oa_gain": 2440,
+      "baseline_quality": {
+        "chamfer_sq": 2.175526326309434,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "redandblack_vox10_1451",
+      "budget_percent": 0.15,
+      "method": "actual_oa_oracle",
+      "plan": 3,
+      "operation_percent": 0.1501032589533068,
+      "changed_cell_percent": 0.25033999899259557,
+      "counts": {
+        "Add": 38,
+        "Prune": 61,
+        "Adjust": 199
+      },
+      "oa_C": -1.3033631041408533,
+      "gpcc_C": -0.4027791763165811,
+      "quality": {
+        "chamfer_sq": 2.1743400279639675,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "self_gain": 2942.4458075219977,
+      "context_gain": -507.2054062137877,
+      "total_gain": 2435.24040130821,
+      "actual_oa_gain": 2440,
+      "baseline_quality": {
+        "chamfer_sq": 2.175526326309434,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "redandblack_vox10_1451",
+      "budget_percent": 0.15,
+      "method": "actual_gpcc_oracle",
+      "plan": 3,
+      "operation_percent": 0.1501032589533068,
+      "changed_cell_percent": 0.25033999899259557,
+      "counts": {
+        "Add": 38,
+        "Prune": 61,
+        "Adjust": 199
+      },
+      "oa_C": -1.3033631041408533,
+      "gpcc_C": -0.4027791763165811,
+      "quality": {
+        "chamfer_sq": 2.1743400279639675,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "self_gain": 2942.4458075219977,
+      "context_gain": -507.2054062137877,
+      "total_gain": 2435.24040130821,
+      "actual_oa_gain": 2440,
+      "baseline_quality": {
+        "chamfer_sq": 2.175526326309434,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "redandblack_vox10_1451",
+      "budget_percent": 0.3,
+      "method": "current_prior",
+      "plan": 4,
+      "operation_percent": 0.2790510250339999,
+      "changed_cell_percent": 0.4095098977484512,
+      "counts": {
+        "Add": 142,
+        "Prune": 153,
+        "Adjust": 259
+      },
+      "oa_C": -1.363189607281745,
+      "gpcc_C": -0.47830027187594215,
+      "quality": {
+        "chamfer_sq": 2.174289258478166,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "self_gain": 3803.597913177594,
+      "context_gain": -1254.7279802406888,
+      "total_gain": 2548.869932936905,
+      "actual_oa_gain": 2552,
+      "baseline_quality": {
+        "chamfer_sq": 2.175526326309434,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "redandblack_vox10_1451",
+      "budget_percent": 0.3,
+      "method": "node_only",
+      "plan": 5,
+      "operation_percent": 0.3002065179066136,
+      "changed_cell_percent": 0.49413186923890595,
+      "counts": {
+        "Add": 125,
+        "Prune": 86,
+        "Adjust": 385
+      },
+      "oa_C": -1.9443613520789715,
+      "gpcc_C": -0.3473970395730497,
+      "quality": {
+        "chamfer_sq": 2.1738931304672886,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "self_gain": 5820.751371442475,
+      "context_gain": -2183.091303198934,
+      "total_gain": 3637.660068243541,
+      "actual_oa_gain": 3640,
+      "baseline_quality": {
+        "chamfer_sq": 2.175526326309434,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "redandblack_vox10_1451",
+      "budget_percent": 0.3,
+      "method": "total_context",
+      "plan": 6,
+      "operation_percent": 0.3002065179066136,
+      "changed_cell_percent": 0.4946355714501587,
+      "counts": {
+        "Add": 77,
+        "Prune": 133,
+        "Adjust": 386
+      },
+      "oa_C": -2.2691337977009507,
+      "gpcc_C": -0.4078139160205385,
+      "quality": {
+        "chamfer_sq": 2.1730915845697076,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "self_gain": 5443.854485607559,
+      "context_gain": -1200.3146803154832,
+      "total_gain": 4243.5398052920755,
+      "actual_oa_gain": 4248,
+      "baseline_quality": {
+        "chamfer_sq": 2.175526326309434,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "redandblack_vox10_1451",
+      "budget_percent": 0.3,
+      "method": "actual_oa_oracle",
+      "plan": 6,
+      "operation_percent": 0.3002065179066136,
+      "changed_cell_percent": 0.4946355714501587,
+      "counts": {
+        "Add": 77,
+        "Prune": 133,
+        "Adjust": 386
+      },
+      "oa_C": -2.2691337977009507,
+      "gpcc_C": -0.4078139160205385,
+      "quality": {
+        "chamfer_sq": 2.1730915845697076,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "self_gain": 5443.854485607559,
+      "context_gain": -1200.3146803154832,
+      "total_gain": 4243.5398052920755,
+      "actual_oa_gain": 4248,
+      "baseline_quality": {
+        "chamfer_sq": 2.175526326309434,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "redandblack_vox10_1451",
+      "budget_percent": 0.3,
+      "method": "actual_gpcc_oracle",
+      "plan": 4,
+      "operation_percent": 0.2790510250339999,
+      "changed_cell_percent": 0.4095098977484512,
+      "counts": {
+        "Add": 142,
+        "Prune": 153,
+        "Adjust": 259
+      },
+      "oa_C": -1.363189607281745,
+      "gpcc_C": -0.47830027187594215,
+      "quality": {
+        "chamfer_sq": 2.174289258478166,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "self_gain": 3803.597913177594,
+      "context_gain": -1254.7279802406888,
+      "total_gain": 2548.869932936905,
+      "actual_oa_gain": 2552,
+      "baseline_quality": {
+        "chamfer_sq": 2.175526326309434,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "redandblack_vox10_1451",
+      "budget_percent": 1.0,
+      "method": "current_prior",
+      "plan": 7,
+      "operation_percent": 0.46239862992998537,
+      "changed_cell_percent": 0.6563239812622776,
+      "counts": {
+        "Add": 273,
+        "Prune": 260,
+        "Adjust": 385
+      },
+      "oa_C": -1.9529079953848116,
+      "gpcc_C": -0.46823079246802735,
+      "quality": {
+        "chamfer_sq": 2.1737596190719106,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "self_gain": 5388.915963141874,
+      "context_gain": -1737.56013233362,
+      "total_gain": 3651.3558308082543,
+      "actual_oa_gain": 3656,
+      "baseline_quality": {
+        "chamfer_sq": 2.175526326309434,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "redandblack_vox10_1451",
+      "budget_percent": 1.0,
+      "method": "node_only",
+      "plan": 8,
+      "operation_percent": 0.9993451871253715,
+      "changed_cell_percent": 1.5720546013196999,
+      "counts": {
+        "Add": 510,
+        "Prune": 337,
+        "Adjust": 1137
+      },
+      "oa_C": -5.1749925216871056,
+      "gpcc_C": -0.25173698519787013,
+      "quality": {
+        "chamfer_sq": 2.17045507291373,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "self_gain": 15309.229068322116,
+      "context_gain": -5626.37367520083,
+      "total_gain": 9682.855393121286,
+      "actual_oa_gain": 9688,
+      "baseline_quality": {
+        "chamfer_sq": 2.175526326309434,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "redandblack_vox10_1451",
+      "budget_percent": 1.0,
+      "method": "total_context",
+      "plan": 9,
+      "operation_percent": 0.9998488893366242,
+      "changed_cell_percent": 1.56651387699592,
+      "counts": {
+        "Add": 353,
+        "Prune": 507,
+        "Adjust": 1125
+      },
+      "oa_C": -5.969830349130378,
+      "gpcc_C": -0.6092035041788346,
+      "quality": {
+        "chamfer_sq": 2.1678684414688334,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "self_gain": 14069.766794978961,
+      "context_gain": -2896.276880409676,
+      "total_gain": 11173.489914569285,
+      "actual_oa_gain": 11176,
+      "baseline_quality": {
+        "chamfer_sq": 2.175526326309434,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "redandblack_vox10_1451",
+      "budget_percent": 1.0,
+      "method": "actual_oa_oracle",
+      "plan": 9,
+      "operation_percent": 0.9998488893366242,
+      "changed_cell_percent": 1.56651387699592,
+      "counts": {
+        "Add": 353,
+        "Prune": 507,
+        "Adjust": 1125
+      },
+      "oa_C": -5.969830349130378,
+      "gpcc_C": -0.6092035041788346,
+      "quality": {
+        "chamfer_sq": 2.1678684414688334,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "self_gain": 14069.766794978961,
+      "context_gain": -2896.276880409676,
+      "total_gain": 11173.489914569285,
+      "actual_oa_gain": 11176,
+      "baseline_quality": {
+        "chamfer_sq": 2.175526326309434,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "redandblack_vox10_1451",
+      "budget_percent": 1.0,
+      "method": "actual_gpcc_oracle",
+      "plan": 9,
+      "operation_percent": 0.9998488893366242,
+      "changed_cell_percent": 1.56651387699592,
+      "counts": {
+        "Add": 353,
+        "Prune": 507,
+        "Adjust": 1125
+      },
+      "oa_C": -5.969830349130378,
+      "gpcc_C": -0.6092035041788346,
+      "quality": {
+        "chamfer_sq": 2.1678684414688334,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "self_gain": 14069.766794978961,
+      "context_gain": -2896.276880409676,
+      "total_gain": 11173.489914569285,
+      "actual_oa_gain": 11176,
+      "baseline_quality": {
+        "chamfer_sq": 2.175526326309434,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "redandblack_vox10_1451",
+      "budget_percent": 3.0,
+      "method": "current_prior",
+      "plan": 7,
+      "operation_percent": 0.46239862992998537,
+      "changed_cell_percent": 0.6563239812622776,
+      "counts": {
+        "Add": 273,
+        "Prune": 260,
+        "Adjust": 385
+      },
+      "oa_C": -1.9529079953848116,
+      "gpcc_C": -0.46823079246802735,
+      "quality": {
+        "chamfer_sq": 2.1737596190719106,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "self_gain": 5388.915963141874,
+      "context_gain": -1737.56013233362,
+      "total_gain": 3651.3558308082543,
+      "actual_oa_gain": 3656,
+      "baseline_quality": {
+        "chamfer_sq": 2.175526326309434,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "redandblack_vox10_1451",
+      "budget_percent": 3.0,
+      "method": "node_only",
+      "plan": 10,
+      "operation_percent": 3.000050370221125,
+      "changed_cell_percent": 4.392283282123609,
+      "counts": {
+        "Add": 1651,
+        "Prune": 1541,
+        "Adjust": 2764
+      },
+      "oa_C": -11.982393914789968,
+      "gpcc_C": -0.9062531467123103,
+      "quality": {
+        "chamfer_sq": 2.1611425903446566,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "self_gain": 33673.35573513747,
+      "context_gain": -11241.124771482435,
+      "total_gain": 22432.230963655034,
+      "actual_oa_gain": 22432,
+      "baseline_quality": {
+        "chamfer_sq": 2.175526326309434,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "redandblack_vox10_1451",
+      "budget_percent": 3.0,
+      "method": "total_context",
+      "plan": 11,
+      "operation_percent": 2.9980355613761143,
+      "changed_cell_percent": 4.486979297839117,
+      "counts": {
+        "Add": 1313,
+        "Prune": 1683,
+        "Adjust": 2956
+      },
+      "oa_C": -13.790008973975477,
+      "gpcc_C": -1.7974020743127594,
+      "quality": {
+        "chamfer_sq": 2.1559942936753878,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "self_gain": 31341.289376766752,
+      "context_gain": -5524.672827920356,
+      "total_gain": 25816.616548846396,
+      "actual_oa_gain": 25816,
+      "baseline_quality": {
+        "chamfer_sq": 2.175526326309434,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "redandblack_vox10_1451",
+      "budget_percent": 3.0,
+      "method": "actual_oa_oracle",
+      "plan": 11,
+      "operation_percent": 2.9980355613761143,
+      "changed_cell_percent": 4.486979297839117,
+      "counts": {
+        "Add": 1313,
+        "Prune": 1683,
+        "Adjust": 2956
+      },
+      "oa_C": -13.790008973975477,
+      "gpcc_C": -1.7974020743127594,
+      "quality": {
+        "chamfer_sq": 2.1559942936753878,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "self_gain": 31341.289376766752,
+      "context_gain": -5524.672827920356,
+      "total_gain": 25816.616548846396,
+      "actual_oa_gain": 25816,
+      "baseline_quality": {
+        "chamfer_sq": 2.175526326309434,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "redandblack_vox10_1451",
+      "budget_percent": 3.0,
+      "method": "actual_gpcc_oracle",
+      "plan": 11,
+      "operation_percent": 2.9980355613761143,
+      "changed_cell_percent": 4.486979297839117,
+      "counts": {
+        "Add": 1313,
+        "Prune": 1683,
+        "Adjust": 2956
+      },
+      "oa_C": -13.790008973975477,
+      "gpcc_C": -1.7974020743127594,
+      "quality": {
+        "chamfer_sq": 2.1559942936753878,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "self_gain": 31341.289376766752,
+      "context_gain": -5524.672827920356,
+      "total_gain": 25816.616548846396,
+      "actual_oa_gain": 25816,
+      "baseline_quality": {
+        "chamfer_sq": 2.175526326309434,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "redandblack_vox10_1451",
+      "budget_percent": 5.0,
+      "method": "current_prior",
+      "plan": 7,
+      "operation_percent": 0.46239862992998537,
+      "changed_cell_percent": 0.6563239812622776,
+      "counts": {
+        "Add": 273,
+        "Prune": 260,
+        "Adjust": 385
+      },
+      "oa_C": -1.9529079953848116,
+      "gpcc_C": -0.46823079246802735,
+      "quality": {
+        "chamfer_sq": 2.1737596190719106,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "self_gain": 5388.915963141874,
+      "context_gain": -1737.56013233362,
+      "total_gain": 3651.3558308082543,
+      "actual_oa_gain": 3656,
+      "baseline_quality": {
+        "chamfer_sq": 2.175526326309434,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "redandblack_vox10_1451",
+      "budget_percent": 5.0,
+      "method": "node_only",
+      "plan": 12,
+      "operation_percent": 4.998740744471868,
+      "changed_cell_percent": 7.043771722157859,
+      "counts": {
+        "Add": 2961,
+        "Prune": 2903,
+        "Adjust": 4060
+      },
+      "oa_C": -16.144609204734838,
+      "gpcc_C": -1.4248313362199228,
+      "quality": {
+        "chamfer_sq": 2.154517424000107,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "self_gain": 46060.898357735045,
+      "context_gain": -15835.945441299857,
+      "total_gain": 30224.952916435188,
+      "actual_oa_gain": 30224,
+      "baseline_quality": {
+        "chamfer_sq": 2.175526326309434,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "redandblack_vox10_1451",
+      "budget_percent": 5.0,
+      "method": "total_context",
+      "plan": 13,
+      "operation_percent": 4.998740744471868,
+      "changed_cell_percent": 7.258852566362766,
+      "counts": {
+        "Add": 2340,
+        "Prune": 3097,
+        "Adjust": 4487
+      },
+      "oa_C": -19.32396051450793,
+      "gpcc_C": -2.6734467828013253,
+      "quality": {
+        "chamfer_sq": 2.1462782986678706,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "self_gain": 42229.321448523326,
+      "context_gain": -6058.616977873207,
+      "total_gain": 36170.70447065012,
+      "actual_oa_gain": 36176,
+      "baseline_quality": {
+        "chamfer_sq": 2.175526326309434,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "redandblack_vox10_1451",
+      "budget_percent": 5.0,
+      "method": "actual_oa_oracle",
+      "plan": 13,
+      "operation_percent": 4.998740744471868,
+      "changed_cell_percent": 7.258852566362766,
+      "counts": {
+        "Add": 2340,
+        "Prune": 3097,
+        "Adjust": 4487
+      },
+      "oa_C": -19.32396051450793,
+      "gpcc_C": -2.6734467828013253,
+      "quality": {
+        "chamfer_sq": 2.1462782986678706,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "self_gain": 42229.321448523326,
+      "context_gain": -6058.616977873207,
+      "total_gain": 36170.70447065012,
+      "actual_oa_gain": 36176,
+      "baseline_quality": {
+        "chamfer_sq": 2.175526326309434,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "redandblack_vox10_1451",
+      "budget_percent": 5.0,
+      "method": "actual_gpcc_oracle",
+      "plan": 13,
+      "operation_percent": 4.998740744471868,
+      "changed_cell_percent": 7.258852566362766,
+      "counts": {
+        "Add": 2340,
+        "Prune": 3097,
+        "Adjust": 4487
+      },
+      "oa_C": -19.32396051450793,
+      "gpcc_C": -2.6734467828013253,
+      "quality": {
+        "chamfer_sq": 2.1462782986678706,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "self_gain": 42229.321448523326,
+      "context_gain": -6058.616977873207,
+      "total_gain": 36170.70447065012,
+      "actual_oa_gain": 36176,
+      "baseline_quality": {
+        "chamfer_sq": 2.175526326309434,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    }
+  ],
+  "single_context_groups": [
+    {
+      "frame": "longdress_vox10_1051",
+      "category": "self_good_context_bad",
+      "n": 20,
+      "total_gain": {
+        "n": 20,
+        "min": -6.461147505115811,
+        "median": 6.234992554349207,
+        "max": 15.768706700899786,
+        "mean": 5.348563920614324
+      },
+      "context_gain": {
+        "n": 20,
+        "min": -12.396296329547171,
+        "median": -2.7149730324923853,
+        "max": -0.07454065777345065,
+        "mean": -3.584786419608803
+      },
+      "affected_nodes": {
+        "n": 20,
+        "min": 19.0,
+        "median": 433.0,
+        "max": 911.0,
+        "mean": 454.35
+      },
+      "window_fraction": {
+        "n": 20,
+        "min": 0.0703125,
+        "median": 0.52392578125,
+        "max": 0.9794921875,
+        "mean": 0.509521484375
+      },
+      "mask_population": {
+        "n": 20,
+        "min": 2.0,
+        "median": 5.0,
+        "max": 6.0,
+        "mean": 4.6
+      }
+    },
+    {
+      "frame": "longdress_vox10_1051",
+      "category": "self_and_context_good",
+      "n": 6,
+      "total_gain": {
+        "n": 6,
+        "min": 1.3464453321686651,
+        "median": 3.082366367739147,
+        "max": 18.492546381280476,
+        "mean": 7.728420208451024
+      },
+      "context_gain": {
+        "n": 6,
+        "min": 0.10615195501676133,
+        "median": 0.853755704075918,
+        "max": 3.9630548213605508,
+        "mean": 1.4511352737614398
+      },
+      "affected_nodes": {
+        "n": 6,
+        "min": 52.0,
+        "median": 240.5,
+        "max": 844.0,
+        "mean": 359.1666666666667
+      },
+      "window_fraction": {
+        "n": 6,
+        "min": 0.09765625,
+        "median": 0.7138671875,
+        "max": 0.9443359375,
+        "mean": 0.607421875
+      },
+      "mask_population": {
+        "n": 6,
+        "min": 2.0,
+        "median": 5.0,
+        "max": 6.0,
+        "mean": 4.666666666666667
+      }
+    },
+    {
+      "frame": "redandblack_vox10_1451",
+      "category": "self_good_context_bad",
+      "n": 14,
+      "total_gain": {
+        "n": 14,
+        "min": -2.2768398979601727,
+        "median": 5.016450377357365,
+        "max": 15.608311127672605,
+        "mean": 5.934498840668472
+      },
+      "context_gain": {
+        "n": 14,
+        "min": -10.759751671562345,
+        "median": -3.041499278914383,
+        "max": -0.05003984159090358,
+        "mean": -4.500291972400633
+      },
+      "affected_nodes": {
+        "n": 14,
+        "min": 35.0,
+        "median": 481.5,
+        "max": 886.0,
+        "mean": 475.5
+      },
+      "window_fraction": {
+        "n": 14,
+        "min": 0.0546875,
+        "median": 0.46923828125,
+        "max": 0.962890625,
+        "mean": 0.48583984375
+      },
+      "mask_population": {
+        "n": 14,
+        "min": 1.0,
+        "median": 4.0,
+        "max": 6.0,
+        "mean": 3.7142857142857144
+      }
+    },
+    {
+      "frame": "redandblack_vox10_1451",
+      "category": "self_and_context_good",
+      "n": 4,
+      "total_gain": {
+        "n": 4,
+        "min": 1.3724913126015714,
+        "median": 3.7081077764350674,
+        "max": 15.230988903042913,
+        "mean": 6.004923942128655
+      },
+      "context_gain": {
+        "n": 4,
+        "min": 0.9190987091922977,
+        "median": 1.5347204799640837,
+        "max": 2.0802130079929224,
+        "mean": 1.5171881692783469
+      },
+      "affected_nodes": {
+        "n": 4,
+        "min": 288.0,
+        "median": 693.5,
+        "max": 732.0,
+        "mean": 601.75
+      },
+      "window_fraction": {
+        "n": 4,
+        "min": 0.1630859375,
+        "median": 0.1826171875,
+        "max": 0.62109375,
+        "mean": 0.287353515625
+      },
+      "mask_population": {
+        "n": 4,
+        "min": 3.0,
+        "median": 4.5,
+        "max": 7.0,
+        "mean": 4.75
+      }
+    }
+  ],
+  "score_correlations": [
+    {
+      "frame": "longdress_vox10_1051",
+      "n": 51,
+      "prior_vs_actual_oa": 0.37272578570927134,
+      "self_vs_actual_oa": 0.5621188116345155,
+      "context_vs_actual_oa": 0.9800951238913754,
+      "oa_context_vs_actual_gpcc": 0.5442517997363963,
+      "gpcc_zero_delta_fraction": 0.3333333333333333
+    },
+    {
+      "frame": "redandblack_vox10_1451",
+      "n": 45,
+      "prior_vs_actual_oa": 0.49039248041644007,
+      "self_vs_actual_oa": 0.3644380491415063,
+      "context_vs_actual_oa": 0.9765347577421887,
+      "oa_context_vs_actual_gpcc": 0.06196277213905809,
+      "gpcc_zero_delta_fraction": 0.2222222222222222
+    }
+  ],
+  "single_candidate_rows": 152,
+  "single_comparisons": [
+    {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "trial": "same_pool_single_comparison",
+      "method": "current_prior",
+      "winner": 67,
+      "candidate_ids": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        13,
+        20,
+        22,
+        26,
+        28,
+        29,
+        32,
+        33,
+        34,
+        35,
+        36,
+        38,
+        39,
+        40,
+        43,
+        45,
+        46,
+        49,
+        50,
+        52,
+        53,
+        54,
+        55,
+        57,
+        60,
+        61,
+        62,
+        64,
+        65,
+        66,
+        67,
+        68,
+        69,
+        70,
+        71,
+        72,
+        73,
+        74,
+        75,
+        -1
+      ],
+      "oa_C": 0.0,
+      "gpcc_C": 0.0,
+      "quality": {
+        "chamfer_sq": 2.1783260712841743,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "trial": "same_pool_single_comparison",
+      "method": "node_only",
+      "winner": 61,
+      "candidate_ids": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        13,
+        20,
+        22,
+        26,
+        28,
+        29,
+        32,
+        33,
+        34,
+        35,
+        36,
+        38,
+        39,
+        40,
+        43,
+        45,
+        46,
+        49,
+        50,
+        52,
+        53,
+        54,
+        55,
+        57,
+        60,
+        61,
+        62,
+        64,
+        65,
+        66,
+        67,
+        68,
+        69,
+        70,
+        71,
+        72,
+        73,
+        74,
+        75,
+        -1
+      ],
+      "oa_C": -0.008479966080132684,
+      "gpcc_C": 0.005324813631513159,
+      "quality": {
+        "chamfer_sq": 2.178312069578992,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "trial": "same_pool_single_comparison",
+      "method": "total_context",
+      "winner": 69,
+      "candidate_ids": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        13,
+        20,
+        22,
+        26,
+        28,
+        29,
+        32,
+        33,
+        34,
+        35,
+        36,
+        38,
+        39,
+        40,
+        43,
+        45,
+        46,
+        49,
+        50,
+        52,
+        53,
+        54,
+        55,
+        57,
+        60,
+        61,
+        62,
+        64,
+        65,
+        66,
+        67,
+        68,
+        69,
+        70,
+        71,
+        72,
+        73,
+        74,
+        75,
+        -1
+      ],
+      "oa_C": -0.029679881280475495,
+      "gpcc_C": -0.015974440894572783,
+      "quality": {
+        "chamfer_sq": 2.1783277490690756,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "trial": "same_pool_single_comparison",
+      "method": "actual_oa_oracle",
+      "winner": 69,
+      "candidate_ids": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        13,
+        20,
+        22,
+        26,
+        28,
+        29,
+        32,
+        33,
+        34,
+        35,
+        36,
+        38,
+        39,
+        40,
+        43,
+        45,
+        46,
+        49,
+        50,
+        52,
+        53,
+        54,
+        55,
+        57,
+        60,
+        61,
+        62,
+        64,
+        65,
+        66,
+        67,
+        68,
+        69,
+        70,
+        71,
+        72,
+        73,
+        74,
+        75,
+        -1
+      ],
+      "oa_C": -0.029679881280475495,
+      "gpcc_C": -0.015974440894572783,
+      "quality": {
+        "chamfer_sq": 2.1783277490690756,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "trial": "same_pool_single_comparison",
+      "method": "actual_gpcc_oracle",
+      "winner": 69,
+      "candidate_ids": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        13,
+        20,
+        22,
+        26,
+        28,
+        29,
+        32,
+        33,
+        34,
+        35,
+        36,
+        38,
+        39,
+        40,
+        43,
+        45,
+        46,
+        49,
+        50,
+        52,
+        53,
+        54,
+        55,
+        57,
+        60,
+        61,
+        62,
+        64,
+        65,
+        66,
+        67,
+        68,
+        69,
+        70,
+        71,
+        72,
+        73,
+        74,
+        75,
+        -1
+      ],
+      "oa_C": -0.029679881280475495,
+      "gpcc_C": -0.015974440894572783,
+      "quality": {
+        "chamfer_sq": 2.1783277490690756,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+      "trial": "same_pool_single_comparison",
+      "method": "current_prior",
+      "winner": 69,
+      "candidate_ids": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        12,
+        14,
+        15,
+        26,
+        27,
+        28,
+        30,
+        32,
+        39,
+        41,
+        42,
+        43,
+        45,
+        46,
+        48,
+        50,
+        52,
+        53,
+        54,
+        55,
+        56,
+        58,
+        60,
+        62,
+        63,
+        65,
+        67,
+        68,
+        69,
+        70,
+        71,
+        72,
+        73,
+        74,
+        75,
+        -1
+      ],
+      "oa_C": -0.025639929917520288,
+      "gpcc_C": 0.010069479407914805,
+      "quality": {
+        "chamfer_sq": 2.175524686306854,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+      "trial": "same_pool_single_comparison",
+      "method": "node_only",
+      "winner": 63,
+      "candidate_ids": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        12,
+        14,
+        15,
+        26,
+        27,
+        28,
+        30,
+        32,
+        39,
+        41,
+        42,
+        43,
+        45,
+        46,
+        48,
+        50,
+        52,
+        53,
+        54,
+        55,
+        56,
+        58,
+        60,
+        62,
+        63,
+        65,
+        67,
+        68,
+        69,
+        70,
+        71,
+        72,
+        73,
+        74,
+        75,
+        -1
+      ],
+      "oa_C": -0.008546643305840096,
+      "gpcc_C": 0.0050347397039463004,
+      "quality": {
+        "chamfer_sq": 2.1755162522652096,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+      "trial": "same_pool_single_comparison",
+      "method": "total_context",
+      "winner": 71,
+      "candidate_ids": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        12,
+        14,
+        15,
+        26,
+        27,
+        28,
+        30,
+        32,
+        39,
+        41,
+        42,
+        43,
+        45,
+        46,
+        48,
+        50,
+        52,
+        53,
+        54,
+        55,
+        56,
+        58,
+        60,
+        62,
+        63,
+        65,
+        67,
+        68,
+        69,
+        70,
+        71,
+        72,
+        73,
+        74,
+        75,
+        -1
+      ],
+      "oa_C": -0.055553181487966175,
+      "gpcc_C": 0.0050347397039463004,
+      "quality": {
+        "chamfer_sq": 2.175524686306854,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+      "trial": "same_pool_single_comparison",
+      "method": "actual_oa_oracle",
+      "winner": 71,
+      "candidate_ids": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        12,
+        14,
+        15,
+        26,
+        27,
+        28,
+        30,
+        32,
+        39,
+        41,
+        42,
+        43,
+        45,
+        46,
+        48,
+        50,
+        52,
+        53,
+        54,
+        55,
+        56,
+        58,
+        60,
+        62,
+        63,
+        65,
+        67,
+        68,
+        69,
+        70,
+        71,
+        72,
+        73,
+        74,
+        75,
+        -1
+      ],
+      "oa_C": -0.055553181487966175,
+      "gpcc_C": 0.0050347397039463004,
+      "quality": {
+        "chamfer_sq": 2.175524686306854,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+      "trial": "same_pool_single_comparison",
+      "method": "actual_gpcc_oracle",
+      "winner": 5,
+      "candidate_ids": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        12,
+        14,
+        15,
+        26,
+        27,
+        28,
+        30,
+        32,
+        39,
+        41,
+        42,
+        43,
+        45,
+        46,
+        48,
+        50,
+        52,
+        53,
+        54,
+        55,
+        56,
+        58,
+        60,
+        62,
+        63,
+        65,
+        67,
+        68,
+        69,
+        70,
+        71,
+        72,
+        73,
+        74,
+        75,
+        -1
+      ],
+      "oa_C": -0.004273321652925599,
+      "gpcc_C": -0.010069479407914805,
+      "quality": {
+        "chamfer_sq": 2.1755162522652096,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    }
+  ],
+  "topology_budget": [
+    {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "trial": "topology_budget",
+      "method": "node",
+      "budget": 0.01,
+      "counts": {
+        "Add": 0,
+        "Prune": 2112,
+        "Adjust": 6
+      },
+      "selected_patches": 1491,
+      "source_levels": {
+        "1": 565,
+        "2": 818,
+        "3": 108
+      },
+      "operation_count": 2118,
+      "operation_percent": 0.9995894037859803,
+      "quality": {
+        "chamfer_sq": 2.1692500843102884,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality_ok": true,
+      "oa": {
+        "bits": 186944,
+        "codec_sec": 16.8600564468652,
+        "ce_bits": 187479.78125,
+        "nodes": 71092,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "46007b237a83eab0c85b4f909c314e153f9825a1d2eb25a1d355d1f5aee86fc7",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 13.5221529006958
+          },
+          "3": {
+            "nodes": 8,
+            "ce_bits": 21.59096908569336
+          },
+          "4": {
+            "nodes": 43,
+            "ce_bits": 155.7476348876953
+          },
+          "5": {
+            "nodes": 190,
+            "ce_bits": 591.1883544921875
+          },
+          "6": {
+            "nodes": 809,
+            "ce_bits": 2354.279541015625
+          },
+          "7": {
+            "nodes": 3292,
+            "ce_bits": 8365.658203125
+          },
+          "8": {
+            "nodes": 12950,
+            "ce_bits": 27342.146484375
+          },
+          "9": {
+            "nodes": 53797,
+            "ce_bits": 148631.359375
+          }
+        }
+      },
+      "gpcc": {
+        "bits": 149888,
+        "stream_sha256": "3249d231280ead8a4a2da17d183dde3702048387184f0b450f633fb77246d125",
+        "codec_sec": 1.2043158346787095,
+        "decoded_exact": true
+      },
+      "oa_C": -0.9200763196947181,
+      "gpcc_C": -0.23429179978701198
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "trial": "topology_budget",
+      "method": "rescue",
+      "budget": 0.01,
+      "counts": {
+        "Add": 0,
+        "Prune": 1624,
+        "Adjust": 495
+      },
+      "selected_patches": 1323,
+      "source_levels": {
+        "1": 792,
+        "2": 448,
+        "3": 83
+      },
+      "operation_count": 2119,
+      "operation_percent": 1.0000613534572673,
+      "quality": {
+        "chamfer_sq": 2.1717407141097715,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality_ok": true,
+      "oa": {
+        "bits": 190472,
+        "codec_sec": 16.324980771169066,
+        "ce_bits": 191141.4375,
+        "nodes": 71835,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "229bedf34e5745269c5d535b9c0e11dfde7c71fadcdc3b36a3896e766815aa1b",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 13.5221529006958
+          },
+          "3": {
+            "nodes": 8,
+            "ce_bits": 21.59096908569336
+          },
+          "4": {
+            "nodes": 43,
+            "ce_bits": 155.7476348876953
+          },
+          "5": {
+            "nodes": 190,
+            "ce_bits": 591.1883544921875
+          },
+          "6": {
+            "nodes": 809,
+            "ce_bits": 2311.478271484375
+          },
+          "7": {
+            "nodes": 3322,
+            "ce_bits": 8227.8916015625
+          },
+          "8": {
+            "nodes": 13351,
+            "ce_bits": 29604.521484375
+          },
+          "9": {
+            "nodes": 54109,
+            "ce_bits": 150211.21875
+          }
+        }
+      },
+      "gpcc": {
+        "bits": 152856,
+        "stream_sha256": "3928f83b75110bb00238021fde5a699b1db3f1227027ef9dae55ba5070210e29",
+        "codec_sec": 1.1987085482105613,
+        "decoded_exact": true
+      },
+      "oa_C": 0.9497562009751936,
+      "gpcc_C": 1.7412140575079782
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "trial": "topology_budget",
+      "method": "node",
+      "budget": 0.03,
+      "counts": {
+        "Add": 0,
+        "Prune": 4777,
+        "Adjust": 456
+      },
+      "selected_patches": 2584,
+      "source_levels": {
+        "1": 1447,
+        "2": 1027,
+        "3": 110
+      },
+      "operation_count": 5233,
+      "operation_percent": 2.4697126298451533,
+      "quality": {
+        "chamfer_sq": 2.1596707066249703,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality_ok": true,
+      "oa": {
+        "bits": 190152,
+        "codec_sec": 16.01123394537717,
+        "ce_bits": 190734.8125,
+        "nodes": 69541,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "16d8c260afc70d5988eaee5c0c744a7953ca6cb375721a4f8e595e565dc8f5e6",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 13.5221529006958
+          },
+          "3": {
+            "nodes": 8,
+            "ce_bits": 21.59096908569336
+          },
+          "4": {
+            "nodes": 43,
+            "ce_bits": 155.7476348876953
+          },
+          "5": {
+            "nodes": 190,
+            "ce_bits": 591.1883544921875
+          },
+          "6": {
+            "nodes": 809,
+            "ce_bits": 2359.741943359375
+          },
+          "7": {
+            "nodes": 3277,
+            "ce_bits": 8712.958984375
+          },
+          "8": {
+            "nodes": 12734,
+            "ce_bits": 32020.23828125
+          },
+          "9": {
+            "nodes": 52477,
+            "ce_bits": 146855.546875
+          }
+        }
+      },
+      "gpcc": {
+        "bits": 155176,
+        "stream_sha256": "84979c7ebcd6e6308e8e1be2efd1a4143af3a9b5c9c4de141c2a0fc34c97f2eb",
+        "codec_sec": 1.143826323095709,
+        "decoded_exact": true
+      },
+      "oa_C": 0.7801568793724734,
+      "gpcc_C": 3.2854100106496364
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "trial": "topology_budget",
+      "method": "rescue",
+      "budget": 0.03,
+      "counts": {
+        "Add": 0,
+        "Prune": 4775,
+        "Adjust": 495
+      },
+      "selected_patches": 2585,
+      "source_levels": {
+        "1": 1461,
+        "2": 1014,
+        "3": 110
+      },
+      "operation_count": 5270,
+      "operation_percent": 2.4871747676827742,
+      "quality": {
+        "chamfer_sq": 2.159712625063292,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality_ok": true,
+      "oa": {
+        "bits": 190400,
+        "codec_sec": 16.89571135211736,
+        "ce_bits": 191005.328125,
+        "nodes": 69559,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "b8061ec8269ad3c9103625df6d128d2feb36340eaaa839130495285964900bb5",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 13.5221529006958
+          },
+          "3": {
+            "nodes": 8,
+            "ce_bits": 21.59096908569336
+          },
+          "4": {
+            "nodes": 43,
+            "ce_bits": 155.7476348876953
+          },
+          "5": {
+            "nodes": 190,
+            "ce_bits": 591.1883544921875
+          },
+          "6": {
+            "nodes": 809,
+            "ce_bits": 2359.741943359375
+          },
+          "7": {
+            "nodes": 3277,
+            "ce_bits": 8723.150390625
+          },
+          "8": {
+            "nodes": 12748,
+            "ce_bits": 32271.07421875
+          },
+          "9": {
+            "nodes": 52481,
+            "ce_bits": 146865.03125
+          }
+        }
+      },
+      "gpcc": {
+        "bits": 155448,
+        "stream_sha256": "788d7120b95f57bab0c44b9dbb893f3241751aee4a0605dbfc8806710e1737b0",
+        "codec_sec": 1.277071894146502,
+        "decoded_exact": true
+      },
+      "oa_C": 0.9115963536145966,
+      "gpcc_C": 3.4664536741213947
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "trial": "topology_budget",
+      "method": "node",
+      "budget": 0.05,
+      "counts": {
+        "Add": 0,
+        "Prune": 4777,
+        "Adjust": 456
+      },
+      "selected_patches": 2584,
+      "source_levels": {
+        "1": 1447,
+        "2": 1027,
+        "3": 110
+      },
+      "operation_count": 5233,
+      "operation_percent": 2.4697126298451533,
+      "quality": {
+        "chamfer_sq": 2.1596707066249703,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality_ok": true,
+      "oa": {
+        "bits": 190152,
+        "codec_sec": 19.04409007402137,
+        "ce_bits": 190734.8125,
+        "nodes": 69541,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "16d8c260afc70d5988eaee5c0c744a7953ca6cb375721a4f8e595e565dc8f5e6",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 13.5221529006958
+          },
+          "3": {
+            "nodes": 8,
+            "ce_bits": 21.59096908569336
+          },
+          "4": {
+            "nodes": 43,
+            "ce_bits": 155.7476348876953
+          },
+          "5": {
+            "nodes": 190,
+            "ce_bits": 591.1883544921875
+          },
+          "6": {
+            "nodes": 809,
+            "ce_bits": 2359.741943359375
+          },
+          "7": {
+            "nodes": 3277,
+            "ce_bits": 8712.958984375
+          },
+          "8": {
+            "nodes": 12734,
+            "ce_bits": 32020.23828125
+          },
+          "9": {
+            "nodes": 52477,
+            "ce_bits": 146855.546875
+          }
+        }
+      },
+      "gpcc": {
+        "bits": 155176,
+        "stream_sha256": "84979c7ebcd6e6308e8e1be2efd1a4143af3a9b5c9c4de141c2a0fc34c97f2eb",
+        "codec_sec": 1.1640694700181484,
+        "decoded_exact": true
+      },
+      "oa_C": 0.7801568793724734,
+      "gpcc_C": 3.2854100106496364
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "trial": "topology_budget",
+      "method": "rescue",
+      "budget": 0.05,
+      "counts": {
+        "Add": 0,
+        "Prune": 4775,
+        "Adjust": 495
+      },
+      "selected_patches": 2585,
+      "source_levels": {
+        "1": 1461,
+        "2": 1014,
+        "3": 110
+      },
+      "operation_count": 5270,
+      "operation_percent": 2.4871747676827742,
+      "quality": {
+        "chamfer_sq": 2.159712625063292,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality_ok": true,
+      "oa": {
+        "bits": 190400,
+        "codec_sec": 18.27435109205544,
+        "ce_bits": 191005.328125,
+        "nodes": 69559,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "b8061ec8269ad3c9103625df6d128d2feb36340eaaa839130495285964900bb5",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 13.5221529006958
+          },
+          "3": {
+            "nodes": 8,
+            "ce_bits": 21.59096908569336
+          },
+          "4": {
+            "nodes": 43,
+            "ce_bits": 155.7476348876953
+          },
+          "5": {
+            "nodes": 190,
+            "ce_bits": 591.1883544921875
+          },
+          "6": {
+            "nodes": 809,
+            "ce_bits": 2359.741943359375
+          },
+          "7": {
+            "nodes": 3277,
+            "ce_bits": 8723.150390625
+          },
+          "8": {
+            "nodes": 12748,
+            "ce_bits": 32271.07421875
+          },
+          "9": {
+            "nodes": 52481,
+            "ce_bits": 146865.03125
+          }
+        }
+      },
+      "gpcc": {
+        "bits": 155448,
+        "stream_sha256": "788d7120b95f57bab0c44b9dbb893f3241751aee4a0605dbfc8806710e1737b0",
+        "codec_sec": 1.1825345777906477,
+        "decoded_exact": true
+      },
+      "oa_C": 0.9115963536145966,
+      "gpcc_C": 3.4664536741213947
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+      "trial": "topology_budget",
+      "method": "node",
+      "budget": 0.01,
+      "counts": {
+        "Add": 0,
+        "Prune": 1975,
+        "Adjust": 10
+      },
+      "selected_patches": 1421,
+      "source_levels": {
+        "1": 566,
+        "2": 748,
+        "3": 107
+      },
+      "operation_count": 1985,
+      "operation_percent": 0.9998488893366242,
+      "quality": {
+        "chamfer_sq": 2.166454888580275,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality_ok": true,
+      "oa": {
+        "bits": 184992,
+        "codec_sec": 17.77145233983174,
+        "ce_bits": 185669.203125,
+        "nodes": 66451,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "0fdff96041bacbf8da84795f4ed1089df9afa624c958b765cec100182f0b3055",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 9.153928756713867
+          },
+          "3": {
+            "nodes": 7,
+            "ce_bits": 16.083290100097656
+          },
+          "4": {
+            "nodes": 41,
+            "ce_bits": 155.13119506835938
+          },
+          "5": {
+            "nodes": 173,
+            "ce_bits": 528.6829833984375
+          },
+          "6": {
+            "nodes": 729,
+            "ce_bits": 2386.78515625
+          },
+          "7": {
+            "nodes": 3093,
+            "ce_bits": 8440.2578125
+          },
+          "8": {
+            "nodes": 12111,
+            "ce_bits": 27877.52734375
+          },
+          "9": {
+            "nodes": 50294,
+            "ce_bits": 146251.296875
+          }
+        }
+      },
+      "gpcc": {
+        "bits": 158640,
+        "stream_sha256": "342c4f78c713d35f1f2a00a002457f02daedc88346009bf57f7742777bbf765b",
+        "codec_sec": 1.1998385502956808,
+        "decoded_exact": true
+      },
+      "oa_C": -1.1837100978590698,
+      "gpcc_C": -0.16111167052663689
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+      "trial": "topology_budget",
+      "method": "rescue",
+      "budget": 0.01,
+      "counts": {
+        "Add": 0,
+        "Prune": 1567,
+        "Adjust": 418
+      },
+      "selected_patches": 1276,
+      "source_levels": {
+        "1": 802,
+        "2": 395,
+        "3": 79
+      },
+      "operation_count": 1985,
+      "operation_percent": 0.9998488893366242,
+      "quality": {
+        "chamfer_sq": 2.1687677142384176,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality_ok": true,
+      "oa": {
+        "bits": 188344,
+        "codec_sec": 16.698658359237015,
+        "ce_bits": 189083.53125,
+        "nodes": 67098,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "59b1a6e40e382eddca65801b6a1340812ea794f1e123a127e9c53c60a2d1c510",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 9.153928756713867
+          },
+          "3": {
+            "nodes": 7,
+            "ce_bits": 16.083290100097656
+          },
+          "4": {
+            "nodes": 41,
+            "ce_bits": 155.13119506835938
+          },
+          "5": {
+            "nodes": 173,
+            "ce_bits": 532.9324340820312
+          },
+          "6": {
+            "nodes": 729,
+            "ce_bits": 2356.922607421875
+          },
+          "7": {
+            "nodes": 3124,
+            "ce_bits": 8247.810546875
+          },
+          "8": {
+            "nodes": 12487,
+            "ce_bits": 30038.890625
+          },
+          "9": {
+            "nodes": 50534,
+            "ce_bits": 147722.328125
+          }
+        }
+      },
+      "gpcc": {
+        "bits": 161248,
+        "stream_sha256": "2fb419937c09fa371bbd97b629ab81598ee908e5e3446b5e0e7ceb1dd3f6ef3e",
+        "codec_sec": 1.1418182658962905,
+        "decoded_exact": true
+      },
+      "oa_C": 0.6068116747147467,
+      "gpcc_C": 1.4802134729634542
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+      "trial": "topology_budget",
+      "method": "node",
+      "budget": 0.03,
+      "counts": {
+        "Add": 0,
+        "Prune": 4419,
+        "Adjust": 369
+      },
+      "selected_patches": 2434,
+      "source_levels": {
+        "1": 1387,
+        "2": 939,
+        "3": 108
+      },
+      "operation_count": 4788,
+      "operation_percent": 2.411726187477963,
+      "quality": {
+        "chamfer_sq": 2.157079284711413,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality_ok": true,
+      "oa": {
+        "bits": 187720,
+        "codec_sec": 16.39769914513454,
+        "ce_bits": 188437.3125,
+        "nodes": 65030,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "699e7a86eb54c508456c1184c3ed74135ef7cdb54973e94f1b2ea0006955792a",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 9.153928756713867
+          },
+          "3": {
+            "nodes": 7,
+            "ce_bits": 16.083290100097656
+          },
+          "4": {
+            "nodes": 41,
+            "ce_bits": 155.13119506835938
+          },
+          "5": {
+            "nodes": 173,
+            "ce_bits": 528.6829833984375
+          },
+          "6": {
+            "nodes": 729,
+            "ce_bits": 2388.12255859375
+          },
+          "7": {
+            "nodes": 3082,
+            "ce_bits": 8751.884765625
+          },
+          "8": {
+            "nodes": 11913,
+            "ce_bits": 32001.73046875
+          },
+          "9": {
+            "nodes": 49082,
+            "ce_bits": 144582.25
+          }
+        }
+      },
+      "gpcc": {
+        "bits": 162912,
+        "stream_sha256": "6bd61d57c948adf136654a92a2d8c107fff200ff01a22d913032d035eff3d91e",
+        "codec_sec": 1.135238863993436,
+        "decoded_exact": true
+      },
+      "oa_C": 0.2734925857869275,
+      "gpcc_C": 2.5274393313865717
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+      "trial": "topology_budget",
+      "method": "rescue",
+      "budget": 0.03,
+      "counts": {
+        "Add": 0,
+        "Prune": 4404,
+        "Adjust": 418
+      },
+      "selected_patches": 2433,
+      "source_levels": {
+        "1": 1403,
+        "2": 925,
+        "3": 105
+      },
+      "operation_count": 4822,
+      "operation_percent": 2.428852062660555,
+      "quality": {
+        "chamfer_sq": 2.15717798620791,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality_ok": true,
+      "oa": {
+        "bits": 188104,
+        "codec_sec": 16.9102613911964,
+        "ce_bits": 188832.859375,
+        "nodes": 65053,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "408dabecba5ce26aba0ce718f022687fdfe993c0f4a24f4de0a676e542354f54",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 9.153928756713867
+          },
+          "3": {
+            "nodes": 7,
+            "ce_bits": 16.083290100097656
+          },
+          "4": {
+            "nodes": 41,
+            "ce_bits": 155.13119506835938
+          },
+          "5": {
+            "nodes": 173,
+            "ce_bits": 530.308349609375
+          },
+          "6": {
+            "nodes": 728,
+            "ce_bits": 2404.156494140625
+          },
+          "7": {
+            "nodes": 3083,
+            "ce_bits": 8738.265625
+          },
+          "8": {
+            "nodes": 11928,
+            "ce_bits": 32259.859375
+          },
+          "9": {
+            "nodes": 49090,
+            "ce_bits": 144715.609375
+          }
+        }
+      },
+      "gpcc": {
+        "bits": 163080,
+        "stream_sha256": "bb8688e7468c9a1a280661f2662d7cab27b9944895cb400e8b3cb38736def6b5",
+        "codec_sec": 1.1918373270891607,
+        "decoded_exact": true
+      },
+      "oa_C": 0.4786120251271342,
+      "gpcc_C": 2.633168865169666
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+      "trial": "topology_budget",
+      "method": "node",
+      "budget": 0.05,
+      "counts": {
+        "Add": 0,
+        "Prune": 4419,
+        "Adjust": 369
+      },
+      "selected_patches": 2434,
+      "source_levels": {
+        "1": 1387,
+        "2": 939,
+        "3": 108
+      },
+      "operation_count": 4788,
+      "operation_percent": 2.411726187477963,
+      "quality": {
+        "chamfer_sq": 2.157079284711413,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality_ok": true,
+      "oa": {
+        "bits": 187720,
+        "codec_sec": 17.16055121505633,
+        "ce_bits": 188437.3125,
+        "nodes": 65030,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "699e7a86eb54c508456c1184c3ed74135ef7cdb54973e94f1b2ea0006955792a",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 9.153928756713867
+          },
+          "3": {
+            "nodes": 7,
+            "ce_bits": 16.083290100097656
+          },
+          "4": {
+            "nodes": 41,
+            "ce_bits": 155.13119506835938
+          },
+          "5": {
+            "nodes": 173,
+            "ce_bits": 528.6829833984375
+          },
+          "6": {
+            "nodes": 729,
+            "ce_bits": 2388.12255859375
+          },
+          "7": {
+            "nodes": 3082,
+            "ce_bits": 8751.884765625
+          },
+          "8": {
+            "nodes": 11913,
+            "ce_bits": 32001.73046875
+          },
+          "9": {
+            "nodes": 49082,
+            "ce_bits": 144582.25
+          }
+        }
+      },
+      "gpcc": {
+        "bits": 162912,
+        "stream_sha256": "6bd61d57c948adf136654a92a2d8c107fff200ff01a22d913032d035eff3d91e",
+        "codec_sec": 1.138889281079173,
+        "decoded_exact": true
+      },
+      "oa_C": 0.2734925857869275,
+      "gpcc_C": 2.5274393313865717
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+      "trial": "topology_budget",
+      "method": "rescue",
+      "budget": 0.05,
+      "counts": {
+        "Add": 0,
+        "Prune": 4404,
+        "Adjust": 418
+      },
+      "selected_patches": 2433,
+      "source_levels": {
+        "1": 1403,
+        "2": 925,
+        "3": 105
+      },
+      "operation_count": 4822,
+      "operation_percent": 2.428852062660555,
+      "quality": {
+        "chamfer_sq": 2.15717798620791,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality_ok": true,
+      "oa": {
+        "bits": 188104,
+        "codec_sec": 17.161493779625744,
+        "ce_bits": 188832.859375,
+        "nodes": 65053,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "408dabecba5ce26aba0ce718f022687fdfe993c0f4a24f4de0a676e542354f54",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 9.153928756713867
+          },
+          "3": {
+            "nodes": 7,
+            "ce_bits": 16.083290100097656
+          },
+          "4": {
+            "nodes": 41,
+            "ce_bits": 155.13119506835938
+          },
+          "5": {
+            "nodes": 173,
+            "ce_bits": 530.308349609375
+          },
+          "6": {
+            "nodes": 728,
+            "ce_bits": 2404.156494140625
+          },
+          "7": {
+            "nodes": 3083,
+            "ce_bits": 8738.265625
+          },
+          "8": {
+            "nodes": 11928,
+            "ce_bits": 32259.859375
+          },
+          "9": {
+            "nodes": 49090,
+            "ce_bits": 144715.609375
+          }
+        }
+      },
+      "gpcc": {
+        "bits": 163080,
+        "stream_sha256": "bb8688e7468c9a1a280661f2662d7cab27b9944895cb400e8b3cb38736def6b5",
+        "codec_sec": 1.1025344911031425,
+        "decoded_exact": true
+      },
+      "oa_C": 0.4786120251271342,
+      "gpcc_C": 2.633168865169666
+    }
+  ],
+  "patch_audits": [
+    {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "trial": "patch_pool",
+      "leaf": {
+        "sampled_parents": 6000,
+        "total_parents": 55435,
+        "candidates": 1513,
+        "generation_sec": 3.7549913614057004,
+        "candidates_requiring_add_rescue": 311
+      },
+      "higher_level": [
+        {
+          "source_level": 2,
+          "eligible_source_groups": 7272,
+          "quality_safe_candidates": 1347
+        },
+        {
+          "source_level": 3,
+          "eligible_source_groups": 587,
+          "quality_safe_candidates": 145
+        }
+      ],
+      "total_patches": 3005
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+      "trial": "patch_pool",
+      "leaf": {
+        "sampled_parents": 6000,
+        "total_parents": 51812,
+        "candidates": 1456,
+        "generation_sec": 3.7462692107073963,
+        "candidates_requiring_add_rescue": 268
+      },
+      "higher_level": [
+        {
+          "source_level": 2,
+          "eligible_source_groups": 6802,
+          "quality_safe_candidates": 1228
+        },
+        {
+          "source_level": 3,
+          "eligible_source_groups": 608,
+          "quality_safe_candidates": 153
+        }
+      ],
+      "total_patches": 2837
+    }
+  ],
+  "voxelization": [
+    {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "trial": "proposal_audit",
+      "source_level": 2,
+      "tie_rule": "floor",
+      "total_groups": 13991,
+      "legal_patches": 6659,
+      "parent_creation_allowed": true,
+      "total_patch_operation_capacity": 31132
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "trial": "local_voxelization",
+      "budget": 0.01,
+      "source_level": 2,
+      "tie_rule": "floor",
+      "counts": {
+        "Add": 23,
+        "Prune": 1720,
+        "Adjust": 374
+      },
+      "operation_count": 2117,
+      "conservative_patch_cost": 2119,
+      "selected_patches": 1111,
+      "removed_cells": 2094,
+      "added_cells": 397,
+      "quality": {
+        "chamfer_sq": 2.169994650963239,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality_ok": true,
+      "created_leaf_parents": 26,
+      "deleted_leaf_parents": 1343,
+      "operation_percent": 0.9991174541146932,
+      "oa": {
+        "bits": 185504,
+        "codec_sec": 18.111053930595517,
+        "ce_bits": 186013.28125,
+        "nodes": 71676,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "56cd155b6d353a55258542bbbeddbb9229257a20dfba6df3cb33e3e4b2eb472d",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 13.5221529006958
+          },
+          "3": {
+            "nodes": 8,
+            "ce_bits": 21.59096908569336
+          },
+          "4": {
+            "nodes": 43,
+            "ce_bits": 155.7476348876953
+          },
+          "5": {
+            "nodes": 190,
+            "ce_bits": 590.3912353515625
+          },
+          "6": {
+            "nodes": 814,
+            "ce_bits": 2301.782470703125
+          },
+          "7": {
+            "nodes": 3316,
+            "ce_bits": 8243.16015625
+          },
+          "8": {
+            "nodes": 13184,
+            "ce_bits": 26970.78125
+          },
+          "9": {
+            "nodes": 54118,
+            "ce_bits": 147712.046875
+          }
+        }
+      },
+      "gpcc": {
+        "bits": 149712,
+        "stream_sha256": "6a703cf09b36177762e2cd8565b2d8fe6f33e08f1f07ea1e174365ac20acc8d6",
+        "codec_sec": 1.1660755998454988,
+        "decoded_exact": true
+      },
+      "oa_C": -1.6832732669069372,
+      "gpcc_C": -0.3514376996805124
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "trial": "local_voxelization",
+      "budget": 0.03,
+      "source_level": 2,
+      "tie_rule": "floor",
+      "counts": {
+        "Add": 305,
+        "Prune": 3953,
+        "Adjust": 2053
+      },
+      "operation_count": 6311,
+      "conservative_patch_cost": 6357,
+      "selected_patches": 2147,
+      "removed_cells": 6006,
+      "added_cells": 2358,
+      "quality": {
+        "chamfer_sq": 2.1587241147132854,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality_ok": true,
+      "created_leaf_parents": 205,
+      "deleted_leaf_parents": 2584,
+      "operation_percent": 2.9784743754925973,
+      "oa": {
+        "bits": 182824,
+        "codec_sec": 17.063210763037205,
+        "ce_bits": 183298.109375,
+        "nodes": 70454,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "d8e4ad59eb9d42b4b94e5baa98b7a5f6ff0a99f7d36ebd18edff76a2d7ad4da6",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 13.5221529006958
+          },
+          "3": {
+            "nodes": 8,
+            "ce_bits": 21.59096908569336
+          },
+          "4": {
+            "nodes": 43,
+            "ce_bits": 155.7476348876953
+          },
+          "5": {
+            "nodes": 190,
+            "ce_bits": 590.3912353515625
+          },
+          "6": {
+            "nodes": 814,
+            "ce_bits": 2329.89111328125
+          },
+          "7": {
+            "nodes": 3303,
+            "ce_bits": 8323.1748046875
+          },
+          "8": {
+            "nodes": 13037,
+            "ce_bits": 27726.97265625
+          },
+          "9": {
+            "nodes": 53056,
+            "ce_bits": 144132.546875
+          }
+        }
+      },
+      "gpcc": {
+        "bits": 152032,
+        "stream_sha256": "4ca119333a13c972c18fc65110ab8ce60a69b31a1a3fa7a8fd0f01991cb9369f",
+        "codec_sec": 1.1153036588802934,
+        "decoded_exact": true
+      },
+      "oa_C": -3.1036675853296614,
+      "gpcc_C": 1.1927582534611236
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "trial": "local_voxelization",
+      "budget": 0.05,
+      "source_level": 2,
+      "tie_rule": "floor",
+      "counts": {
+        "Add": 498,
+        "Prune": 4660,
+        "Adjust": 2912
+      },
+      "operation_count": 8070,
+      "conservative_patch_cost": 8157,
+      "selected_patches": 2493,
+      "removed_cells": 7572,
+      "added_cells": 3410,
+      "quality": {
+        "chamfer_sq": 2.1552016107833207,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality_ok": true,
+      "created_leaf_parents": 329,
+      "deleted_leaf_parents": 2966,
+      "operation_percent": 3.8086338472865253,
+      "oa": {
+        "bits": 181848,
+        "codec_sec": 17.105213119182736,
+        "ce_bits": 182332.09375,
+        "nodes": 70182,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "23e219c4bfd97832d338108724de2920bb0c1e0691752cb748ae5e7cfcad6760",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 13.5221529006958
+          },
+          "3": {
+            "nodes": 8,
+            "ce_bits": 21.59096908569336
+          },
+          "4": {
+            "nodes": 43,
+            "ce_bits": 155.7476348876953
+          },
+          "5": {
+            "nodes": 190,
+            "ce_bits": 590.3912353515625
+          },
+          "6": {
+            "nodes": 814,
+            "ce_bits": 2327.659912109375
+          },
+          "7": {
+            "nodes": 3303,
+            "ce_bits": 8348.765625
+          },
+          "8": {
+            "nodes": 13023,
+            "ce_bits": 28107.5078125
+          },
+          "9": {
+            "nodes": 52798,
+            "ce_bits": 142762.640625
+          }
+        }
+      },
+      "gpcc": {
+        "bits": 153344,
+        "stream_sha256": "564532c3e18648a95aeed1b512c503d0a6f48a20cd24ed01cd9d5486bf0f3ccb",
+        "codec_sec": 1.1864118361845613,
+        "decoded_exact": true
+      },
+      "oa_C": -3.6209455162179327,
+      "gpcc_C": 2.0660276890308804
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "trial": "proposal_audit",
+      "source_level": 2,
+      "tie_rule": "halfup",
+      "total_groups": 13991,
+      "legal_patches": 6890,
+      "parent_creation_allowed": true,
+      "total_patch_operation_capacity": 31608
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "trial": "local_voxelization",
+      "budget": 0.01,
+      "source_level": 2,
+      "tie_rule": "halfup",
+      "counts": {
+        "Add": 78,
+        "Prune": 1741,
+        "Adjust": 298
+      },
+      "operation_count": 2117,
+      "conservative_patch_cost": 2119,
+      "selected_patches": 964,
+      "removed_cells": 2039,
+      "added_cells": 376,
+      "quality": {
+        "chamfer_sq": 2.169648542921595,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality_ok": true,
+      "created_leaf_parents": 9,
+      "deleted_leaf_parents": 1212,
+      "operation_percent": 0.9991174541146932,
+      "oa": {
+        "bits": 186952,
+        "codec_sec": 19.87868515495211,
+        "ce_bits": 187495.359375,
+        "nodes": 71996,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "4844bc71b8f67ac82427f1f3bbe4b15ab171f2af19e484aa461653da92fbcb0e",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 13.5221529006958
+          },
+          "3": {
+            "nodes": 8,
+            "ce_bits": 21.59096908569336
+          },
+          "4": {
+            "nodes": 43,
+            "ce_bits": 159.05824279785156
+          },
+          "5": {
+            "nodes": 191,
+            "ce_bits": 579.0955200195312
+          },
+          "6": {
+            "nodes": 813,
+            "ce_bits": 2268.226806640625
+          },
+          "7": {
+            "nodes": 3331,
+            "ce_bits": 8194.626953125
+          },
+          "8": {
+            "nodes": 13375,
+            "ce_bits": 27563.162109375
+          },
+          "9": {
+            "nodes": 54232,
+            "ce_bits": 148691.796875
+          }
+        }
+      },
+      "gpcc": {
+        "bits": 150008,
+        "stream_sha256": "1815d85c6ff8c5a41e9528d9cad85df04d11168f214947803038fa7ff4802a45",
+        "codec_sec": 1.172811487223953,
+        "decoded_exact": true
+      },
+      "oa_C": -0.9158363366546518,
+      "gpcc_C": -0.15441959531415916
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "trial": "local_voxelization",
+      "budget": 0.03,
+      "source_level": 2,
+      "tie_rule": "halfup",
+      "counts": {
+        "Add": 353,
+        "Prune": 3959,
+        "Adjust": 2000
+      },
+      "operation_count": 6312,
+      "conservative_patch_cost": 6357,
+      "selected_patches": 1893,
+      "removed_cells": 5959,
+      "added_cells": 2353,
+      "quality": {
+        "chamfer_sq": 2.158989898920256,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality_ok": true,
+      "created_leaf_parents": 109,
+      "deleted_leaf_parents": 2241,
+      "operation_percent": 2.9789463251638844,
+      "oa": {
+        "bits": 184200,
+        "codec_sec": 18.347014915198088,
+        "ce_bits": 184714.21875,
+        "nodes": 70981,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "196257c7ed09b80da5f599b12e27156dc8e3f0f7778365c196d72b63a6de8aee",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 13.5221529006958
+          },
+          "3": {
+            "nodes": 8,
+            "ce_bits": 21.59096908569336
+          },
+          "4": {
+            "nodes": 43,
+            "ce_bits": 159.05824279785156
+          },
+          "5": {
+            "nodes": 191,
+            "ce_bits": 593.4713134765625
+          },
+          "6": {
+            "nodes": 812,
+            "ce_bits": 2282.1923828125
+          },
+          "7": {
+            "nodes": 3325,
+            "ce_bits": 8339.9521484375
+          },
+          "8": {
+            "nodes": 13296,
+            "ce_bits": 28265.99609375
+          },
+          "9": {
+            "nodes": 53303,
+            "ce_bits": 145034.1875
+          }
+        }
+      },
+      "gpcc": {
+        "bits": 152320,
+        "stream_sha256": "20383ce5b0b814598fddc52c0cf69f1084f6ce97dffcd968071ccf1fe7e14803",
+        "codec_sec": 1.3102062186226249,
+        "decoded_exact": true
+      },
+      "oa_C": -2.374390502437995,
+      "gpcc_C": 1.3844515441959526
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "trial": "local_voxelization",
+      "budget": 0.05,
+      "source_level": 2,
+      "tie_rule": "halfup",
+      "counts": {
+        "Add": 513,
+        "Prune": 5410,
+        "Adjust": 3488
+      },
+      "operation_count": 9411,
+      "conservative_patch_cost": 9523,
+      "selected_patches": 2531,
+      "removed_cells": 8898,
+      "added_cells": 4001,
+      "quality": {
+        "chamfer_sq": 2.151733566203394,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality_ok": true,
+      "created_leaf_parents": 197,
+      "deleted_leaf_parents": 2658,
+      "operation_percent": 4.441518356482464,
+      "oa": {
+        "bits": 182608,
+        "codec_sec": 16.36797668086365,
+        "ce_bits": 183146.75,
+        "nodes": 70644,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "c0bec970e3af2c0e090df7c6d2324266486c5e62c76c6e193c4b23af5fb6b23a",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 13.5221529006958
+          },
+          "3": {
+            "nodes": 8,
+            "ce_bits": 21.59096908569336
+          },
+          "4": {
+            "nodes": 43,
+            "ce_bits": 159.05824279785156
+          },
+          "5": {
+            "nodes": 191,
+            "ce_bits": 593.4713134765625
+          },
+          "6": {
+            "nodes": 812,
+            "ce_bits": 2278.39013671875
+          },
+          "7": {
+            "nodes": 3326,
+            "ce_bits": 8341.619140625
+          },
+          "8": {
+            "nodes": 13287,
+            "ce_bits": 28482.27734375
+          },
+          "9": {
+            "nodes": 52974,
+            "ce_bits": 143252.53125
+          }
+        }
+      },
+      "gpcc": {
+        "bits": 154080,
+        "stream_sha256": "a58f41268551669171a07bb22964eb9886046f0b16a4680f79979677dbc9b1a1",
+        "codec_sec": 1.1162583916448057,
+        "decoded_exact": true
+      },
+      "oa_C": -3.218147127411486,
+      "gpcc_C": 2.5559105431310014
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "trial": "proposal_audit",
+      "source_level": 3,
+      "tie_rule": "floor",
+      "total_groups": 3414,
+      "legal_patches": 1763,
+      "parent_creation_allowed": true,
+      "total_patch_operation_capacity": 27666
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "trial": "local_voxelization",
+      "budget": 0.01,
+      "source_level": 3,
+      "tie_rule": "floor",
+      "counts": {
+        "Add": 148,
+        "Prune": 1075,
+        "Adjust": 892
+      },
+      "operation_count": 2115,
+      "conservative_patch_cost": 2119,
+      "selected_patches": 341,
+      "removed_cells": 1967,
+      "added_cells": 1040,
+      "quality": {
+        "chamfer_sq": 2.1730831418049847,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality_ok": true,
+      "created_leaf_parents": 150,
+      "deleted_leaf_parents": 763,
+      "operation_percent": 0.9981735547721191,
+      "oa": {
+        "bits": 186264,
+        "codec_sec": 17.805046425201,
+        "ce_bits": 186778.96875,
+        "nodes": 72905,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "2a9892d82cebc6174a1dacf76cee113a119a28fd4ebc2feae320a53663f07c05",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 13.5221529006958
+          },
+          "3": {
+            "nodes": 8,
+            "ce_bits": 21.59096908569336
+          },
+          "4": {
+            "nodes": 43,
+            "ce_bits": 155.7476348876953
+          },
+          "5": {
+            "nodes": 190,
+            "ce_bits": 586.4818725585938
+          },
+          "6": {
+            "nodes": 813,
+            "ce_bits": 2314.85986328125
+          },
+          "7": {
+            "nodes": 3301,
+            "ce_bits": 7849.27880859375
+          },
+          "8": {
+            "nodes": 13725,
+            "ce_bits": 27031.552734375
+          },
+          "9": {
+            "nodes": 54822,
+            "ce_bits": 148801.671875
+          }
+        }
+      },
+      "gpcc": {
+        "bits": 152008,
+        "stream_sha256": "b5f302ecaeeeb0488a52d6099af62dc85781990dea943fec703aea2acc941eed",
+        "codec_sec": 1.1599713549949229,
+        "decoded_exact": true
+      },
+      "oa_C": -1.2804748781004904,
+      "gpcc_C": 1.176783812566562
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "trial": "local_voxelization",
+      "budget": 0.03,
+      "source_level": 3,
+      "tie_rule": "floor",
+      "counts": {
+        "Add": 321,
+        "Prune": 1540,
+        "Adjust": 1653
+      },
+      "operation_count": 3514,
+      "conservative_patch_cost": 3540,
+      "selected_patches": 437,
+      "removed_cells": 3193,
+      "added_cells": 1974,
+      "quality": {
+        "chamfer_sq": 2.1708966300319963,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality_ok": true,
+      "created_leaf_parents": 298,
+      "deleted_leaf_parents": 1072,
+      "operation_percent": 1.6584311449027076,
+      "oa": {
+        "bits": 185240,
+        "codec_sec": 18.175302322022617,
+        "ce_bits": 185750.15625,
+        "nodes": 72697,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "7f50d388f63cec0130ac9ffe0f13506baf400bb2ced153cc8e84748b66fd36e2",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 13.5221529006958
+          },
+          "3": {
+            "nodes": 8,
+            "ce_bits": 21.59096908569336
+          },
+          "4": {
+            "nodes": 43,
+            "ce_bits": 155.7476348876953
+          },
+          "5": {
+            "nodes": 190,
+            "ce_bits": 586.4818725585938
+          },
+          "6": {
+            "nodes": 813,
+            "ce_bits": 2330.623046875
+          },
+          "7": {
+            "nodes": 3298,
+            "ce_bits": 7894.4775390625
+          },
+          "8": {
+            "nodes": 13681,
+            "ce_bits": 27097.626953125
+          },
+          "9": {
+            "nodes": 54661,
+            "ce_bits": 147645.828125
+          }
+        }
+      },
+      "gpcc": {
+        "bits": 152808,
+        "stream_sha256": "d2341f60954665e31edb7bddfe528f868aa11cf263918cecc1eaeecded99acc4",
+        "codec_sec": 1.239420817233622,
+        "decoded_exact": true
+      },
+      "oa_C": -1.823192707229171,
+      "gpcc_C": 1.7092651757188548
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "trial": "local_voxelization",
+      "budget": 0.05,
+      "source_level": 3,
+      "tie_rule": "floor",
+      "counts": {
+        "Add": 321,
+        "Prune": 1540,
+        "Adjust": 1653
+      },
+      "operation_count": 3514,
+      "conservative_patch_cost": 3540,
+      "selected_patches": 437,
+      "removed_cells": 3193,
+      "added_cells": 1974,
+      "quality": {
+        "chamfer_sq": 2.1708966300319963,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality_ok": true,
+      "created_leaf_parents": 298,
+      "deleted_leaf_parents": 1072,
+      "operation_percent": 1.6584311449027076,
+      "oa": {
+        "bits": 185240,
+        "codec_sec": 20.87692887801677,
+        "ce_bits": 185750.15625,
+        "nodes": 72697,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "7f50d388f63cec0130ac9ffe0f13506baf400bb2ced153cc8e84748b66fd36e2",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 13.5221529006958
+          },
+          "3": {
+            "nodes": 8,
+            "ce_bits": 21.59096908569336
+          },
+          "4": {
+            "nodes": 43,
+            "ce_bits": 155.7476348876953
+          },
+          "5": {
+            "nodes": 190,
+            "ce_bits": 586.4818725585938
+          },
+          "6": {
+            "nodes": 813,
+            "ce_bits": 2330.623046875
+          },
+          "7": {
+            "nodes": 3298,
+            "ce_bits": 7894.4775390625
+          },
+          "8": {
+            "nodes": 13681,
+            "ce_bits": 27097.626953125
+          },
+          "9": {
+            "nodes": 54661,
+            "ce_bits": 147645.828125
+          }
+        }
+      },
+      "gpcc": {
+        "bits": 152808,
+        "stream_sha256": "d2341f60954665e31edb7bddfe528f868aa11cf263918cecc1eaeecded99acc4",
+        "codec_sec": 1.2673423034138978,
+        "decoded_exact": true
+      },
+      "oa_C": -1.823192707229171,
+      "gpcc_C": 1.7092651757188548
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "trial": "proposal_audit",
+      "source_level": 3,
+      "tie_rule": "halfup",
+      "total_groups": 3414,
+      "legal_patches": 1849,
+      "parent_creation_allowed": true,
+      "total_patch_operation_capacity": 28135
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "trial": "local_voxelization",
+      "budget": 0.01,
+      "source_level": 3,
+      "tie_rule": "halfup",
+      "counts": {
+        "Add": 178,
+        "Prune": 1030,
+        "Adjust": 903
+      },
+      "operation_count": 2111,
+      "conservative_patch_cost": 2119,
+      "selected_patches": 333,
+      "removed_cells": 1933,
+      "added_cells": 1081,
+      "quality": {
+        "chamfer_sq": 2.173019465174451,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality_ok": true,
+      "created_leaf_parents": 105,
+      "deleted_leaf_parents": 704,
+      "operation_percent": 0.9962857560869709,
+      "oa": {
+        "bits": 186280,
+        "codec_sec": 19.421879298053682,
+        "ce_bits": 186808.1875,
+        "nodes": 72968,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "3e7ca442d8fdf9a01d0c95457d5d7ea212eea0b7311cb0c27f879274dfbf4d5b",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 13.5221529006958
+          },
+          "3": {
+            "nodes": 8,
+            "ce_bits": 21.59096908569336
+          },
+          "4": {
+            "nodes": 43,
+            "ce_bits": 159.05824279785156
+          },
+          "5": {
+            "nodes": 191,
+            "ce_bits": 587.3947143554688
+          },
+          "6": {
+            "nodes": 811,
+            "ce_bits": 2275.689208984375
+          },
+          "7": {
+            "nodes": 3322,
+            "ce_bits": 7972.109375
+          },
+          "8": {
+            "nodes": 13754,
+            "ce_bits": 27158.806640625
+          },
+          "9": {
+            "nodes": 54836,
+            "ce_bits": 148615.75
+          }
+        }
+      },
+      "gpcc": {
+        "bits": 151416,
+        "stream_sha256": "af3b512b64b441625f2ade3e3dee21cd8b35b17cf00d8965785c4eb81bee61ed",
+        "codec_sec": 1.238576855044812,
+        "decoded_exact": true
+      },
+      "oa_C": -1.2719949120203466,
+      "gpcc_C": 0.7827476038338554
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "trial": "local_voxelization",
+      "budget": 0.03,
+      "source_level": 3,
+      "tie_rule": "halfup",
+      "counts": {
+        "Add": 375,
+        "Prune": 1634,
+        "Adjust": 1962
+      },
+      "operation_count": 3971,
+      "conservative_patch_cost": 4000,
+      "selected_patches": 466,
+      "removed_cells": 3596,
+      "added_cells": 2337,
+      "quality": {
+        "chamfer_sq": 2.169974686154555,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality_ok": true,
+      "created_leaf_parents": 237,
+      "deleted_leaf_parents": 1025,
+      "operation_percent": 1.8741121446808913,
+      "oa": {
+        "bits": 184592,
+        "codec_sec": 18.802939245011657,
+        "ce_bits": 185121.390625,
+        "nodes": 72740,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "25523ffa547d2f2d9865f7919a259d9d6b5c07b9935301485850f26913ffcd6e",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 13.5221529006958
+          },
+          "3": {
+            "nodes": 8,
+            "ce_bits": 21.59096908569336
+          },
+          "4": {
+            "nodes": 43,
+            "ce_bits": 159.05824279785156
+          },
+          "5": {
+            "nodes": 191,
+            "ce_bits": 587.3947143554688
+          },
+          "6": {
+            "nodes": 811,
+            "ce_bits": 2275.689208984375
+          },
+          "7": {
+            "nodes": 3322,
+            "ce_bits": 8052.51953125
+          },
+          "8": {
+            "nodes": 13715,
+            "ce_bits": 27109.1171875
+          },
+          "9": {
+            "nodes": 54647,
+            "ce_bits": 146898.234375
+          }
+        }
+      },
+      "gpcc": {
+        "bits": 152928,
+        "stream_sha256": "c70f3fafc0895a811bfa8ebdf93b9f60515a11cba63457d5ed591c22d18b2fe2",
+        "codec_sec": 1.1497643790207803,
+        "decoded_exact": true
+      },
+      "oa_C": -2.1666313334746667,
+      "gpcc_C": 1.7891373801916854
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "trial": "local_voxelization",
+      "budget": 0.05,
+      "source_level": 3,
+      "tie_rule": "halfup",
+      "counts": {
+        "Add": 375,
+        "Prune": 1634,
+        "Adjust": 1962
+      },
+      "operation_count": 3971,
+      "conservative_patch_cost": 4000,
+      "selected_patches": 466,
+      "removed_cells": 3596,
+      "added_cells": 2337,
+      "quality": {
+        "chamfer_sq": 2.169974686154555,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality_ok": true,
+      "created_leaf_parents": 237,
+      "deleted_leaf_parents": 1025,
+      "operation_percent": 1.8741121446808913,
+      "oa": {
+        "bits": 184592,
+        "codec_sec": 22.19056565919891,
+        "ce_bits": 185121.390625,
+        "nodes": 72740,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "25523ffa547d2f2d9865f7919a259d9d6b5c07b9935301485850f26913ffcd6e",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 13.5221529006958
+          },
+          "3": {
+            "nodes": 8,
+            "ce_bits": 21.59096908569336
+          },
+          "4": {
+            "nodes": 43,
+            "ce_bits": 159.05824279785156
+          },
+          "5": {
+            "nodes": 191,
+            "ce_bits": 587.3947143554688
+          },
+          "6": {
+            "nodes": 811,
+            "ce_bits": 2275.689208984375
+          },
+          "7": {
+            "nodes": 3322,
+            "ce_bits": 8052.51953125
+          },
+          "8": {
+            "nodes": 13715,
+            "ce_bits": 27109.1171875
+          },
+          "9": {
+            "nodes": 54647,
+            "ce_bits": 146898.234375
+          }
+        }
+      },
+      "gpcc": {
+        "bits": 152928,
+        "stream_sha256": "c70f3fafc0895a811bfa8ebdf93b9f60515a11cba63457d5ed591c22d18b2fe2",
+        "codec_sec": 1.196248329244554,
+        "decoded_exact": true
+      },
+      "oa_C": -2.1666313334746667,
+      "gpcc_C": 1.7891373801916854
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+      "trial": "proposal_audit",
+      "source_level": 2,
+      "tie_rule": "floor",
+      "total_groups": 13060,
+      "legal_patches": 5963,
+      "parent_creation_allowed": true,
+      "total_patch_operation_capacity": 27417
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+      "trial": "local_voxelization",
+      "budget": 0.01,
+      "source_level": 2,
+      "tie_rule": "floor",
+      "counts": {
+        "Add": 29,
+        "Prune": 1387,
+        "Adjust": 565
+      },
+      "operation_count": 1981,
+      "conservative_patch_cost": 1985,
+      "selected_patches": 1023,
+      "removed_cells": 1952,
+      "added_cells": 594,
+      "quality": {
+        "chamfer_sq": 2.169652527787198,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality_ok": true,
+      "created_leaf_parents": 35,
+      "deleted_leaf_parents": 1193,
+      "operation_percent": 0.9978340804916134,
+      "oa": {
+        "bits": 183712,
+        "codec_sec": 16.738383487332612,
+        "ce_bits": 184401.765625,
+        "nodes": 66991,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "941962af648fb2b54f5b7afa1cd596f9964c046dac477f1689e602c91a51859e",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 9.153928756713867
+          },
+          "3": {
+            "nodes": 7,
+            "ce_bits": 16.083290100097656
+          },
+          "4": {
+            "nodes": 41,
+            "ce_bits": 155.13119506835938
+          },
+          "5": {
+            "nodes": 173,
+            "ce_bits": 538.129638671875
+          },
+          "6": {
+            "nodes": 728,
+            "ce_bits": 2298.67138671875
+          },
+          "7": {
+            "nodes": 3103,
+            "ce_bits": 8163.5732421875
+          },
+          "8": {
+            "nodes": 12282,
+            "ce_bits": 27483.71875
+          },
+          "9": {
+            "nodes": 50654,
+            "ce_bits": 145733.03125
+          }
+        }
+      },
+      "gpcc": {
+        "bits": 157592,
+        "stream_sha256": "138c9c59de9dda29ef21681c549244557c560555de450d943c4ad91eaaa8c761",
+        "codec_sec": 1.0953604858368635,
+        "decoded_exact": true
+      },
+      "oa_C": -1.8674415623263996,
+      "gpcc_C": -0.8206625717450455
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+      "trial": "local_voxelization",
+      "budget": 0.03,
+      "source_level": 2,
+      "tie_rule": "floor",
+      "counts": {
+        "Add": 249,
+        "Prune": 3357,
+        "Adjust": 2309
+      },
+      "operation_count": 5915,
+      "conservative_patch_cost": 5956,
+      "selected_patches": 1920,
+      "removed_cells": 5666,
+      "added_cells": 2558,
+      "quality": {
+        "chamfer_sq": 2.159678941016035,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality_ok": true,
+      "created_leaf_parents": 217,
+      "deleted_leaf_parents": 2418,
+      "operation_percent": 2.9793985795597644,
+      "oa": {
+        "bits": 179152,
+        "codec_sec": 16.035919236019254,
+        "ce_bits": 179824.6875,
+        "nodes": 65718,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "19c71f0e185de92df27891a9861ce3af164dd38955a4c8c7b55a236310a44419",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 9.153928756713867
+          },
+          "3": {
+            "nodes": 7,
+            "ce_bits": 16.083290100097656
+          },
+          "4": {
+            "nodes": 41,
+            "ce_bits": 155.13119506835938
+          },
+          "5": {
+            "nodes": 173,
+            "ce_bits": 533.0350341796875
+          },
+          "6": {
+            "nodes": 725,
+            "ce_bits": 2324.5888671875
+          },
+          "7": {
+            "nodes": 3083,
+            "ce_bits": 8282.666015625
+          },
+          "8": {
+            "nodes": 12075,
+            "ce_bits": 27870.8203125
+          },
+          "9": {
+            "nodes": 49611,
+            "ce_bits": 140628.921875
+          }
+        }
+      },
+      "gpcc": {
+        "bits": 158280,
+        "stream_sha256": "8aece8716962ce5805cc8307c78ed3547ae49357f7a4c73b29a8d9a4e33f267f",
+        "codec_sec": 1.2174780028872192,
+        "decoded_exact": true
+      },
+      "oa_C": -4.30323490449126,
+      "gpcc_C": -0.3876749572047089
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+      "trial": "local_voxelization",
+      "budget": 0.05,
+      "source_level": 2,
+      "tie_rule": "floor",
+      "counts": {
+        "Add": 345,
+        "Prune": 3878,
+        "Adjust": 3112
+      },
+      "operation_count": 7335,
+      "conservative_patch_cost": 7427,
+      "selected_patches": 2199,
+      "removed_cells": 6990,
+      "added_cells": 3457,
+      "quality": {
+        "chamfer_sq": 2.156380889920425,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality_ok": true,
+      "created_leaf_parents": 335,
+      "deleted_leaf_parents": 2781,
+      "operation_percent": 3.6946557195386087,
+      "oa": {
+        "bits": 178200,
+        "codec_sec": 15.402077018283308,
+        "ce_bits": 178887.90625,
+        "nodes": 65454,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "941f90001e88fe2fa6abdb98268e83fc5ed4436df2abd13601f1328db81d9b3b",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 9.153928756713867
+          },
+          "3": {
+            "nodes": 7,
+            "ce_bits": 16.083290100097656
+          },
+          "4": {
+            "nodes": 41,
+            "ce_bits": 155.13119506835938
+          },
+          "5": {
+            "nodes": 173,
+            "ce_bits": 533.0350341796875
+          },
+          "6": {
+            "nodes": 725,
+            "ce_bits": 2328.82275390625
+          },
+          "7": {
+            "nodes": 3082,
+            "ce_bits": 8276.0068359375
+          },
+          "8": {
+            "nodes": 12057,
+            "ce_bits": 28035.73828125
+          },
+          "9": {
+            "nodes": 49366,
+            "ce_bits": 139529.65625
+          }
+        }
+      },
+      "gpcc": {
+        "bits": 158880,
+        "stream_sha256": "e1f5741ae57915891c299b00e67d08ba960e91715a522d6e2ac1df74d861304d",
+        "codec_sec": 1.0910829179920256,
+        "decoded_exact": true
+      },
+      "oa_C": -4.8117601811888395,
+      "gpcc_C": -0.010069479407914805
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+      "trial": "proposal_audit",
+      "source_level": 2,
+      "tie_rule": "halfup",
+      "total_groups": 13060,
+      "legal_patches": 6183,
+      "parent_creation_allowed": true,
+      "total_patch_operation_capacity": 29391
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+      "trial": "local_voxelization",
+      "budget": 0.01,
+      "source_level": 2,
+      "tie_rule": "halfup",
+      "counts": {
+        "Add": 140,
+        "Prune": 1332,
+        "Adjust": 511
+      },
+      "operation_count": 1983,
+      "conservative_patch_cost": 1985,
+      "selected_patches": 697,
+      "removed_cells": 1843,
+      "added_cells": 651,
+      "quality": {
+        "chamfer_sq": 2.169906015055549,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality_ok": true,
+      "created_leaf_parents": 0,
+      "deleted_leaf_parents": 0,
+      "operation_percent": 0.9988414849141187,
+      "oa": {
+        "bits": 186840,
+        "codec_sec": 15.942978288047016,
+        "ce_bits": 187575.609375,
+        "nodes": 69059,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "396bf33121a6f9b172b23d38c51aae427e41c07f93bea74798ccc2cd887941f8",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 9.153928756713867
+          },
+          "3": {
+            "nodes": 7,
+            "ce_bits": 16.083290100097656
+          },
+          "4": {
+            "nodes": 41,
+            "ce_bits": 155.13119506835938
+          },
+          "5": {
+            "nodes": 173,
+            "ce_bits": 524.0158081054688
+          },
+          "6": {
+            "nodes": 741,
+            "ce_bits": 2203.33154296875
+          },
+          "7": {
+            "nodes": 3222,
+            "ce_bits": 8026.64111328125
+          },
+          "8": {
+            "nodes": 13060,
+            "ce_bits": 28226.34765625
+          },
+          "9": {
+            "nodes": 51812,
+            "ce_bits": 148410.65625
+          }
+        }
+      },
+      "gpcc": {
+        "bits": 160456,
+        "stream_sha256": "5c91f18016d8d81b9f17f3a4ee5e22bbaa368bdcb9eb368a803f265bdfda0fc3",
+        "codec_sec": 1.122819108888507,
+        "decoded_exact": true
+      },
+      "oa_C": -0.1965727960343555,
+      "gpcc_C": 0.9817742422716824
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+      "trial": "local_voxelization",
+      "budget": 0.03,
+      "source_level": 2,
+      "tie_rule": "halfup",
+      "counts": {
+        "Add": 300,
+        "Prune": 3522,
+        "Adjust": 1666
+      },
+      "operation_count": 5488,
+      "conservative_patch_cost": 5513,
+      "selected_patches": 1386,
+      "removed_cells": 5188,
+      "added_cells": 1966,
+      "quality": {
+        "chamfer_sq": 2.161338250198612,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality_ok": true,
+      "created_leaf_parents": 0,
+      "deleted_leaf_parents": 0,
+      "operation_percent": 2.764317735354858,
+      "oa": {
+        "bits": 186424,
+        "codec_sec": 17.036960419267416,
+        "ce_bits": 187294.21875,
+        "nodes": 69059,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "1dc6805f861b34bc3b0754e01c9246cfd387ed14b4911b1511b6619a2e32985d",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 9.153928756713867
+          },
+          "3": {
+            "nodes": 7,
+            "ce_bits": 16.083290100097656
+          },
+          "4": {
+            "nodes": 41,
+            "ce_bits": 155.13119506835938
+          },
+          "5": {
+            "nodes": 173,
+            "ce_bits": 524.0158081054688
+          },
+          "6": {
+            "nodes": 741,
+            "ce_bits": 2203.33154296875
+          },
+          "7": {
+            "nodes": 3222,
+            "ce_bits": 8026.64111328125
+          },
+          "8": {
+            "nodes": 13060,
+            "ce_bits": 28226.34765625
+          },
+          "9": {
+            "nodes": 51812,
+            "ce_bits": 148129.234375
+          }
+        }
+      },
+      "gpcc": {
+        "bits": 162144,
+        "stream_sha256": "a814751c05925d6f58ffde526e7ef53b0b512e24373a8a510a631192103c7f8c",
+        "codec_sec": 1.105357529129833,
+        "decoded_exact": true
+      },
+      "oa_C": -0.4187855219862424,
+      "gpcc_C": 2.044104319806661
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+      "trial": "local_voxelization",
+      "budget": 0.05,
+      "source_level": 2,
+      "tie_rule": "halfup",
+      "counts": {
+        "Add": 300,
+        "Prune": 3522,
+        "Adjust": 1666
+      },
+      "operation_count": 5488,
+      "conservative_patch_cost": 5513,
+      "selected_patches": 1386,
+      "removed_cells": 5188,
+      "added_cells": 1966,
+      "quality": {
+        "chamfer_sq": 2.161338250198612,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality_ok": true,
+      "created_leaf_parents": 0,
+      "deleted_leaf_parents": 0,
+      "operation_percent": 2.764317735354858,
+      "oa": {
+        "bits": 186424,
+        "codec_sec": 16.33950573578477,
+        "ce_bits": 187294.21875,
+        "nodes": 69059,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "1dc6805f861b34bc3b0754e01c9246cfd387ed14b4911b1511b6619a2e32985d",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 9.153928756713867
+          },
+          "3": {
+            "nodes": 7,
+            "ce_bits": 16.083290100097656
+          },
+          "4": {
+            "nodes": 41,
+            "ce_bits": 155.13119506835938
+          },
+          "5": {
+            "nodes": 173,
+            "ce_bits": 524.0158081054688
+          },
+          "6": {
+            "nodes": 741,
+            "ce_bits": 2203.33154296875
+          },
+          "7": {
+            "nodes": 3222,
+            "ce_bits": 8026.64111328125
+          },
+          "8": {
+            "nodes": 13060,
+            "ce_bits": 28226.34765625
+          },
+          "9": {
+            "nodes": 51812,
+            "ce_bits": 148129.234375
+          }
+        }
+      },
+      "gpcc": {
+        "bits": 162144,
+        "stream_sha256": "a814751c05925d6f58ffde526e7ef53b0b512e24373a8a510a631192103c7f8c",
+        "codec_sec": 1.0720373969525099,
+        "decoded_exact": true
+      },
+      "oa_C": -0.4187855219862424,
+      "gpcc_C": 2.044104319806661
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+      "trial": "proposal_audit",
+      "source_level": 3,
+      "tie_rule": "floor",
+      "total_groups": 3222,
+      "legal_patches": 1552,
+      "parent_creation_allowed": true,
+      "total_patch_operation_capacity": 23890
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+      "trial": "local_voxelization",
+      "budget": 0.01,
+      "source_level": 3,
+      "tie_rule": "floor",
+      "counts": {
+        "Add": 129,
+        "Prune": 999,
+        "Adjust": 842
+      },
+      "operation_count": 1970,
+      "conservative_patch_cost": 1985,
+      "selected_patches": 320,
+      "removed_cells": 1841,
+      "added_cells": 971,
+      "quality": {
+        "chamfer_sq": 2.1710020845663984,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality_ok": true,
+      "created_leaf_parents": 112,
+      "deleted_leaf_parents": 728,
+      "operation_percent": 0.9922933561678335,
+      "oa": {
+        "bits": 184296,
+        "codec_sec": 16.27854416333139,
+        "ce_bits": 184966.0,
+        "nodes": 67976,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "5c055563ae2bd7624a5e6ddda12811af15b1b19557b9d0bb38408d729ac37405",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 9.153928756713867
+          },
+          "3": {
+            "nodes": 7,
+            "ce_bits": 16.083290100097656
+          },
+          "4": {
+            "nodes": 41,
+            "ce_bits": 155.13119506835938
+          },
+          "5": {
+            "nodes": 173,
+            "ce_bits": 538.441650390625
+          },
+          "6": {
+            "nodes": 722,
+            "ce_bits": 2313.01806640625
+          },
+          "7": {
+            "nodes": 3069,
+            "ce_bits": 7895.6298828125
+          },
+          "8": {
+            "nodes": 12765,
+            "ce_bits": 27853.16796875
+          },
+          "9": {
+            "nodes": 51196,
+            "ce_bits": 146181.109375
+          }
+        }
+      },
+      "gpcc": {
+        "bits": 158944,
+        "stream_sha256": "1af9f6d2fe871e682ba293c71bde004dcdc7f56fad890b326d1f20362bd25893",
+        "codec_sec": 1.0571403689682484,
+        "decoded_exact": true
+      },
+      "oa_C": -1.555489081663175,
+      "gpcc_C": 0.030208438223744416
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+      "trial": "local_voxelization",
+      "budget": 0.03,
+      "source_level": 3,
+      "tie_rule": "floor",
+      "counts": {
+        "Add": 298,
+        "Prune": 1453,
+        "Adjust": 1665
+      },
+      "operation_count": 3416,
+      "conservative_patch_cost": 3452,
+      "selected_patches": 422,
+      "removed_cells": 3118,
+      "added_cells": 1963,
+      "quality": {
+        "chamfer_sq": 2.168645747596107,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality_ok": true,
+      "created_leaf_parents": 253,
+      "deleted_leaf_parents": 1075,
+      "operation_percent": 1.7206467536392485,
+      "oa": {
+        "bits": 182504,
+        "codec_sec": 15.870677484665066,
+        "ce_bits": 183130.4375,
+        "nodes": 67705,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "d8e5e0c4b4247272d669e0ba4812d1a19d8f5b511ef13a46e4eb8d717db7d35b",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 9.153928756713867
+          },
+          "3": {
+            "nodes": 7,
+            "ce_bits": 16.083290100097656
+          },
+          "4": {
+            "nodes": 41,
+            "ce_bits": 157.49139404296875
+          },
+          "5": {
+            "nodes": 172,
+            "ce_bits": 532.6688232421875
+          },
+          "6": {
+            "nodes": 721,
+            "ce_bits": 2310.33203125
+          },
+          "7": {
+            "nodes": 3066,
+            "ce_bits": 7957.2763671875
+          },
+          "8": {
+            "nodes": 12705,
+            "ce_bits": 27655.767578125
+          },
+          "9": {
+            "nodes": 50990,
+            "ce_bits": 144487.359375
+          }
+        }
+      },
+      "gpcc": {
+        "bits": 159856,
+        "stream_sha256": "2d8f51153380dfff2afb6254f2beae5e051a9c0951e3a84e1b6431c97575fe79",
+        "codec_sec": 1.1394506436772645,
+        "decoded_exact": true
+      },
+      "oa_C": -2.5127131319174434,
+      "gpcc_C": 0.6041687644748661
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+      "trial": "local_voxelization",
+      "budget": 0.05,
+      "source_level": 3,
+      "tie_rule": "floor",
+      "counts": {
+        "Add": 298,
+        "Prune": 1453,
+        "Adjust": 1665
+      },
+      "operation_count": 3416,
+      "conservative_patch_cost": 3452,
+      "selected_patches": 422,
+      "removed_cells": 3118,
+      "added_cells": 1963,
+      "quality": {
+        "chamfer_sq": 2.168645747596107,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality_ok": true,
+      "created_leaf_parents": 253,
+      "deleted_leaf_parents": 1075,
+      "operation_percent": 1.7206467536392485,
+      "oa": {
+        "bits": 182504,
+        "codec_sec": 15.421087192837149,
+        "ce_bits": 183130.4375,
+        "nodes": 67705,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "d8e5e0c4b4247272d669e0ba4812d1a19d8f5b511ef13a46e4eb8d717db7d35b",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 9.153928756713867
+          },
+          "3": {
+            "nodes": 7,
+            "ce_bits": 16.083290100097656
+          },
+          "4": {
+            "nodes": 41,
+            "ce_bits": 157.49139404296875
+          },
+          "5": {
+            "nodes": 172,
+            "ce_bits": 532.6688232421875
+          },
+          "6": {
+            "nodes": 721,
+            "ce_bits": 2310.33203125
+          },
+          "7": {
+            "nodes": 3066,
+            "ce_bits": 7957.2763671875
+          },
+          "8": {
+            "nodes": 12705,
+            "ce_bits": 27655.767578125
+          },
+          "9": {
+            "nodes": 50990,
+            "ce_bits": 144487.359375
+          }
+        }
+      },
+      "gpcc": {
+        "bits": 159856,
+        "stream_sha256": "2d8f51153380dfff2afb6254f2beae5e051a9c0951e3a84e1b6431c97575fe79",
+        "codec_sec": 1.0812646471895278,
+        "decoded_exact": true
+      },
+      "oa_C": -2.5127131319174434,
+      "gpcc_C": 0.6041687644748661
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+      "trial": "proposal_audit",
+      "source_level": 3,
+      "tie_rule": "halfup",
+      "total_groups": 3222,
+      "legal_patches": 1614,
+      "parent_creation_allowed": true,
+      "total_patch_operation_capacity": 25898
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+      "trial": "local_voxelization",
+      "budget": 0.01,
+      "source_level": 3,
+      "tie_rule": "halfup",
+      "counts": {
+        "Add": 116,
+        "Prune": 678,
+        "Adjust": 372
+      },
+      "operation_count": 1166,
+      "conservative_patch_cost": 1167,
+      "selected_patches": 156,
+      "removed_cells": 1050,
+      "added_cells": 488,
+      "quality": {
+        "chamfer_sq": 2.173106841864219,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality_ok": true,
+      "created_leaf_parents": 0,
+      "deleted_leaf_parents": 0,
+      "operation_percent": 0.5873167783206569,
+      "oa": {
+        "bits": 186696,
+        "codec_sec": 15.40053877979517,
+        "ce_bits": 187366.234375,
+        "nodes": 69059,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "2c4affb89284041bde47202724ff04790ac8a4afe38e7ce4c988a19eacd8ab01",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 9.153928756713867
+          },
+          "3": {
+            "nodes": 7,
+            "ce_bits": 16.083290100097656
+          },
+          "4": {
+            "nodes": 41,
+            "ce_bits": 155.13119506835938
+          },
+          "5": {
+            "nodes": 173,
+            "ce_bits": 524.0158081054688
+          },
+          "6": {
+            "nodes": 741,
+            "ce_bits": 2203.33154296875
+          },
+          "7": {
+            "nodes": 3222,
+            "ce_bits": 8026.64111328125
+          },
+          "8": {
+            "nodes": 13060,
+            "ce_bits": 28226.34765625
+          },
+          "9": {
+            "nodes": 51812,
+            "ce_bits": 148201.265625
+          }
+        }
+      },
+      "gpcc": {
+        "bits": 159816,
+        "stream_sha256": "dc276081f8298a549ef139126e2178090275aa5801424199002bd62a57b740d7",
+        "codec_sec": 1.1959699499420822,
+        "decoded_exact": true
+      },
+      "oa_C": -0.2734925857869275,
+      "gpcc_C": 0.5789950659550902
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+      "trial": "local_voxelization",
+      "budget": 0.03,
+      "source_level": 3,
+      "tie_rule": "halfup",
+      "counts": {
+        "Add": 116,
+        "Prune": 678,
+        "Adjust": 372
+      },
+      "operation_count": 1166,
+      "conservative_patch_cost": 1167,
+      "selected_patches": 156,
+      "removed_cells": 1050,
+      "added_cells": 488,
+      "quality": {
+        "chamfer_sq": 2.173106841864219,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality_ok": true,
+      "created_leaf_parents": 0,
+      "deleted_leaf_parents": 0,
+      "operation_percent": 0.5873167783206569,
+      "oa": {
+        "bits": 186696,
+        "codec_sec": 15.936312281060964,
+        "ce_bits": 187366.234375,
+        "nodes": 69059,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "2c4affb89284041bde47202724ff04790ac8a4afe38e7ce4c988a19eacd8ab01",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 9.153928756713867
+          },
+          "3": {
+            "nodes": 7,
+            "ce_bits": 16.083290100097656
+          },
+          "4": {
+            "nodes": 41,
+            "ce_bits": 155.13119506835938
+          },
+          "5": {
+            "nodes": 173,
+            "ce_bits": 524.0158081054688
+          },
+          "6": {
+            "nodes": 741,
+            "ce_bits": 2203.33154296875
+          },
+          "7": {
+            "nodes": 3222,
+            "ce_bits": 8026.64111328125
+          },
+          "8": {
+            "nodes": 13060,
+            "ce_bits": 28226.34765625
+          },
+          "9": {
+            "nodes": 51812,
+            "ce_bits": 148201.265625
+          }
+        }
+      },
+      "gpcc": {
+        "bits": 159816,
+        "stream_sha256": "dc276081f8298a549ef139126e2178090275aa5801424199002bd62a57b740d7",
+        "codec_sec": 1.1771110207773745,
+        "decoded_exact": true
+      },
+      "oa_C": -0.2734925857869275,
+      "gpcc_C": 0.5789950659550902
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+      "trial": "local_voxelization",
+      "budget": 0.05,
+      "source_level": 3,
+      "tie_rule": "halfup",
+      "counts": {
+        "Add": 116,
+        "Prune": 678,
+        "Adjust": 372
+      },
+      "operation_count": 1166,
+      "conservative_patch_cost": 1167,
+      "selected_patches": 156,
+      "removed_cells": 1050,
+      "added_cells": 488,
+      "quality": {
+        "chamfer_sq": 2.173106841864219,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality_ok": true,
+      "created_leaf_parents": 0,
+      "deleted_leaf_parents": 0,
+      "operation_percent": 0.5873167783206569,
+      "oa": {
+        "bits": 186696,
+        "codec_sec": 15.621153770945966,
+        "ce_bits": 187366.234375,
+        "nodes": 69059,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "2c4affb89284041bde47202724ff04790ac8a4afe38e7ce4c988a19eacd8ab01",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 9.153928756713867
+          },
+          "3": {
+            "nodes": 7,
+            "ce_bits": 16.083290100097656
+          },
+          "4": {
+            "nodes": 41,
+            "ce_bits": 155.13119506835938
+          },
+          "5": {
+            "nodes": 173,
+            "ce_bits": 524.0158081054688
+          },
+          "6": {
+            "nodes": 741,
+            "ce_bits": 2203.33154296875
+          },
+          "7": {
+            "nodes": 3222,
+            "ce_bits": 8026.64111328125
+          },
+          "8": {
+            "nodes": 13060,
+            "ce_bits": 28226.34765625
+          },
+          "9": {
+            "nodes": 51812,
+            "ce_bits": 148201.265625
+          }
+        }
+      },
+      "gpcc": {
+        "bits": 159816,
+        "stream_sha256": "dc276081f8298a549ef139126e2178090275aa5801424199002bd62a57b740d7",
+        "codec_sec": 1.1585006820969284,
+        "decoded_exact": true
+      },
+      "oa_C": -0.2734925857869275,
+      "gpcc_C": 0.5789950659550902
+    }
+  ],
+  "native_search": [
+    {
+      "trial": "final",
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "initial_bits": 149656,
+      "gpcc": {
+        "bits": 149592,
+        "stream_sha256": "c9c9f9451d8e6f21bda0ac9c6879273d66b5c9ac1f497f86d43a04ab9207bcb5",
+        "codec_sec": 1.1784821092151105,
+        "decoded_exact": true
+      },
+      "gpcc_C": -0.43130990415335413,
+      "counts": {
+        "Add": 191,
+        "Prune": 235,
+        "Adjust": 284
+      },
+      "operation_percent": 0.3350842666138083,
+      "quality": {
+        "chamfer_sq": 2.1767989909957595,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "unique_actual_encodes": 150,
+      "accepted_windows": 3
+    },
+    {
+      "trial": "final",
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "initial_bits": 148392,
+      "gpcc": {
+        "bits": 148320,
+        "stream_sha256": "945828ed70716999a1b2f37eb6aefc8ee9c048eeee2b45661b873d34c7e8ad43",
+        "codec_sec": 1.1103257569484413,
+        "decoded_exact": true
+      },
+      "gpcc_C": -1.2779552715655007,
+      "counts": {
+        "Add": 2477,
+        "Prune": 3174,
+        "Adjust": 4845
+      },
+      "operation_percent": 4.953583749828918,
+      "quality": {
+        "chamfer_sq": 2.147103329662574,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "unique_actual_encodes": 96,
+      "accepted_windows": 2
+    },
+    {
+      "trial": "final",
+      "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+      "initial_bits": 154648,
+      "gpcc": {
+        "bits": 154640,
+        "stream_sha256": "831e3a957c86ae4394cce5eecc3076aa7a32443066b08488f98d70bff5a71c78",
+        "codec_sec": 1.068991671781987,
+        "decoded_exact": true
+      },
+      "gpcc_C": -2.6784815225052827,
+      "counts": {
+        "Add": 2322,
+        "Prune": 3065,
+        "Adjust": 4409
+      },
+      "operation_percent": 4.934266861431522,
+      "quality": {
+        "chamfer_sq": 2.1466724990217845,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "unique_actual_encodes": 96,
+      "accepted_windows": 1
+    }
+  ],
+  "embedding_search": [
+    {
+      "trial": "final",
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "counts": {
+        "Add": 2494,
+        "Prune": 3152,
+        "Adjust": 4930
+      },
+      "operation_count": 10576,
+      "operation_percent": 4.991339723531882,
+      "quality": {
+        "chamfer_sq": 2.146671501901503,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "baseline_quality": {
+        "chamfer_sq": 2.178329269921022,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "oa": {
+        "bits": 145824,
+        "codec_sec": 18.256023210007697,
+        "ce_bits": 145658.171875,
+        "nodes": 73905,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "87e4130545dcbc9155c85dd6bbfd003479dde898f3cfc9d10b279f75742fe3f0",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 13.5221529006958
+          },
+          "3": {
+            "nodes": 8,
+            "ce_bits": 21.59096908569336
+          },
+          "4": {
+            "nodes": 43,
+            "ce_bits": 159.05824279785156
+          },
+          "5": {
+            "nodes": 191,
+            "ce_bits": 578.7169189453125
+          },
+          "6": {
+            "nodes": 820,
+            "ce_bits": 2173.697021484375
+          },
+          "7": {
+            "nodes": 3414,
+            "ce_bits": 7833.625
+          },
+          "8": {
+            "nodes": 13991,
+            "ce_bits": 27330.9453125
+          },
+          "9": {
+            "nodes": 55435,
+            "ce_bits": 107542.75
+          }
+        }
+      },
+      "gpcc": {
+        "bits": 148560,
+        "stream_sha256": "dcac997a888c3efba413be69c7abd9ef26827c83f620dbe8282ecb50b5b0224d",
+        "codec_sec": 1.1864526369608939,
+        "decoded_exact": true
+      },
+      "oa_C": -22.71358914564342,
+      "gpcc_C": -1.1182108626198062,
+      "current_prior_score": -2042.0925664905308,
+      "own_score": 44545.21875,
+      "accepted_windows": 66,
+      "model_weights_sha256_before": "928db2dfd2cccf826a83ac4de91939f92d5a93e56d03df68babad9fd13b8f2f6",
+      "model_weights_sha256_after": "928db2dfd2cccf826a83ac4de91939f92d5a93e56d03df68babad9fd13b8f2f6",
+      "frozen_self_cdf_gain": 44545.218118071556,
+      "edited_node_cdf_gain": 46692.030049185945,
+      "unedited_context_cdf_gain": -3840.90471570738,
+      "total_cdf_gain": 42851.125333478565,
+      "affected_unedited_cost_nodes": 45485,
+      "affected_unedited_probability_nodes": 45551,
+      "changed_nodes": 9272,
+      "actual_oa": {
+        "bits": 145824,
+        "stream_sha256": "87e4130545dcbc9155c85dd6bbfd003479dde898f3cfc9d10b279f75742fe3f0"
+      },
+      "actual_oa_gain": 42856
+    },
+    {
+      "trial": "final",
+      "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+      "counts": {
+        "Add": 2392,
+        "Prune": 3129,
+        "Adjust": 4403
+      },
+      "operation_count": 9924,
+      "operation_percent": 4.998740744471868,
+      "quality": {
+        "chamfer_sq": 2.1465265214158924,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "baseline_quality": {
+        "chamfer_sq": 2.175526326309434,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "oa": {
+        "bits": 149648,
+        "codec_sec": 16.066374097950757,
+        "ce_bits": 149656.125,
+        "nodes": 69059,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "88f17a280e35152f5a30b9695d6b70a839a111278a8adf8778c1a327ccb020af",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 9.153928756713867
+          },
+          "3": {
+            "nodes": 7,
+            "ce_bits": 16.083290100097656
+          },
+          "4": {
+            "nodes": 41,
+            "ce_bits": 155.13119506835938
+          },
+          "5": {
+            "nodes": 173,
+            "ce_bits": 524.0158081054688
+          },
+          "6": {
+            "nodes": 741,
+            "ce_bits": 2203.33154296875
+          },
+          "7": {
+            "nodes": 3222,
+            "ce_bits": 8026.64111328125
+          },
+          "8": {
+            "nodes": 13060,
+            "ce_bits": 28226.34765625
+          },
+          "9": {
+            "nodes": 51812,
+            "ce_bits": 110491.140625
+          }
+        }
+      },
+      "gpcc": {
+        "bits": 154312,
+        "stream_sha256": "08d077dbd59a7effb380f6bd5f2195c35f6d36bf222f2ea3c7f816441ba75b20",
+        "codec_sec": 1.0980952130630612,
+        "decoded_exact": true
+      },
+      "oa_C": -20.06324516046323,
+      "gpcc_C": -2.884905850367536,
+      "current_prior_score": -1733.809783332562,
+      "own_score": 40910.6640625,
+      "accepted_windows": 54,
+      "model_weights_sha256_before": "928db2dfd2cccf826a83ac4de91939f92d5a93e56d03df68babad9fd13b8f2f6",
+      "model_weights_sha256_after": "928db2dfd2cccf826a83ac4de91939f92d5a93e56d03df68babad9fd13b8f2f6",
+      "frozen_self_cdf_gain": 40910.66426688433,
+      "edited_node_cdf_gain": 41962.016944772535,
+      "unedited_context_cdf_gain": -4405.930236332693,
+      "total_cdf_gain": 37556.08670843984,
+      "affected_unedited_cost_nodes": 42268,
+      "affected_unedited_probability_nodes": 42380,
+      "changed_nodes": 8837,
+      "actual_oa": {
+        "bits": 149648,
+        "stream_sha256": "88f17a280e35152f5a30b9695d6b70a839a111278a8adf8778c1a327ccb020af"
+      },
+      "actual_oa_gain": 37560
+    }
+  ],
+  "native_grid_protocol": {
+    "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+    "raw_min": [
+      103.0,
+      9.0,
+      22.0
+    ],
+    "native_grid": "round((raw-raw_min)/2)",
+    "baseline": {
+      "bits": 188072,
+      "codec_sec": 21.681298527866602,
+      "ce_bits": 188593.453125,
+      "nodes": 73780,
+      "arithmetic_roundtrip": true,
+      "stream_sha256": "04e0b4c274c76c451a28be01bb0a3bbdf7cada9c69e49e2fbe0f63d86a9053a1",
+      "levels": {
+        "1": {
+          "nodes": 1,
+          "ce_bits": 4.272367000579834
+        },
+        "2": {
+          "nodes": 2,
+          "ce_bits": 13.5221529006958
+        },
+        "3": {
+          "nodes": 8,
+          "ce_bits": 20.040573120117188
+        },
+        "4": {
+          "nodes": 44,
+          "ce_bits": 159.1315460205078
+        },
+        "5": {
+          "nodes": 194,
+          "ce_bits": 622.4896240234375
+        },
+        "6": {
+          "nodes": 835,
+          "ce_bits": 2264.820068359375
+        },
+        "7": {
+          "nodes": 3410,
+          "ce_bits": 7873.5439453125
+        },
+        "8": {
+          "nodes": 14000,
+          "ce_bits": 27007.11328125
+        },
+        "9": {
+          "nodes": 55286,
+          "ce_bits": 150628.53125
+        }
+      }
+    },
+    "native_teacher": {
+      "bit": 188072.0,
+      "bpp": 0.2455821921832909,
+      "bpn": 2.5490918948224452,
+      "single": 7696.0,
+      "node": 73780.0,
+      "point_count": 765821
+    },
+    "exact_bits_parity": true,
+    "proposal_audit": {
+      "candidate_count": 562371,
+      "joint_rescue_candidates": 104126,
+      "leaf_without_exclusive_nn_assignment": 5009,
+      "generation_sec": 11.76021841634065,
+      "nonpositive_oa_candidates": 490052,
+      "legality": "per-raw-point joint coverage; safe Add distance; bbox anchors; nonempty leaves"
+    }
+  },
+  "native_grid_comparisons": [
+    {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "trial": "same_pool_comparison",
+      "budget": 0.05,
+      "method": "current_prior",
+      "winner": 1,
+      "candidate_plan_ids": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "operation_percent": 0.2975782796196666,
+      "counts": {
+        "Add": 187,
+        "Prune": 174,
+        "Adjust": 269
+      },
+      "oa_C": -1.3867029648219842,
+      "gpcc_C": -0.18713575362241386,
+      "quality": {
+        "chamfer_sq": 2.174744541232198,
+        "d1_mse": 1.4995997759267505,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "trial": "same_pool_comparison",
+      "budget": 0.05,
+      "method": "node_only",
+      "winner": 2,
+      "candidate_plan_ids": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "operation_percent": 4.999787444085986,
+      "counts": {
+        "Add": 2930,
+        "Prune": 3099,
+        "Adjust": 4556
+      },
+      "oa_C": -17.125356246543877,
+      "gpcc_C": -0.42239212960487604,
+      "quality": {
+        "chamfer_sq": 2.1511172194362524,
+        "d1_mse": 1.4995997759267505,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "trial": "same_pool_comparison",
+      "budget": 0.05,
+      "method": "total_context",
+      "winner": 3,
+      "candidate_plan_ids": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "operation_percent": 4.995536325805705,
+      "counts": {
+        "Add": 2386,
+        "Prune": 3186,
+        "Adjust": 5004
+      },
+      "oa_C": -20.651665319664815,
+      "gpcc_C": -1.4810458215259614,
+      "quality": {
+        "chamfer_sq": 2.1443612607377354,
+        "d1_mse": 1.4995997759267505,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "trial": "same_pool_comparison",
+      "budget": 0.05,
+      "method": "actual_oa_oracle",
+      "winner": 3,
+      "candidate_plan_ids": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "operation_percent": 4.995536325805705,
+      "counts": {
+        "Add": 2386,
+        "Prune": 3186,
+        "Adjust": 5004
+      },
+      "oa_C": -20.651665319664815,
+      "gpcc_C": -1.4810458215259614,
+      "quality": {
+        "chamfer_sq": 2.1443612607377354,
+        "d1_mse": 1.4995997759267505,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "trial": "same_pool_comparison",
+      "budget": 0.05,
+      "method": "actual_gpcc_oracle",
+      "winner": 3,
+      "candidate_plan_ids": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "operation_percent": 4.995536325805705,
+      "counts": {
+        "Add": 2386,
+        "Prune": 3186,
+        "Adjust": 5004
+      },
+      "oa_C": -20.651665319664815,
+      "gpcc_C": -1.4810458215259614,
+      "quality": {
+        "chamfer_sq": 2.1443612607377354,
+        "d1_mse": 1.4995997759267505,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    }
+  ],
+  "cases": [
+    {
+      "case": "self_improves_total_worsens",
+      "benchmark_id": 29,
+      "edits": [
+        [
+          71335,
+          243
+        ]
+      ],
+      "counts": {
+        "Add": 0,
+        "Prune": 0,
+        "Adjust": 1
+      },
+      "mask_before": "10111011",
+      "mask_after": "11110011",
+      "raw_probability_before": 0.06569423526525497,
+      "raw_probability_after_frozen": 0.09449516981840134,
+      "raw_probability_after_recomputed": 0.09449516981840134,
+      "own_cdf_bits_before": 3.933574399364444,
+      "own_cdf_bits_after": 3.4091790690694754,
+      "window_fraction": 0.6630859375,
+      "changed_context_spatial_distance": {
+        "min": 2.0,
+        "median": 14.560219778561036,
+        "max": 30.133038346638727
+      },
+      "unedited_node_examples": [
+        {
+          "row": 71338,
+          "mask": 207,
+          "gain_bits": -3.821729285815591,
+          "raw_probability_before": 0.023162024095654488,
+          "raw_probability_after": 0.0016299085691571236,
+          "cdf_bits_before": 5.436803727783262,
+          "cdf_bits_after": 9.258533013598854
+        },
+        {
+          "row": 71591,
+          "mask": 5,
+          "gain_bits": -3.1812507653091675,
+          "raw_probability_before": 0.19979408383369446,
+          "raw_probability_after": 0.022015167400240898,
+          "cdf_bits_before": 2.3289012742515354,
+          "cdf_bits_after": 5.510152039560703
+        },
+        {
+          "row": 71337,
+          "mask": 239,
+          "gain_bits": -0.24326161338404795,
+          "raw_probability_before": 0.04728147014975548,
+          "raw_probability_after": 0.039924800395965576,
+          "cdf_bits_before": 4.408010232384875,
+          "cdf_bits_after": 4.651271845768923
+        },
+        {
+          "row": 71505,
+          "mask": 91,
+          "gain_bits": 0.16992500144231215,
+          "raw_probability_before": 0.00011953366629313678,
+          "raw_probability_after": 0.00011997760157100856,
+          "cdf_bits_before": 13.0,
+          "cdf_bits_after": 12.830074998557688
+        },
+        {
+          "row": 71340,
+          "mask": 170,
+          "gain_bits": 0.2320615211464645,
+          "raw_probability_before": 0.026654310524463654,
+          "raw_probability_after": 0.031325675547122955,
+          "cdf_bits_before": 5.233471091401135,
+          "cdf_bits_after": 5.001409570254671
+        }
+      ],
+      "quality": {
+        "chamfer_sq": 2.178329269921022,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "gpcc_gain": -16,
+      "frozen_self_cdf_gain": 0.5243954658508301,
+      "edited_node_cdf_gain": 0.5243953302949684,
+      "unedited_context_cdf_gain": -6.985542835410779,
+      "total_cdf_gain": -6.461147505115811,
+      "affected_unedited_cost_nodes": 304,
+      "affected_unedited_probability_nodes": 345,
+      "changed_nodes": 1,
+      "actual_oa": {
+        "bits": 188688,
+        "stream_sha256": "4a52f6a299541f0727901177666795597a07451609963e95c80dc5e534007b15"
+      },
+      "actual_oa_gain": -8
+    },
+    {
+      "case": "self_and_context_improve",
+      "benchmark_id": 8,
+      "edits": [
+        [
+          30663,
+          245
+        ]
+      ],
+      "counts": {
+        "Add": 0,
+        "Prune": 0,
+        "Adjust": 1
+      },
+      "mask_before": "10110111",
+      "mask_after": "11110101",
+      "raw_probability_before": 4.377905327146436e-08,
+      "raw_probability_after_frozen": 0.36225494742393494,
+      "raw_probability_after_recomputed": 0.36225494742393494,
+      "own_cdf_bits_before": 16.0,
+      "own_cdf_bits_after": 1.4705084400800743,
+      "window_fraction": 0.9443359375,
+      "changed_context_spatial_distance": {
+        "min": 2.0,
+        "median": 8.601539630659959,
+        "max": 15.231546211727817
+      },
+      "unedited_node_examples": [
+        {
+          "row": 30673,
+          "mask": 245,
+          "gain_bits": -0.7032824679099168,
+          "raw_probability_before": 0.001931829727254808,
+          "raw_probability_after": 0.0011869675945490599,
+          "cdf_bits_before": 9.011315313227835,
+          "cdf_bits_after": 9.714597781137751
+        },
+        {
+          "row": 30684,
+          "mask": 42,
+          "gain_bits": -0.6114347120823478,
+          "raw_probability_before": 0.01515188254415989,
+          "raw_probability_after": 0.009911670349538326,
+          "cdf_bits_before": 6.048715285033028,
+          "cdf_bits_after": 6.660149997115376
+        },
+        {
+          "row": 30680,
+          "mask": 43,
+          "gain_bits": -0.08994212531279899,
+          "raw_probability_before": 0.0027769708540290594,
+          "raw_probability_after": 0.002601106185466051,
+          "cdf_bits_before": 8.492205359801304,
+          "cdf_bits_after": 8.582147485114103
+        },
+        {
+          "row": 30677,
+          "mask": 181,
+          "gain_bits": 1.0,
+          "raw_probability_before": 2.4970916001620935e-07,
+          "raw_probability_after": 2.404789825050102e-07,
+          "cdf_bits_before": 16.0,
+          "cdf_bits_after": 15.0
+        },
+        {
+          "row": 30666,
+          "mask": 171,
+          "gain_bits": 2.3367677139054948,
+          "raw_probability_before": 0.037018656730651855,
+          "raw_probability_after": 0.18710893392562866,
+          "cdf_bits_before": 4.760401470750876,
+          "cdf_bits_after": 2.4236337568453816
+        }
+      ],
+      "quality": {
+        "chamfer_sq": 2.1783198309275966,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "gpcc_gain": 8,
+      "frozen_self_cdf_gain": 14.529491424560547,
+      "edited_node_cdf_gain": 14.529491559919926,
+      "unedited_context_cdf_gain": 3.9630548213605508,
+      "total_cdf_gain": 18.492546381280476,
+      "affected_unedited_cost_nodes": 52,
+      "affected_unedited_probability_nodes": 57,
+      "changed_nodes": 1,
+      "actual_oa": {
+        "bits": 188656,
+        "stream_sha256": "b01e0ce712a537c57873603aece0e9c2b76e36f892d6985687bc61fb49e0d6c9"
+      },
+      "actual_oa_gain": 24
+    }
+  ],
+  "implementation_audit": {
+    "commit": "fdc313b84acaf00585ce12e33745012693de657f",
+    "help_returncode": 1,
+    "probability_help_lines": [
+      "        --entropyContinuationEnabled=0  Propagate context state between",
+      "                                        probability updateOnly applies when",
+      "        --InterEntropyContinuationEnabled=0",
+      "        --numOctreeEntropyStreams=1     Number of entropy streams for octree"
+    ],
+    "native_per_node_probability_api": false,
+    "probability_evidence": [
+      "tmc3/geometry_octree_encoder.cpp: OBUF context evolution + inferred bits",
+      "tmc3/entropydirac.h: threshold-clamped private probability before Schro bit coding",
+      "existing GPCCGeometryEncoder exports stream size, not per-node models"
+    ],
+    "effective_oa_actual_mode": "geometry_codec.configure_geometry_codec sets True unless explicitly overridden",
+    "comparison_current_score": "zero-Actor default empirical prior; not running Network checkpoint evaluation",
+    "proposal_initialization": [
+      {
+        "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+        "voxels": 211887,
+        "leaf_parents": 55435,
+        "pool_counts": {
+          "Add": 848,
+          "Prune": 848,
+          "Adjust": 424
+        },
+        "native_candidates": 2120,
+        "single_nonempty_parent_candidates": 1672,
+        "supported_quality_legal_masks": 722,
+        "expanded_legal_masks": 552319,
+        "operation_shares": {
+          "Add": 0.4,
+          "Prune": 0.4,
+          "Adjust": 0.2
+        },
+        "initial_total_ratio": 0.0025
+      },
+      {
+        "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+        "voxels": 198530,
+        "leaf_parents": 51812,
+        "pool_counts": {
+          "Add": 795,
+          "Prune": 795,
+          "Adjust": 398
+        },
+        "native_candidates": 1988,
+        "single_nonempty_parent_candidates": 1582,
+        "supported_quality_legal_masks": 653,
+        "expanded_legal_masks": 540631,
+        "operation_shares": {
+          "Add": 0.4,
+          "Prune": 0.4,
+          "Adjust": 0.2
+        },
+        "initial_total_ratio": 0.0025
+      }
+    ],
+    "protected_files_unchanged": 15614
+  },
+  "autonomous_small_decode": {
+    "official_function_body_unmodified": true,
+    "nodes": 64,
+    "voxels": 119,
+    "actual_bits": 528,
+    "symbol_roundtrip": true,
+    "geometry_roundtrip": true,
+    "autonomous_probabilities": true,
+    "elapsed_sec": 0.8842957019805908
+  },
+  "native_initial_pool_coverage": [
+    {
+      "frame": "longdress_vox10_1051",
+      "budget_percent": 0.15,
+      "selected_masks": 318,
+      "native_initial_pool_hits": 4,
+      "overlap_fraction": 0.012578616352201259
+    },
+    {
+      "frame": "longdress_vox10_1051",
+      "budget_percent": 0.3,
+      "selected_masks": 633,
+      "native_initial_pool_hits": 12,
+      "overlap_fraction": 0.018957345971563982
+    },
+    {
+      "frame": "longdress_vox10_1051",
+      "budget_percent": 1.0,
+      "selected_masks": 2042,
+      "native_initial_pool_hits": 22,
+      "overlap_fraction": 0.010773751224289911
+    },
+    {
+      "frame": "longdress_vox10_1051",
+      "budget_percent": 3.0,
+      "selected_masks": 5771,
+      "native_initial_pool_hits": 37,
+      "overlap_fraction": 0.006411367180731243
+    },
+    {
+      "frame": "longdress_vox10_1051",
+      "budget_percent": 5.0,
+      "selected_masks": 9291,
+      "native_initial_pool_hits": 59,
+      "overlap_fraction": 0.006350231406737703
+    },
+    {
+      "frame": "redandblack_vox10_1451",
+      "budget_percent": 0.15,
+      "selected_masks": 298,
+      "native_initial_pool_hits": 4,
+      "overlap_fraction": 0.013422818791946308
+    },
+    {
+      "frame": "redandblack_vox10_1451",
+      "budget_percent": 0.3,
+      "selected_masks": 596,
+      "native_initial_pool_hits": 10,
+      "overlap_fraction": 0.016778523489932886
+    },
+    {
+      "frame": "redandblack_vox10_1451",
+      "budget_percent": 1.0,
+      "selected_masks": 1932,
+      "native_initial_pool_hits": 23,
+      "overlap_fraction": 0.011904761904761904
+    },
+    {
+      "frame": "redandblack_vox10_1451",
+      "budget_percent": 3.0,
+      "selected_masks": 5552,
+      "native_initial_pool_hits": 52,
+      "overlap_fraction": 0.009365994236311239
+    },
+    {
+      "frame": "redandblack_vox10_1451",
+      "budget_percent": 5.0,
+      "selected_masks": 8865,
+      "native_initial_pool_hits": 73,
+      "overlap_fraction": 0.00823463056965595
+    }
+  ],
+  "quantization_baseline_control": [
+    {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "raw_unique_voxels": 765821,
+      "qs2_unique_voxels": 211887,
+      "raw_gpcc": {
+        "bits": 557528,
+        "stream_sha256": "5cf4d4eac7d89d9f20c8425c47ef275614c92fd35d66881855287c43ca5e7331",
+        "codec_sec": 4.258161943405867,
+        "decoded_exact": true
+      },
+      "qs2_gpcc": {
+        "bits": 150240,
+        "stream_sha256": "fa7b6836f413a0ca6ecd73c883625067344522ccb82e6bd9a73d746a9157722e",
+        "codec_sec": 1.150843432173133,
+        "decoded_exact": true
+      },
+      "qs2_rate_change_from_raw": -73.05247449455453,
+      "raw_quality": {
+        "chamfer_sq": 0.0,
+        "d1_mse": 0.0,
+        "max_gt_to_rec": 0.0,
+        "max_rec_to_gt": 0.0
+      },
+      "qs2_quality": {
+        "chamfer_sq": 2.178329269921022,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "geometry_preserving_success": false,
+      "interpretation": "Loss improvement is relative to the already qs=2-quantized baseline, not raw-grid bytes"
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+      "raw_unique_voxels": 720568,
+      "qs2_unique_voxels": 198530,
+      "raw_gpcc": {
+        "bits": 590776,
+        "stream_sha256": "8c7ad7cd1955c65d7d613ca599cacc658d04c3f8e1e35d224a3b3d5138f0cb72",
+        "codec_sec": 3.748870948795229,
+        "decoded_exact": true
+      },
+      "qs2_gpcc": {
+        "bits": 158896,
+        "stream_sha256": "07711d7f5040ab7b8ac7976070ff96177be5e0cc84679cb822ae8bcc7059b24d",
+        "codec_sec": 1.0249577416107059,
+        "decoded_exact": true
+      },
+      "qs2_rate_change_from_raw": -73.10384985172045,
+      "raw_quality": {
+        "chamfer_sq": 0.0,
+        "d1_mse": 0.0,
+        "max_gt_to_rec": 0.0,
+        "max_rec_to_gt": 0.0
+      },
+      "qs2_quality": {
+        "chamfer_sq": 2.175526326309434,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "geometry_preserving_success": false,
+      "interpretation": "Loss improvement is relative to the already qs=2-quantized baseline, not raw-grid bytes"
+    }
+  ],
+  "overall_best": [
+    {
+      "frame": "longdress_vox10_1051",
+      "best_oa": {
+        "trial": "final",
+        "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+        "counts": {
+          "Add": 2494,
+          "Prune": 3152,
+          "Adjust": 4930
+        },
+        "operation_count": 10576,
+        "operation_percent": 4.991339723531882,
+        "quality": {
+          "chamfer_sq": 2.146671501901503,
+          "d1_mse": 1.5005765054758227,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772
+        },
+        "baseline_quality": {
+          "chamfer_sq": 2.178329269921022,
+          "d1_mse": 1.5005765054758227,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772
+        },
+        "oa": {
+          "bits": 145824,
+          "codec_sec": 18.256023210007697,
+          "ce_bits": 145658.171875,
+          "nodes": 73905,
+          "arithmetic_roundtrip": true,
+          "stream_sha256": "87e4130545dcbc9155c85dd6bbfd003479dde898f3cfc9d10b279f75742fe3f0",
+          "levels": {
+            "1": {
+              "nodes": 1,
+              "ce_bits": 4.272367000579834
+            },
+            "2": {
+              "nodes": 2,
+              "ce_bits": 13.5221529006958
+            },
+            "3": {
+              "nodes": 8,
+              "ce_bits": 21.59096908569336
+            },
+            "4": {
+              "nodes": 43,
+              "ce_bits": 159.05824279785156
+            },
+            "5": {
+              "nodes": 191,
+              "ce_bits": 578.7169189453125
+            },
+            "6": {
+              "nodes": 820,
+              "ce_bits": 2173.697021484375
+            },
+            "7": {
+              "nodes": 3414,
+              "ce_bits": 7833.625
+            },
+            "8": {
+              "nodes": 13991,
+              "ce_bits": 27330.9453125
+            },
+            "9": {
+              "nodes": 55435,
+              "ce_bits": 107542.75
+            }
+          }
+        },
+        "gpcc": {
+          "bits": 148560,
+          "stream_sha256": "dcac997a888c3efba413be69c7abd9ef26827c83f620dbe8282ecb50b5b0224d",
+          "codec_sec": 1.1864526369608939,
+          "decoded_exact": true
+        },
+        "oa_C": -22.71358914564342,
+        "gpcc_C": -1.1182108626198062,
+        "current_prior_score": -2042.0925664905308,
+        "own_score": 44545.21875,
+        "accepted_windows": 66,
+        "model_weights_sha256_before": "928db2dfd2cccf826a83ac4de91939f92d5a93e56d03df68babad9fd13b8f2f6",
+        "model_weights_sha256_after": "928db2dfd2cccf826a83ac4de91939f92d5a93e56d03df68babad9fd13b8f2f6",
+        "frozen_self_cdf_gain": 44545.218118071556,
+        "edited_node_cdf_gain": 46692.030049185945,
+        "unedited_context_cdf_gain": -3840.90471570738,
+        "total_cdf_gain": 42851.125333478565,
+        "affected_unedited_cost_nodes": 45485,
+        "affected_unedited_probability_nodes": 45551,
+        "changed_nodes": 9272,
+        "actual_oa": {
+          "bits": 145824,
+          "stream_sha256": "87e4130545dcbc9155c85dd6bbfd003479dde898f3cfc9d10b279f75742fe3f0"
+        },
+        "actual_oa_gain": 42856
+      },
+      "best_gpcc": {
+        "trial": "final",
+        "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+        "initial_bits": 148392,
+        "gpcc": {
+          "bits": 148320,
+          "stream_sha256": "945828ed70716999a1b2f37eb6aefc8ee9c048eeee2b45661b873d34c7e8ad43",
+          "codec_sec": 1.1103257569484413,
+          "decoded_exact": true
+        },
+        "gpcc_C": -1.2779552715655007,
+        "counts": {
+          "Add": 2477,
+          "Prune": 3174,
+          "Adjust": 4845
+        },
+        "operation_percent": 4.953583749828918,
+        "quality": {
+          "chamfer_sq": 2.147103329662574,
+          "d1_mse": 1.5005765054758227,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772
+        },
+        "unique_actual_encodes": 96,
+        "accepted_windows": 2
+      },
+      "observed_30_percent": false
+    },
+    {
+      "frame": "redandblack_vox10_1451",
+      "best_oa": {
+        "trial": "final",
+        "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+        "counts": {
+          "Add": 2392,
+          "Prune": 3129,
+          "Adjust": 4403
+        },
+        "operation_count": 9924,
+        "operation_percent": 4.998740744471868,
+        "quality": {
+          "chamfer_sq": 2.1465265214158924,
+          "d1_mse": 1.501114398641072,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772
+        },
+        "baseline_quality": {
+          "chamfer_sq": 2.175526326309434,
+          "d1_mse": 1.501114398641072,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772
+        },
+        "oa": {
+          "bits": 149648,
+          "codec_sec": 16.066374097950757,
+          "ce_bits": 149656.125,
+          "nodes": 69059,
+          "arithmetic_roundtrip": true,
+          "stream_sha256": "88f17a280e35152f5a30b9695d6b70a839a111278a8adf8778c1a327ccb020af",
+          "levels": {
+            "1": {
+              "nodes": 1,
+              "ce_bits": 4.272367000579834
+            },
+            "2": {
+              "nodes": 2,
+              "ce_bits": 9.153928756713867
+            },
+            "3": {
+              "nodes": 7,
+              "ce_bits": 16.083290100097656
+            },
+            "4": {
+              "nodes": 41,
+              "ce_bits": 155.13119506835938
+            },
+            "5": {
+              "nodes": 173,
+              "ce_bits": 524.0158081054688
+            },
+            "6": {
+              "nodes": 741,
+              "ce_bits": 2203.33154296875
+            },
+            "7": {
+              "nodes": 3222,
+              "ce_bits": 8026.64111328125
+            },
+            "8": {
+              "nodes": 13060,
+              "ce_bits": 28226.34765625
+            },
+            "9": {
+              "nodes": 51812,
+              "ce_bits": 110491.140625
+            }
+          }
+        },
+        "gpcc": {
+          "bits": 154312,
+          "stream_sha256": "08d077dbd59a7effb380f6bd5f2195c35f6d36bf222f2ea3c7f816441ba75b20",
+          "codec_sec": 1.0980952130630612,
+          "decoded_exact": true
+        },
+        "oa_C": -20.06324516046323,
+        "gpcc_C": -2.884905850367536,
+        "current_prior_score": -1733.809783332562,
+        "own_score": 40910.6640625,
+        "accepted_windows": 54,
+        "model_weights_sha256_before": "928db2dfd2cccf826a83ac4de91939f92d5a93e56d03df68babad9fd13b8f2f6",
+        "model_weights_sha256_after": "928db2dfd2cccf826a83ac4de91939f92d5a93e56d03df68babad9fd13b8f2f6",
+        "frozen_self_cdf_gain": 40910.66426688433,
+        "edited_node_cdf_gain": 41962.016944772535,
+        "unedited_context_cdf_gain": -4405.930236332693,
+        "total_cdf_gain": 37556.08670843984,
+        "affected_unedited_cost_nodes": 42268,
+        "affected_unedited_probability_nodes": 42380,
+        "changed_nodes": 8837,
+        "actual_oa": {
+          "bits": 149648,
+          "stream_sha256": "88f17a280e35152f5a30b9695d6b70a839a111278a8adf8778c1a327ccb020af"
+        },
+        "actual_oa_gain": 37560
+      },
+      "best_gpcc": {
+        "trial": "final",
+        "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+        "counts": {
+          "Add": 2392,
+          "Prune": 3129,
+          "Adjust": 4403
+        },
+        "operation_count": 9924,
+        "operation_percent": 4.998740744471868,
+        "quality": {
+          "chamfer_sq": 2.1465265214158924,
+          "d1_mse": 1.501114398641072,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772
+        },
+        "baseline_quality": {
+          "chamfer_sq": 2.175526326309434,
+          "d1_mse": 1.501114398641072,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772
+        },
+        "oa": {
+          "bits": 149648,
+          "codec_sec": 16.066374097950757,
+          "ce_bits": 149656.125,
+          "nodes": 69059,
+          "arithmetic_roundtrip": true,
+          "stream_sha256": "88f17a280e35152f5a30b9695d6b70a839a111278a8adf8778c1a327ccb020af",
+          "levels": {
+            "1": {
+              "nodes": 1,
+              "ce_bits": 4.272367000579834
+            },
+            "2": {
+              "nodes": 2,
+              "ce_bits": 9.153928756713867
+            },
+            "3": {
+              "nodes": 7,
+              "ce_bits": 16.083290100097656
+            },
+            "4": {
+              "nodes": 41,
+              "ce_bits": 155.13119506835938
+            },
+            "5": {
+              "nodes": 173,
+              "ce_bits": 524.0158081054688
+            },
+            "6": {
+              "nodes": 741,
+              "ce_bits": 2203.33154296875
+            },
+            "7": {
+              "nodes": 3222,
+              "ce_bits": 8026.64111328125
+            },
+            "8": {
+              "nodes": 13060,
+              "ce_bits": 28226.34765625
+            },
+            "9": {
+              "nodes": 51812,
+              "ce_bits": 110491.140625
+            }
+          }
+        },
+        "gpcc": {
+          "bits": 154312,
+          "stream_sha256": "08d077dbd59a7effb380f6bd5f2195c35f6d36bf222f2ea3c7f816441ba75b20",
+          "codec_sec": 1.0980952130630612,
+          "decoded_exact": true
+        },
+        "oa_C": -20.06324516046323,
+        "gpcc_C": -2.884905850367536,
+        "current_prior_score": -1733.809783332562,
+        "own_score": 40910.6640625,
+        "accepted_windows": 54,
+        "model_weights_sha256_before": "928db2dfd2cccf826a83ac4de91939f92d5a93e56d03df68babad9fd13b8f2f6",
+        "model_weights_sha256_after": "928db2dfd2cccf826a83ac4de91939f92d5a93e56d03df68babad9fd13b8f2f6",
+        "frozen_self_cdf_gain": 40910.66426688433,
+        "edited_node_cdf_gain": 41962.016944772535,
+        "unedited_context_cdf_gain": -4405.930236332693,
+        "total_cdf_gain": 37556.08670843984,
+        "affected_unedited_cost_nodes": 42268,
+        "affected_unedited_probability_nodes": 42380,
+        "changed_nodes": 8837,
+        "actual_oa": {
+          "bits": 149648,
+          "stream_sha256": "88f17a280e35152f5a30b9695d6b70a839a111278a8adf8778c1a327ccb020af"
+        },
+        "actual_oa_gain": 37560
+      },
+      "observed_30_percent": false
+    }
+  ],
+  "protected_files": {
+    "20261017_context_oracle_wide_v1": {
+      "files": 15614,
+      "changed": []
+    },
+    "20261017_context_oracle_bench_v1": {
+      "files": 15614,
+      "changed": []
+    },
+    "20261017_context_oracle_native_oa_grid_v1/study": {
+      "files": 15614,
+      "changed": []
+    }
+  },
+  "full_frame_autonomous_oa_decode": false,
+  "global_optimum_proven": false
+}

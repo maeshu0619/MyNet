@@ -1,0 +1,190 @@
+[
+  {
+    "case": "self_improves_total_worsens",
+    "benchmark_id": 29,
+    "edits": [
+      [
+        71335,
+        243
+      ]
+    ],
+    "counts": {
+      "Add": 0,
+      "Prune": 0,
+      "Adjust": 1
+    },
+    "mask_before": "10111011",
+    "mask_after": "11110011",
+    "raw_probability_before": 0.06569423526525497,
+    "raw_probability_after_frozen": 0.09449516981840134,
+    "raw_probability_after_recomputed": 0.09449516981840134,
+    "own_cdf_bits_before": 3.933574399364444,
+    "own_cdf_bits_after": 3.4091790690694754,
+    "window_fraction": 0.6630859375,
+    "changed_context_spatial_distance": {
+      "min": 2.0,
+      "median": 14.560219778561036,
+      "max": 30.133038346638727
+    },
+    "unedited_node_examples": [
+      {
+        "row": 71338,
+        "mask": 207,
+        "gain_bits": -3.821729285815591,
+        "raw_probability_before": 0.023162024095654488,
+        "raw_probability_after": 0.0016299085691571236,
+        "cdf_bits_before": 5.436803727783262,
+        "cdf_bits_after": 9.258533013598854
+      },
+      {
+        "row": 71591,
+        "mask": 5,
+        "gain_bits": -3.1812507653091675,
+        "raw_probability_before": 0.19979408383369446,
+        "raw_probability_after": 0.022015167400240898,
+        "cdf_bits_before": 2.3289012742515354,
+        "cdf_bits_after": 5.510152039560703
+      },
+      {
+        "row": 71337,
+        "mask": 239,
+        "gain_bits": -0.24326161338404795,
+        "raw_probability_before": 0.04728147014975548,
+        "raw_probability_after": 0.039924800395965576,
+        "cdf_bits_before": 4.408010232384875,
+        "cdf_bits_after": 4.651271845768923
+      },
+      {
+        "row": 71505,
+        "mask": 91,
+        "gain_bits": 0.16992500144231215,
+        "raw_probability_before": 0.00011953366629313678,
+        "raw_probability_after": 0.00011997760157100856,
+        "cdf_bits_before": 13.0,
+        "cdf_bits_after": 12.830074998557688
+      },
+      {
+        "row": 71340,
+        "mask": 170,
+        "gain_bits": 0.2320615211464645,
+        "raw_probability_before": 0.026654310524463654,
+        "raw_probability_after": 0.031325675547122955,
+        "cdf_bits_before": 5.233471091401135,
+        "cdf_bits_after": 5.001409570254671
+      }
+    ],
+    "quality": {
+      "chamfer_sq": 2.178329269921022,
+      "d1_mse": 1.5005765054758227,
+      "max_gt_to_rec": 1.7320508075688772,
+      "max_rec_to_gt": 1.7320508075688772
+    },
+    "gpcc_gain": -16,
+    "frozen_self_cdf_gain": 0.5243954658508301,
+    "edited_node_cdf_gain": 0.5243953302949684,
+    "unedited_context_cdf_gain": -6.985542835410779,
+    "total_cdf_gain": -6.461147505115811,
+    "affected_unedited_cost_nodes": 304,
+    "affected_unedited_probability_nodes": 345,
+    "changed_nodes": 1,
+    "actual_oa": {
+      "bits": 188688,
+      "stream_sha256": "4a52f6a299541f0727901177666795597a07451609963e95c80dc5e534007b15"
+    },
+    "actual_oa_gain": -8
+  },
+  {
+    "case": "self_and_context_improve",
+    "benchmark_id": 8,
+    "edits": [
+      [
+        30663,
+        245
+      ]
+    ],
+    "counts": {
+      "Add": 0,
+      "Prune": 0,
+      "Adjust": 1
+    },
+    "mask_before": "10110111",
+    "mask_after": "11110101",
+    "raw_probability_before": 4.377905327146436e-08,
+    "raw_probability_after_frozen": 0.36225494742393494,
+    "raw_probability_after_recomputed": 0.36225494742393494,
+    "own_cdf_bits_before": 16.0,
+    "own_cdf_bits_after": 1.4705084400800743,
+    "window_fraction": 0.9443359375,
+    "changed_context_spatial_distance": {
+      "min": 2.0,
+      "median": 8.601539630659959,
+      "max": 15.231546211727817
+    },
+    "unedited_node_examples": [
+      {
+        "row": 30673,
+        "mask": 245,
+        "gain_bits": -0.7032824679099168,
+        "raw_probability_before": 0.001931829727254808,
+        "raw_probability_after": 0.0011869675945490599,
+        "cdf_bits_before": 9.011315313227835,
+        "cdf_bits_after": 9.714597781137751
+      },
+      {
+        "row": 30684,
+        "mask": 42,
+        "gain_bits": -0.6114347120823478,
+        "raw_probability_before": 0.01515188254415989,
+        "raw_probability_after": 0.009911670349538326,
+        "cdf_bits_before": 6.048715285033028,
+        "cdf_bits_after": 6.660149997115376
+      },
+      {
+        "row": 30680,
+        "mask": 43,
+        "gain_bits": -0.08994212531279899,
+        "raw_probability_before": 0.0027769708540290594,
+        "raw_probability_after": 0.002601106185466051,
+        "cdf_bits_before": 8.492205359801304,
+        "cdf_bits_after": 8.582147485114103
+      },
+      {
+        "row": 30677,
+        "mask": 181,
+        "gain_bits": 1.0,
+        "raw_probability_before": 2.4970916001620935e-07,
+        "raw_probability_after": 2.404789825050102e-07,
+        "cdf_bits_before": 16.0,
+        "cdf_bits_after": 15.0
+      },
+      {
+        "row": 30666,
+        "mask": 171,
+        "gain_bits": 2.3367677139054948,
+        "raw_probability_before": 0.037018656730651855,
+        "raw_probability_after": 0.18710893392562866,
+        "cdf_bits_before": 4.760401470750876,
+        "cdf_bits_after": 2.4236337568453816
+      }
+    ],
+    "quality": {
+      "chamfer_sq": 2.1783198309275966,
+      "d1_mse": 1.5005765054758227,
+      "max_gt_to_rec": 1.7320508075688772,
+      "max_rec_to_gt": 1.7320508075688772
+    },
+    "gpcc_gain": 8,
+    "frozen_self_cdf_gain": 14.529491424560547,
+    "edited_node_cdf_gain": 14.529491559919926,
+    "unedited_context_cdf_gain": 3.9630548213605508,
+    "total_cdf_gain": 18.492546381280476,
+    "affected_unedited_cost_nodes": 52,
+    "affected_unedited_probability_nodes": 57,
+    "changed_nodes": 1,
+    "actual_oa": {
+      "bits": 188656,
+      "stream_sha256": "b01e0ce712a537c57873603aece0e9c2b76e36f892d6985687bc61fb49e0d6c9"
+    },
+    "actual_oa_gain": 24
+  }
+]

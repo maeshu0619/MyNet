@@ -1,0 +1,8 @@
+{
+  "frames": [
+    "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+    "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply"
+  ],
+  "out": "experiments/results/20261017_context_oracle_bench_v1",
+  "candidates": "experiments/results/20261017_octree_joint_masks_v2"
+}

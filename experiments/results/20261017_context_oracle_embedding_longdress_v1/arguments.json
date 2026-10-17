@@ -1,0 +1,7 @@
+{
+  "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+  "wide": "experiments/results/20261017_context_oracle_wide_v1",
+  "seed_plan": "experiments/results/20261017_context_oracle_wide_v1/longdress_vox10_1051/plan_013.npz",
+  "out": "experiments/results/20261017_context_oracle_embedding_longdress_v1",
+  "passes": 2
+}

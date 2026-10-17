@@ -1,0 +1,72 @@
+{
+  "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+  "raw_min": [
+    103.0,
+    9.0,
+    22.0
+  ],
+  "native_grid": "round((raw-raw_min)/2)",
+  "baseline": {
+    "bits": 188072,
+    "codec_sec": 21.681298527866602,
+    "ce_bits": 188593.453125,
+    "nodes": 73780,
+    "arithmetic_roundtrip": true,
+    "stream_sha256": "04e0b4c274c76c451a28be01bb0a3bbdf7cada9c69e49e2fbe0f63d86a9053a1",
+    "levels": {
+      "1": {
+        "nodes": 1,
+        "ce_bits": 4.272367000579834
+      },
+      "2": {
+        "nodes": 2,
+        "ce_bits": 13.5221529006958
+      },
+      "3": {
+        "nodes": 8,
+        "ce_bits": 20.040573120117188
+      },
+      "4": {
+        "nodes": 44,
+        "ce_bits": 159.1315460205078
+      },
+      "5": {
+        "nodes": 194,
+        "ce_bits": 622.4896240234375
+      },
+      "6": {
+        "nodes": 835,
+        "ce_bits": 2264.820068359375
+      },
+      "7": {
+        "nodes": 3410,
+        "ce_bits": 7873.5439453125
+      },
+      "8": {
+        "nodes": 14000,
+        "ce_bits": 27007.11328125
+      },
+      "9": {
+        "nodes": 55286,
+        "ce_bits": 150628.53125
+      }
+    }
+  },
+  "native_teacher": {
+    "bit": 188072.0,
+    "bpp": 0.2455821921832909,
+    "bpn": 2.5490918948224452,
+    "single": 7696.0,
+    "node": 73780.0,
+    "point_count": 765821
+  },
+  "exact_bits_parity": true,
+  "proposal_audit": {
+    "candidate_count": 562371,
+    "joint_rescue_candidates": 104126,
+    "leaf_without_exclusive_nn_assignment": 5009,
+    "generation_sec": 11.76021841634065,
+    "nonpositive_oa_candidates": 490052,
+    "legality": "per-raw-point joint coverage; safe Add distance; bbox anchors; nonempty leaves"
+  }
+}

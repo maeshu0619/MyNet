@@ -1,0 +1,7 @@
+{
+  "frames": [
+    "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+    "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply"
+  ],
+  "out": "experiments/results/20261017_context_oracle_voxelization_v1"
+}

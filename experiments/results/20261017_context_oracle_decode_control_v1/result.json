@@ -1,0 +1,10 @@
+{
+  "official_function_body_unmodified": true,
+  "nodes": 64,
+  "voxels": 119,
+  "actual_bits": 528,
+  "symbol_roundtrip": true,
+  "geometry_roundtrip": true,
+  "autonomous_probabilities": true,
+  "elapsed_sec": 0.8842957019805908
+}

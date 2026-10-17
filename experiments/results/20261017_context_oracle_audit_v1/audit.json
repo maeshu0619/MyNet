@@ -1,0 +1,61 @@
+{
+  "commit": "fdc313b84acaf00585ce12e33745012693de657f",
+  "help_returncode": 1,
+  "probability_help_lines": [
+    "        --entropyContinuationEnabled=0  Propagate context state between",
+    "                                        probability updateOnly applies when",
+    "        --InterEntropyContinuationEnabled=0",
+    "        --numOctreeEntropyStreams=1     Number of entropy streams for octree"
+  ],
+  "native_per_node_probability_api": false,
+  "probability_evidence": [
+    "tmc3/geometry_octree_encoder.cpp: OBUF context evolution + inferred bits",
+    "tmc3/entropydirac.h: threshold-clamped private probability before Schro bit coding",
+    "existing GPCCGeometryEncoder exports stream size, not per-node models"
+  ],
+  "effective_oa_actual_mode": "geometry_codec.configure_geometry_codec sets True unless explicitly overridden",
+  "comparison_current_score": "zero-Actor default empirical prior; not running Network checkpoint evaluation",
+  "proposal_initialization": [
+    {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "voxels": 211887,
+      "leaf_parents": 55435,
+      "pool_counts": {
+        "Add": 848,
+        "Prune": 848,
+        "Adjust": 424
+      },
+      "native_candidates": 2120,
+      "single_nonempty_parent_candidates": 1672,
+      "supported_quality_legal_masks": 722,
+      "expanded_legal_masks": 552319,
+      "operation_shares": {
+        "Add": 0.4,
+        "Prune": 0.4,
+        "Adjust": 0.2
+      },
+      "initial_total_ratio": 0.0025
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+      "voxels": 198530,
+      "leaf_parents": 51812,
+      "pool_counts": {
+        "Add": 795,
+        "Prune": 795,
+        "Adjust": 398
+      },
+      "native_candidates": 1988,
+      "single_nonempty_parent_candidates": 1582,
+      "supported_quality_legal_masks": 653,
+      "expanded_legal_masks": 540631,
+      "operation_shares": {
+        "Add": 0.4,
+        "Prune": 0.4,
+        "Adjust": 0.2
+      },
+      "initial_total_ratio": 0.0025
+    }
+  ],
+  "protected_files_unchanged": 15614
+}

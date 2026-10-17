@@ -1,0 +1,137 @@
+[
+  {
+    "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+    "trial": "same_pool_comparison",
+    "budget": 0.05,
+    "method": "current_prior",
+    "winner": 1,
+    "candidate_plan_ids": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "operation_percent": 0.2975782796196666,
+    "counts": {
+      "Add": 187,
+      "Prune": 174,
+      "Adjust": 269
+    },
+    "oa_C": -1.3867029648219842,
+    "gpcc_C": -0.18713575362241386,
+    "quality": {
+      "chamfer_sq": 2.174744541232198,
+      "d1_mse": 1.4995997759267505,
+      "max_gt_to_rec": 1.7320508075688772,
+      "max_rec_to_gt": 1.7320508075688772
+    }
+  },
+  {
+    "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+    "trial": "same_pool_comparison",
+    "budget": 0.05,
+    "method": "node_only",
+    "winner": 2,
+    "candidate_plan_ids": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "operation_percent": 4.999787444085986,
+    "counts": {
+      "Add": 2930,
+      "Prune": 3099,
+      "Adjust": 4556
+    },
+    "oa_C": -17.125356246543877,
+    "gpcc_C": -0.42239212960487604,
+    "quality": {
+      "chamfer_sq": 2.1511172194362524,
+      "d1_mse": 1.4995997759267505,
+      "max_gt_to_rec": 1.7320508075688772,
+      "max_rec_to_gt": 1.7320508075688772
+    }
+  },
+  {
+    "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+    "trial": "same_pool_comparison",
+    "budget": 0.05,
+    "method": "total_context",
+    "winner": 3,
+    "candidate_plan_ids": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "operation_percent": 4.995536325805705,
+    "counts": {
+      "Add": 2386,
+      "Prune": 3186,
+      "Adjust": 5004
+    },
+    "oa_C": -20.651665319664815,
+    "gpcc_C": -1.4810458215259614,
+    "quality": {
+      "chamfer_sq": 2.1443612607377354,
+      "d1_mse": 1.4995997759267505,
+      "max_gt_to_rec": 1.7320508075688772,
+      "max_rec_to_gt": 1.7320508075688772
+    }
+  },
+  {
+    "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+    "trial": "same_pool_comparison",
+    "budget": 0.05,
+    "method": "actual_oa_oracle",
+    "winner": 3,
+    "candidate_plan_ids": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "operation_percent": 4.995536325805705,
+    "counts": {
+      "Add": 2386,
+      "Prune": 3186,
+      "Adjust": 5004
+    },
+    "oa_C": -20.651665319664815,
+    "gpcc_C": -1.4810458215259614,
+    "quality": {
+      "chamfer_sq": 2.1443612607377354,
+      "d1_mse": 1.4995997759267505,
+      "max_gt_to_rec": 1.7320508075688772,
+      "max_rec_to_gt": 1.7320508075688772
+    }
+  },
+  {
+    "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+    "trial": "same_pool_comparison",
+    "budget": 0.05,
+    "method": "actual_gpcc_oracle",
+    "winner": 3,
+    "candidate_plan_ids": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "operation_percent": 4.995536325805705,
+    "counts": {
+      "Add": 2386,
+      "Prune": 3186,
+      "Adjust": 5004
+    },
+    "oa_C": -20.651665319664815,
+    "gpcc_C": -1.4810458215259614,
+    "quality": {
+      "chamfer_sq": 2.1443612607377354,
+      "d1_mse": 1.4995997759267505,
+      "max_gt_to_rec": 1.7320508075688772,
+      "max_rec_to_gt": 1.7320508075688772
+    }
+  }
+]

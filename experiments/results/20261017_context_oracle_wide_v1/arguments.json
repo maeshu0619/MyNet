@@ -1,0 +1,21 @@
+{
+  "args": {
+    "frames": [
+      "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply"
+    ],
+    "out": "experiments/results/20261017_context_oracle_wide_v1",
+    "candidates": "experiments/results/20261017_octree_joint_masks_v2",
+    "budgets": [
+      0.0015,
+      0.003,
+      0.01,
+      0.03,
+      0.05
+    ]
+  },
+  "commit": "fdc313b84acaf00585ce12e33745012693de657f",
+  "source_sha256": "8c638f21b3b107c76a530519269ccef1661aef64825985cbad489f1e2fe361fa",
+  "current_score": "zero-Actor empirical prior logits; no Network checkpoint loaded",
+  "gpcc_node_probabilities": "unavailable from existing wrapper; full Actual stream teacher only"
+}

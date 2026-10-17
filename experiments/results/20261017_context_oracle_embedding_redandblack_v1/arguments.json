@@ -1,0 +1,7 @@
+{
+  "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+  "wide": "experiments/results/20261017_context_oracle_wide_v1",
+  "seed_plan": "experiments/results/20261017_context_oracle_wide_v1/redandblack_vox10_1451/plan_013.npz",
+  "out": "experiments/results/20261017_context_oracle_embedding_redandblack_v1",
+  "passes": 2
+}
