@@ -1,0 +1,31 @@
+{
+  "arguments": {
+    "frames": [
+      "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "/data/maejima/data/ground/8i/loot/loot_vox10_1000.ply",
+      "/data/maejima/data/ground/8i/soldier/soldier_vox10_0536.ply"
+    ],
+    "out": "/tmp/octree-oa-leaf-20261017",
+    "codecs": [
+      "oa",
+      "gpcc"
+    ],
+    "modes": [
+      "leaf",
+      "prune",
+      "quant",
+      "orientation"
+    ],
+    "budgets": [
+      0.0015,
+      0.003,
+      0.03
+    ],
+    "oa_device": "cpu",
+    "qs": 2.0,
+    "reflections": false
+  },
+  "source_sha256": "e571a05ebd1a76d43fee6dccd45ebf4fba20409cc842b69afecf26b26fb7f071",
+  "coordinate_protocol": "Common G-PCC qs grid, OA canonical integer input with qs=1",
+  "existing_training_modified": false
+}

@@ -1,0 +1,28 @@
+{
+  "arguments": {
+    "frames": [
+      "/data/maejima/data/ground/8i/loot/loot_vox10_1000.ply",
+      "/data/maejima/data/ground/8i/soldier/soldier_vox10_0536.ply"
+    ],
+    "out": "/tmp/octree-oa-transfer-final-20261017",
+    "codecs": [
+      "oa"
+    ],
+    "modes": [
+      "orientation",
+      "prune",
+      "quant"
+    ],
+    "budgets": [
+      0.0015,
+      0.003,
+      0.03
+    ],
+    "oa_device": "cpu",
+    "qs": 2.0,
+    "reflections": false
+  },
+  "source_sha256": "cac4fce31f39be29d5c7348378b5ba9333c84003f383bd803be8d9949166220e",
+  "coordinate_protocol": "Common G-PCC qs grid, OA canonical integer input with qs=1",
+  "existing_training_modified": false
+}

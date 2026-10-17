@@ -1,0 +1,23 @@
+{
+  "arguments": {
+    "frames": [
+      "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply"
+    ],
+    "out": "/tmp/octree-oa-pilot-20261017",
+    "codecs": [
+      "oa"
+    ],
+    "modes": [
+      "prune"
+    ],
+    "budgets": [
+      0.0015
+    ],
+    "oa_device": "cpu",
+    "qs": 2.0,
+    "reflections": false
+  },
+  "source_sha256": "3078373b0a77df9fef83628a4a47921ad946c391c31d4c9bef214caa84697785",
+  "coordinate_protocol": "Common G-PCC qs grid, OA canonical integer input with qs=1",
+  "existing_training_modified": false
+}

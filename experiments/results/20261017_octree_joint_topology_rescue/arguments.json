@@ -1,0 +1,12 @@
+{
+  "frames": [
+    "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+    "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply"
+  ],
+  "out": "experiments/results/20261017_octree_joint_topology_rescue",
+  "budget": 0.0015,
+  "max_parents": 12000,
+  "rankings": [
+    "rescue"
+  ]
+}

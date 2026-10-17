@@ -1,0 +1,87 @@
+[
+  {
+    "source": "/tmp/octree-gpcc-research-20261017/trials.jsonl",
+    "archived": "experiments/results/20261017_octree_codec_research/octree-gpcc-research-20261017/trials.jsonl",
+    "sha256": "69c8e54ad05bce33b8fbe8dcf3cbc6ae095cb6596e313ff6b5c3b1b4007eba94"
+  },
+  {
+    "source": "/tmp/octree-gpcc-research-20261017/metadata.json",
+    "archived": "experiments/results/20261017_octree_codec_research/octree-gpcc-research-20261017/metadata.json",
+    "sha256": "d71fe36f7b57c2be8db70597ee8a93d21e1bc93555db6c63c2bf171f5f5c02b1"
+  },
+  {
+    "source": "/tmp/octree-oa-pilot-20261017/trials.jsonl",
+    "archived": "experiments/results/20261017_octree_codec_research/octree-oa-pilot-20261017/trials.jsonl",
+    "sha256": "93e9fa88d49c132e2d65abce89cbbd25c293e23ca1cd4f60aab124675d80b241"
+  },
+  {
+    "source": "/tmp/octree-oa-pilot-20261017/metadata.json",
+    "archived": "experiments/results/20261017_octree_codec_research/octree-oa-pilot-20261017/metadata.json",
+    "sha256": "3a5a3777729edc1ab6076e3f9f1895b20cf7376a46a07e40dd9e45c68c696d48"
+  },
+  {
+    "source": "/tmp/octree-oa-leaf-20261017/trials.jsonl",
+    "archived": "experiments/results/20261017_octree_codec_research/octree-oa-leaf-20261017/trials.jsonl",
+    "sha256": "d3f606c438d7c675ce030bd6425a351cd556879b2153ce9f705e79d32fd9a011"
+  },
+  {
+    "source": "/tmp/octree-oa-leaf-20261017/metadata.json",
+    "archived": "experiments/results/20261017_octree_codec_research/octree-oa-leaf-20261017/metadata.json",
+    "sha256": "88acf00c018ca6393c7d8851acd6abc6a2e33eb4043bd47c3d3dfc8c049224e3"
+  },
+  {
+    "source": "/tmp/octree-oa-transfer-final-20261017/trials.jsonl",
+    "archived": "experiments/results/20261017_octree_codec_research/octree-oa-transfer-final-20261017/trials.jsonl",
+    "sha256": "47411cf6737304d642b819d34fe6dfde5d914459659a148921876c5a663cfe00"
+  },
+  {
+    "source": "/tmp/octree-oa-transfer-final-20261017/metadata.json",
+    "archived": "experiments/results/20261017_octree_codec_research/octree-oa-transfer-final-20261017/metadata.json",
+    "sha256": "4e6c67e96984b9d10f02c17bd4d503ff6dc98082bfe2ebca44c0b12afad58cfd"
+  },
+  {
+    "source": "/tmp/octree-conditional-leaf-final-20261017/trials.jsonl",
+    "archived": "experiments/results/20261017_octree_codec_research/octree-conditional-leaf-final-20261017/trials.jsonl",
+    "sha256": "745fa233d2b48d9d52fd0b3077bb0957949ce8d0a520aed438102136ec652fb2"
+  },
+  {
+    "source": "/tmp/octree-conditional-leaf-final-20261017/metadata.json",
+    "archived": "experiments/results/20261017_octree_codec_research/octree-conditional-leaf-final-20261017/metadata.json",
+    "sha256": "29290d0dbf4a839f7a62541d4280276f6605aaf887f480ad1780bbfb5c20c400"
+  },
+  {
+    "source": "/tmp/octree-pattern-final-20261017/trials.jsonl",
+    "archived": "experiments/results/20261017_octree_codec_research/octree-pattern-final-20261017/trials.jsonl",
+    "sha256": "cf3a764e3e132c646164fb5e2449c4fc52d942c53cb21f5541acfba3ce8ba8ff"
+  },
+  {
+    "source": "/tmp/octree-pattern-final-20261017/metadata.json",
+    "archived": "experiments/results/20261017_octree_codec_research/octree-pattern-final-20261017/metadata.json",
+    "sha256": "e868127f0913d67cb1b16e4023dc70552e9eff5174d24846d51f506ddff5f8fa"
+  },
+  {
+    "source": "/tmp/octree-window-final-20261017/results.jsonl",
+    "archived": "experiments/results/20261017_octree_codec_research/octree-window-final-20261017/results.jsonl",
+    "sha256": "a778cce6f9f107d8ecd5688eddd106d466c9620125ba8b42f635ffd530e54898"
+  },
+  {
+    "source": "/tmp/octree-window-final-20261017/redandblack_vox10_1451_window.npz",
+    "archived": "experiments/results/20261017_octree_codec_research/octree-window-final-20261017/redandblack_vox10_1451_window.npz",
+    "sha256": "8aca2a569c667d98d396b7ed44ab0eb004cb355d5b7e7e8bd439e0d7fc4383c1"
+  },
+  {
+    "source": "/tmp/octree-window-final-20261017/longdress_vox10_1051_window.npz",
+    "archived": "experiments/results/20261017_octree_codec_research/octree-window-final-20261017/longdress_vox10_1051_window.npz",
+    "sha256": "50820bd8ec5f174b96af15235c3e03521d747bb0e19d785ed5d3cec3e06b8f6d"
+  },
+  {
+    "source": "/tmp/octree-teacher-validation-20261017/symbol_ce.npz",
+    "archived": "experiments/results/20261017_octree_codec_research/octree-teacher-validation-20261017/symbol_ce.npz",
+    "sha256": "4e9e98f1695b3db7213024e5869a1b909c689e19019b3595640dfe6e92e107c1"
+  },
+  {
+    "source": "/tmp/octree-teacher-validation-20261017/validation.json",
+    "archived": "experiments/results/20261017_octree_codec_research/octree-teacher-validation-20261017/validation.json",
+    "sha256": "6b211d28023e33a04d0970d98165f76b81435c69a0a2abf64a59107515cc7816"
+  }
+]

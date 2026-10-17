@@ -1,0 +1,3866 @@
+{
+  "raw_trial_rows": 268,
+  "window_validation_cases": 2,
+  "frames": {
+    "gpcc|longdress_vox10_1051": {
+      "baseline": {
+        "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+        "codec": "gpcc",
+        "trial": "baseline",
+        "bits": 150240,
+        "stream_sha256": "fa7b6836f413a0ca6ecd73c883625067344522ccb82e6bd9a73d746a9157722e",
+        "codec_sec": 1.1052417322061956,
+        "decoded_exact": true,
+        "chamfer_sq": 2.178329269921022,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772,
+        "details": {},
+        "baseline_bits": 150240,
+        "compression_percent": 0.0,
+        "baseline_voxels": 211887,
+        "edited_voxels": 211887,
+        "removed": 0,
+        "added": 0,
+        "min_operation_percent": 0.0,
+        "run": "octree-gpcc-research-20261017",
+        "physical_operation_percent": 0.0,
+        "net_bits_with_transform_id": 150240,
+        "net_compression_percent": 0.0
+      },
+      "best_orientation": {
+        "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+        "codec": "gpcc",
+        "trial": "orientation_120_pnp",
+        "bits": 149256,
+        "stream_sha256": "96b266732279f76a8954dbe693d1203f16a3dca2af985c39181d0c17fb36c925",
+        "codec_sec": 0.7812011279165745,
+        "decoded_exact": false,
+        "chamfer_sq": 2.178329269921022,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772,
+        "details": {
+          "physical_voxel_edits": 0,
+          "requires_inverse_transform": true,
+          "side_information_bits": 6,
+          "not_Add_Prune_Adjust": true
+        },
+        "baseline_bits": 150240,
+        "compression_percent": -0.6549520766773176,
+        "baseline_voxels": 211887,
+        "edited_voxels": 211887,
+        "removed": 211887,
+        "added": 211887,
+        "min_operation_percent": 100.0,
+        "run": "octree-gpcc-research-20261017",
+        "physical_operation_percent": 0.0,
+        "net_bits_with_transform_id": 149264,
+        "net_compression_percent": -0.6496272630457933
+      },
+      "conditional_leaf": [
+        {
+          "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+          "codec": "gpcc",
+          "trial": "oa_conditional_leaf_0.00150",
+          "bits": 149648,
+          "stream_sha256": "5e3c50a0e2e911c6d845510498b2e10d8aad9a648d0843276ee040ebff0f8c49",
+          "codec_sec": 0.8075716961175203,
+          "decoded_exact": false,
+          "chamfer_sq": 2.177155641623221,
+          "d1_mse": 1.5005765054758227,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "counts": {
+              "Add": 31,
+              "Prune": 30,
+              "Adjust": 257
+            },
+            "predicted_local_gain": 3837.527280837196,
+            "candidate_count": 41434,
+            "edited_leaf_nodes": 318
+          },
+          "baseline_bits": 150240,
+          "compression_percent": -0.3940362087326954,
+          "net_bits": 149648,
+          "net_compression_percent": -0.3940362087326954,
+          "baseline_voxels": 211887,
+          "edited_voxels": 211888,
+          "removed": 287,
+          "added": 288,
+          "code_space_removed": 287,
+          "code_space_added": 288,
+          "min_operation_percent": 0.13592150533067154,
+          "run": "octree-conditional-leaf-final-20261017",
+          "physical_operation_percent": 0.15007999546928316,
+          "net_bits_with_transform_id": 149648
+        },
+        {
+          "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+          "codec": "gpcc",
+          "trial": "oa_conditional_leaf_0.00300",
+          "bits": 149632,
+          "stream_sha256": "1626e6966dad5e42641fe0b88fdbd4d7a58f2838d7031ab624e6f428d0de48c0",
+          "codec_sec": 0.8006533738225698,
+          "decoded_exact": false,
+          "chamfer_sq": 2.176008188840381,
+          "d1_mse": 1.5005765054758227,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "counts": {
+              "Add": 84,
+              "Prune": 68,
+              "Adjust": 484
+            },
+            "predicted_local_gain": 6820.315397143168,
+            "candidate_count": 41434,
+            "edited_leaf_nodes": 636
+          },
+          "baseline_bits": 150240,
+          "compression_percent": -0.4046858359957439,
+          "net_bits": 149632,
+          "net_compression_percent": -0.4046858359957439,
+          "baseline_voxels": 211887,
+          "edited_voxels": 211903,
+          "removed": 552,
+          "added": 568,
+          "code_space_removed": 552,
+          "code_space_added": 568,
+          "min_operation_percent": 0.26806741329104666,
+          "run": "octree-conditional-leaf-final-20261017",
+          "physical_operation_percent": 0.3001599909385663,
+          "net_bits_with_transform_id": 149632
+        },
+        {
+          "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+          "codec": "gpcc",
+          "trial": "oa_conditional_leaf_0.03000",
+          "bits": 150144,
+          "stream_sha256": "4d5e7ce2b9419d5b9508d302b1f5a098cac8e7dd6c29f09bbdb97d00c0f3ca53",
+          "codec_sec": 0.8065243680030107,
+          "decoded_exact": false,
+          "chamfer_sq": 2.1614855792283705,
+          "d1_mse": 1.5005765054758227,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "counts": {
+              "Add": 1806,
+              "Prune": 1741,
+              "Adjust": 2810
+            },
+            "predicted_local_gain": 39447.975832475255,
+            "candidate_count": 41434,
+            "edited_leaf_nodes": 6357
+          },
+          "baseline_bits": 150240,
+          "compression_percent": -0.06389776357828003,
+          "net_bits": 150144,
+          "net_compression_percent": -0.06389776357828003,
+          "baseline_voxels": 211887,
+          "edited_voxels": 211952,
+          "removed": 4551,
+          "added": 4616,
+          "code_space_removed": 4551,
+          "code_space_added": 4616,
+          "min_operation_percent": 2.178519682661041,
+          "run": "octree-conditional-leaf-final-20261017",
+          "physical_operation_percent": 3.0001840603718017,
+          "net_bits_with_transform_id": 150144
+        },
+        {
+          "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+          "codec": "gpcc",
+          "trial": "oa_conditional_leaf_0.30000",
+          "bits": 159384,
+          "stream_sha256": "e775fdefbe602fbff0c7d7cbcca2fcc3c4875e5d9c1e7214150b0101f05e3a27",
+          "codec_sec": 0.855707255192101,
+          "decoded_exact": false,
+          "chamfer_sq": 2.144396671623574,
+          "d1_mse": 1.5005765054758227,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "counts": {
+              "Add": 8626,
+              "Prune": 9496,
+              "Adjust": 5658
+            },
+            "predicted_local_gain": 70104.62664512322,
+            "candidate_count": 41434,
+            "edited_leaf_nodes": 23780
+          },
+          "baseline_bits": 150240,
+          "compression_percent": 6.086261980830665,
+          "net_bits": 159384,
+          "net_compression_percent": 6.086261980830665,
+          "baseline_voxels": 211887,
+          "edited_voxels": 211017,
+          "removed": 15154,
+          "added": 14284,
+          "code_space_removed": 15154,
+          "code_space_added": 14284,
+          "min_operation_percent": 7.1519253186840155,
+          "run": "octree-conditional-leaf-final-20261017",
+          "physical_operation_percent": 11.222963183206144,
+          "net_bits_with_transform_id": 159384
+        }
+      ],
+      "pattern_leaf": [
+        {
+          "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+          "codec": "gpcc",
+          "trial": "oa_pattern_leaf_0.00150",
+          "bits": 149648,
+          "stream_sha256": "5e3c50a0e2e911c6d845510498b2e10d8aad9a648d0843276ee040ebff0f8c49",
+          "codec_sec": 0.8117529647424817,
+          "decoded_exact": false,
+          "chamfer_sq": 2.177155641623221,
+          "d1_mse": 1.5005765054758227,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "counts": {
+              "Add": 31,
+              "Prune": 30,
+              "Adjust": 257
+            },
+            "predicted_local_gain": 3837.5272760391235,
+            "candidate_count": 25616,
+            "edited_leaf_nodes": 318,
+            "coherent_eight_child_masks": true
+          },
+          "baseline_bits": 150240,
+          "compression_percent": -0.3940362087326954,
+          "net_bits": 149648,
+          "net_compression_percent": -0.3940362087326954,
+          "baseline_voxels": 211887,
+          "edited_voxels": 211888,
+          "removed": 287,
+          "added": 288,
+          "code_space_removed": 287,
+          "code_space_added": 288,
+          "min_operation_percent": 0.13592150533067154,
+          "run": "octree-pattern-final-20261017",
+          "physical_operation_percent": 0.15007999546928316,
+          "net_bits_with_transform_id": 149648
+        },
+        {
+          "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+          "codec": "gpcc",
+          "trial": "oa_pattern_leaf_0.00300",
+          "bits": 149632,
+          "stream_sha256": "0a6455c4109ca39522c856c9d79606910f2361a510b578e75df4549af3849c97",
+          "codec_sec": 0.8422850840725005,
+          "decoded_exact": false,
+          "chamfer_sq": 2.1759972188244463,
+          "d1_mse": 1.5005765054758227,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "counts": {
+              "Add": 84,
+              "Prune": 69,
+              "Adjust": 483
+            },
+            "predicted_local_gain": 6821.527151107788,
+            "candidate_count": 25616,
+            "edited_leaf_nodes": 634,
+            "coherent_eight_child_masks": true
+          },
+          "baseline_bits": 150240,
+          "compression_percent": -0.4046858359957439,
+          "net_bits": 149632,
+          "net_compression_percent": -0.4046858359957439,
+          "baseline_voxels": 211887,
+          "edited_voxels": 211902,
+          "removed": 552,
+          "added": 567,
+          "code_space_removed": 552,
+          "code_space_added": 567,
+          "min_operation_percent": 0.2675954636197596,
+          "run": "octree-pattern-final-20261017",
+          "physical_operation_percent": 0.3001599909385663,
+          "net_bits_with_transform_id": 149632
+        },
+        {
+          "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+          "codec": "gpcc",
+          "trial": "oa_pattern_leaf_0.03000",
+          "bits": 149920,
+          "stream_sha256": "d2ad028eac3b1fdfacb5ceac5931b0ced9668d22d432658fe258d291db96f6e6",
+          "codec_sec": 0.9207793511450291,
+          "decoded_exact": false,
+          "chamfer_sq": 2.1609922477986556,
+          "d1_mse": 1.5005765054758227,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "counts": {
+              "Add": 1675,
+              "Prune": 1700,
+              "Adjust": 2982
+            },
+            "predicted_local_gain": 40245.27712726593,
+            "candidate_count": 25616,
+            "edited_leaf_nodes": 5975,
+            "coherent_eight_child_masks": true
+          },
+          "baseline_bits": 150240,
+          "compression_percent": -0.21299254526091493,
+          "net_bits": 149920,
+          "net_compression_percent": -0.21299254526091493,
+          "baseline_voxels": 211887,
+          "edited_voxels": 211862,
+          "removed": 4682,
+          "added": 4657,
+          "code_space_removed": 4682,
+          "code_space_added": 4657,
+          "min_operation_percent": 2.2096683609659866,
+          "run": "octree-pattern-final-20261017",
+          "physical_operation_percent": 3.0001840603718017,
+          "net_bits_with_transform_id": 149920
+        },
+        {
+          "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+          "codec": "gpcc",
+          "trial": "oa_pattern_leaf_0.30000",
+          "bits": 160888,
+          "stream_sha256": "ee82e960c94b760c502302369e8559e268cc70aba83d05fc78d1b16f69a250e5",
+          "codec_sec": 0.8128325683064759,
+          "decoded_exact": false,
+          "chamfer_sq": 2.1388794411648147,
+          "d1_mse": 1.5005765054758227,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "counts": {
+              "Add": 10712,
+              "Prune": 12495,
+              "Adjust": 7408
+            },
+            "predicted_local_gain": 83456.45668033678,
+            "candidate_count": 25616,
+            "edited_leaf_nodes": 25616,
+            "coherent_eight_child_masks": true
+          },
+          "baseline_bits": 150240,
+          "compression_percent": 7.087326943556982,
+          "net_bits": 160888,
+          "net_compression_percent": 7.087326943556982,
+          "baseline_voxels": 211887,
+          "edited_voxels": 210104,
+          "removed": 19903,
+          "added": 18120,
+          "code_space_removed": 19903,
+          "code_space_added": 18120,
+          "min_operation_percent": 9.393214307626234,
+          "run": "octree-pattern-final-20261017",
+          "physical_operation_percent": 14.448739186453157,
+          "net_bits_with_transform_id": 160888
+        }
+      ],
+      "quantization": [
+        {
+          "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+          "codec": "gpcc",
+          "trial": "quant_halfup",
+          "bits": 160144,
+          "stream_sha256": "ca4f189a091e1772ac6157035b6bb271a7579d9da0cc366970c5aae1a4ad5206",
+          "codec_sec": 0.8130422378890216,
+          "decoded_exact": false,
+          "chamfer_sq": 2.184921523273611,
+          "d1_mse": 1.5005765054758227,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "not_micro": true
+          },
+          "baseline_bits": 150240,
+          "compression_percent": 6.592119275825348,
+          "baseline_voxels": 211887,
+          "edited_voxels": 212105,
+          "removed": 45254,
+          "added": 45472,
+          "min_operation_percent": 21.460495452764917,
+          "run": "octree-gpcc-research-20261017",
+          "physical_operation_percent": 21.460495452764917,
+          "net_bits_with_transform_id": 160144,
+          "net_compression_percent": 6.592119275825348
+        },
+        {
+          "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+          "codec": "gpcc",
+          "trial": "quant_floor",
+          "bits": 161656,
+          "stream_sha256": "205974d24c6af28d1416bc8a3cb4822d013896713dc8a5dad60947cce5856077",
+          "codec_sec": 0.8476345329545438,
+          "decoded_exact": false,
+          "chamfer_sq": 2.1853465540082935,
+          "d1_mse": 1.5005765054758227,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "not_micro": true
+          },
+          "baseline_bits": 150240,
+          "compression_percent": 7.598509052183178,
+          "baseline_voxels": 211887,
+          "edited_voxels": 212023,
+          "removed": 45713,
+          "added": 45849,
+          "min_operation_percent": 21.638420478840136,
+          "run": "octree-gpcc-research-20261017",
+          "physical_operation_percent": 21.638420478840136,
+          "net_bits_with_transform_id": 161656,
+          "net_compression_percent": 7.598509052183178
+        },
+        {
+          "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+          "codec": "gpcc",
+          "trial": "quant_ceil",
+          "bits": 160144,
+          "stream_sha256": "ca4f189a091e1772ac6157035b6bb271a7579d9da0cc366970c5aae1a4ad5206",
+          "codec_sec": 0.8089942191727459,
+          "decoded_exact": false,
+          "chamfer_sq": 2.184921523273611,
+          "d1_mse": 1.5005765054758227,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "not_micro": true
+          },
+          "baseline_bits": 150240,
+          "compression_percent": 6.592119275825348,
+          "baseline_voxels": 211887,
+          "edited_voxels": 212105,
+          "removed": 45254,
+          "added": 45472,
+          "min_operation_percent": 21.460495452764917,
+          "run": "octree-gpcc-research-20261017",
+          "physical_operation_percent": 21.460495452764917,
+          "net_bits_with_transform_id": 160144,
+          "net_compression_percent": 6.592119275825348
+        }
+      ]
+    },
+    "gpcc|loot_vox10_1000": {
+      "baseline": {
+        "frame": "/data/maejima/data/ground/8i/loot/loot_vox10_1000.ply",
+        "codec": "gpcc",
+        "trial": "baseline",
+        "bits": 144536,
+        "stream_sha256": "c9fe30c02c4a19ba98686c6570dcbe53fe38de6bd773a5ca17aa12ac23f61252",
+        "codec_sec": 1.2101319120265543,
+        "decoded_exact": true,
+        "chamfer_sq": 2.1731699093591006,
+        "d1_mse": 1.5003200950848188,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772,
+        "details": {},
+        "baseline_bits": 144536,
+        "compression_percent": 0.0,
+        "baseline_voxels": 216179,
+        "edited_voxels": 216179,
+        "removed": 0,
+        "added": 0,
+        "min_operation_percent": 0.0,
+        "run": "octree-gpcc-research-20261017",
+        "physical_operation_percent": 0.0,
+        "net_bits_with_transform_id": 144536,
+        "net_compression_percent": 0.0
+      },
+      "best_orientation": {
+        "frame": "/data/maejima/data/ground/8i/loot/loot_vox10_1000.ply",
+        "codec": "gpcc",
+        "trial": "orientation_210_npp",
+        "bits": 143776,
+        "stream_sha256": "ab12306327574dda0df2f6eaa7b211474c4cd5bdaa7946e534fe7656a9fc28fb",
+        "codec_sec": 0.857206042855978,
+        "decoded_exact": false,
+        "chamfer_sq": 2.1731699093591006,
+        "d1_mse": 1.5003200950848188,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772,
+        "details": {
+          "physical_voxel_edits": 0,
+          "requires_inverse_transform": true,
+          "side_information_bits": 6,
+          "not_Add_Prune_Adjust": true
+        },
+        "baseline_bits": 144536,
+        "compression_percent": -0.5258205568162921,
+        "baseline_voxels": 216179,
+        "edited_voxels": 216179,
+        "removed": 216179,
+        "added": 216179,
+        "min_operation_percent": 100.0,
+        "run": "octree-gpcc-research-20261017",
+        "physical_operation_percent": 0.0,
+        "net_bits_with_transform_id": 143784,
+        "net_compression_percent": -0.5202856035866454
+      },
+      "conditional_leaf": [
+        {
+          "frame": "/data/maejima/data/ground/8i/loot/loot_vox10_1000.ply",
+          "codec": "gpcc",
+          "trial": "oa_conditional_leaf_0.00150",
+          "bits": 144400,
+          "stream_sha256": "bbddfd90c1ee43a1275a8dd9ade710f4d6207a49cedb49f7f824fa264027ce00",
+          "codec_sec": 0.8484022906050086,
+          "decoded_exact": false,
+          "chamfer_sq": 2.1721518758002873,
+          "d1_mse": 1.5003200950848188,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "counts": {
+              "Add": 52,
+              "Prune": 37,
+              "Adjust": 235
+            },
+            "predicted_local_gain": 3654.3262979913643,
+            "candidate_count": 39421,
+            "edited_leaf_nodes": 324
+          },
+          "baseline_bits": 144536,
+          "compression_percent": -0.09409420490397169,
+          "net_bits": 144400,
+          "net_compression_percent": -0.09409420490397169,
+          "baseline_voxels": 216179,
+          "edited_voxels": 216194,
+          "removed": 272,
+          "added": 287,
+          "code_space_removed": 272,
+          "code_space_added": 287,
+          "min_operation_percent": 0.1327603513754805,
+          "run": "octree-conditional-leaf-final-20261017",
+          "physical_operation_percent": 0.1498757973716226,
+          "net_bits_with_transform_id": 144400
+        },
+        {
+          "frame": "/data/maejima/data/ground/8i/loot/loot_vox10_1000.ply",
+          "codec": "gpcc",
+          "trial": "oa_conditional_leaf_0.00300",
+          "bits": 144424,
+          "stream_sha256": "75e6a9f647fd2eed356585e6a867a69358a32d40306797f7945f0e62c8b66bfa",
+          "codec_sec": 0.8419628031551838,
+          "decoded_exact": false,
+          "chamfer_sq": 2.1713027540443566,
+          "d1_mse": 1.5003200950848188,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "counts": {
+              "Add": 138,
+              "Prune": 67,
+              "Adjust": 444
+            },
+            "predicted_local_gain": 6609.214188762315,
+            "candidate_count": 39421,
+            "edited_leaf_nodes": 649
+          },
+          "baseline_bits": 144536,
+          "compression_percent": -0.07748934521503159,
+          "net_bits": 144424,
+          "net_compression_percent": -0.07748934521503159,
+          "baseline_voxels": 216179,
+          "edited_voxels": 216250,
+          "removed": 511,
+          "added": 582,
+          "code_space_removed": 511,
+          "code_space_added": 582,
+          "min_operation_percent": 0.26922133972309986,
+          "run": "octree-conditional-leaf-final-20261017",
+          "physical_operation_percent": 0.30021417436476255,
+          "net_bits_with_transform_id": 144424
+        },
+        {
+          "frame": "/data/maejima/data/ground/8i/loot/loot_vox10_1000.ply",
+          "codec": "gpcc",
+          "trial": "oa_conditional_leaf_0.03000",
+          "bits": 144568,
+          "stream_sha256": "168fb778dc3a94508e3a95c20a3a04fe8b9b26f722116dd3f42ec2b6cac54bb1",
+          "codec_sec": 0.8691777409985662,
+          "decoded_exact": false,
+          "chamfer_sq": 2.15690670016565,
+          "d1_mse": 1.5003200950848188,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "counts": {
+              "Add": 2025,
+              "Prune": 1704,
+              "Adjust": 2756
+            },
+            "predicted_local_gain": 39647.97033795772,
+            "candidate_count": 39421,
+            "edited_leaf_nodes": 6485
+          },
+          "baseline_bits": 144536,
+          "compression_percent": 0.0221398129185868,
+          "net_bits": 144568,
+          "net_compression_percent": 0.0221398129185868,
+          "baseline_voxels": 216179,
+          "edited_voxels": 216500,
+          "removed": 4460,
+          "added": 4781,
+          "code_space_removed": 4460,
+          "code_space_added": 4781,
+          "min_operation_percent": 2.211593170474468,
+          "run": "octree-conditional-leaf-final-20261017",
+          "physical_operation_percent": 2.9998288455400384,
+          "net_bits_with_transform_id": 144568
+        },
+        {
+          "frame": "/data/maejima/data/ground/8i/loot/loot_vox10_1000.ply",
+          "codec": "gpcc",
+          "trial": "oa_conditional_leaf_0.30000",
+          "bits": 152688,
+          "stream_sha256": "3ead28103c6ca53955f80db712a7c1b12ca1c52b93066cc11aa31a3c7f9194c8",
+          "codec_sec": 0.8571259039454162,
+          "decoded_exact": false,
+          "chamfer_sq": 2.1432392997951815,
+          "d1_mse": 1.5003200950848188,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "counts": {
+              "Add": 8905,
+              "Prune": 8710,
+              "Adjust": 5630
+            },
+            "predicted_local_gain": 68909.28767282622,
+            "candidate_count": 39421,
+            "edited_leaf_nodes": 23245
+          },
+          "baseline_bits": 144536,
+          "compression_percent": 5.640117341008466,
+          "net_bits": 152688,
+          "net_compression_percent": 5.640117341008466,
+          "baseline_voxels": 216179,
+          "edited_voxels": 216374,
+          "removed": 14340,
+          "added": 14535,
+          "code_space_removed": 14340,
+          "code_space_added": 14535,
+          "min_operation_percent": 6.7235947987547355,
+          "run": "octree-conditional-leaf-final-20261017",
+          "physical_operation_percent": 10.752663302170886,
+          "net_bits_with_transform_id": 152688
+        }
+      ],
+      "pattern_leaf": [],
+      "quantization": [
+        {
+          "frame": "/data/maejima/data/ground/8i/loot/loot_vox10_1000.ply",
+          "codec": "gpcc",
+          "trial": "quant_halfup",
+          "bits": 153672,
+          "stream_sha256": "7eced48f1cbd9c7e4e7fe0b6187aedd84b12d27838b6fc395d9e50db14f03204",
+          "codec_sec": 0.7979873800650239,
+          "decoded_exact": false,
+          "chamfer_sq": 2.1777616833835127,
+          "d1_mse": 1.5003200950848188,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "not_micro": true
+          },
+          "baseline_bits": 144536,
+          "compression_percent": 6.320916588254821,
+          "baseline_voxels": 216179,
+          "edited_voxels": 216181,
+          "removed": 46597,
+          "added": 46599,
+          "min_operation_percent": 21.555747783087163,
+          "run": "octree-gpcc-research-20261017",
+          "physical_operation_percent": 21.555747783087163,
+          "net_bits_with_transform_id": 153672,
+          "net_compression_percent": 6.320916588254821
+        },
+        {
+          "frame": "/data/maejima/data/ground/8i/loot/loot_vox10_1000.ply",
+          "codec": "gpcc",
+          "trial": "quant_floor",
+          "bits": 153760,
+          "stream_sha256": "8379afd94fbdbea72b08c594a3acbbb5310da7d11221e083029fdcc2de90e0b1",
+          "codec_sec": 0.820317457895726,
+          "decoded_exact": false,
+          "chamfer_sq": 2.1783721655221884,
+          "d1_mse": 1.5003200950848188,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "not_micro": true
+          },
+          "baseline_bits": 144536,
+          "compression_percent": 6.381801073780924,
+          "baseline_voxels": 216179,
+          "edited_voxels": 216476,
+          "removed": 46153,
+          "added": 46450,
+          "min_operation_percent": 21.486823419481077,
+          "run": "octree-gpcc-research-20261017",
+          "physical_operation_percent": 21.486823419481077,
+          "net_bits_with_transform_id": 153760,
+          "net_compression_percent": 6.381801073780924
+        },
+        {
+          "frame": "/data/maejima/data/ground/8i/loot/loot_vox10_1000.ply",
+          "codec": "gpcc",
+          "trial": "quant_ceil",
+          "bits": 153672,
+          "stream_sha256": "7eced48f1cbd9c7e4e7fe0b6187aedd84b12d27838b6fc395d9e50db14f03204",
+          "codec_sec": 0.8136735679581761,
+          "decoded_exact": false,
+          "chamfer_sq": 2.1777616833835127,
+          "d1_mse": 1.5003200950848188,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "not_micro": true
+          },
+          "baseline_bits": 144536,
+          "compression_percent": 6.320916588254821,
+          "baseline_voxels": 216179,
+          "edited_voxels": 216181,
+          "removed": 46597,
+          "added": 46599,
+          "min_operation_percent": 21.555747783087163,
+          "run": "octree-gpcc-research-20261017",
+          "physical_operation_percent": 21.555747783087163,
+          "net_bits_with_transform_id": 153672,
+          "net_compression_percent": 6.320916588254821
+        }
+      ]
+    },
+    "gpcc|soldier_vox10_0536": {
+      "baseline": {
+        "frame": "/data/maejima/data/ground/8i/soldier/soldier_vox10_0536.ply",
+        "codec": "gpcc",
+        "trial": "baseline",
+        "bits": 215664,
+        "stream_sha256": "40897bc1bc1e6f1da0788c3bcf058e30f96dda17109bdc558390df6e518ff06c",
+        "codec_sec": 1.519981222692877,
+        "decoded_exact": true,
+        "chamfer_sq": 2.1899659899919026,
+        "d1_mse": 1.5013115558449155,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772,
+        "details": {},
+        "baseline_bits": 215664,
+        "compression_percent": 0.0,
+        "baseline_voxels": 294679,
+        "edited_voxels": 294679,
+        "removed": 0,
+        "added": 0,
+        "min_operation_percent": 0.0,
+        "run": "octree-gpcc-research-20261017",
+        "physical_operation_percent": 0.0,
+        "net_bits_with_transform_id": 215664,
+        "net_compression_percent": 0.0
+      },
+      "best_orientation": {
+        "frame": "/data/maejima/data/ground/8i/soldier/soldier_vox10_0536.ply",
+        "codec": "gpcc",
+        "trial": "orientation_210_nnp",
+        "bits": 214240,
+        "stream_sha256": "01d4260a64a5f417e6838d940cc432dbb424c52962a07fd287b7231194485879",
+        "codec_sec": 1.1441055280156434,
+        "decoded_exact": false,
+        "chamfer_sq": 2.1899659899919026,
+        "d1_mse": 1.5013115558449155,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772,
+        "details": {
+          "physical_voxel_edits": 0,
+          "requires_inverse_transform": true,
+          "side_information_bits": 6,
+          "not_Add_Prune_Adjust": true
+        },
+        "baseline_bits": 215664,
+        "compression_percent": -0.6602863713925378,
+        "baseline_voxels": 294679,
+        "edited_voxels": 294679,
+        "removed": 294679,
+        "added": 294679,
+        "min_operation_percent": 100.0,
+        "run": "octree-gpcc-research-20261017",
+        "physical_operation_percent": 0.0,
+        "net_bits_with_transform_id": 214248,
+        "net_compression_percent": -0.656576897395944
+      },
+      "conditional_leaf": [
+        {
+          "frame": "/data/maejima/data/ground/8i/soldier/soldier_vox10_0536.ply",
+          "codec": "gpcc",
+          "trial": "oa_conditional_leaf_0.00150",
+          "bits": 215808,
+          "stream_sha256": "a69ffccea892ccb8a0bf3264d30e048af4d9ebd503364d5112dd6967f4cf2030",
+          "codec_sec": 1.1383635848760605,
+          "decoded_exact": false,
+          "chamfer_sq": 2.188987780639044,
+          "d1_mse": 1.5013115558449155,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "counts": {
+              "Add": 71,
+              "Prune": 27,
+              "Adjust": 344
+            },
+            "predicted_local_gain": 4803.604991300413,
+            "candidate_count": 61295,
+            "edited_leaf_nodes": 442
+          },
+          "baseline_bits": 215664,
+          "compression_percent": 0.06677053193857585,
+          "net_bits": 215808,
+          "net_compression_percent": 0.06677053193857585,
+          "baseline_voxels": 294679,
+          "edited_voxels": 294723,
+          "removed": 371,
+          "added": 415,
+          "code_space_removed": 371,
+          "code_space_added": 415,
+          "min_operation_percent": 0.1408312095534463,
+          "run": "octree-conditional-leaf-final-20261017",
+          "physical_operation_percent": 0.14999372198222471,
+          "net_bits_with_transform_id": 215808
+        },
+        {
+          "frame": "/data/maejima/data/ground/8i/soldier/soldier_vox10_0536.ply",
+          "codec": "gpcc",
+          "trial": "oa_conditional_leaf_0.00300",
+          "bits": 216296,
+          "stream_sha256": "dca909b0f0d46dc6237597fd9003b82918375429041062c027fb80b7675ad2b7",
+          "codec_sec": 1.1627166126854718,
+          "decoded_exact": false,
+          "chamfer_sq": 2.1879819088890606,
+          "d1_mse": 1.5013115558449155,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "counts": {
+              "Add": 166,
+              "Prune": 66,
+              "Adjust": 652
+            },
+            "predicted_local_gain": 8754.586779322837,
+            "candidate_count": 61295,
+            "edited_leaf_nodes": 884
+          },
+          "baseline_bits": 215664,
+          "compression_percent": 0.2930484457303928,
+          "net_bits": 216296,
+          "net_compression_percent": 0.2930484457303928,
+          "baseline_voxels": 294679,
+          "edited_voxels": 294779,
+          "removed": 718,
+          "added": 818,
+          "code_space_removed": 718,
+          "code_space_added": 818,
+          "min_operation_percent": 0.27759019136076885,
+          "run": "octree-conditional-leaf-final-20261017",
+          "physical_operation_percent": 0.29998744396444943,
+          "net_bits_with_transform_id": 216296
+        },
+        {
+          "frame": "/data/maejima/data/ground/8i/soldier/soldier_vox10_0536.ply",
+          "codec": "gpcc",
+          "trial": "oa_conditional_leaf_0.03000",
+          "bits": 217744,
+          "stream_sha256": "fb0db4f32d0931a10beb9baec8e9012e161a58a9f5cd7180ac784fe327da33a5",
+          "codec_sec": 1.1354868751950562,
+          "decoded_exact": false,
+          "chamfer_sq": 2.173150490208635,
+          "d1_mse": 1.5013115558449155,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "counts": {
+              "Add": 2465,
+              "Prune": 2109,
+              "Adjust": 4266
+            },
+            "predicted_local_gain": 55060.28171143892,
+            "candidate_count": 61295,
+            "edited_leaf_nodes": 8840
+          },
+          "baseline_bits": 215664,
+          "compression_percent": 0.9644632391127006,
+          "net_bits": 217744,
+          "net_compression_percent": 0.9644632391127006,
+          "baseline_voxels": 294679,
+          "edited_voxels": 295035,
+          "removed": 6375,
+          "added": 6731,
+          "code_space_removed": 6375,
+          "code_space_added": 6731,
+          "min_operation_percent": 2.284180413263246,
+          "run": "octree-conditional-leaf-final-20261017",
+          "physical_operation_percent": 2.9998744396444947,
+          "net_bits_with_transform_id": 217744
+        },
+        {
+          "frame": "/data/maejima/data/ground/8i/soldier/soldier_vox10_0536.ply",
+          "codec": "gpcc",
+          "trial": "oa_conditional_leaf_0.30000",
+          "bits": 230408,
+          "stream_sha256": "c859fb6c416814e02017898b01e0eb18312387bf464ec2016158e4edd68d5aea",
+          "codec_sec": 1.1504071690142155,
+          "decoded_exact": false,
+          "chamfer_sq": 2.158547457138723,
+          "d1_mse": 1.5013115558449155,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "counts": {
+              "Add": 13351,
+              "Prune": 12932,
+              "Adjust": 8981
+            },
+            "predicted_local_gain": 104387.32963488824,
+            "candidate_count": 61295,
+            "edited_leaf_nodes": 35264
+          },
+          "baseline_bits": 215664,
+          "compression_percent": 6.83656057571036,
+          "net_bits": 230408,
+          "net_compression_percent": 6.83656057571036,
+          "baseline_voxels": 294679,
+          "edited_voxels": 295098,
+          "removed": 21913,
+          "added": 22332,
+          "code_space_removed": 21913,
+          "code_space_added": 22332,
+          "min_operation_percent": 7.578415835536296,
+          "run": "octree-conditional-leaf-final-20261017",
+          "physical_operation_percent": 11.966919936608988,
+          "net_bits_with_transform_id": 230408
+        }
+      ],
+      "pattern_leaf": [],
+      "quantization": [
+        {
+          "frame": "/data/maejima/data/ground/8i/soldier/soldier_vox10_0536.ply",
+          "codec": "gpcc",
+          "trial": "quant_halfup",
+          "bits": 233624,
+          "stream_sha256": "82aa0c81f1da60dc04d2210b17ff17562009330d5c2097c3422ecf0c43a8b08f",
+          "codec_sec": 1.1822783681564033,
+          "decoded_exact": false,
+          "chamfer_sq": 2.195227047847019,
+          "d1_mse": 1.5013115558449155,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "not_micro": true
+          },
+          "baseline_bits": 215664,
+          "compression_percent": 8.327769122338458,
+          "baseline_voxels": 294679,
+          "edited_voxels": 294765,
+          "removed": 63041,
+          "added": 63127,
+          "min_operation_percent": 21.422293410796154,
+          "run": "octree-gpcc-research-20261017",
+          "physical_operation_percent": 21.422293410796154,
+          "net_bits_with_transform_id": 233624,
+          "net_compression_percent": 8.327769122338458
+        },
+        {
+          "frame": "/data/maejima/data/ground/8i/soldier/soldier_vox10_0536.ply",
+          "codec": "gpcc",
+          "trial": "quant_floor",
+          "bits": 233312,
+          "stream_sha256": "dc944da9c8bff4e322626be783a38c8c5e4e9d495f21a36ac7169bacfd512b04",
+          "codec_sec": 1.1476918500848114,
+          "decoded_exact": false,
+          "chamfer_sq": 2.195320572341237,
+          "d1_mse": 1.5013115558449155,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "not_micro": true
+          },
+          "baseline_bits": 215664,
+          "compression_percent": 8.183099636471546,
+          "baseline_voxels": 294679,
+          "edited_voxels": 294793,
+          "removed": 62053,
+          "added": 62167,
+          "min_operation_percent": 21.096515191106256,
+          "run": "octree-gpcc-research-20261017",
+          "physical_operation_percent": 21.096515191106256,
+          "net_bits_with_transform_id": 233312,
+          "net_compression_percent": 8.183099636471546
+        },
+        {
+          "frame": "/data/maejima/data/ground/8i/soldier/soldier_vox10_0536.ply",
+          "codec": "gpcc",
+          "trial": "quant_ceil",
+          "bits": 233624,
+          "stream_sha256": "82aa0c81f1da60dc04d2210b17ff17562009330d5c2097c3422ecf0c43a8b08f",
+          "codec_sec": 1.089186450932175,
+          "decoded_exact": false,
+          "chamfer_sq": 2.195227047847019,
+          "d1_mse": 1.5013115558449155,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "not_micro": true
+          },
+          "baseline_bits": 215664,
+          "compression_percent": 8.327769122338458,
+          "baseline_voxels": 294679,
+          "edited_voxels": 294765,
+          "removed": 63041,
+          "added": 63127,
+          "min_operation_percent": 21.422293410796154,
+          "run": "octree-gpcc-research-20261017",
+          "physical_operation_percent": 21.422293410796154,
+          "net_bits_with_transform_id": 233624,
+          "net_compression_percent": 8.327769122338458
+        }
+      ]
+    },
+    "oa|longdress_vox10_1051": {
+      "baseline": {
+        "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+        "codec": "oa",
+        "trial": "baseline",
+        "bits": 188680,
+        "codec_sec": 18.448934347834438,
+        "ce_bits": 189248.359375,
+        "nodes": 73905,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "e3f6f81ba4be57718d93a75e1a39a38542e3e5b50dfd5314491ce3cf263af00f",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 13.5221529006958
+          },
+          "3": {
+            "nodes": 8,
+            "ce_bits": 21.59096908569336
+          },
+          "4": {
+            "nodes": 43,
+            "ce_bits": 159.05824279785156
+          },
+          "5": {
+            "nodes": 191,
+            "ce_bits": 578.7169189453125
+          },
+          "6": {
+            "nodes": 820,
+            "ce_bits": 2173.697021484375
+          },
+          "7": {
+            "nodes": 3414,
+            "ce_bits": 7833.625
+          },
+          "8": {
+            "nodes": 13991,
+            "ce_bits": 27330.9453125
+          },
+          "9": {
+            "nodes": 55435,
+            "ce_bits": 151132.9375
+          }
+        },
+        "chamfer_sq": 2.178329269921022,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772,
+        "details": {},
+        "baseline_bits": 188680,
+        "compression_percent": 0.0,
+        "baseline_voxels": 211887,
+        "edited_voxels": 211887,
+        "removed": 0,
+        "added": 0,
+        "min_operation_percent": 0.0,
+        "run": "octree-oa-pilot-20261017",
+        "physical_operation_percent": 0.0,
+        "net_bits_with_transform_id": 188680,
+        "net_compression_percent": 0.0
+      },
+      "best_orientation": {
+        "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+        "codec": "oa",
+        "trial": "orientation_021_ppp",
+        "bits": 181264,
+        "codec_sec": 15.157873635645956,
+        "ce_bits": 181353.4375,
+        "nodes": 73905,
+        "arithmetic_roundtrip": false,
+        "stream_sha256": "d7eb3bca5128c810b994935a7717cb456b2a307eebd3617c7a61d8b1377543eb",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 5.699090957641602
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 11.912067413330078
+          },
+          "3": {
+            "nodes": 8,
+            "ce_bits": 21.02576446533203
+          },
+          "4": {
+            "nodes": 43,
+            "ce_bits": 159.56004333496094
+          },
+          "5": {
+            "nodes": 191,
+            "ce_bits": 598.8997802734375
+          },
+          "6": {
+            "nodes": 820,
+            "ce_bits": 2215.39892578125
+          },
+          "7": {
+            "nodes": 3414,
+            "ce_bits": 7964.291015625
+          },
+          "8": {
+            "nodes": 13991,
+            "ce_bits": 27758.20703125
+          },
+          "9": {
+            "nodes": 55435,
+            "ce_bits": 142618.453125
+          }
+        },
+        "chamfer_sq": 2.178329269921022,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772,
+        "details": {
+          "physical_voxel_edits": 0,
+          "requires_inverse_transform": true,
+          "side_information_bits": 6,
+          "not_Add_Prune_Adjust": true
+        },
+        "baseline_bits": 188680,
+        "compression_percent": -3.9304642781428867,
+        "baseline_voxels": 211887,
+        "edited_voxels": 211887,
+        "removed": 209063,
+        "added": 209063,
+        "min_operation_percent": 98.66721412828537,
+        "run": "octree-oa-leaf-20261017",
+        "physical_operation_percent": 0.0,
+        "net_bits_with_transform_id": 181272,
+        "net_compression_percent": -3.9262242951028203
+      },
+      "conditional_leaf": [
+        {
+          "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+          "codec": "oa",
+          "trial": "oa_conditional_leaf_0.00150",
+          "bits": 185952,
+          "codec_sec": 14.7133245090954,
+          "ce_bits": 186111.65625,
+          "nodes": 73905,
+          "arithmetic_roundtrip": false,
+          "stream_sha256": "a203767a1b9d9707afd54bd05738115d0823f1b6b3ba49b2b5c2a0f169c91922",
+          "levels": {
+            "1": {
+              "nodes": 1,
+              "ce_bits": 4.272367000579834
+            },
+            "2": {
+              "nodes": 2,
+              "ce_bits": 13.5221529006958
+            },
+            "3": {
+              "nodes": 8,
+              "ce_bits": 21.59096908569336
+            },
+            "4": {
+              "nodes": 43,
+              "ce_bits": 159.05824279785156
+            },
+            "5": {
+              "nodes": 191,
+              "ce_bits": 578.7169189453125
+            },
+            "6": {
+              "nodes": 820,
+              "ce_bits": 2173.697021484375
+            },
+            "7": {
+              "nodes": 3414,
+              "ce_bits": 7833.625
+            },
+            "8": {
+              "nodes": 13991,
+              "ce_bits": 27330.9453125
+            },
+            "9": {
+              "nodes": 55435,
+              "ce_bits": 147996.234375
+            }
+          },
+          "chamfer_sq": 2.177155641623221,
+          "d1_mse": 1.5005765054758227,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "counts": {
+              "Add": 31,
+              "Prune": 30,
+              "Adjust": 257
+            },
+            "predicted_local_gain": 3837.527280837196,
+            "candidate_count": 41434,
+            "edited_leaf_nodes": 318
+          },
+          "baseline_bits": 188680,
+          "compression_percent": -1.4458342166631333,
+          "net_bits": 185952,
+          "net_compression_percent": -1.4458342166631333,
+          "baseline_voxels": 211887,
+          "edited_voxels": 211888,
+          "removed": 287,
+          "added": 288,
+          "code_space_removed": 287,
+          "code_space_added": 288,
+          "min_operation_percent": 0.13592150533067154,
+          "run": "octree-conditional-leaf-final-20261017",
+          "physical_operation_percent": 0.15007999546928316,
+          "net_bits_with_transform_id": 185952
+        },
+        {
+          "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+          "codec": "oa",
+          "trial": "oa_conditional_leaf_0.00300",
+          "bits": 183944,
+          "codec_sec": 15.453183316159993,
+          "ce_bits": 184002.9375,
+          "nodes": 73905,
+          "arithmetic_roundtrip": false,
+          "stream_sha256": "d18e4e8b01adc8d1ede7b47115dcb9971ca0fd7694dd45a3f6ab6767431ccd3a",
+          "levels": {
+            "1": {
+              "nodes": 1,
+              "ce_bits": 4.272367000579834
+            },
+            "2": {
+              "nodes": 2,
+              "ce_bits": 13.5221529006958
+            },
+            "3": {
+              "nodes": 8,
+              "ce_bits": 21.59096908569336
+            },
+            "4": {
+              "nodes": 43,
+              "ce_bits": 159.05824279785156
+            },
+            "5": {
+              "nodes": 191,
+              "ce_bits": 578.7169189453125
+            },
+            "6": {
+              "nodes": 820,
+              "ce_bits": 2173.697021484375
+            },
+            "7": {
+              "nodes": 3414,
+              "ce_bits": 7833.625
+            },
+            "8": {
+              "nodes": 13991,
+              "ce_bits": 27330.9453125
+            },
+            "9": {
+              "nodes": 55435,
+              "ce_bits": 145887.53125
+            }
+          },
+          "chamfer_sq": 2.176008188840381,
+          "d1_mse": 1.5005765054758227,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "counts": {
+              "Add": 84,
+              "Prune": 68,
+              "Adjust": 484
+            },
+            "predicted_local_gain": 6820.315397143168,
+            "candidate_count": 41434,
+            "edited_leaf_nodes": 636
+          },
+          "baseline_bits": 188680,
+          "compression_percent": -2.5100699597201626,
+          "net_bits": 183944,
+          "net_compression_percent": -2.5100699597201626,
+          "baseline_voxels": 211887,
+          "edited_voxels": 211903,
+          "removed": 552,
+          "added": 568,
+          "code_space_removed": 552,
+          "code_space_added": 568,
+          "min_operation_percent": 0.26806741329104666,
+          "run": "octree-conditional-leaf-final-20261017",
+          "physical_operation_percent": 0.3001599909385663,
+          "net_bits_with_transform_id": 183944
+        },
+        {
+          "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+          "codec": "oa",
+          "trial": "oa_conditional_leaf_0.03000",
+          "bits": 161688,
+          "codec_sec": 15.029477123636752,
+          "ce_bits": 161726.15625,
+          "nodes": 73905,
+          "arithmetic_roundtrip": false,
+          "stream_sha256": "438a258ab2de8e87b0c582b14b3bfacbd23c0c2ba126e6630271d6678433a05e",
+          "levels": {
+            "1": {
+              "nodes": 1,
+              "ce_bits": 4.272367000579834
+            },
+            "2": {
+              "nodes": 2,
+              "ce_bits": 13.5221529006958
+            },
+            "3": {
+              "nodes": 8,
+              "ce_bits": 21.59096908569336
+            },
+            "4": {
+              "nodes": 43,
+              "ce_bits": 159.05824279785156
+            },
+            "5": {
+              "nodes": 191,
+              "ce_bits": 578.7169189453125
+            },
+            "6": {
+              "nodes": 820,
+              "ce_bits": 2173.697021484375
+            },
+            "7": {
+              "nodes": 3414,
+              "ce_bits": 7833.625
+            },
+            "8": {
+              "nodes": 13991,
+              "ce_bits": 27330.9453125
+            },
+            "9": {
+              "nodes": 55435,
+              "ce_bits": 123610.734375
+            }
+          },
+          "chamfer_sq": 2.1614855792283705,
+          "d1_mse": 1.5005765054758227,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "counts": {
+              "Add": 1806,
+              "Prune": 1741,
+              "Adjust": 2810
+            },
+            "predicted_local_gain": 39447.975832475255,
+            "candidate_count": 41434,
+            "edited_leaf_nodes": 6357
+          },
+          "baseline_bits": 188680,
+          "compression_percent": -14.30570277718889,
+          "net_bits": 161688,
+          "net_compression_percent": -14.30570277718889,
+          "baseline_voxels": 211887,
+          "edited_voxels": 211952,
+          "removed": 4551,
+          "added": 4616,
+          "code_space_removed": 4551,
+          "code_space_added": 4616,
+          "min_operation_percent": 2.178519682661041,
+          "run": "octree-conditional-leaf-final-20261017",
+          "physical_operation_percent": 3.0001840603718017,
+          "net_bits_with_transform_id": 161688
+        },
+        {
+          "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+          "codec": "oa",
+          "trial": "oa_conditional_leaf_0.30000",
+          "bits": 154888,
+          "codec_sec": 15.100249718409032,
+          "ce_bits": 155208.15625,
+          "nodes": 73905,
+          "arithmetic_roundtrip": false,
+          "stream_sha256": "257c02e31f4935e202c34d63e9776af05644052e1286fd77a5ee75cc27809912",
+          "levels": {
+            "1": {
+              "nodes": 1,
+              "ce_bits": 4.272367000579834
+            },
+            "2": {
+              "nodes": 2,
+              "ce_bits": 13.5221529006958
+            },
+            "3": {
+              "nodes": 8,
+              "ce_bits": 21.59096908569336
+            },
+            "4": {
+              "nodes": 43,
+              "ce_bits": 159.05824279785156
+            },
+            "5": {
+              "nodes": 191,
+              "ce_bits": 578.7169189453125
+            },
+            "6": {
+              "nodes": 820,
+              "ce_bits": 2173.697021484375
+            },
+            "7": {
+              "nodes": 3414,
+              "ce_bits": 7833.625
+            },
+            "8": {
+              "nodes": 13991,
+              "ce_bits": 27330.9453125
+            },
+            "9": {
+              "nodes": 55435,
+              "ce_bits": 117092.7265625
+            }
+          },
+          "chamfer_sq": 2.144396671623574,
+          "d1_mse": 1.5005765054758227,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "counts": {
+              "Add": 8626,
+              "Prune": 9496,
+              "Adjust": 5658
+            },
+            "predicted_local_gain": 70104.62664512322,
+            "candidate_count": 41434,
+            "edited_leaf_nodes": 23780
+          },
+          "baseline_bits": 188680,
+          "compression_percent": -17.909688361246555,
+          "net_bits": 154888,
+          "net_compression_percent": -17.909688361246555,
+          "baseline_voxels": 211887,
+          "edited_voxels": 211017,
+          "removed": 15154,
+          "added": 14284,
+          "code_space_removed": 15154,
+          "code_space_added": 14284,
+          "min_operation_percent": 7.1519253186840155,
+          "run": "octree-conditional-leaf-final-20261017",
+          "physical_operation_percent": 11.222963183206144,
+          "net_bits_with_transform_id": 154888
+        }
+      ],
+      "pattern_leaf": [
+        {
+          "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+          "codec": "oa",
+          "trial": "oa_pattern_leaf_0.00150",
+          "bits": 185952,
+          "codec_sec": 15.819679060019553,
+          "ce_bits": 186111.65625,
+          "nodes": 73905,
+          "arithmetic_roundtrip": false,
+          "stream_sha256": "a203767a1b9d9707afd54bd05738115d0823f1b6b3ba49b2b5c2a0f169c91922",
+          "levels": {
+            "1": {
+              "nodes": 1,
+              "ce_bits": 4.272367000579834
+            },
+            "2": {
+              "nodes": 2,
+              "ce_bits": 13.5221529006958
+            },
+            "3": {
+              "nodes": 8,
+              "ce_bits": 21.59096908569336
+            },
+            "4": {
+              "nodes": 43,
+              "ce_bits": 159.05824279785156
+            },
+            "5": {
+              "nodes": 191,
+              "ce_bits": 578.7169189453125
+            },
+            "6": {
+              "nodes": 820,
+              "ce_bits": 2173.697021484375
+            },
+            "7": {
+              "nodes": 3414,
+              "ce_bits": 7833.625
+            },
+            "8": {
+              "nodes": 13991,
+              "ce_bits": 27330.9453125
+            },
+            "9": {
+              "nodes": 55435,
+              "ce_bits": 147996.234375
+            }
+          },
+          "chamfer_sq": 2.177155641623221,
+          "d1_mse": 1.5005765054758227,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "counts": {
+              "Add": 31,
+              "Prune": 30,
+              "Adjust": 257
+            },
+            "predicted_local_gain": 3837.5272760391235,
+            "candidate_count": 25616,
+            "edited_leaf_nodes": 318,
+            "coherent_eight_child_masks": true
+          },
+          "baseline_bits": 188680,
+          "compression_percent": -1.4458342166631333,
+          "net_bits": 185952,
+          "net_compression_percent": -1.4458342166631333,
+          "baseline_voxels": 211887,
+          "edited_voxels": 211888,
+          "removed": 287,
+          "added": 288,
+          "code_space_removed": 287,
+          "code_space_added": 288,
+          "min_operation_percent": 0.13592150533067154,
+          "run": "octree-pattern-final-20261017",
+          "physical_operation_percent": 0.15007999546928316,
+          "net_bits_with_transform_id": 185952
+        },
+        {
+          "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+          "codec": "oa",
+          "trial": "oa_pattern_leaf_0.00300",
+          "bits": 183960,
+          "codec_sec": 15.763379060197622,
+          "ce_bits": 184004.015625,
+          "nodes": 73905,
+          "arithmetic_roundtrip": false,
+          "stream_sha256": "1250246ea390a13df8b903f7bbe24c605a1875ab664041fea010ee6938861c5e",
+          "levels": {
+            "1": {
+              "nodes": 1,
+              "ce_bits": 4.272367000579834
+            },
+            "2": {
+              "nodes": 2,
+              "ce_bits": 13.5221529006958
+            },
+            "3": {
+              "nodes": 8,
+              "ce_bits": 21.59096908569336
+            },
+            "4": {
+              "nodes": 43,
+              "ce_bits": 159.05824279785156
+            },
+            "5": {
+              "nodes": 191,
+              "ce_bits": 578.7169189453125
+            },
+            "6": {
+              "nodes": 820,
+              "ce_bits": 2173.697021484375
+            },
+            "7": {
+              "nodes": 3414,
+              "ce_bits": 7833.625
+            },
+            "8": {
+              "nodes": 13991,
+              "ce_bits": 27330.9453125
+            },
+            "9": {
+              "nodes": 55435,
+              "ce_bits": 145888.578125
+            }
+          },
+          "chamfer_sq": 2.1759972188244463,
+          "d1_mse": 1.5005765054758227,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "counts": {
+              "Add": 84,
+              "Prune": 69,
+              "Adjust": 483
+            },
+            "predicted_local_gain": 6821.527151107788,
+            "candidate_count": 25616,
+            "edited_leaf_nodes": 634,
+            "coherent_eight_child_masks": true
+          },
+          "baseline_bits": 188680,
+          "compression_percent": -2.50158999364003,
+          "net_bits": 183960,
+          "net_compression_percent": -2.50158999364003,
+          "baseline_voxels": 211887,
+          "edited_voxels": 211902,
+          "removed": 552,
+          "added": 567,
+          "code_space_removed": 552,
+          "code_space_added": 567,
+          "min_operation_percent": 0.2675954636197596,
+          "run": "octree-pattern-final-20261017",
+          "physical_operation_percent": 0.3001599909385663,
+          "net_bits_with_transform_id": 183960
+        },
+        {
+          "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+          "codec": "oa",
+          "trial": "oa_pattern_leaf_0.03000",
+          "bits": 161664,
+          "codec_sec": 15.957384065259248,
+          "ce_bits": 161638.140625,
+          "nodes": 73905,
+          "arithmetic_roundtrip": false,
+          "stream_sha256": "5643e0da88d040663d74237d2dfaf4348d445ba0392e611e4ea915530abe8c79",
+          "levels": {
+            "1": {
+              "nodes": 1,
+              "ce_bits": 4.272367000579834
+            },
+            "2": {
+              "nodes": 2,
+              "ce_bits": 13.5221529006958
+            },
+            "3": {
+              "nodes": 8,
+              "ce_bits": 21.59096908569336
+            },
+            "4": {
+              "nodes": 43,
+              "ce_bits": 159.05824279785156
+            },
+            "5": {
+              "nodes": 191,
+              "ce_bits": 578.7169189453125
+            },
+            "6": {
+              "nodes": 820,
+              "ce_bits": 2173.697021484375
+            },
+            "7": {
+              "nodes": 3414,
+              "ce_bits": 7833.625
+            },
+            "8": {
+              "nodes": 13991,
+              "ce_bits": 27330.9453125
+            },
+            "9": {
+              "nodes": 55435,
+              "ce_bits": 123522.734375
+            }
+          },
+          "chamfer_sq": 2.1609922477986556,
+          "d1_mse": 1.5005765054758227,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "counts": {
+              "Add": 1675,
+              "Prune": 1700,
+              "Adjust": 2982
+            },
+            "predicted_local_gain": 40245.27712726593,
+            "candidate_count": 25616,
+            "edited_leaf_nodes": 5975,
+            "coherent_eight_child_masks": true
+          },
+          "baseline_bits": 188680,
+          "compression_percent": -14.318422726309098,
+          "net_bits": 161664,
+          "net_compression_percent": -14.318422726309098,
+          "baseline_voxels": 211887,
+          "edited_voxels": 211862,
+          "removed": 4682,
+          "added": 4657,
+          "code_space_removed": 4682,
+          "code_space_added": 4657,
+          "min_operation_percent": 2.2096683609659866,
+          "run": "octree-pattern-final-20261017",
+          "physical_operation_percent": 3.0001840603718017,
+          "net_bits_with_transform_id": 161664
+        },
+        {
+          "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+          "codec": "oa",
+          "trial": "oa_pattern_leaf_0.30000",
+          "bits": 149464,
+          "codec_sec": 15.900628231000155,
+          "ce_bits": 149537.21875,
+          "nodes": 73905,
+          "arithmetic_roundtrip": false,
+          "stream_sha256": "15941de918769191e3b05c30b3045d6b65aea1bb94ff3355e0a29779fefe0577",
+          "levels": {
+            "1": {
+              "nodes": 1,
+              "ce_bits": 4.272367000579834
+            },
+            "2": {
+              "nodes": 2,
+              "ce_bits": 13.5221529006958
+            },
+            "3": {
+              "nodes": 8,
+              "ce_bits": 21.59096908569336
+            },
+            "4": {
+              "nodes": 43,
+              "ce_bits": 159.05824279785156
+            },
+            "5": {
+              "nodes": 191,
+              "ce_bits": 578.7169189453125
+            },
+            "6": {
+              "nodes": 820,
+              "ce_bits": 2173.697021484375
+            },
+            "7": {
+              "nodes": 3414,
+              "ce_bits": 7833.625
+            },
+            "8": {
+              "nodes": 13991,
+              "ce_bits": 27330.9453125
+            },
+            "9": {
+              "nodes": 55435,
+              "ce_bits": 111421.796875
+            }
+          },
+          "chamfer_sq": 2.1388794411648147,
+          "d1_mse": 1.5005765054758227,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "counts": {
+              "Add": 10712,
+              "Prune": 12495,
+              "Adjust": 7408
+            },
+            "predicted_local_gain": 83456.45668033678,
+            "candidate_count": 25616,
+            "edited_leaf_nodes": 25616,
+            "coherent_eight_child_masks": true
+          },
+          "baseline_bits": 188680,
+          "compression_percent": -20.784396862412546,
+          "net_bits": 149464,
+          "net_compression_percent": -20.784396862412546,
+          "baseline_voxels": 211887,
+          "edited_voxels": 210104,
+          "removed": 19903,
+          "added": 18120,
+          "code_space_removed": 19903,
+          "code_space_added": 18120,
+          "min_operation_percent": 9.393214307626234,
+          "run": "octree-pattern-final-20261017",
+          "physical_operation_percent": 14.448739186453157,
+          "net_bits_with_transform_id": 149464
+        }
+      ],
+      "quantization": []
+    },
+    "oa|loot_vox10_1000": {
+      "baseline": {
+        "frame": "/data/maejima/data/ground/8i/loot/loot_vox10_1000.ply",
+        "codec": "oa",
+        "trial": "baseline",
+        "bits": 181520,
+        "codec_sec": 19.751809461973608,
+        "ce_bits": 182103.375,
+        "nodes": 75615,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "a8967f9b35594970801b49190efc675c24720100c81a1ac4482b435ca6fe5abf",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 16.8356990814209
+          },
+          "3": {
+            "nodes": 10,
+            "ce_bits": 33.45922088623047
+          },
+          "4": {
+            "nodes": 47,
+            "ce_bits": 193.0889434814453
+          },
+          "5": {
+            "nodes": 202,
+            "ce_bits": 596.01318359375
+          },
+          "6": {
+            "nodes": 869,
+            "ce_bits": 2131.710205078125
+          },
+          "7": {
+            "nodes": 3600,
+            "ce_bits": 7221.779296875
+          },
+          "8": {
+            "nodes": 14370,
+            "ce_bits": 25115.990234375
+          },
+          "9": {
+            "nodes": 56514,
+            "ce_bits": 146790.25
+          }
+        },
+        "chamfer_sq": 2.1731699093591006,
+        "d1_mse": 1.5003200950848188,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772,
+        "details": {},
+        "baseline_bits": 181520,
+        "compression_percent": 0.0,
+        "net_bits": 181520,
+        "net_compression_percent": 0.0,
+        "baseline_voxels": 216179,
+        "edited_voxels": 216179,
+        "removed": 0,
+        "added": 0,
+        "code_space_removed": 0,
+        "code_space_added": 0,
+        "min_operation_percent": 0.0,
+        "run": "octree-oa-transfer-final-20261017",
+        "physical_operation_percent": 0.0,
+        "net_bits_with_transform_id": 181520
+      },
+      "best_orientation": {
+        "frame": "/data/maejima/data/ground/8i/loot/loot_vox10_1000.ply",
+        "codec": "oa",
+        "trial": "orientation_201_ppp",
+        "bits": 181008,
+        "codec_sec": 15.270843834616244,
+        "ce_bits": 181458.78125,
+        "nodes": 75615,
+        "arithmetic_roundtrip": false,
+        "stream_sha256": "8a12f6d278be00a006f97cf7ca15ba3dd0f587136720f1d25999a279b49c16c2",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 5.699090957641602
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 14.505107879638672
+          },
+          "3": {
+            "nodes": 10,
+            "ce_bits": 35.497032165527344
+          },
+          "4": {
+            "nodes": 47,
+            "ce_bits": 210.6815643310547
+          },
+          "5": {
+            "nodes": 202,
+            "ce_bits": 614.687255859375
+          },
+          "6": {
+            "nodes": 869,
+            "ce_bits": 2176.32470703125
+          },
+          "7": {
+            "nodes": 3600,
+            "ce_bits": 7412.67333984375
+          },
+          "8": {
+            "nodes": 14370,
+            "ce_bits": 25780.693359375
+          },
+          "9": {
+            "nodes": 56514,
+            "ce_bits": 145208.0
+          }
+        },
+        "chamfer_sq": 2.1731699093591006,
+        "d1_mse": 1.5003200950848188,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772,
+        "details": {
+          "physical_voxel_edits": 0,
+          "requires_inverse_transform": true,
+          "side_information_bits": 8,
+          "not_Add_Prune_Adjust": true
+        },
+        "baseline_bits": 181520,
+        "compression_percent": -0.28206258263552275,
+        "net_bits": 181016,
+        "net_compression_percent": -0.2776553547818472,
+        "baseline_voxels": 216179,
+        "edited_voxels": 216179,
+        "removed": 0,
+        "added": 0,
+        "code_space_removed": 215250,
+        "code_space_added": 215250,
+        "min_operation_percent": 0.0,
+        "run": "octree-oa-transfer-final-20261017",
+        "physical_operation_percent": 0.0,
+        "net_bits_with_transform_id": 181016
+      },
+      "conditional_leaf": [
+        {
+          "frame": "/data/maejima/data/ground/8i/loot/loot_vox10_1000.ply",
+          "codec": "oa",
+          "trial": "oa_conditional_leaf_0.00150",
+          "bits": 179416,
+          "codec_sec": 16.948054247070104,
+          "ce_bits": 179756.671875,
+          "nodes": 75615,
+          "arithmetic_roundtrip": false,
+          "stream_sha256": "356e46baed95375c6da7083cafd2ac4354a392d0541b79a8d210c8dcd862f676",
+          "levels": {
+            "1": {
+              "nodes": 1,
+              "ce_bits": 4.272367000579834
+            },
+            "2": {
+              "nodes": 2,
+              "ce_bits": 16.8356990814209
+            },
+            "3": {
+              "nodes": 10,
+              "ce_bits": 33.45922088623047
+            },
+            "4": {
+              "nodes": 47,
+              "ce_bits": 193.0889434814453
+            },
+            "5": {
+              "nodes": 202,
+              "ce_bits": 596.01318359375
+            },
+            "6": {
+              "nodes": 869,
+              "ce_bits": 2131.710205078125
+            },
+            "7": {
+              "nodes": 3600,
+              "ce_bits": 7221.779296875
+            },
+            "8": {
+              "nodes": 14370,
+              "ce_bits": 25115.990234375
+            },
+            "9": {
+              "nodes": 56514,
+              "ce_bits": 144443.515625
+            }
+          },
+          "chamfer_sq": 2.1721518758002873,
+          "d1_mse": 1.5003200950848188,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "counts": {
+              "Add": 52,
+              "Prune": 37,
+              "Adjust": 235
+            },
+            "predicted_local_gain": 3654.3262979913643,
+            "candidate_count": 39421,
+            "edited_leaf_nodes": 324
+          },
+          "baseline_bits": 181520,
+          "compression_percent": -1.159100925517853,
+          "net_bits": 179416,
+          "net_compression_percent": -1.159100925517853,
+          "baseline_voxels": 216179,
+          "edited_voxels": 216194,
+          "removed": 272,
+          "added": 287,
+          "code_space_removed": 272,
+          "code_space_added": 287,
+          "min_operation_percent": 0.1327603513754805,
+          "run": "octree-conditional-leaf-final-20261017",
+          "physical_operation_percent": 0.1498757973716226,
+          "net_bits_with_transform_id": 179416
+        },
+        {
+          "frame": "/data/maejima/data/ground/8i/loot/loot_vox10_1000.ply",
+          "codec": "oa",
+          "trial": "oa_conditional_leaf_0.00300",
+          "bits": 177560,
+          "codec_sec": 17.419784418772906,
+          "ce_bits": 177785.234375,
+          "nodes": 75615,
+          "arithmetic_roundtrip": false,
+          "stream_sha256": "0031955d0dfa7f321a84e98b92b2e16bccee10ed2c874b8b45b2d9826b1ae97d",
+          "levels": {
+            "1": {
+              "nodes": 1,
+              "ce_bits": 4.272367000579834
+            },
+            "2": {
+              "nodes": 2,
+              "ce_bits": 16.8356990814209
+            },
+            "3": {
+              "nodes": 10,
+              "ce_bits": 33.45922088623047
+            },
+            "4": {
+              "nodes": 47,
+              "ce_bits": 193.0889434814453
+            },
+            "5": {
+              "nodes": 202,
+              "ce_bits": 596.01318359375
+            },
+            "6": {
+              "nodes": 869,
+              "ce_bits": 2131.710205078125
+            },
+            "7": {
+              "nodes": 3600,
+              "ce_bits": 7221.779296875
+            },
+            "8": {
+              "nodes": 14370,
+              "ce_bits": 25115.990234375
+            },
+            "9": {
+              "nodes": 56514,
+              "ce_bits": 142472.09375
+            }
+          },
+          "chamfer_sq": 2.1713027540443566,
+          "d1_mse": 1.5003200950848188,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "counts": {
+              "Add": 138,
+              "Prune": 67,
+              "Adjust": 444
+            },
+            "predicted_local_gain": 6609.214188762315,
+            "candidate_count": 39421,
+            "edited_leaf_nodes": 649
+          },
+          "baseline_bits": 181520,
+          "compression_percent": -2.1815777875716202,
+          "net_bits": 177560,
+          "net_compression_percent": -2.1815777875716202,
+          "baseline_voxels": 216179,
+          "edited_voxels": 216250,
+          "removed": 511,
+          "added": 582,
+          "code_space_removed": 511,
+          "code_space_added": 582,
+          "min_operation_percent": 0.26922133972309986,
+          "run": "octree-conditional-leaf-final-20261017",
+          "physical_operation_percent": 0.30021417436476255,
+          "net_bits_with_transform_id": 177560
+        },
+        {
+          "frame": "/data/maejima/data/ground/8i/loot/loot_vox10_1000.ply",
+          "codec": "oa",
+          "trial": "oa_conditional_leaf_0.03000",
+          "bits": 156688,
+          "codec_sec": 17.52801217418164,
+          "ce_bits": 156743.453125,
+          "nodes": 75615,
+          "arithmetic_roundtrip": false,
+          "stream_sha256": "7f9b09946f4a48515023776458094ba011f05d10f4fe04eeea68ddc98d2dc72e",
+          "levels": {
+            "1": {
+              "nodes": 1,
+              "ce_bits": 4.272367000579834
+            },
+            "2": {
+              "nodes": 2,
+              "ce_bits": 16.8356990814209
+            },
+            "3": {
+              "nodes": 10,
+              "ce_bits": 33.45922088623047
+            },
+            "4": {
+              "nodes": 47,
+              "ce_bits": 193.0889434814453
+            },
+            "5": {
+              "nodes": 202,
+              "ce_bits": 596.01318359375
+            },
+            "6": {
+              "nodes": 869,
+              "ce_bits": 2131.710205078125
+            },
+            "7": {
+              "nodes": 3600,
+              "ce_bits": 7221.779296875
+            },
+            "8": {
+              "nodes": 14370,
+              "ce_bits": 25115.990234375
+            },
+            "9": {
+              "nodes": 56514,
+              "ce_bits": 121430.3125
+            }
+          },
+          "chamfer_sq": 2.15690670016565,
+          "d1_mse": 1.5003200950848188,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "counts": {
+              "Add": 2025,
+              "Prune": 1704,
+              "Adjust": 2756
+            },
+            "predicted_local_gain": 39647.97033795772,
+            "candidate_count": 39421,
+            "edited_leaf_nodes": 6485
+          },
+          "baseline_bits": 181520,
+          "compression_percent": -13.680035257822832,
+          "net_bits": 156688,
+          "net_compression_percent": -13.680035257822832,
+          "baseline_voxels": 216179,
+          "edited_voxels": 216500,
+          "removed": 4460,
+          "added": 4781,
+          "code_space_removed": 4460,
+          "code_space_added": 4781,
+          "min_operation_percent": 2.211593170474468,
+          "run": "octree-conditional-leaf-final-20261017",
+          "physical_operation_percent": 2.9998288455400384,
+          "net_bits_with_transform_id": 156688
+        },
+        {
+          "frame": "/data/maejima/data/ground/8i/loot/loot_vox10_1000.ply",
+          "codec": "oa",
+          "trial": "oa_conditional_leaf_0.30000",
+          "bits": 149904,
+          "codec_sec": 17.772548776119947,
+          "ce_bits": 150221.859375,
+          "nodes": 75615,
+          "arithmetic_roundtrip": false,
+          "stream_sha256": "c22a316b70997b233e3c97a427c487a079f34d0ca27ae67b791d3aeed75b425e",
+          "levels": {
+            "1": {
+              "nodes": 1,
+              "ce_bits": 4.272367000579834
+            },
+            "2": {
+              "nodes": 2,
+              "ce_bits": 16.8356990814209
+            },
+            "3": {
+              "nodes": 10,
+              "ce_bits": 33.45922088623047
+            },
+            "4": {
+              "nodes": 47,
+              "ce_bits": 193.0889434814453
+            },
+            "5": {
+              "nodes": 202,
+              "ce_bits": 596.01318359375
+            },
+            "6": {
+              "nodes": 869,
+              "ce_bits": 2131.710205078125
+            },
+            "7": {
+              "nodes": 3600,
+              "ce_bits": 7221.779296875
+            },
+            "8": {
+              "nodes": 14370,
+              "ce_bits": 25115.990234375
+            },
+            "9": {
+              "nodes": 56514,
+              "ce_bits": 114908.7265625
+            }
+          },
+          "chamfer_sq": 2.1432392997951815,
+          "d1_mse": 1.5003200950848188,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "counts": {
+              "Add": 8905,
+              "Prune": 8710,
+              "Adjust": 5630
+            },
+            "predicted_local_gain": 68909.28767282622,
+            "candidate_count": 39421,
+            "edited_leaf_nodes": 23245
+          },
+          "baseline_bits": 181520,
+          "compression_percent": -17.4173644777435,
+          "net_bits": 149904,
+          "net_compression_percent": -17.4173644777435,
+          "baseline_voxels": 216179,
+          "edited_voxels": 216374,
+          "removed": 14340,
+          "added": 14535,
+          "code_space_removed": 14340,
+          "code_space_added": 14535,
+          "min_operation_percent": 6.7235947987547355,
+          "run": "octree-conditional-leaf-final-20261017",
+          "physical_operation_percent": 10.752663302170886,
+          "net_bits_with_transform_id": 149904
+        }
+      ],
+      "pattern_leaf": [],
+      "quantization": [
+        {
+          "frame": "/data/maejima/data/ground/8i/loot/loot_vox10_1000.ply",
+          "codec": "oa",
+          "trial": "quant_halfup",
+          "bits": 126992,
+          "codec_sec": 16.6847781999968,
+          "ce_bits": 126629.0859375,
+          "nodes": 75615,
+          "arithmetic_roundtrip": false,
+          "stream_sha256": "3bb6a08379d147857a7761f4a2c883be3a61eb04682b1c5c1805d92e81700ebe",
+          "levels": {
+            "1": {
+              "nodes": 1,
+              "ce_bits": 4.272367000579834
+            },
+            "2": {
+              "nodes": 2,
+              "ce_bits": 16.8356990814209
+            },
+            "3": {
+              "nodes": 10,
+              "ce_bits": 33.45922088623047
+            },
+            "4": {
+              "nodes": 47,
+              "ce_bits": 193.0889434814453
+            },
+            "5": {
+              "nodes": 202,
+              "ce_bits": 596.01318359375
+            },
+            "6": {
+              "nodes": 869,
+              "ce_bits": 2131.710205078125
+            },
+            "7": {
+              "nodes": 3600,
+              "ce_bits": 7221.779296875
+            },
+            "8": {
+              "nodes": 14370,
+              "ce_bits": 25115.990234375
+            },
+            "9": {
+              "nodes": 56514,
+              "ce_bits": 91315.921875
+            }
+          },
+          "chamfer_sq": 2.1777616833835127,
+          "d1_mse": 1.5003200950848188,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "not_micro": true
+          },
+          "baseline_bits": 181520,
+          "compression_percent": -30.03966505068312,
+          "net_bits": 126992,
+          "net_compression_percent": -30.03966505068312,
+          "baseline_voxels": 216179,
+          "edited_voxels": 216181,
+          "removed": 46597,
+          "added": 46599,
+          "code_space_removed": 46597,
+          "code_space_added": 46599,
+          "min_operation_percent": 21.555747783087163,
+          "run": "octree-oa-transfer-final-20261017",
+          "physical_operation_percent": 21.555747783087163,
+          "net_bits_with_transform_id": 126992
+        },
+        {
+          "frame": "/data/maejima/data/ground/8i/loot/loot_vox10_1000.ply",
+          "codec": "oa",
+          "trial": "quant_floor",
+          "bits": 126736,
+          "codec_sec": 15.849407199770212,
+          "ce_bits": 126375.09375,
+          "nodes": 75545,
+          "arithmetic_roundtrip": false,
+          "stream_sha256": "e2b4c3d8b5270251a5a169acdb43ae2ff6385b41c1cb564a41b1b0db8500fbab",
+          "levels": {
+            "1": {
+              "nodes": 1,
+              "ce_bits": 4.272367000579834
+            },
+            "2": {
+              "nodes": 2,
+              "ce_bits": 16.8356990814209
+            },
+            "3": {
+              "nodes": 10,
+              "ce_bits": 33.45922088623047
+            },
+            "4": {
+              "nodes": 47,
+              "ce_bits": 192.66006469726562
+            },
+            "5": {
+              "nodes": 201,
+              "ce_bits": 581.8171997070312
+            },
+            "6": {
+              "nodes": 863,
+              "ce_bits": 2129.70068359375
+            },
+            "7": {
+              "nodes": 3567,
+              "ce_bits": 7407.14306640625
+            },
+            "8": {
+              "nodes": 14342,
+              "ce_bits": 25115.72265625
+            },
+            "9": {
+              "nodes": 56512,
+              "ce_bits": 90893.4765625
+            }
+          },
+          "chamfer_sq": 2.1783721655221884,
+          "d1_mse": 1.5003200950848188,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "not_micro": true
+          },
+          "baseline_bits": 181520,
+          "compression_percent": -30.18069634200088,
+          "net_bits": 126736,
+          "net_compression_percent": -30.18069634200088,
+          "baseline_voxels": 216179,
+          "edited_voxels": 216476,
+          "removed": 46153,
+          "added": 46450,
+          "code_space_removed": 46153,
+          "code_space_added": 46450,
+          "min_operation_percent": 21.486823419481077,
+          "run": "octree-oa-transfer-final-20261017",
+          "physical_operation_percent": 21.486823419481077,
+          "net_bits_with_transform_id": 126736
+        },
+        {
+          "frame": "/data/maejima/data/ground/8i/loot/loot_vox10_1000.ply",
+          "codec": "oa",
+          "trial": "quant_ceil",
+          "bits": 126992,
+          "codec_sec": 16.543939364142716,
+          "ce_bits": 126629.0859375,
+          "nodes": 75615,
+          "arithmetic_roundtrip": false,
+          "stream_sha256": "3bb6a08379d147857a7761f4a2c883be3a61eb04682b1c5c1805d92e81700ebe",
+          "levels": {
+            "1": {
+              "nodes": 1,
+              "ce_bits": 4.272367000579834
+            },
+            "2": {
+              "nodes": 2,
+              "ce_bits": 16.8356990814209
+            },
+            "3": {
+              "nodes": 10,
+              "ce_bits": 33.45922088623047
+            },
+            "4": {
+              "nodes": 47,
+              "ce_bits": 193.0889434814453
+            },
+            "5": {
+              "nodes": 202,
+              "ce_bits": 596.01318359375
+            },
+            "6": {
+              "nodes": 869,
+              "ce_bits": 2131.710205078125
+            },
+            "7": {
+              "nodes": 3600,
+              "ce_bits": 7221.779296875
+            },
+            "8": {
+              "nodes": 14370,
+              "ce_bits": 25115.990234375
+            },
+            "9": {
+              "nodes": 56514,
+              "ce_bits": 91315.921875
+            }
+          },
+          "chamfer_sq": 2.1777616833835127,
+          "d1_mse": 1.5003200950848188,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "not_micro": true
+          },
+          "baseline_bits": 181520,
+          "compression_percent": -30.03966505068312,
+          "net_bits": 126992,
+          "net_compression_percent": -30.03966505068312,
+          "baseline_voxels": 216179,
+          "edited_voxels": 216181,
+          "removed": 46597,
+          "added": 46599,
+          "code_space_removed": 46597,
+          "code_space_added": 46599,
+          "min_operation_percent": 21.555747783087163,
+          "run": "octree-oa-transfer-final-20261017",
+          "physical_operation_percent": 21.555747783087163,
+          "net_bits_with_transform_id": 126992
+        }
+      ]
+    },
+    "oa|soldier_vox10_0536": {
+      "baseline": {
+        "frame": "/data/maejima/data/ground/8i/soldier/soldier_vox10_0536.ply",
+        "codec": "oa",
+        "trial": "baseline",
+        "bits": 278616,
+        "codec_sec": 25.682903591077775,
+        "ce_bits": 279451.375,
+        "nodes": 102982,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "42b0aefe77fdf9e9e08263d78bafa0ad3a42d53b6cd7ad633343856a877b11a1",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 6.0990376472473145
+          },
+          "3": {
+            "nodes": 16,
+            "ce_bits": 50.64427947998047
+          },
+          "4": {
+            "nodes": 59,
+            "ce_bits": 226.453369140625
+          },
+          "5": {
+            "nodes": 266,
+            "ce_bits": 813.9793090820312
+          },
+          "6": {
+            "nodes": 1129,
+            "ce_bits": 3198.953125
+          },
+          "7": {
+            "nodes": 4817,
+            "ce_bits": 11972.65234375
+          },
+          "8": {
+            "nodes": 19553,
+            "ce_bits": 40821.9375
+          },
+          "9": {
+            "nodes": 77139,
+            "ce_bits": 222356.359375
+          }
+        },
+        "chamfer_sq": 2.1899659899919026,
+        "d1_mse": 1.5013115558449155,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772,
+        "details": {},
+        "baseline_bits": 278616,
+        "compression_percent": 0.0,
+        "net_bits": 278616,
+        "net_compression_percent": 0.0,
+        "baseline_voxels": 294679,
+        "edited_voxels": 294679,
+        "removed": 0,
+        "added": 0,
+        "code_space_removed": 0,
+        "code_space_added": 0,
+        "min_operation_percent": 0.0,
+        "run": "octree-oa-transfer-final-20261017",
+        "physical_operation_percent": 0.0,
+        "net_bits_with_transform_id": 278616
+      },
+      "best_orientation": {
+        "frame": "/data/maejima/data/ground/8i/soldier/soldier_vox10_0536.ply",
+        "codec": "oa",
+        "trial": "orientation_021_ppp",
+        "bits": 277488,
+        "codec_sec": 21.552880176808685,
+        "ce_bits": 278226.125,
+        "nodes": 102982,
+        "arithmetic_roundtrip": false,
+        "stream_sha256": "ecd67a8fe1a59327c7f10e7abd30ad09a36aa3d1c13605467fe67f7f1b9f60b4",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 5.699090957641602
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 8.658354759216309
+          },
+          "3": {
+            "nodes": 16,
+            "ce_bits": 58.662742614746094
+          },
+          "4": {
+            "nodes": 59,
+            "ce_bits": 242.62814331054688
+          },
+          "5": {
+            "nodes": 266,
+            "ce_bits": 873.4912109375
+          },
+          "6": {
+            "nodes": 1129,
+            "ce_bits": 3364.9072265625
+          },
+          "7": {
+            "nodes": 4817,
+            "ce_bits": 12512.154296875
+          },
+          "8": {
+            "nodes": 19553,
+            "ce_bits": 41652.66796875
+          },
+          "9": {
+            "nodes": 77139,
+            "ce_bits": 219507.234375
+          }
+        },
+        "chamfer_sq": 2.1899659899919026,
+        "d1_mse": 1.5013115558449155,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772,
+        "details": {
+          "physical_voxel_edits": 0,
+          "requires_inverse_transform": true,
+          "side_information_bits": 8,
+          "not_Add_Prune_Adjust": true
+        },
+        "baseline_bits": 278616,
+        "compression_percent": -0.4048582995951455,
+        "net_bits": 277496,
+        "net_compression_percent": -0.4019869641370244,
+        "baseline_voxels": 294679,
+        "edited_voxels": 294679,
+        "removed": 0,
+        "added": 0,
+        "code_space_removed": 292130,
+        "code_space_added": 292130,
+        "min_operation_percent": 0.0,
+        "run": "octree-oa-transfer-final-20261017",
+        "physical_operation_percent": 0.0,
+        "net_bits_with_transform_id": 277496
+      },
+      "conditional_leaf": [
+        {
+          "frame": "/data/maejima/data/ground/8i/soldier/soldier_vox10_0536.ply",
+          "codec": "oa",
+          "trial": "oa_conditional_leaf_0.00150",
+          "bits": 275768,
+          "codec_sec": 23.290900468826294,
+          "ce_bits": 276260.1875,
+          "nodes": 102982,
+          "arithmetic_roundtrip": false,
+          "stream_sha256": "5f5af001543188eb3361c4731569cb2e8eb3ff6e1ca35c570ffb754587f088ed",
+          "levels": {
+            "1": {
+              "nodes": 1,
+              "ce_bits": 4.272367000579834
+            },
+            "2": {
+              "nodes": 2,
+              "ce_bits": 6.0990376472473145
+            },
+            "3": {
+              "nodes": 16,
+              "ce_bits": 50.64427947998047
+            },
+            "4": {
+              "nodes": 59,
+              "ce_bits": 226.453369140625
+            },
+            "5": {
+              "nodes": 266,
+              "ce_bits": 813.9793090820312
+            },
+            "6": {
+              "nodes": 1129,
+              "ce_bits": 3198.953125
+            },
+            "7": {
+              "nodes": 4817,
+              "ce_bits": 11972.65234375
+            },
+            "8": {
+              "nodes": 19553,
+              "ce_bits": 40821.9375
+            },
+            "9": {
+              "nodes": 77139,
+              "ce_bits": 219165.171875
+            }
+          },
+          "chamfer_sq": 2.188987780639044,
+          "d1_mse": 1.5013115558449155,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "counts": {
+              "Add": 71,
+              "Prune": 27,
+              "Adjust": 344
+            },
+            "predicted_local_gain": 4803.604991300413,
+            "candidate_count": 61295,
+            "edited_leaf_nodes": 442
+          },
+          "baseline_bits": 278616,
+          "compression_percent": -1.0221954230912766,
+          "net_bits": 275768,
+          "net_compression_percent": -1.0221954230912766,
+          "baseline_voxels": 294679,
+          "edited_voxels": 294723,
+          "removed": 371,
+          "added": 415,
+          "code_space_removed": 371,
+          "code_space_added": 415,
+          "min_operation_percent": 0.1408312095534463,
+          "run": "octree-conditional-leaf-final-20261017",
+          "physical_operation_percent": 0.14999372198222471,
+          "net_bits_with_transform_id": 275768
+        },
+        {
+          "frame": "/data/maejima/data/ground/8i/soldier/soldier_vox10_0536.ply",
+          "codec": "oa",
+          "trial": "oa_conditional_leaf_0.00300",
+          "bits": 273504,
+          "codec_sec": 23.995409769006073,
+          "ce_bits": 273856.78125,
+          "nodes": 102982,
+          "arithmetic_roundtrip": false,
+          "stream_sha256": "2eb62f4f9ccafcd8fe6cbbdcd40489e6911bec65acfcd5ae98768dd70f504154",
+          "levels": {
+            "1": {
+              "nodes": 1,
+              "ce_bits": 4.272367000579834
+            },
+            "2": {
+              "nodes": 2,
+              "ce_bits": 6.0990376472473145
+            },
+            "3": {
+              "nodes": 16,
+              "ce_bits": 50.64427947998047
+            },
+            "4": {
+              "nodes": 59,
+              "ce_bits": 226.453369140625
+            },
+            "5": {
+              "nodes": 266,
+              "ce_bits": 813.9793090820312
+            },
+            "6": {
+              "nodes": 1129,
+              "ce_bits": 3198.953125
+            },
+            "7": {
+              "nodes": 4817,
+              "ce_bits": 11972.65234375
+            },
+            "8": {
+              "nodes": 19553,
+              "ce_bits": 40821.9375
+            },
+            "9": {
+              "nodes": 77139,
+              "ce_bits": 216761.734375
+            }
+          },
+          "chamfer_sq": 2.1879819088890606,
+          "d1_mse": 1.5013115558449155,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "counts": {
+              "Add": 166,
+              "Prune": 66,
+              "Adjust": 652
+            },
+            "predicted_local_gain": 8754.586779322837,
+            "candidate_count": 61295,
+            "edited_leaf_nodes": 884
+          },
+          "baseline_bits": 278616,
+          "compression_percent": -1.8347833577396888,
+          "net_bits": 273504,
+          "net_compression_percent": -1.8347833577396888,
+          "baseline_voxels": 294679,
+          "edited_voxels": 294779,
+          "removed": 718,
+          "added": 818,
+          "code_space_removed": 718,
+          "code_space_added": 818,
+          "min_operation_percent": 0.27759019136076885,
+          "run": "octree-conditional-leaf-final-20261017",
+          "physical_operation_percent": 0.29998744396444943,
+          "net_bits_with_transform_id": 273504
+        },
+        {
+          "frame": "/data/maejima/data/ground/8i/soldier/soldier_vox10_0536.ply",
+          "codec": "oa",
+          "trial": "oa_conditional_leaf_0.03000",
+          "bits": 244248,
+          "codec_sec": 22.71635003387928,
+          "ce_bits": 244460.234375,
+          "nodes": 102982,
+          "arithmetic_roundtrip": false,
+          "stream_sha256": "51b678371f68f3231ac973b9e30634ef70f7738944b442532cd1652716725a22",
+          "levels": {
+            "1": {
+              "nodes": 1,
+              "ce_bits": 4.272367000579834
+            },
+            "2": {
+              "nodes": 2,
+              "ce_bits": 6.0990376472473145
+            },
+            "3": {
+              "nodes": 16,
+              "ce_bits": 50.64427947998047
+            },
+            "4": {
+              "nodes": 59,
+              "ce_bits": 226.453369140625
+            },
+            "5": {
+              "nodes": 266,
+              "ce_bits": 813.9793090820312
+            },
+            "6": {
+              "nodes": 1129,
+              "ce_bits": 3198.953125
+            },
+            "7": {
+              "nodes": 4817,
+              "ce_bits": 11972.65234375
+            },
+            "8": {
+              "nodes": 19553,
+              "ce_bits": 40821.9375
+            },
+            "9": {
+              "nodes": 77139,
+              "ce_bits": 187365.265625
+            }
+          },
+          "chamfer_sq": 2.173150490208635,
+          "d1_mse": 1.5013115558449155,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "counts": {
+              "Add": 2465,
+              "Prune": 2109,
+              "Adjust": 4266
+            },
+            "predicted_local_gain": 55060.28171143892,
+            "candidate_count": 61295,
+            "edited_leaf_nodes": 8840
+          },
+          "baseline_bits": 278616,
+          "compression_percent": -12.335257128090271,
+          "net_bits": 244248,
+          "net_compression_percent": -12.335257128090271,
+          "baseline_voxels": 294679,
+          "edited_voxels": 295035,
+          "removed": 6375,
+          "added": 6731,
+          "code_space_removed": 6375,
+          "code_space_added": 6731,
+          "min_operation_percent": 2.284180413263246,
+          "run": "octree-conditional-leaf-final-20261017",
+          "physical_operation_percent": 2.9998744396444947,
+          "net_bits_with_transform_id": 244248
+        },
+        {
+          "frame": "/data/maejima/data/ground/8i/soldier/soldier_vox10_0536.ply",
+          "codec": "oa",
+          "trial": "oa_conditional_leaf_0.30000",
+          "bits": 229432,
+          "codec_sec": 21.969425953924656,
+          "ce_bits": 229769.65625,
+          "nodes": 102982,
+          "arithmetic_roundtrip": false,
+          "stream_sha256": "f2c3959860d99d2b1cde04ba637244a5a04e5f266f4ca64acc29a6722b07e8db",
+          "levels": {
+            "1": {
+              "nodes": 1,
+              "ce_bits": 4.272367000579834
+            },
+            "2": {
+              "nodes": 2,
+              "ce_bits": 6.0990376472473145
+            },
+            "3": {
+              "nodes": 16,
+              "ce_bits": 50.64427947998047
+            },
+            "4": {
+              "nodes": 59,
+              "ce_bits": 226.453369140625
+            },
+            "5": {
+              "nodes": 266,
+              "ce_bits": 813.9793090820312
+            },
+            "6": {
+              "nodes": 1129,
+              "ce_bits": 3198.953125
+            },
+            "7": {
+              "nodes": 4817,
+              "ce_bits": 11972.65234375
+            },
+            "8": {
+              "nodes": 19553,
+              "ce_bits": 40821.9375
+            },
+            "9": {
+              "nodes": 77139,
+              "ce_bits": 172674.65625
+            }
+          },
+          "chamfer_sq": 2.158547457138723,
+          "d1_mse": 1.5013115558449155,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "counts": {
+              "Add": 13351,
+              "Prune": 12932,
+              "Adjust": 8981
+            },
+            "predicted_local_gain": 104387.32963488824,
+            "candidate_count": 61295,
+            "edited_leaf_nodes": 35264
+          },
+          "baseline_bits": 278616,
+          "compression_percent": -17.65297039653143,
+          "net_bits": 229432,
+          "net_compression_percent": -17.65297039653143,
+          "baseline_voxels": 294679,
+          "edited_voxels": 295098,
+          "removed": 21913,
+          "added": 22332,
+          "code_space_removed": 21913,
+          "code_space_added": 22332,
+          "min_operation_percent": 7.578415835536296,
+          "run": "octree-conditional-leaf-final-20261017",
+          "physical_operation_percent": 11.966919936608988,
+          "net_bits_with_transform_id": 229432
+        }
+      ],
+      "pattern_leaf": [],
+      "quantization": [
+        {
+          "frame": "/data/maejima/data/ground/8i/soldier/soldier_vox10_0536.ply",
+          "codec": "oa",
+          "trial": "quant_halfup",
+          "bits": 197328,
+          "codec_sec": 20.628104098141193,
+          "ce_bits": 196860.265625,
+          "nodes": 102952,
+          "arithmetic_roundtrip": false,
+          "stream_sha256": "0b8e7034e59531e8c51c062aee05e449e687e0da21b7a0b7aea5cc7b0f520801",
+          "levels": {
+            "1": {
+              "nodes": 1,
+              "ce_bits": 4.272367000579834
+            },
+            "2": {
+              "nodes": 2,
+              "ce_bits": 6.0990376472473145
+            },
+            "3": {
+              "nodes": 16,
+              "ce_bits": 50.64427947998047
+            },
+            "4": {
+              "nodes": 59,
+              "ce_bits": 228.1340789794922
+            },
+            "5": {
+              "nodes": 269,
+              "ce_bits": 807.170166015625
+            },
+            "6": {
+              "nodes": 1134,
+              "ce_bits": 3307.564453125
+            },
+            "7": {
+              "nodes": 4815,
+              "ce_bits": 12052.3125
+            },
+            "8": {
+              "nodes": 19518,
+              "ce_bits": 41127.58984375
+            },
+            "9": {
+              "nodes": 77138,
+              "ce_bits": 139276.484375
+            }
+          },
+          "chamfer_sq": 2.195227047847019,
+          "d1_mse": 1.5013115558449155,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "not_micro": true
+          },
+          "baseline_bits": 278616,
+          "compression_percent": -29.1756395899733,
+          "net_bits": 197328,
+          "net_compression_percent": -29.1756395899733,
+          "baseline_voxels": 294679,
+          "edited_voxels": 294765,
+          "removed": 63041,
+          "added": 63127,
+          "code_space_removed": 63041,
+          "code_space_added": 63127,
+          "min_operation_percent": 21.422293410796154,
+          "run": "octree-oa-transfer-final-20261017",
+          "physical_operation_percent": 21.422293410796154,
+          "net_bits_with_transform_id": 197328
+        },
+        {
+          "frame": "/data/maejima/data/ground/8i/soldier/soldier_vox10_0536.ply",
+          "codec": "oa",
+          "trial": "quant_floor",
+          "bits": 196264,
+          "codec_sec": 21.710151670034975,
+          "ce_bits": 195802.21875,
+          "nodes": 103044,
+          "arithmetic_roundtrip": false,
+          "stream_sha256": "a8b061d2a603f85a8d36083cbbc706989a017762bd4f6dc161e79a5c5fccbb59",
+          "levels": {
+            "1": {
+              "nodes": 1,
+              "ce_bits": 4.272367000579834
+            },
+            "2": {
+              "nodes": 2,
+              "ce_bits": 6.0990376472473145
+            },
+            "3": {
+              "nodes": 16,
+              "ce_bits": 50.64427947998047
+            },
+            "4": {
+              "nodes": 59,
+              "ce_bits": 227.30215454101562
+            },
+            "5": {
+              "nodes": 268,
+              "ce_bits": 763.2637329101562
+            },
+            "6": {
+              "nodes": 1132,
+              "ce_bits": 3214.51904296875
+            },
+            "7": {
+              "nodes": 4824,
+              "ce_bits": 12145.94140625
+            },
+            "8": {
+              "nodes": 19496,
+              "ce_bits": 41074.62890625
+            },
+            "9": {
+              "nodes": 77246,
+              "ce_bits": 138315.53125
+            }
+          },
+          "chamfer_sq": 2.195320572341237,
+          "d1_mse": 1.5013115558449155,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "not_micro": true
+          },
+          "baseline_bits": 278616,
+          "compression_percent": -29.557527205903465,
+          "net_bits": 196264,
+          "net_compression_percent": -29.557527205903465,
+          "baseline_voxels": 294679,
+          "edited_voxels": 294793,
+          "removed": 62053,
+          "added": 62167,
+          "code_space_removed": 62053,
+          "code_space_added": 62167,
+          "min_operation_percent": 21.096515191106256,
+          "run": "octree-oa-transfer-final-20261017",
+          "physical_operation_percent": 21.096515191106256,
+          "net_bits_with_transform_id": 196264
+        },
+        {
+          "frame": "/data/maejima/data/ground/8i/soldier/soldier_vox10_0536.ply",
+          "codec": "oa",
+          "trial": "quant_ceil",
+          "bits": 197328,
+          "codec_sec": 20.846500140149146,
+          "ce_bits": 196860.265625,
+          "nodes": 102952,
+          "arithmetic_roundtrip": false,
+          "stream_sha256": "0b8e7034e59531e8c51c062aee05e449e687e0da21b7a0b7aea5cc7b0f520801",
+          "levels": {
+            "1": {
+              "nodes": 1,
+              "ce_bits": 4.272367000579834
+            },
+            "2": {
+              "nodes": 2,
+              "ce_bits": 6.0990376472473145
+            },
+            "3": {
+              "nodes": 16,
+              "ce_bits": 50.64427947998047
+            },
+            "4": {
+              "nodes": 59,
+              "ce_bits": 228.1340789794922
+            },
+            "5": {
+              "nodes": 269,
+              "ce_bits": 807.170166015625
+            },
+            "6": {
+              "nodes": 1134,
+              "ce_bits": 3307.564453125
+            },
+            "7": {
+              "nodes": 4815,
+              "ce_bits": 12052.3125
+            },
+            "8": {
+              "nodes": 19518,
+              "ce_bits": 41127.58984375
+            },
+            "9": {
+              "nodes": 77138,
+              "ce_bits": 139276.484375
+            }
+          },
+          "chamfer_sq": 2.195227047847019,
+          "d1_mse": 1.5013115558449155,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "not_micro": true
+          },
+          "baseline_bits": 278616,
+          "compression_percent": -29.1756395899733,
+          "net_bits": 197328,
+          "net_compression_percent": -29.1756395899733,
+          "baseline_voxels": 294679,
+          "edited_voxels": 294765,
+          "removed": 63041,
+          "added": 63127,
+          "code_space_removed": 63041,
+          "code_space_added": 63127,
+          "min_operation_percent": 21.422293410796154,
+          "run": "octree-oa-transfer-final-20261017",
+          "physical_operation_percent": 21.422293410796154,
+          "net_bits_with_transform_id": 197328
+        }
+      ]
+    },
+    "oa|redandblack_vox10_1451": {
+      "baseline": {
+        "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+        "codec": "oa",
+        "trial": "baseline",
+        "bits": 187208,
+        "codec_sec": 17.49894296610728,
+        "ce_bits": 187870.375,
+        "nodes": 69059,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "db8ca2c1656b6d5855bf78bb795d8d3e53a2f0f5e3b9589904b3787eec0f3dff",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 9.153928756713867
+          },
+          "3": {
+            "nodes": 7,
+            "ce_bits": 16.083290100097656
+          },
+          "4": {
+            "nodes": 41,
+            "ce_bits": 155.13119506835938
+          },
+          "5": {
+            "nodes": 173,
+            "ce_bits": 524.0158081054688
+          },
+          "6": {
+            "nodes": 741,
+            "ce_bits": 2203.33154296875
+          },
+          "7": {
+            "nodes": 3222,
+            "ce_bits": 8026.64111328125
+          },
+          "8": {
+            "nodes": 13060,
+            "ce_bits": 28226.34765625
+          },
+          "9": {
+            "nodes": 51812,
+            "ce_bits": 148705.390625
+          }
+        },
+        "chamfer_sq": 2.175526326309434,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772,
+        "details": {},
+        "baseline_bits": 187208,
+        "compression_percent": 0.0,
+        "net_bits": 187208,
+        "net_compression_percent": 0.0,
+        "baseline_voxels": 198530,
+        "edited_voxels": 198530,
+        "removed": 0,
+        "added": 0,
+        "code_space_removed": 0,
+        "code_space_added": 0,
+        "min_operation_percent": 0.0,
+        "run": "octree-pattern-final-20261017",
+        "physical_operation_percent": 0.0,
+        "net_bits_with_transform_id": 187208
+      },
+      "best_orientation": {
+        "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+        "codec": "oa",
+        "trial": "baseline",
+        "bits": 187208,
+        "codec_sec": 17.49894296610728,
+        "ce_bits": 187870.375,
+        "nodes": 69059,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "db8ca2c1656b6d5855bf78bb795d8d3e53a2f0f5e3b9589904b3787eec0f3dff",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 9.153928756713867
+          },
+          "3": {
+            "nodes": 7,
+            "ce_bits": 16.083290100097656
+          },
+          "4": {
+            "nodes": 41,
+            "ce_bits": 155.13119506835938
+          },
+          "5": {
+            "nodes": 173,
+            "ce_bits": 524.0158081054688
+          },
+          "6": {
+            "nodes": 741,
+            "ce_bits": 2203.33154296875
+          },
+          "7": {
+            "nodes": 3222,
+            "ce_bits": 8026.64111328125
+          },
+          "8": {
+            "nodes": 13060,
+            "ce_bits": 28226.34765625
+          },
+          "9": {
+            "nodes": 51812,
+            "ce_bits": 148705.390625
+          }
+        },
+        "chamfer_sq": 2.175526326309434,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772,
+        "details": {},
+        "baseline_bits": 187208,
+        "compression_percent": 0.0,
+        "net_bits": 187208,
+        "net_compression_percent": 0.0,
+        "baseline_voxels": 198530,
+        "edited_voxels": 198530,
+        "removed": 0,
+        "added": 0,
+        "code_space_removed": 0,
+        "code_space_added": 0,
+        "min_operation_percent": 0.0,
+        "run": "octree-pattern-final-20261017",
+        "physical_operation_percent": 0.0,
+        "net_bits_with_transform_id": 187208
+      },
+      "conditional_leaf": [],
+      "pattern_leaf": [
+        {
+          "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+          "codec": "oa",
+          "trial": "oa_pattern_leaf_0.00150",
+          "bits": 185064,
+          "codec_sec": 14.756840416695923,
+          "ce_bits": 185468.875,
+          "nodes": 69059,
+          "arithmetic_roundtrip": false,
+          "stream_sha256": "131a404617fc8ac4d4bdb2e640ae91716336fe3cb4ddfeca4bd13cf2703a664f",
+          "levels": {
+            "1": {
+              "nodes": 1,
+              "ce_bits": 4.272367000579834
+            },
+            "2": {
+              "nodes": 2,
+              "ce_bits": 9.153928756713867
+            },
+            "3": {
+              "nodes": 7,
+              "ce_bits": 16.083290100097656
+            },
+            "4": {
+              "nodes": 41,
+              "ce_bits": 155.13119506835938
+            },
+            "5": {
+              "nodes": 173,
+              "ce_bits": 524.0158081054688
+            },
+            "6": {
+              "nodes": 741,
+              "ce_bits": 2203.33154296875
+            },
+            "7": {
+              "nodes": 3222,
+              "ce_bits": 8026.64111328125
+            },
+            "8": {
+              "nodes": 13060,
+              "ce_bits": 28226.34765625
+            },
+            "9": {
+              "nodes": 51812,
+              "ce_bits": 146303.890625
+            }
+          },
+          "chamfer_sq": 2.174589028694159,
+          "d1_mse": 1.501114398641072,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "counts": {
+              "Add": 53,
+              "Prune": 41,
+              "Adjust": 204
+            },
+            "predicted_local_gain": 3433.215849876404,
+            "candidate_count": 23931,
+            "edited_leaf_nodes": 298,
+            "coherent_eight_child_masks": true
+          },
+          "baseline_bits": 187208,
+          "compression_percent": -1.1452502029827838,
+          "net_bits": 185064,
+          "net_compression_percent": -1.1452502029827838,
+          "baseline_voxels": 198530,
+          "edited_voxels": 198542,
+          "removed": 245,
+          "added": 257,
+          "code_space_removed": 245,
+          "code_space_added": 257,
+          "min_operation_percent": 0.12945146829194581,
+          "run": "octree-pattern-final-20261017",
+          "physical_operation_percent": 0.1501032589533068,
+          "net_bits_with_transform_id": 185064
+        },
+        {
+          "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+          "codec": "oa",
+          "trial": "oa_pattern_leaf_0.00300",
+          "bits": 183296,
+          "codec_sec": 14.75953579088673,
+          "ce_bits": 183581.375,
+          "nodes": 69059,
+          "arithmetic_roundtrip": false,
+          "stream_sha256": "c95312a32ff57465f178d8c4c2a07e312f2ae95c3defc090622fc91518d434cc",
+          "levels": {
+            "1": {
+              "nodes": 1,
+              "ce_bits": 4.272367000579834
+            },
+            "2": {
+              "nodes": 2,
+              "ce_bits": 9.153928756713867
+            },
+            "3": {
+              "nodes": 7,
+              "ce_bits": 16.083290100097656
+            },
+            "4": {
+              "nodes": 41,
+              "ce_bits": 155.13119506835938
+            },
+            "5": {
+              "nodes": 173,
+              "ce_bits": 524.0158081054688
+            },
+            "6": {
+              "nodes": 741,
+              "ce_bits": 2203.33154296875
+            },
+            "7": {
+              "nodes": 3222,
+              "ce_bits": 8026.64111328125
+            },
+            "8": {
+              "nodes": 13060,
+              "ce_bits": 28226.34765625
+            },
+            "9": {
+              "nodes": 51812,
+              "ce_bits": 144416.40625
+            }
+          },
+          "chamfer_sq": 2.1735980054461366,
+          "d1_mse": 1.501114398641072,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "counts": {
+              "Add": 120,
+              "Prune": 92,
+              "Adjust": 384
+            },
+            "predicted_local_gain": 6192.089716911316,
+            "candidate_count": 23931,
+            "edited_leaf_nodes": 596,
+            "coherent_eight_child_masks": true
+          },
+          "baseline_bits": 187208,
+          "compression_percent": -2.0896542882782754,
+          "net_bits": 183296,
+          "net_compression_percent": -2.0896542882782754,
+          "baseline_voxels": 198530,
+          "edited_voxels": 198558,
+          "removed": 476,
+          "added": 504,
+          "code_space_removed": 476,
+          "code_space_added": 504,
+          "min_operation_percent": 0.25386591447136453,
+          "run": "octree-pattern-final-20261017",
+          "physical_operation_percent": 0.3002065179066136,
+          "net_bits_with_transform_id": 183296
+        },
+        {
+          "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+          "codec": "oa",
+          "trial": "oa_pattern_leaf_0.03000",
+          "bits": 163392,
+          "codec_sec": 15.766540507785976,
+          "ce_bits": 163514.421875,
+          "nodes": 69059,
+          "arithmetic_roundtrip": false,
+          "stream_sha256": "c1555444b05b3c87020114f1cac25d83b3d2f480bbcb89496eb8bb3e999a4dfa",
+          "levels": {
+            "1": {
+              "nodes": 1,
+              "ce_bits": 4.272367000579834
+            },
+            "2": {
+              "nodes": 2,
+              "ce_bits": 9.153928756713867
+            },
+            "3": {
+              "nodes": 7,
+              "ce_bits": 16.083290100097656
+            },
+            "4": {
+              "nodes": 41,
+              "ce_bits": 155.13119506835938
+            },
+            "5": {
+              "nodes": 173,
+              "ce_bits": 524.0158081054688
+            },
+            "6": {
+              "nodes": 741,
+              "ce_bits": 2203.33154296875
+            },
+            "7": {
+              "nodes": 3222,
+              "ce_bits": 8026.64111328125
+            },
+            "8": {
+              "nodes": 13060,
+              "ce_bits": 28226.34765625
+            },
+            "9": {
+              "nodes": 51812,
+              "ce_bits": 124349.4453125
+            }
+          },
+          "chamfer_sq": 2.160920560012234,
+          "d1_mse": 1.501114398641072,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "counts": {
+              "Add": 1736,
+              "Prune": 1544,
+              "Adjust": 2676
+            },
+            "predicted_local_gain": 36902.635793209076,
+            "candidate_count": 23931,
+            "edited_leaf_nodes": 5728,
+            "coherent_eight_child_masks": true
+          },
+          "baseline_bits": 187208,
+          "compression_percent": -12.721678560745264,
+          "net_bits": 163392,
+          "net_compression_percent": -12.721678560745264,
+          "baseline_voxels": 198530,
+          "edited_voxels": 198722,
+          "removed": 4220,
+          "added": 4412,
+          "code_space_removed": 4220,
+          "code_space_added": 4412,
+          "min_operation_percent": 2.222334156046945,
+          "run": "octree-pattern-final-20261017",
+          "physical_operation_percent": 3.000050370221125,
+          "net_bits_with_transform_id": 163392
+        },
+        {
+          "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+          "codec": "oa",
+          "trial": "oa_pattern_leaf_0.30000",
+          "bits": 152144,
+          "codec_sec": 15.352173168212175,
+          "ce_bits": 152238.6875,
+          "nodes": 69059,
+          "arithmetic_roundtrip": false,
+          "stream_sha256": "0ffc0ca14b3c412edc69bead273b33443ed62c5956569f0d867f970791e86618",
+          "levels": {
+            "1": {
+              "nodes": 1,
+              "ce_bits": 4.272367000579834
+            },
+            "2": {
+              "nodes": 2,
+              "ce_bits": 9.153928756713867
+            },
+            "3": {
+              "nodes": 7,
+              "ce_bits": 16.083290100097656
+            },
+            "4": {
+              "nodes": 41,
+              "ce_bits": 155.13119506835938
+            },
+            "5": {
+              "nodes": 173,
+              "ce_bits": 524.0158081054688
+            },
+            "6": {
+              "nodes": 741,
+              "ce_bits": 2203.33154296875
+            },
+            "7": {
+              "nodes": 3222,
+              "ce_bits": 8026.64111328125
+            },
+            "8": {
+              "nodes": 13060,
+              "ce_bits": 28226.34765625
+            },
+            "9": {
+              "nodes": 51812,
+              "ce_bits": 113073.6953125
+            }
+          },
+          "chamfer_sq": 2.154346778955233,
+          "d1_mse": 1.501114398641072,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "counts": {
+              "Add": 11297,
+              "Prune": 9866,
+              "Adjust": 6993
+            },
+            "predicted_local_gain": 75155.85880166854,
+            "candidate_count": 23931,
+            "edited_leaf_nodes": 23931,
+            "coherent_eight_child_masks": true
+          },
+          "baseline_bits": 187208,
+          "compression_percent": -18.729968804751927,
+          "net_bits": 152144,
+          "net_compression_percent": -18.729968804751927,
+          "baseline_voxels": 198530,
+          "edited_voxels": 199961,
+          "removed": 16859,
+          "added": 18290,
+          "code_space_removed": 16859,
+          "code_space_added": 18290,
+          "min_operation_percent": 9.212713443812019,
+          "run": "octree-pattern-final-20261017",
+          "physical_operation_percent": 14.18223946003123,
+          "net_bits_with_transform_id": 152144
+        }
+      ],
+      "quantization": []
+    },
+    "gpcc|redandblack_vox10_1451": {
+      "baseline": {
+        "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+        "codec": "gpcc",
+        "trial": "baseline",
+        "bits": 158896,
+        "stream_sha256": "07711d7f5040ab7b8ac7976070ff96177be5e0cc84679cb822ae8bcc7059b24d",
+        "codec_sec": 1.0992831150069833,
+        "decoded_exact": true,
+        "chamfer_sq": 2.175526326309434,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772,
+        "details": {},
+        "baseline_bits": 158896,
+        "compression_percent": 0.0,
+        "net_bits": 158896,
+        "net_compression_percent": 0.0,
+        "baseline_voxels": 198530,
+        "edited_voxels": 198530,
+        "removed": 0,
+        "added": 0,
+        "code_space_removed": 0,
+        "code_space_added": 0,
+        "min_operation_percent": 0.0,
+        "run": "octree-pattern-final-20261017",
+        "physical_operation_percent": 0.0,
+        "net_bits_with_transform_id": 158896
+      },
+      "best_orientation": {
+        "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+        "codec": "gpcc",
+        "trial": "baseline",
+        "bits": 158896,
+        "stream_sha256": "07711d7f5040ab7b8ac7976070ff96177be5e0cc84679cb822ae8bcc7059b24d",
+        "codec_sec": 1.0992831150069833,
+        "decoded_exact": true,
+        "chamfer_sq": 2.175526326309434,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772,
+        "details": {},
+        "baseline_bits": 158896,
+        "compression_percent": 0.0,
+        "net_bits": 158896,
+        "net_compression_percent": 0.0,
+        "baseline_voxels": 198530,
+        "edited_voxels": 198530,
+        "removed": 0,
+        "added": 0,
+        "code_space_removed": 0,
+        "code_space_added": 0,
+        "min_operation_percent": 0.0,
+        "run": "octree-pattern-final-20261017",
+        "physical_operation_percent": 0.0,
+        "net_bits_with_transform_id": 158896
+      },
+      "conditional_leaf": [],
+      "pattern_leaf": [
+        {
+          "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+          "codec": "gpcc",
+          "trial": "oa_pattern_leaf_0.00150",
+          "bits": 158280,
+          "stream_sha256": "3fb2c7daca573016c3cba306eef2fa4b55eff3265c4aa96f91479be77d0851c4",
+          "codec_sec": 0.7776908096857369,
+          "decoded_exact": false,
+          "chamfer_sq": 2.174589028694159,
+          "d1_mse": 1.501114398641072,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "counts": {
+              "Add": 53,
+              "Prune": 41,
+              "Adjust": 204
+            },
+            "predicted_local_gain": 3433.215849876404,
+            "candidate_count": 23931,
+            "edited_leaf_nodes": 298,
+            "coherent_eight_child_masks": true
+          },
+          "baseline_bits": 158896,
+          "compression_percent": -0.3876749572047089,
+          "net_bits": 158280,
+          "net_compression_percent": -0.3876749572047089,
+          "baseline_voxels": 198530,
+          "edited_voxels": 198542,
+          "removed": 245,
+          "added": 257,
+          "code_space_removed": 245,
+          "code_space_added": 257,
+          "min_operation_percent": 0.12945146829194581,
+          "run": "octree-pattern-final-20261017",
+          "physical_operation_percent": 0.1501032589533068,
+          "net_bits_with_transform_id": 158280
+        },
+        {
+          "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+          "codec": "gpcc",
+          "trial": "oa_pattern_leaf_0.00300",
+          "bits": 158144,
+          "stream_sha256": "fec667c2405bbcd0a9b072f6e4b53a0f6599a20822fced1ff248ae1e01299ffd",
+          "codec_sec": 0.7800771589390934,
+          "decoded_exact": false,
+          "chamfer_sq": 2.1735980054461366,
+          "d1_mse": 1.501114398641072,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "counts": {
+              "Add": 120,
+              "Prune": 92,
+              "Adjust": 384
+            },
+            "predicted_local_gain": 6192.089716911316,
+            "candidate_count": 23931,
+            "edited_leaf_nodes": 596,
+            "coherent_eight_child_masks": true
+          },
+          "baseline_bits": 158896,
+          "compression_percent": -0.47326553217198475,
+          "net_bits": 158144,
+          "net_compression_percent": -0.47326553217198475,
+          "baseline_voxels": 198530,
+          "edited_voxels": 198558,
+          "removed": 476,
+          "added": 504,
+          "code_space_removed": 476,
+          "code_space_added": 504,
+          "min_operation_percent": 0.25386591447136453,
+          "run": "octree-pattern-final-20261017",
+          "physical_operation_percent": 0.3002065179066136,
+          "net_bits_with_transform_id": 158144
+        },
+        {
+          "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+          "codec": "gpcc",
+          "trial": "oa_pattern_leaf_0.03000",
+          "bits": 156680,
+          "stream_sha256": "c955986287944caf36b11debfb5f3aad9efb24026f6ba1ce24059c046e1a0e02",
+          "codec_sec": 0.7922442187555134,
+          "decoded_exact": false,
+          "chamfer_sq": 2.160920560012234,
+          "d1_mse": 1.501114398641072,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "counts": {
+              "Add": 1736,
+              "Prune": 1544,
+              "Adjust": 2676
+            },
+            "predicted_local_gain": 36902.635793209076,
+            "candidate_count": 23931,
+            "edited_leaf_nodes": 5728,
+            "coherent_eight_child_masks": true
+          },
+          "baseline_bits": 158896,
+          "compression_percent": -1.3946228979961783,
+          "net_bits": 156680,
+          "net_compression_percent": -1.3946228979961783,
+          "baseline_voxels": 198530,
+          "edited_voxels": 198722,
+          "removed": 4220,
+          "added": 4412,
+          "code_space_removed": 4220,
+          "code_space_added": 4412,
+          "min_operation_percent": 2.222334156046945,
+          "run": "octree-pattern-final-20261017",
+          "physical_operation_percent": 3.000050370221125,
+          "net_bits_with_transform_id": 156680
+        },
+        {
+          "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+          "codec": "gpcc",
+          "trial": "oa_pattern_leaf_0.30000",
+          "bits": 162680,
+          "stream_sha256": "ed89752687bd7f76d724fcedf750359413afec216d10934052d2407b23d97de3",
+          "codec_sec": 0.8502594991587102,
+          "decoded_exact": false,
+          "chamfer_sq": 2.154346778955233,
+          "d1_mse": 1.501114398641072,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772,
+          "details": {
+            "counts": {
+              "Add": 11297,
+              "Prune": 9866,
+              "Adjust": 6993
+            },
+            "predicted_local_gain": 75155.85880166854,
+            "candidate_count": 23931,
+            "edited_leaf_nodes": 23931,
+            "coherent_eight_child_masks": true
+          },
+          "baseline_bits": 158896,
+          "compression_percent": 2.381431879971796,
+          "net_bits": 162680,
+          "net_compression_percent": 2.381431879971796,
+          "baseline_voxels": 198530,
+          "edited_voxels": 199961,
+          "removed": 16859,
+          "added": 18290,
+          "code_space_removed": 16859,
+          "code_space_added": 18290,
+          "min_operation_percent": 9.212713443812019,
+          "run": "octree-pattern-final-20261017",
+          "physical_operation_percent": 14.18223946003123,
+          "net_bits_with_transform_id": 162680
+        }
+      ],
+      "quantization": []
+    }
+  },
+  "window_results": [
+    {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "budget": 0.0015,
+      "actual_operation_percent": 0.15007999546928316,
+      "baseline_oa_bits": 188680,
+      "edited_oa_bits": 185736,
+      "compression_percent": -1.560313758744969,
+      "baseline_gpcc_bits": 150240,
+      "edited_gpcc_bits": 149632,
+      "gpcc_compression_percent": -0.4046858359957439,
+      "baseline_quality": {
+        "chamfer_sq": 2.178329269921022,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "edited_quality": {
+        "chamfer_sq": 2.1771698000465394,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "measured_cdf_gain_bits": 2941.612484284444,
+      "selected_count": 318,
+      "counts": {
+        "Add": 37,
+        "Prune": 36,
+        "Adjust": 245
+      },
+      "predicted_cdf_gain_bits": 2941.6124842844315,
+      "windows": 55,
+      "model_window_forwards": 330,
+      "optimization_sec": 67.06342529924586
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+      "budget": 0.0015,
+      "actual_operation_percent": 0.1501032589533068,
+      "baseline_oa_bits": 187208,
+      "edited_oa_bits": 184768,
+      "compression_percent": -1.3033631041408533,
+      "baseline_gpcc_bits": 158896,
+      "edited_gpcc_bits": 158216,
+      "gpcc_compression_percent": -0.4279528748363681,
+      "baseline_quality": {
+        "chamfer_sq": 2.175526326309434,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "edited_quality": {
+        "chamfer_sq": 2.1744349380026833,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "measured_cdf_gain_bits": 2439.246387504565,
+      "selected_count": 298,
+      "counts": {
+        "Add": 48,
+        "Prune": 47,
+        "Adjust": 203
+      },
+      "predicted_cdf_gain_bits": 2439.2463875045564,
+      "windows": 52,
+      "model_window_forwards": 312,
+      "optimization_sec": 63.32527428911999
+    }
+  ],
+  "aborted_run": "octree-oa-leaf-20261017: stopped own process during candidate generation; completed rows only",
+  "warning": "These are independent research/oracle measurements, not trained network results."
+}

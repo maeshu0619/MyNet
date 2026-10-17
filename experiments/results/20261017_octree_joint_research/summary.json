@@ -1,0 +1,1951 @@
+{
+  "joint_result_rows": 124,
+  "portfolio_proposals": 88,
+  "best": [
+    {
+      "frame": "longdress_vox10_1051",
+      "budget": 0.0015,
+      "profile": "oa_freq",
+      "counts": {
+        "Add": 103,
+        "Prune": 57,
+        "Adjust": 158
+      },
+      "operation_percent": 0.15007999546928316,
+      "gpcc_baseline_bits": 150240,
+      "gpcc_bits": 148912,
+      "gpcc_C": -0.8839190628328053,
+      "oa_baseline_bits": 188680,
+      "oa_bits": 186144,
+      "oa_C": -1.3440746237015078,
+      "baseline_quality": {
+        "chamfer_sq": 2.178329269921022,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality": {
+        "chamfer_sq": 2.178007580391008,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "joint_rescue_rewrites": 7,
+      "measured_gpcc_gain_per_operation": 4.176100628930818,
+      "required_gpcc_gain_per_operation_for_50_percent": 236.22641509433961
+    },
+    {
+      "frame": "longdress_vox10_1051",
+      "budget": 0.003,
+      "profile": "oa_freq",
+      "counts": {
+        "Add": 276,
+        "Prune": 121,
+        "Adjust": 239
+      },
+      "operation_percent": 0.3001599909385663,
+      "gpcc_baseline_bits": 150240,
+      "gpcc_bits": 148264,
+      "gpcc_C": -1.3152289669861594,
+      "oa_baseline_bits": 188680,
+      "oa_bits": 184368,
+      "oa_C": -2.2853508585965687,
+      "baseline_quality": {
+        "chamfer_sq": 2.178329269921022,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality": {
+        "chamfer_sq": 2.1781168040959074,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "joint_rescue_rewrites": 9,
+      "measured_gpcc_gain_per_operation": 3.106918238993711,
+      "required_gpcc_gain_per_operation_for_50_percent": 118.11320754716981
+    },
+    {
+      "frame": "loot_vox10_1000",
+      "budget": 0.0015,
+      "profile": "oa_freq",
+      "counts": {
+        "Add": 118,
+        "Prune": 91,
+        "Adjust": 115
+      },
+      "operation_percent": 0.1498757973716226,
+      "gpcc_baseline_bits": 144536,
+      "gpcc_bits": 143712,
+      "gpcc_C": -0.5701001826534546,
+      "oa_baseline_bits": 181520,
+      "oa_bits": 179408,
+      "oa_C": -1.1635081533715286,
+      "baseline_quality": {
+        "chamfer_sq": 2.1731699093591006,
+        "d1_mse": 1.5003200950848188,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality": {
+        "chamfer_sq": 2.172826871029982,
+        "d1_mse": 1.5003200950848188,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "joint_rescue_rewrites": 5,
+      "measured_gpcc_gain_per_operation": 2.54320987654321,
+      "required_gpcc_gain_per_operation_for_50_percent": 223.0493827160494
+    },
+    {
+      "frame": "loot_vox10_1000",
+      "budget": 0.003,
+      "profile": "oa_freq",
+      "counts": {
+        "Add": 320,
+        "Prune": 134,
+        "Adjust": 195
+      },
+      "operation_percent": 0.30021417436476255,
+      "gpcc_baseline_bits": 144536,
+      "gpcc_bits": 143352,
+      "gpcc_C": -0.8191730779874895,
+      "oa_baseline_bits": 181520,
+      "oa_bits": 177840,
+      "oa_C": -2.027324812692821,
+      "baseline_quality": {
+        "chamfer_sq": 2.1731699093591006,
+        "d1_mse": 1.5003200950848188,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality": {
+        "chamfer_sq": 2.1731045103090927,
+        "d1_mse": 1.5003200950848188,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "joint_rescue_rewrites": 6,
+      "measured_gpcc_gain_per_operation": 1.8243451463790448,
+      "required_gpcc_gain_per_operation_for_50_percent": 111.35285053929121
+    },
+    {
+      "frame": "soldier_vox10_0536",
+      "budget": 0.0015,
+      "profile": "combined",
+      "counts": {
+        "Add": 106,
+        "Prune": 226,
+        "Adjust": 110
+      },
+      "operation_percent": 0.14999372198222471,
+      "gpcc_baseline_bits": 215664,
+      "gpcc_bits": 214416,
+      "gpcc_C": -0.5786779434676204,
+      "oa_baseline_bits": 278616,
+      "oa_bits": 276688,
+      "oa_C": -0.6919918454073026,
+      "baseline_quality": {
+        "chamfer_sq": 2.1899659899919026,
+        "d1_mse": 1.5013115558449155,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality": {
+        "chamfer_sq": 2.1899579730312855,
+        "d1_mse": 1.5013115558449155,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "joint_rescue_rewrites": 11,
+      "measured_gpcc_gain_per_operation": 2.823529411764706,
+      "required_gpcc_gain_per_operation_for_50_percent": 243.96380090497738
+    },
+    {
+      "frame": "soldier_vox10_0536",
+      "budget": 0.003,
+      "profile": "combined",
+      "counts": {
+        "Add": 212,
+        "Prune": 513,
+        "Adjust": 159
+      },
+      "operation_percent": 0.29998744396444943,
+      "gpcc_baseline_bits": 215664,
+      "gpcc_bits": 214144,
+      "gpcc_C": -0.7048000593515846,
+      "oa_baseline_bits": 278616,
+      "oa_bits": 275232,
+      "oa_C": -1.2145748987854255,
+      "baseline_quality": {
+        "chamfer_sq": 2.1899659899919026,
+        "d1_mse": 1.5013115558449155,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality": {
+        "chamfer_sq": 2.189960164096891,
+        "d1_mse": 1.5013115558449155,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "joint_rescue_rewrites": 15,
+      "measured_gpcc_gain_per_operation": 1.7194570135746607,
+      "required_gpcc_gain_per_operation_for_50_percent": 121.98190045248869
+    },
+    {
+      "frame": "redandblack_vox10_1451",
+      "budget": 0.0015,
+      "profile": "combined",
+      "counts": {
+        "Add": 30,
+        "Prune": 136,
+        "Adjust": 132
+      },
+      "operation_percent": 0.1501032589533068,
+      "gpcc_baseline_bits": 158896,
+      "gpcc_bits": 157648,
+      "gpcc_C": -0.7854193938173437,
+      "oa_baseline_bits": 187208,
+      "oa_bits": 185584,
+      "oa_C": -0.8674842955429307,
+      "baseline_quality": {
+        "chamfer_sq": 2.175526326309434,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality": {
+        "chamfer_sq": 2.1750197729909493,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "joint_rescue_rewrites": 26,
+      "measured_gpcc_gain_per_operation": 4.1879194630872485,
+      "required_gpcc_gain_per_operation_for_50_percent": 266.6040268456376
+    },
+    {
+      "frame": "redandblack_vox10_1451",
+      "budget": 0.003,
+      "profile": "combined",
+      "counts": {
+        "Add": 120,
+        "Prune": 298,
+        "Adjust": 178
+      },
+      "operation_percent": 0.3002065179066136,
+      "gpcc_baseline_bits": 158896,
+      "gpcc_bits": 157032,
+      "gpcc_C": -1.1730943510220526,
+      "oa_baseline_bits": 187208,
+      "oa_bits": 184528,
+      "oa_C": -1.431562753728477,
+      "baseline_quality": {
+        "chamfer_sq": 2.175526326309434,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality": {
+        "chamfer_sq": 2.1750022344077897,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "joint_rescue_rewrites": 29,
+      "measured_gpcc_gain_per_operation": 3.12751677852349,
+      "required_gpcc_gain_per_operation_for_50_percent": 133.3020134228188
+    }
+  ],
+  "operation_family_interactions": [
+    {
+      "frame": "longdress_vox10_1051",
+      "joint_gain_bits": 1328,
+      "gain_beyond_sum_of_three_isolated_families_bits": 0,
+      "family_ablations": [
+        {
+          "operations": [
+            "Add"
+          ],
+          "bits": 149816,
+          "quality": {
+            "chamfer_sq": 2.178731135411197,
+            "d1_mse": 1.5005765054758227,
+            "max_gt_to_rec": 1.7320508075688772,
+            "max_rec_to_gt": 1.7320508075688772
+          }
+        },
+        {
+          "operations": [
+            "Prune"
+          ],
+          "bits": 150016,
+          "quality": {
+            "chamfer_sq": 2.1780584485433767,
+            "d1_mse": 1.5005765054758227,
+            "max_gt_to_rec": 1.7320508075688772,
+            "max_rec_to_gt": 1.7320508075688772
+          }
+        },
+        {
+          "operations": [
+            "Adjust"
+          ],
+          "bits": 149560,
+          "quality": {
+            "chamfer_sq": 2.1778761982365866,
+            "d1_mse": 1.5005765054758227,
+            "max_gt_to_rec": 1.7320508075688772,
+            "max_rec_to_gt": 1.7320508075688772
+          }
+        },
+        {
+          "operations": [
+            "Add",
+            "Prune"
+          ],
+          "bits": 149592,
+          "quality": {
+            "chamfer_sq": 2.178460553736358,
+            "d1_mse": 1.5005765054758227,
+            "max_gt_to_rec": 1.7320508075688772,
+            "max_rec_to_gt": 1.7320508075688772
+          }
+        },
+        {
+          "operations": [
+            "Add",
+            "Adjust"
+          ],
+          "bits": 149144,
+          "quality": {
+            "chamfer_sq": 2.1782782838615957,
+            "d1_mse": 1.5005765054758227,
+            "max_gt_to_rec": 1.7320508075688772,
+            "max_rec_to_gt": 1.7320508075688772
+          }
+        },
+        {
+          "operations": [
+            "Prune",
+            "Adjust"
+          ],
+          "bits": 149344,
+          "quality": {
+            "chamfer_sq": 2.1776052549447362,
+            "d1_mse": 1.5005765054758227,
+            "max_gt_to_rec": 1.7320508075688772,
+            "max_rec_to_gt": 1.7320508075688772
+          }
+        }
+      ]
+    },
+    {
+      "frame": "loot_vox10_1000",
+      "joint_gain_bits": 824,
+      "gain_beyond_sum_of_three_isolated_families_bits": 56,
+      "family_ablations": [
+        {
+          "operations": [
+            "Add"
+          ],
+          "bits": 144312,
+          "quality": {
+            "chamfer_sq": 2.17355643215838,
+            "d1_mse": 1.5003200950848188,
+            "max_gt_to_rec": 1.7320508075688772,
+            "max_rec_to_gt": 1.7320508075688772
+          }
+        },
+        {
+          "operations": [
+            "Prune"
+          ],
+          "bits": 144128,
+          "quality": {
+            "chamfer_sq": 2.1727544736713207,
+            "d1_mse": 1.5003200950848188,
+            "max_gt_to_rec": 1.7320508075688772,
+            "max_rec_to_gt": 1.7320508075688772
+          }
+        },
+        {
+          "operations": [
+            "Adjust"
+          ],
+          "bits": 144400,
+          "quality": {
+            "chamfer_sq": 2.172855355216469,
+            "d1_mse": 1.5003200950848188,
+            "max_gt_to_rec": 1.7320508075688772,
+            "max_rec_to_gt": 1.7320508075688772
+          }
+        },
+        {
+          "operations": [
+            "Add",
+            "Prune"
+          ],
+          "bits": 143896,
+          "quality": {
+            "chamfer_sq": 2.1731413858908093,
+            "d1_mse": 1.5003200950848188,
+            "max_gt_to_rec": 1.7320508075688772,
+            "max_rec_to_gt": 1.7320508075688772
+          }
+        },
+        {
+          "operations": [
+            "Add",
+            "Adjust"
+          ],
+          "bits": 144128,
+          "quality": {
+            "chamfer_sq": 2.1732420496195557,
+            "d1_mse": 1.5003200950848188,
+            "max_gt_to_rec": 1.7320508075688772,
+            "max_rec_to_gt": 1.7320508075688772
+          }
+        },
+        {
+          "operations": [
+            "Prune",
+            "Adjust"
+          ],
+          "bits": 143984,
+          "quality": {
+            "chamfer_sq": 2.1724397870621615,
+            "d1_mse": 1.5003200950848188,
+            "max_gt_to_rec": 1.7320508075688772,
+            "max_rec_to_gt": 1.7320508075688772
+          }
+        }
+      ]
+    },
+    {
+      "frame": "soldier_vox10_0536",
+      "joint_gain_bits": 1248,
+      "gain_beyond_sum_of_three_isolated_families_bits": 64,
+      "family_ablations": [
+        {
+          "operations": [
+            "Add"
+          ],
+          "bits": 215144,
+          "quality": {
+            "chamfer_sq": 2.1904443136175296,
+            "d1_mse": 1.5013115558449155,
+            "max_gt_to_rec": 1.7320508075688772,
+            "max_rec_to_gt": 1.7320508075688772
+          }
+        },
+        {
+          "operations": [
+            "Prune"
+          ],
+          "bits": 215288,
+          "quality": {
+            "chamfer_sq": 2.1894523163146653,
+            "d1_mse": 1.5013153301063398,
+            "max_gt_to_rec": 2.23606797749979,
+            "max_rec_to_gt": 1.7320508075688772
+          }
+        },
+        {
+          "operations": [
+            "Adjust"
+          ],
+          "bits": 215376,
+          "quality": {
+            "chamfer_sq": 2.1899965316999985,
+            "d1_mse": 1.5013115558449155,
+            "max_gt_to_rec": 1.7320508075688772,
+            "max_rec_to_gt": 1.7320508075688772
+          }
+        },
+        {
+          "operations": [
+            "Add",
+            "Prune"
+          ],
+          "bits": 214768,
+          "quality": {
+            "chamfer_sq": 2.189931193142268,
+            "d1_mse": 1.5013153301063398,
+            "max_gt_to_rec": 2.23606797749979,
+            "max_rec_to_gt": 1.7320508075688772
+          }
+        },
+        {
+          "operations": [
+            "Add",
+            "Adjust"
+          ],
+          "bits": 214840,
+          "quality": {
+            "chamfer_sq": 2.1904748443433126,
+            "d1_mse": 1.5013115558449155,
+            "max_gt_to_rec": 1.7320508075688772,
+            "max_rec_to_gt": 1.7320508075688772
+          }
+        },
+        {
+          "operations": [
+            "Prune",
+            "Adjust"
+          ],
+          "bits": 214952,
+          "quality": {
+            "chamfer_sq": 2.189479107202857,
+            "d1_mse": 1.5013115558449155,
+            "max_gt_to_rec": 1.7320508075688772,
+            "max_rec_to_gt": 1.7320508075688772
+          }
+        }
+      ]
+    },
+    {
+      "frame": "redandblack_vox10_1451",
+      "joint_gain_bits": 1248,
+      "gain_beyond_sum_of_three_isolated_families_bits": 8,
+      "family_ablations": [
+        {
+          "operations": [
+            "Add"
+          ],
+          "bits": 158728,
+          "quality": {
+            "chamfer_sq": 2.175671207666052,
+            "d1_mse": 1.501114398641072,
+            "max_gt_to_rec": 1.7320508075688772,
+            "max_rec_to_gt": 1.7320508075688772
+          }
+        },
+        {
+          "operations": [
+            "Prune"
+          ],
+          "bits": 158360,
+          "quality": {
+            "chamfer_sq": 2.174950300936504,
+            "d1_mse": 1.501114398641072,
+            "max_gt_to_rec": 1.7320508075688772,
+            "max_rec_to_gt": 1.7320508075688772
+          }
+        },
+        {
+          "operations": [
+            "Adjust"
+          ],
+          "bits": 158360,
+          "quality": {
+            "chamfer_sq": 2.1754507709777466,
+            "d1_mse": 1.501114398641072,
+            "max_gt_to_rec": 1.7320508075688772,
+            "max_rec_to_gt": 1.7320508075688772
+          }
+        },
+        {
+          "operations": [
+            "Add",
+            "Prune"
+          ],
+          "bits": 158184,
+          "quality": {
+            "chamfer_sq": 2.1750953686850183,
+            "d1_mse": 1.501114398641072,
+            "max_gt_to_rec": 1.7320508075688772,
+            "max_rec_to_gt": 1.7320508075688772
+          }
+        },
+        {
+          "operations": [
+            "Add",
+            "Adjust"
+          ],
+          "bits": 158200,
+          "quality": {
+            "chamfer_sq": 2.1755956637498555,
+            "d1_mse": 1.501114398641072,
+            "max_gt_to_rec": 1.7320508075688772,
+            "max_rec_to_gt": 1.7320508075688772
+          }
+        },
+        {
+          "operations": [
+            "Prune",
+            "Adjust"
+          ],
+          "bits": 157824,
+          "quality": {
+            "chamfer_sq": 2.174874693811289,
+            "d1_mse": 1.501114398641072,
+            "max_gt_to_rec": 1.7320508075688772,
+            "max_rec_to_gt": 1.7320508075688772
+          }
+        }
+      ]
+    }
+  ],
+  "marginal_entropy": [
+    {
+      "frame": "longdress_vox10_1051_proposals",
+      "leaf_nodes": 55435,
+      "empirical_marginal_entropy_bits": 310659.1501382489
+    },
+    {
+      "frame": "redandblack_vox10_1451_proposals",
+      "leaf_nodes": 51812,
+      "empirical_marginal_entropy_bits": 294689.8332669532
+    },
+    {
+      "frame": "loot_vox10_1000_proposals",
+      "leaf_nodes": 56514,
+      "empirical_marginal_entropy_bits": 316163.00301552634
+    },
+    {
+      "frame": "soldier_vox10_0536_proposals",
+      "leaf_nodes": 77139,
+      "empirical_marginal_entropy_bits": 446165.3767465131
+    }
+  ],
+  "context_audit": [
+    {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "edited_leaf_rows": 318,
+      "actual_stream_gain_bits": 2536,
+      "own_symbol_frozen_integer_cdf_gain_bits": 3123.8671199546693,
+      "context_integer_cdf_gain_bits": -587.8458673565802,
+      "context_gain_on_unedited_rows": -587.0590749457584,
+      "context_gain_on_edited_rows": -0.7867924108217696,
+      "net_integer_cdf_gain_bits": 2536.021252598089,
+      "unedited_rows_with_changed_cdf_cost": 42628,
+      "edited_before_probabilities": {
+        "min": 4.875964632056196e-10,
+        "median": 0.00018534674018155783,
+        "max": 0.018589945510029793,
+        "mean": 0.0009116130531765521
+      },
+      "edited_after_frozen_probabilities": {
+        "min": 3.3098443964263424e-05,
+        "median": 0.2825745940208435,
+        "max": 0.9907885193824768,
+        "mean": 0.3746500313282013
+      },
+      "edited_after_recomputed_probabilities": {
+        "min": 3.3006650483002886e-05,
+        "median": 0.2837716341018677,
+        "max": 0.9913779497146606,
+        "mean": 0.3750791549682617
+      },
+      "baseline_quality": {
+        "chamfer_sq": 2.178329269921022,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "all_removals_without_destinations_quality": {
+        "chamfer_sq": 2.177249561743076,
+        "d1_mse": 1.5006130675445046,
+        "max_gt_to_rec": 2.449489742783178,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "joint_final_quality": {
+        "chamfer_sq": 2.178007580391008,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/loot/loot_vox10_1000.ply",
+      "edited_leaf_rows": 324,
+      "actual_stream_gain_bits": 2112,
+      "own_symbol_frozen_integer_cdf_gain_bits": 3083.147748525138,
+      "context_integer_cdf_gain_bits": -967.0661174575207,
+      "context_gain_on_unedited_rows": -963.5346471020058,
+      "context_gain_on_edited_rows": -3.531470355514845,
+      "net_integer_cdf_gain_bits": 2116.0816310676173,
+      "unedited_rows_with_changed_cdf_cost": 43458,
+      "edited_before_probabilities": {
+        "min": 2.537472276742392e-08,
+        "median": 0.0003045439952984452,
+        "max": 0.03328968957066536,
+        "mean": 0.001324490294791758
+      },
+      "edited_after_frozen_probabilities": {
+        "min": 0.00011590996291488409,
+        "median": 0.4047611653804779,
+        "max": 0.9964583516120911,
+        "mean": 0.44297099113464355
+      },
+      "edited_after_recomputed_probabilities": {
+        "min": 0.0001230166817549616,
+        "median": 0.40248459577560425,
+        "max": 0.9964225888252258,
+        "mean": 0.44164860248565674
+      },
+      "baseline_quality": {
+        "chamfer_sq": 2.1731699093591006,
+        "d1_mse": 1.5003200950848188,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "all_removals_without_destinations_quality": {
+        "chamfer_sq": 2.1721842101250783,
+        "d1_mse": 1.5003456006692666,
+        "max_gt_to_rec": 2.23606797749979,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "joint_final_quality": {
+        "chamfer_sq": 2.172826871029982,
+        "d1_mse": 1.5003200950848188,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    }
+  ],
+  "actual_search": {
+    "trial": "final",
+    "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+    "initial_bits": 148912,
+    "gpcc": {
+      "bits": 148912,
+      "stream_sha256": "9db60c4c5a046dc7ab3ea7b007cffcce601bfad6b4fadfb83a68db114f01a708",
+      "codec_sec": 1.1530211460776627,
+      "decoded_exact": true
+    },
+    "gpcc_C": -0.8839190628328053,
+    "oa": {
+      "bits": 186144,
+      "codec_sec": 17.119227374903858,
+      "ce_bits": 186448.75,
+      "nodes": 73905,
+      "arithmetic_roundtrip": true,
+      "stream_sha256": "99d19277a0162d8f28bff148360e379c2129192d1c9086ee692197bb53700836",
+      "levels": {
+        "1": {
+          "nodes": 1,
+          "ce_bits": 4.272367000579834
+        },
+        "2": {
+          "nodes": 2,
+          "ce_bits": 13.5221529006958
+        },
+        "3": {
+          "nodes": 8,
+          "ce_bits": 21.59096908569336
+        },
+        "4": {
+          "nodes": 43,
+          "ce_bits": 159.05824279785156
+        },
+        "5": {
+          "nodes": 191,
+          "ce_bits": 578.7169189453125
+        },
+        "6": {
+          "nodes": 820,
+          "ce_bits": 2173.697021484375
+        },
+        "7": {
+          "nodes": 3414,
+          "ce_bits": 7833.625
+        },
+        "8": {
+          "nodes": 13991,
+          "ce_bits": 27330.9453125
+        },
+        "9": {
+          "nodes": 55435,
+          "ce_bits": 148333.3125
+        }
+      }
+    },
+    "oa_C": -1.3440746237015078,
+    "counts": {
+      "Add": 103,
+      "Prune": 57,
+      "Adjust": 158
+    },
+    "operation_percent": 0.15007999546928316,
+    "accepted_steps": 0,
+    "unique_proposals": 31,
+    "quality": {
+      "chamfer_sq": 2.178007580391008,
+      "d1_mse": 1.5005765054758227,
+      "max_gt_to_rec": 1.7320508075688772,
+      "max_rec_to_gt": 1.7320508075688772
+    }
+  },
+  "topology": [
+    {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "trial": "baseline",
+      "gpcc": {
+        "bits": 150240,
+        "stream_sha256": "fa7b6836f413a0ca6ecd73c883625067344522ccb82e6bd9a73d746a9157722e",
+        "codec_sec": 1.1278137643821537,
+        "decoded_exact": true
+      },
+      "oa": {
+        "bits": 188680,
+        "codec_sec": 17.82797156414017,
+        "ce_bits": 189248.359375,
+        "nodes": 73905,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "e3f6f81ba4be57718d93a75e1a39a38542e3e5b50dfd5314491ce3cf263af00f",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 13.5221529006958
+          },
+          "3": {
+            "nodes": 8,
+            "ce_bits": 21.59096908569336
+          },
+          "4": {
+            "nodes": 43,
+            "ce_bits": 159.05824279785156
+          },
+          "5": {
+            "nodes": 191,
+            "ce_bits": 578.7169189453125
+          },
+          "6": {
+            "nodes": 820,
+            "ce_bits": 2173.697021484375
+          },
+          "7": {
+            "nodes": 3414,
+            "ce_bits": 7833.625
+          },
+          "8": {
+            "nodes": 13991,
+            "ce_bits": 27330.9453125
+          },
+          "9": {
+            "nodes": 55435,
+            "ce_bits": 151132.9375
+          }
+        }
+      },
+      "quality": {
+        "chamfer_sq": 2.178329269921022,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "trial": "proposal_audit",
+      "sampled_parents": 12000,
+      "total_parents": 55435,
+      "candidates": 3050,
+      "generation_sec": 6.3237850409932435,
+      "candidates_requiring_add_rescue": 582
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "trial": "node",
+      "quality": {
+        "chamfer_sq": 2.177132728002646,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality_ok": true,
+      "counts": {
+        "Add": 0,
+        "Prune": 317,
+        "Adjust": 1
+      },
+      "removed_leaf_parents": 303,
+      "joint_rescue_patches": 1,
+      "rescued_raw_points": 1,
+      "operation_percent": 0.15007999546928316,
+      "gpcc": {
+        "bits": 150368,
+        "stream_sha256": "a0bcdfaa9470da5d5f10b4f8056f1744354fd331726e4e600476fbdb4dece159",
+        "codec_sec": 1.160437138285488,
+        "decoded_exact": true
+      },
+      "oa": {
+        "bits": 188096,
+        "codec_sec": 16.3999350881204,
+        "ce_bits": 188640.25,
+        "nodes": 73426,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "224bdb093f22744eef7b89c204c3f56ca41511b8f7f44866358b4ff4896ac193",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 13.5221529006958
+          },
+          "3": {
+            "nodes": 8,
+            "ce_bits": 21.59096908569336
+          },
+          "4": {
+            "nodes": 43,
+            "ce_bits": 159.05824279785156
+          },
+          "5": {
+            "nodes": 191,
+            "ce_bits": 584.9921875
+          },
+          "6": {
+            "nodes": 817,
+            "ce_bits": 2193.658203125
+          },
+          "7": {
+            "nodes": 3398,
+            "ce_bits": 7964.55126953125
+          },
+          "8": {
+            "nodes": 13834,
+            "ce_bits": 27310.5625
+          },
+          "9": {
+            "nodes": 55132,
+            "ce_bits": 150388.03125
+          }
+        }
+      },
+      "gpcc_C": 0.08519701810436597,
+      "oa_C": -0.309518761924954
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "trial": "prune",
+      "quality": {
+        "chamfer_sq": 2.177131199216399,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality_ok": true,
+      "counts": {
+        "Add": 0,
+        "Prune": 318,
+        "Adjust": 0
+      },
+      "removed_leaf_parents": 303,
+      "joint_rescue_patches": 0,
+      "rescued_raw_points": 0,
+      "operation_percent": 0.15007999546928316,
+      "gpcc": {
+        "bits": 150384,
+        "stream_sha256": "8fcb6891157b84f7375f5bf088b233c471bf13ecc7c0325304ca63f4988d7c41",
+        "codec_sec": 1.1359008578583598,
+        "decoded_exact": true
+      },
+      "oa": {
+        "bits": 188200,
+        "codec_sec": 15.993636677972972,
+        "ce_bits": 188755.984375,
+        "nodes": 73427,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "f8f83aa7aa907a13b8811d6740e18f85315b489a4446a5b7146679334dafc5a2",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 13.5221529006958
+          },
+          "3": {
+            "nodes": 8,
+            "ce_bits": 21.59096908569336
+          },
+          "4": {
+            "nodes": 43,
+            "ce_bits": 159.05824279785156
+          },
+          "5": {
+            "nodes": 191,
+            "ce_bits": 584.9921875
+          },
+          "6": {
+            "nodes": 817,
+            "ce_bits": 2193.658203125
+          },
+          "7": {
+            "nodes": 3398,
+            "ce_bits": 7962.2822265625
+          },
+          "8": {
+            "nodes": 13835,
+            "ce_bits": 27302.580078125
+          },
+          "9": {
+            "nodes": 55132,
+            "ce_bits": 150514.015625
+          }
+        }
+      },
+      "gpcc_C": 0.0958466453674145,
+      "oa_C": -0.25439898240406933
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "trial": "balanced",
+      "quality": {
+        "chamfer_sq": 2.177132728002646,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality_ok": true,
+      "counts": {
+        "Add": 0,
+        "Prune": 317,
+        "Adjust": 1
+      },
+      "removed_leaf_parents": 303,
+      "joint_rescue_patches": 1,
+      "rescued_raw_points": 1,
+      "operation_percent": 0.15007999546928316,
+      "gpcc": {
+        "bits": 150368,
+        "stream_sha256": "a0bcdfaa9470da5d5f10b4f8056f1744354fd331726e4e600476fbdb4dece159",
+        "codec_sec": 1.1307658478617668,
+        "decoded_exact": true
+      },
+      "oa": {
+        "bits": 188096,
+        "codec_sec": 15.46384019497782,
+        "ce_bits": 188640.25,
+        "nodes": 73426,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "224bdb093f22744eef7b89c204c3f56ca41511b8f7f44866358b4ff4896ac193",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 13.5221529006958
+          },
+          "3": {
+            "nodes": 8,
+            "ce_bits": 21.59096908569336
+          },
+          "4": {
+            "nodes": 43,
+            "ce_bits": 159.05824279785156
+          },
+          "5": {
+            "nodes": 191,
+            "ce_bits": 584.9921875
+          },
+          "6": {
+            "nodes": 817,
+            "ce_bits": 2193.658203125
+          },
+          "7": {
+            "nodes": 3398,
+            "ce_bits": 7964.55126953125
+          },
+          "8": {
+            "nodes": 13834,
+            "ce_bits": 27310.5625
+          },
+          "9": {
+            "nodes": 55132,
+            "ce_bits": 150388.03125
+          }
+        }
+      },
+      "gpcc_C": 0.08519701810436597,
+      "oa_C": -0.309518761924954
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+      "trial": "baseline",
+      "gpcc": {
+        "bits": 158896,
+        "stream_sha256": "07711d7f5040ab7b8ac7976070ff96177be5e0cc84679cb822ae8bcc7059b24d",
+        "codec_sec": 1.0485990978777409,
+        "decoded_exact": true
+      },
+      "oa": {
+        "bits": 187208,
+        "codec_sec": 15.261858912650496,
+        "ce_bits": 187870.375,
+        "nodes": 69059,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "db8ca2c1656b6d5855bf78bb795d8d3e53a2f0f5e3b9589904b3787eec0f3dff",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 9.153928756713867
+          },
+          "3": {
+            "nodes": 7,
+            "ce_bits": 16.083290100097656
+          },
+          "4": {
+            "nodes": 41,
+            "ce_bits": 155.13119506835938
+          },
+          "5": {
+            "nodes": 173,
+            "ce_bits": 524.0158081054688
+          },
+          "6": {
+            "nodes": 741,
+            "ce_bits": 2203.33154296875
+          },
+          "7": {
+            "nodes": 3222,
+            "ce_bits": 8026.64111328125
+          },
+          "8": {
+            "nodes": 13060,
+            "ce_bits": 28226.34765625
+          },
+          "9": {
+            "nodes": 51812,
+            "ce_bits": 148705.390625
+          }
+        }
+      },
+      "quality": {
+        "chamfer_sq": 2.175526326309434,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+      "trial": "proposal_audit",
+      "sampled_parents": 12000,
+      "total_parents": 51812,
+      "candidates": 2948,
+      "generation_sec": 6.16955976607278,
+      "candidates_requiring_add_rescue": 551
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+      "trial": "node",
+      "quality": {
+        "chamfer_sq": 2.1741976273017154,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality_ok": true,
+      "counts": {
+        "Add": 0,
+        "Prune": 293,
+        "Adjust": 5
+      },
+      "removed_leaf_parents": 280,
+      "joint_rescue_patches": 5,
+      "rescued_raw_points": 6,
+      "operation_percent": 0.1501032589533068,
+      "gpcc": {
+        "bits": 159088,
+        "stream_sha256": "4bcb4536884fe9521b58a9c2ec2aa371a846770f21147a73e1b6be5a95409a6c",
+        "codec_sec": 1.069414323195815,
+        "decoded_exact": true
+      },
+      "oa": {
+        "bits": 186800,
+        "codec_sec": 15.309342252090573,
+        "ce_bits": 187456.8125,
+        "nodes": 68614,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "b296679be1f2c631e1f99d8fdd2e681390b027211faf33cd70bfcc6d177141da",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 9.153928756713867
+          },
+          "3": {
+            "nodes": 7,
+            "ce_bits": 16.083290100097656
+          },
+          "4": {
+            "nodes": 41,
+            "ce_bits": 155.13119506835938
+          },
+          "5": {
+            "nodes": 173,
+            "ce_bits": 522.2347412109375
+          },
+          "6": {
+            "nodes": 739,
+            "ce_bits": 2252.4267578125
+          },
+          "7": {
+            "nodes": 3198,
+            "ce_bits": 8068.59033203125
+          },
+          "8": {
+            "nodes": 12921,
+            "ce_bits": 28422.36328125
+          },
+          "9": {
+            "nodes": 51532,
+            "ce_bits": 148006.546875
+          }
+        }
+      },
+      "gpcc_C": 0.12083375289497766,
+      "oa_C": -0.2179394042989613
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+      "trial": "prune",
+      "quality": {
+        "chamfer_sq": 2.1741641585183875,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality_ok": true,
+      "counts": {
+        "Add": 0,
+        "Prune": 298,
+        "Adjust": 0
+      },
+      "removed_leaf_parents": 283,
+      "joint_rescue_patches": 0,
+      "rescued_raw_points": 0,
+      "operation_percent": 0.1501032589533068,
+      "gpcc": {
+        "bits": 159104,
+        "stream_sha256": "c1a591644dea5b9a328536d0ffb2e32cc6414ba78b988e139736c6a448d7fec2",
+        "codec_sec": 1.056008846964687,
+        "decoded_exact": true
+      },
+      "oa": {
+        "bits": 186696,
+        "codec_sec": 14.845101209823042,
+        "ce_bits": 187335.671875,
+        "nodes": 68618,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "0596af53825c2eb154555009b832884db82987bbfcc81bcb3198ba614d69b420",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 9.153928756713867
+          },
+          "3": {
+            "nodes": 7,
+            "ce_bits": 16.083290100097656
+          },
+          "4": {
+            "nodes": 41,
+            "ce_bits": 155.13119506835938
+          },
+          "5": {
+            "nodes": 173,
+            "ce_bits": 523.8397216796875
+          },
+          "6": {
+            "nodes": 740,
+            "ce_bits": 2254.9541015625
+          },
+          "7": {
+            "nodes": 3199,
+            "ce_bits": 8041.48974609375
+          },
+          "8": {
+            "nodes": 12926,
+            "ce_bits": 28378.9375
+          },
+          "9": {
+            "nodes": 51529,
+            "ce_bits": 147951.8125
+          }
+        }
+      },
+      "gpcc_C": 0.13090323230289247,
+      "oa_C": -0.2734925857869275
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+      "trial": "balanced",
+      "quality": {
+        "chamfer_sq": 2.1741791954731147,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality_ok": true,
+      "counts": {
+        "Add": 0,
+        "Prune": 295,
+        "Adjust": 3
+      },
+      "removed_leaf_parents": 282,
+      "joint_rescue_patches": 3,
+      "rescued_raw_points": 4,
+      "operation_percent": 0.1501032589533068,
+      "gpcc": {
+        "bits": 159080,
+        "stream_sha256": "37f67cc1b82cc2e2a7a76b15e96f66ad4539ec036d1f5057e61fb73e4f4165ea",
+        "codec_sec": 1.0167994280345738,
+        "decoded_exact": true
+      },
+      "oa": {
+        "bits": 186792,
+        "codec_sec": 15.097101450897753,
+        "ce_bits": 187443.59375,
+        "nodes": 68614,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "e2ba63916cdb1360fc7657cfe0b76dd4eac364622ae1ef7814564cb1cb18eb9b",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 9.153928756713867
+          },
+          "3": {
+            "nodes": 7,
+            "ce_bits": 16.083290100097656
+          },
+          "4": {
+            "nodes": 41,
+            "ce_bits": 155.13119506835938
+          },
+          "5": {
+            "nodes": 173,
+            "ce_bits": 522.2347412109375
+          },
+          "6": {
+            "nodes": 739,
+            "ce_bits": 2252.4267578125
+          },
+          "7": {
+            "nodes": 3198,
+            "ce_bits": 8065.8134765625
+          },
+          "8": {
+            "nodes": 12923,
+            "ce_bits": 28405.00390625
+          },
+          "9": {
+            "nodes": 51530,
+            "ce_bits": 148013.46875
+          }
+        }
+      },
+      "gpcc_C": 0.11579901319100916,
+      "oa_C": -0.2222127259518869
+    }
+  ],
+  "topology_rescue": [
+    {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "trial": "baseline",
+      "gpcc": {
+        "bits": 150240,
+        "stream_sha256": "fa7b6836f413a0ca6ecd73c883625067344522ccb82e6bd9a73d746a9157722e",
+        "codec_sec": 1.091670649126172,
+        "decoded_exact": true
+      },
+      "oa": {
+        "bits": 188680,
+        "codec_sec": 16.41088067414239,
+        "ce_bits": 189248.359375,
+        "nodes": 73905,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "e3f6f81ba4be57718d93a75e1a39a38542e3e5b50dfd5314491ce3cf263af00f",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 13.5221529006958
+          },
+          "3": {
+            "nodes": 8,
+            "ce_bits": 21.59096908569336
+          },
+          "4": {
+            "nodes": 43,
+            "ce_bits": 159.05824279785156
+          },
+          "5": {
+            "nodes": 191,
+            "ce_bits": 578.7169189453125
+          },
+          "6": {
+            "nodes": 820,
+            "ce_bits": 2173.697021484375
+          },
+          "7": {
+            "nodes": 3414,
+            "ce_bits": 7833.625
+          },
+          "8": {
+            "nodes": 13991,
+            "ce_bits": 27330.9453125
+          },
+          "9": {
+            "nodes": 55435,
+            "ce_bits": 151132.9375
+          }
+        }
+      },
+      "quality": {
+        "chamfer_sq": 2.178329269921022,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "trial": "proposal_audit",
+      "sampled_parents": 12000,
+      "total_parents": 55435,
+      "candidates": 3050,
+      "generation_sec": 6.168645408935845,
+      "candidates_requiring_add_rescue": 582
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "trial": "rescue",
+      "quality": {
+        "chamfer_sq": 2.177840001437661,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality_ok": true,
+      "counts": {
+        "Add": 0,
+        "Prune": 157,
+        "Adjust": 161
+      },
+      "removed_leaf_parents": 139,
+      "joint_rescue_patches": 134,
+      "rescued_raw_points": 189,
+      "operation_percent": 0.15007999546928316,
+      "gpcc": {
+        "bits": 151176,
+        "stream_sha256": "e6314d8f5da524b165318efdecb4b5c752b16e3f7c12da8e5b21d06b3a1fa292",
+        "codec_sec": 1.1922988439910114,
+        "decoded_exact": true
+      },
+      "oa": {
+        "bits": 188696,
+        "codec_sec": 16.08067949814722,
+        "ce_bits": 189264.734375,
+        "nodes": 73744,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "20ca80f2d077d1b4ce8672ba6a8736cfb559c395467e84bafb1325556ee5393d",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 13.5221529006958
+          },
+          "3": {
+            "nodes": 8,
+            "ce_bits": 21.59096908569336
+          },
+          "4": {
+            "nodes": 43,
+            "ce_bits": 159.05824279785156
+          },
+          "5": {
+            "nodes": 191,
+            "ce_bits": 584.9921875
+          },
+          "6": {
+            "nodes": 817,
+            "ce_bits": 2172.45849609375
+          },
+          "7": {
+            "nodes": 3408,
+            "ce_bits": 7843.9130859375
+          },
+          "8": {
+            "nodes": 13978,
+            "ce_bits": 27925.5078125
+          },
+          "9": {
+            "nodes": 55296,
+            "ce_bits": 150539.421875
+          }
+        }
+      },
+      "gpcc_C": 0.623003194888172,
+      "oa_C": 0.008479966080132684
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+      "trial": "baseline",
+      "gpcc": {
+        "bits": 158896,
+        "stream_sha256": "07711d7f5040ab7b8ac7976070ff96177be5e0cc84679cb822ae8bcc7059b24d",
+        "codec_sec": 1.0348356729373336,
+        "decoded_exact": true
+      },
+      "oa": {
+        "bits": 187208,
+        "codec_sec": 14.962409249972552,
+        "ce_bits": 187870.375,
+        "nodes": 69059,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "db8ca2c1656b6d5855bf78bb795d8d3e53a2f0f5e3b9589904b3787eec0f3dff",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 9.153928756713867
+          },
+          "3": {
+            "nodes": 7,
+            "ce_bits": 16.083290100097656
+          },
+          "4": {
+            "nodes": 41,
+            "ce_bits": 155.13119506835938
+          },
+          "5": {
+            "nodes": 173,
+            "ce_bits": 524.0158081054688
+          },
+          "6": {
+            "nodes": 741,
+            "ce_bits": 2203.33154296875
+          },
+          "7": {
+            "nodes": 3222,
+            "ce_bits": 8026.64111328125
+          },
+          "8": {
+            "nodes": 13060,
+            "ce_bits": 28226.34765625
+          },
+          "9": {
+            "nodes": 51812,
+            "ce_bits": 148705.390625
+          }
+        }
+      },
+      "quality": {
+        "chamfer_sq": 2.175526326309434,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      }
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+      "trial": "proposal_audit",
+      "sampled_parents": 12000,
+      "total_parents": 51812,
+      "candidates": 2948,
+      "generation_sec": 5.850569855887443,
+      "candidates_requiring_add_rescue": 551
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply",
+      "trial": "rescue",
+      "quality": {
+        "chamfer_sq": 2.174996428957698,
+        "d1_mse": 1.501114398641072,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality_ok": true,
+      "counts": {
+        "Add": 0,
+        "Prune": 157,
+        "Adjust": 141
+      },
+      "removed_leaf_parents": 139,
+      "joint_rescue_patches": 129,
+      "rescued_raw_points": 154,
+      "operation_percent": 0.1501032589533068,
+      "gpcc": {
+        "bits": 159824,
+        "stream_sha256": "a5919df841ee39547f4fb55d3c27c2b3003f498516295b03917f030686496e4e",
+        "codec_sec": 1.152300443034619,
+        "decoded_exact": true
+      },
+      "oa": {
+        "bits": 187136,
+        "codec_sec": 14.838245210703462,
+        "ce_bits": 187773.53125,
+        "nodes": 68879,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "bbebd15d37f1c9e594b231a93d11c4b91ee7e5b8d8e6d8a7c5b6adfae9b7348d",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 9.153928756713867
+          },
+          "3": {
+            "nodes": 7,
+            "ce_bits": 16.083290100097656
+          },
+          "4": {
+            "nodes": 41,
+            "ce_bits": 155.13119506835938
+          },
+          "5": {
+            "nodes": 173,
+            "ce_bits": 522.2347412109375
+          },
+          "6": {
+            "nodes": 739,
+            "ce_bits": 2229.99560546875
+          },
+          "7": {
+            "nodes": 3210,
+            "ce_bits": 8006.20556640625
+          },
+          "8": {
+            "nodes": 13033,
+            "ce_bits": 28799.61328125
+          },
+          "9": {
+            "nodes": 51673,
+            "ce_bits": 148030.84375
+          }
+        }
+      },
+      "gpcc_C": 0.5840298056590365,
+      "oa_C": -0.03845989487628598
+    }
+  ],
+  "phase": [
+    {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "trial": "baseline",
+      "gpcc": {
+        "bits": 150240,
+        "stream_sha256": "fa7b6836f413a0ca6ecd73c883625067344522ccb82e6bd9a73d746a9157722e",
+        "codec_sec": 1.131123418919742,
+        "decoded_exact": true
+      },
+      "oa": {
+        "bits": 188680,
+        "codec_sec": 18.948436500970274,
+        "ce_bits": 189248.359375,
+        "nodes": 73905,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "e3f6f81ba4be57718d93a75e1a39a38542e3e5b50dfd5314491ce3cf263af00f",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 13.5221529006958
+          },
+          "3": {
+            "nodes": 8,
+            "ce_bits": 21.59096908569336
+          },
+          "4": {
+            "nodes": 43,
+            "ce_bits": 159.05824279785156
+          },
+          "5": {
+            "nodes": 191,
+            "ce_bits": 578.7169189453125
+          },
+          "6": {
+            "nodes": 820,
+            "ce_bits": 2173.697021484375
+          },
+          "7": {
+            "nodes": 3414,
+            "ce_bits": 7833.625
+          },
+          "8": {
+            "nodes": 13991,
+            "ce_bits": 27330.9453125
+          },
+          "9": {
+            "nodes": 55435,
+            "ce_bits": 151132.9375
+          }
+        }
+      },
+      "quality": {
+        "chamfer_sq": 2.178329269921022,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "anchor_audit": [
+        {
+          "axis": 0,
+          "candidates": 251,
+          "within_original_max_distance": 63,
+          "best_predicted_chamfer_delta": 1.5208375913067206e-06
+        },
+        {
+          "axis": 1,
+          "candidates": 43,
+          "within_original_max_distance": 0,
+          "best_predicted_chamfer_delta": null
+        },
+        {
+          "axis": 2,
+          "candidates": 40,
+          "within_original_max_distance": 0,
+          "best_predicted_chamfer_delta": null
+        }
+      ]
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "trial": "joint_phase",
+      "axes": [],
+      "counts": {
+        "Add": 103,
+        "Prune": 57,
+        "Adjust": 158
+      },
+      "operation_percent": 0.15007999546928316,
+      "gpcc": {
+        "bits": 148912,
+        "stream_sha256": "9db60c4c5a046dc7ab3ea7b007cffcce601bfad6b4fadfb83a68db114f01a708",
+        "codec_sec": 0.7993049509823322,
+        "decoded_exact": false
+      },
+      "gpcc_C": -0.8839190628328053,
+      "estimated_side_bits": 0,
+      "estimated_net_gpcc_C": -0.8839190628328053,
+      "quality": {
+        "chamfer_sq": 2.178007580391008,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality_ok": true
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "trial": "phase_only",
+      "axes": [
+        0
+      ],
+      "counts": {
+        "Add": 1,
+        "Prune": 0,
+        "Adjust": 0
+      },
+      "operation_percent": 0.00047194967128705393,
+      "gpcc": {
+        "bits": 150112,
+        "stream_sha256": "1baf1dab84dfc37b37026c0995aa8fb47ad0ed275b2e18e35b4325bae6d80af5",
+        "codec_sec": 0.8268681070767343,
+        "decoded_exact": false
+      },
+      "gpcc_C": -0.08519701810436597,
+      "estimated_side_bits": 8,
+      "estimated_net_gpcc_C": -0.07987220447284171,
+      "quality": {
+        "chamfer_sq": 2.1783307907586136,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality_ok": false
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "trial": "joint_phase",
+      "axes": [
+        0
+      ],
+      "counts": {
+        "Add": 104,
+        "Prune": 57,
+        "Adjust": 157
+      },
+      "operation_percent": 0.15007999546928316,
+      "gpcc": {
+        "bits": 148856,
+        "stream_sha256": "8a02ccc9b4f723e0621f7faf954ea3405cc4d4af3d2989d5393a46a05702c643",
+        "codec_sec": 0.8097856538370252,
+        "decoded_exact": false
+      },
+      "gpcc_C": -0.921192758253464,
+      "estimated_side_bits": 8,
+      "estimated_net_gpcc_C": -0.9158679446219398,
+      "quality": {
+        "chamfer_sq": 2.1780091024163797,
+        "d1_mse": 1.5005765054758227,
+        "max_gt_to_rec": 1.7320508075688772,
+        "max_rec_to_gt": 1.7320508075688772
+      },
+      "quality_ok": true
+    },
+    {
+      "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "trial": "best_validated",
+      "selection": {
+        "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+        "trial": "joint_phase",
+        "axes": [
+          0
+        ],
+        "counts": {
+          "Add": 104,
+          "Prune": 57,
+          "Adjust": 157
+        },
+        "operation_percent": 0.15007999546928316,
+        "gpcc": {
+          "bits": 148856,
+          "stream_sha256": "8a02ccc9b4f723e0621f7faf954ea3405cc4d4af3d2989d5393a46a05702c643",
+          "codec_sec": 0.8097856538370252,
+          "decoded_exact": false
+        },
+        "gpcc_C": -0.921192758253464,
+        "estimated_side_bits": 8,
+        "estimated_net_gpcc_C": -0.9158679446219398,
+        "quality": {
+          "chamfer_sq": 2.1780091024163797,
+          "d1_mse": 1.5005765054758227,
+          "max_gt_to_rec": 1.7320508075688772,
+          "max_rec_to_gt": 1.7320508075688772
+        },
+        "quality_ok": true
+      },
+      "gpcc": {
+        "bits": 148856,
+        "stream_sha256": "8a02ccc9b4f723e0621f7faf954ea3405cc4d4af3d2989d5393a46a05702c643",
+        "codec_sec": 1.12819802807644,
+        "decoded_exact": true
+      },
+      "oa": {
+        "bits": 189496,
+        "codec_sec": 15.904967790935189,
+        "ce_bits": 189660.3125,
+        "nodes": 73776,
+        "arithmetic_roundtrip": true,
+        "stream_sha256": "d3278354de55daee5f510d7dee175fda62694dcd57dd1d0c76cf588e5244aa93",
+        "levels": {
+          "1": {
+            "nodes": 1,
+            "ce_bits": 4.272367000579834
+          },
+          "2": {
+            "nodes": 2,
+            "ce_bits": 13.5221529006958
+          },
+          "3": {
+            "nodes": 8,
+            "ce_bits": 21.59096908569336
+          },
+          "4": {
+            "nodes": 43,
+            "ce_bits": 160.7173309326172
+          },
+          "5": {
+            "nodes": 190,
+            "ce_bits": 582.35888671875
+          },
+          "6": {
+            "nodes": 821,
+            "ce_bits": 2247.10693359375
+          },
+          "7": {
+            "nodes": 3409,
+            "ce_bits": 7857.326171875
+          },
+          "8": {
+            "nodes": 13995,
+            "ce_bits": 26907.833984375
+          },
+          "9": {
+            "nodes": 55307,
+            "ce_bits": 151865.578125
+          }
+        }
+      },
+      "oa_C": 0.4324782700869223,
+      "estimated_net_oa_C": 0.43671825312698864
+    }
+  ],
+  "posthoc_internal_profile_cv": [
+    {
+      "held_out": "longdress_vox10_1051",
+      "profile_selected_on_other_three": "combined",
+      "quality_ok": true,
+      "gpcc_C_after_noop_safety_fallback": -0.7614483493077695,
+      "note": "post-hoc internal cross-validation; not independent prospective network evaluation"
+    },
+    {
+      "held_out": "loot_vox10_1000",
+      "profile_selected_on_other_three": "combined",
+      "quality_ok": true,
+      "gpcc_C_after_noop_safety_fallback": -0.5645652294238079,
+      "note": "post-hoc internal cross-validation; not independent prospective network evaluation"
+    },
+    {
+      "held_out": "soldier_vox10_0536",
+      "profile_selected_on_other_three": "oa_freq",
+      "quality_ok": false,
+      "gpcc_C_after_noop_safety_fallback": 0.0,
+      "note": "post-hoc internal cross-validation; not independent prospective network evaluation"
+    },
+    {
+      "held_out": "redandblack_vox10_1451",
+      "profile_selected_on_other_three": "combined",
+      "quality_ok": true,
+      "gpcc_C_after_noop_safety_fallback": -0.7854193938173437,
+      "note": "post-hoc internal cross-validation; not independent prospective network evaluation"
+    }
+  ],
+  "tracked_diff_exit_code": 0,
+  "achieved_50_percent": false
+}

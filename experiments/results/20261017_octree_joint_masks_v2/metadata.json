@@ -1,0 +1,20 @@
+{
+  "args": {
+    "frames": [
+      "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "/data/maejima/data/ground/8i/loot/loot_vox10_1000.ply",
+      "/data/maejima/data/ground/8i/soldier/soldier_vox10_0536.ply",
+      "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply"
+    ],
+    "out": "experiments/results/20261017_octree_joint_masks_v2",
+    "budgets": [
+      0.0015,
+      0.003
+    ],
+    "skip_ablations": false
+  },
+  "source_sha256": "f40d19cc9e57bb5d3ec458c4c641433849a178c69a279dc9a84663bd3ca5b292",
+  "cpu_only": true,
+  "baseline_commit": "deb783be385bd764d1bbb87e683655b2d9399ebb",
+  "scope": "isolated offline research; no training changes"
+}

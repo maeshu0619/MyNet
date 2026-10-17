@@ -1,0 +1,83 @@
+{
+  "frame": "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+  "canonical_voxels": 211887,
+  "common_grid_actual": {
+    "bits": 188680,
+    "codec_sec": 20.438922162167728,
+    "ce_bits": 189248.359375,
+    "nodes": 73905,
+    "arithmetic_roundtrip": true,
+    "stream_sha256": "e3f6f81ba4be57718d93a75e1a39a38542e3e5b50dfd5314491ce3cf263af00f",
+    "levels": {
+      "1": {
+        "nodes": 1,
+        "ce_bits": 4.272367000579834
+      },
+      "2": {
+        "nodes": 2,
+        "ce_bits": 13.5221529006958
+      },
+      "3": {
+        "nodes": 8,
+        "ce_bits": 21.59096908569336
+      },
+      "4": {
+        "nodes": 43,
+        "ce_bits": 159.05824279785156
+      },
+      "5": {
+        "nodes": 191,
+        "ce_bits": 578.7169189453125
+      },
+      "6": {
+        "nodes": 820,
+        "ce_bits": 2173.697021484375
+      },
+      "7": {
+        "nodes": 3414,
+        "ce_bits": 7833.625
+      },
+      "8": {
+        "nodes": 13991,
+        "ce_bits": 27330.9453125
+      },
+      "9": {
+        "nodes": 55435,
+        "ce_bits": 151132.9375
+      }
+    }
+  },
+  "existing_teacher_common_grid_bits": 188680.0,
+  "teacher_parity": true,
+  "native_OA_raw_min_first_qs2_bits": 188072.0,
+  "leaf_ce_fraction_percent": 79.85957860946655,
+  "leaf_nodes": 55435,
+  "max_leaf_ce_bits": 30.93359375,
+  "top_cost_concentration": [
+    {
+      "voxel_budget_percent": 0.06,
+      "symbol_count": 127,
+      "top_leaf_ce_bits": 2565.028076171875,
+      "fraction_total_ce_percent": 1.3553766533732414
+    },
+    {
+      "voxel_budget_percent": 0.15,
+      "symbol_count": 318,
+      "top_leaf_ce_bits": 5620.9384765625,
+      "fraction_total_ce_percent": 2.9701385647058487
+    },
+    {
+      "voxel_budget_percent": 0.3,
+      "symbol_count": 636,
+      "top_leaf_ce_bits": 10041.419921875,
+      "fraction_total_ce_percent": 5.305948108434677
+    },
+    {
+      "voxel_budget_percent": 1.0,
+      "symbol_count": 2119,
+      "top_leaf_ce_bits": 26401.345703125,
+      "fraction_total_ce_percent": 13.950634002685547
+    }
+  ],
+  "caveat": "CE concentration is frozen-context diagnostic, not an Actual gain bound"
+}

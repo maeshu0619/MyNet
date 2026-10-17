@@ -1,0 +1,28 @@
+{
+  "arguments": {
+    "frames": [
+      "/data/maejima/data/ground/8i/longdress/longdress_vox10_1051.ply",
+      "/data/maejima/data/ground/8i/redandblack/redandblack_vox10_1451.ply"
+    ],
+    "out": "/tmp/octree-pattern-final-20261017",
+    "codecs": [
+      "oa",
+      "gpcc"
+    ],
+    "modes": [
+      "pattern"
+    ],
+    "budgets": [
+      0.0015,
+      0.003,
+      0.03,
+      0.3
+    ],
+    "oa_device": "cpu",
+    "qs": 2.0,
+    "reflections": false
+  },
+  "source_sha256": "4d348c15b1929c026ed3734f13e4e8348125786c75ce012bf263bdb58e823509",
+  "coordinate_protocol": "Common G-PCC qs grid, OA canonical integer input with qs=1",
+  "existing_training_modified": false
+}

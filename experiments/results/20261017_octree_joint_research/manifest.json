@@ -1,0 +1,202 @@
+[
+  {
+    "path": "experiments/octree_joint_actual_search.py",
+    "bytes": 5317,
+    "sha256": "5b55d91a958e1c298ae1a852a1b1f34520fa22305f3bd74409ec83c979d1c147"
+  },
+  {
+    "path": "experiments/octree_joint_context_audit.py",
+    "bytes": 4279,
+    "sha256": "6f47a829bd4a8cebb13ce7870fdb920d3886cbd2b01898637dabecd005097123"
+  },
+  {
+    "path": "experiments/octree_joint_mask_research.py",
+    "bytes": 13946,
+    "sha256": "f40d19cc9e57bb5d3ec458c4c641433849a178c69a279dc9a84663bd3ca5b292"
+  },
+  {
+    "path": "experiments/octree_joint_phase_research.py",
+    "bytes": 6771,
+    "sha256": "f43238e38c8b92785d42877cdf870279695bcb258fb1b32c9612a4e0e30f13f1"
+  },
+  {
+    "path": "experiments/octree_joint_topology_research.py",
+    "bytes": 9063,
+    "sha256": "4ad496d18e302a0539c5046393c99fc93fc301afcf68b58904482bb6a4757239"
+  },
+  {
+    "path": "experiments/results/20261017_octree_joint_actual_longdress/best.npz",
+    "bytes": 586951,
+    "sha256": "ad4f1ff51ee6329f7a21570ddc7393b148c269c39b78214706a0161ff86a5383"
+  },
+  {
+    "path": "experiments/results/20261017_octree_joint_actual_longdress/trials.jsonl",
+    "bytes": 21027,
+    "sha256": "8da7e52a4c8e4fb6c54023befe743f84e0358f6fbc9e8deb41bb40845a8c6af0"
+  },
+  {
+    "path": "experiments/results/20261017_octree_joint_context/audit.jsonl",
+    "bytes": 2839,
+    "sha256": "b45f1646183622f8130433eb9bc1ef6e6c1a02c0619b1fed6c56d87f7f791dc0"
+  },
+  {
+    "path": "experiments/results/20261017_octree_joint_context/longdress_vox10_1051_context.npz",
+    "bytes": 429105,
+    "sha256": "3de55c1216debb2cbd3d629c19a4562308468b805199a25bea5b6a7a00323e97"
+  },
+  {
+    "path": "experiments/results/20261017_octree_joint_context/loot_vox10_1000_context.npz",
+    "bytes": 435852,
+    "sha256": "ae35472071ade9e2a4ddeeada6457fc555478dea1bb9fe01729b3d90afd24d87"
+  },
+  {
+    "path": "experiments/results/20261017_octree_joint_masks_v2/longdress_vox10_1051_0.00150_best.npz",
+    "bytes": 586951,
+    "sha256": "ad4f1ff51ee6329f7a21570ddc7393b148c269c39b78214706a0161ff86a5383"
+  },
+  {
+    "path": "experiments/results/20261017_octree_joint_masks_v2/longdress_vox10_1051_0.00300_best.npz",
+    "bytes": 588613,
+    "sha256": "34bd74d37608492e6fbf3c409acdcd07e735a173eabd4d63aed657ab328866b4"
+  },
+  {
+    "path": "experiments/results/20261017_octree_joint_masks_v2/longdress_vox10_1051_proposals.npz",
+    "bytes": 8016719,
+    "sha256": "62ce6882a695dd86e0ac7b51340e808d2af5e86c05b70314f0afd3c4ac2d2b5b"
+  },
+  {
+    "path": "experiments/results/20261017_octree_joint_masks_v2/loot_vox10_1000_0.00150_best.npz",
+    "bytes": 595727,
+    "sha256": "e31a16354b353120e543e96bf17249fa59cd8f7e5d2bf59c5633b892a97232da"
+  },
+  {
+    "path": "experiments/results/20261017_octree_joint_masks_v2/loot_vox10_1000_0.00300_best.npz",
+    "bytes": 597555,
+    "sha256": "64cbb43a3d88c1de7f2d05e1961c1f538a44655560b800ba60911beb6b3b3809"
+  },
+  {
+    "path": "experiments/results/20261017_octree_joint_masks_v2/loot_vox10_1000_proposals.npz",
+    "bytes": 8399719,
+    "sha256": "8d78b10be575b9595dfdc2e7b36241aaffc23ae5f1d5d07f903c0d4a463d50be"
+  },
+  {
+    "path": "experiments/results/20261017_octree_joint_masks_v2/metadata.json",
+    "bytes": 699,
+    "sha256": "bd1bb9dbd810a2253a4e099b5ea70f1d0033f03a807611ed3c1cb62c3b3c2d45"
+  },
+  {
+    "path": "experiments/results/20261017_octree_joint_masks_v2/redandblack_vox10_1451_0.00150_best.npz",
+    "bytes": 554296,
+    "sha256": "03fffc337a862c848231564491391ceb4348cc2d20bf209d99f733b73d52dbaa"
+  },
+  {
+    "path": "experiments/results/20261017_octree_joint_masks_v2/redandblack_vox10_1451_0.00300_best.npz",
+    "bytes": 555396,
+    "sha256": "64759ec720e7468ffa36416e65d5c53b03c53b98a21ab1a2358267283dbe1edd"
+  },
+  {
+    "path": "experiments/results/20261017_octree_joint_masks_v2/redandblack_vox10_1451_proposals.npz",
+    "bytes": 8044002,
+    "sha256": "b8175d8e06239d693170bfed90ed1d3b0b574a60af5c0b069b3db632c3ee63ed"
+  },
+  {
+    "path": "experiments/results/20261017_octree_joint_masks_v2/soldier_vox10_0536_0.00150_best.npz",
+    "bytes": 847906,
+    "sha256": "b4a8f9a3282376bd8585163130c3ea6edaa664856fa82ab4e96e625c18748568"
+  },
+  {
+    "path": "experiments/results/20261017_octree_joint_masks_v2/soldier_vox10_0536_0.00300_best.npz",
+    "bytes": 849242,
+    "sha256": "8812c7071c2331466d94163c4e4225d663ae07648ac4c9af47aab1d79080d1ef"
+  },
+  {
+    "path": "experiments/results/20261017_octree_joint_masks_v2/soldier_vox10_0536_proposals.npz",
+    "bytes": 11798031,
+    "sha256": "05d2fc0b1192299d3564b609aec69613a97a1e17f3d17b21c3d923a629f73d97"
+  },
+  {
+    "path": "experiments/results/20261017_octree_joint_masks_v2/trials.jsonl",
+    "bytes": 93303,
+    "sha256": "0e04a437344fd6d355145ca795757d7acfc39d3d3b30e1ce952e905b882c1c94"
+  },
+  {
+    "path": "experiments/results/20261017_octree_joint_phase/longdress_vox10_1051_best.npz",
+    "bytes": 585269,
+    "sha256": "cfa8df59deef5c725dc8525af10d90b13ca13f074bd8bdd4071be689819e8e1e"
+  },
+  {
+    "path": "experiments/results/20261017_octree_joint_phase/trials.jsonl",
+    "bytes": 5042,
+    "sha256": "65c29a93f83992e448ffe1d814e1b953db6fe8f722eda8d01d2444e74c29b167"
+  },
+  {
+    "path": "experiments/results/20261017_octree_joint_research/summary.json",
+    "bytes": 55720,
+    "sha256": "7e615814978e3359bb219a161b8a8ce864542c9976f309163b301cb098747101"
+  },
+  {
+    "path": "experiments/results/20261017_octree_joint_topology/longdress_vox10_1051_balanced.npz",
+    "bytes": 584334,
+    "sha256": "63f835d3258845013ab39275933a25e139baf30a9362543521e7ee589f82ab9a"
+  },
+  {
+    "path": "experiments/results/20261017_octree_joint_topology/longdress_vox10_1051_node.npz",
+    "bytes": 584334,
+    "sha256": "63f835d3258845013ab39275933a25e139baf30a9362543521e7ee589f82ab9a"
+  },
+  {
+    "path": "experiments/results/20261017_octree_joint_topology/longdress_vox10_1051_prune.npz",
+    "bytes": 584328,
+    "sha256": "deca0867d70b401c040dc2d0c12608f7fad861d939a49517978d7dd3c20d230d"
+  },
+  {
+    "path": "experiments/results/20261017_octree_joint_topology/redandblack_vox10_1451_balanced.npz",
+    "bytes": 552325,
+    "sha256": "6d6d81bcc24f1e1c73787e0d8bc1994c2bef25948b5cfd7775fd31a914a7f54c"
+  },
+  {
+    "path": "experiments/results/20261017_octree_joint_topology/redandblack_vox10_1451_node.npz",
+    "bytes": 552335,
+    "sha256": "cf254c6cd53266a27e6f756e5499ed2b1f23c784fc9b0546448c6e0925863836"
+  },
+  {
+    "path": "experiments/results/20261017_octree_joint_topology/redandblack_vox10_1451_prune.npz",
+    "bytes": 552311,
+    "sha256": "ffb20b721b9534bc7ac03a3cd277eb450ae449e391c1d7bc12b873896f9cf91a"
+  },
+  {
+    "path": "experiments/results/20261017_octree_joint_topology/trials.jsonl",
+    "bytes": 10658,
+    "sha256": "5323cff50d0e1d2ffcf3a7b1bfbe0460040c539f7297858755129361822b5c62"
+  },
+  {
+    "path": "experiments/results/20261017_octree_joint_topology_rescue/arguments.json",
+    "bytes": 314,
+    "sha256": "0ec4fb973ee9607365ce64088631200b3cf48e20656ebd9cf3450c8d3e76cbc9"
+  },
+  {
+    "path": "experiments/results/20261017_octree_joint_topology_rescue/longdress_vox10_1051_rescue.npz",
+    "bytes": 584797,
+    "sha256": "41242b67ac5698b0a605a74a2d87e8d101ba55f7394bf8aad2197dd3b60db136"
+  },
+  {
+    "path": "experiments/results/20261017_octree_joint_topology_rescue/redandblack_vox10_1451_rescue.npz",
+    "bytes": 552660,
+    "sha256": "a8f6e545609bd35597ae37e99cd0f1c5e265ebc389ed383f2e3a240cb44fc513"
+  },
+  {
+    "path": "experiments/results/20261017_octree_joint_topology_rescue/trials.jsonl",
+    "bytes": 5355,
+    "sha256": "9ab9284aa1df1fc8bf47a93abd79bff0b2cf600b35acb115398012f20cacfdfb"
+  },
+  {
+    "path": "experiments/summarize_octree_joint_research.py",
+    "bytes": 6071,
+    "sha256": "ed5b73795cfd387d8c206e35514d6221d8081b8a077edd5d550b9c8cc348e720"
+  },
+  {
+    "path": "experiments/test_octree_joint_mask_research.py",
+    "bytes": 3655,
+    "sha256": "754c3b367df3ea350f9a997e79ac6e259a961e0ece58b042ea8f11b93f9a061b"
+  }
+]
