@@ -1,0 +1,14 @@
+Traceback (most recent call last):
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/inference_worker.py", line 81, in <module>
+    main()
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/inference_worker.py", line 67, in main
+    existing.test(model, args, writer)
+  File "/home/maejima/MasterEx/myNet/test.py", line 482, in test
+    dataset = PlyDirDataset(args, args.input_dir_test)
+  File "/home/maejima/MasterEx/myNet/models/utils/data/dataset.py", line 206, in __init__
+    self.training_dataset_name = training_dataset_name_from_path(path)
+  File "/home/maejima/MasterEx/myNet/models/utils/data/dataset.py", line 186, in training_dataset_name_from_path
+    return canonical_training_dataset_name(parent_name)
+  File "/home/maejima/MasterEx/myNet/models/utils/data/dataset.py", line 178, in canonical_training_dataset_name
+    raise ValueError(f"未対応の訓練datasetである: {value}")
+ValueError: 未対応の訓練datasetである: network

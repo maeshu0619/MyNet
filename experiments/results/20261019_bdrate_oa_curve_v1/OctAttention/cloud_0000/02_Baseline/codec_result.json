@@ -1,0 +1,12 @@
+{
+  "streams": [
+    "/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_oa_curve_v1/OctAttention/cloud_0000/02_Baseline/occupancy.bin",
+    "/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_oa_curve_v1/OctAttention/cloud_0000/02_Baseline/geometry.side.bin"
+  ],
+  "checkpoint_sha256": "d7c1dff347c48060a7bf9a241c85f73ae31f0ae0314b5397784814f8ec316870",
+  "decoder": "causal autonomous probabilities; no encoder probability/symbol side channel",
+  "rate_definition": "actual arithmetic bytes + 56-byte serialized geometry side record",
+  "qs": 4.0,
+  "octree_depth": 5,
+  "symbols": 311
+}

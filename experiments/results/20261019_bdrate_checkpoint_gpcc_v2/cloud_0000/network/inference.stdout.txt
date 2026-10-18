@@ -1,0 +1,10 @@
+Profile CSV: /home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_checkpoint_gpcc_v2/cloud_0000/network/profile.csv
+Save output points: True
+Output point directory: /home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_checkpoint_gpcc_v2/cloud_0000/network/mine
+DataLoader Ready: files=1, workers=0, pin_memory=False, ply_loader=numpy
+Step Start: step=1/1
+Step Preprocess Done: step=1/1, points=576, time=0.000096s
+Step Forward Start: step=1/1, mode=full_cloud
+Step Forward Done: step=1/1, mode=full_cloud, time=0.188247s
+Step Postprocess Done: step=1/1, output_points=576, time=0.000134s
+Progress: step=1/1, sample_id=0, input=576, output=576, add=0, delete=0, adjust=0, forward=0.188247s, preprocess=0.000096s, postprocess=0.000134s, save=0.000303s, total=0.188899s

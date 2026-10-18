@@ -1,0 +1,86 @@
+[
+  {
+    "bits": 904,
+    "decoded_path": "/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_final_learned_v1/OctAttention/decoded.ply",
+    "decoded_points": 241,
+    "decoded_sha256": "4594c254c0e8e62f586ab3d61f8691bc228fcbf7f9c742760c2b45035d80d52c",
+    "streams": [
+      {
+        "path": "/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_final_learned_v1/OctAttention/occupancy.bin",
+        "bytes": 57,
+        "sha256": "aba0905832783c58a515b9f49c0b301713d36b765252b74b99c8b1f4ea3680b6"
+      },
+      {
+        "path": "/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_final_learned_v1/OctAttention/geometry.side.bin",
+        "bytes": 56,
+        "sha256": "10f8e26255ded33d14cc51d2bb2da0153a20ca56e21e3848950d0a1ef8cfef1e"
+      }
+    ],
+    "codec_metadata": {
+      "checkpoint_sha256": "d7c1dff347c48060a7bf9a241c85f73ae31f0ae0314b5397784814f8ec316870",
+      "decoder": "causal autonomous probabilities; no encoder probability/symbol side channel",
+      "rate_definition": "actual arithmetic bytes + 56-byte serialized geometry side record",
+      "qs": 8.0,
+      "octree_depth": 4,
+      "symbols": 120
+    },
+    "d1_psnr": 39.5934,
+    "d1_mse": 21.4219,
+    "d2_psnr": 43.4654,
+    "d2_mse": 8.7833,
+    "resolution": 255,
+    "metric_binary_sha256": "758e1d7a744bfae3094d7781a4c1c9d15810b054d9a866785ace6c96a1ff5f96",
+    "normals_sha256": "34fd51fb5923e9e284fc78488c995a8eed527bd14fbb57cbe0647083f0fd1695",
+    "metric_warnings": [],
+    "canonical_normals_dtype": "float32",
+    "canonical_normals_sha256": "6a9256cbdc151f895a007b6d46cceab0df57f7ab3c9ba6ad5fcb8b83c561ed5c",
+    "peak_definition": "MPEG pc_error PSNR: 10*log10(3*resolution^2 / symmetric_MSE)",
+    "duplicate_policy": "pc_error dropdups=2; Original point count retained as bpp denominator",
+    "metric_precision": "Native tool textual precision; no further rounding",
+    "codec": "OctAttention",
+    "status": "ok"
+  },
+  {
+    "bits": 4184,
+    "decoded_path": "/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_final_learned_v1/SparsePCGC/decoded.ply",
+    "decoded_points": 576,
+    "decoded_sha256": "ad6623e2fb1e21b9bd4d0908749b806eedf12598836306c6df9ab34883d8501c",
+    "streams": [
+      {
+        "path": "/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_final_learned_v1/SparsePCGC/occupancy.bin",
+        "bytes": 380,
+        "sha256": "f4f61638fae1b149549510fc790be81a96182af22a9d0b7e78e4c6f50b11bb33"
+      },
+      {
+        "path": "/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_final_learned_v1/SparsePCGC/geometry.side.bin",
+        "bytes": 143,
+        "sha256": "824362fee316d3862310adf1f0c984196d090c63c2d08d7a95b037b81942b58b"
+      }
+    ],
+    "codec_metadata": {
+      "checkpoint_sha256": "b3e1c1bd30f7f54c4671c94f13c126f9c2d5ba0ff240565de490a74329885831",
+      "sr_checkpoint_sha256": "8e60478469f9518223f3e12d0cc1261a30c461f71a8c1153a02fdcb4a6029948",
+      "ae_checkpoint_sha256": "d843e5b24e51e8e4e2eb167a31ea91a3d88e58d042d5c1004fbf7343ce07a5d2",
+      "rate_definition": "physical basic stream + serialized stage counts/AE bytes/coordinate side record",
+      "quantization_note": "integer input on requested voxel grid",
+      "scale_ae": 1,
+      "scale_sr": 1,
+      "compatibility_note": "MYSP0001 evaluation wrapper; overhead differs from paper logical-count convention"
+    },
+    "d1_psnr": 24.1057,
+    "d1_mse": 757.931,
+    "d2_psnr": 52.6201,
+    "d2_mse": 1.06706,
+    "resolution": 255,
+    "metric_binary_sha256": "758e1d7a744bfae3094d7781a4c1c9d15810b054d9a866785ace6c96a1ff5f96",
+    "normals_sha256": "34fd51fb5923e9e284fc78488c995a8eed527bd14fbb57cbe0647083f0fd1695",
+    "metric_warnings": [],
+    "canonical_normals_dtype": "float32",
+    "canonical_normals_sha256": "6a9256cbdc151f895a007b6d46cceab0df57f7ab3c9ba6ad5fcb8b83c561ed5c",
+    "peak_definition": "MPEG pc_error PSNR: 10*log10(3*resolution^2 / symmetric_MSE)",
+    "duplicate_policy": "pc_error dropdups=2; Original point count retained as bpp denominator",
+    "metric_precision": "Native tool textual precision; no further rounding",
+    "codec": "SparsePCGC",
+    "status": "ok"
+  }
+]

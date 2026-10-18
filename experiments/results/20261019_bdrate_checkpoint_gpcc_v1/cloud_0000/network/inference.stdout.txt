@@ -1,0 +1,3 @@
+Profile CSV: /home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_checkpoint_gpcc_v1/cloud_0000/network/profile.csv
+Save output points: True
+Output point directory: /home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_checkpoint_gpcc_v1/cloud_0000/network/mine

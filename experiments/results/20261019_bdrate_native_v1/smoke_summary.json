@@ -1,0 +1,10 @@
+[
+  {
+    "codec": "G-PCC",
+    "exit_code": 1
+  },
+  {
+    "codec": "Draco",
+    "exit_code": 1
+  }
+]

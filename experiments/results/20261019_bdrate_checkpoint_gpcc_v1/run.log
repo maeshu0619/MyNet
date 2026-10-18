@@ -1,0 +1,51 @@
+Traceback (most recent call last):
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/runner.py", line 133, in run
+    mine = _network_output(args, gt, cloud_folder / "network", checkpoint)
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/runner.py", line 39, in _network_output
+    run_command([args.network_python, str(Path(__file__).with_name("inference_worker.py")), str(folder / "request.json")],
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/io.py", line 95, in run_command
+    raise RuntimeError("{} failed: {}; see {}".format(name, status, folder))
+RuntimeError: inference failed: {'returncode': 1}; see /home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_checkpoint_gpcc_v1/cloud_0000/network
+
+synthetic_surface.ply Baseline point 0: ok
+Traceback (most recent call last):
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/runner.py", line 149, in run
+    raise ValueError(mine_error)
+ValueError: RuntimeError: inference failed: {'returncode': 1}; see /home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_checkpoint_gpcc_v1/cloud_0000/network
+
+synthetic_surface.ply MINE point 0: error
+synthetic_surface.ply Baseline point 1: ok
+Traceback (most recent call last):
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/runner.py", line 149, in run
+    raise ValueError(mine_error)
+ValueError: RuntimeError: inference failed: {'returncode': 1}; see /home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_checkpoint_gpcc_v1/cloud_0000/network
+
+synthetic_surface.ply MINE point 1: error
+synthetic_surface.ply Baseline point 2: ok
+Traceback (most recent call last):
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/runner.py", line 149, in run
+    raise ValueError(mine_error)
+ValueError: RuntimeError: inference failed: {'returncode': 1}; see /home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_checkpoint_gpcc_v1/cloud_0000/network
+
+synthetic_surface.ply MINE point 2: error
+synthetic_surface.ply Baseline point 3: ok
+Traceback (most recent call last):
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/runner.py", line 149, in run
+    raise ValueError(mine_error)
+ValueError: RuntimeError: inference failed: {'returncode': 1}; see /home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_checkpoint_gpcc_v1/cloud_0000/network
+
+synthetic_surface.ply MINE point 3: error
+synthetic_surface.ply Baseline point 4: ok
+Traceback (most recent call last):
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/runner.py", line 149, in run
+    raise ValueError(mine_error)
+ValueError: RuntimeError: inference failed: {'returncode': 1}; see /home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_checkpoint_gpcc_v1/cloud_0000/network
+
+synthetic_surface.ply MINE point 4: error
+synthetic_surface.ply Baseline point 5: ok
+Traceback (most recent call last):
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/runner.py", line 149, in run
+    raise ValueError(mine_error)
+ValueError: RuntimeError: inference failed: {'returncode': 1}; see /home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_checkpoint_gpcc_v1/cloud_0000/network
+
+synthetic_surface.ply MINE point 5: error

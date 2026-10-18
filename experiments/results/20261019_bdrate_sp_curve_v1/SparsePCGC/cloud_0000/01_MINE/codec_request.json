@@ -1,0 +1,80 @@
+{
+  "codec": "SparsePCGC",
+  "source": "/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_sp_curve_v1/SparsePCGC/cloud_0000/01_MINE/geometry_input.ply",
+  "folder": "/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_sp_curve_v1/SparsePCGC/cloud_0000/01_MINE",
+  "point": {
+    "scale_ae": 0,
+    "scale_sr": 1
+  },
+  "settings": {
+    "input": [
+      "/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_sp_curve_v1/synthetic_surface.ply"
+    ],
+    "normals": [],
+    "resolution": 255.0,
+    "d1_only": false,
+    "codec": "SparsePCGC",
+    "network_codec": "SparsePCGC",
+    "model_date": "20260801",
+    "model_time": "072958",
+    "model_name": "best_loss_joint",
+    "checkpoint": "",
+    "dataset": "SYNTHETIC_SELF_TEST_NOT_THESIS",
+    "points_json": null,
+    "coarse_indices": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "output": "/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_sp_curve_v1/SparsePCGC",
+    "log_root": "/data/maejima/log",
+    "minimum_overlap_db": 0.0,
+    "timeout": 300.0,
+    "threads": 2,
+    "codec_device": "cpu",
+    "network_python": "/home/maejima/miniconda3/envs/myOA/bin/python",
+    "oa_python": "/home/maejima/miniconda3/envs/myOA/bin/python",
+    "sparse_python": "/home/maejima/miniconda3/envs/sparsepcgc/bin/python",
+    "identity_control": true,
+    "no_plots": false,
+    "gpcc_binary": "/home/maejima/MasterEx/compress/octree/G-PCC/build/tmc3/tmc3",
+    "gpcc_config": "/home/maejima/MasterEx/compress/octree/G-PCC/cfg/octree-predlift/lossy-geom-lossy-attrs/longdress_vox10_1300/r01/encoder.cfg",
+    "draco_encoder": "/home/maejima/MasterEx/compress/octree/Draco/build/draco_encoder",
+    "draco_decoder": "/home/maejima/MasterEx/compress/octree/Draco/build/draco_decoder",
+    "pc_error": "/home/maejima/MasterEx/compress/octree/SparsePCGC/extension/pc_error_d",
+    "oa_checkpoint": "/home/maejima/MasterEx/compress/octree/OctAttention/modelsave/obj/encoder_epoch_00800093.pth",
+    "sp_checkpoint": "/home/maejima/MasterEx/compress/octree/SparsePCGC/ckpts/dense/epoch_last.pth",
+    "sp_ae_checkpoint": "/home/maejima/MasterEx/compress/octree/SparsePCGC/ckpts/dense_slne/epoch_last.pth",
+    "sp_sr_checkpoint": "/home/maejima/MasterEx/compress/octree/SparsePCGC/ckpts/dense_1stage/epoch_last.pth",
+    "network_extra_args": [],
+    "points": [
+      {
+        "scale_ae": 1,
+        "scale_sr": 0
+      },
+      {
+        "scale_ae": 0,
+        "scale_sr": 1
+      },
+      {
+        "scale_ae": 1,
+        "scale_sr": 1
+      },
+      {
+        "scale_ae": 0,
+        "scale_sr": 2
+      },
+      {
+        "scale_ae": 1,
+        "scale_sr": 2
+      },
+      {
+        "scale_ae": 0,
+        "scale_sr": 3
+      }
+    ]
+  }
+}

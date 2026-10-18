@@ -1,0 +1,24 @@
+MPEG PCC tmc3 version release-v23.0-rc2-0-ga3d15c5
++ Effective configuration parameters
+    mode                  : 1
+    firstFrameNum         : 0
+    frameCount            : 1
+    reconstructedDataPath : "/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_checkpoint_gpcc_v1/cloud_0000/05_Baseline/decoded.ply"
+    uncompressedDataPath  : ""
+    compressedStreamPath  : "/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_checkpoint_gpcc_v1/cloud_0000/05_Baseline/geometry.bin"
+    postRecolorPath       : ""
+    preInvScalePath       : ""
+    convertPlyColourspace : 1
+    outputBinaryPly       : 1
+    outputUnitLength      : 1
+    outputScaling         : 1 (External)
+    outputPrecisionBits   : -1
+    skipOctreeLayers : 0
+    decodeMaxPoints  : 0
+
+positions bitstream size 559 B
+positions processing time (user): 0.003 s
+
+Total bitstream size 588 B
+Processing time (wall): 0.015 s
+Processing time (user): 0.003 s

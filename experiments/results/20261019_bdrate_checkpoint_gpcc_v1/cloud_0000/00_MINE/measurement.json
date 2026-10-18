@@ -1,0 +1,18 @@
+{
+  "cloud": "/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_native_v2/synthetic_surface.ply",
+  "dataset": "explicit_holdout",
+  "codec": "G-PCC",
+  "series": "MINE",
+  "experiment_mode": "trained_network",
+  "model_date": "20260801",
+  "model_time": "072958",
+  "rate_index": 0,
+  "parameters": {
+    "positionQuantizationScale": 0.03125
+  },
+  "original_points": 576,
+  "mine_points": null,
+  "status": "error",
+  "resolution": 255.0,
+  "error": "ValueError: RuntimeError: inference failed: {'returncode': 1}; see /home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_checkpoint_gpcc_v1/cloud_0000/network"
+}

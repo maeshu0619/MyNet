@@ -1,0 +1,29 @@
+{
+  "bits": 7664,
+  "decoded_path": "/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_signed_control_v1/decoded.ply",
+  "decoded_points": 576,
+  "decoded_sha256": "f7306e5c0a3f0719d0da6be9479cb95fe184c399d42f295f7c3f951a8b8f786d",
+  "streams": [
+    {
+      "path": "/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_signed_control_v1/occupancy.bin",
+      "bytes": 901,
+      "sha256": "f4e077fb098b2ca3aa509a935f2471771d6ae56205e6b8eaf3d29f8063544b7c"
+    },
+    {
+      "path": "/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_signed_control_v1/geometry.side.bin",
+      "bytes": 57,
+      "sha256": "545c56cdf193f3000cabdd38a3c845e44f27da8bbca795d18dd69c89f3333464"
+    }
+  ],
+  "codec_metadata": {
+    "checkpoint_sha256": "b3e1c1bd30f7f54c4671c94f13c126f9c2d5ba0ff240565de490a74329885831",
+    "sr_checkpoint_sha256": "8e60478469f9518223f3e12d0cc1261a30c461f71a8c1153a02fdcb4a6029948",
+    "ae_checkpoint_sha256": "d843e5b24e51e8e4e2eb167a31ea91a3d88e58d042d5c1004fbf7343ce07a5d2",
+    "rate_definition": "physical basic stream + serialized stage counts/AE bytes/coordinate side record",
+    "quantization_note": "existing load_sparse_tensor voxelization",
+    "scale_ae": 0,
+    "scale_sr": 0,
+    "compatibility_note": "MYSP0001 evaluation wrapper; overhead differs from paper logical-count convention"
+  },
+  "signed_offset_voxel_scale_roundtrip": true
+}

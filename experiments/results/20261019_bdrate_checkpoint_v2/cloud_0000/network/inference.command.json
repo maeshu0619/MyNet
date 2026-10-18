@@ -1,0 +1,5 @@
+[
+  "/home/maejima/miniconda3/envs/sparsepcgc/bin/python",
+  "/home/maejima/MasterEx/myNet/utils/bdrate/inference_worker.py",
+  "/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_checkpoint_v2/cloud_0000/network/request.json"
+]

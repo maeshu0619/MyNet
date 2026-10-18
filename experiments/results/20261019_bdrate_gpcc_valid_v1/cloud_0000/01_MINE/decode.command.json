@@ -1,0 +1,8 @@
+[
+  "/home/maejima/MasterEx/compress/octree/G-PCC/build/tmc3/tmc3",
+  "--mode=1",
+  "--compressedStreamPath=/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_gpcc_valid_v1/cloud_0000/01_MINE/geometry.bin",
+  "--reconstructedDataPath=/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_gpcc_valid_v1/cloud_0000/01_MINE/decoded.ply",
+  "--outputBinaryPly=1",
+  "--outputScaling=1"
+]

@@ -1,0 +1,30 @@
+synthetic_surface.ply Baseline point 0: ok
+synthetic_surface.ply MINE point 0: ok
+synthetic_surface.ply Baseline point 1: ok
+synthetic_surface.ply MINE point 1: ok
+synthetic_surface.ply Baseline point 2: ok
+synthetic_surface.ply MINE point 2: ok
+synthetic_surface.ply Baseline point 3: ok
+synthetic_surface.ply MINE point 3: ok
+synthetic_surface.ply Baseline point 4: ok
+synthetic_surface.ply MINE point 4: ok
+Traceback (most recent call last):
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/runner.py", line 140, in run
+    log.write(traceback.format_exc() + "\n")
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/codecs.py", line 102, in encode_decode
+    import json
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/io.py", line 92, in run_command
+    finally:
+RuntimeError: codec_worker failed: {'error': 'timeout after 300.0 seconds'}; see /home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_oa_curve_v1/OctAttention/cloud_0000/05_Baseline
+
+synthetic_surface.ply Baseline point 5: error
+Traceback (most recent call last):
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/runner.py", line 140, in run
+    log.write(traceback.format_exc() + "\n")
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/codecs.py", line 102, in encode_decode
+    import json
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/io.py", line 92, in run_command
+    finally:
+RuntimeError: codec_worker failed: {'error': 'timeout after 300.0 seconds'}; see /home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_oa_curve_v1/OctAttention/cloud_0000/05_MINE
+
+synthetic_surface.ply MINE point 5: error

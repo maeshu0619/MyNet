@@ -1,0 +1,7 @@
+[
+  "/home/maejima/MasterEx/compress/octree/Draco/build/draco_decoder",
+  "-i",
+  "/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_draco_dense_v1/cloud_0000/08_MINE/geometry.drc",
+  "-o",
+  "/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_draco_dense_v1/cloud_0000/08_MINE/decoded.ply"
+]

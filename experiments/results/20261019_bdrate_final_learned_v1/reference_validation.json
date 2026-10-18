@@ -1,0 +1,9 @@
+{
+  "reference": "FAU-LMS bjontegaard 1.3.0",
+  "reference_wheel_sha256": "df8c0934ea505b80392126adefcb6fb5b2c747313a50cba69f3e5973dd8b2e5e",
+  "cases": 100,
+  "seed": 75,
+  "maximum_absolute_difference_percentage_points": 1.4210854715202004e-14,
+  "tolerance_percentage_points": 1e-09,
+  "passed": true
+}

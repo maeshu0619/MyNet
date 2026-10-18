@@ -1,0 +1,149 @@
+MPEG PCC tmc3 version release-v23.0-rc2-0-ga3d15c5
++ Effective configuration parameters
+    mode                  : 0
+    firstFrameNum         : 0
+    frameCount            : 1
+    reconstructedDataPath : "/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_checkpoint_v2/cloud_0000/05_Baseline/encoder_reconstruction.ply"
+    uncompressedDataPath  : "/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_checkpoint_v2/cloud_0000/05_Baseline/geometry_input.ply"
+    compressedStreamPath  : "/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_checkpoint_v2/cloud_0000/05_Baseline/geometry.bin"
+    postRecolorPath       : ""
+    preInvScalePath       : ""
+    convertPlyColourspace : 1
+    outputBinaryPly       : 1
+    outputUnitLength      : 1
+    outputScaling         : 1 (External)
+    outputPrecisionBits   : -1
+    srcUnitLength             : 1
+    srcUnit                   : 0 (Dimensionless)
+    inputScale                : 1
+    codingScale               : 0.9375
+    sequenceScale             : 0.9375
+    positionQuantizationScale : 0.9375
+    externalScale             : 1
+    sortInputByAzimuth               : 0
+    geometry_axis_order              : 1 (xyz)
+    autoSeqBbox                      : 1
+    seqOrigin                        : 0, 0, 0
+    seqSizeWhd                       : 0, 0, 0
+    mergeDuplicatedPoints            : 1
+    partitionMethod                  : 4 (UniformSquare)
+    safeTrisoupPartionning           : 0
+    partitionOctreeDepth             : 1
+    sliceMaxPointsTrisoup            : 1100000
+    sliceMaxPoints                   : 1100000
+    sliceMinPoints                   : 550000
+    tileSize                         : 0
+    cabac_bypass_stream_enabled_flag : 0
+    entropyContinuationEnabled       : 0
+    bypassBinCodingWithoutProbUpdate : 1
+    InterEntropyContinuationEnabled  : 0
+    disableAttributeCoding           : 1
+    enforceLevelLimits               : 1
+    geomTreeType                                : 0
+    qtbtEnabled                                 : 1
+    maxNumQtBtBeforeOt                          : 4
+    minQtbtSizeLog2                             : 0
+    numOctreeEntropyStreams                     : 0
+    bitwiseOccupancyCoding                      : 1
+    neighbourAvailBoundaryLog2                  : 7
+    inferredDirectCodingMode                    : 0
+    jointTwoPointIdcm                           : 1
+    adjacentChildContextualization              : 1
+    intra_pred_max_node_size_log2               : 6
+    planarEnabled                               : 0
+    octreeDepthPlanarEligibilityEnabled         : 1
+    octreePlanarDynamicOBUFEligibilityEnabled   : 1
+    multiplePlanarEnabled                       : 1
+    planarModeThreshold0                        : 77
+    planarModeThreshold1                        : 99
+    planarModeThreshold2                        : 113
+    planarModeIdcmUse                           : -1
+    trisoupNodeSizeLog2                         : 
+    trisoup_sampling_value                      : 0
+    trisoupQuantizationBits                     : 0
+    trisoupCentroidResidualEnabled              : 1
+    trisoupHaloEnabled                          : 1
+    trisoupAdaptiveHaloEnabled                  : 1
+    trisoupFineRayTracingEnabled                : 1
+    trisoupImprovedEncoderEnabled               : 1
+    nodeUniqueDSE                               : 1
+    trisoupNonCubicNodeNearOriginSideEnabled    : 1
+    trisoupNonCubicNodeFarFromOriginSideEnabled : 1
+    trisoupFaceVertexEnabled                    : 1
+    positionQuantisationEnabled                 : 0
+    positionQuantisationMethod                  : 0 (Uniform)
+    positionQpMultiplierLog2                    : 0
+    positionBaseQp                              : 0
+    positionIdcmQp                              : 0
+    positionSliceQpOffset                       : 0
+    positionQuantisationOctreeSizeLog2          : -1
+    positionQuantisationOctreeDepth             : -1
+    positionBaseQpFreqLog2                      : 8
+    positionSliceQpFreqLog2                     : -8
+    angularEnabled                              : 0
+    interIDCMPredEnabled                        : 0
+    zCompensationEnabled                        : 0
+    secondaryResidualDisabled                   : 0
+    lidarHeadPosition                           : 0, 0, 0
+    numLasers                                   : 0
+    lasersTheta                                 : 
+    lasersZ                                     : 
+    lasersNumPhiPerTurn                         : 
+    planarBufferDisabled                        : 0
+    octreeAngularExtension                      : 1
+    predGeomAzimuthQuantization                 : 0
+    positionAzimuthScaleLog2                    : 5
+    positionAzimuthSpeed                        : 362
+    positionRadiusInvScaleLog2                  : 0
+    resRContextQphiThreshold                    : 0
+    resRContextQphiThresholdPresentFlag         : 0
+    disable_planar_IDCM_angluar                 : 0
+    interAzimScaleLog2                          : 1
+    randomAccessPeriod                          : 1
+    enableGroundPartition                       : 0
+    interPredictionEnabled                      : 0
+    biPredictionEnabled                         : 0
+    frameMergeEnabled                           : 0
+    predictionPeriod                            : 1
+    globalMotionEnabled                         : 0
+    resamplingEnabled                           : 0
+    motionVectorPath                            : ""
+    lpuType                                     : 0 (RoadObjClassfication)
+    globalMotionSrcType                         : 1 (InternalLMSGMSrc)
+    globalMotionBlockSize                       : 0, 0, 4096
+    globalMotionWindowSize                      : 512
+    deriveGMThreshold                           : 0
+    gmThresholdHistScale                        : 100
+    gmThresholdMinZ                             : -4000
+    gmThresholdMaxZ                             : -500
+    gmThresholdLeftScale                        : 1.5
+    gmThresholdRightScale                       : 1.5
+    use_cuboidal_regions_in_GM_estimation       : 0
+    predGeomSort                                : 1 (Morton)
+    predGeomAzimuthSortPrecision                : 0
+    predGeomTreePtsMax                          : 1100000
+    pointCountMetadata                          : 0
+    predGeomMaxPredIdx                          : 3
+    predGeomMaxPredIdxTested                    : -1
+    predGeomRadiusPredThreshold                 : 2048
+    recolourSearchRange                             : 1
+    recolourNumNeighboursFwd                        : 8
+    recolourNumNeighboursBwd                        : 1
+    recolourUseDistWeightedAvgFwd                   : 1
+    recolourUseDistWeightedAvgBwd                   : 1
+    recolourSkipAvgIfIdenticalSourcePointPresentFwd : 1
+    recolourSkipAvgIfIdenticalSourcePointPresentBwd : 0
+    recolourDistOffsetFwd                           : 4
+    recolourDistOffsetBwd                           : 4
+    recolourMaxGeometryDist2Fwd                     : 1000
+    recolourMaxGeometryDist2Bwd                     : 1000
+    recolourMaxAttributeDist2Fwd                    : 1000
+    recolourMaxAttributeDist2Bwd                    : 1000
+
+Slice number: 1
+positions bitstream size 634 B (8.80556 bpp)
+positions processing time (user): 0.008 s
+Total frame size 664 B
+Total bitstream size 664 B
+Processing time (wall): 0.017 s
+Processing time (user): 0.008 s

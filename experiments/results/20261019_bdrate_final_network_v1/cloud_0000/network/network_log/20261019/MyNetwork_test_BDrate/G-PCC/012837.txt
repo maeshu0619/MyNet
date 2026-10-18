@@ -1,0 +1,28 @@
+KNNBackend: pointops_available=True, knn_backend=pointops_cuda, allow_slow_knn_fallback=True, torch=1.10.0+cu113, torch_cuda=11.3, cuda_available=True
+Test Role: inference_only
+checkpoint: /data/maejima/log/20261017/MyNetwork_train/pretrained/192050_G-PCC/best_loss_joint.pth
+input_dir: /home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_final_network_v1/cloud_0000/network/8i/eval
+output_log: /home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_final_network_v1/cloud_0000/network/profile.csv
+save_output_points: True
+output_dir: /home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_final_network_v1/cloud_0000/network/mine
+Test Operation Config: add_enabled=True, target_add_ratio=0.000000, max_add_ratio=0.003300, target_drop_ratio=0.000000, max_drop_ratio=0.003300, target_move_ratio=0.000000, max_move_ratio=0.001650
+Disabled in test.py: compression eval, shape quality metrics, detailed structure debug.
+DataLoader: files=1, workers=0, pin_memory=False, ply_loader=numpy
+InferenceStep: step=1, input=576, output=576, add=0, delete=0, adjust=0, model=0.091601s, total=0.092521s
+Step 1 Result
+| input_points | output_points | added | deleted | adjusted | model_time_s | total_time_s |
+| ------------ | ------------- | ----- | ------- | -------- | ------------ | ------------ |
+| 576          | 576           | 0     | 0       | 0        | 0.091601     | 0.092521     |
+Average Result
+| metric        | mean       |
+| ------------- | ---------- |
+| input_points  | 576.000000 |
+| output_points | 576.000000 |
+| added         | 0.000000   |
+| deleted       | 0.000000   |
+| adjusted      | 0.000000   |
+| model_time_s  | 0.091601   |
+| total_time_s  | 0.092521   |
+TotalInferenceTiming: samples=1, total=0.093827s
+InferenceProfileCSV: /home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_final_network_v1/cloud_0000/network/profile.csv
+OutputPointDir: /home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_final_network_v1/cloud_0000/network/mine

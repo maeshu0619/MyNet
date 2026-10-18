@@ -1,0 +1,16 @@
+[
+  "/home/maejima/MasterEx/compress/octree/G-PCC/build/tmc3/tmc3",
+  "-c",
+  "/home/maejima/MasterEx/compress/octree/G-PCC/cfg/octree-predlift/lossy-geom-lossy-attrs/longdress_vox10_1300/r01/encoder.cfg",
+  "--uncompressedDataPath=/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_checkpoint_v1/cloud_0000/04_Baseline/geometry_input.ply",
+  "--reconstructedDataPath=/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_checkpoint_v1/cloud_0000/04_Baseline/encoder_reconstruction.ply",
+  "--compressedStreamPath=/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_checkpoint_v1/cloud_0000/04_Baseline/geometry.bin",
+  "--mode=0",
+  "--autoSeqBbox=1",
+  "--trisoupNodeSizeLog2=0",
+  "--mergeDuplicatedPoints=1",
+  "--disableAttributeCoding=1",
+  "--positionQuantizationScale=0.875",
+  "--outputBinaryPly=1",
+  "--outputScaling=1"
+]

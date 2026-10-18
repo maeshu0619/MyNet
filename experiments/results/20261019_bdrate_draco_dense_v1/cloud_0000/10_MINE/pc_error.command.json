@@ -1,0 +1,14 @@
+[
+  "/home/maejima/MasterEx/compress/octree/SparsePCGC/extension/pc_error_d",
+  "--fileA=/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_draco_dense_v1/cloud_0000/10_MINE/metric_gt.ply",
+  "--fileB=/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_draco_dense_v1/cloud_0000/10_MINE/decoded.ply",
+  "--resolution=255.0",
+  "--singlePass=0",
+  "--hausdorff=1",
+  "--color=0",
+  "--dropdups=2",
+  "--neighborsProc=1",
+  "--averageNormals=1",
+  "--nbThreads=1",
+  "--inputNorm=/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_draco_dense_v1/cloud_0000/10_MINE/metric_normals.ply"
+]

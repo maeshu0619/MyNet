@@ -1,0 +1,1 @@
+Decoded geometry saved to /home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_draco_v3/Draco/cloud_0000/04_Baseline/decoded.ply (0 ms to decode)

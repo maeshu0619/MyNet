@@ -1,0 +1,20 @@
+[
+  {
+    "positionQuantizationScale": 0.03125
+  },
+  {
+    "positionQuantizationScale": 0.0625
+  },
+  {
+    "positionQuantizationScale": 0.125
+  },
+  {
+    "positionQuantizationScale": 0.25
+  },
+  {
+    "positionQuantizationScale": 0.5
+  },
+  {
+    "positionQuantizationScale": 0.75
+  }
+]

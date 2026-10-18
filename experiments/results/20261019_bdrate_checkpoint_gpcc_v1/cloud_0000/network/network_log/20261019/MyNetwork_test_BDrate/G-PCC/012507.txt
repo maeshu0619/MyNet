@@ -1,0 +1,9 @@
+KNNBackend: pointops_available=True, knn_backend=pointops_cuda, allow_slow_knn_fallback=True, torch=1.10.0+cu113, torch_cuda=11.3, cuda_available=True
+Test Role: inference_only
+checkpoint: /data/maejima/log/20261017/MyNetwork_train/pretrained/192050_G-PCC/best_loss_joint.pth
+input_dir: /home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_checkpoint_gpcc_v1/cloud_0000/network/input
+output_log: /home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_checkpoint_gpcc_v1/cloud_0000/network/profile.csv
+save_output_points: True
+output_dir: /home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_checkpoint_gpcc_v1/cloud_0000/network/mine
+Test Operation Config: add_enabled=True, target_add_ratio=0.000000, max_add_ratio=0.003300, target_drop_ratio=0.000000, max_drop_ratio=0.003300, target_move_ratio=0.000000, max_move_ratio=0.001650
+Disabled in test.py: compression eval, shape quality metrics, detailed structure debug.

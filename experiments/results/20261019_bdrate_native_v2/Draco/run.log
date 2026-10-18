@@ -1,0 +1,120 @@
+Traceback (most recent call last):
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/runner.py", line 140, in run
+    measured = encode_decode(args.codec, source, point_folder, point, vars(args))
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/codecs.py", line 88, in encode_decode
+    run_command(encoder._encode_command(str(geometry), str(bitstream)), folder, "encode", timeout, cwd=encoder.root)
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/io.py", line 92, in run_command
+    raise RuntimeError("{} failed: {}; see {}".format(name, status, folder))
+RuntimeError: encode failed: {'returncode': 255}; see /home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_native_v2/Draco/cloud_0000/00_Baseline
+
+synthetic_surface.ply Baseline point 0: error
+Traceback (most recent call last):
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/runner.py", line 140, in run
+    measured = encode_decode(args.codec, source, point_folder, point, vars(args))
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/codecs.py", line 88, in encode_decode
+    run_command(encoder._encode_command(str(geometry), str(bitstream)), folder, "encode", timeout, cwd=encoder.root)
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/io.py", line 92, in run_command
+    raise RuntimeError("{} failed: {}; see {}".format(name, status, folder))
+RuntimeError: encode failed: {'returncode': 255}; see /home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_native_v2/Draco/cloud_0000/00_MINE
+
+synthetic_surface.ply MINE point 0: error
+Traceback (most recent call last):
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/runner.py", line 140, in run
+    measured = encode_decode(args.codec, source, point_folder, point, vars(args))
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/codecs.py", line 88, in encode_decode
+    run_command(encoder._encode_command(str(geometry), str(bitstream)), folder, "encode", timeout, cwd=encoder.root)
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/io.py", line 92, in run_command
+    raise RuntimeError("{} failed: {}; see {}".format(name, status, folder))
+RuntimeError: encode failed: {'returncode': 255}; see /home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_native_v2/Draco/cloud_0000/01_Baseline
+
+synthetic_surface.ply Baseline point 1: error
+Traceback (most recent call last):
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/runner.py", line 140, in run
+    measured = encode_decode(args.codec, source, point_folder, point, vars(args))
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/codecs.py", line 88, in encode_decode
+    run_command(encoder._encode_command(str(geometry), str(bitstream)), folder, "encode", timeout, cwd=encoder.root)
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/io.py", line 92, in run_command
+    raise RuntimeError("{} failed: {}; see {}".format(name, status, folder))
+RuntimeError: encode failed: {'returncode': 255}; see /home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_native_v2/Draco/cloud_0000/01_MINE
+
+synthetic_surface.ply MINE point 1: error
+Traceback (most recent call last):
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/runner.py", line 140, in run
+    measured = encode_decode(args.codec, source, point_folder, point, vars(args))
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/codecs.py", line 88, in encode_decode
+    run_command(encoder._encode_command(str(geometry), str(bitstream)), folder, "encode", timeout, cwd=encoder.root)
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/io.py", line 92, in run_command
+    raise RuntimeError("{} failed: {}; see {}".format(name, status, folder))
+RuntimeError: encode failed: {'returncode': 255}; see /home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_native_v2/Draco/cloud_0000/02_Baseline
+
+synthetic_surface.ply Baseline point 2: error
+Traceback (most recent call last):
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/runner.py", line 140, in run
+    measured = encode_decode(args.codec, source, point_folder, point, vars(args))
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/codecs.py", line 88, in encode_decode
+    run_command(encoder._encode_command(str(geometry), str(bitstream)), folder, "encode", timeout, cwd=encoder.root)
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/io.py", line 92, in run_command
+    raise RuntimeError("{} failed: {}; see {}".format(name, status, folder))
+RuntimeError: encode failed: {'returncode': 255}; see /home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_native_v2/Draco/cloud_0000/02_MINE
+
+synthetic_surface.ply MINE point 2: error
+Traceback (most recent call last):
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/runner.py", line 140, in run
+    measured = encode_decode(args.codec, source, point_folder, point, vars(args))
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/codecs.py", line 88, in encode_decode
+    run_command(encoder._encode_command(str(geometry), str(bitstream)), folder, "encode", timeout, cwd=encoder.root)
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/io.py", line 92, in run_command
+    raise RuntimeError("{} failed: {}; see {}".format(name, status, folder))
+RuntimeError: encode failed: {'returncode': 255}; see /home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_native_v2/Draco/cloud_0000/03_Baseline
+
+synthetic_surface.ply Baseline point 3: error
+Traceback (most recent call last):
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/runner.py", line 140, in run
+    measured = encode_decode(args.codec, source, point_folder, point, vars(args))
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/codecs.py", line 88, in encode_decode
+    run_command(encoder._encode_command(str(geometry), str(bitstream)), folder, "encode", timeout, cwd=encoder.root)
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/io.py", line 92, in run_command
+    raise RuntimeError("{} failed: {}; see {}".format(name, status, folder))
+RuntimeError: encode failed: {'returncode': 255}; see /home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_native_v2/Draco/cloud_0000/03_MINE
+
+synthetic_surface.ply MINE point 3: error
+Traceback (most recent call last):
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/runner.py", line 140, in run
+    measured = encode_decode(args.codec, source, point_folder, point, vars(args))
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/codecs.py", line 88, in encode_decode
+    run_command(encoder._encode_command(str(geometry), str(bitstream)), folder, "encode", timeout, cwd=encoder.root)
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/io.py", line 92, in run_command
+    raise RuntimeError("{} failed: {}; see {}".format(name, status, folder))
+RuntimeError: encode failed: {'returncode': 255}; see /home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_native_v2/Draco/cloud_0000/04_Baseline
+
+synthetic_surface.ply Baseline point 4: error
+Traceback (most recent call last):
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/runner.py", line 140, in run
+    measured = encode_decode(args.codec, source, point_folder, point, vars(args))
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/codecs.py", line 88, in encode_decode
+    run_command(encoder._encode_command(str(geometry), str(bitstream)), folder, "encode", timeout, cwd=encoder.root)
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/io.py", line 92, in run_command
+    raise RuntimeError("{} failed: {}; see {}".format(name, status, folder))
+RuntimeError: encode failed: {'returncode': 255}; see /home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_native_v2/Draco/cloud_0000/04_MINE
+
+synthetic_surface.ply MINE point 4: error
+Traceback (most recent call last):
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/runner.py", line 140, in run
+    measured = encode_decode(args.codec, source, point_folder, point, vars(args))
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/codecs.py", line 88, in encode_decode
+    run_command(encoder._encode_command(str(geometry), str(bitstream)), folder, "encode", timeout, cwd=encoder.root)
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/io.py", line 92, in run_command
+    raise RuntimeError("{} failed: {}; see {}".format(name, status, folder))
+RuntimeError: encode failed: {'returncode': 255}; see /home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_native_v2/Draco/cloud_0000/05_Baseline
+
+synthetic_surface.ply Baseline point 5: error
+Traceback (most recent call last):
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/runner.py", line 140, in run
+    measured = encode_decode(args.codec, source, point_folder, point, vars(args))
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/codecs.py", line 88, in encode_decode
+    run_command(encoder._encode_command(str(geometry), str(bitstream)), folder, "encode", timeout, cwd=encoder.root)
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/io.py", line 92, in run_command
+    raise RuntimeError("{} failed: {}; see {}".format(name, status, folder))
+RuntimeError: encode failed: {'returncode': 255}; see /home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_native_v2/Draco/cloud_0000/05_MINE
+
+synthetic_surface.ply MINE point 5: error

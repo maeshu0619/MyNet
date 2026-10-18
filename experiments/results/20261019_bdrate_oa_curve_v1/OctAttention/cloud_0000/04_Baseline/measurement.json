@@ -1,0 +1,56 @@
+{
+  "cloud": "/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_oa_curve_v1/synthetic_surface.ply",
+  "dataset": "SYNTHETIC_SELF_TEST_NOT_THESIS",
+  "codec": "OctAttention",
+  "series": "Baseline",
+  "experiment_mode": "IDENTITY_CONTROL_NOT_TRAINED_MINE",
+  "model_date": "20260801",
+  "model_time": "072958",
+  "rate_index": 4,
+  "parameters": {
+    "qs": 2
+  },
+  "original_points": 576,
+  "mine_points": 576,
+  "status": "ok",
+  "resolution": 255.0,
+  "bits": 4344,
+  "decoded_path": "/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_oa_curve_v1/OctAttention/cloud_0000/04_Baseline/decoded.ply",
+  "decoded_points": 576,
+  "decoded_sha256": "d08b2da5e24465b46377c0d086de40ed1b6d4930873e3957a878a4b2f91ce4be",
+  "streams": [
+    {
+      "path": "/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_oa_curve_v1/OctAttention/cloud_0000/04_Baseline/occupancy.bin",
+      "bytes": 487,
+      "sha256": "647e036f793740d77c7b584cb189e524417284dd4445a9e2403447944c570e27"
+    },
+    {
+      "path": "/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_oa_curve_v1/OctAttention/cloud_0000/04_Baseline/geometry.side.bin",
+      "bytes": 56,
+      "sha256": "3c26bf1df22e62ba6e2392874936527a237508f8deee4a74c36b53011911ea77"
+    }
+  ],
+  "codec_metadata": {
+    "checkpoint_sha256": "d7c1dff347c48060a7bf9a241c85f73ae31f0ae0314b5397784814f8ec316870",
+    "decoder": "causal autonomous probabilities; no encoder probability/symbol side channel",
+    "rate_definition": "actual arithmetic bytes + 56-byte serialized geometry side record",
+    "qs": 2.0,
+    "octree_depth": 6,
+    "symbols": 887
+  },
+  "bpp": 7.541666666666667,
+  "source_path": "/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_oa_curve_v1/synthetic_surface.ply",
+  "source_sha256": "34fd51fb5923e9e284fc78488c995a8eed527bd14fbb57cbe0647083f0fd1695",
+  "d1_psnr": 55.9274,
+  "d1_mse": 0.498264,
+  "d2_psnr": 58.0639,
+  "d2_mse": 0.304656,
+  "metric_binary_sha256": "758e1d7a744bfae3094d7781a4c1c9d15810b054d9a866785ace6c96a1ff5f96",
+  "normals_sha256": "34fd51fb5923e9e284fc78488c995a8eed527bd14fbb57cbe0647083f0fd1695",
+  "metric_warnings": [],
+  "canonical_normals_dtype": "float32",
+  "canonical_normals_sha256": "6a9256cbdc151f895a007b6d46cceab0df57f7ab3c9ba6ad5fcb8b83c561ed5c",
+  "peak_definition": "MPEG pc_error PSNR: 10*log10(3*resolution^2 / symmetric_MSE)",
+  "duplicate_policy": "pc_error dropdups=2; Original point count retained as bpp denominator",
+  "metric_precision": "Native tool textual precision; no further rounding"
+}

@@ -1,0 +1,56 @@
+{
+  "cloud": "/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_native_v2/synthetic_surface.ply",
+  "dataset": "explicit_holdout",
+  "codec": "G-PCC",
+  "series": "MINE",
+  "experiment_mode": "trained_network",
+  "model_date": "20260801",
+  "model_time": "072958",
+  "rate_index": 0,
+  "parameters": {
+    "positionQuantizationScale": 0.03125
+  },
+  "original_points": 576,
+  "mine_points": 576,
+  "status": "ok",
+  "resolution": 255.0,
+  "bits": 368,
+  "decoded_path": "/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_checkpoint_gpcc_v2/cloud_0000/00_MINE/decoded.ply",
+  "decoded_points": 28,
+  "decoded_sha256": "3c043b63a2d63d4eaeaa9d10671466f84c50b21f8f9cd666bb3d96e4782c04d8",
+  "streams": [
+    {
+      "path": "/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_checkpoint_gpcc_v2/cloud_0000/00_MINE/geometry.bin",
+      "bytes": 46,
+      "sha256": "bf1a3c02e322af425fa75f2db34b3b48d6b4ab1722c70a2d91f624337f27001c"
+    }
+  ],
+  "codec_metadata": {
+    "binary_sha256": "ae225666df7a0d14590f09ec4216fe69b4733d75a4adf18410904bca05c9aacd",
+    "config_sha256": "6076b7f352dbac031544ee39904266d2161c92e834dc4e9fb8c4c03d0afce6ec",
+    "rate_definition": "complete geometry-only native stream including headers",
+    "native_version_banner": [
+      "MPEG PCC tmc3 version release-v23.0-rc2-0-ga3d15c5",
+      "+ Effective configuration parameters",
+      "    mode                  : 0",
+      "    firstFrameNum         : 0",
+      "    frameCount            : 1",
+      "    reconstructedDataPath : \"/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_checkpoint_gpcc_v2/cloud_0000/00_MINE/encoder_reconstruction.ply\""
+    ]
+  },
+  "bpp": 0.6388888888888888,
+  "source_path": "/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_checkpoint_gpcc_v2/cloud_0000/network/mine/0000_Mine.ply",
+  "source_sha256": "474257a924102793813283b3ed480aa873ee0881d08b2ed583e74b58f0192871",
+  "d1_psnr": 28.7471,
+  "d1_mse": 260.311,
+  "d2_psnr": 30.7793,
+  "d2_mse": 163.03,
+  "metric_binary_sha256": "758e1d7a744bfae3094d7781a4c1c9d15810b054d9a866785ace6c96a1ff5f96",
+  "normals_sha256": "34fd51fb5923e9e284fc78488c995a8eed527bd14fbb57cbe0647083f0fd1695",
+  "metric_warnings": [],
+  "canonical_normals_dtype": "float32",
+  "canonical_normals_sha256": "6a9256cbdc151f895a007b6d46cceab0df57f7ab3c9ba6ad5fcb8b83c561ed5c",
+  "peak_definition": "MPEG pc_error PSNR: 10*log10(3*resolution^2 / symmetric_MSE)",
+  "duplicate_policy": "pc_error dropdups=2; Original point count retained as bpp denominator",
+  "metric_precision": "Native tool textual precision; no further rounding"
+}

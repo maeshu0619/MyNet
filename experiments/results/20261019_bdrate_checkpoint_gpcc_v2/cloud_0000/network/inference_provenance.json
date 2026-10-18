@@ -1,0 +1,11 @@
+{
+  "checkpoint": "/data/maejima/log/20261017/MyNetwork_train/pretrained/192050_G-PCC/best_loss_joint.pth",
+  "checkpoint_sha256": "e53f1149e9fec9af46bc2dcf2e6502dd82bbba1f30f1b4d6378f64e3edf1fbad",
+  "test_py_sha256": "7fd4defa29ebdf31e9e9c6f03670a965e9c54ab9a6192f9175d7c119f4ecdb1f",
+  "exact_checkpoint_shape_and_values": true,
+  "seed": 0,
+  "eval": true,
+  "training_exploration": false,
+  "frozen_encoder_checkpoint_sha256": "cb917b6905668766ec2bf7954919b1dd45f4ff9dad6338afcc2f278ac5cedd56",
+  "note": "Existing test.py pipeline; strict checkpoint check added in standalone wrapper"
+}

@@ -1,0 +1,12 @@
+[
+  "/home/maejima/MasterEx/compress/octree/Draco/build/draco_encoder",
+  "-point_cloud",
+  "-i",
+  "/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_final_dense_v1/cloud_0000/11_Baseline/geometry_input.ply",
+  "-o",
+  "/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_final_dense_v1/cloud_0000/11_Baseline/geometry.drc",
+  "-qp",
+  "15",
+  "-cl",
+  "7"
+]

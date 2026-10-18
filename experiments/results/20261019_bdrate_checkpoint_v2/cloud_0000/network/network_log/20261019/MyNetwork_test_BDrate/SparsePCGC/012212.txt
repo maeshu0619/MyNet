@@ -1,0 +1,6 @@
+KNNBackend: pointops_available=True, knn_backend=pointops_cuda, allow_slow_knn_fallback=True, torch=1.10.0+cu113, torch_cuda=11.3, cuda_available=True
+Model checkpoint shape-adapted 4 tensors.
+  full_cloud_amount_selector.amount_bin_logits.weight: (8, 64) -> (6, 64)
+  full_cloud_amount_selector.amount_bin_logits.bias: (8,) -> (6,)
+  full_cloud_amount_selector.predicted_delta_per_amount.weight: (8, 64) -> (6, 64)
+  full_cloud_amount_selector.predicted_delta_per_amount.bias: (8,) -> (6,)
