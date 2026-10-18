@@ -1,0 +1,54 @@
+PCC quality measurement software, version 0.13.4
+
+infile1:        /home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_progress_model_v1/cloud_0000/04_Baseline/metric_gt.ply
+infile2:        /home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_progress_model_v1/cloud_0000/04_Baseline/decoded.ply
+normal1:        /home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_progress_model_v1/cloud_0000/04_Baseline/metric_normals.ply
+singlePass:     0
+hausdorff:      1
+color:          0
+lidar:          0
+resolution:     255
+dropDuplicates: 2
+neighborsProc:  1
+averageNormals: 1
+nbThreads:      1
+
+Verifying if the data is loaded correctly.. The last point is: 92 92 102
+Reading file 1 done.
+Verifying if the data is loaded correctly.. The last point is: 92 92 102
+Reading normal 1 done.
+Verifying if the data is loaded correctly.. The last point is: 13 12 2
+Reading file 2 done.
+Imported intrinsic resoluiton: 255
+Peak distance for PSNR: 255
+Point cloud sizes for org version, dec version, and the scaling ratio: 576, 576, 1
+Normals prepared.
+
+1. Use infile1 (A) as reference, loop over A, use normals on B. (A->B).
+   mse1      (p2point): 45.5417
+   mse1,PSNR (p2point): 36.3179
+   mse1      (p2plane): 1.70826
+   mse1,PSNR (p2plane): 50.5765
+   h.       1(p2point): 286
+   h.,PSNR  1(p2point): 28.3384
+   h.       1(p2plane): 11.7606
+   h.,PSNR  1(p2plane): 42.1977
+2. Use infile2 (B) as reference, loop over B, use normals on A. (B->A).
+   mse2      (p2point): 4.96181
+   mse2,PSNR (p2point): 45.9456
+   mse2      (p2plane): 1.44784
+   mse2,PSNR (p2plane): 51.2948
+   h.       2(p2point): 19
+   h.,PSNR  2(p2point): 40.1145
+   h.       2(p2plane): 10.674
+   h.,PSNR  2(p2plane): 42.6187
+3. Final (symmetric).
+   mseF      (p2point): 45.5417
+   mseF,PSNR (p2point): 36.3179
+   mseF      (p2plane): 1.70826
+   mseF,PSNR (p2plane): 50.5765
+   h.        (p2point): 286
+   h.,PSNR   (p2point): 28.3384
+   h.        (p2plane): 11.7606
+   h.,PSNR   (p2plane): 42.1977
+Job done! 0.005 seconds elapsed (excluding the time to load the point clouds).

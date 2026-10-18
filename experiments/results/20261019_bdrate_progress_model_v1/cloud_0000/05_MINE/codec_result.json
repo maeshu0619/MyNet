@@ -1,0 +1,14 @@
+{
+  "streams": [
+    "/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_progress_model_v1/cloud_0000/05_MINE/occupancy.bin",
+    "/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_progress_model_v1/cloud_0000/05_MINE/geometry.side.bin"
+  ],
+  "checkpoint_sha256": "b3e1c1bd30f7f54c4671c94f13c126f9c2d5ba0ff240565de490a74329885831",
+  "sr_checkpoint_sha256": "8e60478469f9518223f3e12d0cc1261a30c461f71a8c1153a02fdcb4a6029948",
+  "ae_checkpoint_sha256": "d843e5b24e51e8e4e2eb167a31ea91a3d88e58d042d5c1004fbf7343ce07a5d2",
+  "rate_definition": "physical basic stream + serialized stage counts/AE bytes/coordinate side record",
+  "quantization_note": "integer input on requested voxel grid",
+  "scale_ae": 0,
+  "scale_sr": 3,
+  "compatibility_note": "MYSP0001 evaluation wrapper; overhead differs from paper logical-count convention"
+}

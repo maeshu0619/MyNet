@@ -1,0 +1,39 @@
+{
+  "missing_trainable": [
+    "point_transformer_feature_gate",
+    "point_transformer_feature_adapter.0.weight",
+    "point_transformer_feature_adapter.0.bias",
+    "point_transformer_feature_adapter.2.weight",
+    "point_transformer_feature_adapter.2.bias",
+    "actuator.candidate_local_utility_gate_logits",
+    "actuator.den6_candidate_actor.0.weight",
+    "actuator.den6_candidate_actor.0.bias",
+    "actuator.den6_candidate_actor.2.weight",
+    "actuator.den6_candidate_actor.2.bias",
+    "actuator.den6_candidate_critic.0.weight",
+    "actuator.den6_candidate_critic.0.bias",
+    "actuator.den6_candidate_critic.2.weight",
+    "actuator.den6_candidate_critic.2.bias",
+    "actuator.den6_candidate_proxy_critic.0.weight",
+    "actuator.den6_candidate_proxy_critic.0.bias",
+    "actuator.den6_candidate_proxy_critic.2.weight",
+    "actuator.den6_candidate_proxy_critic.2.bias",
+    "actuator.den6_candidate_proposal.0.weight",
+    "actuator.den6_candidate_proposal.0.bias",
+    "actuator.den6_candidate_proposal.2.weight",
+    "actuator.den6_candidate_proposal.2.bias",
+    "actuator.den6_plan_critic.0.weight",
+    "actuator.den6_plan_critic.0.bias",
+    "actuator.den6_plan_critic.2.weight",
+    "actuator.den6_plan_critic.2.bias",
+    "actuator.den6_plan_critic.4.weight",
+    "actuator.den6_plan_critic.4.bias"
+  ],
+  "shape_or_unexpected": [
+    "full_cloud_amount_selector.amount_bin_logits.weight",
+    "full_cloud_amount_selector.amount_bin_logits.bias",
+    "full_cloud_amount_selector.predicted_delta_per_amount.weight",
+    "full_cloud_amount_selector.predicted_delta_per_amount.bias"
+  ],
+  "changed_values": []
+}

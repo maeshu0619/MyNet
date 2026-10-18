@@ -1,0 +1,15 @@
+{
+  "status": "failed",
+  "exit_code": 2,
+  "experiment_mode": "trained_network",
+  "requested_rd_measurements": 12,
+  "successful_rd_measurements": 12,
+  "successful_codec_roundtrips": 12,
+  "successful_psnr_measurements": 12,
+  "successful_mine_inferences": 1,
+  "elapsed_seconds": 30.05305859586224,
+  "reasons": [
+    "/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_final_learned_v1/synthetic_surface.ply D1: Nonmonotonic rate versus PSNR; not silently corrected",
+    "/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_final_learned_v1/synthetic_surface.ply D2: Nonmonotonic rate versus PSNR; not silently corrected"
+  ]
+}

@@ -2,6 +2,11 @@
 import sys
 import tempfile
 import unittest
+import contextlib
+import io
+import json
+from types import SimpleNamespace
+from unittest.mock import patch
 from pathlib import Path
 import numpy as np
 
@@ -11,6 +16,90 @@ from utils.bdrate.metrics import parse_pc_error, validate_normals, evaluate
 from utils.bdrate.codecs import default_points, validate_points
 from utils.bdrate.io import read_vertices, write_geometry, measure_streams
 from utils.bdrate.report import summarize
+from utils.bdrate.preflight import check_prerequisites
+from utils.bdrate.progress import completion_status, timed_stage
+from utils.bdrate.io import run_command
+
+
+class FailureVisibilityTests(unittest.TestCase):
+    def test_placeholder_command_cannot_look_like_success_or_start_work(self):
+        import test_BDrate
+        from utils.bdrate.runner import run
+        from openpyxl import load_workbook
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "run"
+            args = test_BDrate.parse_args(["--input", "/path/to/holdout/frame.ply", "--normals", "/path/to/holdout/frame_normals.ply",
+                "--checkpoint", "/path/to/compatible_model.pth", "--resolution", "1023", "--output", str(dest)])
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with patch("utils.bdrate.runner._network_output") as inference, patch("utils.bdrate.runner.encode_decode") as codec, \
+                 patch("utils.bdrate.runner.evaluate") as metric, contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                exit_code = run(args)
+            self.assertEqual(exit_code, 2)
+            inference.assert_not_called(); codec.assert_not_called(); metric.assert_not_called()
+            self.assertIn("[FAILED]", stderr.getvalue())
+            self.assertIn("example placeholder", stderr.getvalue())
+            self.assertIn("ERROR REPORT", stderr.getvalue())
+            self.assertNotIn("[SUCCESS]", stdout.getvalue() + stderr.getvalue())
+            self.assertFalse(list(dest.glob("rd_*.png")))
+            status = json.loads((dest / "run_status.json").read_text())
+            self.assertEqual(status["successful_rd_measurements"], 0)
+            self.assertEqual(load_workbook(dest / "results.xlsx", read_only=True).sheetnames[0], "Run status")
+
+    def test_preflight_collects_missing_model_input_and_normal(self):
+        args = SimpleNamespace(input=["/path/to/holdout/frame.ply"], normals=["/path/to/holdout/normals.ply"],
+            identity_control=False, pc_error=sys.executable, network_python=sys.executable,
+            codec="Draco", draco_encoder=sys.executable, draco_decoder=sys.executable)
+        errors = check_prerequisites(args, "/path/to/compatible_model.pth")
+        self.assertEqual(len(errors), 3)
+        self.assertTrue(all("placeholder" in e for e in errors))
+
+    def test_empty_evaluation_is_failure(self):
+        metadata = dict(mode="trained_network", config=dict(d1_only=False, input=["gt.ply"]))
+        summary, _ = summarize([], ["gt.ply"], 6, list(range(6)))
+        result = completion_status([], summary, metadata, 12)
+        self.assertEqual(result["exit_code"], 2)
+        self.assertEqual(result["successful_rd_measurements"], 0)
+
+    def test_success_requires_actual_stage_counters(self):
+        summary = [dict(cloud="DATASET_MEAN", metric="d1", status="ok", bd_rate_percent=0)]
+        rows = [dict(status="ok") for _ in range(12)]
+        metadata = dict(mode="trained_network", config=dict(d1_only=True, input=["gt.ply"]),
+                        codec_roundtrips_completed=12, psnr_measurements_completed=12)
+        self.assertEqual(completion_status(rows, summary, metadata, 12)["exit_code"], 2)
+        metadata["mine_inferences_completed"] = 1
+        self.assertEqual(completion_status(rows, summary, metadata, 12)["exit_code"], 0)
+
+    def test_control_is_explicitly_not_model_inference(self):
+        summary = [dict(cloud="DATASET_MEAN", metric="d1", status="ok", bd_rate_percent=0)]
+        metadata = dict(mode="IDENTITY_CONTROL_NOT_TRAINED_MINE", config=dict(d1_only=True, input=["gt.ply"]),
+                        codec_roundtrips_completed=12, psnr_measurements_completed=12)
+        result = completion_status([dict(status="ok")]*12, summary, metadata, 12)
+        self.assertEqual(result["exit_code"], 0)
+        self.assertEqual(result["successful_mine_inferences"], 0)
+
+    def test_failed_stage_preserves_timing_and_exception(self):
+        messages, timings = [], {}
+        with self.assertRaisesRegex(ValueError, "diagnostic"):
+            with timed_stage("PSNR", timings, "metric_seconds", messages.append):
+                raise ValueError("diagnostic")
+        self.assertIn("metric_seconds", timings)
+        self.assertTrue(messages[0].startswith("[START]"))
+        self.assertTrue(messages[-1].startswith("[FAILED]"))
+
+    def test_child_failure_is_visible_not_only_in_a_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(RuntimeError, "specific checkpoint mismatch"):
+                run_command([sys.executable, "-c", "import sys; print('specific checkpoint mismatch',file=sys.stderr); sys.exit(3)"], tmp, "child", timeout=5)
+            status = json.loads((Path(tmp) / "child.status.json").read_text())
+            self.assertEqual(status["returncode"], 3)
+            self.assertGreater(status["elapsed_seconds"], 0)
+
+    def test_owned_child_timeout_remains_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(RuntimeError, "timeout"):
+                run_command([sys.executable, "-c", "import time; time.sleep(5)"], tmp, "child", timeout=.05)
+            status = json.loads((Path(tmp) / "child.status.json").read_text())
+            self.assertIn("timeout", status["error"])
 
 
 class CurvesTests(unittest.TestCase):

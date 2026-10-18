@@ -59,7 +59,8 @@ def write_report(folder, rows, summaries, diagnostics, metadata):
     save_json(folder / "summary.json", dict(metadata=metadata, summary=summaries, sampling=diagnostics))
     workbook = Workbook()
     workbook.remove(workbook.active)
-    for name, items in (("BD-rate", summaries), ("RD points", rows), ("Sampling validation", diagnostics),
+    for name, items in (("Run status", [metadata.get("evaluation_status", {"status": "not recorded"})]),
+                        ("BD-rate", summaries), ("RD points", rows), ("Sampling validation", diagnostics),
                         ("Provenance", [dict(key=k, value=v) for k, v in metadata.items()])):
         sheet = workbook.create_sheet(name)
         keys = list(dict.fromkeys(k for r in items for k in r))

@@ -1,0 +1,54 @@
+PCC quality measurement software, version 0.13.4
+
+infile1:        /home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_progress_sparse_v1/cloud_0000/00_Baseline/metric_gt.ply
+infile2:        /home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_progress_sparse_v1/cloud_0000/00_Baseline/decoded.ply
+normal1:        /home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_progress_sparse_v1/cloud_0000/00_Baseline/metric_normals.ply
+singlePass:     0
+hausdorff:      1
+color:          0
+lidar:          0
+resolution:     255
+dropDuplicates: 2
+neighborsProc:  1
+averageNormals: 1
+nbThreads:      1
+
+Verifying if the data is loaded correctly.. The last point is: 92 92 102
+Reading file 1 done.
+Verifying if the data is loaded correctly.. The last point is: 92 92 102
+Reading normal 1 done.
+Verifying if the data is loaded correctly.. The last point is: 56 1 12
+Reading file 2 done.
+Imported intrinsic resoluiton: 255
+Peak distance for PSNR: 255
+Point cloud sizes for org version, dec version, and the scaling ratio: 576, 576, 1
+Normals prepared.
+
+1. Use infile1 (A) as reference, loop over A, use normals on B. (A->B).
+   mse1      (p2point): 8.58681
+   mse1,PSNR (p2point): 43.5637
+   mse1      (p2plane): 0.24845
+   mse1,PSNR (p2plane): 58.9496
+   h.       1(p2point): 146
+   h.,PSNR  1(p2point): 31.2585
+   h.       1(p2plane): 2.19172
+   h.,PSNR  1(p2plane): 49.4942
+2. Use infile2 (B) as reference, loop over B, use normals on A. (B->A).
+   mse2      (p2point): 1.59375
+   mse2,PSNR (p2point): 50.8778
+   mse2      (p2plane): 0.424386
+   mse2,PSNR (p2plane): 56.6244
+   h.       2(p2point): 3
+   h.,PSNR  2(p2point): 48.1308
+   h.       2(p2plane): 2.91019
+   h.,PSNR  2(p2plane): 48.2628
+3. Final (symmetric).
+   mseF      (p2point): 8.58681
+   mseF,PSNR (p2point): 43.5637
+   mseF      (p2plane): 0.424386
+   mseF,PSNR (p2plane): 56.6244
+   h.        (p2point): 146
+   h.,PSNR   (p2point): 31.2585
+   h.        (p2plane): 2.91019
+   h.,PSNR   (p2plane): 48.2628
+Job done! 0.004 seconds elapsed (excluding the time to load the point clouds).

@@ -1,0 +1,11 @@
+Encoder options:
+  Compression level = 7
+  Positions: Quantization = 10 bits
+
+[Draco Octree Info] Total points: 576, Estimated Octree nodes: 144
+Encoded point cloud saved to /home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_progress_success_v1/cloud_0000/05_MINE/geometry.drc
+  Encoding time = 0.000313 s (0.313 ms, 313 μs)
+  Encoded size  = 1694 bytes
+
+For better compression, increase the compression level up to '-cl 10' .
+

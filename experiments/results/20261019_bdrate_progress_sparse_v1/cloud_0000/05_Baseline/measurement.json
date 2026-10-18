@@ -1,0 +1,63 @@
+{
+  "cloud": "/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_final_learned_v1/synthetic_surface.ply",
+  "dataset": "SYNTHETIC_CONTROL_NOT_RESEARCH",
+  "codec": "SparsePCGC",
+  "series": "Baseline",
+  "experiment_mode": "IDENTITY_CONTROL_NOT_TRAINED_MINE",
+  "model_date": "20260801",
+  "model_time": "072958",
+  "rate_index": 5,
+  "parameters": {
+    "scale_ae": 0,
+    "scale_sr": 3
+  },
+  "original_points": 576,
+  "mine_points": 576,
+  "status": "ok",
+  "resolution": 255.0,
+  "timings": {
+    "codec_seconds": 2.1043204655870795,
+    "metric_seconds": 0.0377813670784235
+  },
+  "bits": 2496,
+  "decoded_path": "/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_progress_sparse_v1/cloud_0000/05_Baseline/decoded.ply",
+  "decoded_points": 576,
+  "decoded_sha256": "cd4bbde57bf7ba6d1094c1141e4e7e3b19a1f1dea6ac80d477c85de2cd8bbc7a",
+  "streams": [
+    {
+      "path": "/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_progress_sparse_v1/cloud_0000/05_Baseline/occupancy.bin",
+      "bytes": 231,
+      "sha256": "7866e7e9a8ded273054eab24853992ab0a13114be8e834bea9b50c2469bebedb"
+    },
+    {
+      "path": "/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_progress_sparse_v1/cloud_0000/05_Baseline/geometry.side.bin",
+      "bytes": 81,
+      "sha256": "e4ec643a7320b16a42afcb510a21a7fa3f4642a220a1d7c2ca3b8a6379834a3d"
+    }
+  ],
+  "codec_metadata": {
+    "checkpoint_sha256": "b3e1c1bd30f7f54c4671c94f13c126f9c2d5ba0ff240565de490a74329885831",
+    "sr_checkpoint_sha256": "8e60478469f9518223f3e12d0cc1261a30c461f71a8c1153a02fdcb4a6029948",
+    "ae_checkpoint_sha256": "d843e5b24e51e8e4e2eb167a31ea91a3d88e58d042d5c1004fbf7343ce07a5d2",
+    "rate_definition": "physical basic stream + serialized stage counts/AE bytes/coordinate side record",
+    "quantization_note": "integer input on requested voxel grid",
+    "scale_ae": 0,
+    "scale_sr": 3,
+    "compatibility_note": "MYSP0001 evaluation wrapper; overhead differs from paper logical-count convention"
+  },
+  "bpp": 4.333333333333333,
+  "source_path": "/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_final_learned_v1/synthetic_surface.ply",
+  "source_sha256": "34fd51fb5923e9e284fc78488c995a8eed527bd14fbb57cbe0647083f0fd1695",
+  "d1_psnr": 33.5854,
+  "d1_mse": 85.441,
+  "d2_psnr": 50.6702,
+  "d2_mse": 1.6718,
+  "metric_binary_sha256": "758e1d7a744bfae3094d7781a4c1c9d15810b054d9a866785ace6c96a1ff5f96",
+  "normals_sha256": "34fd51fb5923e9e284fc78488c995a8eed527bd14fbb57cbe0647083f0fd1695",
+  "metric_warnings": [],
+  "canonical_normals_dtype": "float32",
+  "canonical_normals_sha256": "6a9256cbdc151f895a007b6d46cceab0df57f7ab3c9ba6ad5fcb8b83c561ed5c",
+  "peak_definition": "MPEG pc_error PSNR: 10*log10(3*resolution^2 / symmetric_MSE)",
+  "duplicate_policy": "pc_error dropdups=2; Original point count retained as bpp denominator",
+  "metric_precision": "Native tool textual precision; no further rounding"
+}

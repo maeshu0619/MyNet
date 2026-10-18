@@ -4,6 +4,7 @@ import json
 import math
 import os
 import subprocess
+import time
 from pathlib import Path
 
 import numpy as np
@@ -82,17 +83,45 @@ def run_command(command, folder, name, timeout=3600, cwd=None, env=None):
     folder = Path(folder)
     save_json(folder / (name + ".command.json"), list(map(str, command)))
     status = {}
+    started = time.perf_counter()
     with (folder / (name + ".stdout.txt")).open("x") as out, (folder / (name + ".stderr.txt")).open("x") as err:
         try:
-            proc = subprocess.run(list(map(str, command)), stdout=out, stderr=err,
-                                  cwd=cwd, env=env, timeout=timeout, check=False)
-            status["returncode"] = proc.returncode
+            with subprocess.Popen(list(map(str, command)), stdout=out, stderr=err, cwd=cwd, env=env) as proc:
+                try:
+                    while True:
+                        remaining = timeout - (time.perf_counter() - started)
+                        if remaining <= 0:
+                            raise subprocess.TimeoutExpired(command, timeout)
+                        try:
+                            status["returncode"] = proc.wait(timeout=min(30.0, remaining))
+                            break
+                        except subprocess.TimeoutExpired:
+                            if time.perf_counter() - started >= timeout:
+                                raise
+                            print("[RUNNING] {}: {:.0f}s elapsed; stdout={}, stderr={}".format(
+                                name, time.perf_counter() - started, folder / (name + ".stdout.txt"),
+                                folder / (name + ".stderr.txt")), flush=True)
+                except BaseException:
+                    # Only terminate the subprocess created by THIS evaluation;
+                    # existing training/codec processes are never inspected/killed.
+                    if proc.poll() is None:
+                        proc.kill()
+                    proc.wait()
+                    raise
         except subprocess.TimeoutExpired:
             status["error"] = "timeout after {} seconds".format(timeout)
         finally:
+            status["elapsed_seconds"] = time.perf_counter() - started
             save_json(folder / (name + ".status.json"), status)
     if status.get("returncode") != 0:
-        raise RuntimeError("{} failed: {}; see {}".format(name, status, folder))
+        # Surface the actual exception (e.g. checkpoint incompatibility) on the
+        # terminal, not just a generic worker exit code. Full logs are preserved.
+        with (folder / (name + ".stderr.txt")).open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - 1600))
+            tail = handle.read().decode("utf-8", errors="replace").strip()
+        raise RuntimeError("{} failed: {}; see {}{}".format(
+            name, status, folder, "\nWorker stderr tail:\n" + tail if tail else ""))
 
 
 def measure_streams(paths):

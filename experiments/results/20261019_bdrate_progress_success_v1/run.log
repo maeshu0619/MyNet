@@ -1,0 +1,78 @@
+[START] Preflight: checkpoint, GT, normals, selected codec files and Python executables
+[DONE] Preflight. Plan: 1 cloud(s), 6 RD settings, 12 Actual encode/decode + metric pairs; IDENTITY CONTROL (no trained model).
+[CLOUD 1/1] /home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_final_learned_v1/synthetic_surface.ply
+[CONTROL] Identity output: Network inference is intentionally disabled
+[GEOMETRY] Original=576 points, MINE=576 points; saved MINE=/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_final_learned_v1/synthetic_surface.ply
+[START] Actual Draco encode/decode: Baseline rate 1/6 {'qp': 5}
+[DONE] Actual Draco encode/decode: Baseline rate 1/6 {'qp': 5} (0.405s)
+[START] MPEG D1/D2 PSNR: Baseline rate 1/6 {'qp': 5}
+[DONE] MPEG D1/D2 PSNR: Baseline rate 1/6 {'qp': 5} (0.041s)
+[MEASURED] Baseline rate 1/6 {'qp': 5}: bits=4952, Original denominator=576, bpp=8.59722222222, D1=48.6501 dB, D2=53.3521 dB
+synthetic_surface.ply Baseline point 0: ok
+[START] Actual Draco encode/decode: MINE rate 1/6 {'qp': 5}
+[DONE] Actual Draco encode/decode: MINE rate 1/6 {'qp': 5} (0.048s)
+[START] MPEG D1/D2 PSNR: MINE rate 1/6 {'qp': 5}
+[DONE] MPEG D1/D2 PSNR: MINE rate 1/6 {'qp': 5} (0.040s)
+[MEASURED] MINE rate 1/6 {'qp': 5}: bits=4952, Original denominator=576, bpp=8.59722222222, D1=48.6501 dB, D2=53.3521 dB
+synthetic_surface.ply MINE point 0: ok
+[START] Actual Draco encode/decode: Baseline rate 2/6 {'qp': 6}
+[DONE] Actual Draco encode/decode: Baseline rate 2/6 {'qp': 6} (0.061s)
+[START] MPEG D1/D2 PSNR: Baseline rate 2/6 {'qp': 6}
+[DONE] MPEG D1/D2 PSNR: Baseline rate 2/6 {'qp': 6} (0.040s)
+[MEASURED] Baseline rate 2/6 {'qp': 6}: bits=6640, Original denominator=576, bpp=11.5277777778, D1=54.7896 dB, D2=59.6091 dB
+synthetic_surface.ply Baseline point 1: ok
+[START] Actual Draco encode/decode: MINE rate 2/6 {'qp': 6}
+[DONE] Actual Draco encode/decode: MINE rate 2/6 {'qp': 6} (0.053s)
+[START] MPEG D1/D2 PSNR: MINE rate 2/6 {'qp': 6}
+[DONE] MPEG D1/D2 PSNR: MINE rate 2/6 {'qp': 6} (0.041s)
+[MEASURED] MINE rate 2/6 {'qp': 6}: bits=6640, Original denominator=576, bpp=11.5277777778, D1=54.7896 dB, D2=59.6091 dB
+synthetic_surface.ply MINE point 1: ok
+[START] Actual Draco encode/decode: Baseline rate 3/6 {'qp': 7}
+[DONE] Actual Draco encode/decode: Baseline rate 3/6 {'qp': 7} (0.056s)
+[START] MPEG D1/D2 PSNR: Baseline rate 3/6 {'qp': 7}
+[DONE] MPEG D1/D2 PSNR: Baseline rate 3/6 {'qp': 7} (0.039s)
+[MEASURED] Baseline rate 3/6 {'qp': 7}: bits=8368, Original denominator=576, bpp=14.5277777778, D1=61.3264 dB, D2=63.949 dB
+synthetic_surface.ply Baseline point 2: ok
+[START] Actual Draco encode/decode: MINE rate 3/6 {'qp': 7}
+[DONE] Actual Draco encode/decode: MINE rate 3/6 {'qp': 7} (0.053s)
+[START] MPEG D1/D2 PSNR: MINE rate 3/6 {'qp': 7}
+[DONE] MPEG D1/D2 PSNR: MINE rate 3/6 {'qp': 7} (0.039s)
+[MEASURED] MINE rate 3/6 {'qp': 7}: bits=8368, Original denominator=576, bpp=14.5277777778, D1=61.3264 dB, D2=63.949 dB
+synthetic_surface.ply MINE point 2: ok
+[START] Actual Draco encode/decode: Baseline rate 4/6 {'qp': 8}
+[DONE] Actual Draco encode/decode: Baseline rate 4/6 {'qp': 8} (0.058s)
+[START] MPEG D1/D2 PSNR: Baseline rate 4/6 {'qp': 8}
+[DONE] MPEG D1/D2 PSNR: Baseline rate 4/6 {'qp': 8} (0.041s)
+[MEASURED] Baseline rate 4/6 {'qp': 8}: bits=10104, Original denominator=576, bpp=17.5416666667, D1=69.9068 dB, D2=72.0433 dB
+synthetic_surface.ply Baseline point 3: ok
+[START] Actual Draco encode/decode: MINE rate 4/6 {'qp': 8}
+[DONE] Actual Draco encode/decode: MINE rate 4/6 {'qp': 8} (0.054s)
+[START] MPEG D1/D2 PSNR: MINE rate 4/6 {'qp': 8}
+[DONE] MPEG D1/D2 PSNR: MINE rate 4/6 {'qp': 8} (0.037s)
+[MEASURED] MINE rate 4/6 {'qp': 8}: bits=10104, Original denominator=576, bpp=17.5416666667, D1=69.9068 dB, D2=72.0433 dB
+synthetic_surface.ply MINE point 3: ok
+[START] Actual Draco encode/decode: Baseline rate 5/6 {'qp': 9}
+[DONE] Actual Draco encode/decode: Baseline rate 5/6 {'qp': 9} (0.054s)
+[START] MPEG D1/D2 PSNR: Baseline rate 5/6 {'qp': 9}
+[DONE] MPEG D1/D2 PSNR: Baseline rate 5/6 {'qp': 9} (0.039s)
+[MEASURED] Baseline rate 5/6 {'qp': 9}: bits=11840, Original denominator=576, bpp=20.5555555556, D1=72.6804 dB, D2=77.8509 dB
+synthetic_surface.ply Baseline point 4: ok
+[START] Actual Draco encode/decode: MINE rate 5/6 {'qp': 9}
+[DONE] Actual Draco encode/decode: MINE rate 5/6 {'qp': 9} (0.052s)
+[START] MPEG D1/D2 PSNR: MINE rate 5/6 {'qp': 9}
+[DONE] MPEG D1/D2 PSNR: MINE rate 5/6 {'qp': 9} (0.043s)
+[MEASURED] MINE rate 5/6 {'qp': 9}: bits=11840, Original denominator=576, bpp=20.5555555556, D1=72.6804 dB, D2=77.8509 dB
+synthetic_surface.ply MINE point 4: ok
+[START] Actual Draco encode/decode: Baseline rate 6/6 {'qp': 10}
+[DONE] Actual Draco encode/decode: Baseline rate 6/6 {'qp': 10} (0.056s)
+[START] MPEG D1/D2 PSNR: Baseline rate 6/6 {'qp': 10}
+[DONE] MPEG D1/D2 PSNR: Baseline rate 6/6 {'qp': 10} (0.047s)
+[MEASURED] Baseline rate 6/6 {'qp': 10}: bits=13552, Original denominator=576, bpp=23.5277777778, D1=78.8418 dB, D2=84.1235 dB
+synthetic_surface.ply Baseline point 5: ok
+[START] Actual Draco encode/decode: MINE rate 6/6 {'qp': 10}
+[DONE] Actual Draco encode/decode: MINE rate 6/6 {'qp': 10} (0.056s)
+[START] MPEG D1/D2 PSNR: MINE rate 6/6 {'qp': 10}
+[DONE] MPEG D1/D2 PSNR: MINE rate 6/6 {'qp': 10} (0.043s)
+[MEASURED] MINE rate 6/6 {'qp': 10}: bits=13552, Original denominator=576, bpp=23.5277777778, D1=78.8418 dB, D2=84.1235 dB
+synthetic_surface.ply MINE point 5: ok
+{"status": "success", "exit_code": 0, "experiment_mode": "IDENTITY_CONTROL_NOT_TRAINED_MINE", "requested_rd_measurements": 12, "successful_rd_measurements": 12, "successful_codec_roundtrips": 12, "successful_psnr_measurements": 12, "successful_mine_inferences": 0, "elapsed_seconds": 1.9308819328434765, "reasons": []}

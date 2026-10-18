@@ -5,6 +5,7 @@ import json
 import os
 import platform
 import sys
+import time
 import traceback
 import uuid
 from pathlib import Path
@@ -14,6 +15,8 @@ from .codecs import REPO, encode_decode
 from .io import json_safe, read_vertices, run_command, save_json, sha256
 from .metrics import evaluate, validate_normals
 from .report import plot_curves, summarize, write_report
+from .preflight import check_prerequisites
+from .progress import completion_status, print_completion, timed_stage
 
 
 def _network_output(args, gt, folder, checkpoint):
@@ -63,12 +66,13 @@ def _versions():
 
 
 def run(args):
+    started = time.perf_counter()
     now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9)))
     run_name = now.strftime("%H%M%S") + "_" + uuid.uuid4().hex[:8]
     folder = (Path(args.output).expanduser() if args.output else
               Path(args.log_root).expanduser() / now.strftime("%Y%m%d") / "MyNetwork_test_BDrate" / args.codec / run_name).resolve()
     folder.mkdir(parents=True, exist_ok=False)
-    print("BD-rate artifacts: " + str(folder), flush=True)
+    print("BD-rate artifacts (directory creation is NOT evaluation success): " + str(folder), flush=True)
     clouds = [str(Path(p).expanduser().resolve()) for p in args.input]
     if len(set(clouds)) != len(clouds):
         raise ValueError("Duplicate Original GT path")
@@ -97,27 +101,41 @@ def run(args):
                     protected_source_hashes=before, source_sha256={str(p.relative_to(REPO)): sha256(p) for p in [REPO / "test_BDrate.py"] + list(Path(__file__).parent.glob("*.py"))},
                     evaluation_protocol="Original GT versus final decoded geometry; physical geometry streams including decoder side data; bpp denominator=Original GT vertex count",
                     network_rate_conditioning="one deterministic original test.py output per cloud, reused across codec rate settings",
+                    mine_inferences_completed=0, codec_roundtrips_completed=0, psnr_measurements_completed=0,
                     caveats=["No automatic training/test split inference; explicit held-out selection is the researcher's responsibility",
                              "Custom OA/SP serialized wrapper overhead differs from native paper conventions; see codec_metadata",
                              "MPEG executable textual precision retained; no extra pre-integration rounding"])
     rows = []
     with (folder / "run.log").open("x", buffering=1) as log, (folder / "rd_points.jsonl").open("x", buffering=1) as journal:
+        def announce(message, error=False):
+            print(message, file=sys.stderr if error else sys.stdout, flush=True)
+            log.write(message + "\n")
+
         def emit(row):
             rows.append(row)
             journal.write(json.dumps(json_safe(row), ensure_ascii=False, allow_nan=False) + "\n")
             journal.flush(); os.fsync(journal.fileno())
             message = "{} {} point {}: {}".format(Path(row["cloud"]).name, row["series"], row["rate_index"], row["status"])
-            print(message, flush=True); log.write(message + "\n")
+            announce(message + (": " + row["error"] if row.get("error") else ""), error=row["status"] != "ok")
         save_json(folder / "configuration.json", metadata)
         try:
-            if not Path(args.pc_error).is_file():
-                raise FileNotFoundError("MPEG metric executable: " + args.pc_error)
+            announce("[START] Preflight: checkpoint, GT, normals, selected codec files and Python executables")
+            metadata["preflight_errors"] = check_prerequisites(args, checkpoint)
+            if metadata["preflight_errors"]:
+                for error in metadata["preflight_errors"]:
+                    announce("[PREFLIGHT ERROR] " + error, error=True)
+                raise ValueError("Preflight failed; no model inference, codec or PSNR calculation was started")
+            announce("[DONE] Preflight. Plan: {} cloud(s), {} RD settings, {} Actual encode/decode + metric pairs; {}.".format(
+                len(clouds), len(args.points), 2 * len(clouds) * len(args.points),
+                "IDENTITY CONTROL (no trained model)" if args.identity_control else "one MINE model inference per cloud, reused across rates"))
             metadata["pc_error_sha256"] = sha256(args.pc_error)
             if checkpoint:
                 metadata["checkpoint_sha256"] = sha256(checkpoint)
             for cloud_index, cloud in enumerate(clouds):
                 cloud_folder = folder / ("cloud_{:04d}".format(cloud_index)); cloud_folder.mkdir()
                 gt, mine, n_original, mine_error, n_mine, normal = Path(cloud), None, None, None, None, None
+                cloud_timings = {}
+                announce("[CLOUD {}/{}] {}".format(cloud_index + 1, len(clouds), cloud))
                 try:
                     xyz, vertices = read_vertices(gt)
                     n_original = len(xyz)
@@ -132,30 +150,45 @@ def run(args):
                                normals=normal, normals_sha256=sha256(normal) if normal else None))
                     if args.identity_control:
                         mine = gt
+                        announce("[CONTROL] Identity output: Network inference is intentionally disabled")
                     else:
-                        mine = _network_output(args, gt, cloud_folder / "network", checkpoint)
+                        with timed_stage("MINE Network inference: " + gt.name, cloud_timings, "mine_inference_seconds", announce):
+                            mine = _network_output(args, gt, cloud_folder / "network", checkpoint)
+                            # Count only a completed inference with a readable PLY.
+                            n_mine = len(read_vertices(mine)[0])
+                            metadata["mine_inferences_completed"] += 1
                     n_mine = len(read_vertices(mine)[0])
+                    announce("[GEOMETRY] Original={} points, MINE={} points; saved MINE={}".format(n_original, n_mine, mine))
                 except Exception as exc:
                     mine_error = "{}: {}".format(type(exc).__name__, exc)
+                    announce("[CLOUD ERROR] " + mine_error, error=True)
                     log.write(traceback.format_exc() + "\n")
+                save_json(cloud_folder / "stage_timings.json", cloud_timings)
                 for rate_index, point in enumerate(args.points):
                     for series, source in (("Baseline", gt), ("MINE", mine)):
                         point_folder = cloud_folder / ("{:02d}_{}".format(rate_index, series)); point_folder.mkdir()
                         row = dict(cloud=cloud, dataset=args.dataset, codec=args.codec, series=series,
                                    experiment_mode=metadata["mode"], model_date=args.model_date, model_time=args.model_time,
                                    rate_index=rate_index, parameters=point, original_points=n_original, mine_points=n_mine,
-                                   status="error", resolution=args.resolution)
+                                   status="error", resolution=args.resolution, timings={})
                         try:
                             if n_original is None or (not args.d1_only and not normal):
                                 raise ValueError(mine_error or "GT/normal preflight failed")
                             if series == "MINE" and mine_error:
                                 raise ValueError(mine_error)
-                            measured = encode_decode(args.codec, source, point_folder, point, vars(args))
+                            label = "{} rate {}/{} {}".format(series, rate_index + 1, len(args.points), point)
+                            with timed_stage("Actual {} encode/decode: {}".format(args.codec, label), row["timings"], "codec_seconds", announce):
+                                measured = encode_decode(args.codec, source, point_folder, point, vars(args))
+                                metadata["codec_roundtrips_completed"] += 1
                             row.update(measured, bpp=measured["bits"] / n_original,
                                        source_path=str(source), source_sha256=sha256(source))
-                            row.update(evaluate(gt, measured["decoded_path"], point_folder, args.pc_error,
-                                                args.resolution, normal, not args.d1_only, args.timeout))
+                            with timed_stage("MPEG {} PSNR: {}".format("D1" if args.d1_only else "D1/D2", label), row["timings"], "metric_seconds", announce):
+                                row.update(evaluate(gt, measured["decoded_path"], point_folder, args.pc_error,
+                                                    args.resolution, normal, not args.d1_only, args.timeout))
+                                metadata["psnr_measurements_completed"] += 1
                             row["status"] = "ok"
+                            announce("[MEASURED] {}: bits={}, Original denominator={}, bpp={:.12g}, D1={} dB, D2={} dB".format(
+                                label, row["bits"], n_original, row["bpp"], row["d1_psnr"], row.get("d2_psnr", "not measured")))
                         except Exception as exc:
                             row["error"] = "{}: {}".format(type(exc).__name__, exc)
                             log.write(traceback.format_exc() + "\n")
@@ -163,6 +196,7 @@ def run(args):
                         emit(row)
         except Exception as exc:
             metadata["fatal_error"] = "{}: {}".format(type(exc).__name__, exc)
+            announce("[FATAL] " + metadata["fatal_error"], error=True)
             log.write(traceback.format_exc() + "\n")
         finally:
             metadata["protected_source_unchanged"] = all(Path(p).is_file() and sha256(p) == digest for p, digest in before.items())
@@ -179,14 +213,18 @@ def run(args):
             if not metadata["protected_source_unchanged"] or not metadata["evaluation_source_unchanged"] or metadata.get("checkpoint_unchanged") is False:
                 for item in summary:
                     item.update(status="invalid", bd_rate_percent=None, error="Source/checkpoint changed during evaluation")
+            metadata["elapsed_seconds"] = time.perf_counter() - started
+            status = completion_status(rows, summary, metadata, 2 * len(clouds) * len(args.points))
+            metadata["evaluation_status"] = status
+            save_json(folder / "run_status.json", status)
             write_report(folder, rows, summary, diagnostics, metadata)
-            if not args.no_plots:
+            if not args.no_plots and any(r.get("status") == "ok" for r in rows):
                 try:
                     plot_curves(folder, rows, clouds)
                 except Exception as exc:
                     save_json(folder / "plot_error.json", dict(error=str(exc)))
             artifacts = {str(p.relative_to(folder)): sha256(p) for p in folder.rglob("*") if p.is_file() and p.name not in ("manifest.json", "run.log", "rd_points.jsonl")}
             save_json(folder / "manifest.json", artifacts)
-    print("Excel: " + str(folder / "results.xlsx"), flush=True)
-    required = [r for r in summary if r.get("cloud") == "DATASET_MEAN" and (not args.d1_only or r["metric"] == "d1")]
-    return 0 if not metadata.get("fatal_error") and metadata["protected_source_unchanged"] and all(r["status"] == "ok" for r in required) else 2
+            log.write(json.dumps(json_safe(status), ensure_ascii=False) + "\n")
+    print_completion(status, summary, folder)
+    return status["exit_code"]

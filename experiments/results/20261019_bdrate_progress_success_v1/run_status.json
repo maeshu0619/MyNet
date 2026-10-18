@@ -1,0 +1,12 @@
+{
+  "status": "success",
+  "exit_code": 0,
+  "experiment_mode": "IDENTITY_CONTROL_NOT_TRAINED_MINE",
+  "requested_rd_measurements": 12,
+  "successful_rd_measurements": 12,
+  "successful_codec_roundtrips": 12,
+  "successful_psnr_measurements": 12,
+  "successful_mine_inferences": 0,
+  "elapsed_seconds": 1.9308819328434765,
+  "reasons": []
+}

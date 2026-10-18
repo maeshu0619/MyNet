@@ -1,0 +1,6 @@
+Traceback (most recent call last):
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/inference_worker.py", line 92, in <module>
+    main()
+  File "/home/maejima/MasterEx/myNet/utils/bdrate/inference_worker.py", line 55, in main
+    raise RuntimeError("Checkpoint is not exact for current inference architecture: missing trainable={}, shape/unexpected={}, changed={}".format(
+RuntimeError: Checkpoint is not exact for current inference architecture: missing trainable=['point_transformer_feature_gate', 'point_transformer_feature_adapter.0.weight', 'point_transformer_feature_adapter.0.bias', 'point_transformer_feature_adapter.2.weight', 'point_transformer_feature_adapter.2.bias', 'actuator.candidate_local_utility_gate_logits', 'actuator.den6_candidate_actor.0.weight', 'actuator.den6_candidate_actor.0.bias', 'actuator.den6_candidate_actor.2.weight', 'actuator.den6_candidate_actor.2.bias', 'actuator.den6_candidate_critic.0.weight', 'actuator.den6_candidate_critic.0.bias'], shape/unexpected=['full_cloud_amount_selector.amount_bin_logits.weight', 'full_cloud_amount_selector.amount_bin_logits.bias', 'full_cloud_amount_selector.predicted_delta_per_amount.weight', 'full_cloud_amount_selector.predicted_delta_per_amount.bias'], changed=[]

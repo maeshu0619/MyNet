@@ -1,0 +1,6 @@
+/tmp/MinkowskiEngine/src/pruning_cpu.cpp:90, (true) MinkowskiPruning: Generating an empty SparseTensor
+/tmp/MinkowskiEngine/src/pruning_cpu.cpp:90, (true) MinkowskiPruning: Generating an empty SparseTensor
+/tmp/MinkowskiEngine/src/pruning_cpu.cpp:90, (true) MinkowskiPruning: Generating an empty SparseTensor
+/tmp/MinkowskiEngine/src/pruning_cpu.cpp:90, (true) MinkowskiPruning: Generating an empty SparseTensor
+/tmp/MinkowskiEngine/src/pruning_cpu.cpp:90, (true) MinkowskiPruning: Generating an empty SparseTensor
+/tmp/MinkowskiEngine/src/pruning_cpu.cpp:90, (true) MinkowskiPruning: Generating an empty SparseTensor

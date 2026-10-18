@@ -1,0 +1,24 @@
+{
+  "folder": "/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_user_model_check_v1",
+  "original_gt": "/data/maejima/data/ground/8i/loot/loot_vox10_1150.ply",
+  "threads": 2,
+  "network_args": [
+    "--trainORtest", "test",
+    "--checkpoint", "/data/maejima/log/20260801/MyNetwork_train/pretrained/072958_SparsePCGC/best_loss_joint.pth",
+    "--compression", "SparsePCGC",
+    "--dataname", "8i",
+    "--input_dir_test", "/data/maejima/data/ground/8i/loot/loot_vox10_1150.ply",
+    "--save_ply_dir", "/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_user_model_check_v1/mine",
+    "--save_test_ply", "true",
+    "--output_log", "/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_user_model_check_v1/profile.csv",
+    "--log_root", "/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_user_model_check_v1/network_log",
+    "--max_test_samples", "1",
+    "--test_inference_mode", "full_cloud",
+    "--num_workers", "0",
+    "--use_amp", "false",
+    "--use_tf32", "false",
+    "--use_uniform_noise", "false",
+    "--cpu",
+    "--allow_slow_knn_fallback", "true"
+  ]
+}

@@ -1,0 +1,79 @@
+[START] Preflight: checkpoint, GT, normals, selected codec files and Python executables
+[DONE] Preflight. Plan: 1 cloud(s), 6 RD settings, 12 Actual encode/decode + metric pairs; one MINE model inference per cloud, reused across rates.
+[CLOUD 1/1] /home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_final_learned_v1/synthetic_surface.ply
+[START] MINE Network inference: synthetic_surface.ply
+[DONE] MINE Network inference: synthetic_surface.ply (2.097s)
+[GEOMETRY] Original=576 points, MINE=576 points; saved MINE=/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_progress_model_v1/cloud_0000/network/mine/0000_Mine.ply
+[START] Actual SparsePCGC encode/decode: Baseline rate 1/6 {'scale_ae': 1, 'scale_sr': 0}
+[DONE] Actual SparsePCGC encode/decode: Baseline rate 1/6 {'scale_ae': 1, 'scale_sr': 0} (2.107s)
+[START] MPEG D1/D2 PSNR: Baseline rate 1/6 {'scale_ae': 1, 'scale_sr': 0}
+[DONE] MPEG D1/D2 PSNR: Baseline rate 1/6 {'scale_ae': 1, 'scale_sr': 0} (0.039s)
+[MEASURED] Baseline rate 1/6 {'scale_ae': 1, 'scale_sr': 0}: bits=7624, Original denominator=576, bpp=13.2361111111, D1=43.5637 dB, D2=56.6244 dB
+synthetic_surface.ply Baseline point 0: ok
+[START] Actual SparsePCGC encode/decode: MINE rate 1/6 {'scale_ae': 1, 'scale_sr': 0}
+[DONE] Actual SparsePCGC encode/decode: MINE rate 1/6 {'scale_ae': 1, 'scale_sr': 0} (2.202s)
+[START] MPEG D1/D2 PSNR: MINE rate 1/6 {'scale_ae': 1, 'scale_sr': 0}
+[DONE] MPEG D1/D2 PSNR: MINE rate 1/6 {'scale_ae': 1, 'scale_sr': 0} (0.035s)
+[MEASURED] MINE rate 1/6 {'scale_ae': 1, 'scale_sr': 0}: bits=7864, Original denominator=576, bpp=13.6527777778, D1=44.2986 dB, D2=55.0143 dB
+synthetic_surface.ply MINE point 0: ok
+[START] Actual SparsePCGC encode/decode: Baseline rate 2/6 {'scale_ae': 0, 'scale_sr': 1}
+[DONE] Actual SparsePCGC encode/decode: Baseline rate 2/6 {'scale_ae': 0, 'scale_sr': 1} (2.345s)
+[START] MPEG D1/D2 PSNR: Baseline rate 2/6 {'scale_ae': 0, 'scale_sr': 1}
+[DONE] MPEG D1/D2 PSNR: Baseline rate 2/6 {'scale_ae': 0, 'scale_sr': 1} (0.036s)
+[MEASURED] Baseline rate 2/6 {'scale_ae': 0, 'scale_sr': 1}: bits=7488, Original denominator=576, bpp=13, D1=55.8973 dB, D2=58.0018 dB
+synthetic_surface.ply Baseline point 1: ok
+[START] Actual SparsePCGC encode/decode: MINE rate 2/6 {'scale_ae': 0, 'scale_sr': 1}
+[DONE] Actual SparsePCGC encode/decode: MINE rate 2/6 {'scale_ae': 0, 'scale_sr': 1} (2.302s)
+[START] MPEG D1/D2 PSNR: MINE rate 2/6 {'scale_ae': 0, 'scale_sr': 1}
+[DONE] MPEG D1/D2 PSNR: MINE rate 2/6 {'scale_ae': 0, 'scale_sr': 1} (0.039s)
+[MEASURED] MINE rate 2/6 {'scale_ae': 0, 'scale_sr': 1}: bits=7728, Original denominator=576, bpp=13.4166666667, D1=51.1968 dB, D2=53.368 dB
+synthetic_surface.ply MINE point 1: ok
+[START] Actual SparsePCGC encode/decode: Baseline rate 3/6 {'scale_ae': 1, 'scale_sr': 1}
+[DONE] Actual SparsePCGC encode/decode: Baseline rate 3/6 {'scale_ae': 1, 'scale_sr': 1} (2.144s)
+[START] MPEG D1/D2 PSNR: Baseline rate 3/6 {'scale_ae': 1, 'scale_sr': 1}
+[DONE] MPEG D1/D2 PSNR: Baseline rate 3/6 {'scale_ae': 1, 'scale_sr': 1} (0.038s)
+[MEASURED] Baseline rate 3/6 {'scale_ae': 1, 'scale_sr': 1}: bits=4184, Original denominator=576, bpp=7.26388888889, D1=24.1057 dB, D2=52.6201 dB
+synthetic_surface.ply Baseline point 2: ok
+[START] Actual SparsePCGC encode/decode: MINE rate 3/6 {'scale_ae': 1, 'scale_sr': 1}
+[DONE] Actual SparsePCGC encode/decode: MINE rate 3/6 {'scale_ae': 1, 'scale_sr': 1} (2.302s)
+[START] MPEG D1/D2 PSNR: MINE rate 3/6 {'scale_ae': 1, 'scale_sr': 1}
+[DONE] MPEG D1/D2 PSNR: MINE rate 3/6 {'scale_ae': 1, 'scale_sr': 1} (0.038s)
+[MEASURED] MINE rate 3/6 {'scale_ae': 1, 'scale_sr': 1}: bits=4216, Original denominator=576, bpp=7.31944444444, D1=24.3513 dB, D2=52.1802 dB
+synthetic_surface.ply MINE point 2: ok
+[START] Actual SparsePCGC encode/decode: Baseline rate 4/6 {'scale_ae': 0, 'scale_sr': 2}
+[DONE] Actual SparsePCGC encode/decode: Baseline rate 4/6 {'scale_ae': 0, 'scale_sr': 2} (2.253s)
+[START] MPEG D1/D2 PSNR: Baseline rate 4/6 {'scale_ae': 0, 'scale_sr': 2}
+[DONE] MPEG D1/D2 PSNR: Baseline rate 4/6 {'scale_ae': 0, 'scale_sr': 2} (0.039s)
+[MEASURED] Baseline rate 4/6 {'scale_ae': 0, 'scale_sr': 2}: bits=3624, Original denominator=576, bpp=6.29166666667, D1=29.7707 dB, D2=51.2272 dB
+synthetic_surface.ply Baseline point 3: ok
+[START] Actual SparsePCGC encode/decode: MINE rate 4/6 {'scale_ae': 0, 'scale_sr': 2}
+[DONE] Actual SparsePCGC encode/decode: MINE rate 4/6 {'scale_ae': 0, 'scale_sr': 2} (2.203s)
+[START] MPEG D1/D2 PSNR: MINE rate 4/6 {'scale_ae': 0, 'scale_sr': 2}
+[DONE] MPEG D1/D2 PSNR: MINE rate 4/6 {'scale_ae': 0, 'scale_sr': 2} (0.037s)
+[MEASURED] MINE rate 4/6 {'scale_ae': 0, 'scale_sr': 2}: bits=3632, Original denominator=576, bpp=6.30555555556, D1=30.0091 dB, D2=55.1408 dB
+synthetic_surface.ply MINE point 3: ok
+[START] Actual SparsePCGC encode/decode: Baseline rate 5/6 {'scale_ae': 1, 'scale_sr': 2}
+[DONE] Actual SparsePCGC encode/decode: Baseline rate 5/6 {'scale_ae': 1, 'scale_sr': 2} (2.302s)
+[START] MPEG D1/D2 PSNR: Baseline rate 5/6 {'scale_ae': 1, 'scale_sr': 2}
+[DONE] MPEG D1/D2 PSNR: Baseline rate 5/6 {'scale_ae': 1, 'scale_sr': 2} (0.037s)
+[MEASURED] Baseline rate 5/6 {'scale_ae': 1, 'scale_sr': 2}: bits=2736, Original denominator=576, bpp=4.75, D1=36.3179 dB, D2=50.5765 dB
+synthetic_surface.ply Baseline point 4: ok
+[START] Actual SparsePCGC encode/decode: MINE rate 5/6 {'scale_ae': 1, 'scale_sr': 2}
+[DONE] Actual SparsePCGC encode/decode: MINE rate 5/6 {'scale_ae': 1, 'scale_sr': 2} (2.353s)
+[START] MPEG D1/D2 PSNR: MINE rate 5/6 {'scale_ae': 1, 'scale_sr': 2}
+[DONE] MPEG D1/D2 PSNR: MINE rate 5/6 {'scale_ae': 1, 'scale_sr': 2} (0.039s)
+[MEASURED] MINE rate 5/6 {'scale_ae': 1, 'scale_sr': 2}: bits=2728, Original denominator=576, bpp=4.73611111111, D1=35.1659 dB, D2=53.9187 dB
+synthetic_surface.ply MINE point 4: ok
+[START] Actual SparsePCGC encode/decode: Baseline rate 6/6 {'scale_ae': 0, 'scale_sr': 3}
+[DONE] Actual SparsePCGC encode/decode: Baseline rate 6/6 {'scale_ae': 0, 'scale_sr': 3} (2.203s)
+[START] MPEG D1/D2 PSNR: Baseline rate 6/6 {'scale_ae': 0, 'scale_sr': 3}
+[DONE] MPEG D1/D2 PSNR: Baseline rate 6/6 {'scale_ae': 0, 'scale_sr': 3} (0.036s)
+[MEASURED] Baseline rate 6/6 {'scale_ae': 0, 'scale_sr': 3}: bits=2496, Original denominator=576, bpp=4.33333333333, D1=33.5854 dB, D2=50.6702 dB
+synthetic_surface.ply Baseline point 5: ok
+[START] Actual SparsePCGC encode/decode: MINE rate 6/6 {'scale_ae': 0, 'scale_sr': 3}
+[DONE] Actual SparsePCGC encode/decode: MINE rate 6/6 {'scale_ae': 0, 'scale_sr': 3} (2.354s)
+[START] MPEG D1/D2 PSNR: MINE rate 6/6 {'scale_ae': 0, 'scale_sr': 3}
+[DONE] MPEG D1/D2 PSNR: MINE rate 6/6 {'scale_ae': 0, 'scale_sr': 3} (0.039s)
+[MEASURED] MINE rate 6/6 {'scale_ae': 0, 'scale_sr': 3}: bits=2496, Original denominator=576, bpp=4.33333333333, D1=35.1879 dB, D2=53.3904 dB
+synthetic_surface.ply MINE point 5: ok
+{"status": "failed", "exit_code": 2, "experiment_mode": "trained_network", "requested_rd_measurements": 12, "successful_rd_measurements": 12, "successful_codec_roundtrips": 12, "successful_psnr_measurements": 12, "successful_mine_inferences": 1, "elapsed_seconds": 30.05305859586224, "reasons": ["/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_final_learned_v1/synthetic_surface.ply D1: Nonmonotonic rate versus PSNR; not silently corrected", "/home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_final_learned_v1/synthetic_surface.ply D2: Nonmonotonic rate versus PSNR; not silently corrected"]}

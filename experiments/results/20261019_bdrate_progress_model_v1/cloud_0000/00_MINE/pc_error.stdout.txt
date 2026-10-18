@@ -1,0 +1,54 @@
+PCC quality measurement software, version 0.13.4
+
+infile1:        /home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_progress_model_v1/cloud_0000/00_MINE/metric_gt.ply
+infile2:        /home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_progress_model_v1/cloud_0000/00_MINE/decoded.ply
+normal1:        /home/maejima/MasterEx/myNet/experiments/results/20261019_bdrate_progress_model_v1/cloud_0000/00_MINE/metric_normals.ply
+singlePass:     0
+hausdorff:      1
+color:          0
+lidar:          0
+resolution:     255
+dropDuplicates: 2
+neighborsProc:  1
+averageNormals: 1
+nbThreads:      1
+
+Verifying if the data is loaded correctly.. The last point is: 92 92 102
+Reading file 1 done.
+Verifying if the data is loaded correctly.. The last point is: 92 92 102
+Reading normal 1 done.
+Verifying if the data is loaded correctly.. The last point is: 1 40 11
+Reading file 2 done.
+Imported intrinsic resoluiton: 255
+Peak distance for PSNR: 255
+Point cloud sizes for org version, dec version, and the scaling ratio: 576, 576, 1
+Normals prepared.
+
+1. Use infile1 (A) as reference, loop over A, use normals on B. (A->B).
+   mse1      (p2point): 7.25
+   mse1,PSNR (p2point): 44.2986
+   mse1      (p2plane): 0.614856
+   mse1,PSNR (p2plane): 55.0143
+   h.       1(p2point): 105
+   h.,PSNR  1(p2point): 32.6901
+   h.       1(p2plane): 6.6432
+   h.,PSNR  1(p2plane): 44.6782
+2. Use infile2 (B) as reference, loop over B, use normals on A. (B->A).
+   mse2      (p2point): 2.64236
+   mse2,PSNR (p2point): 48.6821
+   mse2      (p2plane): 0.534152
+   mse2,PSNR (p2plane): 55.6254
+   h.       2(p2point): 5
+   h.,PSNR  2(p2point): 45.9123
+   h.       2(p2plane): 3.511
+   h.,PSNR  2(p2plane): 47.4477
+3. Final (symmetric).
+   mseF      (p2point): 7.25
+   mseF,PSNR (p2point): 44.2986
+   mseF      (p2plane): 0.614856
+   mseF,PSNR (p2plane): 55.0143
+   h.        (p2point): 105
+   h.,PSNR   (p2point): 32.6901
+   h.        (p2plane): 6.6432
+   h.,PSNR   (p2plane): 44.6782
+Job done! 0.005 seconds elapsed (excluding the time to load the point clouds).
