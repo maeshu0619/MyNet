@@ -554,7 +554,14 @@ class StructureRepairActuator(nn.Module):
         nn.init.constant_(self.drop_amount_head.bias, 0.0)
         nn.init.constant_(self.add_amount_head.bias, 0.0)
         nn.init.constant_(self.move_amount_head.bias, 0.0)
+        from ..utils.training.sparsepcgc_amount_policy import register_amount_reference
+        register_amount_reference(self)
         self.debug_tensors = {}
+
+    def _load_from_state_dict(self, state_dict, prefix, *args):
+        from ..utils.training.sparsepcgc_amount_policy import migrate_amount_reference
+        migrate_amount_reference(self, state_dict, prefix)
+        super()._load_from_state_dict(state_dict, prefix, *args)
 
     def _should_collect_runtime_debug(self):
         """Return whether scalar diagnostics may synchronize the GPU this step."""
@@ -3420,6 +3427,20 @@ class StructureRepairActuator(nn.Module):
             bounded_logit = ratio_logit_scale * torch.tanh(raw_logit / ratio_logit_scale)
         learned_ratio = torch.sigmoid(bounded_logit) * float(max_ratio)
 
+        # Keep a frozen checkpoint reference, not a detached copy of the
+        # changing output. The Exact plan uses its legacy forward plus a real
+        # learnable log-residual; saturated legacy heads can then move again.
+        from ..utils.training.sparsepcgc_amount_policy import (
+            OPERATIONS, amount_learning_enabled, reference_raw,
+        )
+        if amount_learning_enabled(self.args) and hasattr(self, 'sparse_amount_policy_version'):
+            operation = next((op for op, name in OPERATIONS if getattr(self, name) is head), None)
+            if operation is not None:
+                ref_raw = reference_raw(self, operation, pooled)
+                cache = getattr(self, '_sparse_amount_inputs', {})
+                cache[operation] = dict(raw=raw_logit, reference_raw=ref_raw)
+                self._sparse_amount_inputs = cache
+
         if bool(getattr(self.args, "repair_learn_operation_amounts", True)):
             ratio = learned_ratio
         else:
@@ -4764,6 +4785,14 @@ class StructureRepairActuator(nn.Module):
             "Prune": learned_drop_ratio.float().mean().clamp_min(1e-9),
             "Adjust": learned_move_ratio.float().mean().clamp_min(1e-9),
         }
+        from ..utils.training.sparsepcgc_amount_policy import (
+            amount_learning_enabled, calibrated_log_residual, sampled_bin_log_probs,
+        )
+        broad_amount_learning = amount_learning_enabled(self.args)
+        amount_inputs = getattr(self, '_sparse_amount_inputs', {}) if broad_amount_learning else {}
+        # Retain the FINAL legacy ratios passed by forward, including its
+        # downstream calibration/gates. A cached pre-calibration head ratio
+        # is not equivalent, even when the head-minus-reference delta is zero.
         amount_beta = min(max(float(
             getattr(self.args, "heuristic_guidance_online_amount_residual_scale", 0.35)
         ), 0.0), 0.50)
@@ -5140,6 +5169,7 @@ class StructureRepairActuator(nn.Module):
             amount_logit_calibration_scale = 1.0
         amount_log_probs = torch.log_softmax(amount_logits, dim=0)
         amount_prob = amount_log_probs.exp()
+        amount_behavior_log_probs = amount_log_probs
         learned_total_for_backward = (
             (amount_prob * bin_tensor).sum()
             if torch.is_tensor(amount_selector_logits)
@@ -5181,6 +5211,11 @@ class StructureRepairActuator(nn.Module):
                 amount_logits
                 + gumbel * float(effective_amount_gumbel_scale)
             )
+            if broad_amount_learning and effective_amount_gumbel_scale > 0.0:
+                # Credit the distribution actually sampled, not softmax at a
+                # different temperature. Keep pure-policy logits for proxies.
+                amount_behavior_log_probs = sampled_bin_log_probs(
+                    amount_logits, effective_amount_gumbel_scale)
         else:
             selected_amount_bin = torch.argmax(amount_logits)
         # den6の初期総量はdataset/codec条件で異なる。UVG m=8では0.50%であり、
@@ -5211,6 +5246,10 @@ class StructureRepairActuator(nn.Module):
         fine_sigma_base = max(float(getattr(
             self.args, "heuristic_guidance_online_amount_log_sigma", 0.08
         )), 0.0) * float(residual_alpha) * float(exploration_multiplier)
+        if broad_amount_learning:
+            fine_sigma_base = max(float(getattr(
+                self.args, 'sparsepcgc_amount_exploration_log_sigma', 0.30
+            )), 0.0) * float(residual_alpha) * float(exploration_multiplier)
         operation_fine_means = {
             name: torch.log(
                 ratio_tensors[name] / ratio_tensors[name].new_tensor(prior_ratios[name])
@@ -5221,16 +5260,26 @@ class StructureRepairActuator(nn.Module):
         operation_fine_log_probs = {}
         operation_fine_policy_means = {}
         operation_fine_sigmas = {}
+        joint_amount_exploration = broad_amount_learning and bool(getattr(
+            self.args, 'sparsepcgc_amount_joint_exploration', True))
         for name in operations:
             fine_mean = _confidence_forward_full_backward(
                 operation_fine_means[name], "Fine"
             )
+            if broad_amount_learning and name in amount_inputs:
+                delta = calibrated_log_residual(
+                    amount_inputs[name]['raw'], amount_inputs[name]['reference_raw'],
+                    getattr(self.args, 'sparsepcgc_amount_residual_span', math.log(2.)),
+                ).float().mean()
+                fine_mean = fine_mean + delta
+                operation_fine_means[name] = operation_fine_means[name] + delta
             operation_fine_policy_means[name] = fine_mean
             fine_sigma = (
                 float(fine_sigma_base)
                 * float(
                     plan_exploration_factor
-                    if str(factorized_exploration_group) == "Fine"
+                    if str(factorized_exploration_group) == "Fine" or (
+                        joint_amount_exploration and str(factorized_exploration_group) == "Amount")
                     else operation_exploration_factors[name]
                 )
             )
@@ -5241,6 +5290,7 @@ class StructureRepairActuator(nn.Module):
                 and (
                     not factorized_behavior
                     or factorized_exploration_group in {"all", "Fine"}
+                    or (joint_amount_exploration and factorized_exploration_group == "Amount")
                 )
             ):
                 fine_noise = torch.randn_like(fine_mean).detach()
@@ -5333,7 +5383,7 @@ class StructureRepairActuator(nn.Module):
             for index, name in enumerate(operations)
         }
         sampled_total_ratio = sum(sampled_ratio_tensors.values())
-        amount_bin_log_prob = amount_log_probs[selected_amount_bin]
+        amount_bin_log_prob = amount_behavior_log_probs[selected_amount_bin]
         if exact_anchor_active:
             # anchorのAmountはNetworkの選択ではなく教師planの強制再生。
             # ここで圧縮改善creditを与えると、探索前に中央binへ
@@ -5393,7 +5443,7 @@ class StructureRepairActuator(nn.Module):
             # sync with that override; otherwise the no-op replay carries the
             # positive Amount bin's log-probability (and can become entirely
             # non-differentiable when the positive path was detached).
-            amount_bin_log_prob = amount_log_probs[selected_amount_bin]
+            amount_bin_log_prob = amount_behavior_log_probs[selected_amount_bin]
             amount_fine_log_prob = amount_fine_log_prob.detach() * 0.0
             requested_counts = {name: 0 for name in operations}
         elif diagnostic_policy == "heuristic":
@@ -5481,7 +5531,8 @@ class StructureRepairActuator(nn.Module):
                         current_gate if matched_group == "Gate" else stored_gate
                     )
                     counterfactual_fine = (
-                        current_fine if matched_group == "Fine" else stored_fine
+                        current_fine if matched_group == "Fine" or (
+                            joint_amount_exploration and matched_group == "Amount") else stored_fine
                     )
                     if matched_group != "Amount":
                         no_op_selected = bool(
@@ -6939,7 +6990,16 @@ class StructureRepairActuator(nn.Module):
                 anchor_bin = min(max(int(matched_anchor_record.get(
                     "amount_bin_index", 0
                 )), 0), int(amount_log_probs.numel()) - 1)
-                anchor_group_log_prob = amount_log_probs[anchor_bin]
+                anchor_group_log_prob = amount_behavior_log_probs[anchor_bin]
+                if joint_amount_exploration and anchor_bin > 0:
+                    stored_fine = dict(matched_anchor_record.get('fine_log_residuals') or {})
+                    anchor_group_log_prob = anchor_group_log_prob + torch.stack([
+                        normalized_fine_log_prob(operation_fine_policy_means[name],
+                            operation_fine_policy_means[name].new_tensor(float(stored_fine.get(name, 0.0))),
+                            operation_fine_sigmas[name])
+                        if operation_fine_sigmas[name] > 0.0 else operation_fine_policy_means[name] * 0.0
+                        for name in operations
+                    ]).mean()
             elif matched_group == "Gate":
                 anchor_counts = dict(
                     matched_anchor_record.get("selected_counts") or {}
@@ -7244,7 +7304,7 @@ class StructureRepairActuator(nn.Module):
                 explored_operation = factorized_exploration_group[:-5]
                 policy_log_prob = where_log_prob_by_operation[explored_operation]
             elif factorized_exploration_group == "Amount":
-                policy_log_prob = amount_bin_log_prob
+                policy_log_prob = amount_log_prob if joint_amount_exploration else amount_bin_log_prob
             elif factorized_exploration_group == "Gate":
                 policy_log_prob = action_log_prob
             elif factorized_exploration_group == "Fine":
@@ -7795,6 +7855,13 @@ class StructureRepairActuator(nn.Module):
             "amount_bin_probabilities": [
                 float(value) for value in amount_prob.detach().cpu().tolist()
             ],
+            "sparse_amount_learning_enabled": bool(broad_amount_learning),
+            "sparse_amount_joint_exploration": bool(joint_amount_exploration),
+            "amount_behavior_probabilities": amount_behavior_log_probs.detach().exp().cpu().tolist(),
+            "operation_amount_sigmas": dict(operation_fine_sigmas),
+            "operation_amount_policy_means": {
+                name: float(operation_fine_policy_means[name].detach().cpu()) for name in operations
+            },
             "amount_logit_calibration_scale": float(amount_logit_calibration_scale),
             "amount_logit_std_uncalibrated": float(
                 amount_logits_uncalibrated.detach().std(unbiased=False).cpu()
@@ -7879,7 +7946,7 @@ class StructureRepairActuator(nn.Module):
             "where_log_prob": where_log_prob,
             "amount_log_prob": amount_log_prob,
             "amount_bin_log_prob": amount_bin_log_prob,
-            "_actual_credit_amount_log_probs": amount_log_probs,
+            "_actual_credit_amount_log_probs": amount_behavior_log_probs,
             "_actual_credit_amount_bin_index": int(selected_amount_bin.detach().cpu()),
             "_actual_credit_group_log_prob": policy_log_prob,
             "_actual_credit_anchor_group_log_prob": anchor_group_log_prob,
@@ -8318,6 +8385,9 @@ class StructureRepairActuator(nn.Module):
         external_executable_plan=None,
     ):
         external_plan_authority = external_executable_plan is not None
+        # Per-forward graph references must never survive into a different
+        # frame, an omitted/disabled operation, or an evaluation pass.
+        self._sparse_amount_inputs = {}
         timing_enabled = bool(
             getattr(self.args, "debug_timing", False)
             or getattr(self.args, "_profile_runtime_this_step", False)

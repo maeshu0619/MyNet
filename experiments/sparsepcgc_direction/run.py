@@ -35,6 +35,10 @@ def main():
     parser.add_argument('--seed-cache',type=Path,default=ROOT/'experiments/results/20261022_credit_fixes/16_verified_initial/cache')
     parser.add_argument('--probe-steps',default='2,4,6,8,24,64')
     parser.add_argument('--evaluate-only',type=Path)
+    parser.add_argument('--eval-only-final',action='store_true',help='Only evaluate the selected saved snapshot, without rollback ablations')
+    parser.add_argument('--evaluation-step',type=int,help='Select a saved model_NNN snapshot for compatibility checks')
+    parser.add_argument('--amount-exploration',choices=['on','off'],default=None,
+                        help='Explicit experimental Amount policy override; omitted uses production default')
     parser.add_argument('--disable-proxy-distill',action='store_true',
                         help='One-factor experimental ablation; production args are not edited')
     parser.add_argument('--post-window-probe-floor',type=float)
@@ -76,6 +80,8 @@ def main():
     def parse(*a,**kw):
         args=original_parse(*a,**kw)
         args.seed=opts.seed
+        if opts.amount_exploration is not None:
+            args.sparsepcgc_amount_exploration=opts.amount_exploration=='on'
         args.sparsepcgc_cpu_actual_overlap=False
         # Both sources receive exactly the same external 2-view input stream
         # and the same schedule estimate. Do not pair current a second time.
@@ -426,6 +432,7 @@ def main():
             target=opts.evaluate_only.resolve()
             initial=torch.load(str(target/'model_000.pth'),map_location='cpu')
             final_file=max(target.glob('model_[0-9][0-9][0-9].pth'),key=lambda p:int(p.stem.split('_')[-1]))
+            if opts.evaluation_step is not None:final_file=target/('model_%03d.pth'%opts.evaluation_step)
             final=torch.load(str(final_file),map_location='cpu')
             schedule=json.loads((target/'schedule.json').read_text())
             for key,value in schedule.items():setattr(args,key,value)
@@ -446,6 +453,7 @@ def main():
                 for key in ablated['model']:
                     if any(key.startswith(prefix) for prefix in prefixes):ablated['model'][key]=initial['model'][key].clone()
                 specs['rollback_'+name]=ablated
+            if opts.eval_only_final:specs={'full':final}
             state['snapshots']={900+i:payload for i,payload in enumerate(specs.values())}
             write_json(out/'evaluation_labels.json',{str(900+i):name for i,name in enumerate(specs)})
             result=None

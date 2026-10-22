@@ -3604,6 +3604,14 @@ def parse_pugan_args(parser, file_day, file_time):
     parser.add_argument('--checkpoint_min_optimizer_step_ratio', default=0.20, type=float, help='この割合未満しかoptimizer更新できないepisodeはbest/guard対象外')
     parser.add_argument('--max_train_steps', default=0, type=int, help='デバッグ用: 0より大きい場合、そのglobal step数でtrain loopを早期終了する')
     parser.add_argument('--sparsepcgc_matched_frame_repeats', default=2, type=int, choices=[1, 2], help='SparsePCGC ana_den6学習だけで同一frameのanchor/比較を連続処理する。1は従来順、2は1回ずつencodeする2-view。評価・他codecは変更しない')
+    parser.add_argument('--sparsepcgc_amount_exploration', default=False, type=str2bool,
+                        help='実験用opt-in: SparsePCGC ana_den6だけcheckpoint基準の連続Amount残差と広い初期探索を有効化。短期Actual改善未確認のため標準OFF')
+    parser.add_argument('--sparsepcgc_amount_joint_exploration', default=True, type=str2bool,
+                        help='Amount比較で総量binとAdd/Prune/Adjustの連続残差を同時に探索・Actual RDで学習する')
+    parser.add_argument('--sparsepcgc_amount_exploration_log_sigma', default=0.30, type=float,
+                        help='初期Amount探索のlog標準偏差。既存探索scheduleと同時に0へ減衰。評価は常にnoiseなし')
+    parser.add_argument('--sparsepcgc_amount_residual_span', default=0.6931471805599453, type=float,
+                        help='checkpoint基準の学習log残差上限。既定log(2)で各操作量を約0.5～2倍まで学習可能。安全上限とPool容量は別途維持')
     parser.add_argument('--save_good_bad_cases', default=False, type=str2bool, help='actual deltaが大きく改善/悪化したstepのdebug summaryをCSV保存する')
     parser.add_argument('--save_proxy_actual_bad_cases', default=True, type=str2bool, help='proxy/cause scoreとactual bitの符号が逆のcaseをCSV保存する')
     parser.add_argument('--proxy_actual_bad_case_threshold', default=0.0, type=float, help='proxy-actual逆方向caseを保存する最小絶対値しきい値')
@@ -4830,6 +4838,10 @@ def parse_pugan_args(parser, file_day, file_time):
         float(getattr(args, "heuristic_guidance_online_amount_gumbel_scale", 2.0)),
         0.0,
     )
+    args.sparsepcgc_amount_exploration_log_sigma = min(max(float(
+        getattr(args, 'sparsepcgc_amount_exploration_log_sigma', 0.30)), 0.0), 0.50)
+    args.sparsepcgc_amount_residual_span = min(max(float(
+        getattr(args, 'sparsepcgc_amount_residual_span', 0.6931471805599453)), 1e-6), 1.3862943611198906)
     args.heuristic_guidance_online_efficiency_direct_grad_scale = max(float(getattr(
         args, "heuristic_guidance_online_efficiency_direct_grad_scale", 0.10
     )), 0.0)
